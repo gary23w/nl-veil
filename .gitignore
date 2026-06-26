@@ -19,9 +19,12 @@ keys.env
 !.env.example
 
 # The neuron memory-engine binary is a build artifact / release asset, not source.
-# Place it at bin/neuron[.exe] locally (see the README).
+# deploy.py fetches + builds it on first run (or place it at bin/neuron[.exe] yourself).
 bin/*
 !bin/.gitkeep
+
+# neuron-db source + target that deploy.py downloads and compiles on first run
+.neuron-src/
 
 # OS / editor noise
 .DS_Store
