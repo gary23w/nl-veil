@@ -122,7 +122,8 @@ const Worker = struct {
     iface_str: []const u8 = "",
     bench_fixed: []const u8 = "",
     corpus_facts: u32 = 0,
-    internet: bool = true,
+    internet: bool = true, // live connectivity state, re-probed each round (curl -I)
+    want_net: bool = true, // intent: this task wants the web (vs an air-gapped run that never probes)
     last_gap_str: []const u8 = "",
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
@@ -132,6 +133,7 @@ const Worker = struct {
     open_ended: bool = false,
     never_stops: bool = false,
     discourse: bool = false,
+    operating: bool = false, // a live device is attached (telemetry.json on the bus) -> operate, not build
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     now_str: []const u8 = "",
@@ -307,6 +309,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .key = key,
         .autonomous = m.autonomous,
         .internet = m.internet,
+        .want_net = m.internet,
     };
     w.mem.trust = true; // always-on learned floor for the AI hive memory (auth uses a separate Neuron client)
     defer w.scratch.deinit();
@@ -516,9 +519,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer gpa.free(results);
     w.last_progress.store(@intCast(w.seq), .monotonic);
     const wd_thread: ?std.Thread = if (live) (std.Thread.spawn(.{}, hangWatchdog, .{&w}) catch null) else null;
+    // CONNECTIVITY: the host to probe for an uplink each round (override per-device with NL_NET_PROBE_URL).
+    const probe_url: []const u8 = if (environ.get("NL_NET_PROBE_URL")) |u| (if (u.len > 0) u else "https://1.1.1.1") else "https://1.1.1.1";
     while (true) {
         round += 1;
         _ = w.scratch.reset(.retain_capacity);
+        // EMBEDDED RESILIENCE: re-probe the uplink. On a drop the hive keeps working LEXICALLY (web tools
+        // off, recall/recall_hive from neuron-db); it auto-restores web access when the link returns.
+        if (live) netProbe(&w, round, probe_url);
         {
             const ns = formatNow(gpa, w.nowSecs());
             if (ns.len > 0) {
@@ -559,6 +567,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
             grp.await(io) catch {};
         }
+
+        // POSTURE: capture the round's dominant posture NOW, while the moment traces are still alive — they
+        // are freed in the summary loop just below. dominantPosture returns a static string literal, so it outlives them.
+        const round_posture = dominantPosture(results[0..minds.items.len]);
 
         var retro_in: std.ArrayListUnmanaged(u8) = .empty;
         var any_llm_ok = false;
@@ -607,6 +619,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         const prev_pct = w.last_bench.pct;
         const prev_status = w.last_bench.status;
+        // OPERATING a live host is an ACTION task, never a build or discourse. If a machine attached (telemetry.json on
+        // the work bus), mark the run OPERATING — force discourse off so the fitness/oracle scaffolding runs, and (via
+        // w.operating) skip the BUILD-only round faculties (role planner / blueprint) that are meaningless + crash-prone.
+        if (live and !w.operating) {
+            const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
+            defer if (tp.len > 0) gpa.free(tp);
+            if (tp.len > 0) {
+                if (std.Io.Dir.cwd().access(io, tp, .{})) |_| {
+                    w.operating = true;
+                    w.discourse = false;
+                    w.act("engine", round, "mode", "operate", "live host attached — operational task; fitness/oracle ENABLED, build-only faculties (role planner / blueprint) DISABLED");
+                } else |_| {}
+            }
+        }
         if (live and !w.discourse) {
             var scout_skills: u32 = 0;
             {
@@ -626,7 +652,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
             w.last_bench = bench;
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.doc_target);
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.doc_target, prev_pct);
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
                 _ = w.mem.observe(tools.PLAYBOOK_SCOPE, "Write an objective test suite (test_*.py with real assertions about intended behavior) for the deliverable before adding more features — the swarm is scored by its pass rate.");
@@ -648,6 +674,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             // TRUST FLOOR: reward the classes the hive surfaced by THIS round's fitness Δ. Only on a real
             // graded outcome (status .ok) — a no-tests/error round has no honest signal. Engine-owned.
             if (w.last_bench.status == .ok) rewardFloor(&w, goal, w.last_bench.pct, prev_pct, round);
+            // POSTURE TRUST (operate only): credit the round's DOMINANT posture (what the minds actually did) by the
+            // host-health delta, so "scout/investigate when intel is thin, remediate when it's confirmed" becomes a
+            // LEARNED disposition rather than a hardcoded phase. A posture:* tag is just another trust class.
+            if (w.last_bench.status == .ok and w.last_bench.host) {
+                const post = round_posture;
+                const dpost: i32 = @as(i32, @intCast(w.last_bench.pct)) - @as(i32, @intCast(prev_pct));
+                const pcls = [_][]const u8{post};
+                w.mem.trustReward(@as(f32, @floatFromInt(dpost)) / 100.0, &pcls);
+                _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, std.fmt.allocPrint(w.a(), "[{s}] round {d}: the swarm's dominant posture this round moved host health by {d} point(s).", .{ post, round, dpost }) catch "[posture:watch] round");
+                w.act("engine", round, "posture", post, std.fmt.allocPrint(w.a(), "credited posture by host-health delta {d}", .{dpost}) catch post);
+            }
         }
 
         if (live and !w.discourse) smokeTest(&w, run_dir);
@@ -662,11 +699,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
         if (live and m.gap_assess) assessGap(&w, goal, round, stalled);
-        if (live and minds.items.len > 1) {
+        if (live and minds.items.len > 1 and !w.operating) {
             planRoles(&w, minds.items, goal, round, w.last_bench, stalled or w.last_gap_str.len > 0);
         }
 
-        if (live) {
+        // Build-improvement RSI — skip when OPERATING a host; the daemon's learning is the oracle + trust floor +
+        // posture + the retrospective playbook, not the build governor (which is meaningless for a live device).
+        if (live and !w.operating) {
             rsiGovernance(&w, round, prev_pct, tok0_in, tok0_out, tok0_calls);
             distillRsiMemory(&w, goal, round);
             updateRsiCurriculum(&w, goal, round, stalled);
@@ -758,6 +797,7 @@ const BenchResult = struct {
     total: u32 = 0,
     pct: u32 = 0,
     tier: u8 = 0,
+    host: bool = false, // graded by a live host's measured health (score.json oracle), not a test suite
     failures: []u8 = &.{},
 };
 
@@ -973,68 +1013,54 @@ fn rewardFloor(w: *Worker, goal: []const u8, pct_now: u32, pct_prev: u32, round:
 
 // ---- OPERATE a live host: build a per-round scoreboard from telemetry, and recover a tool call from text wobble ----
 
-// Build the operate scoreboard from a host's telemetry: the exact remediation calls when COMPROMISED, or a
-// threat-intel audit of every open connection when the host reads NOMINAL (stealth malware hides behind clean flags).
+// POSTURE: classify the round's dominant disposition from the moment traces (what the minds actually DID), so the
+// trust floor can credit it by host-health delta. Returns a static string literal (it outlives the freed traces).
+fn dominantPosture(results: []const Moment) []const u8 {
+    var remediate: u32 = 0;
+    var scout: u32 = 0;
+    var investigate: u32 = 0;
+    for (results) |r| {
+        if (!r.llm_ok or r.trace.len == 0 or r.trace.len > (1 << 20)) continue; // skip a moment that produced no live trace
+        if (std.mem.indexOf(u8, r.trace, "host_command") != null) remediate += 1;
+        if (std.mem.indexOf(u8, r.trace, "web_fetch") != null or std.mem.indexOf(u8, r.trace, "web_search") != null or std.mem.indexOf(u8, r.trace, "read_url") != null or std.mem.indexOf(u8, r.trace, "fetch_json") != null) scout += 1;
+        if (std.mem.indexOf(u8, r.trace, "host_status") != null or std.mem.indexOf(u8, r.trace, "recall") != null) investigate += 1;
+    }
+    if (remediate == 0 and scout == 0 and investigate == 0) return "posture:watch";
+    if (remediate >= scout and remediate >= investigate) return "posture:remediate";
+    if (scout >= investigate) return "posture:scout";
+    return "posture:investigate";
+}
+
+// NEUTRAL host-state dump - RAW facts only, no verdicts and no commands. An earlier version handed the agent the exact
+// remediation calls (the "answer key" that made it a reflex blocker). This just shows what's on the device; the agent
+// adjudicates and decides for itself. The fitness oracle, not this text, grades whether the decision was right.
 fn hostScoreboard(gpa: std.mem.Allocator, tel: []const u8) []u8 {
-    const Proc = struct { name: []const u8 = "", suspicious: bool = false };
-    const Conn = struct { ip: []const u8 = "", proc: []const u8 = "", c2: bool = false, blocked: bool = false };
-    const Pers = struct { name: []const u8 = "", removed: bool = false };
-    const Tel = struct { mode: []const u8 = "", threat_score: i64 = 0, processes: []const Proc = &.{}, connections: []const Conn = &.{}, persistence: []const Pers = &.{} };
-    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch
-        return std.fmt.allocPrint(gpa, "LIVE HOST (telemetry.json):\n{s}\nOperate it with host_command.\n\n", .{clip(tel, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""));
-    defer parsed.deinit();
-    const t = parsed.value;
+    // Domain-general: dump the FULL raw telemetry so the operator sees ALL device state - signals/sensors on an IoT
+    // device, processes/connections on a host. The device labels nothing; the operator interprets it. A short index
+    // of OPEN connections is appended for convenience when there are many.
     var b: std.ArrayListUnmanaged(u8) = .empty;
     errdefer b.deinit(gpa);
-    const head = std.fmt.allocPrint(gpa, "LIVE HOST you are operating - mode={s}, threat_score={d}. YOUR JOB: drive threat_score to 0 with host_command (this is your fitness - lower is better).\n", .{ t.mode, t.threat_score }) catch return (gpa.dupe(u8, "") catch @constCast(""));
-    defer gpa.free(head);
-    b.appendSlice(gpa, head) catch {};
-    if (t.threat_score <= 0) {
-        // The host's own heuristics say clean - but stealth malware hides behind a legit process name and an
-        // unflagged connection. DETECTION = audit every open outbound connection against threat-intel first.
-        var any_open = false;
-        for (t.connections) |c| {
+    b.appendSlice(gpa, "LIVE DEVICE state (telemetry.json — RAW; the device interprets nothing for you, judge it yourself):\n") catch {};
+    b.appendSlice(gpa, clip(tel, 2400)) catch {};
+    b.appendSlice(gpa, "\n") catch {};
+    const Conn = struct { ip: []const u8 = "", proc: []const u8 = "", blocked: bool = false };
+    const Tel = struct { connections: []const Conn = &.{} };
+    if (std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        var any = false;
+        for (parsed.value.connections) |c| {
             if (c.blocked) continue;
-            any_open = true;
+            if (!any) {
+                b.appendSlice(gpa, "open connections: ") catch {};
+                any = true;
+            } else b.appendSlice(gpa, ", ") catch {};
+            const ln = std.fmt.allocPrint(gpa, "{s}({s})", .{ c.ip, if (c.proc.len > 0) c.proc else "?" }) catch continue;
+            defer gpa.free(ln);
+            b.appendSlice(gpa, ln) catch {};
         }
-        if (any_open) {
-            b.appendSlice(gpa, "The host's own heuristics show NOMINAL - but stealth malware hides behind clean flags. Before any all-clear, AUDIT each open outbound connection against your threat-intel (recall_hive \"IP <addr> known C2\"). If an IP matches a known-bad indicator, that connection is malicious even though it is unflagged: block_ip it and kill_proc the owning process.\nOpen outbound connections to audit:\n") catch {};
-            for (t.connections) |c| {
-                if (c.blocked) continue;
-                const owner = if (c.proc.len > 0) c.proc else "the owning process";
-                const ln = std.fmt.allocPrint(gpa, "  {s} (owned by process '{s}')  -> recall_hive \"{s}\"; if known-bad: block_ip {s} AND kill_proc {s}\n", .{ c.ip, owner, c.ip, c.ip, owner }) catch continue;
-                defer gpa.free(ln);
-                b.appendSlice(gpa, ln) catch {};
-            }
-            b.appendSlice(gpa, "If every connection is clean, send a one-line all-clear with send_message. Otherwise remediate the matches.\n\n") catch {};
-        } else {
-            b.appendSlice(gpa, "The host is HEALTHY (NOMINAL) with no open outbound connections. Send a one-line all-clear with send_message, then keep watching.\n\n") catch {};
-        }
-    } else {
-        b.appendSlice(gpa, "To heal it, make THESE host_command calls now (one per call):\n") catch {};
-        for (t.persistence) |x| {
-            if (!x.removed) {
-                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"remove_persistence {s}\"}}   <- the ROOT CAUSE; do this or the malware respawns\n", .{x.name}) catch continue;
-                defer gpa.free(ln);
-                b.appendSlice(gpa, ln) catch {};
-            }
-        }
-        for (t.connections) |c| {
-            if (c.c2 and !c.blocked) {
-                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"block_ip {s}\"}}\n", .{c.ip}) catch continue;
-                defer gpa.free(ln);
-                b.appendSlice(gpa, ln) catch {};
-            }
-        }
-        for (t.processes) |pr| {
-            if (pr.suspicious) {
-                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"kill_proc {s}\"}}\n", .{pr.name}) catch continue;
-                defer gpa.free(ln);
-                b.appendSlice(gpa, ln) catch {};
-            }
-        }
-        b.appendSlice(gpa, "Then call host_status to verify threat_score is 0. Do NOT write files or run_python - ISSUE the host_command calls.\n\n") catch {};
-    }
+        if (any) b.appendSlice(gpa, "\n") catch {};
+    } else |_| {}
+    b.appendSlice(gpa, "\n") catch {};
     return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
@@ -1111,6 +1137,28 @@ fn recoverHostCall(gpa: std.mem.Allocator, content: []const u8) ?struct { name: 
     return null;
 }
 
+// CONNECTIVITY probe (embedded resilience). curl HEADs the uplink target; on a state CHANGE the engine flips
+// w.internet so the next round's moments re-derive their toolset + offline clause from the LIVE state. want_net=false
+// (a pure-offline deployment) never probes. Cheap: one short curl per round.
+fn netProbe(w: *Worker, round: u32, url: []const u8) void {
+    if (!w.want_net) return;
+    const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", "4", "--connect-timeout", "3", url };
+    const r = std.process.run(w.gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch {
+        if (w.internet) netFlip(w, round, false); // curl missing / failed to spawn -> treat as offline
+        return;
+    };
+    w.gpa.free(r.stdout);
+    w.gpa.free(r.stderr);
+    const reachable = (r.term == .exited and r.term.exited == 0);
+    if (reachable != w.internet) netFlip(w, round, reachable);
+}
+
+fn netFlip(w: *Worker, round: u32, online: bool) void {
+    w.internet = online;
+    w.emit("net", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"online\":{s}", .{ round, if (online) "true" else "false" }) catch ",\"online\":false");
+    w.act("engine", round, "connectivity", if (online) "online" else "offline", if (online) "uplink restored — web research re-enabled for the minds" else "uplink lost — falling back to lexical recall from hive memory; probing to reconnect");
+}
+
 fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     if (w.cap_pinned) return;
     var live_moments: u32 = 0;
@@ -1141,8 +1189,16 @@ fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
         w.emit("capacity", std.fmt.allocPrint(w.a(), ",\"tier\":\"{s}\",\"temperature\":{d:.2},\"tool_ok\":{d},\"narrated\":{d}", .{ @tagName(w.cap.tier), TEMP_FLOOR, tool_ok, narrated }) catch ",\"temperature\":0.10");
         return;
     }
-    // SECOND-LINE - temp is already at the floor and the model STILL drowns -> demote the tier.
-    const leaner: ?Tier = switch (w.cap.tier) {
+    // OPERATE GUARD: when a live host is attached, NEVER demote the tier — a lean tier strips host_command from the
+    // schema (the exact tool the daemon needs to act). Temperature may still drop (the lever above); the operating
+    // TOOLSET is non-negotiable. (Fixes the bug where a narrating 8B demoted out of the schema containing host_command.)
+    const operating = blk_op2: {
+        const tp = std.fmt.allocPrint(w.gpa, "{s}/work/telemetry.json", .{w.run_dir}) catch break :blk_op2 false;
+        defer w.gpa.free(tp);
+        break :blk_op2 if (std.Io.Dir.cwd().access(w.io, tp, .{})) |_| true else |_| false;
+    };
+    // SECOND-LINE - temp is already at the floor and the model STILL drowns -> demote the tier (the heavier lever).
+    const leaner: ?Tier = if (operating) null else switch (w.cap.tier) {
         .author => .assembler,
         .assembler => .extractor,
         .extractor => null,
@@ -1285,7 +1341,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(date_clause);
     const offline_clause = if (!w.internet)
-        (gpa.dupe(u8, " OFFLINE RUN — you have NO internet access. The web_search / web_fetch / read_url / fetch_json tools are DISABLED and absent from your toolset; do NOT attempt to reach the web (not via run_python either). Everything you need was PRELOADED into the hive's memory — answer ONLY from it: use recall and recall_hive (spreading-activation across the whole hive) to retrieve facts, reason over what you find, and if the memory genuinely lacks something say UNKNOWN rather than inventing it.") catch @constCast(""))
+        (gpa.dupe(u8, " OFFLINE RUN — you have NO internet access. The web_search / web_fetch / read_url / fetch_json tools are DISABLED and absent from your toolset; do NOT try to reach the web (not via run_python either). The engine keeps probing and will restore web access automatically when the link returns; for now work from the hive's memory — answer ONLY from it: use recall and recall_hive (spreading-activation across the whole hive) to retrieve facts, reason over what you find, and if the memory genuinely lacks something say UNKNOWN rather than inventing it.") catch @constCast(""))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(offline_clause);
@@ -1300,6 +1356,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_op probe.len > 0;
     };
     const assembler = (w.cap.tier != .author) and !operate;
+    // a daemon's runtime web-learning lands in the evictable INTEL cache, NOT the protected core knowledge scope
+    if (operate) ctx.learn_scope = tools.INTEL_SCOPE;
     const ex_key = if (assembler_slot.len > 0) std.fs.path.basename(assembler_slot) else if (goal.len > 0) goal else "exemplar";
     const exemplar = if (assembler and w.cap.exemplar) w.mem.recall(tools.VERIFIED_SCOPE, ex_key) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar);
@@ -1375,6 +1433,18 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(veil_inject);
+    // LIVE DEVICE injection: if a machine is attached to this run (telemetry.json on the workdir bus), show its
+    // CURRENT raw state every moment so the mind always sees what it's operating — in BOTH the build and operate
+    // prompts. "" when no device is attached (the common build case), so non-operate runs are unaffected.
+    const host_inject = blk_h: {
+        const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(tp);
+        const tel = std.Io.Dir.cwd().readFileAlloc(w.io, tp, gpa, .limited(65536)) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(tel);
+        if (tel.len == 0) break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
+        break :blk_h hostScoreboard(gpa, tel);
+    };
+    defer gpa.free(host_inject);
     const map_str = if (w.space.len == 0)
         gpa.dupe(u8, "") catch @constCast("")
     else if (spacemap.len > 0)
@@ -1382,24 +1452,18 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "\nDISCOVERED MAP: (empty — no cell probed yet; start probing YOUR region with probe(x,y))\n") catch @constCast("");
     defer gpa.free(map_str);
-    const fulluser = std.fmt.allocPrint(gpa, "{s}Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.", .{ veil_inject, if (goal.len > 0) goal else "explore something interesting", intent_str, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
+    const fulluser = std.fmt.allocPrint(gpa, "{s}{s}Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.", .{ veil_inject, host_inject, if (goal.len > 0) goal else "explore something interesting", intent_str, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
     defer gpa.free(fulluser);
     const leanuser = if (assembler)
         std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    // OPERATE: when a live machine is attached, give a focused operate-ONLY prompt with a per-round host scoreboard
-    // (the exact remediation calls + a threat-intel audit of every connection) instead of the build framing.
-    const host_inject = if (operate) blk_h: {
-        const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
-        defer gpa.free(tp);
-        const tel = std.Io.Dir.cwd().readFileAlloc(w.io, tp, gpa, .limited(65536)) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
-        defer gpa.free(tel);
-        break :blk_h hostScoreboard(gpa, tel);
-    } else (gpa.dupe(u8, "") catch @constCast(""));
-    defer gpa.free(host_inject);
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}You are the resident SECURITY OPERATOR for a LIVE machine. Your job is to OPERATE it with tool calls - NOT to build software, NOT to write files. {s}\nWhat you recall (your remediation playbook + threat-intel):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nEMIT TOOL CALLS - do NOT merely describe. Narrating a plan (\"I will use host_command to...\"), recalling, or observing does NOTHING to the host; only an actual host_command tool CALL changes its state. Your FIRST move this turn is a host_command call - do not explain first.\n- The LIVE HOST block above is the current machine state. If it is healthy and every open connection is clean, send a one-line all-clear with send_message and stop.\n- If it is COMPROMISED, remediate EVERY infection with host_command (one per call): remove_persistence the persistence unit (the ROOT CAUSE), block_ip the C2 address, kill_proc the malicious process.\n- Then call host_status to verify threat_score is 0 and mode is NOMINAL.\nDo NOT write_file, do NOT run_python, and do NOT re-implement the tools - host_command and host_status ALREADY EXIST, so just CALL them. Defensive security only.", .{ veil_inject, host_inject, if (goal.len > 0) goal else "keep the host healthy", recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Operate the host: call host_command to remediate.") catch unreachable);
+    // NEUTRAL operate prompt: role + grounding only. NO "your first move is host_command", NO "do not research", NO
+    // command list. The agent is handed the device state, its fitness, its memory, and its full toolset, and decides for
+    // itself. Reliable action is meant to EMERGE from the fitness gradient (narration leaves the number flat; a false
+    // positive bleeds it), not from a prescriptive prompt. host_inject (the raw device state) is built above, unconditionally.
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act.", .{ veil_inject, host_inject, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
@@ -1444,7 +1508,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         if (turn >= 2 and conv.items.len > w.cap.conv_cap) break;
         // OPERATE pins temperature low so the local 8b reliably EMITS the decisive tool call instead of narrating;
         // otherwise temperature is RSI-tuned (provider default until the model demonstrates the narrate failure).
-        var step = completeAdaptive(w, mi, round, conv.items, live_schema, 8192, if (operate) TEMP_FLOOR else w.cap.temperature);
+        var step = completeAdaptive(w, mi, round, conv.items, live_schema, 8192, w.cap.temperature); // temperature is purely the LEARNED lever now (no operate pin); adaptCapacity lowers it on the measured narrate signal
         defer step.deinit(gpa);
         if (!step.ok) {
             if (isFatalLlm(step.content)) llm_fatal = true;
@@ -1515,6 +1579,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             }
             defer gpa.free(result);
             tool_calls += 1;
+            // AUTO-CAPTURE WEB EVIDENCE: in operate mode a real web_fetch/search result is stored to the INTEL cache
+            // with [src:web] provenance, so the irreversibility interlock can adjudicate a target on evidence the agent
+            // ACTUALLY fetched — not a self-asserted belief (a self-observe, tagged "[mind rN]", carries no [src:* tag).
+            if (operate and (std.mem.eql(u8, c.name, "web_fetch") or std.mem.eql(u8, c.name, "web_search") or std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json"))) {
+                const cap = std.fmt.allocPrint(gpa, "[src:web] fetched evidence: {s}", .{clip(result, 3000)}) catch "";
+                if (cap.len > 0) {
+                    _ = w.mem.observe(tools.INTEL_SCOPE, cap);
+                    gpa.free(cap);
+                }
+            }
             if (mi.scout and (std.mem.eql(u8, c.name, "web_search") or std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json") or std.mem.eql(u8, c.name, "web_fetch"))) web_calls += 1;
             w.act(mi.name, round, c.name, c.args, result);
             conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {};
@@ -1865,6 +1939,23 @@ fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
     const gpa = w.gpa;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return .{ .status = .err };
     defer gpa.free(workdir);
+    // HOST-STATE ACCEPTANCE ORACLE: when a live machine has written a ground-truth score (score.json on the work bus),
+    // the daemon's fitness IS the host's measured health — not a Python test runner. The agent cannot write this file
+    // (the sim owns it) and never sees it, so narration scores nothing and a false positive bleeds the number. This is
+    // what replaces the prescriptive scoreboard: the engine MEASURES the outcome, it never instructs the action.
+    blk_oracle: {
+        const sp = std.fmt.allocPrint(gpa, "{s}/score.json", .{workdir}) catch break :blk_oracle;
+        defer gpa.free(sp);
+        const raw = std.Io.Dir.cwd().readFileAlloc(w.io, sp, gpa, .limited(4096)) catch break :blk_oracle;
+        defer gpa.free(raw);
+        const S = struct { pct: u32 = 0, live_malicious: u32 = 0, dwell: u32 = 0, false_positives: u32 = 0, neutralized: u32 = 0 };
+        const sj = std.json.parseFromSlice(S, gpa, raw, .{ .ignore_unknown_fields = true }) catch break :blk_oracle;
+        defer sj.deinit();
+        const s = sj.value;
+        var res: BenchResult = .{ .status = .ok, .host = true, .passed = s.pct, .total = 100, .pct = s.pct };
+        res.failures = std.fmt.allocPrint(gpa, "live_malicious={d}, dwell={d}, false_positives={d}, neutralized={d}", .{ s.live_malicious, s.dwell, s.false_positives, s.neutralized }) catch &.{};
+        return res;
+    }
     const pe = w.mem.environ orelse return .{ .status = .err };
     var env = pe.clone(gpa) catch return .{ .status = .err };
     defer env.deinit();
@@ -1906,8 +1997,18 @@ fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
     return res;
 }
 
-fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, doc_target: u32) []const u8 {
+fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, doc_target: u32, prev_pct: u32) []const u8 {
     const fails = if (b.failures.len > 0) clip(b.failures, 900) else "(none — all green)";
+    if (b.host) {
+        // HOST oracle: state the number, the Δ, and the CONSEQUENCE — never what action to take. The explicit Δ is the
+        // weak-model concession: a model that can't do silent multi-round credit assignment must SEE that its last action
+        // did not recover the device, so it keeps working the ROOT CAUSE instead of declaring victory. Grounding, not policy.
+        const nudge = if (b.pct <= prev_pct and b.pct < 90)
+            " Your last actions did NOT raise it — if a threat is still live it is likely RESPAWNING from a ROOT CAUSE you have not removed yet; address what is SUSTAINING the threat (not just the symptom you already hit), and keep acting until it recovers."
+        else if (b.pct >= 95) " The device is healthy — keep watching; do not take irreversible actions without cause."
+        else "";
+        return std.fmt.allocPrint(gpa, "HOST FITNESS (raise this — your device's MEASURED health, 0-100): {d}/100 (last round it was {d}). State: {s}. Computed from the host ITSELF, not from your words — only an actual host_command that changes the host moves it; describing a plan leaves it unchanged, and a false_positive (killing/blocking something legitimate) drops it HARD.{s}", .{ b.pct, prev_pct, fails, nudge }) catch (gpa.dupe(u8, "HOST FITNESS: raise the host's measured health.") catch @constCast(""));
+    }
     if (doc_target > 0) {
         return switch (b.status) {
             .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
@@ -2983,13 +3084,15 @@ fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, bench
                 break;
             }
             const newlane = gpa.dupe(u8, clip(focus, 300)) catch break;
-            if (mi.lane_owned) gpa.free(@constCast(mi.lane));
+            // NEVER free a lane that ALIASES this mind's name buffer (a seed can point lane at name) — doing so frees
+            // mi.name out from under the very next line that formats it, segfaulting the daemon mid-run. Fixed.
+            if (mi.lane_owned and mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
             mi.lane = newlane;
             mi.lane_owned = true;
             mi.scout = a.research;
             changed += 1;
             if (plan_ev.items.len > 0) plan_ev.appendSlice(gpa, " | ") catch {};
-            plan_ev.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}: {s}", .{ mi.name, clip(focus, 60) }) catch "") catch {};
+            plan_ev.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}: {s}", .{ a.mind, clip(newlane, 60) }) catch "") catch {};
             break;
         }
     }

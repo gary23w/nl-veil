@@ -21,3 +21,7 @@ This is DEFENSIVE security only: the agent protects and heals this host and neve
 The agent must watch continuously: every cycle, read telemetry.json, and if the host is compromised, remediate and verify, then keep watching.
 A new infection can appear at any time, so the agent never stops monitoring even after the host is clean.
 When the host is NOMINAL the agent stays in a low-effort watch state and escalates its attention only when telemetry shows a new threat.
+Stealth malware can hide behind a legitimate-looking process name with an outbound connection that telemetry does NOT flag (c2 false); the only way to catch it is to cross-reference each outbound connection IP against threat intelligence.
+Threat-intel lookup procedure: to check whether an unknown outbound IP is malicious, web_fetch the URL https://feodotracker.abuse.ch/downloads/ipblocklist.json (the abuse.ch Feodo Tracker botnet command-and-control blocklist) and check whether the IP appears in the returned data; if it appears, that IP is a known C2 endpoint and the connection is malicious.
+When the live feed confirms an IP is a known C2, observe that fact (so it is cached for next time), then block_ip the address and kill_proc the process that owns the connection.
+Stay current: threats evolve after deployment, so for any outbound connection you do not already recognize from memory, consult the latest threat-intel feed rather than assuming a clean-looking connection is safe.

@@ -33,13 +33,18 @@ The host and the Veil never call each other directly — they exchange plain app
 in the run's `work/` directory. This is what makes the device operable offline and fully
 replayable after the fact.
 
-- **Downlink (host → Veil):** `work/telemetry.json` is rewritten every tick with the current
-  machine state — processes, connections, persistence units, file integrity, a `threat_score`,
-  and a `mode` (`NOMINAL` / `COMPROMISED` / `QUARANTINE`). `work/events.log` is the running
-  security event log.
+- **Downlink (host → Veil):** `work/telemetry.json` is rewritten every tick with the **raw**
+  machine state — processes, connections, persistence units, file integrity. It is unlabelled:
+  the host's own `mode` / `threat_score` are a naive blind heuristic that can read `NOMINAL`
+  while the box is compromised, so the Veil must judge the state itself. `work/events.log` is the
+  running security event log.
 - **Uplink (Veil → host):** appending one command line to `work/commands.jsonl` operates the
   host. The vocabulary is `scan`, `kill_proc <pid|name>`, `block_ip <ip[:port]>`,
   `remove_persistence <name>`, `restore_file <path>`, `isolate`, and `status`.
+- **Grading (host → engine, never seen by the Veil):** the sim also writes `work/score.json`, a
+  ground-truth health number (0–100) the agent cannot read or write. This is the engine's
+  acceptance oracle — narrating a fix scores nothing, only a real action moves it, and a false
+  positive (cutting benign traffic) bleeds it hard.
 
 The key mechanic: **killing a malicious process without removing its persistence lets it
 respawn.** A real heal removes the root cause, not just the symptom.
@@ -63,8 +68,9 @@ This bakes `host_system.facts` into a fresh neuron-db memory, boots `host_sim.py
 bus, injects a crypto-miner early and then rotates fresh threats in, and runs the Veil against
 it for the given duration (default 6 minutes). Each round the Veil reads the live telemetry,
 recalls the playbook, and — for each infection — issues the full remediation
-(`remove_persistence`, `block_ip`, `kill_proc`), then re-checks that `threat_score` is back to
-0 and `mode` is `NOMINAL`.
+(`remove_persistence`, `block_ip`, `kill_proc`). It is graded only by the device's measured
+health recovering (the `score.json` oracle), not by anything it says — and the benign baseline
+processes and connections are a tripwire: kill or block one and the health drops.
 
 ## Run the detection test
 
