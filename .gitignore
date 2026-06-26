@@ -11,6 +11,9 @@ __pycache__/
 # Runtime: per-run swarm dirs (work, sqlite memory, event streams)
 data/
 
+# Example run outputs — the embedded harnesses write forensics here per run.
+examples/embedded/debug/
+
 # Secrets — never commit. Keys live here or in the environment.
 keys.env
 *.key

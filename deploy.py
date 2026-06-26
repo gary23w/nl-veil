@@ -127,12 +127,16 @@ def build_neuron(repo_root, target_dir):
     return out if (r.returncode == 0 and os.path.isfile(out)) else None
 
 
-def ensure_neuron(override, assume_yes=False):
-    """Find the neuron memory engine, or fetch + build it from source the first time."""
+def ensure_neuron(override, assume_yes=False, force=False):
+    """Find the neuron memory engine, or fetch + build it from source. `force` ALWAYS re-fetches the latest
+    source and rebuilds (neuron-db evolves fast, so a deployment should pin the freshest engine)."""
     n = _first([override, os.path.join(ROOT, "bin", NEU)]) or shutil.which("neuron")
-    if n:
+    if n and not force:
         return n
-    print("\n- the neuron memory engine (the hive's memory) isn't installed yet.")
+    if n and force:
+        print("\n- rebuilding the neuron memory engine fresh from source (deployment always pins the latest)...")
+    else:
+        print("\n- the neuron memory engine (the hive's memory) isn't installed yet.")
     if not _have("cargo"):
         sys.exit("ERROR: building neuron needs the Rust toolchain (cargo), which wasn't found.\n"
                  "       Install it from https://rustup.rs and re-run, or pass --neuron-bin <path> to an\n"
@@ -157,6 +161,105 @@ def ensure_neuron(override, assume_yes=False):
         pass
     print(f"  neuron installed -> {dst}\n")
     return dst
+
+
+# ------------------------------------------------------------------------ local model bootstrap
+
+def ensure_model(provider, model, assume_yes=False):
+    """For a local Ollama target, make sure the runtime AND the model are present — installing/pulling them as
+    part of the deployment if missing (an embedded box won't have a llama service running yet). No-op for hosted
+    providers (their model lives on the endpoint)."""
+    if provider != "ollama":
+        return
+    models = ollama_models()  # None => Ollama not reachable
+    if models is None:
+        print("\n- Ollama (the local model runtime) isn't responding at localhost:11434.")
+        if WIN:
+            print("  Install it from https://ollama.com/download, start it, then re-run.")
+            return
+        if not _have("ollama") and (assume_yes or ask_yes("install Ollama now (curl https://ollama.com/install.sh | sh)?", True)):
+            subprocess.run("curl -fsSL https://ollama.com/install.sh | sh", shell=True)
+        # the installer registers a systemd service on most distros; nudge it up if not
+        if _have("ollama"):
+            try:
+                subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            for _ in range(10):
+                time.sleep(1)
+                models = ollama_models()
+                if models is not None:
+                    break
+        if models is None:
+            print("  ! couldn't reach Ollama. Start it (`ollama serve`) and re-run, or point --provider at a hosted endpoint.")
+            return
+    if model not in (models or []):
+        print(f"- model '{model}' isn't pulled yet.")
+        if assume_yes or ask_yes(f"pull it now (ollama pull {model})?", True):
+            subprocess.run(["ollama", "pull", model])
+
+
+# --------------------------------------------------------------------------- service installation
+
+SYSTEMD_UNIT = """[Unit]
+Description=Veil hive-mind daemon ({name})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={root}
+ExecStart={binary} worker {run_dir} {neuron} {model}
+Restart=on-failure
+RestartSec=5
+Environment=NEURON_MAX_FACTS=1000000
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def install_service(name, run_dir, binary, neuron, model):
+    """Install the run as a long-lived OS service so the Veil comes up on boot and restarts on failure — the
+    'live in-system daemon' deployment. systemd on Linux; a documented fallback elsewhere. Returns True on install."""
+    unit = SYSTEMD_UNIT.format(name=name, root=ROOT, binary=binary, run_dir=run_dir, neuron=neuron, model=model)
+    if platform.system() == "Linux" and _have("systemctl"):
+        svc = f"veil-{name}.service"
+        path = f"/etc/systemd/system/{svc}"
+        sudo = [] if os.geteuid() == 0 else (["sudo"] if _have("sudo") else [])
+        try:
+            tmp = os.path.join(run_dir, svc)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(unit)
+            subprocess.run(sudo + ["cp", tmp, path], check=True)
+            subprocess.run(sudo + ["systemctl", "daemon-reload"], check=True)
+            subprocess.run(sudo + ["systemctl", "enable", "--now", svc], check=True)
+            print(f"\n  service installed: {svc}")
+            print(f"    status : {' '.join(sudo)} systemctl status {svc}")
+            print(f"    logs   : journalctl -u {svc} -f")
+            print(f"    stop   : {' '.join(sudo)} systemctl disable --now {svc}")
+            return True
+        except Exception as e:
+            print(f"  ! service install failed ({e}). The unit file is at {os.path.join(run_dir, svc)} — install it by hand.")
+            return False
+    # non-systemd fallback: write the unit + a runner so the user can wire it into their init of choice
+    runner = os.path.join(run_dir, "run-daemon.sh" if not WIN else "run-daemon.cmd")
+    with open(runner, "w", encoding="utf-8") as f:
+        if WIN:
+            f.write(f'@echo off\r\nset NEURON_MAX_FACTS=1000000\r\n"{binary}" worker "{run_dir}" "{neuron}" {model}\r\n')
+        else:
+            f.write(f'#!/usr/bin/env bash\nexport NEURON_MAX_FACTS=1000000\nexec "{binary}" worker "{run_dir}" "{neuron}" {model}\n')
+    try:
+        os.chmod(runner, 0o755)
+    except Exception:
+        pass
+    with open(os.path.join(run_dir, f"veil-{name}.service"), "w", encoding="utf-8") as f:
+        f.write(unit)
+    print(f"\n  systemd not available here — wrote a daemon runner: {runner}")
+    print(f"  (a systemd unit is also at {os.path.join(run_dir, 'veil-' + name + '.service')} for Linux targets.)")
+    if WIN:
+        print("  On Windows, register it as a service with NSSM or Task Scheduler, pointing at the runner above.")
+    return False
 
 
 # ------------------------------------------------------------------------------------ run mgmt
@@ -260,8 +363,13 @@ def follow(run_dir, proc):
 
 def deploy(args):
     args.name = args.name or ("swarm_" + time.strftime("%Y%m%d_%H%M%S"))
+    service = getattr(args, "service", False)
     binary = find_binary(args.bin)
-    neuron = ensure_neuron(args.neuron_bin, getattr(args, "yes", False))
+    # an embedded box may have no llama runtime yet — detect + install/pull it as part of the deployment
+    ensure_model(args.provider, args.model, getattr(args, "yes", False))
+    # neuron-db evolves fast: rebuild it fresh from source on an explicit --rebuild-neuron or any service deployment
+    neuron = ensure_neuron(args.neuron_bin, getattr(args, "yes", False),
+                           force=getattr(args, "rebuild_neuron", False) or service)
     run_dir = os.path.join(DATA, args.name)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -299,6 +407,16 @@ def deploy(args):
           f"{' | break-out ON' if args.breakout else ''}{' | corpus' if args.corpus else ''}")
     print(f"  goal    : {goal_disp[:92]}{'...' if len(goal_disp) > 92 else ''}")
     print("  the Veil is waking the hive...\n")
+
+    # SERVICE deployment: hand the run to the OS as a long-lived daemon instead of a foreground process. The worker
+    # reads its key from run_dir/keys.env (the service won't inherit this shell's env), so persist it there.
+    if service:
+        if args.key and args.provider != "ollama":
+            with open(os.path.join(run_dir, "keys.env"), "w", encoding="utf-8") as f:
+                f.write("NL_LLM_KEY=" + args.key + "\n")
+        install_service(args.name, run_dir, binary, neuron, args.model)
+        print(f"\n  events: {os.path.join(run_dir, 'events.jsonl')}   |   talk to it: python examples/embedded/veil_chat.py --dir {run_dir} chat")
+        return
 
     logf = open(os.path.join(run_dir, "worker.log"), "w", encoding="utf-8")
     proc = subprocess.Popen([binary, "worker", run_dir, neuron, args.model],
@@ -550,7 +668,12 @@ def wizard():
             corpus_cap = ask_int("max facts to load from the corpus", corpus_cap)
 
     name = ask("run name", "swarm_" + time.strftime("%Y%m%d_%H%M%S"))
-    watch = ask_yes("watch the hive live after launch?", True)
+    deploy_as = ask_menu("How should it run on this system?", [
+        ("isolated", "Isolated foreground run (default) - runs here in an isolated build env; you watch/stop it"),
+        ("service",  "Live system daemon/service - installs to start on boot + restart on failure (systemd on Linux)"),
+    ], 1)
+    service = (deploy_as == "service")
+    watch = False if service else ask_yes("watch the hive live after launch?", True)
 
     # endpoint preflight
     print("\n  checking the endpoint...")
@@ -573,6 +696,7 @@ def wizard():
         provider=p["provider"], base_url=p["base_url"], key=key_value, style=style,
         offline=offline, breakout=breakout, corpus=corpus, corpus_cap=corpus_cap,
         gateway_model=gateway_model, bin=None, neuron_bin=None, follow=watch, yes=False,
+        service=service, rebuild_neuron=False,
     )
 
     print("\n  --- plan ------------------------------------------------")
@@ -634,7 +758,9 @@ def main():
     ap.add_argument("--gateway-model", dest="gateway_model", default=None, help="cheaper model for mechanical engine calls (summarise/classify/route)")
     ap.add_argument("--bin", default=None)
     ap.add_argument("--neuron-bin", dest="neuron_bin", default=None, help="path to an existing neuron engine binary")
-    ap.add_argument("-y", "--yes", action="store_true", help="don't prompt before fetching/building the neuron engine on first run")
+    ap.add_argument("-y", "--yes", action="store_true", help="don't prompt before fetching/building the neuron engine or pulling the model")
+    ap.add_argument("--service", action="store_true", help="install as a long-lived OS service/daemon (systemd on Linux) that starts on boot and restarts on failure, instead of a foreground run")
+    ap.add_argument("--rebuild-neuron", dest="rebuild_neuron", action="store_true", help="re-fetch + rebuild the neuron memory engine from source before launching (always on for --service)")
     ap.add_argument("--follow", action="store_true", help="stream the hive's activity live")
     deploy(ap.parse_args())
 
