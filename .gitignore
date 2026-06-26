@@ -1,0 +1,30 @@
+# Zig build output, cache, and fetched dependencies (deps come from build.zig.zon)
+zig-out/
+.zig-cache/
+zig-cache/
+zig-pkg/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime: per-run swarm dirs (work, sqlite memory, event streams)
+data/
+
+# Secrets — never commit. Keys live here or in the environment.
+keys.env
+*.key
+.env
+.env.*
+!.env.example
+
+# The neuron memory-engine binary is a build artifact / release asset, not source.
+# Place it at bin/neuron[.exe] locally (see the README).
+bin/*
+!bin/.gitkeep
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

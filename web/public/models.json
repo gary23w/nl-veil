@@ -1,0 +1,645 @@
+{
+  "providers": [
+    {
+      "key": "workers-ai",
+      "label": "Cloudflare Workers AI (included — no key)",
+      "kind": "openai-compatible",
+      "base_url": "cloudflare",
+      "needs_key": false
+    },
+    {
+      "key": "anthropic",
+      "label": "Anthropic (Claude)",
+      "kind": "openai-compatible",
+      "base_url": "https://api.anthropic.com/v1",
+      "needs_key": true
+    },
+    {
+      "key": "openai",
+      "label": "OpenAI",
+      "kind": "openai-compatible",
+      "base_url": "https://api.openai.com/v1",
+      "needs_key": true
+    },
+    {
+      "key": "ollama",
+      "label": "Ollama (local)",
+      "kind": "openai-compatible",
+      "base_url": "local",
+      "needs_key": false
+    },
+    {
+      "key": "groq",
+      "label": "Groq",
+      "kind": "openai-compatible",
+      "base_url": "https://api.groq.com/openai/v1",
+      "needs_key": true
+    },
+    {
+      "key": "together",
+      "label": "Together AI",
+      "kind": "openai-compatible",
+      "base_url": "https://api.together.xyz/v1",
+      "needs_key": true
+    },
+    {
+      "key": "openrouter",
+      "label": "OpenRouter",
+      "kind": "openai-compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "needs_key": true
+    },
+    {
+      "key": "fireworks",
+      "label": "Fireworks AI",
+      "kind": "openai-compatible",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "needs_key": true
+    },
+    {
+      "key": "mistral",
+      "label": "Mistral",
+      "kind": "openai-compatible",
+      "base_url": "https://api.mistral.ai/v1",
+      "needs_key": true
+    },
+    {
+      "key": "custom",
+      "label": "Custom URL (self-hosted / open model)",
+      "kind": "openai-compatible",
+      "base_url": "",
+      "needs_key": false
+    },
+    {
+      "key": "deepseek",
+      "label": "DeepSeek",
+      "kind": "openai-compatible",
+      "base_url": "https://api.deepseek.com/v1",
+      "needs_key": true
+    },
+    {
+      "key": "google",
+      "label": "Google Gemini",
+      "kind": "openai-compatible",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "needs_key": true
+    }
+  ],
+  "models": [
+    {
+      "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      "label": "Llama 3.3 70B (Workers AI)",
+      "provider": "workers-ai",
+      "hosting": "hosted",
+      "context": 24000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Cloudflare Workers AI — the included inference backbone (no BYOK key). Strong, fast 70B tool-caller served on Cloudflare's edge; the recommended default for most swarms. Billed to the platform Cloudflare account."
+    },
+    {
+      "id": "@cf/meta/llama-3.1-8b-instruct",
+      "label": "Llama 3.1 8B (Workers AI)",
+      "provider": "workers-ai",
+      "hosting": "hosted",
+      "context": 8000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "Cloudflare Workers AI — cheapest/fastest included tier (no key). Good for simple single-tool minds; prefer the 70B for complex multi-tool swarms."
+    },
+    {
+      "id": "@cf/qwen/qwen2.5-coder-32b-instruct",
+      "label": "Qwen2.5-Coder 32B (Workers AI)",
+      "provider": "workers-ai",
+      "hosting": "hosted",
+      "context": 32000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Cloudflare Workers AI — strong coder/tool-caller (no key). Best Workers-AI pick for code-heavy or structured-output minds."
+    },
+    {
+      "id": "claude-opus-4-8",
+      "label": "Claude Opus 4.8",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Most capable Opus-tier model; state-of-the-art long-horizon agentic execution and tool use. Best default for demanding tool-using minds. 1M context, 128K max output. Adaptive thinking only (no budget_tokens); assistant prefill removed. $5/$25 per MTok."
+    },
+    {
+      "id": "claude-fable-5",
+      "label": "Claude Fable 5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Anthropic's most capable widely released model for the hardest reasoning/long-horizon agentic work. Above Opus pricing ($10/$50 per MTok). Thinking always on (omit thinking param); safety classifiers may return stop_reason 'refusal' (enable fallbacks); requires 30-day data retention (no ZDR). Not the default Opus upgrade \u2014 select explicitly."
+    },
+    {
+      "id": "claude-opus-4-7",
+      "label": "Claude Opus 4.7",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Previous-generation Opus; highly autonomous, very strong on long-horizon agentic/tool-use work. Same API surface as 4.8. 1M context, 128K max output. $5/$25 per MTok."
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Best speed/intelligence balance; reliable tool use, recommended for high-volume production swarms. Adaptive thinking. 1M context, 64K max output. $3/$15 per MTok."
+    },
+    {
+      "id": "claude-haiku-4-5",
+      "label": "Claude Haiku 4.5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Fastest and cheapest current model; tool use is reliable. Good for speed-critical or lightweight agents. 200K context, 64K max output. $1/$5 per MTok."
+    },
+    {
+      "id": "claude-opus-4-6",
+      "label": "Claude Opus 4.6",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Older Opus, still active. Adaptive thinking (recommended); budget_tokens deprecated. 1M context, 128K max output. Use 4.8 for new work unless pinning."
+    },
+    {
+      "id": "claude-opus-4-5",
+      "label": "Claude Opus 4.5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Legacy but still active. Supports adaptive thinking and the effort parameter. Offer only if a user needs to pin this version; prefer Opus 4.8."
+    },
+    {
+      "id": "claude-sonnet-4-5",
+      "label": "Claude Sonnet 4.5",
+      "provider": "anthropic",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Legacy Sonnet, still active. No effort parameter; reliable tool use. Prefer Sonnet 4.6 for new minds; offer for version pinning only."
+    },
+    {
+      "id": "gpt-5",
+      "label": "GPT-5",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 400000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Current flagship; best OpenAI choice for agentic/tool-using minds (strong function calling, parallel tools, instruction following). Reasoning model: on Chat Completions use max_completion_tokens (NOT max_tokens); Responses API uses max_output_tokens. Requires an API key (BYOK)."
+    },
+    {
+      "id": "gpt-4.1",
+      "label": "GPT-4.1",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Non-reasoning workhorse, 1M context, explicitly built for agents (big gains in instruction following + tool calling over 4o). Accepts the classic max_tokens parameter. Solid, predictable choice for tool-using minds. Needs API key."
+    },
+    {
+      "id": "gpt-4.1-mini",
+      "label": "GPT-4.1 mini",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Cheap, fast, 1M context; OpenAI highlights it as strong at instruction following and tool calling. Excellent low-cost default for agentic minds. Uses max_tokens."
+    },
+    {
+      "id": "gpt-5.4-mini",
+      "label": "GPT-5.4 mini",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 400000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Newer GPT-5.4 refresh of the mini tier (text+image, function calling, web/file search, computer use). Per OpenAI docs ~$0.75/$4.50 per 1M in/out. Reasoning model: use max_completion_tokens (NOT max_tokens). Confirm availability on your account."
+    },
+    {
+      "id": "gpt-5-mini",
+      "label": "GPT-5 mini",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 400000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Cheaper/faster GPT-5 tier; succeeds o4-mini. Good default for cost-sensitive tool-using minds. Reasoning model: use max_completion_tokens on Chat Completions (NOT max_tokens). Needs API key."
+    },
+    {
+      "id": "o4-mini",
+      "label": "o4-mini (legacy reasoning)",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Fast cost-efficient reasoning model; now marked deprecated in OpenAI docs, succeeded by gpt-5-mini. Still callable on many accounts. Reasoning model: requires max_completion_tokens (NOT max_tokens). Prefer gpt-5-mini for new minds."
+    },
+    {
+      "id": "gpt-5.4-nano",
+      "label": "GPT-5.4 nano",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 400000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "Newest smallest/cheapest tier; recommended for classification, data extraction, ranking, coding subagents rather than full autonomous minds. Use max_completion_tokens (NOT max_tokens). Confirm availability on your account."
+    },
+    {
+      "id": "gpt-5-nano",
+      "label": "GPT-5 nano",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 400000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "Smallest/cheapest GPT-5; aimed at classification, extraction, ranking, coding subagents. Tool calling works but the small tier is less reliable for complex multi-tool swarms \u2014 validate before trusting in a mind. Use max_completion_tokens (NOT max_tokens)."
+    },
+    {
+      "id": "gpt-4.1-nano",
+      "label": "GPT-4.1 nano",
+      "provider": "openai",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "Cheapest 4.1 tier; fast 1M-context model for light tasks. Function calling supported but the nano tier is weaker for complex multi-tool orchestration \u2014 verify per swarm. Uses max_tokens."
+    },
+    {
+      "id": "qwen2.5-coder:7b",
+      "label": "Qwen2.5-Coder 7B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "Best value free-local tool caller for agentic/coding minds. ~4.7GB download, runs in ~6-8GB VRAM/RAM at Q4. Solid, consistent function-calling for single and small multi-tool loops. Default recommendation for most users."
+    },
+    {
+      "id": "qwen2.5-coder:14b",
+      "label": "Qwen2.5-Coder 14B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "Step up from 7B; noticeably better at multi-step tool plans and arg formatting. ~9GB download, wants ~12-16GB VRAM/RAM at Q4. Good sweet spot for serious agentic work on a 16GB machine."
+    },
+    {
+      "id": "qwen2.5:7b",
+      "label": "Qwen2.5 7B Instruct",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "General-purpose sibling of the coder; reliable native tool support, better for non-code conversational minds. ~4.7GB, ~6-8GB VRAM/RAM at Q4."
+    },
+    {
+      "id": "qwen2.5:14b",
+      "label": "Qwen2.5 14B Instruct",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "More capable general tool-using mind; handles multi-tool reasoning better than 7B. ~9GB, ~12-16GB VRAM/RAM at Q4."
+    },
+    {
+      "id": "mistral-nemo:12b",
+      "label": "Mistral Nemo 12B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 128000,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "Native tool support, 128K context (big win for long agent transcripts), multilingual. ~7.1GB, fits 12GB VRAM at Q4_K_M. Strong 'step up from 8B' pick for quality-sensitive minds."
+    },
+    {
+      "id": "qwen2.5-coder:32b",
+      "label": "Qwen2.5-Coder 32B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Strongest free-local coder/tool caller in this family; most robust in complex swarms. ~20GB download, needs ~24GB+ VRAM (or 32GB+ RAM, slow on CPU). 'cost=high' = local hardware burden, not a fee."
+    },
+    {
+      "id": "mistral-small:24b",
+      "label": "Mistral Small 3 24B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Owns the agentic/structured-JSON niche with strong native function calling; very steady in multi-tool loops. ~14GB download, wants ~24GB VRAM (or 32GB RAM). 'cost=high' = hardware, not a fee."
+    },
+    {
+      "id": "command-r:35b",
+      "label": "Command R 35B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 128000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Cohere model purpose-built for RAG + tool use; very reliable structured tool calls and citations. Heavy: ~20GB download, ~24GB+ VRAM. 'cost=high' = local hardware burden, not a fee."
+    },
+    {
+      "id": "qwen3:14b",
+      "label": "Qwen3 14B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "partial",
+      "cost": "free",
+      "note": "Stronger Qwen3 with tool+thinking support and better agent reasoning than 8B. Caveat: confirm thinking-mode tool calls are stable on your Ollama build. ~9.3GB, ~12-16GB VRAM at Q4."
+    },
+    {
+      "id": "qwen3:8b",
+      "label": "Qwen3 8B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 32768,
+      "tools": "partial",
+      "cost": "free",
+      "note": "Tools + thinking modes; agent-oriented. HONEST: tool-calling in thinking mode can be inconsistent across Ollama versions \u2014 verify against your swarm before trusting. ~5.2GB, ~8GB VRAM at Q4."
+    },
+    {
+      "id": "llama3.1:8b",
+      "label": "Llama 3.1 8B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 128000,
+      "tools": "partial",
+      "cost": "free",
+      "note": "HONEST: emits tool calls but is unreliable in complex multi-tool swarms (drops/duplicates calls, malformed args). Fine for simple single-tool minds. ~4.7GB, runs in ~6GB VRAM. Prefer qwen2.5-coder:7b for real agentic use."
+    },
+    {
+      "id": "llama3.2:3b",
+      "label": "Llama 3.2 3B",
+      "provider": "ollama",
+      "hosting": "local",
+      "context": 128000,
+      "tools": "partial",
+      "cost": "free",
+      "note": "Lightweight (runs on ~4GB, even CPU-tolerable). Supports tools but small size means shaky arg accuracy and weak multi-step planning. Good for cheap/edge minds with one or two simple tools."
+    },
+    {
+      "id": "moonshotai/kimi-k2-instruct-0905",
+      "label": "Kimi K2 (0905) on Groq",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Moonshot Kimi K2, 1T MoE / 32B active, purpose-built for agentic tool use; tops tool-use benchmarks. Groq serves it at very high tok/s. Excellent default for minds. Groq id exactly as shown."
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "label": "GPT-OSS 120B on Groq",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "OpenAI open-weight reasoning model, strong agentic tool use, native function calling. Groq id is namespaced 'openai/gpt-oss-120b'. Good agentic pick on Groq's fast inference."
+    },
+    {
+      "id": "qwen/qwen3-32b",
+      "label": "Qwen3 32B on Groq",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Qwen3 32B, strong instruction-following + agent tool use, multilingual. Groq id namespaced 'qwen/qwen3-32b'. Good mid-size agentic option."
+    },
+    {
+      "id": "llama-3.3-70b-versatile",
+      "label": "Llama 3.3 70B Versatile on Groq",
+      "provider": "groq",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Meta Llama 3.3 70B, solid + cheap tool-caller, parallel tool use supported on Groq. The 70B handles complex swarms far better than llama3.1:8b (which tool-calls poorly)."
+    },
+    {
+      "id": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "label": "Qwen3 235B A22B Instruct (2507) on Together",
+      "provider": "together",
+      "hosting": "hosted",
+      "context": 262144,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Qwen3 235B MoE (22B active), instruction-tuned, optimized for reasoning/code/tool usage, ~262K ctx. Together id is HF-style 'Qwen/...'. Strong agentic flagship-tier open model."
+    },
+    {
+      "id": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "label": "Llama 3.3 70B Instruct Turbo on Together",
+      "provider": "together",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Meta Llama 3.3 70B Turbo on Together, function calling supported. Reliable, low-cost agentic baseline. A -Free variant (meta-llama/Llama-3.3-70B-Instruct-Turbo-Free) exists for testing."
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3.2",
+      "label": "DeepSeek V3.2 on Together",
+      "provider": "together",
+      "hosting": "hosted",
+      "context": 163840,
+      "tools": "partial",
+      "cost": "med",
+      "note": "DeepSeek V3.2 (sparse-attention MoE) tuned for reasoning + agentic tool use. Together id HF-style 'deepseek-ai/...'. DeepSeek tool-calling is good but historically less rock-solid than Qwen/Kimi in dense swarms \u2014 verify per-mind. Confirm exact casing against Together's live catalog."
+    },
+    {
+      "id": "moonshotai/kimi-k2",
+      "label": "Kimi K2 on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 262144,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Kimi K2 via OpenRouter (routes to cheapest/fastest upstream). Top-tier agentic tool use. OpenRouter slug 'moonshotai/kimi-k2'. Good when you want provider failover behind one key."
+    },
+    {
+      "id": "qwen/qwen3-235b-a22b",
+      "label": "Qwen3 235B A22B on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 262144,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Qwen3 235B-A22B via OpenRouter, optimized for tool usage, native ~262K ctx. Slug 'qwen/qwen3-235b-a22b'. Append ':free' for the zero-cost rate-limited tier if available. Strong agentic open model."
+    },
+    {
+      "id": "deepseek/deepseek-chat-v3.1",
+      "label": "DeepSeek Chat V3.1 on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 163840,
+      "tools": "partial",
+      "cost": "low",
+      "note": "DeepSeek V3.1 chat via OpenRouter, supports structured tool calling (V3.1 Terminus variant: deepseek/deepseek-v3.1-terminus). Capable + cheap; DeepSeek tool reliability in complex swarms is good-not-perfect \u2014 test per-mind."
+    },
+    {
+      "id": "accounts/fireworks/models/kimi-k2-instruct-0905",
+      "label": "Kimi K2 (0905) on Fireworks",
+      "provider": "fireworks",
+      "hosting": "hosted",
+      "context": 262144,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Kimi K2 on Fireworks, function calling supported. Fireworks ids use 'accounts/fireworks/models/...' path form. Strong agentic default with Fireworks' fast serverless inference."
+    },
+    {
+      "id": "accounts/fireworks/models/deepseek-v3p1",
+      "label": "DeepSeek V3.1 on Fireworks",
+      "provider": "fireworks",
+      "hosting": "hosted",
+      "context": 163840,
+      "tools": "partial",
+      "cost": "low",
+      "note": "DeepSeek V3.1 on Fireworks (note Fireworks spells the version 'v3p1', dot->p). Function calling supported. Newer deepseek-v3p2 also available. DeepSeek tool-calling: verify in dense swarms."
+    },
+    {
+      "id": "mistral-medium-latest",
+      "label": "Mistral Medium 3.5",
+      "provider": "mistral",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Dated id mistral-medium-3-5. Frontier-class, explicitly tuned for agentic + coding; best-in-class reliable multi-tool calling and long-horizon tasks. Configurable reasoning_effort per request. Best price/perf agentic pick here."
+    },
+    {
+      "id": "mistral-large-latest",
+      "label": "Mistral Large 3 (2512)",
+      "provider": "mistral",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Flagship open-weight multimodal model. Native function calling, parallel tool calls, structured outputs, Agents API. Dated id: mistral-large-2512. Strong agentic default."
+    },
+    {
+      "id": "devstral-2512",
+      "label": "Devstral 2",
+      "provider": "mistral",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Frontier code-agent model for software-engineering tasks (SWE-bench class). Tool use central to its design. Use for code-heavy minds; less general-purpose than Medium 3.5."
+    },
+    {
+      "id": "mistral-small-latest",
+      "label": "Mistral Small 4 (2603)",
+      "provider": "mistral",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Dated id mistral-small-2603. Hybrid instruct+reasoning+coding multimodal, tool calling + extended reasoning. Cheap workhorse for swarms; good agentic value. Also open-weight (Apache-2.0) for local hosting."
+    },
+    {
+      "id": "ministral-3-8b-2512",
+      "label": "Ministral 3 8B",
+      "provider": "mistral",
+      "hosting": "hosted",
+      "context": 256000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "Edge/latency-tier (also 3B and 14B variants: ministral-3-3b-2512 / ministral-3-14b-2512). Supports tools but small models tool-call less reliably in complex swarms \u2014 verify per deployment. Open-weight, runnable locally."
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash",
+      "provider": "deepseek",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Current DeepSeek default (284B/13B-active MoE). 1M context, tool use + function calling, agentic-coding SOTA among open models. OpenAI-compatible base_url https://api.deepseek.com (or /v1). Cheap, strong tool caller. Replaces deepseek-chat non-thinking mode."
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro",
+      "provider": "deepseek",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Larger MoE (1.6T/49B-active). 1M context, tool use + function calling; DeepSeek's own pick for complex long-horizon agentic coding. Use when V4-Flash falls short on multi-step tool chains."
+    },
+    {
+      "id": "deepseek-chat",
+      "label": "DeepSeek Chat (legacy alias)",
+      "provider": "deepseek",
+      "hosting": "hosted",
+      "context": 128000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Legacy alias = non-thinking mode of deepseek-v4-flash. Function calling supported. DEPRECATES 2026-07-24 \u2014 migrate to deepseek-v4-flash. Listed only for back-compat; do not pick for new minds."
+    },
+    {
+      "id": "gemini-3.5-flash",
+      "label": "Gemini 3.5 Flash",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Current most-intelligent Gemini for sustained agentic + coding. 1M context, function calling via tools/tool_choice. OpenAI endpoint base_url https://generativelanguage.googleapis.com/v1beta/openai/ , model field = bare id 'gemini-3.5-flash'. Top agentic pick for Google."
+    },
+    {
+      "id": "gemini-3.1-pro-preview",
+      "label": "Gemini 3.1 Pro (preview)",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "high",
+      "note": "Highest-capability Gemini, advanced reasoning + powerful agentic/coding. 1M context, function calling. Preview channel \u2014 id may change; confirm before pinning. Use for hardest multi-step tool reasoning."
+    },
+    {
+      "id": "gemini-2.5-flash",
+      "label": "Gemini 2.5 Flash",
+      "provider": "google",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Stable price/perf reasoning model, function calling + web search + structured output. 1M context. Cheaper, fully-GA alternative to 3.5 Flash for high-volume swarms. Budget tiers: gemini-2.5-flash-lite (cheapest 2.5)."
+    }
+  ],
+  "defaults": {
+    "workers_ai": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "free_local": "qwen2.5-coder:7b",
+    "recommended_paid": "claude-opus-4-8"
+  }
+}

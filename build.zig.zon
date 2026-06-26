@@ -1,0 +1,20 @@
+.{
+    .name = .veil,
+    .version = "0.1.0",
+    .fingerprint = 0xd137d40acdb7c43e,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .httpz = .{
+            .url = "git+https://github.com/karlseguin/http.zig#20076ad87f91eb068ee14376ddba02c2331b6ce9",
+            .hash = "httpz-0.0.0-PNVzrIDeCABKV7yA3QNNPMvThuact7-XyawnWsmVyeuP",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "web",
+        "LICENSE",
+        "README.md",
+    },
+}
