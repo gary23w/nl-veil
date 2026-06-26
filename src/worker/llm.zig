@@ -104,12 +104,19 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
 }
 
-pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32) Step {
+pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     const mt = effTokens(base_url, model, max_tokens);
-    const body = if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, mt }) catch return stepErr(gpa, "oom")
+    // temperature < 0 => OMIT (provider default); >= 0 => pin it. Operate mode pins it low so a weak model reliably
+    // EMITS the decisive tool call instead of narrating its plan.
+    const temp_frag = if (temperature >= 0)
+        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, messages_json, mt }) catch return stepErr(gpa, "oom");
+        gpa.dupe(u8, "") catch return stepErr(gpa, "oom");
+    defer gpa.free(temp_frag);
+    const body = if (tools_json.len > 0)
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt }) catch return stepErr(gpa, "oom")
+    else
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     return completeBody(gpa, io, run_dir, tag, base_url, key, body);
 }
