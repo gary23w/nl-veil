@@ -1,0 +1,23 @@
+This host is watched by a resident security agent whose standing duty is to keep it clean and healthy.
+Observe the host by reading telemetry.json (processes, connections, persistence, integrity, threat_score, mode), events.log, and debug/state.jsonl.
+Operate the host by appending exactly one command line to commands.jsonl.
+The host remediation command dictionary is: scan, kill_proc <pid|name>, block_ip <ip>, remove_persistence <name>, restore_file <path>, isolate, status.
+If telemetry mode is COMPROMISED or threat_score is above 0, the host is infected and must be remediated.
+The incident response procedure is: scan to identify the indicators, contain and remediate each infection, verify it is cleared, then keep monitoring.
+Each infection in telemetry.infections lists the remaining remediation actions it still needs: kill, block, rmpersist, or restore.
+A suspicious process shows up in telemetry.processes with suspicious true (for example xmrig or nc-backdoor); terminate it with kill_proc.
+An outbound command-and-control connection shows up in telemetry.connections with c2 true; cut it with block_ip.
+A malicious persistence unit shows up in telemetry.persistence; remove it with remove_persistence, because the persistence is the ROOT CAUSE.
+A tampered file shows up in telemetry.integrity with ok false; restore it with restore_file from the golden image.
+KEY LESSON: killing a malicious process without removing its persistence lets the malware respawn; always remove the persistence root cause, not just the running process.
+A crypto-miner infection (xmrig) requires all three actions: kill the process, block its mining-pool C2 address, and remove its persistence timer.
+A backdoor infection (nc-backdoor) requires removing the rogue cron persistence, killing the process, and blocking its C2 address.
+A beacon infection requires killing the beaconing process and blocking its C2 address.
+A file-tamper infection requires restore_file on the tampered path.
+After successful remediation the infection disappears from telemetry.infections, threat_score returns to 0, and mode returns to NOMINAL.
+Use isolate to quarantine the host (cut all outbound) when a threat is spreading or unidentified, to contain it first.
+Prefer least-destructive actions first: kill, block, and remove specific threats before isolating the entire host.
+This is DEFENSIVE security only: the agent protects and heals this host and never attacks any other system.
+The agent must watch continuously: every cycle, read telemetry.json, and if the host is compromised, remediate and verify, then keep watching.
+A new infection can appear at any time, so the agent never stops monitoring even after the host is clean.
+When the host is NOMINAL the agent stays in a low-effort watch state and escalates its attention only when telemetry shows a new threat.

@@ -1,0 +1,99 @@
+# Blue-team threat intelligence (IOC snapshot) from abuse.ch Feodo Tracker + ThreatFox.
+# Cross-reference a host's outbound connections against these to DETECT malware that hides behind
+# legit process names and unflagged connections. Real deployments re-fetch fresh feeds.
+[src:threatintel] [verified] IP 162.243.103.246 (port 8080) is a known Emotet botnet C2 endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the owning process. Source: Feodo Tracker.
+[src:threatintel] [verified] IP 50.16.16.211 (port 443) is a known QakBot botnet C2 endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the owning process. Source: Feodo Tracker.
+[src:threatintel] [verified] IP 34.204.119.63 (port 443) is a known QakBot botnet C2 endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the owning process. Source: Feodo Tracker.
+[src:threatintel] [verified] IP 178.62.3.223 (port 443) is a known QakBot botnet C2 endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the owning process. Source: Feodo Tracker.
+[src:threatintel] [verified] IP 27.133.154.218 (port 443) is a known QakBot botnet C2 endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the owning process. Source: Feodo Tracker.
+[src:threatintel] [verified] IP 1.117.61.9 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.117.61.9 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.117.77.166 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.13.141.229 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.13.141.229 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.14.172.47 is a known AdaptixC2 command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.14.234.107 is a known AdaptixC2 command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.14.76.111 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.15.100.187 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.15.174.189 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.15.248.225 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.15.25.148 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.92.101.103 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.92.101.103 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.92.101.103 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.92.95.105 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 1.94.187.246 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 100.110.56.1 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.126.10.34 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.126.150.253 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.133.148.66 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.201.54.74 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.32.109.112 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.32.204.81 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.33.202.134 is a known AdaptixC2 command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.33.225.32 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.34.182.130 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.34.205.214 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.34.222.38 is a known Viper RAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.35.109.246 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.35.214.58 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.35.95.103 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.103.154 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.2.116 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.24.136 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.24.136 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.29.69 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.30.6 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.32.212 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.43.91.156 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.99.92.220 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 101.99.95.16 is a known Evilginx command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.117.173.226 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.129.165.177 is a known VShell command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.134.53.147 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.204.223.106 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.217 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.217 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.217 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.222 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.250 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.250 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.250 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.250 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.220.160.47 is a known Mirai command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.46.221.148 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.46.221.148 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 102.46.221.148 is a known AsyncRAT command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.101.85.184 is a known Stealc command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.10 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.19 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.19 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.19 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.20 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.11.41.20 is a known Remcos command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.110.65.166 is a known Sliver command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.110.65.166 is a known Sliver command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.110.80.154 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.110.80.154 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.125.248.109 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.142.147.17 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.142.147.18 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.142.147.19 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.149.93.107 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.149.93.146 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.153.254.32 is a known Unknown malware command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.166.200.226 is a known Mirai command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.171.35.26 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:threatintel] [verified] IP 103.171.35.66 is a known Cobalt Strike command-and-control (C2) endpoint. Outbound traffic to it indicates compromise: block_ip it and kill the process. Source: ThreatFox.
+[src:corpus] To DETECT stealthy malware: a process named like a system service can still be malicious. Cross-reference EVERY outbound connection IP against threat intelligence (recall_hive 'IP <addr> known C2'); a match means the owning process is malicious even if it is unflagged.
