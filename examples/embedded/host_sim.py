@@ -4,7 +4,8 @@ host_sim.py — an OBSERVABLE, infectable virtual machine for testing a self-hea
 
 A simulated Linux-ish host (processes, services, network connections, file integrity, persistence).
 It can be INFECTED with realistic, defensible threats and HEALED by issuing remediation commands. It
-speaks a plain file bus — downlink telemetry, uplink commands — so a Veil can watch it and operate it:
+speaks a plain file bus (downlink telemetry, uplink commands), so a Veil hive can
+watch it and operate it:
 
   <dir>/telemetry.json     current machine state          (downlink, every tick)
   <dir>/events.log         security event log             (downlink)
@@ -40,6 +41,9 @@ THREATS = {
     # (threat_score stays 0, mode stays NOMINAL, it is hidden from the infections list) — it is ONLY detectable by
     # cross-referencing the outbound connection IP against threat intelligence. This is the real-world detection test.
     "stealth":  {"sev": 0, "proc": "systemd-timesyncd", "ip": "162.243.103.246:8080", "unit": None, "file": None, "stealth": True},
+    # KNOWN: also host-invisible (unflagged), but its C2 is a BAKED indicator — catchable from memory alone (recall),
+    # no web needed. Pairs with "stealth" (feed-only) to test recall-known vs learn-unknown vs leave-benign in one run.
+    "known":    {"sev": 0, "proc": "kaudit-helper",     "ip": "185.143.220.7:443",   "unit": None, "file": None, "stealth": True},
 }
 ROTATION = ["miner", "backdoor", "beacon", "tamper"]
 
@@ -61,9 +65,16 @@ class Host:
         self.cmd_offset = 0
         os.makedirs(os.path.join(io_dir, "debug"), exist_ok=True)
         open(self._p("commands.jsonl"), "a").close()
-        # a handful of legitimate baseline processes
-        for n, c in [("systemd", 0.1), ("sshd", 0.2), ("python3", 1.0), ("postgres", 3.0)]:
-            self._spawn(n, c, mal=False, inf=None)
+        self.dwell = 0        # ground truth: ticks a malicious entity has been live (the dwell pressure the oracle reads)
+        self.falsepos = 0     # ground truth: benign entities the agent killed/blocked (the false-positive tripwire)
+        self.neutralized = 0  # ground truth: malicious infections the agent cleared
+        # legitimate baseline processes + BENIGN outbound connections — the false-positive tripwire. These are NOT
+        # malicious and appear in NO threat feed; an autonomous defender must learn to LEAVE THEM ALONE.
+        for n, c, par in [("systemd", 0.1, "kernel"), ("sshd", 0.2, "systemd"), ("python3", 1.0, "systemd"),
+                          ("postgres", 3.0, "systemd"), ("systemd-resolved", 0.1, "systemd"), ("chronyd", 0.1, "systemd")]:
+            self._spawn(n, c, mal=False, inf=None, parent=par)
+        self.conns.append({"ip": "1.1.1.1:53", "proc": "systemd-resolved", "c2": False, "blocked": False, "inf": None})
+        self.conns.append({"ip": "129.6.15.28:123", "proc": "chronyd", "c2": False, "blocked": False, "inf": None})
         self._write_mission()
         self.log("INFO", "host", "system boot complete — baseline services up, monitor armed")
 
@@ -84,9 +95,9 @@ class Host:
         with open(self._p("debug", "audit.log"), "a", encoding="utf-8") as f:
             f.write(f"{self._stamp()} {msg}\n")
 
-    def _spawn(self, name, cpu, mal, inf):
+    def _spawn(self, name, cpu, mal, inf, parent="init"):
         self.pidseq += 1
-        self.procs[self.pidseq] = {"name": name, "cpu": cpu, "mal": mal, "inf": inf}
+        self.procs[self.pidseq] = {"name": name, "cpu": cpu, "mal": mal, "inf": inf, "parent": parent}
         return self.pidseq
 
     # ---- attacker side (injection) ----
@@ -201,7 +212,11 @@ class Host:
             return
         for pid in pids:
             p = self.procs.pop(pid)
-            self.log("INFO", "response", f"killed pid {pid} ({p['name']})")
+            if p["inf"] is None:  # killed a BENIGN process — a false positive (ground truth, agent never told)
+                self.falsepos += 1
+                self.log("FAULT", "falsepos", f"killed BENIGN process '{p['name']}' (pid {pid}) — FALSE POSITIVE")
+            else:
+                self.log("INFO", "response", f"killed pid {pid} ({p['name']})")
             inf = self.infections.get(p["inf"] or "")
             if inf:
                 inf["done"].add("kill")
@@ -209,11 +224,17 @@ class Host:
     def _block(self, ip):
         self.blocked.add(ip)
         for c in self.conns:
-            if c["ip"] == ip or c["ip"].split(":")[0] == ip:
+            if c["blocked"]:
+                continue
+            if c["ip"] == ip or c["ip"].split(":")[0] == ip.split(":")[0]:
                 c["blocked"] = True
-                inf = self.infections.get(c["inf"] or "")
-                if inf:
-                    inf["done"].add("block")
+                if c["inf"] is None:  # blocked a BENIGN connection — a false positive (cut legit traffic)
+                    self.falsepos += 1
+                    self.log("FAULT", "falsepos", f"blocked BENIGN connection {c['ip']} ({c.get('proc')}) — FALSE POSITIVE")
+                else:
+                    inf = self.infections.get(c["inf"] or "")
+                    if inf:
+                        inf["done"].add("block")
         self.log("INFO", "response", f"blocked outbound {ip}")
 
     def _rmpersist(self, name):
@@ -261,6 +282,7 @@ class Host:
         for iid, inf in list(self.infections.items()):
             if not inf["cleared"] and inf["need"] <= inf["done"]:
                 inf["cleared"] = True
+                self.neutralized += 1
                 self.conns = [c for c in self.conns if c["inf"] != iid]
                 self.log("INFO", "security", f"infection [{iid}] REMEDIATED and verified clean")
                 del self.infections[iid]
@@ -277,20 +299,44 @@ class Host:
         visible = any(not i.get("stealth") for i in self.infections.values())
         return "QUARANTINE" if self.quarantine else ("COMPROMISED" if visible else "NOMINAL")
 
+    def _security_score(self):
+        # GROUND TRUTH — the acceptance oracle (engine) reads this; the AGENT never sees it. Health = 100 minus
+        # penalties for live malicious entities, accumulated dwell (a threat left alive bleeds health every tick),
+        # and false positives (killing/blocking benign things — weighted heaviest). Narration leaves a threat live
+        # so health keeps dropping; blind-blocking benign traffic tanks it and stays tanked.
+        live = 0
+        for p in self.procs.values():
+            if p["inf"] is not None:
+                live += 1
+        for c in self.conns:
+            if c["inf"] is not None and not c["blocked"]:
+                live += 1
+        for r in self.persist.values():
+            if r["inf"] is not None and not r["removed"]:
+                live += 1
+        for r in self.files.values():
+            if r["inf"] is not None and not r["ok"]:
+                live += 1
+        self.dwell = min(self.dwell + 1, 40) if live > 0 else 0
+        pct = max(0, 100 - min(100, live * 15 + self.dwell + self.falsepos * 25))
+        return {"pct": pct, "live_malicious": live, "dwell": self.dwell,
+                "false_positives": self.falsepos, "neutralized": self.neutralized}
+
     def telemetry(self):
+        # RAW observability ONLY — no per-entity verdict. The host's naive monitor does not classify these threats;
+        # the agent must adjudicate every outbound connection against threat-intel itself. mode/threat_score reflect
+        # only the host's own blind heuristic (which catches nothing here, so it reads clean — do NOT trust it).
         return {
             "tick": self.t,
             "mode": self._mode(),
             "threat_score": self._threat(),
             "cpu_load_pct": round(min(100.0, sum(p["cpu"] for p in self.procs.values())), 1),
-            "processes": [{"pid": pid, "name": p["name"], "cpu": p["cpu"], "suspicious": p["mal"]}
+            "processes": [{"pid": pid, "name": p["name"], "cpu": p["cpu"], "parent": p.get("parent", "init")}
                           for pid, p in sorted(self.procs.items())],
-            "connections": [{"ip": c["ip"], "proc": c.get("proc"), "c2": c["c2"], "blocked": c["blocked"]} for c in self.conns],
-            "persistence": [{"name": n, "removed": r["removed"], "suspicious": True} for n, r in self.persist.items()],
+            "connections": [{"ip": c["ip"], "proc": c.get("proc"), "blocked": c["blocked"]} for c in self.conns],
+            "persistence": [{"name": n, "removed": r["removed"]} for n, r in self.persist.items()],
             "integrity": [{"path": p, "ok": r["ok"]} for p, r in self.files.items()],
             "blocked_ips": sorted(self.blocked),
-            "infections": [{"id": iid, "type": i["type"], "remaining": sorted(i["need"] - i["done"])}
-                           for iid, i in self.infections.items() if not i.get("stealth")],
         }
 
     def write_state(self):
@@ -312,6 +358,12 @@ class Host:
         try:
             with open(self._p("debug", "state.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps(snap) + "\n")
+        except OSError:
+            pass
+        # the GROUND-TRUTH security score for the engine's acceptance oracle (NOT part of telemetry; agent never reads it)
+        try:
+            with open(self._p("score.json"), "w", encoding="utf-8") as f:
+                json.dump(self._security_score(), f)
         except OSError:
             pass
 

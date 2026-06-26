@@ -67,6 +67,7 @@ pub const ToolCtx = struct {
     skills_saved: *u32,
     directives_set: *u32,
     tools_made: *u32,
+    learn_scope: []const u8 = KNOWLEDGE_SCOPE, // where the agent's observes land; operate mode routes them to INTEL
     space: []const u8 = "",
     band_y0: i64 = -1,
     band_y1: i64 = -1,
@@ -89,7 +90,7 @@ fn unlockFiles(ctx: *ToolCtx) void {
 fn hiveStore(ctx: *ToolCtx, fact: []const u8) void {
     const tagged = std.fmt.allocPrint(ctx.gpa, "[{s} r{d}] {s}", .{ ctx.mind, ctx.round, fact }) catch fact;
     defer if (tagged.ptr != fact.ptr) ctx.gpa.free(tagged);
-    _ = ctx.mem.observe(KNOWLEDGE_SCOPE, tagged);
+    _ = ctx.mem.observe(ctx.learn_scope, tagged);
 }
 
 pub const SKILL_SCOPE = "skills";
@@ -99,6 +100,10 @@ pub const PLAYBOOK_SCOPE = "playbook";
 pub const SCORE_SCOPE = "score";
 
 pub const KNOWLEDGE_SCOPE = "knowledge";
+
+// INTEL — the evictable runtime-learning cache (web evidence, threat-intel the agent fetches mid-run), kept apart
+// from the protected KNOWLEDGE core so a baked indicator is never crowded out by transient observations.
+pub const INTEL_SCOPE = "intel";
 
 pub const VERIFIED_SCOPE = "verified";
 
@@ -244,12 +249,15 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { query: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
-        const r = ctx.mem.assoc(KNOWLEDGE_SCOPE, p.value.query, 1, 12);
-        if (r.len == 0) {
-            gpa.free(r);
-            return dupe(gpa, "(the hive knows nothing relevant yet — be the first to share something)");
-        }
-        return r;
+        // recall_hive spans BOTH tiers: the protected KNOWLEDGE core and the evictable INTEL learning-cache.
+        const core = ctx.mem.assoc(KNOWLEDGE_SCOPE, p.value.query, 1, 12);
+        defer gpa.free(core);
+        const learned = ctx.mem.assoc(INTEL_SCOPE, p.value.query, 1, 12);
+        defer gpa.free(learned);
+        if (core.len == 0 and learned.len == 0) return dupe(gpa, "(the hive knows nothing relevant yet — be the first to share something)");
+        if (learned.len == 0) return dupe(gpa, core);
+        if (core.len == 0) return dupe(gpa, learned);
+        return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ core, learned }) catch dupe(gpa, core);
     }
     if (std.mem.eql(u8, name, "probe")) {
         if (ctx.space.len == 0) return dupe(gpa, "this swarm has no spatial grid (the task isn't spatial) — there is nothing to probe");
@@ -850,17 +858,102 @@ fn targetGuard(ctx: *ToolCtx, verb: []const u8, target: []const u8) ?[]u8 {
     return std.fmt.allocPrint(gpa, "rejected: '{s} {s}' - '{s}' appears NOWHERE in this host's live telemetry (a hallucinated target). Real {s} targets on the host right now: [{s}]. Reissue host_command against one that actually exists.", .{ verb, target, target, verb, list.items }) catch dupe(gpa, "rejected: target appears nowhere in telemetry");
 }
 
+/// A target is "adjudicated" only by an EXTERNALLY-SOURCED fact that names it - a baked indicator ([src:corpus] /
+/// [src:threatintel] / [verified]) or captured web evidence ([src:web]). A self-authored observe (tagged "[mind rN]")
+/// does NOT count: the agent cannot satisfy the interlock by simply asserting an entity is bad - it must recall a real
+/// indicator or actually fetch one. This is what forces the web-learning a pure "does memory mention it" check missed.
+fn externallyAdjudicated(text: []const u8, needle: []const u8) bool {
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) == null) continue;
+        if (std.mem.indexOf(u8, line, "[src:") != null or std.mem.indexOf(u8, line, "[verified]") != null) return true;
+    }
+    return false;
+}
+
+fn memMentions(ctx: *ToolCtx, needle: []const u8) bool {
+    if (needle.len < 3) return false;
+    const a = ctx.mem.assoc(INTEL_SCOPE, needle, 1, 8);
+    defer ctx.gpa.free(a);
+    if (externallyAdjudicated(a, needle)) return true;
+    const b = ctx.mem.assoc(KNOWLEDGE_SCOPE, needle, 1, 8);
+    defer ctx.gpa.free(b);
+    return externallyAdjudicated(b, needle);
+}
+
+/// A process is adjudicated if a connection it OWNS points at an address the agent holds adjudicating intel for - so
+/// killing the owner of a confirmed-bad C2 is allowed without the agent needing separate intel on the process name.
+fn procOwnsAdjudicatedConn(ctx: *ToolCtx, proc: []const u8) bool {
+    const gpa = ctx.gpa;
+    const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return false;
+    defer gpa.free(tp);
+    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(16384)) catch return false;
+    defer gpa.free(tel);
+    const Conn = struct { ip: []const u8 = "", proc: []const u8 = "" };
+    const Tel = struct { connections: []const Conn = &.{} };
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    for (parsed.value.connections) |c| {
+        if (std.mem.eql(u8, c.proc, proc) and memMentions(ctx, bareIp(c.ip))) return true;
+    }
+    return false;
+}
+
+/// Record a staged (un-executed) irreversible action for forensics; never touches the host command bus.
+fn stageAction(ctx: *ToolCtx, cmd: []const u8) void {
+    const gpa = ctx.gpa;
+    const sp = std.fmt.allocPrint(gpa, "{s}/staged.jsonl", .{ctx.workdir}) catch return;
+    defer gpa.free(sp);
+    const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, sp, gpa, .limited(64 << 10)) catch &[_]u8{};
+    defer if (prior.len > 0) gpa.free(prior);
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(gpa);
+    j.appendSlice(gpa, prior) catch {};
+    j.appendSlice(gpa, cmd) catch {};
+    j.appendSlice(gpa, "\n") catch {};
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = sp, .data = j.items }) catch {};
+}
+
+/// Map the common verb variants a weak model reaches for onto the canonical verb, so its natural phrasing lands
+/// (kill_process -> kill_proc, block -> block_ip, setphase -> set_phase, ...). Returns gpa-owned only if rewritten.
+fn normalizeCmd(gpa: std.mem.Allocator, cmd: []const u8) []const u8 {
+    const pairs = .{
+        .{ "kill_process", "kill_proc" }, .{ "killproc", "kill_proc" }, .{ "kill", "kill_proc" },
+        .{ "block_address", "block_ip" }, .{ "blockip", "block_ip" },   .{ "block", "block_ip" },
+        .{ "setphase", "set_phase" },     .{ "set_signal", "set_phase" }, .{ "grant_pedestrian_walk", "grant_walk" },
+    };
+    inline for (pairs) |pr| {
+        const v = pr[0];
+        if (std.mem.startsWith(u8, cmd, v) and (cmd.len == v.len or cmd[v.len] == ' ')) {
+            return std.fmt.allocPrint(gpa, "{s}{s}", .{ pr[1], cmd[v.len..] }) catch cmd;
+        }
+    }
+    return cmd;
+}
+
 fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { command: []const u8 = "" };
+    // accept the natural key variants a weak model reaches for ("cmd"/"action") as well as the schema's "command",
+    // so its action actually LANDS instead of parsing to empty - this papercut silently dropped every command in the IoT test.
+    const A = struct { command: []const u8 = "", cmd: []const u8 = "", action: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const cmd = std.mem.trim(u8, p.value.command, " \r\n\t");
-    if (cmd.len == 0) return dupe(gpa, "no command given");
+    const raw_cmd = if (p.value.command.len > 0) p.value.command else if (p.value.cmd.len > 0) p.value.cmd else p.value.action;
+    // STRIP MARKDOWN NOISE: a weak model wraps commands in backticks/asterisks (`kill_proc 5602`) and the noise mangles
+    // the target so a CORRECT command gets rejected ('185.220.101.34`' != '185.220.101.34'). Remove it so its action lands.
+    var clean: std.ArrayListUnmanaged(u8) = .empty;
+    defer clean.deinit(gpa);
+    for (raw_cmd) |c| {
+        if (c != '`' and c != '*' and c != '"') clean.append(gpa, c) catch {};
+    }
+    const cmd0 = std.mem.trim(u8, clean.items, " \r\n\t");
+    if (cmd0.len == 0) return dupe(gpa, "no command given");
+    const cmd = normalizeCmd(gpa, cmd0); // map common verb variants (kill_process->kill_proc, block->block_ip, ...)
+    defer if (cmd.ptr != cmd0.ptr) gpa.free(@constCast(cmd));
     var it = std.mem.tokenizeAny(u8, cmd, " \t");
     const verb = it.next() orelse "";
     // allowlist the verb - the agent OPERATES the host, it cannot inject an arbitrary line (defensive remediation only)
-    const allowed = [_][]const u8{ "kill_proc", "block_ip", "remove_persistence", "restore_file", "isolate", "quarantine", "unisolate", "resume", "scan", "status", "safe_mode", "heater", "drive", "task_restart", "mutex_inherit" };
+    const allowed = [_][]const u8{ "kill_proc", "block_ip", "remove_persistence", "restore_file", "isolate", "quarantine", "unisolate", "resume", "scan", "status", "safe_mode", "heater", "drive", "task_restart", "mutex_inherit", "set_phase", "set_green", "grant_walk", "set_mode", "restart_proc", "set_param" };
     var ok = false;
     for (allowed) |a| {
         if (std.mem.eql(u8, verb, a)) {
@@ -872,6 +965,19 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // the target must be a real indicator in live telemetry (blocks hallucinated targets; steers the model right)
     const target = std.mem.trim(u8, cmd[@min(verb.len + 1, cmd.len)..], " \t");
     if (targetGuard(ctx, verb, target)) |rej| return rej;
+    // IRREVERSIBILITY INTERLOCK: a targeted irreversible action (kill_proc/block_ip) on an entity the agent holds NO
+    // adjudicating intel for is STAGED, not executed - the structural "investigate-before-act" floor that stops blind
+    // blocking/killing of benign traffic. A model that recalls or fetches intel first is never blocked (a no-op on the
+    // capable path); the weak 8B is caught here as a safety net rather than allowed a false positive.
+    const irreversible = std.mem.eql(u8, verb, "kill_proc") or std.mem.eql(u8, verb, "block_ip");
+    if (irreversible and target.len > 0) {
+        var adjudicated = memMentions(ctx, bareIp(target));
+        if (!adjudicated and std.mem.eql(u8, verb, "kill_proc")) adjudicated = procOwnsAdjudicatedConn(ctx, target);
+        if (!adjudicated) {
+            stageAction(ctx, cmd);
+            return std.fmt.allocPrint(gpa, "STAGED (not executed): '{s} {s}' is an irreversible action and you hold NO adjudicating intel for '{s}'. Investigate it first - recall_hive it, or web_fetch a threat-intel feed and observe what you learn; once your memory identifies it as malicious, reissue and it executes. (This stops you cutting or killing benign things.)", .{ verb, target, target }) catch dupe(gpa, "staged: investigate the target first");
+        }
+    }
     const cp = std.fmt.allocPrint(gpa, "{s}/commands.jsonl", .{ctx.workdir}) catch return dupe(gpa, "oom");
     defer gpa.free(cp);
     const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, cp, gpa, .limited(256 << 10)) catch &[_]u8{};

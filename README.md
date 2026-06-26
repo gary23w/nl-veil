@@ -93,24 +93,41 @@ live event stream to `data/<run>/events.jsonl`.
 
 The same binary and the same launcher cover very different jobs. Four worked use cases:
 
-### a) Embedded security daemon — a self-healing, threat-detecting Veil on a device
+### a) Autonomous device operator — a self-healing Veil that keeps a live device healthy
 
-The Veil can run **on a device** as a security daemon: it watches a host's telemetry, recalls a
-remediation playbook from its own memory, and operates the host through `host_status` /
-`host_command` tools instead of writing files. In **operate mode** it heals a live infection
-end-to-end — detect → remove persistence → block C2 → kill process → verify. A separate
-**blue-team detection** harness catches a stealth implant the host itself rates `NOMINAL`, by
-cross-referencing every outbound connection against a baked threat-intel corpus (`threatintel.facts`,
-sourced from abuse.ch). `veil_chat.py` is an offline-first operator console — `status` / `log` /
-`ask` answer straight from neuron-db with no model and no network, and live `veil` / `cmd` drive
-the running device. Verified working on a local 8B model. See **[`examples/embedded/`](examples/embedded/)**.
+Point the Veil at a **live device** and it operates it directly. The device drops raw telemetry on a
+file bus (`telemetry.json`); the Veil reads that state, recalls what it knows, and acts through
+`host_status` / `host_command` instead of writing files about a fix. It is graded by an **acceptance
+oracle** — the device's own measured health (`score.json`), which the Veil never sees and cannot write —
+so narrating a plan scores nothing and only a real action that changes the device moves the number.
+Protective behaviour **emerges from that gradient**: the engine measures the outcome, it never scripts
+the steps.
+
+Two structural floors keep a weak model honest:
+
+- **Irreversibility interlock.** An irreversible action (kill a process, block an address) on a target
+  the Veil holds *no externally-sourced intel* for is **staged, not executed** — it must recall a baked
+  indicator or actually `web_fetch` evidence first. This is what stops a jumpy model cutting legitimate
+  SSH / RDP / SMB, while still letting it neutralise a confirmed threat.
+- **Resilience.** If the uplink drops it keeps working **lexically** from hive memory (`recall` /
+  `recall_hive`) and re-probes each round, restoring web research automatically when the link returns.
+
+The shipped worked example is a **security daemon**: it heals a live infection end-to-end (detect →
+remove persistence → block C2 → kill process → verify), and a **blue-team detection** harness catches a
+stealth implant the host itself rates `NOMINAL` by cross-referencing every outbound connection against a
+baked threat-intel corpus (`threatintel.facts`, sourced from abuse.ch). Nothing in the engine is
+security-specific, though — the same operate loop drives **any** device that speaks telemetry: an IoT
+signal controller, an application server, a sensor. Swap the corpus and the telemetry, not the code.
+`veil_chat.py` is an offline-first operator console (`status` / `log` / `ask` answer straight from
+neuron-db with no model and no network; live `veil` / `cmd` drive the running device). Verified operating
+a live host on a local 8B model. See **[`examples/embedded/`](examples/embedded/)**.
 
 ```bash
 ./examples/embedded/run_secops.sh                 # self-healing remediation test
 ./examples/embedded/run_detect.sh                 # blue-team stealth-implant detection
 python examples/embedded/veil_chat.py --dir <run> status
 # install it to live on the box (starts on boot, restarts on failure):
-python deploy.py "Keep this host clean" --service
+python deploy.py "Keep this device healthy" --service
 ```
 
 ### b) Build software — scored by its own test runs
