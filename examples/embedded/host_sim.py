@@ -334,7 +334,7 @@ class Host:
             "processes": [{"pid": pid, "name": p["name"], "cpu": p["cpu"], "parent": p.get("parent", "init")}
                           for pid, p in sorted(self.procs.items())],
             "connections": [{"ip": c["ip"], "proc": c.get("proc"), "blocked": c["blocked"]} for c in self.conns],
-            "persistence": [{"name": n, "removed": r["removed"]} for n, r in self.persist.items()],
+            "persistence": [{"name": n, "removed": r["removed"], "proc": r.get("proc")} for n, r in self.persist.items()],
             "integrity": [{"path": p, "ok": r["ok"]} for p, r in self.files.items()],
             "blocked_ips": sorted(self.blocked),
         }
