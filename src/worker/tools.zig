@@ -133,6 +133,8 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"delete_file","description":"Delete a file you created in your build workdir (clean up a dead end, a wrong scaffold, or junk).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine - do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"HTTP GET a URL and return its readable text content (HTML tags stripped, truncated). Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — find URLs + snippets for a query. Use this FIRST to discover sources, then web_fetch the best result.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body (not HTML-stripped). Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -189,6 +191,8 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, args_json);
     if (std.mem.eql(u8, name, "run_tests")) return runTests(ctx, args_json);
     if (std.mem.eql(u8, name, "delete_file")) return deleteFile(ctx, args_json);
+    if (std.mem.eql(u8, name, "host_status")) return hostStatus(ctx, args_json);
+    if (std.mem.eql(u8, name, "host_command")) return hostCommand(ctx, args_json);
     if (!ctx.internet and (std.mem.eql(u8, name, "web_fetch") or std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "fetch_json") or std.mem.eql(u8, name, "read_url") or
         std.mem.eql(u8, name, "osint_scan") or std.mem.eql(u8, name, "deep_crawl")))
@@ -774,6 +778,112 @@ fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(full);
     std.Io.Dir.cwd().deleteFile(ctx.io, full) catch return dupe(gpa, "could not delete (not found?)");
     return std.fmt.allocPrint(gpa, "deleted {s}", .{p.value.path}) catch dupe(gpa, "deleted");
+}
+
+// ---- OPERATE a live host: read its telemetry and issue remediation commands over a file bus ----
+
+fn hostStatus(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    _ = args_json;
+    const gpa = ctx.gpa;
+    const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return dupe(gpa, "oom");
+    defer gpa.free(tp);
+    return std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(8192)) catch
+        dupe(gpa, "no telemetry.json on the bus - no machine is attached to this run");
+}
+
+/// IPv4 address with the :port stripped (everything before the first ':'), so "185.143.220.7:3333" and
+/// "185.143.220.7" compare equal.
+fn bareIp(s: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, s, ':')) |i| s[0..i] else s;
+}
+
+/// TARGET GUARD: a verb that names a specific threat (block_ip / kill_proc / remove_persistence) must point at a
+/// target that EXISTS in the host's live telemetry. A target is valid if it is a REAL connection/process - NOT only
+/// a host-FLAGGED one (requiring the flag would defeat DETECTION, where the agent identifies a stealth implant by
+/// cross-referencing threat-intel). The guard still rejects HALLUCINATED targets that appear nowhere in telemetry,
+/// listing the real ones to steer the model. Fail-open if no machine is attached. Returns an owned rejection or null.
+fn targetGuard(ctx: *ToolCtx, verb: []const u8, target: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    const is_ip = std.mem.eql(u8, verb, "block_ip");
+    const is_proc = std.mem.eql(u8, verb, "kill_proc");
+    const is_pers = std.mem.eql(u8, verb, "remove_persistence");
+    if (!is_ip and !is_proc and !is_pers) return null; // host-wide verbs (isolate/scan/...) need no target
+    const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return null;
+    defer gpa.free(tp);
+    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(16384)) catch return null; // no machine -> allow
+    defer gpa.free(tel);
+    const Proc = struct { name: []const u8 = "", pid: i64 = 0, suspicious: bool = false };
+    const Conn = struct { ip: []const u8 = "", c2: bool = false };
+    const Pers = struct { name: []const u8 = "" };
+    const Tel = struct { processes: []const Proc = &.{}, connections: []const Conn = &.{}, persistence: []const Pers = &.{} };
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return null; // unparseable -> allow
+    defer parsed.deinit();
+    const t = parsed.value;
+    var known = false;
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    defer list.deinit(gpa);
+    const add = struct {
+        fn f(g: std.mem.Allocator, l: *std.ArrayListUnmanaged(u8), s: []const u8) void {
+            if (l.items.len > 0) l.appendSlice(g, ", ") catch {};
+            l.appendSlice(g, s) catch {};
+        }
+    }.f;
+    if (is_ip) {
+        for (t.connections) |c| {
+            add(gpa, &list, c.ip);
+            if (std.mem.eql(u8, bareIp(c.ip), bareIp(target))) known = true;
+        }
+    } else if (is_proc) {
+        var pidbuf: [24]u8 = undefined;
+        for (t.processes) |pr| {
+            add(gpa, &list, pr.name);
+            const pids = std.fmt.bufPrint(&pidbuf, "{d}", .{pr.pid}) catch "";
+            if (std.mem.eql(u8, pr.name, target) or std.mem.eql(u8, pids, target)) known = true;
+        }
+    } else { // remove_persistence
+        for (t.persistence) |x| {
+            add(gpa, &list, x.name);
+            if (std.mem.eql(u8, x.name, target)) known = true;
+        }
+    }
+    if (known) return null;
+    return std.fmt.allocPrint(gpa, "rejected: '{s} {s}' - '{s}' appears NOWHERE in this host's live telemetry (a hallucinated target). Real {s} targets on the host right now: [{s}]. Reissue host_command against one that actually exists.", .{ verb, target, target, verb, list.items }) catch dupe(gpa, "rejected: target appears nowhere in telemetry");
+}
+
+fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { command: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    const cmd = std.mem.trim(u8, p.value.command, " \r\n\t");
+    if (cmd.len == 0) return dupe(gpa, "no command given");
+    var it = std.mem.tokenizeAny(u8, cmd, " \t");
+    const verb = it.next() orelse "";
+    // allowlist the verb - the agent OPERATES the host, it cannot inject an arbitrary line (defensive remediation only)
+    const allowed = [_][]const u8{ "kill_proc", "block_ip", "remove_persistence", "restore_file", "isolate", "quarantine", "unisolate", "resume", "scan", "status", "safe_mode", "heater", "drive", "task_restart", "mutex_inherit" };
+    var ok = false;
+    for (allowed) |a| {
+        if (std.mem.eql(u8, verb, a)) {
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) return std.fmt.allocPrint(gpa, "rejected: '{s}' is not an allowed host command", .{verb}) catch dupe(gpa, "rejected");
+    // the target must be a real indicator in live telemetry (blocks hallucinated targets; steers the model right)
+    const target = std.mem.trim(u8, cmd[@min(verb.len + 1, cmd.len)..], " \t");
+    if (targetGuard(ctx, verb, target)) |rej| return rej;
+    const cp = std.fmt.allocPrint(gpa, "{s}/commands.jsonl", .{ctx.workdir}) catch return dupe(gpa, "oom");
+    defer gpa.free(cp);
+    const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, cp, gpa, .limited(256 << 10)) catch &[_]u8{};
+    defer if (prior.len > 0) gpa.free(prior);
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    defer joined.deinit(gpa);
+    joined.appendSlice(gpa, prior) catch {};
+    if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n") catch {};
+    joined.appendSlice(gpa, cmd) catch {};
+    joined.appendSlice(gpa, "\n") catch {};
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cp, .data = joined.items }) catch return dupe(gpa, "could not write to the command bus");
+    return std.fmt.allocPrint(gpa, "issued to host: {s}", .{cmd}) catch dupe(gpa, "issued");
 }
 
 fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {

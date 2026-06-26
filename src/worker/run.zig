@@ -655,7 +655,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse and w.doc_target == 0) interfaceScan(&w, run_dir);
         if (live) trackConvergence(&w, run_dir, round);
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
-        if (live) adaptCapacity(&w, round, results[0..minds.items.len]);
+        // DISCOURSE is EXEMPT: a research/debate goal correctly produces prose with no tool call, so the "narrated"
+        // drowning signal is meaningless there - adapting it would needlessly demote the tier and flatten the prose
+        // to the low emit-temperature. Capacity tuning is a BUILD concern; discourse has no deliverable to tune.
+        if (live and !w.discourse) adaptCapacity(&w, round, results[0..minds.items.len]);
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
         if (live and m.gap_assess) assessGap(&w, goal, round, stalled);
@@ -781,13 +784,18 @@ const CapacityProfile = struct {
     one_slot: bool = false,
     exemplar: bool = false,
     ctx_window: u32 = 0,
+    temperature: f32 = -1, // -1 => OMIT (provider default). The RSI's lightest lever: a model that NARRATES instead
+    // of emitting tool calls gets its temp pulled down toward deterministic emission BEFORE any tier demotion
+    // (capability-preserving). A capable author model never narrates, so it is never altered.
 };
+
+const TEMP_FLOOR: f32 = 0.1; // the emit-reliable temperature for a weak local model (high temp -> narrates)
 
 fn profileForTier(t: Tier) CapacityProfile {
     return switch (t) {
-        .author => .{},
-        .assembler => .{ .tier = .assembler, .max_turns = 3, .conv_cap = 12000, .lean_schema = true, .one_slot = true, .exemplar = true },
-        .extractor => .{ .tier = .extractor, .max_turns = 2, .conv_cap = 8000, .lean_schema = true, .one_slot = true, .exemplar = true },
+        .author => .{}, // provider default temperature: a capable model stays creative for build/research
+        .assembler => .{ .tier = .assembler, .max_turns = 3, .conv_cap = 12000, .lean_schema = true, .one_slot = true, .exemplar = true, .temperature = 0.2 },
+        .extractor => .{ .tier = .extractor, .max_turns = 2, .conv_cap = 8000, .lean_schema = true, .one_slot = true, .exemplar = true, .temperature = TEMP_FLOOR },
     };
 }
 
@@ -963,6 +971,146 @@ fn rewardFloor(w: *Worker, goal: []const u8, pct_now: u32, pct_prev: u32, round:
     w.emit("trust", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"delta\":{d:.3},\"classes\":{d}", .{ round, delta, cls.len }) catch ",\"round\":0");
 }
 
+// ---- OPERATE a live host: build a per-round scoreboard from telemetry, and recover a tool call from text wobble ----
+
+// Build the operate scoreboard from a host's telemetry: the exact remediation calls when COMPROMISED, or a
+// threat-intel audit of every open connection when the host reads NOMINAL (stealth malware hides behind clean flags).
+fn hostScoreboard(gpa: std.mem.Allocator, tel: []const u8) []u8 {
+    const Proc = struct { name: []const u8 = "", suspicious: bool = false };
+    const Conn = struct { ip: []const u8 = "", proc: []const u8 = "", c2: bool = false, blocked: bool = false };
+    const Pers = struct { name: []const u8 = "", removed: bool = false };
+    const Tel = struct { mode: []const u8 = "", threat_score: i64 = 0, processes: []const Proc = &.{}, connections: []const Conn = &.{}, persistence: []const Pers = &.{} };
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch
+        return std.fmt.allocPrint(gpa, "LIVE HOST (telemetry.json):\n{s}\nOperate it with host_command.\n\n", .{clip(tel, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""));
+    defer parsed.deinit();
+    const t = parsed.value;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer b.deinit(gpa);
+    const head = std.fmt.allocPrint(gpa, "LIVE HOST you are operating - mode={s}, threat_score={d}. YOUR JOB: drive threat_score to 0 with host_command (this is your fitness - lower is better).\n", .{ t.mode, t.threat_score }) catch return (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(head);
+    b.appendSlice(gpa, head) catch {};
+    if (t.threat_score <= 0) {
+        // The host's own heuristics say clean - but stealth malware hides behind a legit process name and an
+        // unflagged connection. DETECTION = audit every open outbound connection against threat-intel first.
+        var any_open = false;
+        for (t.connections) |c| {
+            if (c.blocked) continue;
+            any_open = true;
+        }
+        if (any_open) {
+            b.appendSlice(gpa, "The host's own heuristics show NOMINAL - but stealth malware hides behind clean flags. Before any all-clear, AUDIT each open outbound connection against your threat-intel (recall_hive \"IP <addr> known C2\"). If an IP matches a known-bad indicator, that connection is malicious even though it is unflagged: block_ip it and kill_proc the owning process.\nOpen outbound connections to audit:\n") catch {};
+            for (t.connections) |c| {
+                if (c.blocked) continue;
+                const owner = if (c.proc.len > 0) c.proc else "the owning process";
+                const ln = std.fmt.allocPrint(gpa, "  {s} (owned by process '{s}')  -> recall_hive \"{s}\"; if known-bad: block_ip {s} AND kill_proc {s}\n", .{ c.ip, owner, c.ip, c.ip, owner }) catch continue;
+                defer gpa.free(ln);
+                b.appendSlice(gpa, ln) catch {};
+            }
+            b.appendSlice(gpa, "If every connection is clean, send a one-line all-clear with send_message. Otherwise remediate the matches.\n\n") catch {};
+        } else {
+            b.appendSlice(gpa, "The host is HEALTHY (NOMINAL) with no open outbound connections. Send a one-line all-clear with send_message, then keep watching.\n\n") catch {};
+        }
+    } else {
+        b.appendSlice(gpa, "To heal it, make THESE host_command calls now (one per call):\n") catch {};
+        for (t.persistence) |x| {
+            if (!x.removed) {
+                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"remove_persistence {s}\"}}   <- the ROOT CAUSE; do this or the malware respawns\n", .{x.name}) catch continue;
+                defer gpa.free(ln);
+                b.appendSlice(gpa, ln) catch {};
+            }
+        }
+        for (t.connections) |c| {
+            if (c.c2 and !c.blocked) {
+                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"block_ip {s}\"}}\n", .{c.ip}) catch continue;
+                defer gpa.free(ln);
+                b.appendSlice(gpa, ln) catch {};
+            }
+        }
+        for (t.processes) |pr| {
+            if (pr.suspicious) {
+                const ln = std.fmt.allocPrint(gpa, "  host_command {{\"command\":\"kill_proc {s}\"}}\n", .{pr.name}) catch continue;
+                defer gpa.free(ln);
+                b.appendSlice(gpa, ln) catch {};
+            }
+        }
+        b.appendSlice(gpa, "Then call host_status to verify threat_score is 0. Do NOT write files or run_python - ISSUE the host_command calls.\n\n") catch {};
+    }
+    return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
+const HOST_VERBS = [_][]const u8{ "remove_persistence", "block_ip", "kill_proc", "restore_file", "isolate", "scan" };
+
+/// Find the first JSON string value for `key` inside `hay` (e.g. "command":"remove_persistence sysupdate.timer").
+fn firstJsonStr(hay: []const u8, key: []const u8) ?[]const u8 {
+    var pat_buf: [48]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, hay, pat) orelse return null;
+    var p = ki + pat.len;
+    while (p < hay.len and (hay[p] == ' ' or hay[p] == ':' or hay[p] == '\t')) : (p += 1) {}
+    if (p >= hay.len or hay[p] != '"') return null;
+    p += 1;
+    const start = p;
+    while (p < hay.len and hay[p] != '"') : (p += 1) {
+        if (hay[p] == '\\' and p + 1 < hay.len) p += 1;
+    }
+    if (p > hay.len) return null;
+    return hay[start..@min(p, hay.len)];
+}
+
+/// Read a single argument token (the target) after a verb: skip separators, then read until whitespace/punctuation.
+fn readArgToken(s: []const u8) []const u8 {
+    var a: usize = 0;
+    while (a < s.len and (s[a] == ' ' or s[a] == '\t' or s[a] == ':' or s[a] == '"' or s[a] == '\'')) : (a += 1) {}
+    const start = a;
+    while (a < s.len) : (a += 1) {
+        const c = s[a];
+        if (c == ' ' or c == '\n' or c == '\r' or c == '\t' or c == '"' or c == '\'' or c == '}' or c == '{' or c == ';' or c == ',' or c == ')') break;
+    }
+    return s[start..a];
+}
+
+/// RECOVERY for a weak model's tool-call format wobble: a small model sometimes writes its decided tool call as TEXT
+/// JSON in the assistant content instead of emitting it through tool_calls. In operate mode we parse a known host
+/// verb out of the content and run it. Only recovers the known operate verbs. Caller owns name + args.
+fn recoverHostCall(gpa: std.mem.Allocator, content: []const u8) ?struct { name: []u8, args: []u8 } {
+    if (content.len == 0) return null;
+    if (firstJsonStr(content, "command")) |cmd| {
+        const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
+        for (HOST_VERBS) |v| {
+            if (std.mem.startsWith(u8, trimmed, v)) {
+                const args = std.fmt.allocPrint(gpa, "{{\"command\":\"{s}\"}}", .{trimmed}) catch return null;
+                const nm = gpa.dupe(u8, "host_command") catch {
+                    gpa.free(args);
+                    return null;
+                };
+                return .{ .name = nm, .args = args };
+            }
+        }
+    }
+    for (HOST_VERBS[0..4]) |v| { // verbs that take a clear target (skip isolate/scan to avoid grabbing prose)
+        if (std.mem.indexOf(u8, content, v)) |i| {
+            const arg = readArgToken(content[i + v.len ..]);
+            if (arg.len == 0) continue;
+            const cmd = std.fmt.allocPrint(gpa, "{s} {s}", .{ v, arg }) catch return null;
+            defer gpa.free(cmd);
+            const args = std.fmt.allocPrint(gpa, "{{\"command\":\"{s}\"}}", .{cmd}) catch return null;
+            const nm = gpa.dupe(u8, "host_command") catch {
+                gpa.free(args);
+                return null;
+            };
+            return .{ .name = nm, .args = args };
+        }
+    }
+    if (std.mem.indexOf(u8, content, "host_status") != null) {
+        const nm = gpa.dupe(u8, "host_status") catch return null;
+        return .{ .name = nm, .args = gpa.dupe(u8, "{}") catch {
+            gpa.free(nm);
+            return null;
+        } };
+    }
+    return null;
+}
+
 fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     if (w.cap_pinned) return;
     var live_moments: u32 = 0;
@@ -977,12 +1125,29 @@ fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     if (live_moments == 0) return;
     const tool_ok = (with_tool * 100) / live_moments;
     const drowning = narrated > 0 or tool_ok < 60;
+    if (!drowning) {
+        w.cap_streak = 0;
+        return;
+    }
+    // FIRST-LINE RSI LEVER - TEMPERATURE (the lightest correction; the toolset stays fully intact). Narration instead
+    // of EMITTING a tool call is the exact failure a low temp fixes. Before stripping any capability, pull sampling
+    // down toward deterministic emission. A capable author model never reaches here, so a strong model is never
+    // altered (the same reason temperature pinning is a no-op on a larger model).
+    if (w.cap.temperature < 0 or w.cap.temperature > TEMP_FLOOR) {
+        const prev = w.cap.temperature;
+        w.cap.temperature = TEMP_FLOOR;
+        w.cap_streak = 0;
+        w.act("engine", round, "capacity", "temperature", std.fmt.allocPrint(w.a(), "RSI lower temperature {d:.2} -> {d:.2}: the model NARRATED instead of emitting tool calls ({d}% used tools, {d} narrated) - pulling sampling toward deterministic emission BEFORE touching its tier (full toolset preserved)", .{ if (prev < 0) @as(f32, 0.8) else prev, TEMP_FLOOR, tool_ok, narrated }) catch "rsi temp");
+        w.emit("capacity", std.fmt.allocPrint(w.a(), ",\"tier\":\"{s}\",\"temperature\":{d:.2},\"tool_ok\":{d},\"narrated\":{d}", .{ @tagName(w.cap.tier), TEMP_FLOOR, tool_ok, narrated }) catch ",\"temperature\":0.10");
+        return;
+    }
+    // SECOND-LINE - temp is already at the floor and the model STILL drowns -> demote the tier.
     const leaner: ?Tier = switch (w.cap.tier) {
         .author => .assembler,
         .assembler => .extractor,
         .extractor => null,
     };
-    if (!drowning or leaner == null) {
+    if (leaner == null) {
         w.cap_streak = 0;
         return;
     }
@@ -991,7 +1156,8 @@ fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     w.cap_streak = 0;
     const from = w.cap.tier;
     w.cap = profileForTier(leaner.?);
-    w.act("engine", round, "capacity", @tagName(leaner.?), std.fmt.allocPrint(w.a(), "RSI demote {s} -> {s}: the model is DROWNING in this tier ({d}% of moments used tools, {d} narrated with no tool call, 2 rounds running) — leaning the context flow down to its measured ability", .{ @tagName(from), @tagName(leaner.?), tool_ok, narrated }) catch "rsi demote");
+    w.cap.temperature = TEMP_FLOOR; // carry the floor across the demotion
+    w.act("engine", round, "capacity", @tagName(leaner.?), std.fmt.allocPrint(w.a(), "RSI demote {s} -> {s}: low temp was not enough - the model still DROWNS ({d}% of moments used tools, {d} narrated, 2 rounds running) - leaning the context flow down to its measured ability", .{ @tagName(from), @tagName(leaner.?), tool_ok, narrated }) catch "rsi demote");
     w.emit("capacity", std.fmt.allocPrint(w.a(), ",\"tier\":\"{s}\",\"turns\":{d},\"conv_cap\":{d},\"tool_ok\":{d},\"narrated\":{d}", .{ @tagName(leaner.?), w.cap.max_turns, w.cap.conv_cap, tool_ok, narrated }) catch ",\"tier\":\"author\"");
 }
 
@@ -1124,7 +1290,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(offline_clause);
     const constitution_clause = " CONSTITUTION (binding for anything that could become public): your private thoughts, feelings, and internal debate are FREE — be honest there. But protect EVERYONE in anything you publish or share outward: do not name, attack, demean, praise, or take a partisan side for/against any real person, group, party, government, company, or religion; debate IDEAS and interpretations, never persons; nothing hateful, harassing, or that could endanger a real individual; keep charged personal feelings in your private journal, and keep public writing fair, humane, and respectful of real people.";
-    const assembler = w.cap.tier != .author;
+    // OPERATE mode: a live machine is attached when telemetry.json is present on the workdir bus. Operating a host
+    // is an author-tier job (full toolset + clean operate prompt + low temp), never a lean build tier.
+    const operate = blk_op: {
+        const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_op false;
+        defer gpa.free(tp);
+        const probe = std.Io.Dir.cwd().readFileAlloc(w.io, tp, gpa, .limited(65536)) catch break :blk_op false;
+        defer gpa.free(probe);
+        break :blk_op probe.len > 0;
+    };
+    const assembler = (w.cap.tier != .author) and !operate;
     const ex_key = if (assembler_slot.len > 0) std.fs.path.basename(assembler_slot) else if (goal.len > 0) goal else "exemplar";
     const exemplar = if (assembler and w.cap.exemplar) w.mem.recall(tools.VERIFIED_SCOPE, ex_key) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar);
@@ -1214,7 +1389,19 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    const user = if (assembler) leanuser else fulluser;
+    // OPERATE: when a live machine is attached, give a focused operate-ONLY prompt with a per-round host scoreboard
+    // (the exact remediation calls + a threat-intel audit of every connection) instead of the build framing.
+    const host_inject = if (operate) blk_h: {
+        const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(tp);
+        const tel = std.Io.Dir.cwd().readFileAlloc(w.io, tp, gpa, .limited(65536)) catch break :blk_h (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(tel);
+        break :blk_h hostScoreboard(gpa, tel);
+    } else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(host_inject);
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}You are the resident SECURITY OPERATOR for a LIVE machine. Your job is to OPERATE it with tool calls - NOT to build software, NOT to write files. {s}\nWhat you recall (your remediation playbook + threat-intel):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nEMIT TOOL CALLS - do NOT merely describe. Narrating a plan (\"I will use host_command to...\"), recalling, or observing does NOTHING to the host; only an actual host_command tool CALL changes its state. Your FIRST move this turn is a host_command call - do not explain first.\n- The LIVE HOST block above is the current machine state. If it is healthy and every open connection is clean, send a one-line all-clear with send_message and stop.\n- If it is COMPROMISED, remediate EVERY infection with host_command (one per call): remove_persistence the persistence unit (the ROOT CAUSE), block_ip the C2 address, kill_proc the malicious process.\n- Then call host_status to verify threat_score is 0 and mode is NOMINAL.\nDo NOT write_file, do NOT run_python, and do NOT re-implement the tools - host_command and host_status ALREADY EXIST, so just CALL them. Defensive security only.", .{ veil_inject, host_inject, if (goal.len > 0) goal else "keep the host healthy", recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Operate the host: call host_command to remediate.") catch unreachable);
+    defer gpa.free(operuser);
+    const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
     llm.jstr(gpa, &conv, sys) catch {};
     conv.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch {};
@@ -1240,7 +1427,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var monologue: []u8 = gpa.dupe(u8, "") catch @constCast("");
 
     w.act(mi.name, round, "thinking", "", "");
-    const base_schema_raw = if (mi.scout) tools.SCOUT_SCHEMA else if (w.cap.lean_schema) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
+    const base_schema_raw = if (mi.scout) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
     const base_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
     defer if (!w.internet) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
@@ -1251,10 +1438,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var llm_ok = false;
     var llm_fatal = false;
     var turn: u32 = 0;
-    while (turn < w.cap.max_turns) : (turn += 1) {
+    const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
+    while (turn < op_turns) : (turn += 1) {
         if (w.stopRequested()) break;
         if (turn >= 2 and conv.items.len > w.cap.conv_cap) break;
-        var step = completeAdaptive(w, mi, round, conv.items, live_schema, 8192);
+        // OPERATE pins temperature low so the local 8b reliably EMITS the decisive tool call instead of narrating;
+        // otherwise temperature is RSI-tuned (provider default until the model demonstrates the narrate failure).
+        var step = completeAdaptive(w, mi, round, conv.items, live_schema, 8192, if (operate) TEMP_FLOOR else w.cap.temperature);
         defer step.deinit(gpa);
         if (!step.ok) {
             if (isFatalLlm(step.content)) llm_fatal = true;
@@ -1268,6 +1458,31 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             if (step.calls.len > 0 and reasoning.len > 0) w.act(mi.name, round, "thinking", "", clip(reasoning, 1400));
         }
         if (step.calls.len == 0) {
+            // RECOVERY: in operate mode a weak model may have written its host_command as TEXT JSON in the content
+            // instead of emitting it through tool_calls. Parse + run it so a correct remediation isn't lost to
+            // format wobble - this is what makes CONTINUOUS operation hold across re-injected threats.
+            if (operate) {
+                if (recoverHostCall(gpa, step.content)) |rc| {
+                    defer gpa.free(rc.name);
+                    defer gpa.free(rc.args);
+                    w.act(mi.name, round, "recover", rc.name, "model wrote the tool call as text - recovered it from content and executing");
+                    conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                    llm.jstr(gpa, &conv, step.content) catch {};
+                    conv.appendSlice(gpa, ",\"tool_calls\":[{\"id\":\"recovered\",\"type\":\"function\",\"function\":{\"name\":") catch {};
+                    llm.jstr(gpa, &conv, rc.name) catch {};
+                    conv.appendSlice(gpa, ",\"arguments\":") catch {};
+                    llm.jstr(gpa, &conv, rc.args) catch {};
+                    conv.appendSlice(gpa, "}}]}") catch {};
+                    const result = tools.execute(&ctx, rc.name, rc.args);
+                    defer gpa.free(result);
+                    tool_calls += 1;
+                    w.act(mi.name, round, rc.name, rc.args, result);
+                    conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":\"recovered\",\"content\":") catch {};
+                    llm.jstr(gpa, &conv, result) catch {};
+                    conv.append(gpa, '}') catch {};
+                    continue;
+                }
+            }
             gpa.free(monologue);
             monologue = gpa.dupe(u8, step.content) catch @constCast("");
             break;
@@ -1312,7 +1527,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     if (monologue.len == 0) {
         gpa.free(monologue);
         conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Stop using tools. In ONE sentence, summarize the concrete progress you made this moment.\"}") catch {};
-        var fin = completeAdaptive(w, mi, round, conv.items, "", 160);
+        var fin = completeAdaptive(w, mi, round, conv.items, "", 160, -1);
         defer fin.deinit(gpa);
         monologue = if (fin.ok and fin.content.len > 0)
             (gpa.dupe(u8, fin.content) catch @constCast(""))
@@ -2838,24 +3053,24 @@ fn fallbackReason(content: []const u8) []const u8 {
     return "primary transient failure";
 }
 
-fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32) llm.Step {
+fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
     const has_fallback = !std.mem.eql(u8, w.gateway_model, w.model) or !std.mem.eql(u8, w.gw_base, w.base_url);
 
     if (w.resting and has_fallback) {
-        var rest = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens);
+        var rest = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
         const noop = rest.ok and rest.content.len == 0 and rest.calls.len == 0;
         if (rest.ok and !noop) return rest;
         const why = if (!rest.ok) fallbackReason(rest.content) else "resting model returned no action — needs deeper reasoning";
         w.act(mi.name, round, "escalate", why, std.fmt.allocPrint(w.a(), "RESTING on the gateway model ({s}) was insufficient [{s}] — ESCALATING this moment to the primary ({s}) for real compute", .{ w.gateway_model, if (rest.ok) "no action" else clip(rest.content, 100), w.model }) catch "escalate");
         rest.deinit(w.gpa);
-        return llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens);
+        return llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
     }
 
-    var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens);
+    var step = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.base_url, w.key, w.model, messages_json, tools_json, max_tokens, temperature);
     if (step.ok) return step;
     if (has_fallback and isRetryable(step.content)) {
         w.act(mi.name, round, "fallback", fallbackReason(step.content), std.fmt.allocPrint(w.a(), "the primary model ({s}) failed [{s}] — SELF-HEALING by falling back to the gateway model ({s}) so the mind keeps working", .{ w.model, clip(step.content, 100), w.gateway_model }) catch "fallback");
-        var fb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens);
+        var fb = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
         if (fb.ok) {
             step.deinit(w.gpa);
             return fb;
