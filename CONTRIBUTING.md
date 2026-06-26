@@ -6,9 +6,11 @@ Thanks for your interest — contributions are welcome.
 
 1. Install [Zig 0.16+](https://ziglang.org/download/) and Python 3.9+.
 2. Get a model endpoint (the easiest is [Ollama](https://ollama.com): `ollama pull llama3.1:8b`).
-3. Put the `neuron` memory-engine binary at `bin/neuron` (`bin/neuron.exe` on Windows) — see the README.
+3. Install the [Rust toolchain](https://rustup.rs) so `deploy.py` can build the `neuron` memory
+   engine on first run (or drop an existing `neuron` binary at `bin/`). See the README.
 4. `zig build` — the binary lands in `zig-out/bin/veil`.
-5. `python deploy.py "say hello" --minutes 1 --follow` to confirm the loop runs end to end.
+5. `python deploy.py "say hello" --minutes 1 --follow` to confirm the loop runs end to end
+   (the first run fetches + builds `neuron`; pass `--yes` to skip the prompt).
 
 ## Ground rules
 

@@ -50,7 +50,8 @@ python deploy.py "Write a five-chapter sci-fi novella as ch01.md..ch05.md" --min
 - Python 3.9+ — to run `deploy.py`.
 - An OpenAI-compatible model endpoint. The simplest is [Ollama](https://ollama.com):
   `ollama pull llama3.1:8b` (free, local, no key).
-- The **neuron memory engine** binary at `bin/neuron` (`bin/neuron.exe` on Windows). See
+- The [Rust toolchain](https://rustup.rs) (`cargo`) — needed **once** so `deploy.py` can build the
+  **neuron memory engine** on first run. Skip it if you already have a `neuron` binary. See
   [Memory engine](#memory-engine).
 
 **Build**
@@ -151,10 +152,18 @@ environment, or in a `keys.env` (`NAME=VALUE`) inside the run dir — both are g
 
 ## Memory engine
 
-The hive's memory is **neuron-db**, a small associative store compiled to a single `neuron`
-binary. `veil` shells out to it for every recall/observe. Put the binary at `bin/neuron`
-(`bin/neuron.exe` on Windows); `deploy.py` finds it there automatically, or point it with
-`--neuron-bin <path>`.
+The hive's memory is **neuron-db** ([source](https://github.com/gary23w/neuron-db)), a small
+associative store compiled to a single `neuron` binary that `veil` shells out to for every
+recall/observe.
+
+You don't install it by hand. The **first time** you run `deploy.py` with no `neuron` binary
+present, it offers to fetch the source from GitHub and build it (this needs the
+[Rust toolchain](https://rustup.rs) — `cargo`), drops the result at `bin/neuron`
+(`bin/neuron.exe` on Windows), and reuses it on every later run. Pass `--yes` to skip the prompt
+(e.g. in CI). The fetched source and build cache live in `.neuron-src/` (gitignored).
+
+Already have a `neuron` binary? Put it at `bin/neuron`, or point `deploy.py` at it with
+`--neuron-bin <path>`, and the build step is skipped.
 
 ## Project layout
 

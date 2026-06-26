@@ -68,12 +68,92 @@ def find_binary(override):
     sys.exit("ERROR: the `veil` binary was not found. Build it with `zig build`, or pass --bin <path>.")
 
 
-def find_neuron(override):
+NEURON_REPO = "https://github.com/gary23w/neuron-db"
+
+
+def _have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def fetch_neuron_src(dest):
+    """Get the neuron-db source into dest/ (download a tarball, or git clone). Returns the repo root."""
+    for cand in (os.path.join(dest, "neuron-db-main"), os.path.join(dest, "neuron-db-master"),
+                 os.path.join(dest, "neuron-db")):
+        if os.path.isfile(os.path.join(cand, "rust", "neuron-core", "Cargo.toml")):
+            return cand
+    os.makedirs(dest, exist_ok=True)
+    import urllib.request, tarfile, io as _io
+    for branch in ("main", "master"):
+        url = f"{NEURON_REPO}/archive/refs/heads/{branch}.tar.gz"
+        try:
+            print(f"  fetching neuron-db source ({branch}) ...")
+            with urllib.request.urlopen(url, timeout=120) as r:
+                blob = r.read()
+            with tarfile.open(fileobj=_io.BytesIO(blob), mode="r:gz") as tf:
+                try:
+                    tf.extractall(dest, filter="data")
+                except TypeError:
+                    tf.extractall(dest)
+            root = os.path.join(dest, "neuron-db-" + branch)
+            if os.path.isfile(os.path.join(root, "rust", "neuron-core", "Cargo.toml")):
+                return root
+        except Exception as e:
+            print(f"    {branch} tarball unavailable: {e}")
+    if _have("git"):
+        repo = os.path.join(dest, "neuron-db")
+        print("  cloning neuron-db ...")
+        subprocess.run(["git", "clone", "--depth", "1", NEURON_REPO + ".git", repo])
+        if os.path.isfile(os.path.join(repo, "rust", "neuron-core", "Cargo.toml")):
+            return repo
+    return None
+
+
+def build_neuron(repo_root, target_dir):
+    """cargo-build the `neuron` CLI from repo_root into target_dir. Returns the binary path or None."""
+    manifest = os.path.join(repo_root, "rust", "neuron-core", "Cargo.toml")
+    if not os.path.isfile(manifest):
+        for base, _dirs, files in os.walk(repo_root):
+            if "Cargo.toml" in files and base.replace("\\", "/").endswith("neuron-core"):
+                manifest = os.path.join(base, "Cargo.toml"); break
+    env = dict(os.environ); env["CARGO_TARGET_DIR"] = target_dir
+    print("  building neuron (cargo build --release --bin neuron --features sqlite,cortex) ...")
+    print("  one-time: this downloads crates and compiles - a few minutes. Reused afterwards.")
+    r = subprocess.run(["cargo", "build", "--release", "--bin", "neuron",
+                        "--features", "sqlite,cortex", "--manifest-path", manifest], env=env)
+    out = os.path.join(target_dir, "release", NEU)
+    return out if (r.returncode == 0 and os.path.isfile(out)) else None
+
+
+def ensure_neuron(override, assume_yes=False):
+    """Find the neuron memory engine, or fetch + build it from source the first time."""
     n = _first([override, os.path.join(ROOT, "bin", NEU)]) or shutil.which("neuron")
-    if not n:
-        sys.exit("ERROR: the neuron memory engine was not found. Pass --neuron-bin <path>, or place the "
-                 "`neuron` binary at bin/" + NEU + " (see the README).")
-    return n
+    if n:
+        return n
+    print("\n- the neuron memory engine (the hive's memory) isn't installed yet.")
+    if not _have("cargo"):
+        sys.exit("ERROR: building neuron needs the Rust toolchain (cargo), which wasn't found.\n"
+                 "       Install it from https://rustup.rs and re-run, or pass --neuron-bin <path> to an\n"
+                 "       existing binary. Source: " + NEURON_REPO)
+    if not assume_yes and sys.stdin.isatty():
+        if not ask_yes(f"fetch + build it now from {NEURON_REPO} (needs cargo; ~a few minutes)?", True):
+            sys.exit("aborted. Build neuron yourself from " + NEURON_REPO + " and place it at bin/" + NEU)
+    src = os.path.join(ROOT, ".neuron-src")
+    repo = fetch_neuron_src(src)
+    if not repo:
+        sys.exit("ERROR: couldn't fetch the neuron-db source. Clone " + NEURON_REPO + " and build it manually.")
+    built = build_neuron(repo, os.path.join(src, "_target"))
+    if not built:
+        sys.exit("ERROR: the neuron build failed (see the cargo output above). Source: " + NEURON_REPO)
+    bindir = os.path.join(ROOT, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    dst = os.path.join(bindir, NEU)
+    shutil.copyfile(built, dst)
+    try:
+        os.chmod(dst, 0o755)
+    except Exception:
+        pass
+    print(f"  neuron installed -> {dst}\n")
+    return dst
 
 
 # ------------------------------------------------------------------------------------ run mgmt
@@ -118,7 +198,7 @@ def resume(name, watch=False):
     if os.path.isfile(stop):
         os.remove(stop)
     binary = find_binary(None)
-    neuron = find_neuron(None)
+    neuron = ensure_neuron(None)
     env = dict(os.environ)
     env.setdefault("NEURON_MAX_FACTS", "1000000")
     logf = open(os.path.join(d, "worker.log"), "a", encoding="utf-8")
@@ -178,7 +258,7 @@ def follow(run_dir, proc):
 def deploy(args):
     args.name = args.name or ("swarm_" + time.strftime("%Y%m%d_%H%M%S"))
     binary = find_binary(args.bin)
-    neuron = find_neuron(args.neuron_bin)
+    neuron = ensure_neuron(args.neuron_bin, getattr(args, "yes", False))
     run_dir = os.path.join(DATA, args.name)
     os.makedirs(run_dir, exist_ok=True)
 
@@ -489,7 +569,7 @@ def wizard():
         goal=goal, name=name, minds=minds, minutes=minutes, model=p["model"],
         provider=p["provider"], base_url=p["base_url"], key=key_value, style=style,
         offline=offline, breakout=breakout, corpus=corpus, corpus_cap=corpus_cap,
-        gateway_model=gateway_model, bin=None, neuron_bin=None, follow=watch,
+        gateway_model=gateway_model, bin=None, neuron_bin=None, follow=watch, yes=False,
     )
 
     print("\n  --- plan ------------------------------------------------")
@@ -550,7 +630,8 @@ def main():
     ap.add_argument("--corpus-cap", dest="corpus_cap", type=int, default=20000)
     ap.add_argument("--gateway-model", dest="gateway_model", default=None, help="cheaper model for mechanical engine calls (summarise/classify/route)")
     ap.add_argument("--bin", default=None)
-    ap.add_argument("--neuron-bin", dest="neuron_bin", default=None)
+    ap.add_argument("--neuron-bin", dest="neuron_bin", default=None, help="path to an existing neuron engine binary")
+    ap.add_argument("-y", "--yes", action="store_true", help="don't prompt before fetching/building the neuron engine on first run")
     ap.add_argument("--follow", action="store_true", help="stream the hive's activity live")
     deploy(ap.parse_args())
 
