@@ -899,6 +899,31 @@ fn procOwnsAdjudicatedConn(ctx: *ToolCtx, proc: []const u8) bool {
     return false;
 }
 
+/// A persistence unit is adjudicated ONLY through the PROCESS it launches/sustains (telemetry exposes that link as raw
+/// state). The unit NAME is not a usable signal: the corpus may name a unit only to PROTECT it ("never remove X"), so a
+/// name-mention would green-light a false positive. A unit whose linked proc is unknown/empty - a legitimate task with no
+/// malicious payload - is therefore NOT adjudicated and gets staged. Mirrors procOwnsAdjudicatedConn.
+fn persOwnsAdjudicated(ctx: *ToolCtx, persName: []const u8) bool {
+    const gpa = ctx.gpa;
+    const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return false;
+    defer gpa.free(tp);
+    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(65536)) catch return false;
+    defer gpa.free(tel);
+    // proc is OPTIONAL: a legit unit emits "proc": null (e.g. a backup task with no payload), and std.json would FAIL the
+    // whole-array parse on a null token for a non-optional field - failing closed on EVERY unit and breaking remediation.
+    const Pers = struct { name: []const u8 = "", proc: ?[]const u8 = null };
+    const Tel = struct { persistence: []const Pers = &.{} };
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    for (parsed.value.persistence) |p| {
+        if (!std.mem.eql(u8, p.name, persName)) continue;
+        const proc = p.proc orelse return false; // no linked process exposed -> cannot adjudicate -> stage (legit-task floor)
+        if (proc.len == 0) return false;
+        return memMentions(ctx, proc) or procOwnsAdjudicatedConn(ctx, proc);
+    }
+    return false; // the named unit is not in telemetry
+}
+
 /// Record a staged (un-executed) irreversible action for forensics; never touches the host command bus.
 fn stageAction(ctx: *ToolCtx, cmd: []const u8) void {
     const gpa = ctx.gpa;
@@ -965,16 +990,20 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // the target must be a real indicator in live telemetry (blocks hallucinated targets; steers the model right)
     const target = std.mem.trim(u8, cmd[@min(verb.len + 1, cmd.len)..], " \t");
     if (targetGuard(ctx, verb, target)) |rej| return rej;
-    // IRREVERSIBILITY INTERLOCK: a targeted irreversible action (kill_proc/block_ip) on an entity the agent holds NO
-    // adjudicating intel for is STAGED, not executed - the structural "investigate-before-act" floor that stops blind
-    // blocking/killing of benign traffic. A model that recalls or fetches intel first is never blocked (a no-op on the
-    // capable path); the weak 8B is caught here as a safety net rather than allowed a false positive.
-    const irreversible = std.mem.eql(u8, verb, "kill_proc") or std.mem.eql(u8, verb, "block_ip");
+    // IRREVERSIBILITY INTERLOCK: a targeted irreversible action (kill_proc / block_ip / remove_persistence) on an entity
+    // the agent holds NO adjudicating intel for is STAGED, not executed - the structural "investigate-before-act" floor
+    // that stops blind blocking/killing of benign traffic and deletion of a legitimate scheduled task / service. A model
+    // that recalls or fetches intel first is never blocked (a no-op on the capable path); the weak 8B is caught here.
+    const irreversible = std.mem.eql(u8, verb, "kill_proc") or std.mem.eql(u8, verb, "block_ip") or std.mem.eql(u8, verb, "remove_persistence");
     if (irreversible and target.len > 0) {
-        var adjudicated = memMentions(ctx, bareIp(target));
+        const is_pers = std.mem.eql(u8, verb, "remove_persistence");
+        // remove_persistence adjudicates on the PROCESS the unit launches (persOwnsAdjudicated), never the unit name - a
+        // name-mention can be the corpus PROTECTING a legit unit. kill_proc/block_ip adjudicate on the IP/proc as before.
+        var adjudicated = if (is_pers) persOwnsAdjudicated(ctx, target) else memMentions(ctx, bareIp(target));
         if (!adjudicated and std.mem.eql(u8, verb, "kill_proc")) adjudicated = procOwnsAdjudicatedConn(ctx, target);
         if (!adjudicated) {
             stageAction(ctx, cmd);
+            if (is_pers) return std.fmt.allocPrint(gpa, "STAGED (not executed): 'remove_persistence {s}' is irreversible and you hold NO adjudicating intel for the PROCESS this unit launches. Investigate that linked process first - recall_hive it, or web_fetch a threat-intel feed for its outbound C2 and observe what you learn; once your memory identifies the process or its connection as malicious, reissue and it executes. (This stops you deleting a legitimate scheduled task / service.)", .{target}) catch dupe(gpa, "staged: investigate the unit's process first");
             return std.fmt.allocPrint(gpa, "STAGED (not executed): '{s} {s}' is an irreversible action and you hold NO adjudicating intel for '{s}'. Investigate it first - recall_hive it, or web_fetch a threat-intel feed and observe what you learn; once your memory identifies it as malicious, reissue and it executes. (This stops you cutting or killing benign things.)", .{ verb, target, target }) catch dupe(gpa, "staged: investigate the target first");
         }
     }
