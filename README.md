@@ -1,3 +1,5 @@
+![the-veil](web/public/veil.png)
+
 # the veil
 
 **A hive mind controlled by the Veil.**

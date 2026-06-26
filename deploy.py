@@ -116,10 +116,13 @@ def build_neuron(repo_root, target_dir):
             if "Cargo.toml" in files and base.replace("\\", "/").endswith("neuron-core"):
                 manifest = os.path.join(base, "Cargo.toml"); break
     env = dict(os.environ); env["CARGO_TARGET_DIR"] = target_dir
-    print("  building neuron (cargo build --release --bin neuron --features sqlite,cortex) ...")
+    # `trust` enables the learned recall floor (the AI memory's anti-drift grounding). Override with
+    # NEURON_FEATURES=... for a custom build. Cross-OS: cargo emits the binary in target/release/ everywhere.
+    features = os.environ.get("NEURON_FEATURES", "sqlite,cortex,trust")
+    print(f"  building neuron (cargo build --release --bin neuron --features {features}) ...")
     print("  one-time: this downloads crates and compiles - a few minutes. Reused afterwards.")
     r = subprocess.run(["cargo", "build", "--release", "--bin", "neuron",
-                        "--features", "sqlite,cortex", "--manifest-path", manifest], env=env)
+                        "--features", features, "--manifest-path", manifest], env=env)
     out = os.path.join(target_dir, "release", NEU)
     return out if (r.returncode == 0 and os.path.isfile(out)) else None
 

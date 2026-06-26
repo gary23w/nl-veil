@@ -308,6 +308,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .autonomous = m.autonomous,
         .internet = m.internet,
     };
+    w.mem.trust = true; // always-on learned floor for the AI hive memory (auth uses a separate Neuron client)
     defer w.scratch.deinit();
     defer gpa.free(w.ev_path);
     defer gpa.free(w.ctl_path);
@@ -644,6 +645,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 w.depgraph_str = dg;
                 if (dg.len > 0) w.act("engine", round, "depgraph", "import graph", dg);
             }
+            // TRUST FLOOR: reward the classes the hive surfaced by THIS round's fitness Δ. Only on a real
+            // graded outcome (status .ok) — a no-tests/error round has no honest signal. Engine-owned.
+            if (w.last_bench.status == .ok) rewardFloor(&w, goal, w.last_bench.pct, prev_pct, round);
         }
 
         if (live and !w.discourse) smokeTest(&w, run_dir);
@@ -941,6 +945,22 @@ fn retriableToolFail(name: []const u8, result: []const u8) bool {
     const marks = [_][]const u8{ "error", "failed", "could not", "timed out", "timeout", "curl", "unreachable", "no response", "connection", "temporar" };
     for (marks) |mk| if (std.mem.indexOf(u8, low, mk) != null) return true;
     return false;
+}
+
+// TRUST FLOOR (interim): reward the tag-classes the hive surfaces for `goal` by the round's fitness Δ
+// (pct now − before, /100). One sample recall + one reward; the ledger lives in mind.sqlite, engine-owned.
+fn rewardFloor(w: *Worker, goal: []const u8, pct_now: u32, pct_prev: u32, round: u32) void {
+    const q = if (goal.len > 0) goal else "knowledge";
+    const cls = w.mem.sampleClassesAlloc(tools.KNOWLEDGE_SCOPE, q, 1, 12) orelse return;
+    defer {
+        for (cls) |c| w.gpa.free(c);
+        w.gpa.free(cls);
+    }
+    if (cls.len == 0) return;
+    const dpct: i32 = @as(i32, @intCast(pct_now)) - @as(i32, @intCast(pct_prev));
+    const delta: f32 = @as(f32, @floatFromInt(dpct)) / 100.0;
+    w.mem.trustReward(delta, cls);
+    w.emit("trust", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"delta\":{d:.3},\"classes\":{d}", .{ round, delta, cls.len }) catch ",\"round\":0");
 }
 
 fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
