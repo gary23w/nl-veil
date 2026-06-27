@@ -69,7 +69,8 @@ fn isThinking(model: []const u8) bool {
     return std.mem.indexOf(u8, m, "r1") != null or std.mem.indexOf(u8, m, "qwq") != null or
         std.mem.indexOf(u8, m, "o1") != null or std.mem.indexOf(u8, m, "o3") != null or
         std.mem.indexOf(u8, m, "think") != null or std.mem.indexOf(u8, m, "reason") != null or
-        std.mem.indexOf(u8, m, "deepseek-r") != null;
+        std.mem.indexOf(u8, m, "deepseek-r") != null or std.mem.indexOf(u8, m, "gpt-oss") != null or
+        std.mem.indexOf(u8, m, "gpt-5") != null or std.mem.indexOf(u8, m, "o4") != null;
 }
 
 /// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or a

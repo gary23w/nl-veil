@@ -9,8 +9,9 @@ Thanks for your interest — contributions are welcome.
    if `cargo` is missing (needed once to build the `neuron` memory engine — skip it entirely with an
    existing `neuron` binary via `--neuron-bin <path>`). The one thing it can't auto-install is a **C
    compiler** (neuron compiles SQLite); `doctor` prints the one-liner for your OS.
-3. Get a model endpoint (the easiest is [Ollama](https://ollama.com): `ollama pull llama3.1:8b` —
-   `deploy.py` will offer to install Ollama and pull the model for you too).
+3. Get a model endpoint (the easiest is [Ollama](https://ollama.com): `ollama pull gpt-oss:20b`, the
+   default — or `llama3.1:8b` on very small devices; `deploy.py` will offer to install Ollama and pull
+   the model for you too).
 4. To build by hand: `zig build` — the binary lands in `zig-out/bin/veil`.
 5. `python deploy.py "say hello" --minutes 1 --follow` confirms the loop runs end to end
    (the first run fetches + builds `neuron`; pass `--yes` to take every auto-install default).

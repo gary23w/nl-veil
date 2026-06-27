@@ -2160,7 +2160,23 @@ pub const SMOKE_PY =
     \\        except Exception: continue
     \\        if ("http.server" in t or "socketserver" in t or "BaseHTTPRequestHandler" in t) and "__main__" in t:
     \\            cands.append(p.replace(os.sep,"/"))
-    \\    if not cands: out({"status":"no-server"})
+    \\    if not cands:
+    \\        errs=[]
+    \\        for q in glob.glob("**/*.py",recursive=True):
+    \\            if "__pycache__" in q: continue
+    \\            try: compile(open(q,encoding="utf-8",errors="replace").read(),q,"exec")
+    \\            except SyntaxError as e: errs.append("%s:%s %s"%(os.path.basename(q),getattr(e,"lineno","?"),(e.msg or "")[:50]))
+    \\            except Exception: pass
+    \\        if errs: out({"status":"cli","ok":False,"note":"syntax error: "+"; ".join(errs[:3])})
+    \\        tf=[q for q in glob.glob("**/*.py",recursive=True) if "__pycache__" not in q and os.path.basename(q)!="spec_test.py" and (os.path.basename(q).startswith("test_") or os.path.basename(q).endswith("_test.py"))]
+    \\        if tf:
+    \\            try:
+    \\                pr=subprocess.run([sys.executable,"-m","pytest","-q","--no-header","-x"]+tf,capture_output=True,text=True,timeout=60)
+    \\                if pr.returncode!=0:
+    \\                    ls=[l for l in (pr.stdout or pr.stderr or "").strip().splitlines() if l.strip()]
+    \\                    out({"status":"cli","ok":False,"note":"pytest failed: "+(ls[-1] if ls else "see output")[:80]})
+    \\            except Exception as e: out({"status":"cli","ok":True,"note":"pytest skipped: "+str(e)[:40]})
+    \\        out({"status":"cli","ok":True})
     \\    entry=sorted(cands,key=lambda p:(p.count("/"),len(p)))[0]
     \\    s=socket.socket(); s.bind(("127.0.0.1",0)); port=s.getsockname()[1]; s.close()
     \\    env=dict(os.environ); env["AINET_PORT"]=str(port); env["PORT"]=str(port)

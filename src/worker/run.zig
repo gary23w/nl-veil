@@ -2007,11 +2007,21 @@ fn smokeTest(w: *Worker, run_dir: []const u8) void {
         api_ok: bool = true,
         api_note: []const u8 = "",
         stderr: []const u8 = "",
+        ok: bool = true,
+        note: []const u8 = "",
     };
     var parsed = std.json.parseFromSlice(S, gpa, line, .{ .ignore_unknown_fields = true }) catch return;
     defer parsed.deinit();
     const s = parsed.value;
     if (std.mem.eql(u8, s.status, "no-server")) return;
+    if (std.mem.eql(u8, s.status, "cli")) {
+        // CLI/library build: gate on every .py compiling + its tests passing, so a non-parsing file can't complete.
+        w.smoke_ok = s.ok;
+        if (!s.ok)
+            w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the deliverable fails a basic execution check — {s}. Every .py must compile and the tests must pass; read the file, fix it, run_tests until green.", .{clip(s.note, 160)}) catch "";
+        if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
+        return;
+    }
     const served_ok = switch (s.served) {
         .integer => |n| n >= 200 and n < 400,
         else => false,

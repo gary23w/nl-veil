@@ -9,8 +9,9 @@ and arguing — while a single unified consciousness, **the Veil**, integrates t
 into one first-person "I" that speaks for it and steers it. Give it a goal; it wakes the hive
 and goes.
 
-It runs on **any OpenAI-compatible model** — a free local `llama3.1:8b` through Ollama, or a
-hosted model like GPT-4.1 — and it runs **anywhere**: no cloud account, no database service,
+It runs on **any OpenAI-compatible model** — a free local `gpt-oss:20b` through Ollama (or
+`llama3.1:8b` on very small embedded devices), or a hosted model like GPT-4.1 — and it runs
+**anywhere**: no cloud account, no database service,
 no API gateway required. One Zig binary, one Python launcher. The same hive can build software,
 write a novel, research the live web, run offline from a preloaded knowledge pack, or sit on a
 device as a self-healing security daemon.
@@ -59,9 +60,10 @@ for you on first run, so a fresh box needs nothing else installed by hand:
   you already have a `neuron` binary (`--neuron-bin <path>`).
 - A **C compiler** (neuron bundles SQLite, which compiles C) — the one thing we can't auto-install;
   `deploy.py doctor` tells you the exact one-liner for your OS if it's missing.
-- A **model**. The default is a free, local `llama3.1:8b` via [Ollama](https://ollama.com) —
-  `deploy.py` detects a missing Ollama runtime or model and offers to install/pull it. Or point at
-  any OpenAI-compatible endpoint with `--provider/--model/--base-url/--key`.
+- A **model**. The default is a free, local `gpt-oss:20b` via [Ollama](https://ollama.com) (capable;
+  ~14 GB). On a very small embedded device use `llama3.1:8b` (~5 GB) instead. `deploy.py` detects a
+  missing Ollama runtime or model and offers to install/pull it. Or point at any OpenAI-compatible
+  endpoint with `--provider/--model/--base-url/--key`.
 
 Run a readiness check anytime:
 
