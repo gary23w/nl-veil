@@ -1,5 +1,6 @@
 //! Commons — the swarm's shared message bus (messages.jsonl) + event-sourced task board (tasks.jsonl), kept
-
+//! byte-compatible with the Python Commons so the existing swarm-chat pane (mind_msg) + board render
+//! identically. Minds in a swarm run sequentially in one worker process, so plain read+append is safe.
 const std = @import("std");
 const llm = @import("llm.zig");
 
@@ -25,6 +26,7 @@ fn countLines(s: []const u8) u32 {
     return n;
 }
 
+/// Post a bus message: {"i":N,"round":R,"from":frm,"to":to,"kind":"msg","text":text}.
 pub fn sendMessage(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, frm: []const u8, to: []const u8, text: []const u8, round: u32) void {
     const path = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{run_dir}) catch return;
     defer gpa.free(path);
@@ -47,6 +49,8 @@ pub fn sendMessage(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, frm:
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items }) catch {};
 }
 
+/// Recent messages addressed to `me` (or broadcast), not its own — for injecting into the moment prompt.
+/// Returns a newline-joined text block (caller frees).
 pub fn inbox(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, me: []const u8, limit: usize) []u8 {
     const path = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(path);
@@ -76,6 +80,7 @@ pub fn inbox(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, me: []cons
     return out.toOwnedSlice(gpa) catch gpa.dupe(u8, "") catch @constCast("");
 }
 
+/// Add a task event: {"type":"add","id":N,"by":by,"assignee":assignee,"task":task}.
 pub fn addTask(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, by: []const u8, assignee: []const u8, task: []const u8) u32 {
     const path = std.fmt.allocPrint(gpa, "{s}/tasks.jsonl", .{run_dir}) catch return 0;
     defer gpa.free(path);
@@ -121,6 +126,7 @@ fn nextTaskId(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) u32 {
 
 pub const Board = struct { done: u32, open: u32 };
 
+/// Fold the task events into done/open counts (a `done` event closes a prior `add`).
 pub fn board(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) Board {
     const path = std.fmt.allocPrint(gpa, "{s}/tasks.jsonl", .{run_dir}) catch return .{ .done = 0, .open = 0 };
     defer gpa.free(path);

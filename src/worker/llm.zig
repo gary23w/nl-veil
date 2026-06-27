@@ -1,5 +1,9 @@
 //! The worker's LLM client. The Zig control plane has no HTTPS client, and an LLM call is network-bound
-
+//! (seconds), so we shell out to curl — its overhead is noise next to the model latency. The API key is
+//! passed via a curl config file (-K), so it never appears on the process argv.
+//!
+//! Two entry points: chat() for a one-shot system+user completion, and complete() for the agentic tool loop
+//! (a pre-built messages array + a tools array → content OR parsed tool_calls).
 const std = @import("std");
 
 pub const Reply = struct {
@@ -7,6 +11,10 @@ pub const Reply = struct {
     ok: bool,
 };
 
+/// PROCESS-WIDE TOKEN METER. The provider reports exact prompt/completion token counts in every response's
+/// `usage` block; we accumulate them here at the single call choke-point (completeBody) so the engine can report
+/// REAL cost per round/run instead of guessing from request byte sizes (which are noisy — a moment's last request
+/// depends on how many tool turns it ran). Atomic because minds call concurrently. One worker = one swarm = one process.
 pub var tokens_in: std.atomic.Value(u64) = .init(0);
 pub var tokens_out: std.atomic.Value(u64) = .init(0);
 pub var tokens_in_free: std.atomic.Value(u64) = .init(0);
@@ -35,14 +43,24 @@ pub const Step = struct {
     }
 };
 
+/// A LOCAL model endpoint (Ollama / LM Studio / llama.cpp on this machine) — detected from the base_url. Local
+/// inference behaves differently from a hosted API: it is much SLOWER (seconds–minutes, CPU/partial-GPU) and it
+/// never rate-limits, so the client must NOT use the short hosted timeout + transient-retry, and a THINKING model
+/// (e.g. DeepSeek-R1) spends part of its token budget on hidden reasoning — so tiny max_tokens calls return empty.
 fn isLocal(base_url: []const u8) bool {
     return std.mem.indexOf(u8, base_url, "localhost") != null or
         std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, base_url, "0.0.0.0") != null or
         std.mem.indexOf(u8, base_url, "[::1]") != null;
 }
+/// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer, so a
+/// 160-token retro/gap call would come back empty. Give those calls room to think AND answer.
 const LOCAL_MIN_TOKENS: u32 = 2048;
 
+/// Is this a THINKING/reasoning model (hidden chain-of-thought before the answer)? Only those need the token floor.
+/// A plain relay model (llama3.1, qwen-instruct, mistral, gemma, phi) answers fine at a small max_tokens — and
+/// flooring IT to 2048 forces it to GENERATE 2048 tokens for a 200-token task, which turned the local relay into a
+/// multi-minute stall. So the floor must be gated on the model, not just on "is it local".
 fn isThinking(model: []const u8) bool {
     var buf: [64]u8 = undefined;
     const n = @min(model.len, buf.len);
@@ -54,10 +72,15 @@ fn isThinking(model: []const u8) bool {
         std.mem.indexOf(u8, m, "deepseek-r") != null;
 }
 
+/// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or a
+/// local NON-thinking relay model) uses the caller's value verbatim — so the relay generates only what it needs.
 fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
     return if (isLocal(base_url) and isThinking(model)) @max(max_tokens, LOCAL_MIN_TOKENS) else max_tokens;
 }
 
+/// POST a fully-formed request body to {base_url}/chat/completions. Returns the raw response JSON (caller
+/// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv. `tag`
+/// makes the scratch request/config files per-caller (per-mind) so concurrent minds don't clobber each other.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Reply {
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.llmreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
     defer gpa.free(reqpath);
@@ -87,6 +110,7 @@ fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8
     return .{ .content = run.stdout, .ok = true };
 }
 
+/// One-shot system+user completion → the assistant text.
 pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, system: []const u8, user: []const u8, max_tokens: u32) Reply {
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -104,10 +128,10 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
 }
 
+/// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
+/// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     const mt = effTokens(base_url, model, max_tokens);
-    // temperature < 0 => OMIT (provider default); >= 0 => pin it. Operate mode pins it low so a weak model reliably
-    // EMITS the decisive tool call instead of narrating its plan.
     const temp_frag = if (temperature >= 0)
         std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
     else
@@ -183,6 +207,12 @@ fn stepErr(gpa: std.mem.Allocator, msg: []const u8) Step {
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .calls = &.{}, .ok = false };
 }
 
+/// Append a JSON-escaped, quoted string. Multibyte runs are copied verbatim only when they decode as
+/// valid UTF-8; any invalid, lone, or truncated byte is replaced with U+FFFD. This matters because the
+/// body is shipped raw by `curl --data-binary`: a single bad byte makes it invalid UTF-8 and OpenAI
+/// answers `400 ... error parsing the body`. Such bytes turn up when `max_tokens` truncates model output
+/// (or tool arguments) mid-codepoint, or when a tool result carries arbitrary bytes — both of which are
+/// echoed back into the next request, producing the intermittent 400-then-recover we saw on live swarms.
 pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     try list.append(gpa, '"');
     var i: usize = 0;

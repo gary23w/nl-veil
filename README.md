@@ -49,22 +49,30 @@ python deploy.py "Build a CLI todo app in Python, with tests" --follow
 
 ## Quick start
 
-**Prerequisites**
+**Prerequisites** — only **Python 3.9+** is truly required up front. `deploy.py` bootstraps the rest
+for you on first run, so a fresh box needs nothing else installed by hand:
 
-- [Zig 0.16+](https://ziglang.org/download/) — to build the engine.
-- Python 3.9+ — to run `deploy.py`.
-- A model. The default is a free, local `llama3.1:8b` via [Ollama](https://ollama.com). You don't
-  have to set it up by hand — `deploy.py` detects a missing Ollama runtime or model and offers to
-  install/pull it for you. Or point at any OpenAI-compatible endpoint with
-  `--provider/--model/--base-url/--key`.
-- The [Rust toolchain](https://rustup.rs) (`cargo`) — needed **once** so `deploy.py` can build the
-  **neuron memory engine** on first run. Skip it if you already have a `neuron` binary. See
-  [Memory engine](#memory-engine).
+- **Zig** (to build the `veil` engine) — if it's missing, `deploy.py` downloads a pinned release into
+  `./.zig` and builds with it.
+- The **Rust toolchain** / `cargo` (to build the **neuron memory engine** once) — if it's missing,
+  `deploy.py` installs it via the official [rustup](https://rustup.rs) installer. Skip it entirely if
+  you already have a `neuron` binary (`--neuron-bin <path>`).
+- A **C compiler** (neuron bundles SQLite, which compiles C) — the one thing we can't auto-install;
+  `deploy.py doctor` tells you the exact one-liner for your OS if it's missing.
+- A **model**. The default is a free, local `llama3.1:8b` via [Ollama](https://ollama.com) —
+  `deploy.py` detects a missing Ollama runtime or model and offers to install/pull it. Or point at
+  any OpenAI-compatible endpoint with `--provider/--model/--base-url/--key`.
 
-**Build**
+Run a readiness check anytime:
 
 ```bash
-zig build              # produces zig-out/bin/veil
+python deploy.py doctor      # shows every build/runtime dependency + what deploy.py will auto-install
+```
+
+**Build** (optional — `deploy.py` does this for you the first time):
+
+```bash
+zig build              # produces zig-out/bin/veil  (auto-downloaded zig also works: ./.zig/zig build)
 ```
 
 **Deploy a hive**
