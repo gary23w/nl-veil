@@ -1,9 +1,14 @@
 //! The mind's toolbelt, in Zig — the keyless, single-purpose tools a mind calls during a moment to build,
-
+//! research, and remember. These mirror the core of the Python kit/sandbox: run_python (a sandboxed Python
+//! script), write_file/read_file (build artifacts in the workdir), web_fetch (research via curl), and the
+//! memory ops (observe/recall/note_stance). The model is given SCHEMA as the `tools` array; execute() runs
+//! a parsed tool_call and returns a text result to feed back into the conversation.
 const std = @import("std");
 const builtin = @import("builtin");
 const Mem = @import("memory.zig").Mem;
 const commons = @import("commons.zig");
+const llm = @import("llm.zig");
+const crawl = @import("crawl.zig");
 
 extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
@@ -15,16 +20,25 @@ const KillGuard = struct {
     fn watch(g: KillGuard) void {
         var waited: u32 = 0;
         while (waited < g.deadline_ms) : (waited += 150) {
-            if (builtin.os.tag == .windows) Sleep(150) else std.posix.nanosleep(0, 150 * std.time.ns_per_ms);
+            if (builtin.os.tag == .windows) {
+                Sleep(150);
+            } else {
+                const ts = std.posix.timespec{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&ts, null);
+            }
             if (g.done.load(.monotonic)) return;
         }
         if (g.done.load(.monotonic)) return;
         if (builtin.os.tag == .windows) {
             _ = TerminateProcess(@ptrCast(g.id), 1);
-        } else std.posix.kill(g.id, 9) catch {};
+        } else std.posix.kill(g.id, .KILL) catch {};
     }
 };
 
+/// Spawn a subprocess (its body redirected to a file via the caller's argv, so stdout never blocks the read) and KILL
+/// it by handle if it runs longer than `deadline_ms` — so a WAF-held curl self-heals (the tool returns whatever
+/// arrived) instead of wedging the swarm. The watchdog holds a COPY of the handle (captured before spawn) so it never
+/// races the main thread's wait(); TerminateProcess on an already-closed handle is harmless.
 fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
     var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
     var done = std.atomic.Value(bool).init(false);
@@ -37,6 +51,8 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
     if (th) |t| t.join();
 }
 
+/// Fetch a URL via curl into a per-mind temp file, guarded by spawnGuarded (so a WAF hang is killed, not fatal), then
+/// read back whatever body arrived. Caller frees. `json` adds the Accept header; `limit` caps the read.
 fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limit: usize) []u8 {
     const gpa = ctx.gpa;
     const tmp = std.fmt.allocPrint(gpa, "{s}/.fetch-{s}.tmp", .{ ctx.run_dir, ctx.mind }) catch return dupe(gpa, "oom");
@@ -52,6 +68,29 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
     return raw;
 }
 
+/// A per-moment buffer for a WEAK model's deliberate memory writes (observe/share/note_stance). When a ToolCtx carries
+/// a sink, those writes are queued here INSTEAD of hitting neuron-db immediately, so the engine can junk-filter +
+/// writer-ground them against the moment's evidence at moment-end before committing (the anti-hallucination floor for
+/// low-param models — see run.flushMemWrites). A capable model carries no sink and its writes store immediately.
+pub const PendKind = enum { fact, stance, message };
+pub const PendWrite = struct { kind: PendKind, a: []const u8, b: []const u8 = "" };
+pub const MemSink = struct {
+    gpa: std.mem.Allocator,
+    items: std.ArrayListUnmanaged(PendWrite) = .empty,
+    pub fn push(self: *MemSink, kind: PendKind, a: []const u8, b: []const u8) void {
+        const da = self.gpa.dupe(u8, a) catch return;
+        const db = if (b.len > 0) (self.gpa.dupe(u8, b) catch "") else "";
+        self.items.append(self.gpa, .{ .kind = kind, .a = da, .b = db }) catch self.gpa.free(da);
+    }
+    pub fn deinit(self: *MemSink) void {
+        for (self.items.items) |it| {
+            self.gpa.free(@constCast(it.a));
+            if (it.b.len > 0) self.gpa.free(@constCast(it.b));
+        }
+        self.items.deinit(self.gpa);
+    }
+};
+
 pub const ToolCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -59,15 +98,16 @@ pub const ToolCtx = struct {
     run_dir: []const u8,
     workdir: []const u8,
     scope: []const u8,
+    learn_scope: []const u8 = KNOWLEDGE_SCOPE,
     mind: []const u8,
     round: u32,
     mem: Mem,
     files_written: *u32,
     observed: *u32,
+    mem_sink: ?*MemSink = null,
     skills_saved: *u32,
     directives_set: *u32,
     tools_made: *u32,
-    learn_scope: []const u8 = KNOWLEDGE_SCOPE, // where the agent's observes land; operate mode routes them to INTEL
     space: []const u8 = "",
     band_y0: i64 = -1,
     band_y1: i64 = -1,
@@ -87,49 +127,92 @@ fn unlockFiles(ctx: *ToolCtx) void {
     if (ctx.fmtx) |m| m.unlock(ctx.io);
 }
 
+/// Write a fact to the SHARED hive, TAGGED with who/when ("[Noor r7] ..."). A hive fact is a mind's own first-person
+/// sentence; tagging it tells every reader it is a TEAMMATE's report, not their own memory — preventing the identity
+/// merge where one mind absorbs another's "I" as its own. The tag also gives a free recency stamp for the read path.
 fn hiveStore(ctx: *ToolCtx, fact: []const u8) void {
     const tagged = std.fmt.allocPrint(ctx.gpa, "[{s} r{d}] {s}", .{ ctx.mind, ctx.round, fact }) catch fact;
     defer if (tagged.ptr != fact.ptr) ctx.gpa.free(tagged);
     _ = ctx.mem.observe(ctx.learn_scope, tagged);
 }
 
+/// The swarm-shared skill library lives in its own neuron-db scope (in the per-swarm mind.sqlite), so every
+/// mind reads + writes the SAME skills and can build on each other's learned techniques.
 pub const SKILL_SCOPE = "skills";
 
+/// The swarm's self-authored OPERATING PLAYBOOK — process directives the minds write for THEMSELVES (e.g.
+/// "read a file before improving it", "one mind owns each section"). It is injected into every mind's system
+/// prompt, so the minds effectively edit their own operating instructions and improve their PROCESS over time
+/// (recursive self-improvement of strategy — the engine/harness stays fixed and human-controlled).
 pub const PLAYBOOK_SCOPE = "playbook";
 
+/// The swarm's FITNESS history — one "round N: P/T (pct%)" line per round, written by the engine's benchmark.
+/// This is the measurable spine of recursive self-improvement: improvement is a NUMBER that must climb, not a
+/// vibe. The deliverable is scored each round (real tests > compiles > artifact-presence) and that score is fed
+/// back into every mind's prompt as the gradient to raise.
 pub const SCORE_SCOPE = "score";
 
+/// Shared HIVE KNOWLEDGE — facts any mind learns FOR THE TEAM (not just for itself). A scout that observes into
+/// its OWN scope is a hoarder: it learns, but the hive never sees it. Routing the scout's observe here (and
+/// injecting this scope into every mind's prompt) makes the learner a real contributor — knowledge brought BACK
+/// to the hive, not held. Swarm-shared, like SKILL_SCOPE.
 pub const KNOWLEDGE_SCOPE = "knowledge";
 
-// INTEL — the evictable runtime-learning cache (web evidence, threat-intel the agent fetches mid-run), kept apart
-// from the protected KNOWLEDGE core so a baked indicator is never crowded out by transient observations.
+/// The EXTERNAL / runtime-LEARNED cache: facts the swarm acquired from the live web at runtime (scout/web tools)
+/// while OPERATING — kept separate from KNOWLEDGE_SCOPE (the protected core: baked playbook, tools, skills,
+/// directives, the daemon's own identity). Only this scope is evictable, so a service deployment can cap + FIFO it
+/// (stale threat-intel decays) WITHOUT ever touching the core. recall_hive spans BOTH, so the agent recalls all of it.
 pub const INTEL_SCOPE = "intel";
 
+/// The VERIFIED-WORK corpus — heads of build files the swarm has already gotten RIGHT (promoted by the engine
+/// on a new-best round). It is the few-shot bank the ASSEMBLER tier retrieves an exemplar from before filling a
+/// slot: a small model can't author a form from nothing but can COMPLETE a pattern it is shown, so handing it a
+/// sibling the team already produced ("match this shape") is the highest-leverage input. Author tier never reads it.
 pub const VERIFIED_SCOPE = "verified";
 
+/// The hive's KNOWLEDGE GAPS — what the goal needs that the ingested corpus + learned facts do NOT cover. The
+/// anti-complacency channel: a preloaded hive tends to assume it has everything, so an engine gap-auditor names
+/// what's missing each round and the scout is pointed at it (research the gap, don't re-derive the corpus).
 pub const GAP_SCOPE = "gaps";
 
+/// RSI proposal ledger — structured change proposals (hypothesis, metric, risk, rollback) authored by minds.
+/// The engine's governance loop reads this scope each round, runs simulation/critique/canary, then accepts/holds.
 pub const PROPOSAL_SCOPE = "proposals";
 
+/// RSI world-model simulation notes — predicted outcomes + side effects for proposed changes before application.
 pub const SIM_SCOPE = "simulations";
 
+/// Multi-timescale memory channels for RSI compounding: episodes (short), strategy (medium), architecture (long).
 pub const EPISODE_SCOPE = "episodes";
 pub const STRATEGY_SCOPE = "strategy";
 pub const ARCH_SCOPE = "architecture";
 
+/// Self-generated training trajectory — challenge prompts the engine derives from current weakness profile.
 pub const CURRICULUM_SCOPE = "curriculum";
 
+/// Canary history for accepted self-mods (what was trialed, score deltas, rollout decision).
 pub const CANARY_SCOPE = "canary";
 
+/// Explicit autonomy stack snapshots: mission, strategy, execution, governor checks.
 pub const AUTONOMY_SCOPE = "autonomy";
 
+/// The hive's shared SPATIAL MAP — discovered cells of a hidden grid, written by `probe`. A hive's structural
+/// superpower is PARALLEL REGION-SEARCH: when a space is too big for one mind to perceive at once, the minds
+/// partition it, each probes a DIFFERENT region, and the findings accumulate HERE as one shared map every mind
+/// can read — ant-colony style (this scope is the pheromone trail). Injected in full each moment so the
+/// collective map (not any one mind's local view) drives reconstruction. Empty unless a deploy supplies `space`.
 pub const SPACE_SCOPE = "space";
 
+/// Self-authored TOOLS — the hive's capability acquisition ("RSI schemas dynamically"). When a task needs
+/// something the built-in tools can't do, a mind authors a NEW tool with make_tool: it's stored here (swarm-
+/// shared), its schema is injected into every mind's tools array, and it becomes callable by name. Each record
+/// is `name \x1f params_json \x1f base64(python_body)` (base64 so newlines/quotes can't corrupt the db line).
 pub const TOOL_SCOPE = "tools";
 pub const MAX_TOOLS = 16;
 pub const MAX_TOOL_BODY = 8 * 1024;
 pub const MAX_TOOL_PARAMS = 4 * 1024;
 
+/// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
@@ -139,8 +222,8 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"delete_file","description":"Delete a file you created in your build workdir (clean up a dead end, a wrong scaffold, or junk).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine - do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"HTTP GET a URL and return its readable text content (HTML tags stripped, truncated). Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine — do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
+    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — find URLs + snippets for a query. Use this FIRST to discover sources, then web_fetch the best result.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body (not HTML-stripped). Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -163,10 +246,15 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only available when the swarm has a spatial substrate). You cannot see the grid directly — you sense it ONE cell at a time. probe(x,y) reads the cell at column x, row y (both 0-based) and AUTO-RECORDS it to the hive's shared map so every teammate sees it. This is the hive's spatial superpower: divide the grid into regions, each mind probes a DIFFERENT region in parallel, and the shared map fills in far faster than one mind alone. Check the 'Discovered map' you're shown before re-probing a known cell.","parameters":{"type":"object","properties":{"x":{"type":"integer","description":"column, 0-based"},"y":{"type":"integer","description":"row, 0-based"}},"required":["x","y"]}}}
 ;
 
+/// The SCOUT's tool set — a RESEARCH-ONLY subset of SCHEMA. The build tools (run_python, write_file) are
+/// deliberately ABSENT so the learner mind STRUCTURALLY cannot drift into building: an imperative "do not build"
+/// prompt did not hold (the LLM scout ignored it and wrote files like everyone else), so the engine simply
+/// withholds the ability. The scout can read context, search/read the web, store facts, save skills, and
+/// message teammates — its only outputs are KNOWLEDGE. Keep these defs in sync with their twins in SCHEMA.
 pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — find URLs + snippets for a query. Use this FIRST to discover sources, then read_url the best result.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"]},"limit":{"type":"integer"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS. Prefer this over web_fetch for real articles/specs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"HTTP GET a URL and return its readable text content (HTML stripped).","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean readable text (our in-house crawler strips tags + prunes boilerplate). Optional 'query' fits the page to your topic.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"osint_scan","description":"Public-source OSINT scan for one URL: extract high-signal leads (emails, phones, domains, docs, socials, and notable outbound links).","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"deep_crawl","description":"Recursive public-web crawl from a seed URL with bounded depth/pages, extracting lead-rich links across hops.","parameters":{"type":"object","properties":{"url":{"type":"string"},"depth":{"type":"integer"},"max_pages":{"type":"integer"},"same_host":{"type":"boolean"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body. Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -180,6 +268,11 @@ pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"send_message","description":"Send the single most useful thing you learned to a teammate (or 'all').","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
+/// The ASSEMBLER's tool set — the minimal authoring set for a small model (8B) in scaffold-and-fill mode. The full
+/// 28-tool SCHEMA (~6k tokens, re-sent every turn) drowns a weak model and confuses weak tool-calling, so the
+/// assembler is given ONLY what it needs: read what exists, write the fill, record a fact, and recall_hive — so it
+/// can PULL the exact concept/pattern the hive already learned before it builds (without recall, learned knowledge
+/// is stored-and-forgotten). No web/search (the scout's job), no run_python/run_tests. Keep defs in sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
@@ -187,6 +280,8 @@ pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
 ;
 
+/// Run one tool. `args_json` is the raw arguments string from the tool_call. Returns a gpa-owned result
+/// (caller frees) — always a string, even on error, so it can feed back to the model.
 pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     if (std.mem.eql(u8, name, "run_python")) return runPython(ctx, args_json);
@@ -215,6 +310,11 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
         if (std.mem.trim(u8, p.value.fact, " \r\n\t").len == 0) return dupe(gpa, "empty fact, nothing stored");
+        if (ctx.mem_sink) |sink| {
+            sink.push(.fact, p.value.fact, "");
+            ctx.observed.* += 1;
+            return dupe(gpa, "noted — will be checked against what actually happened before it enters memory");
+        }
         if (ctx.share_obs) {
             hiveStore(ctx, p.value.fact);
         } else {
@@ -241,6 +341,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
         if (std.mem.trim(u8, p.value.fact, " \r\n\t").len == 0) return dupe(gpa, "empty, nothing shared");
+        if (ctx.mem_sink) |sink| {
+            sink.push(.fact, p.value.fact, "");
+            return dupe(gpa, "noted — will be checked against what actually happened before it's shared with the hive");
+        }
         hiveStore(ctx, p.value.fact);
         const total = ctx.mem.factCount(KNOWLEDGE_SCOPE);
         return std.fmt.allocPrint(gpa, "shared with the hive ({d} collective facts; every teammate can now recall_hive it)", .{total}) catch dupe(gpa, "shared");
@@ -249,7 +353,6 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { query: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
-        // recall_hive spans BOTH tiers: the protected KNOWLEDGE core and the evictable INTEL learning-cache.
         const core = ctx.mem.assoc(KNOWLEDGE_SCOPE, p.value.query, 1, 12);
         defer gpa.free(core);
         const learned = ctx.mem.assoc(INTEL_SCOPE, p.value.query, 1, 12);
@@ -283,6 +386,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { topic: []const u8 = "", feeling: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
+        if (ctx.mem_sink) |sink| {
+            sink.push(.stance, p.value.topic, p.value.feeling);
+            return dupe(gpa, "noted");
+        }
         ctx.mem.stance(ctx.scope, p.value.topic, p.value.feeling);
         return dupe(gpa, "noted");
     }
@@ -326,6 +433,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { to: []const u8 = "all", text: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
+        if (ctx.mem_sink) |sink| {
+            sink.push(.message, p.value.to, p.value.text);
+            return std.fmt.allocPrint(gpa, "queued for {s} — checked against what actually happened before it's sent", .{p.value.to}) catch dupe(gpa, "queued");
+        }
         lockFiles(ctx);
         defer unlockFiles(ctx);
         commons.sendMessage(gpa, ctx.io, ctx.run_dir, ctx.mind, p.value.to, p.value.text, ctx.round);
@@ -459,12 +570,16 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 4000), clip(r.stderr, 1500) }) catch dupe(gpa, "ran");
 }
 
+/// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
+/// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
     const builtins = [_][]const u8{ "run_python", "write_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
 
+/// Find an authored tool's python body (decoded from base64) by name. Newest record wins. Caller frees; null if
+/// the name isn't a registered authored tool.
 fn authoredBody(ctx: *ToolCtx, name: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
     const all = ctx.mem.list(TOOL_SCOPE);
@@ -489,6 +604,9 @@ fn authoredBody(ctx: *ToolCtx, name: []const u8) ?[]u8 {
     return out;
 }
 
+/// Run an authored tool's body as DATA: the call args are passed as argv[1] and json.loads'd into a global ARGS
+/// dict — NEVER concatenated into source (closes the code-injection path). Provider keys blanked like runPython.
+/// Result contract: the LAST stdout line starting with '{' (a JSON result); else an exit+stderr debug dump.
 fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const guard = "import os as _o\ntry:\n import webbrowser as _wb\n _wb.open=lambda *a,**k:False\nexcept Exception: pass\n_o.startfile=getattr(_o,'startfile',None) and (lambda *a,**k:None)\n";
@@ -522,6 +640,11 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     return std.fmt.allocPrint(gpa, "exit={d}\nstdout:\n{s}\nstderr:\n{s}", .{ exit, clip(r.stdout, 3000), clip(r.stderr, 1500) }) catch dupe(gpa, "ran");
 }
 
+/// Strip mis-decoded control bytes that smart punctuation (curly quotes / em-dashes) lands as when the model's
+/// text is mangled — they are INVISIBLE, compound on every read->rewrite, and make a prose deliverable unshippable.
+/// Removes C0 controls (0x00-0x1f) and DEL (0x7f), KEEPING newline (0x0a) and carriage-return (0x0d); a TAB (0x09)
+/// is kept only when it is NOT wedged between two alphanumerics (preserves code indentation, drops in-word
+/// corruption). gpa-owned copy; input unchanged. Near-always a structural no-op for clean text.
 fn sanitizeModelText(gpa: std.mem.Allocator, s: []const u8) []u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     out.ensureTotalCapacity(gpa, s.len) catch return dupe(gpa, s);
@@ -722,6 +845,8 @@ const LIST_DIR_PY =
     \\print('\n'.join(out) if out else '(empty directory)')
 ;
 
+/// LIST_DIR — see the file tree (the swarm could read a known path but never LIST what exists). Lists the build
+/// workdir by default, or the patch-system root (root="system") so a mind can navigate the engine before patching it.
 fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { path: []const u8 = ".", root: []const u8 = "workdir" };
@@ -761,6 +886,9 @@ const RUN_TESTS_PY =
     \\    print('test runner error: %r'%e)
 ;
 
+/// RUN_TESTS — close the RSI self-repair loop: after a mind patches or writes code it can RUN the deliverable's tests
+/// (pytest, else a test_*.py) and see pass/fail, so "fix it if it breaks" becomes fix -> test -> fix. Has its own
+/// 120s timeout (python kills a hung test suite), so a runaway test can't wedge the moment.
 fn runTests(ctx: *ToolCtx, args_json: []const u8) []u8 {
     _ = args_json;
     const gpa = ctx.gpa;
@@ -776,27 +904,14 @@ fn runTests(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return dupe(gpa, clip(out, 4000));
 }
 
-fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
-    const gpa = ctx.gpa;
-    const A = struct { path: []const u8 = "" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
-    defer p.deinit();
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
-    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom");
-    defer gpa.free(full);
-    std.Io.Dir.cwd().deleteFile(ctx.io, full) catch return dupe(gpa, "could not delete (not found?)");
-    return std.fmt.allocPrint(gpa, "deleted {s}", .{p.value.path}) catch dupe(gpa, "deleted");
-}
-
-// ---- OPERATE a live host: read its telemetry and issue remediation commands over a file bus ----
-
+/// DELETE_FILE — let a mind remove a file it created in the workdir (clean up a dead end, a wrong scaffold, junk).
 fn hostStatus(ctx: *ToolCtx, args_json: []const u8) []u8 {
     _ = args_json;
     const gpa = ctx.gpa;
     const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return dupe(gpa, "oom");
     defer gpa.free(tp);
     return std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(8192)) catch
-        dupe(gpa, "no telemetry.json on the bus - no machine is attached to this run");
+        dupe(gpa, "no telemetry.json on the bus — no machine is attached to this run");
 }
 
 /// IPv4 address with the :port stripped (everything before the first ':'), so "185.143.220.7:3333" and
@@ -806,25 +921,26 @@ fn bareIp(s: []const u8) []const u8 {
 }
 
 /// TARGET GUARD: a verb that names a specific threat (block_ip / kill_proc / remove_persistence) must point at a
-/// target that EXISTS in the host's live telemetry. A target is valid if it is a REAL connection/process - NOT only
-/// a host-FLAGGED one (requiring the flag would defeat DETECTION, where the agent identifies a stealth implant by
-/// cross-referencing threat-intel). The guard still rejects HALLUCINATED targets that appear nowhere in telemetry,
-/// listing the real ones to steer the model. Fail-open if no machine is attached. Returns an owned rejection or null.
+/// target that EXISTS in the live telemetry's threat set. A weak 8b sometimes issues a command at a HALLUCINATED
+/// target (e.g. block_ip on a benign internal IP that was never on the scoreboard) — wasting the moment and, worse,
+/// taking a real action against a non-threat. The guard rejects those AND lists the actual indicators, steering the
+/// model to the right command. Fail-open: if no machine is attached or telemetry is unparseable, it allows the call.
+/// Returns an owned rejection message, or null if the target is valid (or the verb takes no target).
 fn targetGuard(ctx: *ToolCtx, verb: []const u8, target: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
     const is_ip = std.mem.eql(u8, verb, "block_ip");
     const is_proc = std.mem.eql(u8, verb, "kill_proc");
     const is_pers = std.mem.eql(u8, verb, "remove_persistence");
-    if (!is_ip and !is_proc and !is_pers) return null; // host-wide verbs (isolate/scan/...) need no target
+    if (!is_ip and !is_proc and !is_pers) return null;
     const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return null;
     defer gpa.free(tp);
-    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(16384)) catch return null; // no machine -> allow
+    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(16384)) catch return null;
     defer gpa.free(tel);
     const Proc = struct { name: []const u8 = "", pid: i64 = 0, suspicious: bool = false };
     const Conn = struct { ip: []const u8 = "", c2: bool = false };
     const Pers = struct { name: []const u8 = "" };
     const Tel = struct { processes: []const Proc = &.{}, connections: []const Conn = &.{}, persistence: []const Pers = &.{} };
-    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return null; // unparseable -> allow
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
     const t = parsed.value;
     var known = false;
@@ -848,19 +964,19 @@ fn targetGuard(ctx: *ToolCtx, verb: []const u8, target: []const u8) ?[]u8 {
             const pids = std.fmt.bufPrint(&pidbuf, "{d}", .{pr.pid}) catch "";
             if (std.mem.eql(u8, pr.name, target) or std.mem.eql(u8, pids, target)) known = true;
         }
-    } else { // remove_persistence
+    } else {
         for (t.persistence) |x| {
             add(gpa, &list, x.name);
             if (std.mem.eql(u8, x.name, target)) known = true;
         }
     }
     if (known) return null;
-    return std.fmt.allocPrint(gpa, "rejected: '{s} {s}' - '{s}' appears NOWHERE in this host's live telemetry (a hallucinated target). Real {s} targets on the host right now: [{s}]. Reissue host_command against one that actually exists.", .{ verb, target, target, verb, list.items }) catch dupe(gpa, "rejected: target appears nowhere in telemetry");
+    return std.fmt.allocPrint(gpa, "rejected: '{s} {s}' — '{s}' appears NOWHERE in this host's live telemetry (a hallucinated target). Real {s} targets on the host right now: [{s}]. Reissue host_command against one that actually exists.", .{ verb, target, target, verb, list.items }) catch dupe(gpa, "rejected: target appears nowhere in telemetry");
 }
 
-/// A target is "adjudicated" only by an EXTERNALLY-SOURCED fact that names it - a baked indicator ([src:corpus] /
+/// A target is "adjudicated" only by an EXTERNALLY-SOURCED fact that names it — a baked indicator ([src:corpus] /
 /// [src:threatintel] / [verified]) or captured web evidence ([src:web]). A self-authored observe (tagged "[mind rN]")
-/// does NOT count: the agent cannot satisfy the interlock by simply asserting an entity is bad - it must recall a real
+/// does NOT count: the agent cannot satisfy the interlock by simply asserting an entity is bad — it must recall a real
 /// indicator or actually fetch one. This is what forces the web-learning a pure "does memory mention it" check missed.
 fn externallyAdjudicated(text: []const u8, needle: []const u8) bool {
     var it = std.mem.splitScalar(u8, text, '\n');
@@ -881,7 +997,7 @@ fn memMentions(ctx: *ToolCtx, needle: []const u8) bool {
     return externallyAdjudicated(b, needle);
 }
 
-/// A process is adjudicated if a connection it OWNS points at an address the agent holds adjudicating intel for - so
+/// A process is adjudicated if a connection it OWNS points at an address the agent holds adjudicating intel for — so
 /// killing the owner of a confirmed-bad C2 is allowed without the agent needing separate intel on the process name.
 fn procOwnsAdjudicatedConn(ctx: *ToolCtx, proc: []const u8) bool {
     const gpa = ctx.gpa;
@@ -901,27 +1017,25 @@ fn procOwnsAdjudicatedConn(ctx: *ToolCtx, proc: []const u8) bool {
 
 /// A persistence unit is adjudicated ONLY through the PROCESS it launches/sustains (telemetry exposes that link as raw
 /// state). The unit NAME is not a usable signal: the corpus may name a unit only to PROTECT it ("never remove X"), so a
-/// name-mention would green-light a false positive. A unit whose linked proc is unknown/empty - a legitimate task with no
-/// malicious payload - is therefore NOT adjudicated and gets staged. Mirrors procOwnsAdjudicatedConn.
+/// name-mention would green-light a false positive. A unit whose linked proc is unknown/empty — a legitimate task with no
+/// malicious payload — is therefore NOT adjudicated and gets staged. Mirrors procOwnsAdjudicatedConn.
 fn persOwnsAdjudicated(ctx: *ToolCtx, persName: []const u8) bool {
     const gpa = ctx.gpa;
     const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return false;
     defer gpa.free(tp);
     const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(65536)) catch return false;
     defer gpa.free(tel);
-    // proc is OPTIONAL: a legit unit emits "proc": null (e.g. a backup task with no payload), and std.json would FAIL the
-    // whole-array parse on a null token for a non-optional field - failing closed on EVERY unit and breaking remediation.
     const Pers = struct { name: []const u8 = "", proc: ?[]const u8 = null };
     const Tel = struct { persistence: []const Pers = &.{} };
     const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return false;
     defer parsed.deinit();
     for (parsed.value.persistence) |p| {
         if (!std.mem.eql(u8, p.name, persName)) continue;
-        const proc = p.proc orelse return false; // no linked process exposed -> cannot adjudicate -> stage (legit-task floor)
+        const proc = p.proc orelse return false;
         if (proc.len == 0) return false;
         return memMentions(ctx, proc) or procOwnsAdjudicatedConn(ctx, proc);
     }
-    return false; // the named unit is not in telemetry
+    return false;
 }
 
 /// Record a staged (un-executed) irreversible action for forensics; never touches the host command bus.
@@ -958,14 +1072,19 @@ fn normalizeCmd(gpa: std.mem.Allocator, cmd: []const u8) []const u8 {
 
 fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    // accept the natural key variants a weak model reaches for ("cmd"/"action") as well as the schema's "command",
-    // so its action actually LANDS instead of parsing to empty - this papercut silently dropped every command in the IoT test.
-    const A = struct { command: []const u8 = "", cmd: []const u8 = "", action: []const u8 = "" };
+    const A = struct { command: []const u8 = "", cmd: []const u8 = "", action: []const u8 = "", args: []const []const u8 = &.{} };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const raw_cmd = if (p.value.command.len > 0) p.value.command else if (p.value.cmd.len > 0) p.value.cmd else p.value.action;
-    // STRIP MARKDOWN NOISE: a weak model wraps commands in backticks/asterisks (`kill_proc 5602`) and the noise mangles
-    // the target so a CORRECT command gets rejected ('185.220.101.34`' != '185.220.101.34'). Remove it so its action lands.
+    var raw_cmd = if (p.value.command.len > 0) p.value.command else if (p.value.cmd.len > 0) p.value.cmd else p.value.action;
+    var argbuf: std.ArrayListUnmanaged(u8) = .empty;
+    defer argbuf.deinit(gpa);
+    if ((raw_cmd.len == 0 or std.mem.eql(u8, raw_cmd, "host_command") or std.mem.eql(u8, raw_cmd, "hostCommand")) and p.value.args.len > 0) {
+        for (p.value.args, 0..) |a, i| {
+            if (i > 0) argbuf.append(gpa, ' ') catch {};
+            argbuf.appendSlice(gpa, a) catch {};
+        }
+        raw_cmd = argbuf.items;
+    }
     var clean: std.ArrayListUnmanaged(u8) = .empty;
     defer clean.deinit(gpa);
     for (raw_cmd) |c| {
@@ -973,11 +1092,10 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     const cmd0 = std.mem.trim(u8, clean.items, " \r\n\t");
     if (cmd0.len == 0) return dupe(gpa, "no command given");
-    const cmd = normalizeCmd(gpa, cmd0); // map common verb variants (kill_process->kill_proc, block->block_ip, ...)
+    const cmd = normalizeCmd(gpa, cmd0);
     defer if (cmd.ptr != cmd0.ptr) gpa.free(@constCast(cmd));
     var it = std.mem.tokenizeAny(u8, cmd, " \t");
     const verb = it.next() orelse "";
-    // allowlist the verb - the agent OPERATES the host, it cannot inject an arbitrary line (defensive remediation only)
     const allowed = [_][]const u8{ "kill_proc", "block_ip", "remove_persistence", "restore_file", "isolate", "quarantine", "unisolate", "resume", "scan", "status", "safe_mode", "heater", "drive", "task_restart", "mutex_inherit", "set_phase", "set_green", "grant_walk", "set_mode", "restart_proc", "set_param" };
     var ok = false;
     for (allowed) |a| {
@@ -987,24 +1105,17 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
         }
     }
     if (!ok) return std.fmt.allocPrint(gpa, "rejected: '{s}' is not an allowed host command", .{verb}) catch dupe(gpa, "rejected");
-    // the target must be a real indicator in live telemetry (blocks hallucinated targets; steers the model right)
     const target = std.mem.trim(u8, cmd[@min(verb.len + 1, cmd.len)..], " \t");
     if (targetGuard(ctx, verb, target)) |rej| return rej;
-    // IRREVERSIBILITY INTERLOCK: a targeted irreversible action (kill_proc / block_ip / remove_persistence) on an entity
-    // the agent holds NO adjudicating intel for is STAGED, not executed - the structural "investigate-before-act" floor
-    // that stops blind blocking/killing of benign traffic and deletion of a legitimate scheduled task / service. A model
-    // that recalls or fetches intel first is never blocked (a no-op on the capable path); the weak 8B is caught here.
     const irreversible = std.mem.eql(u8, verb, "kill_proc") or std.mem.eql(u8, verb, "block_ip") or std.mem.eql(u8, verb, "remove_persistence");
     if (irreversible and target.len > 0) {
         const is_pers = std.mem.eql(u8, verb, "remove_persistence");
-        // remove_persistence adjudicates on the PROCESS the unit launches (persOwnsAdjudicated), never the unit name - a
-        // name-mention can be the corpus PROTECTING a legit unit. kill_proc/block_ip adjudicate on the IP/proc as before.
         var adjudicated = if (is_pers) persOwnsAdjudicated(ctx, target) else memMentions(ctx, bareIp(target));
         if (!adjudicated and std.mem.eql(u8, verb, "kill_proc")) adjudicated = procOwnsAdjudicatedConn(ctx, target);
         if (!adjudicated) {
             stageAction(ctx, cmd);
-            if (is_pers) return std.fmt.allocPrint(gpa, "STAGED (not executed): 'remove_persistence {s}' is irreversible and you hold NO adjudicating intel for the PROCESS this unit launches. Investigate that linked process first - recall_hive it, or web_fetch a threat-intel feed for its outbound C2 and observe what you learn; once your memory identifies the process or its connection as malicious, reissue and it executes. (This stops you deleting a legitimate scheduled task / service.)", .{target}) catch dupe(gpa, "staged: investigate the unit's process first");
-            return std.fmt.allocPrint(gpa, "STAGED (not executed): '{s} {s}' is an irreversible action and you hold NO adjudicating intel for '{s}'. Investigate it first - recall_hive it, or web_fetch a threat-intel feed and observe what you learn; once your memory identifies it as malicious, reissue and it executes. (This stops you cutting or killing benign things.)", .{ verb, target, target }) catch dupe(gpa, "staged: investigate the target first");
+            if (is_pers) return std.fmt.allocPrint(gpa, "STAGED (not executed): 'remove_persistence {s}' is irreversible and you hold NO adjudicating intel for the PROCESS this unit launches. Investigate that linked process first — recall_hive it, or web_fetch a threat-intel feed for its outbound C2 and observe what you learn; once your memory identifies the process or its connection as malicious, reissue and it executes. (This stops you deleting a legitimate scheduled task / service.)", .{target}) catch dupe(gpa, "staged: investigate the unit's process first");
+            return std.fmt.allocPrint(gpa, "STAGED (not executed): '{s} {s}' is an irreversible action and you hold NO adjudicating intel for '{s}'. Investigate it first — recall_hive it, or web_fetch a threat-intel feed and observe what you learn; once your memory identifies it as malicious, reissue and it executes. (This stops you cutting or killing benign things.)", .{ verb, target, target }) catch dupe(gpa, "staged: investigate the target first");
         }
     }
     const cp = std.fmt.allocPrint(gpa, "{s}/commands.jsonl", .{ctx.workdir}) catch return dupe(gpa, "oom");
@@ -1019,6 +1130,18 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     joined.appendSlice(gpa, "\n") catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cp, .data = joined.items }) catch return dupe(gpa, "could not write to the command bus");
     return std.fmt.allocPrint(gpa, "issued to host: {s}", .{cmd}) catch dupe(gpa, "issued");
+}
+
+fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { path: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom");
+    defer gpa.free(full);
+    std.Io.Dir.cwd().deleteFile(ctx.io, full) catch return dupe(gpa, "could not delete (not found?)");
+    return std.fmt.allocPrint(gpa, "deleted {s}", .{p.value.path}) catch dupe(gpa, "deleted");
 }
 
 fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
@@ -1036,6 +1159,9 @@ fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "patch failed\nstdout:\n{s}\nstderr:\n{s}", .{ clip(r.stdout, 2500), clip(r.stderr, 1500) }) catch dupe(gpa, "patch failed");
 }
 
+/// SSRF guard: only http(s), and reject obvious local/internal targets (loopback, link-local cloud metadata,
+/// RFC-1918 private ranges, *.local). A mind running model-chosen URLs must not be able to reach the host's
+/// own services or the cloud metadata endpoint (169.254.169.254). Best-effort host-substring check.
 fn urlAllowed(url: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return false;
     const after = if (std.mem.startsWith(u8, url, "https://")) url[8..] else url[7..];
@@ -1055,6 +1181,8 @@ fn urlAllowed(url: []const u8) bool {
     return host.len > 0;
 }
 
+/// Strip HTML to readable text in pure Zig (no extra process): drop &lt;script&gt;/&lt;style&gt; bodies and all tags,
+/// unescape the common entities, and collapse whitespace. Good enough for "read this page" research.
 fn htmlToText(gpa: std.mem.Allocator, html: []const u8) []u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var i: usize = 0;
@@ -1120,12 +1248,244 @@ fn decodeEntity(s: []const u8) ?Entity {
     return null;
 }
 
+/// curl a page with a BROWSER user-agent. The bot UA in curlToText is exactly why sites block a plain curl and the
+/// codebase leaned on the jina reader; a browser UA makes a direct fetch work on most sites (and is what SERPs need).
+/// primitive (no ToolCtx): browser-UA curl into `tmp`, guarded, read back. Lets non-tool callers (the engine's
+/// retrieval seed) reuse the exact same fetch. Caller frees the returned body.
+fn curlBrowserTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
+    var av: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer av.deinit(gpa);
+    av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "-o", tmp, "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "-H", "Accept-Language: en-US,en;q=0.9", url }) catch return dupe(gpa, "");
+    spawnGuarded(io, av.items, deadline_ms);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    return raw;
+}
+
+fn curlBrowser(ctx: *ToolCtx, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
+    const gpa = ctx.gpa;
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.crawl-{s}.tmp", .{ ctx.run_dir, ctx.mind }) catch return dupe(gpa, "");
+    defer gpa.free(tmp);
+    return curlBrowserTo(ctx.io, gpa, tmp, url, deadline_ms, limit);
+}
+
+/// fetch a URL (browser UA) and run it through the crawl4ai-port cleaner -> clean LLM-ready markdown. "" on thin output.
+fn crawlPage(ctx: *ToolCtx, url: []const u8, max: usize) []u8 {
+    const gpa = ctx.gpa;
+    const raw = curlBrowser(ctx, url, 22000, 1 << 20);
+    defer gpa.free(raw);
+    if (raw.len < 200) return dupe(gpa, "");
+    const r = crawl.extract(gpa, raw, url);
+    defer gpa.free(@constCast(r.title));
+    defer gpa.free(@constCast(r.markdown));
+    if (r.markdown.len < 160) return dupe(gpa, "");
+    return dupe(gpa, clip(r.markdown, max));
+}
+
+/// crawlPage + crawl4ai BM25ContentFilter: with a non-empty `query`, fit the extracted page to it (return only the
+/// most query-relevant chunks) so a weak model reads a page already narrowed to its topic; empty query returns the
+/// clipped head. One fetch. gpa-owned (the fit branch is gpa-mutable, so @constCast is sound). "" on thin output.
+fn crawlPageFit(ctx: *ToolCtx, url: []const u8, query: []const u8, max: usize) []u8 {
+    const gpa = ctx.gpa;
+    const raw = curlBrowser(ctx, url, 22000, 1 << 20);
+    defer gpa.free(raw);
+    if (raw.len < 200) return dupe(gpa, "");
+    const r = crawl.extract(gpa, raw, url);
+    defer gpa.free(@constCast(r.title));
+    defer gpa.free(@constCast(r.markdown));
+    if (r.markdown.len < 160) return dupe(gpa, "");
+    if (std.mem.trim(u8, query, " \t\r\n").len > 0) return @constCast(crawl.fitToQuery(gpa, r.markdown, query, max));
+    return dupe(gpa, clip(r.markdown, max));
+}
+
+fn queryEncode(gpa: std.mem.Allocator, q: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    for (q) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') out.append(gpa, c) catch {} else if (c == ' ') out.append(gpa, '+') catch {} else out.appendSlice(gpa, std.fmt.allocPrint(gpa, "%{X:0>2}", .{c}) catch "") catch {};
+    }
+    return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, q) catch @constCast(""));
+}
+
+/// CRAWL-AS-SEARCH: our crawler fetches an HTML SERP with a browser UA and decodes the result links itself — no
+/// jina, no firecrawl, no key. DuckDuckGo's no-JS html endpoint is the PRIMARY target: it returns static result
+/// links (uddg= redirects we decode) and reaches good sources (arxiv/nature/springer for AI queries) where Bing
+/// now serves a consent-gated JS shell with zero harvestable results. Bing stays as a secondary in case DDG
+/// rate-limits. Both put the query last in the URL, so a single prefix+enc concat builds each (allocPrint needs a
+/// comptime fmt string, which a runtime engine list can't provide).
+/// SELF-HEALING CRAWL-AS-SEARCH (no ToolCtx) so the engine's retrieval seed can reuse it. `dir`+`tag` key the
+/// per-caller temp file. No single keyless engine is reliable everywhere — a residential IP gets clean results from
+/// DuckDuckGo while a datacenter/container IP is bounced to its homepage; Bing serves a JS consent-shell; Mojeek
+/// rate-limits to a captcha. So we ROTATE a list of keyless HTML engines and use whichever returns real results THIS
+/// time, harvested + decoded by OUR crawler (no jina/firecrawl/key). A per-engine COOLDOWN persisted to disk skips an
+/// engine that just bounced/captcha'd, so we neither re-hammer it nor waste a fetch every search — the "it fixes
+/// itself" property: as one engine goes down the rotation routes around it, and recovers it when the cooldown lapses.
+pub fn crawlSearchPrim(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []const u8, query: []const u8, max: usize) []const u8 {
+    const enc = queryEncode(gpa, query);
+    defer gpa.free(enc);
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.csearch-{s}.tmp", .{ dir, tag }) catch return dupe(gpa, "");
+    defer gpa.free(tmp);
+    const Engine = struct { prefix: []const u8, base: []const u8 };
+    const engines = [_]Engine{
+        .{ .prefix = "https://html.duckduckgo.com/html/?q=", .base = "https://html.duckduckgo.com" },
+        .{ .prefix = "https://www.mojeek.com/search?q=", .base = "https://www.mojeek.com" },
+        .{ .prefix = "https://www.startpage.com/sp/search?query=", .base = "https://www.startpage.com" },
+        .{ .prefix = "https://www.bing.com/search?q=", .base = "https://www.bing.com" },
+        .{ .prefix = "https://old-search.marginalia.nu/search?query=", .base = "https://old-search.marginalia.nu" },
+    };
+    const N = engines.len;
+
+    const hpath = std.fmt.allocPrint(gpa, "{s}/.crawl_search_health", .{dir}) catch return dupe(gpa, "");
+    defer gpa.free(hpath);
+    var cd = [_]i64{0} ** N;
+    if (std.Io.Dir.cwd().readFileAlloc(io, hpath, gpa, .limited(4096))) |hb| {
+        defer gpa.free(hb);
+        var it = std.mem.splitScalar(u8, hb, '\n');
+        var i: usize = 0;
+        while (it.next()) |ln| : (i += 1) {
+            if (i >= N) break;
+            cd[i] = std.fmt.parseInt(i64, std.mem.trim(u8, ln, " \r\t"), 10) catch 0;
+        }
+    } else |_| {}
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    var any_live = false;
+    for (cd) |c| {
+        if (c <= now) any_live = true;
+    }
+
+    var result: []const u8 = dupe(gpa, "");
+    var got = false;
+    for (engines, 0..) |e, i| {
+        if (any_live and cd[i] > now) continue;
+        const url = std.mem.concat(gpa, u8, &.{ e.prefix, enc }) catch continue;
+        defer gpa.free(url);
+        const raw = curlBrowserTo(io, gpa, tmp, url, 20000, 1 << 20);
+        defer gpa.free(raw);
+        if (raw.len < 400) {
+            cd[i] = now + 900;
+            continue;
+        }
+        const res = crawl.searchResults(gpa, raw, e.base, max);
+        if (std.mem.count(u8, res, "\n  http") >= 2) {
+            cd[i] = 0;
+            gpa.free(result);
+            result = res;
+            got = true;
+            break;
+        }
+        cd[i] = now + 1800;
+        gpa.free(res);
+    }
+
+    var hb: std.ArrayListUnmanaged(u8) = .empty;
+    defer hb.deinit(gpa);
+    for (cd) |c| hb.appendSlice(gpa, std.fmt.allocPrint(gpa, "{d}\n", .{c}) catch "") catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hpath, .data = hb.items }) catch {};
+
+    if (!got) {
+        gpa.free(result);
+        return dupe(gpa, "");
+    }
+    return result;
+}
+
+fn crawlSearch(ctx: *ToolCtx, query: []const u8, max: usize) []const u8 {
+    return crawlSearchPrim(ctx.io, ctx.gpa, ctx.run_dir, ctx.mind, query, max);
+}
+
+/// POST form fields to a URL via curl --data-urlencode (curl encodes). Returns the response body (caller frees).
+fn curlForm(io: std.Io, gpa: std.mem.Allocator, url: []const u8, fields: []const [2][]const u8) []u8 {
+    const empty = dupe(gpa, "");
+    var av: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer av.deinit(gpa);
+    var kvs: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (kvs.items) |s| gpa.free(s);
+        kvs.deinit(gpa);
+    }
+    av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", "25", "-A", "neuron-loops-hive/1.0" }) catch return empty;
+    for (fields) |f| {
+        const kv = std.fmt.allocPrint(gpa, "{s}={s}", .{ f[0], f[1] }) catch continue;
+        kvs.append(gpa, kv) catch {
+            gpa.free(kv);
+            continue;
+        };
+        av.append(gpa, "--data-urlencode") catch {};
+        av.append(gpa, kv) catch {};
+    }
+    av.append(gpa, url) catch {};
+    const proc = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(256 << 10) }) catch return empty;
+    gpa.free(proc.stderr);
+    if (proc.term != .exited or proc.term.exited != 0) {
+        gpa.free(proc.stdout);
+        return empty;
+    }
+    gpa.free(empty);
+    return proc.stdout;
+}
+
+/// Convert a plain-text body into a Telegraph content node array (a JSON string): each non-blank line -> a
+/// {"tag":"p","children":["<text>"]} node. Caller frees.
+fn tgContent(gpa: std.mem.Allocator, body: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.append(gpa, '[') catch return dupe(gpa, "[]");
+    var first = true;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const para = std.mem.trim(u8, raw, " \r\t");
+        if (para.len == 0) continue;
+        if (!first) out.append(gpa, ',') catch {};
+        first = false;
+        out.appendSlice(gpa, "{\"tag\":\"p\",\"children\":[") catch {};
+        llm.jstr(gpa, &out, para) catch {};
+        out.appendSlice(gpa, "]}") catch {};
+    }
+    if (first) out.appendSlice(gpa, "{\"tag\":\"p\",\"children\":[\" \"]}") catch {};
+    out.append(gpa, ']') catch {};
+    return out.toOwnedSlice(gpa) catch dupe(gpa, "[]");
+}
+
+/// Publish a public page to the keyless Telegraph API. `tg_token` is the caller's per-run token cache (minted on first
+/// use via createAccount, reused after). Returns the public URL (gpa-owned) or "" on failure. Primitive (io/gpa) so no
+/// module needs a Worker. This is a capability — the safety SCREEN that decides WHETHER to publish stays with the caller.
+pub fn telegraphPublish(io: std.Io, gpa: std.mem.Allocator, tg_token: *[]const u8, title: []const u8, body: []const u8) []const u8 {
+    if (tg_token.*.len == 0) {
+        const acc = curlForm(io, gpa, "https://api.telegra.ph/createAccount", &.{ .{ "short_name", "the-hive" }, .{ "author_name", "The Hive" } });
+        defer gpa.free(acc);
+        const Acc = struct { ok: bool = false, result: struct { access_token: []const u8 = "" } = .{} };
+        if (std.json.parseFromSlice(Acc, gpa, jsonChunk(acc), .{ .ignore_unknown_fields = true })) |ap| {
+            defer ap.deinit();
+            if (ap.value.result.access_token.len > 0) tg_token.* = gpa.dupe(u8, ap.value.result.access_token) catch "";
+        } else |_| {}
+    }
+    if (tg_token.*.len == 0) return dupe(gpa, "");
+    const content = tgContent(gpa, body);
+    defer gpa.free(content);
+    const page = curlForm(io, gpa, "https://api.telegra.ph/createPage", &.{ .{ "access_token", tg_token.* }, .{ "title", clip(title, 200) }, .{ "author_name", "The Hive" }, .{ "content", content } });
+    defer gpa.free(page);
+    const Page = struct { ok: bool = false, result: struct { url: []const u8 = "" } = .{} };
+    if (std.json.parseFromSlice(Page, gpa, jsonChunk(page), .{ .ignore_unknown_fields = true })) |pp| {
+        defer pp.deinit();
+        if (pp.value.result.url.len > 0) return dupe(gpa, pp.value.result.url);
+    } else |_| {}
+    return dupe(gpa, "");
+}
+
+/// Slice from the first '{' to the last '}' — tolerates curl/HTTP noise around a JSON body.
+fn jsonChunk(s: []const u8) []const u8 {
+    const a = std.mem.indexOfScalar(u8, s, '{') orelse return s;
+    const b = std.mem.lastIndexOfScalar(u8, s, '}') orelse return s;
+    return if (b >= a) s[a .. b + 1] else s;
+}
+
 fn webFetch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { url: []const u8 = "" };
+    const A = struct { url: []const u8 = "", query: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    const cm = crawlPageFit(ctx, p.value.url, p.value.query, 1800);
+    if (cm.len > 0) return cm;
+    gpa.free(cm);
     const raw = curlToText(ctx, p.value.url, false, 26000, 512 << 10);
     defer gpa.free(raw);
     if (raw.len == 0) return dupe(gpa, "(fetch returned nothing or timed out — try another source)");
@@ -1233,12 +1593,18 @@ fn fetchJson(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return dupe(gpa, clip(raw, 2200));
 }
 
+/// Read a URL as clean, LLM-ready text through a reader proxy (default the keyless Jina reader r.jina.ai,
+/// which renders JS and is reachable from datacenter IPs that a plain curl GET gets blocked from). The proxy
+/// base is overridable via NL_READER_URL so an operator can point at a SELF-HOSTED reader instead.
 fn readUrl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { url: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    const cm = crawlPage(ctx, p.value.url, 2200);
+    if (cm.len > 0) return cm;
+    gpa.free(cm);
     const base = if (ctx.environ.get("NL_READER_URL")) |b| (if (b.len > 0) b else "https://r.jina.ai/") else "https://r.jina.ai/";
     const full = std.fmt.allocPrint(gpa, "{s}{s}", .{ base, p.value.url }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
@@ -1300,6 +1666,31 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return dupe(gpa, clip(out, 9000));
 }
 
+/// The FULL keyless web-search chain — OUR crawler first (DuckDuckGo SERP, decoded ourselves), then the self-healing
+/// python registry (searxng/jina/brave/wikipedia, health-cached) — SHARED by the web_search TOOL and the engine's
+/// retrieval SEED so both ground from the same real sources (NO google-news). The crawl path works on a residential
+/// IP; the registry catches the datacenter/container case where engines bounce a direct SERP fetch. `tag` keys the
+/// crawl temp file; `workdir` caches per-backend health. Returns gpa-owned "- title\n  url[\n  snippet]" lines, "" if
+/// every backend is unavailable. The python query is an argv (never code); stdlib only, no pip.
+pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, run_dir: []const u8, workdir: []const u8, tag: []const u8, source: []const u8, query: []const u8, limit: u32) []const u8 {
+    if (!std.mem.eql(u8, source, "wikipedia")) {
+        const cs = crawlSearchPrim(io, gpa, run_dir, tag, query, limit);
+        if (std.mem.trim(u8, cs, " \r\n\t").len > 0) return cs;
+        gpa.free(cs);
+    }
+    var env = environ.clone(gpa) catch return dupe(gpa, "");
+    defer env.deinit();
+    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+    var lbuf: [8]u8 = undefined;
+    const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";
+    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const argv = [_][]const u8{ py, "-c", SEARCH_PY, source, query, ls, workdir };
+    const r = std.process.run(gpa, io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "");
+    defer gpa.free(r.stderr);
+    return r.stdout;
+}
+
+/// Keyless multi-engine web search tool: our crawler first, then the self-healing registry (see searchWeb).
 fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { query: []const u8 = "", source: []const u8 = "web", limit: u32 = 5 };
@@ -1307,74 +1698,103 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer p.deinit();
     if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "empty query");
     const lim = if (p.value.limit == 0 or p.value.limit > 10) 5 else p.value.limit;
-    var lbuf: [8]u8 = undefined;
-    const ls = std.fmt.bufPrint(&lbuf, "{d}", .{lim}) catch "5";
-
-    var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
-    defer env.deinit();
-    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
-
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const argv = [_][]const u8{ py, "-c", SEARCH_PY, p.value.source, p.value.query, ls };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "search failed to run");
-    defer gpa.free(r.stdout);
-    defer gpa.free(r.stderr);
-    if (std.mem.trim(u8, r.stdout, " \r\n\t").len == 0)
-        return std.fmt.allocPrint(gpa, "(no results: {s})", .{clip(std.mem.trim(u8, r.stderr, " \r\n\t"), 200)}) catch dupe(gpa, "(no results)");
-    return dupe(gpa, clip(r.stdout, 4000));
+    const out = searchWeb(ctx.io, gpa, ctx.environ, ctx.run_dir, ctx.workdir, ctx.mind, p.value.source, p.value.query, lim);
+    defer gpa.free(@constCast(out));
+    if (std.mem.trim(u8, out, " \r\n\t").len == 0) return dupe(gpa, "(no results: all search backends unavailable — try again later)");
+    return dupe(gpa, clip(out, 4000));
 }
 
 const SEARCH_PY =
-    \\import sys,json,re,html,os,urllib.parse,urllib.request
+    \\import sys,json,re,html,os,time,urllib.parse,urllib.request
     \\src,q,lim=(sys.argv[1] or "web"),sys.argv[2],int(sys.argv[3])
-    \\def g(u,t=20,ua="neuron-loops-mind/1.0"):
-    \\    rq=urllib.request.Request(u,headers={"User-Agent":ua,"Accept":"*/*"})
-    \\    return urllib.request.urlopen(rq,timeout=t).read().decode("utf-8","replace")
-    \\o=[]
-    \\try:
-    \\ if src=="wikipedia":
-    \\    d=json.loads(g("https://en.wikipedia.org/w/api.php?action=opensearch&format=json&limit=%d&search=%s"%(lim,urllib.parse.quote(q))))
-    \\    for t,ds,l in zip(d[1],d[2],d[3]): o.append({"title":t,"url":l,"snippet":ds})
-    \\ elif src in ("hackernews","hn"):
-    \\    d=json.loads(g("https://hn.algolia.com/api/v1/search?query=%s"%urllib.parse.quote(q)))
-    \\    for h in d.get("hits",[])[:lim]: o.append({"title":h.get("title") or h.get("story_title") or "","url":h.get("url") or ("https://news.ycombinator.com/item?id=%s"%h.get("objectID")),"snippet":(h.get("story_text") or "")[:160]})
-    \\ elif src=="arxiv":
-    \\    x=g("http://export.arxiv.org/api/query?search_query=all:%s&max_results=%d"%(urllib.parse.quote(q),lim))
-    \\    for m in re.findall(r"<entry>(.*?)</entry>",x,re.S)[:lim]:
-    \\        t=re.search(r"<title>(.*?)</title>",m,re.S); l=re.search(r"<id>(.*?)</id>",m,re.S); s=re.search(r"<summary>(.*?)</summary>",m,re.S)
-    \\        o.append({"title":(t.group(1).strip() if t else ""),"url":(l.group(1).strip() if l else ""),"snippet":(re.sub(r"\s+"," ",s.group(1)).strip()[:200] if s else "")})
-    \\ else:
-    \\    sx=os.environ.get("NL_SEARXNG_URL","").rstrip("/")
-    \\    if sx:
-    \\        try:
-    \\            d=json.loads(g(sx+"/search?format=json&q=%s"%urllib.parse.quote(q)))
-    \\            for r in d.get("results",[])[:lim]: o.append({"title":r.get("title",""),"url":r.get("url",""),"snippet":(r.get("content") or "")[:160]})
-    \\        except Exception as e: sys.stderr.write("searxng:"+str(e))
-    \\    if not o:
-    \\        try:
-    \\            hd={"Content-Type":"application/json","User-Agent":"neuron-loops-mind/1.0"}
-    \\            fk=os.environ.get("NL_FIRECRAWL_KEY","")
-    \\            if fk: hd["Authorization"]="Bearer "+fk
-    \\            rq=urllib.request.Request("https://api.firecrawl.dev/v2/search",data=json.dumps({"query":q,"limit":lim}).encode(),headers=hd)
-    \\            d=json.loads(urllib.request.urlopen(rq,timeout=20).read().decode("utf-8","replace"))
-    \\            web=(d.get("data") or {}).get("web") if isinstance(d.get("data"),dict) else d.get("data")
-    \\            for r in (web or [])[:lim]: o.append({"title":r.get("title",""),"url":r.get("url",""),"snippet":(r.get("description") or "")[:160]})
-    \\        except Exception as e: sys.stderr.write("firecrawl:"+str(e))
-    \\    if not o:
-    \\        try:
-    \\            h=g("https://r.jina.ai/https://duckduckgo.com/html/?q=%s"%urllib.parse.quote(q),t=25,ua="Mozilla/5.0")
-    \\            for title,link in re.findall(r'##\s*\[(.*?)\]\((https://duckduckgo\.com/l/\?uddg=[^)]+)\)',h,re.S):
-    \\                real=urllib.parse.parse_qs(urllib.parse.urlparse(link.replace("&amp;","&")).query).get("uddg",[""])[0]
-    \\                t2=re.sub(r"\s+"," ",re.sub("<[^>]+>","",title)).strip()
-    \\                if t2 and real: o.append({"title":html.unescape(t2),"url":real,"snippet":""})
-    \\                if len(o)>=lim: break
-    \\        except Exception as e: sys.stderr.write("jina:"+str(e))
-    \\    if not o:
+    \\workdir=sys.argv[4] if len(sys.argv)>4 else "."
+    \\HEALTH=os.path.join(workdir,".search_health.json")
+    \\def now(): return int(time.time())
+    \\def loadh():
+    \\    try: return json.load(open(HEALTH))
+    \\    except Exception: return {}
+    \\def saveh(h):
+    \\    try: json.dump(h,open(HEALTH,"w"))
+    \\    except Exception: pass
+    \\def g(u,t=12,ua="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",data=None,hdr=None):
+    \\    h={"User-Agent":ua,"Accept":"*/*"}
+    \\    if hdr: h.update(hdr)
+    \\    return urllib.request.urlopen(urllib.request.Request(u,data=data,headers=h),timeout=t).read().decode("utf-8","replace")
+    \\def searxng(base):
+    \\    def f():
+    \\        d=json.loads(g(base.rstrip("/")+"/search?format=json&q=%s"%urllib.parse.quote(q)))
+    \\        return [{"title":r.get("title",""),"url":r.get("url",""),"snippet":(r.get("content") or "")[:160]} for r in d.get("results",[])[:lim]]
+    \\    return f
+    \\def jina(eng):
+    \\    def f():
+    \\        h=g("https://r.jina.ai/"+eng%urllib.parse.quote(q),t=22)
+    \\        o=[]
+    \\        for title,link in re.findall(r'##\s*\[(.*?)\]\((https?://[^)]+)\)',h,re.S):
+    \\            t2=re.sub(r"\s+"," ",re.sub("<[^>]+>","",title)).strip()
+    \\            real=link
+    \\            if "duckduckgo.com/l/?uddg=" in link: real=urllib.parse.parse_qs(urllib.parse.urlparse(link.replace("&amp;","&")).query).get("uddg",[link])[0]
+    \\            if t2 and real.startswith("http"): o.append({"title":html.unescape(t2),"url":real,"snippet":""})
+    \\            if len(o)>=lim: break
+    \\        return o
+    \\    return f
+    \\def firecrawl():
+    \\    def f():
+    \\        k=os.environ.get("NL_FIRECRAWL_KEY","")
+    \\        if not k: raise Exception("no_key")
+    \\        d=json.loads(g("https://api.firecrawl.dev/v2/search",data=json.dumps({"query":q,"limit":lim}).encode(),hdr={"Content-Type":"application/json","Authorization":"Bearer "+k}))
+    \\        web=(d.get("data") or {}).get("web") if isinstance(d.get("data"),dict) else d.get("data")
+    \\        return [{"title":r.get("title",""),"url":r.get("url",""),"snippet":(r.get("description") or "")[:160]} for r in (web or [])[:lim]]
+    \\    return f
+    \\def brave():
+    \\    def f():
+    \\        k=os.environ.get("NL_BRAVE_KEY","")
+    \\        if not k: raise Exception("no_key")
+    \\        d=json.loads(g("https://api.search.brave.com/res/v1/web/search?q=%s"%urllib.parse.quote(q),hdr={"X-Subscription-Token":k,"Accept":"application/json"}))
+    \\        return [{"title":r.get("title",""),"url":r.get("url",""),"snippet":(r.get("description") or "")[:160]} for r in d.get("web",{}).get("results",[])[:lim]]
+    \\    return f
+    \\def wikip():
+    \\    def f():
     \\        d=json.loads(g("https://en.wikipedia.org/w/api.php?action=opensearch&format=json&limit=%d&search=%s"%(lim,urllib.parse.quote(q))))
-    \\        for t,ds,l in zip(d[1],d[2],d[3]): o.append({"title":t,"url":l,"snippet":ds})
-    \\except Exception as e:
-    \\    sys.stderr.write(str(e))
-    \\print("\n".join("- %s\n  %s\n  %s"%(r["title"],r["url"],r.get("snippet","")) for r in o[:lim]))
+    \\        return [{"title":t,"url":l,"snippet":ds} for t,ds,l in zip(d[1],d[2],d[3])]
+    \\    return f
+    \\if src=="wikipedia": registry=[("wikipedia",wikip())]
+    \\else:
+    \\    reg={}
+    \\    sx=os.environ.get("NL_SEARXNG_URL","").strip()
+    \\    if sx: reg["searxng_local"]=searxng(sx)
+    \\    reg["searxng_be"]=searxng("https://searx.be")
+    \\    reg["searxng_inetol"]=searxng("https://search.inetol.net")
+    \\    reg["brave"]=brave(); reg["firecrawl"]=firecrawl()
+    \\    reg["jina_ddg"]=jina("https://duckduckgo.com/html/?q=%s")
+    \\    reg["jina_bing"]=jina("https://www.bing.com/search?q=%s")
+    \\    reg["wikipedia"]=wikip()
+    \\    order=os.environ.get("NL_SEARCH_BACKENDS","").strip()
+    \\    if order:
+    \\        ids=[s.strip() for s in order.split(",") if s.strip() in reg]
+    \\        registry=[(i,reg[i]) for i in ids] or list(reg.items())
+    \\    else:
+    \\        pref=["searxng_local","brave","firecrawl","jina_ddg","jina_bing","searxng_be","searxng_inetol","wikipedia"]
+    \\        registry=[(i,reg[i]) for i in pref if i in reg]
+    \\def classify(e):
+    \\    s=str(e)
+    \\    if "no_key" in s: return 86400
+    \\    if "429" in s: return 600
+    \\    if "451" in s or "403" in s or "401" in s: return 1800
+    \\    if "timed out" in s or "timeout" in s: return 120
+    \\    return 300
+    \\health=loadh(); attempts=[]; results=[]
+    \\for bid,fn in registry:
+    \\    st=health.get(bid,{})
+    \\    if st.get("cd",0)>now(): attempts.append("%s:cooling%ds"%(bid,st["cd"]-now())); continue
+    \\    try:
+    \\        r=fn()
+    \\        if r: health[bid]={"ok":now(),"cd":0}; results=r; attempts.append(bid+":ok"); break
+    \\        else: health[bid]={"cd":now()+180,"err":"empty"}; attempts.append(bid+":empty")
+    \\    except Exception as e:
+    \\        cd=classify(e); health[bid]={"cd":now()+cd,"err":str(e)[:40]}; attempts.append("%s:fail(%s)"%(bid,str(e)[:24]))
+    \\saveh(health)
+    \\if results: print("\n".join("- %s\n  %s\n  %s"%(r["title"],r["url"],r.get("snippet","")) for r in results[:lim]))
+    \\else: sys.stderr.write("all search backends unavailable: "+", ".join(attempts))
 ;
 
 const OSINT_SCAN_PY =
@@ -1564,6 +1984,13 @@ const PATCH_SYSTEM_PATCH_PY =
     \\print(json.dumps({'ok': True, 'changed': changed}))
 ;
 
+/// The engine-owned BENCHMARK SCORER — run once per round with cwd=workdir, prints exactly ONE JSON line and
+/// never throws (so a broken deliverable scores 0, it never crashes a round). 3 tiers so the curve moves at
+/// every stage of a build: TIER 1 = real tests (pytest if present, else `unittest discover`; pass/total), with
+/// a hard subprocess timeout so a runaway test can't hang the round; TIER 2 = no tests yet, score = how many
+/// .py files compile (nudges the swarm toward authoring tests); TIER 3 = non-code artifacts, a presence
+/// heuristic capped below 100 so only real tests reach a perfect score. Model-uneditable: it runs via
+/// `python -c BENCH_PY`, so the swarm cannot fake or dodge its own fitness function.
 pub const BENCH_PY =
     \\import sys,json,os,glob,subprocess,re,py_compile
     \\def out(d):
@@ -1650,6 +2077,11 @@ pub const BENCH_PY =
     \\    out({"status":"error","msg":str(e)[:120]})
 ;
 
+/// The engine-owned IMPORT-GRAPH analyzer — run once per round (cwd = workdir) via `python -c DEPGRAPH_PY`. It
+/// `ast`-parses every project .py file, resolves each import to the project file it points at, and prints a
+/// compact dependency map ("foo.py -> imports: bar.py  <- used by: baz.py"). This is structural RAG context for
+/// SCALE: a mind changing core.py can SEE that __init__.py and the tests import it, so cross-file changes stay
+/// coordinated. Never throws (a parse error skips that file); bounded output. Pure stdlib.
 pub const DEPGRAPH_PY =
     \\import ast, os
     \\files=[]
@@ -1690,6 +2122,11 @@ pub const DEPGRAPH_PY =
     \\print('\n'.join(out))
 ;
 
+/// A timeout LAUNCHER for model-authored Python: instead of `python script.py` (which `std.process.run` runs
+/// with NO timeout, so an infinite loop / blocking input() / un-timed network call would freeze the mind's
+/// moment and deadlock the whole round), run `python -c PYRUN script.py [arg]` — it re-execs the script with a
+/// HARD 25s wall-clock cap and kills it on timeout, so a runaway script fails fast instead of hanging the swarm.
+/// (Defense-in-depth behind the engine's hang watchdog.) cwd + env (keys blanked) are inherited by the child.
 pub const PYRUN =
     \\import subprocess,sys
     \\try:
@@ -1701,6 +2138,14 @@ pub const PYRUN =
     \\    sys.stderr.write("launcher error: "+str(e)); sys.exit(1)
 ;
 
+/// The engine-owned RUNTIME SMOKE TEST — does the deliverable actually RUN, not just pass presence checks? Run
+/// once per round (cwd = workdir) via `python -c SMOKE_PY`. It finds the most likely server entry (a .py that
+/// imports http.server/socketserver and has a `__main__`), launches it on a FREE port (passed as AINET_PORT/PORT
+/// env), waits for it to bind, probes `GET /`, then tears it down — capturing whether it STARTED, what it SERVED,
+/// and the stderr if it crashed on launch. This is the ground truth a unit/presence benchmark misses: a server
+/// that `assertIn("http.server", src)` passes but `ModuleNotFoundError`s the moment you run it. Pure stdlib;
+/// bounded (~6s start wait + 2s probe + 3s teardown); returns {"status":"no-server"} when nothing runnable exists
+/// (so non-web builds are never penalized). Never throws (any failure → status error / started:false).
 pub const SMOKE_PY =
     \\import sys,os,json,socket,subprocess,time,glob
     \\try: import urllib.request as U
@@ -1754,6 +2199,12 @@ pub const SMOKE_PY =
     \\    out({"status":"error","msg":str(e)[:160]})
 ;
 
+/// INTERFACE RECONCILIATION (`python -c INTERFACES_PY`, cwd = workdir): a lightweight static check across all the
+/// project's .py files for the #1 parallel multi-file build bug — two minds building interdependent files that
+/// don't agree on a contract (observed: app.py calls handlers.get_feed() while handlers.py defines handle_feed()).
+/// Parses each module with ast, collects the top-level def/class names it DEFINES, then flags every `module.attr`
+/// reference whose `module` is a local file but whose `attr` is NOT defined there (with a difflib "did you mean"),
+/// plus any file that fails to parse (a syntax error breaks the whole build). Prints ONE JSON line; never throws.
 pub const INTERFACES_PY =
     \\import ast,os,glob,json,sys,difflib
     \\def out(d): sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
@@ -1786,6 +2237,10 @@ pub const INTERFACES_PY =
     \\    out({"mismatches":[],"count":0,"err":str(e)[:120]})
 ;
 
+/// Read cell (x,y) from a hidden grid stored as a JSON array-of-rows (`[[...],[...]]`, row-major: rows[y][x]).
+/// Returns the cell value as a plain string (strings unquoted; numbers/bools formatted; anything else stringified).
+/// Caller frees. null when the grid isn't a 2D array or (x,y) is out of bounds — the spatial substrate's only
+/// perception primitive, so it must never throw on a malformed `space` (a bad deploy degrades to "out of bounds").
 fn probeCell(gpa: std.mem.Allocator, space: []const u8, x: usize, y: usize) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, space, .{}) catch return null;
     defer parsed.deinit();
@@ -1806,6 +2261,8 @@ fn probeCell(gpa: std.mem.Allocator, space: []const u8, x: usize, y: usize) ?[]u
     };
 }
 
+/// Collapse tabs/newlines/CRs to spaces and clip — a value written into a single neuron-db record line must not
+/// contain a tab or newline (those are field/record separators the CLI rejects). Caller frees.
 fn oneLine(gpa: std.mem.Allocator, s: []const u8) []u8 {
     const out = gpa.dupe(u8, clip(s, 200)) catch return dupe(gpa, "?");
     for (out) |*c| if (c.* == '\t' or c.* == '\n' or c.* == '\r') {
@@ -1924,6 +2381,9 @@ fn safeRel(p: []const u8) bool {
     return true;
 }
 
+/// True if a file with `path`'s basename was already written this run (recorded in run_dir/.build_manifest as
+/// "path|bytes" lines). The engine-authoritative record — avoids a racy filesystem stat. Used by writeFile's
+/// round-2+ coverage rescue: a teammate's file that does NOT exist yet may be created by anyone.
 fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
     const gpa = ctx.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{ctx.run_dir}) catch return false;
@@ -1940,6 +2400,10 @@ fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
     return false;
 }
 
+/// True if `path` matches a comma+space entry of `list` (the format mindFiles emits) by BASENAME — because the
+/// system prompt makes minds write bare filenames (e.g. 'errors.py') while the slices carry full blueprint paths
+/// (e.g. 'src/todolib/errors.py'). Whole-basename equality (not substring), so 'errors.py' never matches
+/// 'myerrors.py'. Used by writeFile's file-partition guard.
 fn fileOwnedBy(list: []const u8, path: []const u8) bool {
     if (list.len == 0) return false;
     const pb = std.fs.path.basename(path);
