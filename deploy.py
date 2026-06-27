@@ -15,7 +15,8 @@ it researches, builds, remembers, and - when its feeling flares - can speak publ
   python deploy.py resume <run-name>    # continue a stopped run
   python deploy.py stop <run-name>      # stop a run (writes its STOP sentinel)
 
-Defaults target a local, free Ollama model (llama3.1:8b). Point --provider/--model/--base-url/--key
+Defaults target a free local Ollama model (gpt-oss:20b; use llama3.1:8b on very small embedded
+devices). Point --provider/--model/--base-url/--key
 at any OpenAI-compatible endpoint (OpenAI, Groq, Together, OpenRouter, a local relay, ...).
 Run `python deploy.py --help` for every option, or just `python deploy.py` for the wizard.
 """
@@ -33,7 +34,7 @@ STYLES = ["auto", "build", "build_use", "discourse", "investigate", "debate"]
 
 # Preset OpenAI-compatible endpoints. base_url ends at /v1; "custom" lets the user type their own.
 PROVIDERS = {
-    "ollama":     {"base_url": "http://localhost:11434/v1",     "model": "llama3.1:8b",                                  "needs_key": False},
+    "ollama":     {"base_url": "http://localhost:11434/v1",     "model": "gpt-oss:20b",                                  "needs_key": False},
     "openai":     {"base_url": "https://api.openai.com/v1",      "model": "gpt-4.1-mini",                                 "needs_key": True},
     "groq":       {"base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile",                      "needs_key": True},
     "together":   {"base_url": "https://api.together.xyz/v1",    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",      "needs_key": True},
@@ -422,7 +423,7 @@ def resume(name, watch=False):
     env = dict(os.environ)
     env.setdefault("NEURON_MAX_FACTS", "1000000")
     logf = open(os.path.join(d, "worker.log"), "a", encoding="utf-8")
-    proc = subprocess.Popen([binary, "worker", d, neuron, m.get("model", "llama3.1:8b")],
+    proc = subprocess.Popen([binary, "worker", d, neuron, m.get("model", "gpt-oss:20b")],
                             cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT)
     print(f"  resumed {name} (pid {proc.pid}) - model {m.get('model', '?')} - "
           f"its memory + files in data/{name}/ carry over")
@@ -862,9 +863,11 @@ def wiz_provider():
     p = dict(PROVIDERS[choice]); p["provider"] = choice
     if choice == "ollama":
         models = ollama_models()
+        print("    default is gpt-oss:20b (capable; ~14 GB, wants a decent GPU/RAM).")
+        print("    on a very small embedded device, llama3.1:8b (~5 GB) is the working lightweight alternative.")
         if models is None:
             print("    ! Ollama isn't responding at localhost:11434.")
-            print("      Install it from https://ollama.com, then:  ollama pull llama3.1:8b")
+            print("      Install it from https://ollama.com, then:  ollama pull gpt-oss:20b  (or llama3.1:8b)")
         elif models:
             print("    detected local models: " + ", ".join(models[:8]) + ("  ..." if len(models) > 8 else ""))
         p["model"] = ask("model", p["model"])
@@ -933,7 +936,7 @@ def equiv_cli(args, provider):
     parts = ["python deploy.py", (json.dumps(args.goal) if args.goal else '""')]
     if provider != "ollama":
         parts += [f"--provider {provider}", f"--model {args.model}", f"--base-url {args.base_url}"]
-    elif args.model != "llama3.1:8b":
+    elif args.model != "gpt-oss:20b":
         parts.append(f"--model {args.model}")
     if args.minds != 4:
         parts.append(f"--minds {args.minds}")
@@ -1129,7 +1132,7 @@ def main():
     ap.add_argument("--name", default=None, help="run name (a dir under data/); default: swarm_<timestamp>")
     ap.add_argument("--minds", type=int, default=4)
     ap.add_argument("--minutes", type=int, default=30, help="auto-stop after N min (0 = until stopped)")
-    ap.add_argument("--model", default="llama3.1:8b")
+    ap.add_argument("--model", default="gpt-oss:20b", help="default gpt-oss:20b; use llama3.1:8b on very small embedded devices")
     ap.add_argument("--provider", default="ollama")
     ap.add_argument("--base-url", dest="base_url", default="http://localhost:11434/v1")
     ap.add_argument("--key", default=os.environ.get("NL_LLM_KEY", "ollama"), help="API key (or NL_LLM_KEY; local Ollama needs none)")
