@@ -1574,7 +1574,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var monologue: []u8 = gpa.dupe(u8, "") catch @constCast("");
 
     w.act(mi.name, round, "thinking", "", "");
-    const base_schema_raw = if (mi.scout) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
+    // A discourse/research run needs web tools, but the lean ASSEMBLER_SCHEMA is build-only — route lean-tier
+    // discourse minds to the research SCOUT_SCHEMA so they can actually research (the engine consolidates the briefing).
+    const base_schema_raw = if (mi.scout or (w.discourse and w.cap.lean_schema)) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
     const base_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
     defer if (!w.internet) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
