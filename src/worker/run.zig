@@ -2786,18 +2786,36 @@ fn docFileCount(blueprint: []const u8) u32 {
 /// scores LENGTH (word coverage) instead of file presence. The target is parsed from the goal ("2200-2800",
 /// "~2500 words", "3000-word") taking the LOW end of a range; defaults to 2200 when prose is detected but no
 /// explicit number is given. 0 => a normal code build (unchanged behavior).
+fn isCodeExt(base: []const u8) bool {
+    const ext = [_][]const u8{ ".py", ".js", ".mjs", ".ts", ".jsx", ".tsx", ".rs", ".go", ".c", ".h", ".cpp", ".cc", ".hpp", ".java", ".rb", ".php", ".zig", ".lua", ".sh", ".pl", ".swift", ".kt", ".scala", ".clj", ".ex", ".exs", ".ml", ".hs", ".sql", ".html", ".htm", ".css", ".vue", ".cs", ".r", ".jl" };
+    for (ext) |e| if (std.mem.endsWith(u8, base, e)) return true;
+    return false;
+}
+
 fn docTargetFromBlueprint(blueprint: []const u8, goal: []const u8) u32 {
     var docs: u32 = 0;
+    var code: u32 = 0;
     var total: u32 = 0;
     var it = std.mem.splitScalar(u8, blueprint, '\n');
     while (it.next()) |ln| {
         const bp = bpPath(ln) orelse continue;
-        total += 1;
         const base = if (std.mem.lastIndexOfScalar(u8, bp, '/')) |i| bp[i + 1 ..] else bp;
+        // standard support files (readme/licence/gitignore/requirements) don't decide prose-vs-code
+        if (std.ascii.eqlIgnoreCase(base, "README.md") or std.ascii.eqlIgnoreCase(base, "LICENSE") or
+            std.ascii.eqlIgnoreCase(base, "LICENSE.txt") or std.ascii.eqlIgnoreCase(base, "LICENSE.md") or
+            std.ascii.eqlIgnoreCase(base, "CHANGELOG.md") or std.ascii.eqlIgnoreCase(base, "CONTRIBUTING.md") or
+            std.ascii.eqlIgnoreCase(base, ".gitignore") or std.ascii.eqlIgnoreCase(base, "requirements.txt")) continue;
+        total += 1;
         if (std.mem.endsWith(u8, base, ".md") or std.mem.endsWith(u8, base, ".txt") or
-            std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst")) docs += 1;
+            std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst")) {
+            docs += 1;
+        } else if (isCodeExt(base)) {
+            code += 1;
+        }
     }
-    if (total == 0 or docs * 2 < total) return 0;
+    // a length-scored PROSE build: documents ARE the deliverable and there is NO code to test. A single source
+    // file (with a README beside it) is a code build scored by its tests, not a manuscript to pad with words.
+    if (total == 0 or docs == 0 or code > 0 or docs * 2 < total) return 0;
     var best: u32 = 0;
     var i: usize = 0;
     while (i < goal.len) : (i += 1) {
