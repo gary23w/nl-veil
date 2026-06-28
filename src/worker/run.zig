@@ -1397,7 +1397,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const tree = buildTree(gpa, w.io, w.run_dir, w.blueprint, w.doc_target);
     defer gpa.free(tree);
     const plan_block = if (w.plan_str.len > 0)
-        std.fmt.allocPrint(gpa, "PROJECT PLAN — the shared CONTRACT every piece must honor (the canon: names, world, rules; the arc; each piece's beat). Keep your piece CONSISTENT with this so it fits the others built in parallel:\n{s}\n\n", .{clip(w.plan_str, 1100)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, "PROJECT PLAN — the shared CONTRACT every piece must honor (the canon: names, world, rules; the arc; each piece's beat). Keep your piece CONSISTENT with this so it fits the others built in parallel:\n{s}\n\n", .{clip(w.plan_str, 3000)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(plan_block);
@@ -2403,13 +2403,13 @@ fn establishPlan(w: *Worker, goal: []const u8) void {
         const jsys = "You are the lead planner. Two draft plans for the same project are below. Produce the FINAL plan that takes the STRONGEST canon, arc, and per-file beats from both and resolves any conflict decisively. It is the contract every teammate (building files IN PARALLEL, unable to read each other) must honor — concrete and self-consistent: the CANON (entities/names/world/rules), the ARC, and a one-line beat for EACH file. <= 340 words, no preamble.";
         const ju = std.fmt.allocPrint(gpa, "Goal: {s}\n\nFiles:\n{s}\n\nDRAFT A:\n{s}\n\nDRAFT B:\n{s}\n\nWrite the FINAL plan now.", .{ clip(goal, 300), bp, clip(ca, 1700), clip(cb, 1700) }) catch "";
         defer if (ju.len > 0) gpa.free(ju);
-        const rj = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, jsys, ju, 600);
+        const rj = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, jsys, ju, 900);
         jcontent = rj.content;
         if (rj.ok and rj.content.len > 40) chosen = std.mem.trim(u8, rj.content, " \r\n\t");
     }
     if (chosen.len < 40) chosen = if (ca.len >= cb.len) ca else cb;
     if (chosen.len < 40) return;
-    w.plan_str = gpa.dupe(u8, clip(chosen, 2600)) catch "";
+    w.plan_str = gpa.dupe(u8, clip(chosen, 4096)) catch "";
     w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
     w.act("engine", 0, "plan", "project plan (deliberated: 2 drafts -> synthesis; forward contract for every parallel piece)", clip(chosen, 600));
@@ -2419,7 +2419,7 @@ fn deriveDependencies(w: *Worker, goal: []const u8) void {
     const gpa = w.gpa;
     if (w.blueprint.len == 0 or w.deps_str.len > 0) return;
     const sys = "You decide the BUILD ORDER for a team building these files in parallel. For EACH file, list ONLY the other listed files it must be built AFTER — a HARD dependency: it cannot be written correctly until that other file exists (code that imports another module; a test for a module; a piece whose content strictly requires an earlier piece's concrete outcome). Most files have NONE — a shared PLAN already gives the context, so prefer NONE so they build in parallel; reserve deps for real structural ordering. Output EXACTLY one line per file and nothing else, as `path: dep1, dep2` or `path: none`, using the exact paths given.";
-    const u = std.fmt.allocPrint(gpa, "Goal: {s}\n\nThe shared PLAN (context all files already have):\n{s}\n\nFiles:\n{s}\n\nOutput the dependency lines now.", .{ clip(goal, 250), clip(w.plan_str, 1300), clip(w.blueprint, 2000) }) catch return;
+    const u = std.fmt.allocPrint(gpa, "Goal: {s}\n\nThe shared PLAN (context all files already have):\n{s}\n\nFiles:\n{s}\n\nOutput the dependency lines now.", .{ clip(goal, 250), clip(w.plan_str, 2400), clip(w.blueprint, 2000) }) catch return;
     defer gpa.free(u);
     const r = llm.chat(gpa, w.io, w.run_dir, "deps", w.gw_base, w.gw_key, w.gateway_model, sys, u, 500);
     defer gpa.free(r.content);
@@ -2476,14 +2476,14 @@ fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
     const reqs = w.mem.recall(tools.PLAN_REQ_SCOPE, if (goal.len > 0) clip(goal, 80) else "plan");
     defer gpa.free(reqs);
     const sys = "You maintain the PROJECT PLAN as the team builds. Produce the UPDATED plan. HARD RULE — THE CANON RATCHET: any name, fact, world-rule, or decision already used by a BUILT piece is LOCKED and MUST appear unchanged; you may only REFINE the plan for the pieces NOT yet built (sharper beats, a better arc for what remains, folding in what's been learned and any sound teammate proposal), and ADD canon the goal still leaves open. NEVER contradict locked canon. Stay the concrete shared contract, <= 340 words, no preamble.";
-    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\nCURRENT PLAN:\n{s}\n\nALREADY BUILT — their canon is LOCKED: {s}\nNOT YET BUILT — revise these freely: {s}\n\nWHAT'S ACTUALLY BEEN BUILT (the state):\n{s}\n\nTEAMMATE PROPOSALS to change the plan (fold in the sound ones):\n{s}\n\nWrite the UPDATED plan now.", .{ clip(goal, 220), clip(w.plan_str, 1500), clip(built.items, 400), clip(unbuilt.items, 400), clip(if (w.state_str.len > 0) w.state_str else "(none yet)", 1100), clip(if (reqs.len > 0) reqs else "(none)", 700) }) catch return;
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\nCURRENT PLAN:\n{s}\n\nALREADY BUILT — their canon is LOCKED: {s}\nNOT YET BUILT — revise these freely: {s}\n\nWHAT'S ACTUALLY BEEN BUILT (the state):\n{s}\n\nTEAMMATE PROPOSALS to change the plan (fold in the sound ones):\n{s}\n\nWrite the UPDATED plan now.", .{ clip(goal, 220), clip(w.plan_str, 3000), clip(built.items, 400), clip(unbuilt.items, 400), clip(if (w.state_str.len > 0) w.state_str else "(none yet)", 1100), clip(if (reqs.len > 0) reqs else "(none)", 700) }) catch return;
     defer gpa.free(user);
-    const r = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, sys, user, 600);
+    const r = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, sys, user, 900);
     defer gpa.free(r.content);
     if (!r.ok or r.content.len < 40) return;
     const s = std.mem.trim(u8, r.content, " \r\n\t");
     if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
-    w.plan_str = gpa.dupe(u8, clip(s, 2600)) catch "";
+    w.plan_str = gpa.dupe(u8, clip(s, 4096)) catch "";
     w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
     w.act("engine", round, "plan", "plan REVISED (canon ratchet held; forward strategy updated from what's built + learned)", clip(s, 500));
@@ -2693,7 +2693,7 @@ pub fn planProject(w: *Worker, goal: []const u8, brief: []const u8) []const u8 {
         return explicit;
     }
     if (explicit.len > 0) gpa.free(@constCast(explicit));
-    const sys = "You are the architect for an autonomous build swarm. Design the project's FILE & FOLDER STRUCTURE and list EVERY file the finished project needs, ONE PER LINE, as `relative/path — one-line purpose`. CRITICAL: match the layout the goal IMPLIES. HONOR any explicit filename in the goal exactly — if it says 'build calc.py', the deliverable IS `calc.py` at the ROOT; do NOT move it into src/. A test or spec that does `import calc` needs `calc.py` importable from the root, so keep it flat. Use subdirectories (src/, tests/, config/, docs/) ONLY when the project is genuinely large enough to need modular structure; for a small or single-module deliverable, keep the files at the ROOT. Don't over-engineer a simple task into a package. Output ONLY the file list — no headings, no prose, no code fences.";
+    const sys = "You are the architect for an autonomous build swarm. Design the project's FILE & FOLDER STRUCTURE and list EVERY file the finished project needs, ONE PER LINE, as `relative/path — one-line purpose`. CRITICAL: match the layout the goal IMPLIES. HONOR any explicit filename in the goal exactly — if it says 'build calc.py', the deliverable IS `calc.py` at the ROOT; do NOT move it into src/. A test or spec that does `import calc` needs `calc.py` importable from the root, so keep it flat. Use subdirectories (src/, tests/, config/, docs/) ONLY when the project is genuinely large enough to need modular structure; for a small or single-module deliverable, keep the files at the ROOT. Don't over-engineer a simple task into a package. THE FILE LIST IS THE DELIVERABLE ITSELF, NOT A PROGRAM THAT PRODUCES IT: if the goal asks for an OUTPUT — a document, a poem, a story, a dataset, a report, a config, a single answer file — list THAT file and it will be written DIRECTLY with the real content; do NOT invent generator/runner/helper scripts to emit it (never a `generate_*`, `make_*`, `build_*`, or `run_*` whose only job is to produce a file the goal already named). Propose code/source files ONLY when the deliverable itself is software. If the goal asks the hive to DO ongoing work — keep finding tasks, research, monitor, act, or otherwise work over time — that is something the minds DO each round directly, NOT a system to build: never scaffold an orchestrator, scheduler, task-runner, framework, config, or logging module to perform work the hive can simply do. Always prefer the FEWEST files that together ARE the finished deliverable; when in doubt, fewer. Output ONLY the file list — no headings, no prose, no code fences.";
     const user = std.fmt.allocPrint(gpa,
         \\Goal: {s}
         \\Intent: {s}
