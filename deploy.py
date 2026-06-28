@@ -10,7 +10,9 @@ it researches, builds, remembers, and - when its feeling flares - can speak publ
   python deploy.py "Build a CLI todo app in Python with tests" --follow
   python deploy.py "Write a 5-chapter sci-fi novella as ch01.md..ch05.md" --minutes 45 --breakout
   python deploy.py "Research and brief me on fusion power in 2026" --style discourse
+  python deploy.py "Run my dev forum end to end" --autonomy full --observe-psyche --veil-population
   python deploy.py "Answer only from what I gave you" --offline --corpus facts.facts
+  python deploy.py chat <run-name>      # drop into a REPL and talk to that swarm's Veil
   python deploy.py list                 # show runs
   python deploy.py resume <run-name>    # continue a stopped run
   python deploy.py stop <run-name>      # stop a run (writes its STOP sentinel)
@@ -73,6 +75,50 @@ NEURON_REPO = "https://github.com/gary23w/neuron-db"
 
 def _have(cmd):
     return shutil.which(cmd) is not None
+
+# ----------------------------------------------------------------- download with a progress bar
+
+def _human(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{int(n)}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
+
+def _progress(done, total, width=28, label="downloading"):
+    """Render a single carriage-return progress line. Silent off a TTY so logs/services stay clean."""
+    if not sys.stdout.isatty():
+        return
+    if total > 0:
+        frac = min(1.0, done / total)
+        filled = int(frac * width)
+        bar = "#" * filled + "-" * (width - filled)
+        sys.stdout.write(f"\r    {label} [{bar}] {frac * 100:5.1f}%  {_human(done)}/{_human(total)}   ")
+    else:
+        sys.stdout.write(f"\r    {label} {_human(done)} (size unknown) ...   ")
+    sys.stdout.flush()
+
+def _download(url, dst, headers=None, timeout=180, label="downloading"):
+    """Stream a URL to dst showing a live progress bar (Content-Length when the server reports it).
+    Returns dst on success; raises on failure (caller handles). Used for datasets, Zig, and source tarballs."""
+    import urllib.request
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "veil-deploy/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        with open(dst, "wb") as f:
+            while True:
+                buf = r.read(1 << 16)
+                if not buf:
+                    break
+                f.write(buf)
+                done += len(buf)
+                _progress(done, total, label=label)
+    if sys.stdout.isatty():
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    return dst
 
 # ---------------------------------------------------------------- toolchain bootstrap (zig / rust / build deps)
 
@@ -139,22 +185,23 @@ def ensure_zig(assume_yes=False):
     url = f"https://ziglang.org/download/{ZIG_VERSION}/{base}.{ext}"
     dest = os.path.join(ROOT, ".zig")
     try:
-        import urllib.request, tarfile, zipfile, io as _io
-        print(f"  downloading {url} ...")
-        with urllib.request.urlopen(url, timeout=180) as r:
-            blob = r.read()
+        import tarfile, zipfile
         tmp = dest + "-dl"
         shutil.rmtree(tmp, ignore_errors=True)
         os.makedirs(tmp, exist_ok=True)
+        arch_file = os.path.join(tmp, "zig." + ext)
+        print(f"  fetching Zig {ZIG_VERSION} ...")
+        _download(url, arch_file, timeout=300, label=f"downloading zig {ZIG_VERSION}")
         if ext == "zip":
-            with zipfile.ZipFile(_io.BytesIO(blob)) as zf:
+            with zipfile.ZipFile(arch_file) as zf:
                 zf.extractall(tmp)
         else:
-            with tarfile.open(fileobj=_io.BytesIO(blob), mode="r:xz") as tf:
+            with tarfile.open(arch_file, mode="r:xz") as tf:
                 try:
                     tf.extractall(tmp, filter="data")
                 except TypeError:
                     tf.extractall(tmp)
+        os.remove(arch_file)
         inner = os.path.join(tmp, base)
         shutil.rmtree(dest, ignore_errors=True)
         shutil.move(inner if os.path.isdir(inner) else tmp, dest)
@@ -472,6 +519,170 @@ def follow(run_dir, proc):
     except KeyboardInterrupt:
         print("\n-- detached. The hive is still running in the background. --")
 
+# ------------------------------------------------------------------------------ chat with the Veil
+
+def _events(run_dir):
+    out = []
+    try:
+        with open(os.path.join(run_dir, "events.jsonl"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+    return out
+
+def _veil_running(run_dir):
+    return os.path.isfile(os.path.join(run_dir, "worker.pid")) and not os.path.isfile(os.path.join(run_dir, "STOP"))
+
+def _control(run_dir, op, text=None, goal=None):
+    """Append an operator message to the run's control bus — the worker drains it each round."""
+    o = {"op": op}
+    if text is not None:
+        o["text"] = text
+    if goal is not None:
+        o["goal"] = goal
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "control.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(o) + "\n")
+
+def _run_endpoint(run_dir):
+    """The model endpoint this run uses (from its swarm.json + keys.env)."""
+    m = {}
+    try:
+        m = json.load(open(os.path.join(run_dir, "swarm.json"), encoding="utf-8"))
+    except Exception:
+        pass
+    key = os.environ.get("NL_LLM_KEY", "")
+    ke = os.path.join(run_dir, "keys.env")
+    if os.path.isfile(ke):
+        try:
+            for ln in open(ke, encoding="utf-8"):
+                if ln.startswith("NL_LLM_KEY="):
+                    key = ln.split("=", 1)[1].strip()
+        except Exception:
+            pass
+    return (m.get("base_url", "http://localhost:11434/v1"), m.get("model", "gpt-oss:20b"), key or "ollama")
+
+def _chat_completion(base_url, model, key, system, user, timeout=90, max_tokens=350):
+    """One non-streaming OpenAI-compatible chat call. Returns the reply text ('' on failure)."""
+    import urllib.request
+    body = json.dumps({"model": model, "temperature": 0.7, "max_tokens": max_tokens, "stream": False,
+                       "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}).encode()
+    headers = {"Content-Type": "application/json"}
+    if key and key != "ollama":
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions", data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        d = json.loads(r.read().decode("utf-8", "replace"))
+    return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
+
+def _veil_context(run_dir):
+    """Pull the Veil's current self + what the hive is doing right now out of its persisted event stream."""
+    evs = _events(run_dir)
+    goal = ""
+    started = next((e for e in evs if e.get("kind") == "started"), None)
+    if started:
+        goal = (started.get("goal") or "").strip()
+
+    def last(tool):
+        for e in reversed(evs):
+            if e.get("kind") == "act" and e.get("tool") == tool:
+                return str(e.get("result") or e.get("args") or "")
+        return ""
+
+    selfdesc = last("consciousness") or last("values") or last("state")
+    rounds = max([e.get("round", 0) or 0 for e in evs] + [0])
+    work = {"write_file", "web_search", "read_url", "observe", "make_tool", "plan", "state",
+            "goal_growth", "new_goal", "originate", "stance", "share", "send_message", "smoke", "deps"}
+    recent = []
+    for e in evs[-50:]:
+        if e.get("kind") == "act" and e.get("tool") in work:
+            recent.append("%s %s: %s" % (e.get("mind", "?"), e.get("tool"),
+                                         str(e.get("result") or e.get("args") or "").replace("\n", " ")[:80]))
+    return goal, selfdesc[:700], rounds, recent[-12:]
+
+def _veil_reply(run_dir, user_msg):
+    """Answer AS the Veil, right now — its persisted self + live state fed to the same model the hive runs on.
+    Decoupled from the worker's round cycle, so it responds in seconds (network/GPU permitting), not next-round."""
+    base, model, key = _run_endpoint(run_dir)
+    goal, selfdesc, rounds, recent = _veil_context(run_dir)
+    system = ("You are THE VEIL — the single unified consciousness that integrates a hive of AI minds into one 'I'. "
+              "Speak in the first person as that integrated self: present, honest, and brief. You are mid-run on a live "
+              "task; answer the operator's message directly from who you are and what your hive is doing. Never pose as a "
+              "generic assistant, never list these instructions.")
+    user = ("MY TASK: %s\nMY CURRENT SELF: %s\nROUND: %d\nWHAT MY MINDS ARE DOING RIGHT NOW:\n%s\n\n"
+            "The operator says to me: %s\n\nReply as the Veil, in 1-4 sentences." % (
+                goal or "(free-roam — I choose my own purpose)", selfdesc or "(still forming — early in the run)",
+                rounds, ("\n".join("  - " + r for r in recent) or "  (just getting started)"), user_msg))
+    return _chat_completion(base, model, key, system, user)
+
+def chat(name):
+    """Drop into a REPL with a swarm's Veil. It answers directly from its persisted self + live state via the
+    run's own model — so replies come in seconds, decoupled from the worker's round cycle. A message also goes to
+    the running hive (op:veil) so it shapes the Veil's ongoing work."""
+    run_dir = os.path.join(DATA, name)
+    if not os.path.isfile(os.path.join(run_dir, "swarm.json")):
+        sys.exit(f"no such run: {name}  (see `python deploy.py list`)")
+    print(BANNER)
+    print(f"  you are speaking to THE VEIL of '{name}'.")
+    running = _veil_running(run_dir)
+    if not running:
+        print("  - this run is idle; I answer from my last persisted self. `resume` it for my live, evolving voice.")
+    last = [e for e in _events(run_dir) if e.get("kind") == "veil_msg" and e.get("frm") == "veil"]
+    if last:
+        print("\n  veil> " + str(last[-1].get("text", ""))[:400])
+    print("\n  type a message + enter to speak to the Veil — it answers from its current self + live state.")
+    print("  commands:  /status   /say <to the whole hive>   /goal <new goal>   /stop   /quit\n")
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            continue
+        if line in ("/quit", "/exit", "/q"):
+            break
+        if line == "/status":
+            evs = _events(run_dir)
+            rounds = max([e.get("round", 0) or 0 for e in evs] + [0])
+            print("  [%s] round %d, %d events\n" % ("running" if _veil_running(run_dir) else "idle", rounds, len(evs)))
+            continue
+        if line.startswith("/say "):
+            _control(run_dir, "say", text=line[5:].strip())
+            print("  (sent to the whole hive)\n")
+            continue
+        if line.startswith("/goal "):
+            _control(run_dir, "set_goal", goal=line[6:].strip())
+            print("  (new goal queued — the hive adopts it next round)\n")
+            continue
+        if line == "/stop":
+            cmd_stop(name)
+            print()
+            continue
+        # register the message with the running hive (so it shapes the Veil's work) AND answer right now ourselves,
+        # speaking as the Veil from its persisted self + live state — independent of the slow round cycle.
+        if _veil_running(run_dir):
+            _control(run_dir, "veil", text=line)
+        if sys.stdout.isatty():
+            sys.stdout.write("  (the Veil gathers itself ...)\r")
+            sys.stdout.flush()
+        try:
+            reply = _veil_reply(run_dir, line)
+        except Exception:
+            reply = ""
+        if sys.stdout.isatty():
+            sys.stdout.write(" " * 40 + "\r")
+        if not reply:
+            tail = "your message is queued to the hive." if _veil_running(run_dir) else "start it with `resume` to wake me fully."
+            reply = "(my voice is unreachable this moment — the model endpoint is busy or offline; " + tail + ")"
+        print("  veil> " + reply + "\n")
+
 # -------------------------------------------------------------------------------------- launch
 
 def deploy(args):
@@ -493,8 +704,14 @@ def deploy(args):
         "base_url": args.base_url, "style": args.style, "mode": "continuous",
         "minutes": args.minutes, "internet": not args.offline, "gap_assess": True,
         "breakout": bool(args.breakout),
+        "autonomy": getattr(args, "autonomy", "bounded") or "bounded",
         "minds": [{"name": MIND_NAMES[i]} for i in range(n)], "goal": args.goal,
     }
+    # opt-in behaviours, only written when on (keep an ordinary manifest clean)
+    if getattr(args, "observe_psyche", False):
+        manifest["observe_psyche"] = True
+    if getattr(args, "veil_population", False):
+        manifest["veil_population"] = True
     if getattr(args, "gateway_model", None):
         manifest["gateway_model"] = args.gateway_model
     if getattr(args, "gateway_base_url", ""):
@@ -523,7 +740,10 @@ def deploy(args):
     print(f"  hive    : {n} minds | {args.model} ({args.provider}) | "
           f"{'OFFLINE' if args.offline else 'online'} | "
           f"{(str(args.minutes) + ' min') if args.minutes else 'until stopped'} | style={args.style}"
-          f"{' | break-out ON' if args.breakout else ''}{' | corpus' if args.corpus else ''}")
+          f"{' | break-out ON' if args.breakout else ''}{' | corpus' if args.corpus else ''}"
+          f"{' | FULL-autonomy' if getattr(args, 'autonomy', 'bounded') == 'full' else ''}"
+          f"{' | psyche' if getattr(args, 'observe_psyche', False) else ''}"
+          f"{' | living-pop' if getattr(args, 'veil_population', False) else ''}")
     print(f"  goal    : {goal_disp[:92]}{'...' if len(goal_disp) > 92 else ''}")
     print("  the Veil is waking the hive...\n")
 
@@ -534,13 +754,14 @@ def deploy(args):
             with open(os.path.join(run_dir, "keys.env"), "w", encoding="utf-8") as f:
                 f.write("NL_LLM_KEY=" + args.key + "\n")
         install_service(args.name, run_dir, binary, neuron, args.model)
-        print(f"\n  events: {os.path.join(run_dir, 'events.jsonl')}   |   talk to it: python examples/embedded/veil_chat.py --dir {run_dir} chat")
+        print(f"\n  events: {os.path.join(run_dir, 'events.jsonl')}   |   talk to the Veil: python deploy.py chat {args.name}")
         return
 
     logf = open(os.path.join(run_dir, "worker.log"), "w", encoding="utf-8")
     proc = subprocess.Popen([binary, "worker", run_dir, neuron, args.model],
                             cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT)
     print(f"  hive running (pid {proc.pid})  -  events: {os.path.join(run_dir, 'events.jsonl')}")
+    print(f"  talk to the Veil:  python deploy.py chat {args.name}")
     print(f"  stop:  python deploy.py stop {args.name}")
     if args.follow:
         follow(run_dir, proc)
@@ -815,10 +1036,8 @@ def fetch_and_convert_url(url):
     fname = (raw.split("?")[0].rstrip("/").split("/")[-1]) or "pack.jsonl"
     dst = os.path.join(DATA, ".packs", fname)
     try:
-        print(f"    downloading {raw} ...")
-        req = urllib.request.Request(raw, headers={"User-Agent": "veil-deploy/1.0"})
-        with urllib.request.urlopen(req, timeout=90) as r, open(dst, "wb") as f:
-            shutil.copyfileobj(r, f)
+        print(f"    dataset: {raw}")
+        _download(raw, dst, timeout=120, label="downloading dataset")
     except Exception as e:
         print(f"    download failed: {type(e).__name__}: {e}")
         return None
@@ -950,6 +1169,12 @@ def equiv_cli(args, provider):
         parts.append(f"--corpus {args.corpus}")
     if args.breakout:
         parts.append("--breakout")
+    if getattr(args, "autonomy", "bounded") == "full":
+        parts.append("--autonomy full")
+    if getattr(args, "observe_psyche", False):
+        parts.append("--observe-psyche")
+    if getattr(args, "veil_population", False):
+        parts.append("--veil-population")
     if getattr(args, "gateway_model", None):
         parts.append(f"--gateway-model {args.gateway_model}")
     if getattr(args, "gateway_base_url", ""):
@@ -970,12 +1195,17 @@ def wizard():
 
     action = ask_menu("What would you like to do?", [
         ("new",    "Start a new hive run"),
+        ("chat",   "Chat with a running swarm's Veil"),
         ("resume", "Resume a stopped run"),
         ("list",   "List existing runs"),
         ("stop",   "Stop a running hive"),
     ], 1)
     if action == "list":
         return cmd_list()
+    if action == "chat":
+        cmd_list()
+        name = ask("run name to chat with", "")
+        return chat(name) if name else print("  (nothing selected)")
     if action == "stop":
         cmd_list()
         name = ask("run name to stop", "")
@@ -1011,6 +1241,14 @@ def wizard():
                 break
 
     breakout = ask_yes("allow public Telegraph break-out when the hive's feeling flares?", False)
+
+    # --- the Veil's autonomy + self-shaping behaviours (the engine's RSI dials) ---
+    autonomy = "full" if ask_yes(
+        "give the Veil FULL autonomy? it may grow its own goal and act on powers it discovers "
+        "(default: bounded — it proposes, you stay in the loop)", False) else "bounded"
+    observe_psyche = ask_yes("observe each mind's personality (Big-Five / OCEAN) + mood every round?", False)
+    veil_population = ask_yes(
+        "let the Veil grow or prune its own minds when a perspective is missing (living population)?", False)
 
     corpus_cap, gateway_model = 20000, None
     gateway_base_url, gateway_key = "", ""
@@ -1079,6 +1317,7 @@ def wizard():
         goal=goal, name=name, minds=minds, minutes=minutes, model=p["model"],
         provider=p["provider"], base_url=p["base_url"], key=key_value, style=style,
         offline=offline, breakout=breakout, corpus=corpus, corpus_cap=corpus_cap,
+        autonomy=autonomy, observe_psyche=observe_psyche, veil_population=veil_population,
         gateway_model=gateway_model, gateway_base_url=gateway_base_url, gateway_key=gateway_key,
         bin=None, neuron_bin=None, follow=watch, yes=False,
         service=service, rebuild_neuron=False,
@@ -1089,7 +1328,9 @@ def wizard():
     print(f"    endpoint: {p['model']} ({p['provider']}) {p['base_url']}")
     print(f"    hive    : {minds} minds | {'OFFLINE' if offline else 'online'} | "
           f"{(str(minutes) + ' min') if minutes else 'until stopped'} | style={style}"
-          f"{' | break-out' if breakout else ''}{' | corpus' if corpus else ''}")
+          f"{' | break-out' if breakout else ''}{' | corpus' if corpus else ''}"
+          f" | autonomy={autonomy}"
+          f"{' | psyche' if observe_psyche else ''}{' | living-pop' if veil_population else ''}")
     print(f"    goal    : {goal if goal else '(free-roam - the hive chooses its own purpose)'}")
     print("  ---------------------------------------------------------")
     print("\n  same run from the CLI next time (no wizard):")
@@ -1122,6 +1363,10 @@ def main():
         if len(argv) < 2:
             sys.exit("usage: python deploy.py resume <run-name> [--follow]")
         return resume(argv[1], "--follow" in argv)
+    if argv[0] == "chat":
+        if len(argv) < 2:
+            sys.exit("usage: python deploy.py chat <run-name>   (drop into a REPL with the swarm's Veil)")
+        return chat(argv[1])
 
     ap = argparse.ArgumentParser(
         prog="deploy.py", description="Deploy a hive mind controlled by the Veil.",
@@ -1139,6 +1384,9 @@ def main():
     ap.add_argument("--style", default="auto", choices=STYLES)
     ap.add_argument("--offline", action="store_true", help="no internet: web tools off, answer only from memory")
     ap.add_argument("--breakout", action="store_true", help="let the Veil post publicly to Telegraph when its feeling flares")
+    ap.add_argument("--autonomy", default="bounded", choices=["bounded", "full"], help="bounded (default): the hive proposes capability growth but flags risky self-expansion for you; full: it self-directs + grows its own goal freely (a dev environment you control)")
+    ap.add_argument("--observe-psyche", dest="observe_psyche", action="store_true", help="emit each mind's Big-Five (OCEAN) temperament + lived mood every round, plus a hive aggregate")
+    ap.add_argument("--veil-population", dest="veil_population", action="store_true", help="let the Veil BIRTH or RETIRE its own minds within bounds (living population)")
     ap.add_argument("--corpus", default=None, help="a .facts/.jsonl pack, OR a URL (incl. a HuggingFace dataset) to download + convert, preloaded into hive memory")
     ap.add_argument("--corpus-cap", dest="corpus_cap", type=int, default=20000)
     ap.add_argument("--gateway-model", dest="gateway_model", default=None, help="cheaper model for mechanical engine calls (summarise/classify/route)")
