@@ -641,8 +641,8 @@ fn walkAnchors(node: *const Node, base: []const u8, gpa: std.mem.Allocator, ta: 
         const is_http = std.mem.startsWith(u8, real, "http");
         const is_engine = isEngineLink(real, base);
         if (is_http and !is_engine and text.len >= 8 and !seen.contains(real)) {
-            seen.put(gpa, gpa.dupe(u8, real) catch real, {}) catch {};
             out.appendSlice(gpa, std.fmt.allocPrint(ta, "- {s}\n  {s}\n", .{ clipText(text, 140), real }) catch "") catch {};
+            seen.put(gpa, real, {}) catch gpa.free(real); // `real` IS the owned seen-key — duping it leaked the original
             n.* += 1;
         } else gpa.free(real);
         return;
@@ -873,4 +873,64 @@ pub fn extractLinks(gpa: std.mem.Allocator, html: []const u8, base_url: []const 
         out.appendSlice(gpa, media.items) catch {};
     }
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
+// Unit tests for the pure crawl/search surface. std.testing.allocator is leak-checking — these guard the
+// search hot path against allocation leaks (caught the walkAnchors `real` leak).
+
+test "hostOf extracts the host (or empty when there's no scheme)" {
+    try std.testing.expectEqualStrings("www.example.com", hostOf("https://www.example.com/path?q=1"));
+    try std.testing.expectEqualStrings("a.b.c", hostOf("http://a.b.c/x"));
+    try std.testing.expectEqualStrings("", hostOf("no-scheme-here/path"));
+}
+
+test "isChromeTag flags nav/footer/header chrome, not content tags" {
+    try std.testing.expect(isChromeTag("footer"));
+    try std.testing.expect(isChromeTag("FOOTER"));
+    try std.testing.expect(isChromeTag("nav"));
+    try std.testing.expect(!isChromeTag("div"));
+    try std.testing.expect(!isChromeTag("a"));
+}
+
+test "isEngineLink drops engine + chrome domains, keeps genuine results" {
+    const base = "https://www.startpage.com";
+    try std.testing.expect(isEngineLink("https://www.bing.com/x", base));
+    try std.testing.expect(isEngineLink("https://twitter.com/acct", base));
+    try std.testing.expect(isEngineLink("https://creativecommons.org/licenses/by/4.0/", base));
+    try std.testing.expect(isEngineLink("https://www.startpage.com/foo", base));
+    try std.testing.expect(!isEngineLink("https://www.reuters.com/world/x", base));
+    try std.testing.expect(!isEngineLink("https://github.com/torvalds/linux", base));
+}
+
+test "unwrapRedirect decodes a DDG uddg link + passes plain urls through" {
+    const gpa = std.testing.allocator;
+    const ddg = unwrapRedirect(gpa, "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage&rut=z");
+    defer gpa.free(ddg);
+    try std.testing.expectEqualStrings("https://example.com/page", ddg);
+    const plain = unwrapRedirect(gpa, "https://example.com/plain");
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("https://example.com/plain", plain);
+}
+
+test "searchResults harvests body results but skips footer chrome (and does not leak)" {
+    const gpa = std.testing.allocator;
+    const serp =
+        "<html><body>" ++
+        "<div class=\"result\"><a href=\"https://www.reuters.com/world/real-story-here\">A genuine news result headline</a></div>" ++
+        "<footer><a href=\"https://github.com/EngineProject\">Our GitHub repository here</a>" ++
+        "<a href=\"https://creativecommons.org/licenses/\">Content licence notice</a></footer>" ++
+        "</body></html>";
+    const res = searchResults(gpa, serp, "https://www.example-engine.com", 10);
+    defer gpa.free(res);
+    try std.testing.expect(std.mem.indexOf(u8, res, "reuters.com/world/real-story-here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "github.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "creativecommons") == null);
+}
+
+test "fitToQuery returns the query-relevant chunk" {
+    const gpa = std.testing.allocator;
+    const md = "The cat sat quietly on the warm mat by the door for hours.\n\nQuantum chromodynamics is the theory describing the strong nuclear interaction between quarks and gluons.";
+    const fit = fitToQuery(gpa, md, "quantum quarks gluons interaction", 200);
+    defer gpa.free(@constCast(fit));
+    try std.testing.expect(std.mem.indexOf(u8, fit, "chromodynamics") != null);
 }
