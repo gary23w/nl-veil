@@ -1680,7 +1680,7 @@ fn enrichResults(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []con
     const tmp = std.fmt.allocPrint(gpa, "{s}/.cenrich-{s}.tmp", .{ dir, tag }) catch return dupe(gpa, list);
     defer gpa.free(tmp);
     var out: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer out.deinit(gpa);
+    defer out.deinit(gpa); // toOwnedSlice empties `out` on success (no-op); frees the buffer on the OOM-catch path
     var seen_host: std.StringHashMapUnmanaged(void) = .empty;
     defer seen_host.deinit(gpa);
     var fetched: usize = 0;

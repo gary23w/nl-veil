@@ -849,6 +849,11 @@ pub fn extractLinks(gpa: std.mem.Allocator, html: []const u8, base_url: []const 
     var intl: std.ArrayListUnmanaged(u8) = .empty;
     var extl: std.ArrayListUnmanaged(u8) = .empty;
     var media: std.ArrayListUnmanaged(u8) = .empty;
+    defer { // their .items are copied into `out` below — free the section buffers (else leaked every call)
+        intl.deinit(gpa);
+        extl.deinit(gpa);
+        media.deinit(gpa);
+    }
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = seen.keyIterator();
@@ -933,4 +938,17 @@ test "fitToQuery returns the query-relevant chunk" {
     const fit = fitToQuery(gpa, md, "quantum quarks gluons interaction", 200);
     defer gpa.free(@constCast(fit));
     try std.testing.expect(std.mem.indexOf(u8, fit, "chromodynamics") != null);
+}
+
+test "extractLinks splits internal/external/media and does not leak" {
+    const gpa = std.testing.allocator;
+    const html = "<html><body>" ++
+        "<a href=\"/internal/page\">Internal link</a>" ++
+        "<a href=\"https://ext.example.com/x\">External link</a>" ++
+        "<img src=\"/img/a.png\" alt=\"a picture\">" ++
+        "</body></html>";
+    const res = extractLinks(gpa, html, "https://site.example.com", 10);
+    defer gpa.free(res);
+    try std.testing.expect(std.mem.indexOf(u8, res, "site.example.com/internal/page") != null);
+    try std.testing.expect(std.mem.indexOf(u8, res, "ext.example.com/x") != null);
 }
