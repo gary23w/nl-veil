@@ -53,6 +53,13 @@ pub const Mem = struct {
         return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \r\n\t"), 10) catch 0;
     }
 
+    pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
+        self.lockW();
+        if (self.run(&.{ "forget", scope })) |o| self.gpa.free(o);
+        self.unlockW();
+        _ = self.observe(scope, fact);
+    }
+
     /// Single best fact (RecallOne) as a text block. Caller frees. Empty when recall abstains (no match).
     pub fn recall(self: Mem, scope: []const u8, query: []const u8) []u8 {
         const out = self.run(&.{ "recall", scope, query }) orelse return self.gpa.dupe(u8, "") catch @constCast("");

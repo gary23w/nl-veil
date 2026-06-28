@@ -117,6 +117,7 @@ pub const ToolCtx = struct {
     internet: bool = true,
     one_slot: bool = false,
     slot_path: []const u8 = "",
+    blueprint: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
 };
 
@@ -186,6 +187,9 @@ pub const SIM_SCOPE = "simulations";
 pub const EPISODE_SCOPE = "episodes";
 pub const STRATEGY_SCOPE = "strategy";
 pub const ARCH_SCOPE = "architecture";
+pub const STATE_SCOPE = "state";
+pub const PLAN_SCOPE = "plan";
+pub const PLAN_REQ_SCOPE = "plan_req";
 
 /// Self-generated training trajectory — challenge prompts the engine derives from current weakness profile.
 pub const CURRICULUM_SCOPE = "curriculum";
@@ -234,6 +238,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"note_stance","description":"Record how you feel about a topic (your stance).","parameters":{"type":"object","properties":{"topic":{"type":"string"},"feeling":{"type":"string"}},"required":["topic","feeling"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"Save a NEW reusable skill you developed — a method, code snippet, or step-by-step approach — into the swarm's shared skill library, so you and teammates can reuse it instead of re-deriving it. Do NOT re-save a skill already in the 'Reusable skills' list you were shown; save each distinct skill ONCE.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"a short skill name"},"skill":{"type":"string","description":"the reusable how-to / snippet / approach, concrete enough to follow again"}},"required":["name","skill"]}}},
     \\{"type":"function","function":{"name":"set_directive","description":"IMPROVE HOW YOUR SWARM WORKS. Write a concise process directive — a lesson about a better way to operate — into the swarm's shared, self-authored operating PLAYBOOK. It is injected into every mind's instructions from now on, so this is how the swarm improves its own process over time. Use it when you notice what's working or what's failing (e.g. 'read a file before rewriting it', 'one mind owns each section', 'verify code by running it'). Phrase it as an imperative rule. Don't repeat a directive already in the playbook.","parameters":{"type":"object","properties":{"directive":{"type":"string","description":"one concise imperative process rule for the swarm to follow"}},"required":["directive"]}}},
+    \\{"type":"function","function":{"name":"propose_plan_change","description":"Propose a change to the shared PROJECT PLAN (the forward contract every piece is built to) with a clear rationale — e.g. the arc isn't landing, research revealed a better structure, two pieces need a different hand-off. The engine folds sound proposals into its next plan revision. The CANON RATCHET protects finished work: any fact a built piece already used cannot change, so you can only refine the plan for pieces NOT yet built.","parameters":{"type":"object","properties":{"rationale":{"type":"string","description":"why the plan should change and what it should become for the unbuilt pieces"}},"required":["rationale"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Send a message to a teammate mind (or 'all' to broadcast) on the swarm bus.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}},
     \\{"type":"function","function":{"name":"add_task","description":"Add a task to the shared swarm board, assigned to a mind (or 'all').","parameters":{"type":"object","properties":{"assignee":{"type":"string"},"task":{"type":"string"}},"required":["assignee","task"]}}},
     \\{"type":"function","function":{"name":"complete_task","description":"Mark a board task done by its id, with a short result.","parameters":{"type":"object","properties":{"id":{"type":"integer"},"result":{"type":"string"}},"required":["id"]}}},
@@ -428,6 +433,15 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         ctx.directives_set.* += 1;
         const total = ctx.mem.factCount(PLAYBOOK_SCOPE);
         return std.fmt.allocPrint(gpa, "added to the operating playbook ({d} directives — all minds follow it now)", .{total}) catch dupe(gpa, "directive added");
+    }
+    if (std.mem.eql(u8, name, "propose_plan_change")) {
+        const A = struct { rationale: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        const d = std.mem.trim(u8, p.value.rationale, " \r\n\t");
+        if (d.len < 8) return dupe(gpa, "rationale too short, nothing proposed");
+        _ = ctx.mem.observe(PLAN_REQ_SCOPE, d);
+        return dupe(gpa, "plan-change proposed — the engine will weigh it at the next plan revision (locked canon won't change)");
     }
     if (std.mem.eql(u8, name, "send_message")) {
         const A = struct { to: []const u8 = "all", text: []const u8 = "" };
@@ -675,6 +689,11 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
     const redirected = ctx.one_slot and ctx.slot_path.len > 0 and !std.mem.eql(u8, p.value.path, ctx.slot_path);
     const wpath = if (redirected) ctx.slot_path else p.value.path;
+    if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !std.mem.eql(u8, std.fs.path.basename(wpath), std.fs.path.basename(ctx.slot_path))) {
+        const yours = if (ctx.slot_path.len > 0) std.fmt.allocPrint(gpa, " YOUR file this round is `{s}` — write that, not this.", .{ctx.slot_path}) catch "" else " You have no deliverable file this round — research the upcoming pieces, share what you learn, or create a NEW helper file.";
+        defer if (yours.len > 0 and ctx.slot_path.len > 0) gpa.free(@constCast(yours));
+        return std.fmt.allocPrint(gpa, "`{s}` is an ordered deliverable file with a single author this round — overwriting it would clobber finished work or jump ahead of the team's current piece.{s}", .{ wpath, yours }) catch dupe(gpa, "that ordered file belongs to its builder this round — don't overwrite it");
+    }
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, wpath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
     if (ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
@@ -2136,7 +2155,8 @@ pub const BENCH_PY =
     \\                if tw>0: sc+= min(1.0, sum(len(ln.split()) for ln in t.split("\n") if ln.strip() and not ln.strip().startswith("#"))/tw)
     \\                else: sc+= 1 if t.count("#")>0 and len(t)>200 else 0
     \\            else: sc+= 1 if len(t)>40 else 0
-    \\        pct=min(99,int(sc*100/len(docs))) if docs else 0
+    \\        denom=max(len(docs), int(os.environ.get("NL_DOC_FILE_COUNT","0") or 0))
+    \\        pct=min(99,int(sc*100/denom)) if denom else 0
     \\        out({"status":"ok","passed":pct,"total":100,"failures":[],"tier":3})
     \\    out({"status":"no-tests"})
     \\except Exception as e:
@@ -2495,6 +2515,21 @@ fn fileOwnedBy(list: []const u8, path: []const u8) bool {
         const t = std.mem.trim(u8, e, " \r\n\t");
         if (t.len == 0) continue;
         if (std.mem.eql(u8, std.fs.path.basename(t), pb)) return true;
+    }
+    return false;
+}
+fn blueprintHas(blueprint: []const u8, path: []const u8) bool {
+    if (blueprint.len == 0) return false;
+    const pb = std.fs.path.basename(path);
+    if (pb.len == 0) return false;
+    var it = std.mem.splitScalar(u8, blueprint, '\n');
+    while (it.next()) |line| {
+        var s = std.mem.trim(u8, line, " \r\t");
+        if (s.len > 0 and (s[0] == '-' or s[0] == '*' or s[0] == '+')) s = std.mem.trim(u8, s[1..], " \r\t");
+        var end: usize = 0;
+        while (end < s.len and s[end] != ' ' and s[end] != '\t' and s[end] != ':' and s[end] != '`') : (end += 1) {}
+        if (end == 0) continue;
+        if (std.mem.eql(u8, std.fs.path.basename(s[0..end]), pb)) return true;
     }
     return false;
 }

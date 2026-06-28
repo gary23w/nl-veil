@@ -164,11 +164,15 @@ pub const Worker = struct {
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     now_str: []const u8 = "",
+    doc_files: u32 = 0,
     doc_target: u32 = 0,
     gateway_model: []const u8 = "",
     gw_base: []const u8 = "",
     gw_key: []const u8 = "",
     digest_str: []const u8 = "",
+    state_str: []const u8 = "",
+    plan_str: []const u8 = "",
+    deps_str: []const u8 = "",
     pop_on: bool = false,
     births: u32 = 0,
     last_pop_round: u32 = 0,
@@ -374,6 +378,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.playbook_str.len > 0) gpa.free(@constCast(w.playbook_str));
     defer if (w.kindex_str.len > 0) gpa.free(@constCast(w.kindex_str));
     defer if (w.digest_str.len > 0) gpa.free(@constCast(w.digest_str));
+    defer if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
+    defer if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
+    defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
     w.breakout_on = m.breakout;
     w.publish_on = m.publish;
@@ -435,13 +442,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     defer if (w.roster.len > 0) gpa.free(@constCast(w.roster));
     if (minds.items.len > 1) {
-        const n = minds.items.len;
+        const ri = roleIndices(@intCast(minds.items.len));
         for (minds.items, 0..) |*mi, i| {
-            mi.lane = if (n >= 3 and i == 0)
+            const ii: i64 = @intCast(i);
+            mi.lane = if (ri.lead == ii)
                 "LEAD/coordinator — set the plan, break it into concrete tasks and assign them to teammates with add_task, integrate their work into the final artifact, and keep everyone aligned (don't build it all yourself)"
-            else if (n >= 3 and i == n - 1)
+            else if (ri.qa == ii)
                 "REVIEW & QA — verify teammates' facts and files, fill gaps, and assemble/polish the final deliverable; OWN the test suite (write/expand real test_*.py with assertions about INTENDED behavior, never trivial asserts that game the score), and each round fix the deliverable's single biggest failing test"
-            else if (n >= 4 and i == 1) blk: {
+            else if (ri.scout == ii) blk: {
                 mi.scout = true;
                 break :blk SCOUT_LANE;
             } else LANES[i % LANES.len];
@@ -520,10 +528,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
         }
         w.doc_target = docTargetFromBlueprint(w.blueprint, goal);
+        if (w.doc_target > 0) w.doc_files = docFileCount(w.blueprint);
         if (w.doc_target > 0) {
             const dm = std.fmt.allocPrint(gpa, "per-file word target = {d} (length-scored, not file-presence)", .{w.doc_target}) catch "";
             defer if (dm.len > 0) gpa.free(dm);
             w.act("engine", 0, "doc_target", "prose/document build", dm);
+        }
+        if (w.blueprint.len > 0) {
+            establishPlan(&w, goal);
+            deriveDependencies(&w, goal);
         }
     }
     defer if (w.blueprint.len > 0) gpa.free(@constCast(w.blueprint));
@@ -759,6 +772,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
             if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
         }
+        if (live and !w.discourse and w.blueprint.len > 0) consolidateState(&w, goal, round);
+        if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
 
         if (live and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
@@ -1335,7 +1350,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var acted = false;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .fmtx = &w.files_mtx };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .blueprint = w.blueprint, .fmtx = &w.files_mtx };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -1360,11 +1375,23 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const inbox = commons.inbox(gpa, w.io, w.run_dir, mi.name, 6);
     w.files_mtx.unlock(w.io);
     defer gpa.free(inbox);
-    const build = buildTree(gpa, w.io, w.run_dir, w.blueprint, w.doc_target);
+    const tree = buildTree(gpa, w.io, w.run_dir, w.blueprint, w.doc_target);
+    defer gpa.free(tree);
+    const plan_block = if (w.plan_str.len > 0)
+        std.fmt.allocPrint(gpa, "PROJECT PLAN — the shared CONTRACT every piece must honor (the canon: names, world, rules; the arc; each piece's beat). Keep your piece CONSISTENT with this so it fits the others built in parallel:\n{s}\n\n", .{clip(w.plan_str, 1100)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(plan_block);
+    const build = if (w.state_str.len > 0)
+        std.fmt.allocPrint(gpa, "{s}CURRENT STATE OF THE WHOLE WORK — what's ACTUALLY been built so far; continue the thread (same world, names, decisions):\n{s}\n\nFILE TREE (sizes):\n{s}", .{ plan_block, clip(w.state_str, 1600), tree }) catch (gpa.dupe(u8, tree) catch @constCast(""))
+    else if (plan_block.len > 0)
+        std.fmt.allocPrint(gpa, "{s}FILE TREE (sizes):\n{s}", .{ plan_block, tree }) catch (gpa.dupe(u8, tree) catch @constCast(""))
+    else
+        gpa.dupe(u8, tree) catch @constCast("");
     defer gpa.free(build);
-    const my_files = mindFiles(gpa, w.blueprint, mi.idx, mi.team);
+    const my_files = mindFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, mi.idx, mi.team);
     defer gpa.free(my_files);
-    const others_files = otherMindsFiles(gpa, w.blueprint, mi.idx, mi.team);
+    const others_files = otherMindsFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, mi.idx, mi.team);
     defer gpa.free(others_files);
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
@@ -1384,7 +1411,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
 
     var conv: std.ArrayListUnmanaged(u8) = .empty;
     defer conv.deinit(gpa);
-    const lane_clause = if (mi.lane.len > 0)
+    const lane_clause = if (mi.lane.len > 0 and assembler_slot.len == 0)
         std.fmt.allocPrint(gpa, " YOUR LANE — own THIS facet and let teammates cover theirs; do NOT run a search a teammate would obviously run for their lane: {s}.", .{mi.lane}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         gpa.dupe(u8, "") catch @constCast("");
@@ -1451,9 +1478,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar_block);
     const slot = if (assembler) blk_slot: {
-        const ff = if (assembler_slot.len > 0) assembler_slot else firstPath(my_files);
-        if (mi.lane.len > 0 and ff.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "{s}  (your file this moment: {s})", .{ clip(mi.lane, 240), ff }) catch (gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast(""));
+        if (assembler_slot.len > 0) {
+            const bpl = bpLineFor(w.blueprint, assembler_slot);
+            if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.", .{ assembler_slot, clip(bpl, 200) }) catch (gpa.dupe(u8, "") catch @constCast(""));
+            break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
+        }
         if (mi.lane.len > 0) break :blk_slot gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast("");
+        const ff = firstPath(my_files);
         if (ff.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose", .{ff}) catch (gpa.dupe(u8, "") catch @constCast(""));
         break :blk_slot (gpa.dupe(u8, "create or extend ONE next unbuilt file from the project tree above (just one)") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
@@ -1541,8 +1572,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(map_str);
     const fulluser = std.fmt.allocPrint(gpa, "{s}{s}Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.", .{ veil_inject, host_inject, if (goal.len > 0) goal else "explore something interesting", intent_str, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
     defer gpa.free(fulluser);
+    const research_clause = if (w.plan_str.len > 0)
+        "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action calling write_file with your file's FULL content (read_file first ONLY if it already exists). Match any example's shape and quality."
+    else
+        "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -2110,6 +2145,8 @@ fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
     if (w.doc_target > 0) {
         var tbuf: [16]u8 = undefined;
         env.put("NL_DOC_TARGET_WORDS", std.fmt.bufPrint(&tbuf, "{d}", .{w.doc_target}) catch "0") catch {};
+        var fbuf: [16]u8 = undefined;
+        env.put("NL_DOC_FILE_COUNT", std.fmt.bufPrint(&fbuf, "{d}", .{w.doc_files}) catch "0") catch {};
     }
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", tools.BENCH_PY };
@@ -2298,6 +2335,7 @@ fn screenPass(w: *Worker, ssys: []const u8, suser: []const u8, round: u32) bool 
 }
 
 const DIGEST_EVERY: u32 = 2;
+const PLAN_EVERY: u32 = 3;
 
 /// COMPACT WORKING-MEMORY DIGEST (the CLAUDE.md analog) for BUILD runs — discourse gets its digest FREE from the
 /// briefing. The cheap GATEWAY model squeezes the hive's accumulated shared knowledge into a dense ≤~180-word
@@ -2320,6 +2358,127 @@ fn gatewayDigest(w: *Worker, goal: []const u8, round: u32) void {
     w.digest_str = gpa.dupe(u8, clip(d, 1200)) catch "";
     w.act("engine", round, "digest", "compact working memory", clip(d, 400));
     w.emit("digest", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"bytes\":{d}", .{ round, d.len }) catch ",\"round\":0");
+}
+
+fn establishPlan(w: *Worker, goal: []const u8) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0 or w.plan_str.len > 0) return;
+    const bp = clip(w.blueprint, 2400);
+    const sysA = "You are a planner. Draft the PROJECT PLAN the team will build to, STRUCTURE-FIRST: nail the overall ARC/shape and how the pieces sequence and hand off, then the CANON (concrete entities, names, world, rules) that follows. One-line beat per file. Concrete and decided, <= 300 words, no preamble.";
+    const sysB = "You are a planner. Draft the PROJECT PLAN the team will build to, ENTITIES-FIRST: pin the CANON hard first (the concrete entities, names, world, rules, the central conflict/contract), then the ARC and a one-line beat per file that all stay consistent with that canon. Concrete and decided, <= 300 words, no preamble.";
+    const u = std.fmt.allocPrint(gpa, "Goal: {s}\n\nFiles to be built, in order:\n{s}\n\nWrite the plan now.", .{ clip(goal, 400), bp }) catch return;
+    defer gpa.free(u);
+    const ra = llm.chat(gpa, w.io, w.run_dir, "planA", w.gw_base, w.gw_key, w.gateway_model, sysA, u, 520);
+    defer gpa.free(ra.content);
+    const rb = llm.chat(gpa, w.io, w.run_dir, "planB", w.gw_base, w.gw_key, w.gateway_model, sysB, u, 520);
+    defer gpa.free(rb.content);
+    const ca = if (ra.ok) std.mem.trim(u8, ra.content, " \r\n\t") else "";
+    const cb = if (rb.ok) std.mem.trim(u8, rb.content, " \r\n\t") else "";
+    var jcontent: []const u8 = "";
+    defer if (jcontent.len > 0) gpa.free(@constCast(jcontent));
+    var chosen: []const u8 = "";
+    if (ca.len > 40 and cb.len > 40) {
+        const jsys = "You are the lead planner. Two draft plans for the same project are below. Produce the FINAL plan that takes the STRONGEST canon, arc, and per-file beats from both and resolves any conflict decisively. It is the contract every teammate (building files IN PARALLEL, unable to read each other) must honor — concrete and self-consistent: the CANON (entities/names/world/rules), the ARC, and a one-line beat for EACH file. <= 340 words, no preamble.";
+        const ju = std.fmt.allocPrint(gpa, "Goal: {s}\n\nFiles:\n{s}\n\nDRAFT A:\n{s}\n\nDRAFT B:\n{s}\n\nWrite the FINAL plan now.", .{ clip(goal, 300), bp, clip(ca, 1700), clip(cb, 1700) }) catch "";
+        defer if (ju.len > 0) gpa.free(ju);
+        const rj = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, jsys, ju, 600);
+        jcontent = rj.content;
+        if (rj.ok and rj.content.len > 40) chosen = std.mem.trim(u8, rj.content, " \r\n\t");
+    }
+    if (chosen.len < 40) chosen = if (ca.len >= cb.len) ca else cb;
+    if (chosen.len < 40) return;
+    w.plan_str = gpa.dupe(u8, clip(chosen, 2600)) catch "";
+    w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
+    w.act("engine", 0, "plan", "project plan (deliberated: 2 drafts -> synthesis; forward contract for every parallel piece)", clip(chosen, 600));
+}
+
+fn deriveDependencies(w: *Worker, goal: []const u8) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0 or w.deps_str.len > 0) return;
+    const sys = "You decide the BUILD ORDER for a team building these files in parallel. For EACH file, list ONLY the other listed files it must be built AFTER — a HARD dependency: it cannot be written correctly until that other file exists (code that imports another module; a test for a module; a piece whose content strictly requires an earlier piece's concrete outcome). Most files have NONE — a shared PLAN already gives the context, so prefer NONE so they build in parallel; reserve deps for real structural ordering. Output EXACTLY one line per file and nothing else, as `path: dep1, dep2` or `path: none`, using the exact paths given.";
+    const u = std.fmt.allocPrint(gpa, "Goal: {s}\n\nThe shared PLAN (context all files already have):\n{s}\n\nFiles:\n{s}\n\nOutput the dependency lines now.", .{ clip(goal, 250), clip(w.plan_str, 1300), clip(w.blueprint, 2000) }) catch return;
+    defer gpa.free(u);
+    const r = llm.chat(gpa, w.io, w.run_dir, "deps", w.gw_base, w.gw_key, w.gateway_model, sys, u, 500);
+    defer gpa.free(r.content);
+    if (!r.ok or r.content.len < 3) return;
+    const s = std.mem.trim(u8, r.content, " \r\n\t");
+    w.deps_str = gpa.dupe(u8, clip(s, 3000)) catch "";
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.deps", .{w.run_dir}) catch "", .data = w.deps_str }) catch {};
+    w.act("engine", 0, "deps", "AI-declared dependency graph — the engine schedules from this", clip(s, 500));
+}
+
+fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0 or w.plan_str.len == 0) return;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return;
+    defer gpa.free(mpath);
+    const mdata = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(128 << 10)) catch "";
+    defer if (mdata.len > 0) gpa.free(mdata);
+    var built: std.ArrayListUnmanaged(u8) = .empty;
+    defer built.deinit(gpa);
+    var unbuilt: std.ArrayListUnmanaged(u8) = .empty;
+    defer unbuilt.deinit(gpa);
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const p = bpPath(ln) orelse continue;
+        const b = std.fs.path.basename(p);
+        const dst = if (builtInManifest(mdata, b)) &built else &unbuilt;
+        dst.appendSlice(gpa, b) catch {};
+        dst.append(gpa, ' ') catch {};
+    }
+    if (built.items.len == 0) return;
+    const reqs = w.mem.recall(tools.PLAN_REQ_SCOPE, if (goal.len > 0) clip(goal, 80) else "plan");
+    defer gpa.free(reqs);
+    const sys = "You maintain the PROJECT PLAN as the team builds. Produce the UPDATED plan. HARD RULE — THE CANON RATCHET: any name, fact, world-rule, or decision already used by a BUILT piece is LOCKED and MUST appear unchanged; you may only REFINE the plan for the pieces NOT yet built (sharper beats, a better arc for what remains, folding in what's been learned and any sound teammate proposal), and ADD canon the goal still leaves open. NEVER contradict locked canon. Stay the concrete shared contract, <= 340 words, no preamble.";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\nCURRENT PLAN:\n{s}\n\nALREADY BUILT — their canon is LOCKED: {s}\nNOT YET BUILT — revise these freely: {s}\n\nWHAT'S ACTUALLY BEEN BUILT (the state):\n{s}\n\nTEAMMATE PROPOSALS to change the plan (fold in the sound ones):\n{s}\n\nWrite the UPDATED plan now.", .{ clip(goal, 220), clip(w.plan_str, 1500), clip(built.items, 400), clip(unbuilt.items, 400), clip(if (w.state_str.len > 0) w.state_str else "(none yet)", 1100), clip(if (reqs.len > 0) reqs else "(none)", 700) }) catch return;
+    defer gpa.free(user);
+    const r = llm.chat(gpa, w.io, w.run_dir, "plan", w.gw_base, w.gw_key, w.gateway_model, sys, user, 600);
+    defer gpa.free(r.content);
+    if (!r.ok or r.content.len < 40) return;
+    const s = std.mem.trim(u8, r.content, " \r\n\t");
+    if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
+    w.plan_str = gpa.dupe(u8, clip(s, 2600)) catch "";
+    w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
+    w.act("engine", round, "plan", "plan REVISED (canon ratchet held; forward strategy updated from what's built + learned)", clip(s, 500));
+}
+
+fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0) return;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(256 << 10)) catch continue;
+        defer gpa.free(data);
+        const t = std.mem.trim(u8, data, " \r\n\t");
+        if (t.len < 40) continue;
+        body.appendSlice(gpa, std.fmt.allocPrint(gpa, "\n== {s} ==\n", .{bp}) catch "") catch {};
+        body.appendSlice(gpa, clip(t, 700)) catch {};
+        if (t.len > 1100) {
+            body.appendSlice(gpa, "\n…\n") catch {};
+            body.appendSlice(gpa, clipTail(t, 320)) catch {};
+        }
+    }
+    if (body.items.len < 80) return;
+    const prior = if (w.state_str.len > 0) w.state_str else "(no state yet — this is the first consolidation)";
+    const sys = "You maintain the SHARED PROJECT STATE that every teammate reads to build the next piece COHERENTLY — the single source of truth for what the work currently IS. From the PRIOR STATE and the built pieces (their openings + endings), produce the UPDATED state: the through-line/design, the concrete facts & decisions ESTABLISHED so far (names, settings, conventions, the arc/structure), and a one-line note on what each completed piece contains and how it ends. Use ONLY what is in the input — never invent a name, event, or detail not present. Tight and factual (<= 280 words), no preamble. A teammate must be able to continue the NEXT piece consistently from this alone.";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\nPRIOR STATE:\n{s}\n\nTHE BUILT PIECES SO FAR (each one's opening + ending):\n{s}\n\nWrite the updated PROJECT STATE now.", .{ clip(goal, 240), clip(prior, 1400), clip(body.items, 5000) }) catch return;
+    defer gpa.free(user);
+    const r = llm.chat(gpa, w.io, w.run_dir, "state", w.gw_base, w.gw_key, w.gateway_model, sys, user, 480);
+    defer gpa.free(r.content);
+    if (!r.ok or r.content.len < 40) return;
+    const s = std.mem.trim(u8, r.content, " \r\n\t");
+    if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
+    w.state_str = gpa.dupe(u8, clip(s, 2400)) catch "";
+    w.mem.replace(tools.STATE_SCOPE, w.state_str);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.state", .{w.run_dir}) catch "", .data = w.state_str }) catch {};
+    w.act("engine", round, "state", "shared project state", clip(s, 500));
 }
 
 /// MODE CLASSIFIER — is the goal a software BUILD or a RESEARCH / DISCOURSE task? One cheap llm.chat at startup.
@@ -2388,6 +2547,17 @@ pub fn bpPath(line: []const u8) ?[]const u8 {
     return tok;
 }
 
+fn bpLineFor(blueprint: []const u8, path: []const u8) []const u8 {
+    const want = std.fs.path.basename(path);
+    if (want.len == 0 or blueprint.len == 0) return "";
+    var it = std.mem.splitScalar(u8, blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        if (std.mem.eql(u8, std.fs.path.basename(bp), want)) return std.mem.trim(u8, ln, " \r\n\t");
+    }
+    return "";
+}
+
 /// When the GOAL itself spells out an explicit file/folder TREE — lines like `backend/src/ainet/network.py — the
 /// Network class` — ADOPT those exact paths verbatim as the blueprint, rather than letting the LLM re-imagine its
 /// own structure. This is the structural guarantee that the swarm builds the ONE intended architecture (and the
@@ -2424,6 +2594,15 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
         return gpa.dupe(u8, "") catch @constCast("");
     }
     return bp.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
+fn docFileCount(blueprint: []const u8) u32 {
+    var n: u32 = 0;
+    var it = std.mem.splitScalar(u8, blueprint, '\n');
+    while (it.next()) |ln| {
+        if (bpPath(ln) != null) n += 1;
+    }
+    return n;
 }
 
 /// PROSE/DOC build detection + per-file word target. Returns >0 (the target words/file) when the blueprint is
@@ -3066,100 +3245,89 @@ pub fn buildTree(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, bluepr
     return clipped;
 }
 
-/// Assign a slice of the blueprint to ONE mind (its index of `team`) by whole DIRECTORY/MODULE — so each mind
-/// owns a coherent part of the tree (changes within a module stay consistent), not scattered round-robin files.
-/// Directories are round-robined across minds; the mind gets every blueprint file in the dirs it owns.
-fn mindFiles(gpa: std.mem.Allocator, blueprint: []const u8, idx: u32, team: u32) []u8 {
-    if (blueprint.len == 0 or team == 0) return gpa.dupe(u8, "") catch @constCast("");
-    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer dirs.deinit(gpa);
-    var it1 = std.mem.splitScalar(u8, blueprint, '\n');
-    while (it1.next()) |ln| {
-        const bp = bpPath(ln) orelse continue;
-        const d = std.fs.path.dirname(bp) orelse ".";
-        var seen = false;
-        for (dirs.items) |dd| if (std.mem.eql(u8, dd, d)) {
-            seen = true;
-            break;
-        };
-        if (!seen) dirs.append(gpa, d) catch {};
+const RoleIdx = struct { lead: i64 = -1, scout: i64 = -1, qa: i64 = -1, builder: u32 = 0 };
+fn roleIndices(team: u32) RoleIdx {
+    if (team <= 1) return .{};
+    var r: RoleIdx = .{};
+    if (team >= 3) {
+        r.lead = 0;
+        r.qa = @as(i64, @intCast(team)) - 1;
     }
-    var out: std.ArrayListUnmanaged(u8) = .empty;
-    var n: u32 = 0;
-    if (dirs.items.len <= 1) {
-        var fi: u32 = 0;
-        var itf = std.mem.splitScalar(u8, blueprint, '\n');
-        while (itf.next()) |ln| {
-            const bp = bpPath(ln) orelse continue;
-            const mine = (fi % team == idx);
-            fi += 1;
-            if (!mine) continue;
-            if (n > 0) out.appendSlice(gpa, ", ") catch {};
-            out.appendSlice(gpa, bp) catch {};
-            n += 1;
-        }
-        return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
-    }
-    for (dirs.items, 0..) |d, di| {
-        if (@as(u32, @intCast(di)) % team != idx) continue;
-        var it2 = std.mem.splitScalar(u8, blueprint, '\n');
-        while (it2.next()) |ln| {
-            const bp = bpPath(ln) orelse continue;
-            const bd = std.fs.path.dirname(bp) orelse ".";
-            if (!std.mem.eql(u8, bd, d)) continue;
-            if (n > 0) out.appendSlice(gpa, ", ") catch {};
-            out.appendSlice(gpa, bp) catch {};
-            n += 1;
-        }
-    }
-    return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+    if (team >= 4) r.scout = 1;
+    r.builder = if (team >= 4) 2 else if (team >= 3) 1 else 0;
+    return r;
 }
 
-/// The complement of mindFiles: the blueprint files owned by minds OTHER than `idx` (round-robin by directory,
-/// same comma+space format). write_file consults it as a deny-list so a mind structurally stays in its slice and
-/// parallel minds stop colliding. Empty when there's no blueprint or team<=1 (a single mind owns all → no others).
-fn otherMindsFiles(gpa: std.mem.Allocator, blueprint: []const u8, idx: u32, team: u32) []u8 {
-    if (blueprint.len == 0 or team <= 1) return gpa.dupe(u8, "") catch @constCast("");
-    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer dirs.deinit(gpa);
-    var it1 = std.mem.splitScalar(u8, blueprint, '\n');
-    while (it1.next()) |ln| {
-        const bp = bpPath(ln) orelse continue;
-        const d = std.fs.path.dirname(bp) orelse ".";
-        var seen = false;
-        for (dirs.items) |dd| if (std.mem.eql(u8, dd, d)) {
-            seen = true;
-            break;
-        };
-        if (!seen) dirs.append(gpa, d) catch {};
+fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
+    if (deps.len == 0) return true;
+    const want = std.fs.path.basename(path);
+    var it = std.mem.splitScalar(u8, deps, '\n');
+    while (it.next()) |ln| {
+        const line = std.mem.trim(u8, ln, " \r\t");
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const lhs = std.mem.trim(u8, line[0..colon], " \r\t`-*");
+        if (!std.mem.eql(u8, std.fs.path.basename(lhs), want)) continue;
+        const rhs = std.mem.trim(u8, line[colon + 1 ..], " \r\t");
+        if (rhs.len == 0 or std.ascii.eqlIgnoreCase(rhs, "none")) return true;
+        var dit = std.mem.splitScalar(u8, rhs, ',');
+        while (dit.next()) |d| {
+            const dep = std.mem.trim(u8, d, " \r\t`");
+            if (dep.len == 0 or std.ascii.eqlIgnoreCase(dep, "none")) continue;
+            if (!builtInManifest(manifest, std.fs.path.basename(dep))) return false;
+        }
+        return true;
     }
+    return true;
+}
+
+fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, idx: u32, team: u32) []u8 {
+    if (blueprint.len == 0 or team == 0) return gpa.dupe(u8, "") catch @constCast("");
+    var files: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer files.deinit(gpa);
+    var it = std.mem.splitScalar(u8, blueprint, '\n');
+    while (it.next()) |ln| if (bpPath(ln)) |bp| (files.append(gpa, bp) catch {});
+    if (files.items.len == 0) return gpa.dupe(u8, "") catch @constCast("");
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return gpa.dupe(u8, files.items[idx % files.items.len]) catch @constCast("");
+    defer gpa.free(mpath);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, mpath, gpa, .limited(256 << 10)) catch "";
+    defer if (data.len > 0) gpa.free(data);
+    var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer ordered.deinit(gpa);
+    for (files.items) |bp| {
+        if (!builtInManifest(data, std.fs.path.basename(bp)) and depsReady(deps, data, bp)) (ordered.append(gpa, bp) catch {});
+    }
+    for (files.items) |bp| {
+        if (builtInManifest(data, std.fs.path.basename(bp))) (ordered.append(gpa, bp) catch {});
+    }
+    if (ordered.items.len == 0) {
+        for (files.items) |bp| {
+            if (!builtInManifest(data, std.fs.path.basename(bp))) (ordered.append(gpa, bp) catch {});
+        }
+    }
+    const ri = roleIndices(team);
+    if (ri.scout >= 0 and @as(i64, @intCast(idx)) == ri.scout) return gpa.dupe(u8, "") catch @constCast("");
+    var rank: u32 = 0;
+    var j: u32 = 0;
+    while (j < idx) : (j += 1) {
+        if (!(ri.scout >= 0 and @as(i64, @intCast(j)) == ri.scout)) rank += 1;
+    }
+    if (rank < ordered.items.len) return gpa.dupe(u8, ordered.items[rank]) catch @constCast("");
+    return gpa.dupe(u8, "") catch @constCast("");
+}
+
+fn otherMindsFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, idx: u32, team: u32) []u8 {
+    if (blueprint.len == 0 or team <= 1) return gpa.dupe(u8, "") catch @constCast("");
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var n: u32 = 0;
-    if (dirs.items.len <= 1) {
-        var fi: u32 = 0;
-        var itf = std.mem.splitScalar(u8, blueprint, '\n');
-        while (itf.next()) |ln| {
-            const bp = bpPath(ln) orelse continue;
-            const others = (fi % team != idx);
-            fi += 1;
-            if (!others) continue;
-            if (n > 0) out.appendSlice(gpa, ", ") catch {};
-            out.appendSlice(gpa, bp) catch {};
-            n += 1;
-        }
-        return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
-    }
-    for (dirs.items, 0..) |d, di| {
-        if (@as(u32, @intCast(di)) % team == idx) continue;
-        var it2 = std.mem.splitScalar(u8, blueprint, '\n');
-        while (it2.next()) |ln| {
-            const bp = bpPath(ln) orelse continue;
-            const bd = std.fs.path.dirname(bp) orelse ".";
-            if (!std.mem.eql(u8, bd, d)) continue;
-            if (n > 0) out.appendSlice(gpa, ", ") catch {};
-            out.appendSlice(gpa, bp) catch {};
-            n += 1;
-        }
+    var j: u32 = 0;
+    while (j < team) : (j += 1) {
+        if (j == idx) continue;
+        const f = mindFiles(gpa, io, run_dir, blueprint, deps, j, team);
+        defer gpa.free(f);
+        if (f.len == 0 or std.mem.indexOf(u8, out.items, f) != null) continue;
+        if (n > 0) out.appendSlice(gpa, ", ") catch {};
+        out.appendSlice(gpa, f) catch {};
+        n += 1;
     }
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
@@ -3460,6 +3628,21 @@ test "builtInManifest matches by basename + non-trivial size (the slot-advance s
     try std.testing.expect(!builtInManifest(m, "routes.rs"));
     try std.testing.expect(!builtInManifest("", "anything"));
     try std.testing.expect(builtInManifest("PROJECT_TREE/main.rs|600\n", "main.rs"));
+}
+
+test "depsReady executes the AI-declared decomposition: independent parallel, dependent ordered" {
+    const deps = "models.py: none\ndb.py: none\napi.py: models.py, db.py\ntest_api.py: api.py\n";
+    const empty = "";
+    const some = "models.py|400\ndb.py|350\n";
+    try std.testing.expect(depsReady("", empty, "api.py"));
+    try std.testing.expect(depsReady(deps, empty, "models.py"));
+    try std.testing.expect(depsReady(deps, empty, "db.py"));
+    try std.testing.expect(!depsReady(deps, empty, "api.py"));
+    try std.testing.expect(!depsReady(deps, "models.py|400\n", "api.py"));
+    try std.testing.expect(depsReady(deps, some, "api.py"));
+    try std.testing.expect(!depsReady(deps, some, "test_api.py"));
+    try std.testing.expect(depsReady(deps, "api.py|900\n", "test_api.py"));
+    try std.testing.expect(depsReady(deps, empty, "README.md"));
 }
 
 test "tierFromStr pins explicit tiers and lets auto/unknown fall through to RSI" {
