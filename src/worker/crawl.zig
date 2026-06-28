@@ -613,13 +613,25 @@ fn aText(node: *const Node, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocat
 fn isEngineLink(real: []const u8, base: []const u8) bool {
     const engines = [_][]const u8{ "bing.com", "duckduckgo.com", "microsoft.com", "msn.com", "mojeek.com", "marginalia.nu", "marginalia-search.com", "startpage.com", "yandex.com", "yandex.ru", "ecosia.org", "brave.com", "4get.ca", "google.com", "googleusercontent.com", "gstatic.com" };
     for (engines) |e| if (std.mem.indexOf(u8, real, e) != null) return true;
+    // site chrome that is never a result: licence/attribution badges + footer social. Collision-safe substrings only.
+    const junk = [_][]const u8{ "creativecommons.org", "ip2location.com", "ip-api.com", "maxmind.com", "schema.org", "w3.org", "gnu.org/licenses", "twitter.com", "facebook.com", "instagram.com", "linkedin.com", "//t.me/" };
+    for (junk) |j| if (std.mem.indexOf(u8, real, j) != null) return true;
     const bh = hostOf(base);
     if (bh.len > 3 and std.mem.indexOf(u8, real, bh) != null) return true;
     return false;
 }
 
+/// Links inside a nav/footer/header/aside/form are site chrome, never results — skipping these subtrees stops an
+/// engine's footer leaking as fake "results" that fake a >=2 hit and block the registry fallback.
+fn isChromeTag(tag: []const u8) bool {
+    const chrome = [_][]const u8{ "footer", "nav", "header", "aside", "form", "script", "style", "head" };
+    for (chrome) |c| if (std.ascii.eqlIgnoreCase(tag, c)) return true;
+    return false;
+}
+
 fn walkAnchors(node: *const Node, base: []const u8, gpa: std.mem.Allocator, ta: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), seen: *std.StringHashMapUnmanaged(void), max: usize, n: *usize) void {
     if (n.* >= max) return;
+    if (!node.is_text and isChromeTag(node.tag)) return; // skip nav/footer/header chrome
     if (!node.is_text and std.mem.eql(u8, node.tag, "a") and node.href.len > 0) {
         var tb: std.ArrayListUnmanaged(u8) = .empty;
         aText(node, &tb, ta);
