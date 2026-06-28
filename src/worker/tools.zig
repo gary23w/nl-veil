@@ -1672,22 +1672,88 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// IP; the registry catches the datacenter/container case where engines bounce a direct SERP fetch. `tag` keys the
 /// crawl temp file; `workdir` caches per-backend health. Returns gpa-owned "- title\n  url[\n  snippet]" lines, "" if
 /// every backend is unavailable. The python query is an argv (never code); stdlib only, no pip.
+/// SEARCH DEPTH (general; no use-case logic): a SERP is links + snippets, not the story. After a search, fetch the
+/// top `k` result pages, run each through the crawl cleaner + BM25 fit-to-query, and inline a short excerpt of the
+/// REAL content under its link. Bounded + best-effort: top-k, short per-fetch deadline, bare link kept on failure.
+fn enrichResults(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []const u8, query: []const u8, list: []const u8, k: usize) []const u8 {
+    if (k == 0 or std.mem.trim(u8, query, " \r\n\t").len == 0) return dupe(gpa, list);
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.cenrich-{s}.tmp", .{ dir, tag }) catch return dupe(gpa, list);
+    defer gpa.free(tmp);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var seen_host: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen_host.deinit(gpa);
+    var fetched: usize = 0;
+    var it = std.mem.splitScalar(u8, list, '\n');
+    while (it.next()) |ln| {
+        out.appendSlice(gpa, ln) catch {};
+        out.append(gpa, '\n') catch {};
+        if (fetched >= k) continue;
+        const t = std.mem.trim(u8, ln, " \r\t");
+        const hp = std.mem.indexOf(u8, t, "http") orelse continue;
+        var url = t[hp..];
+        if (std.mem.indexOfAny(u8, url, " \t)\"<>]")) |sp| url = url[0..sp];
+        if (url.len < 12) continue;
+        const host = crawl.hostOf(url);
+        if (host.len > 0 and seen_host.contains(host)) continue;
+        fetched += 1;
+        if (host.len > 0) seen_host.put(gpa, host, {}) catch {};
+        const raw = curlBrowserTo(io, gpa, tmp, url, 9000, 512 << 10);
+        defer gpa.free(raw);
+        if (raw.len < 300) continue;
+        const r = crawl.extract(gpa, raw, url);
+        defer gpa.free(@constCast(r.title));
+        defer gpa.free(@constCast(r.markdown));
+        if (r.markdown.len < 160) continue;
+        const fit = crawl.fitToQuery(gpa, r.markdown, query, 360);
+        defer gpa.free(@constCast(fit));
+        var ex: std.ArrayListUnmanaged(u8) = .empty;
+        defer ex.deinit(gpa);
+        var last_sp = true;
+        for (fit) |ch| {
+            const c: u8 = if (ch == '\n' or ch == '\r' or ch == '\t') ' ' else ch;
+            if (c == ' ') {
+                if (last_sp) continue;
+                last_sp = true;
+            } else last_sp = false;
+            ex.append(gpa, c) catch {};
+        }
+        const exs = std.mem.trim(u8, ex.items, " ");
+        if (exs.len >= 60) {
+            out.appendSlice(gpa, "    ") catch {};
+            out.appendSlice(gpa, clip(exs, 340)) catch {};
+            out.append(gpa, '\n') catch {};
+        }
+    }
+    return out.toOwnedSlice(gpa) catch dupe(gpa, list);
+}
+
 pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, run_dir: []const u8, workdir: []const u8, tag: []const u8, source: []const u8, query: []const u8, limit: u32) []const u8 {
+    var links: []const u8 = dupe(gpa, "");
     if (!std.mem.eql(u8, source, "wikipedia")) {
         const cs = crawlSearchPrim(io, gpa, run_dir, tag, query, limit);
-        if (std.mem.trim(u8, cs, " \r\n\t").len > 0) return cs;
-        gpa.free(cs);
+        if (std.mem.trim(u8, cs, " \r\n\t").len > 0) {
+            gpa.free(@constCast(links));
+            links = cs;
+        } else gpa.free(cs);
     }
-    var env = environ.clone(gpa) catch return dupe(gpa, "");
-    defer env.deinit();
-    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
-    var lbuf: [8]u8 = undefined;
-    const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";
-    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const argv = [_][]const u8{ py, "-c", SEARCH_PY, source, query, ls, workdir };
-    const r = std.process.run(gpa, io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "");
-    defer gpa.free(r.stderr);
-    return r.stdout;
+    if (std.mem.trim(u8, links, " \r\n\t").len == 0) {
+        gpa.free(@constCast(links));
+        var env = environ.clone(gpa) catch return dupe(gpa, "");
+        defer env.deinit();
+        inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+        var lbuf: [8]u8 = undefined;
+        const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";
+        const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+        const argv = [_][]const u8{ py, "-c", SEARCH_PY, source, query, ls, workdir };
+        const r = std.process.run(gpa, io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "");
+        defer gpa.free(r.stderr);
+        links = r.stdout;
+    }
+    if (std.mem.trim(u8, links, " \r\n\t").len == 0) return links;
+    const enriched = enrichResults(io, gpa, run_dir, tag, query, links, 3);
+    gpa.free(@constCast(links));
+    return enriched;
 }
 
 /// Keyless multi-engine web search tool: our crawler first, then the self-healing registry (see searchWeb).
