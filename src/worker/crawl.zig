@@ -799,7 +799,7 @@ pub fn fitToQuery(gpa: std.mem.Allocator, md: []const u8, query: []const u8, max
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, clipText(md, max_bytes)) catch @constCast(""));
 }
 
-fn hostOf(url: []const u8) []const u8 {
+pub fn hostOf(url: []const u8) []const u8 {
     const p = std.mem.indexOf(u8, url, "://") orelse return "";
     const rest = url[p + 3 ..];
     const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
