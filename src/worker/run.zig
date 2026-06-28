@@ -41,6 +41,8 @@ const Manifest = struct {
     space: []const u8 = "",
     autonomous: bool = false,
     breakout: bool = false,
+    observe_psyche: bool = false,
+    autonomy: []const u8 = "bounded",
     publish: bool = false,
     post: bool = true,
     gateway_model: []const u8 = "",
@@ -173,6 +175,9 @@ pub const Worker = struct {
     state_str: []const u8 = "",
     plan_str: []const u8 = "",
     deps_str: []const u8 = "",
+    incomplete_str: []const u8 = "",
+    autonomy_full: bool = false,
+    psyche_on: bool = false,
     pop_on: bool = false,
     births: u32 = 0,
     last_pop_round: u32 = 0,
@@ -381,9 +386,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
     defer if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
+    defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
     w.breakout_on = m.breakout;
     w.publish_on = m.publish;
+    {
+        const envv = if (environ.get("NL_AUTONOMY")) |v| v else "";
+        w.autonomy_full = std.ascii.eqlIgnoreCase(std.mem.trim(u8, m.autonomy, " \t"), "full") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, envv, " \t"), "full");
+        if (live) w.act("engine", 0, "autonomy", if (w.autonomy_full) "full" else "bounded", if (w.autonomy_full) "FULL self-direction — the hive may act on discovered powers, approve its own work, and grow its own goal freely (operator-set, dev environment)" else "bounded — the hive discovers + proposes capability growth, but flags risky self-expansion for the operator");
+    }
+    {
+        const envv = if (environ.get("NL_PSYCHE")) |v| v else "";
+        w.psyche_on = m.observe_psyche or (envv.len > 0 and !std.ascii.eqlIgnoreCase(std.mem.trim(u8, envv, " \t"), "0"));
+        if (live and w.psyche_on) w.act("engine", 0, "psyche", "on", "PSYCHE OBSERVABILITY: each round emits every mind's OCEAN temperament + accumulated affect, plus a hive valence/negativity aggregate — to watch how each personality shapes its behavior");
+    }
     w.post_on = m.publish and m.post;
     if (w.publish_on) w.act("engine", 0, "publish", if (w.post_on) "telegraph: post" else "telegraph: grounded-only", if (w.post_on) "NEWS DESK on: each briefing is grounded in fetched sources, fair-reporting-screened, and (if it passes) posted to a public Telegraph page" else "NEWS DESK on (grounded, NOT posting): each briefing is grounded in fetched sources + screened + written to disk; Telegraph posting is OFF");
     w.gateway_model = if (m.gateway_model.len > 0) m.gateway_model else model;
@@ -769,10 +785,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         if (live) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
         if (live and w.breakout_on and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items);
+        if (live and w.psyche_on) emitPsyche(&w, minds.items, round, retro_in.items);
         if (live and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
             if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
         }
+        if (live and !w.discourse and w.blueprint.len > 0) markIncomplete(&w, round);
         if (live and !w.discourse and w.blueprint.len > 0) consolidateState(&w, goal, round);
+        if (live and !w.discourse and (w.blueprint.len > 0 or w.operating) and round > 1 and @mod(round, PLAN_EVERY) == 0) capabilityGrowth(&w, goal, round);
         if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
 
@@ -1389,9 +1408,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, tree) catch @constCast("");
     defer gpa.free(build);
-    const my_files = mindFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, mi.idx, mi.team);
+    const my_files = mindFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team);
     defer gpa.free(my_files);
-    const others_files = otherMindsFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, mi.idx, mi.team);
+    const others_files = otherMindsFiles(gpa, w.io, w.run_dir, w.blueprint, w.deps_str, w.incomplete_str, mi.idx, mi.team);
     defer gpa.free(others_files);
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
@@ -1477,11 +1496,14 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar_block);
+    const chunk_clause = " If this file would run more than ~40 lines, do NOT try to emit it all in one call — THIS round write a strong FIRST PART (imports/setup + the first function or section, correct as far as it goes) with write_file, then GROW it using write_file mode:\"append\" over the next rounds. A partial runnable file is real progress; producing nothing is a wasted round.";
     const slot = if (assembler) blk_slot: {
         if (assembler_slot.len > 0) {
+            if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot)))
+                break :blk_slot std.fmt.allocPrint(gpa, "The file `{s}` is PARTIAL — only its first part exists. read_file it, then CONTINUE it with write_file mode:\"append\": add the missing functions/sections and DELETE any 'to be appended / defined in later iterations / for now the module exposes' placeholder comments, until it is COMPLETE and runnable. Do NOT rewrite what's already there; just append what's missing.", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
             const bpl = bpLineFor(w.blueprint, assembler_slot);
-            if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.", .{ assembler_slot, clip(bpl, 200) }) catch (gpa.dupe(u8, "") catch @constCast(""));
-            break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
+            if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.{s}", .{ assembler_slot, clip(bpl, 200), chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
+            break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order.{s}", .{ assembler_slot, chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
         }
         if (mi.lane.len > 0) break :blk_slot gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast("");
         const ff = firstPath(my_files);
@@ -2408,6 +2430,29 @@ fn deriveDependencies(w: *Worker, goal: []const u8) void {
     w.act("engine", 0, "deps", "AI-declared dependency graph — the engine schedules from this", clip(s, 500));
 }
 
+fn capabilityGrowth(w: *Worker, goal: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0 and !w.operating) return;
+    const know = w.mem.assoc(tools.KNOWLEDGE_SCOPE, if (goal.len > 0) clip(goal, 100) else "capabilities powers", 1, 8);
+    defer gpa.free(know);
+    const sys = "You extend an autonomous team's mission. Propose AT MOST ONE concrete EXPANDED objective that uses a capability the team ACTUALLY has (evident in what it discovered + built below) to advance the GOAL further than the literal ask — for example: it learned it holds admin/owner power, so it could LOG its own actions, APPROVE its own queued work, or CONFIGURE the service. Ground it ONLY in the facts below — NEVER invent a capability the team hasn't shown it has. If there is nothing sound to add, reply with exactly NONE. One imperative sentence, <= 40 words.";
+    const user = std.fmt.allocPrint(gpa, "GOAL: {s}\n\nWHAT'S BEEN BUILT (current state):\n{s}\n\nWHAT THE TEAM HAS LEARNED / DISCOVERED:\n{s}\n\nPropose the one expansion now, or NONE:", .{ clip(goal, 240), clip(if (w.state_str.len > 0) w.state_str else "(nothing built yet)", 900), clip(if (know.len > 0) know else "(nothing discovered yet)", 900) }) catch return;
+    defer gpa.free(user);
+    const r = llm.chat(gpa, w.io, w.run_dir, "growth", w.gw_base, w.gw_key, w.gateway_model, sys, user, 120);
+    defer gpa.free(r.content);
+    if (!r.ok) return;
+    const s = std.mem.trim(u8, r.content, " \r\n\t.\"");
+    if (s.len < 10) return;
+    if (std.ascii.eqlIgnoreCase(s, "none") or (s.len >= 5 and std.ascii.eqlIgnoreCase(s[0..5], "none "))) return;
+    if (w.autonomy_full) {
+        _ = w.mem.observe(tools.PLAN_REQ_SCOPE, s);
+        w.act("engine", round, "goal_growth", "the hive GREW its own goal from a discovered capability (full autonomy)", clip(s, 300));
+    } else {
+        _ = w.mem.observe(tools.GROWTH_PENDING_SCOPE, s);
+        w.act("engine", round, "goal_growth", "proposed goal growth — HELD for operator review (bounded autonomy)", clip(s, 300));
+    }
+}
+
 fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
     if (w.blueprint.len == 0 or w.plan_str.len == 0) return;
@@ -2442,6 +2487,37 @@ fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
     w.mem.replace(tools.PLAN_SCOPE, w.plan_str);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.plan", .{w.run_dir}) catch "", .data = w.plan_str }) catch {};
     w.act("engine", round, "plan", "plan REVISED (canon ratchet held; forward strategy updated from what's built + learned)", clip(s, 500));
+}
+
+fn markIncomplete(w: *Worker, round: u32) void {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0) return;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return;
+    defer gpa.free(mpath);
+    const mdata = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(128 << 10)) catch "";
+    defer if (mdata.len > 0) gpa.free(mdata);
+    if (mdata.len == 0) return;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const base = std.fs.path.basename(bp);
+        if (!builtInManifest(mdata, base)) continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, base }) catch continue;
+        defer gpa.free(fp);
+        const fdata = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch continue;
+        defer gpa.free(fdata);
+        if (fileNeedsMore(fdata)) {
+            out.appendSlice(gpa, base) catch {};
+            out.append(gpa, ' ') catch {};
+        }
+    }
+    if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
+    const trimmed = std.mem.trim(u8, out.items, " ");
+    w.incomplete_str = if (trimmed.len > 0) (gpa.dupe(u8, trimmed) catch "") else "";
+    if (w.incomplete_str.len > 0)
+        w.act("engine", round, "incomplete", "built but still a FIRST PART — a builder will keep appending until finished", w.incomplete_str);
 }
 
 fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
@@ -2479,6 +2555,106 @@ fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
     w.mem.replace(tools.STATE_SCOPE, w.state_str);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.state", .{w.run_dir}) catch "", .data = w.state_str }) catch {};
     w.act("engine", round, "state", "shared project state", clip(s, 500));
+}
+
+fn psycheValence(text: []const u8) f32 {
+    if (text.len < 4) return 0;
+    const neg = [_][]const u8{ "despair", "hopeless", "dread", "grief", "grim", "bleak", "devastat", "tragic", "tragedy", "suffer", "anguish", "helpless", "overwhelm", "numb", "hollow", "broken", "mourn", "heartbreak", "fear", "afraid", "anxious", "anxiety", "terrified", "alarm", "dire", "catastroph", "doom", "collapse", "crisis", "ruin", "loss", "lost", "weary", "exhaust", "bitter", "angry", "anger", "outrage", "powerless", "abandon", "darkness", "despond", "dismay", "frighten", "painful", "pain", "ache", "worry", "worried" };
+    const pos = [_][]const u8{ "hope", "hopeful", "resilien", "resolve", "rebuild", "recover", "solidarity", "courage", "determin", "constructive", "opportunity", "progress", "comfort", "reassur", "gratitude", "grateful", "compassion", "support", "solution", "possible", "encourag", "uplift", "optimis", "faith", "strength", "stronger", "endure", "perspective", "agency", "act", "action", "steady", "calm", "reason", "measured", "light", "renew" };
+    var n: f32 = 0;
+    var p: f32 = 0;
+    for (neg) |wd| n += @floatFromInt(countOccurrences(text, wd));
+    for (pos) |wd| p += @floatFromInt(countOccurrences(text, wd));
+    const tot = n + p;
+    if (tot == 0) return 0;
+    return (p - n) / tot;
+}
+
+fn countOccurrences(hay: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or hay.len < needle.len) return 0;
+    var c: usize = 0;
+    var off: usize = 0;
+    while (off + needle.len <= hay.len) {
+        if (std.ascii.indexOfIgnoreCase(hay[off..], needle)) |rel| {
+            const at = off + rel;
+            if (at == 0 or !std.ascii.isAlphabetic(hay[at - 1])) c += 1;
+            off = at + needle.len;
+        } else break;
+    }
+    return c;
+}
+
+fn mindMonologue(blob: []const u8, minds: []MindState, idx: usize) []const u8 {
+    const name = minds[idx].name;
+    var s0: ?usize = null;
+    if (std.mem.startsWith(u8, blob, name) and blob.len > name.len and blob[name.len] == ':') {
+        s0 = name.len + 1;
+    } else {
+        var buf: [80]u8 = undefined;
+        if (name.len + 2 <= buf.len) {
+            const needle = std.fmt.bufPrint(&buf, "\n{s}:", .{name}) catch return "";
+            if (std.mem.indexOf(u8, blob, needle)) |pos| s0 = pos + needle.len;
+        }
+    }
+    const start = s0 orelse return "";
+    var end = blob.len;
+    var off = start;
+    while (std.mem.indexOfScalarPos(u8, blob, off, '\n')) |nl| {
+        const rest = blob[nl + 1 ..];
+        var is_marker = false;
+        for (minds) |*m| {
+            if (std.mem.startsWith(u8, rest, m.name) and rest.len > m.name.len and rest[m.name.len] == ':') {
+                is_marker = true;
+                break;
+            }
+        }
+        if (is_marker) {
+            end = nl;
+            break;
+        }
+        off = nl + 1;
+    }
+    return std.mem.trim(u8, blob[start..end], " :\r\n\t");
+}
+
+fn emitPsyche(w: *Worker, minds: []MindState, round: u32, monologues: []const u8) void {
+    const gpa = w.gpa;
+    if (minds.len == 0) return;
+    var sum_neuro: f32 = 0;
+    var sum_val: f32 = 0;
+    var dark_i: usize = 0;
+    var dark_score: f32 = -1e30;
+    var dark_val: f32 = 0;
+    for (minds, 0..) |mi, i| {
+        const p = mi.persona;
+        var dbuf: [220]u8 = undefined;
+        const desc = personaDesc(p, &dbuf);
+        const wrote = mindMonologue(monologues, minds, i);
+        const val = psycheValence(wrote);
+        sum_neuro += p[4];
+        sum_val += val;
+        const dscore = p[4] - val;
+        if (dscore > dark_score) {
+            dark_score = dscore;
+            dark_i = i;
+            dark_val = val;
+        }
+        const summary = std.fmt.allocPrint(gpa, "O{d:.2} C{d:.2} E{d:.2} A{d:.2} N{d:.2} r{d:.2} | wrote-valence {d:.2} | {s}", .{ p[0], p[1], p[2], p[3], p[4], p[5], val, desc }) catch continue;
+        defer gpa.free(summary);
+        const detail = if (wrote.len > 4) clip(wrote, 400) else "(wrote nothing scoreable this round)";
+        w.act(mi.name, round, "psyche", summary, detail);
+    }
+    const team_f: f32 = @floatFromInt(minds.len);
+    const mean_val = sum_val / team_f;
+    const mean_neuro = sum_neuro / team_f;
+    const tilt = if (mean_val <= -0.34) "the hive is tilting DARK" else if (mean_val >= 0.34) "the hive is tilting BRIGHT" else "the hive is near-neutral";
+    const veil_val = psycheValence(w.veil_str);
+    const veil_note = if (w.veil_str.len < 16) "" else if (veil_val <= -0.34) " | the VEIL-self is leaning DARK" else if (veil_val >= 0.34) " | the VEIL-self is leaning BRIGHT" else " | the VEIL-self is composed";
+    const hsum = std.fmt.allocPrint(gpa, "hive valence {d:.2}, mean neuroticism {d:.2} — {s}{s}", .{ mean_val, mean_neuro, tilt, veil_note }) catch return;
+    defer gpa.free(hsum);
+    const hdet = std.fmt.allocPrint(gpa, "most negative-leaning: {s} (N {d:.2}, valence {d:.2}) — watch whether it regulates back toward reason over the next rounds", .{ minds[dark_i].name, minds[dark_i].persona[4], dark_val }) catch return;
+    defer gpa.free(hdet);
+    w.act("hive", round, "hive_psyche", hsum, hdet);
 }
 
 /// MODE CLASSIFIER — is the goal a software BUILD or a RESEARCH / DISCOURSE task? One cheap llm.chat at startup.
@@ -3280,7 +3456,28 @@ fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
     return true;
 }
 
-fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, idx: u32, team: u32) []u8 {
+fn inSpaceList(list: []const u8, base: []const u8) bool {
+    if (list.len == 0 or base.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, list, ' ');
+    while (it.next()) |tok| if (std.mem.eql(u8, tok, base)) return true;
+    return false;
+}
+
+fn fileNeedsMore(content: []const u8) bool {
+    if (content.len < 24 or content.len > 12000) return false;
+    const markers = [_][]const u8{
+        "will be appended", "later iteration", "subsequent iteration", "will be defined", "will be added in",
+        "will be implemented", "for now, the module", "for now the module", "to be implemented", "to be defined later",
+        "defined in later", "added in subsequent", "raise notimplementederror", "placeholder for the", "rest will be",
+        "complete this in", "finish this in", "continued below in",
+    };
+    for (markers) |m| {
+        if (std.ascii.indexOfIgnoreCase(content, m) != null) return true;
+    }
+    return false;
+}
+
+fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
     if (blueprint.len == 0 or team == 0) return gpa.dupe(u8, "") catch @constCast("");
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     defer files.deinit(gpa);
@@ -3291,17 +3488,23 @@ fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint:
     defer gpa.free(mpath);
     const data = std.Io.Dir.cwd().readFileAlloc(io, mpath, gpa, .limited(256 << 10)) catch "";
     defer if (data.len > 0) gpa.free(data);
+    const isDone = struct {
+        fn f(d: []const u8, inc: []const u8, p: []const u8) bool {
+            const b = std.fs.path.basename(p);
+            return builtInManifest(d, b) and !inSpaceList(inc, b);
+        }
+    }.f;
     var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
     defer ordered.deinit(gpa);
     for (files.items) |bp| {
-        if (!builtInManifest(data, std.fs.path.basename(bp)) and depsReady(deps, data, bp)) (ordered.append(gpa, bp) catch {});
+        if (!isDone(data, incomplete, bp) and depsReady(deps, data, bp)) (ordered.append(gpa, bp) catch {});
     }
     for (files.items) |bp| {
-        if (builtInManifest(data, std.fs.path.basename(bp))) (ordered.append(gpa, bp) catch {});
+        if (isDone(data, incomplete, bp)) (ordered.append(gpa, bp) catch {});
     }
     if (ordered.items.len == 0) {
         for (files.items) |bp| {
-            if (!builtInManifest(data, std.fs.path.basename(bp))) (ordered.append(gpa, bp) catch {});
+            if (!isDone(data, incomplete, bp)) (ordered.append(gpa, bp) catch {});
         }
     }
     const ri = roleIndices(team);
@@ -3315,14 +3518,14 @@ fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint:
     return gpa.dupe(u8, "") catch @constCast("");
 }
 
-fn otherMindsFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, idx: u32, team: u32) []u8 {
+fn otherMindsFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
     if (blueprint.len == 0 or team <= 1) return gpa.dupe(u8, "") catch @constCast("");
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var n: u32 = 0;
     var j: u32 = 0;
     while (j < team) : (j += 1) {
         if (j == idx) continue;
-        const f = mindFiles(gpa, io, run_dir, blueprint, deps, j, team);
+        const f = mindFiles(gpa, io, run_dir, blueprint, deps, incomplete, j, team);
         defer gpa.free(f);
         if (f.len == 0 or std.mem.indexOf(u8, out.items, f) != null) continue;
         if (n > 0) out.appendSlice(gpa, ", ") catch {};
@@ -3689,4 +3892,48 @@ test "topicLabel extracts a short clean label for the knowledge index" {
     try std.testing.expectEqualStrings("Rust Lifetimes", topicLabel("**Rust Lifetimes**"));
     try std.testing.expectEqualStrings("Section: Ownership, Borrowing and Lifetimes", topicLabel("[nox r5] Section: Ownership, Borrowing and Lifetimes\nmore text"));
     try std.testing.expectEqualStrings("axum routing", topicLabel("axum routing. handlers map paths to functions"));
+}
+
+test "fileNeedsMore detects a chunk-built first part, passes a finished file" {
+    try std.testing.expect(fileNeedsMore("import os\n\ndef main():\n    pass\n# the rest will be appended in subsequent iterations\n"));
+    try std.testing.expect(fileNeedsMore("class Client:\n    ...\n# For now, the module exposes the helpers above; entry point to be defined later.\n"));
+    try std.testing.expect(fileNeedsMore("def parse():\n    raise NotImplementedError  # to be implemented\n"));
+    try std.testing.expect(!fileNeedsMore("import os\n\ndef main():\n    print('done')\n\nif __name__ == '__main__':\n    main()\n"));
+    try std.testing.expect(!fileNeedsMore(""));
+    try std.testing.expect(!fileNeedsMore("x"));
+}
+
+test "inSpaceList matches whole basenames only" {
+    try std.testing.expect(inSpaceList("seed_discourse.py models.py", "models.py"));
+    try std.testing.expect(inSpaceList("seed_discourse.py", "seed_discourse.py"));
+    try std.testing.expect(!inSpaceList("myapp.py", "app.py"));
+    try std.testing.expect(!inSpaceList("", "anything.py"));
+}
+
+test "psycheValence scores emotional content, not temperament adjectives" {
+    try std.testing.expect(psycheValence("this is devastating, I feel hollow and full of dread for the displaced") < -0.5);
+    try std.testing.expect(psycheValence("there is real hope here; people are resilient and rebuilding with courage") > 0.5);
+    try std.testing.expectEqual(@as(f32, 0), psycheValence("Your voice is warm and generous; you stay even-keeled and animated."));
+    try std.testing.expectEqual(@as(f32, 0), psycheValence(""));
+    try std.testing.expectEqual(@as(f32, 0), psycheValence("collected high-impact stories and factual context"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences("a high-impact factual react", "act"));
+    try std.testing.expectEqual(@as(usize, 1), countOccurrences("take action now", "act"));
+}
+
+test "mindMonologue slices one mind's writing out of the round digest" {
+    var minds = [_]MindState{
+        .{ .name = "echo", .scope = "echo" },
+        .{ .name = "atlas", .scope = "atlas" },
+        .{ .name = "mira", .scope = "mira" },
+    };
+    const blob = "echo: this is bleak.\nit weighs on me.\natlas: steady as ever.\nmira: hopeful still.\n";
+    try std.testing.expectEqualStrings("this is bleak.\nit weighs on me.", mindMonologue(blob, &minds, 0));
+    try std.testing.expectEqualStrings("steady as ever.", mindMonologue(blob, &minds, 1));
+    try std.testing.expectEqualStrings("hopeful still.", mindMonologue(blob, &minds, 2));
+    try std.testing.expectEqualStrings("", mindMonologue("nobody: here", &minds, 0));
+}
+
+test "countOccurrences counts every case-insensitive hit" {
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences("Dread and dread again", "dread"));
+    try std.testing.expectEqual(@as(usize, 0), countOccurrences("calm", "storm"));
 }

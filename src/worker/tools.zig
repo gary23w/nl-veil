@@ -190,6 +190,7 @@ pub const ARCH_SCOPE = "architecture";
 pub const STATE_SCOPE = "state";
 pub const PLAN_SCOPE = "plan";
 pub const PLAN_REQ_SCOPE = "plan_req";
+pub const GROWTH_PENDING_SCOPE = "growth_pending";
 
 /// Self-generated training trajectory — challenge prompts the engine derives from current weakness profile.
 pub const CURRICULUM_SCOPE = "curriculum";
@@ -228,7 +229,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine — do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — find URLs + snippets for a query. Use this FIRST to discover sources, then web_fetch the best result.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — returns the top results, each WITH a short excerpt of the source's actual page text (auto-fetched + fit to your query), so you usually don't need a separate fetch. For current events just search the topic + a date.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body (not HTML-stripped). Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"osint_scan","description":"Public-source OSINT scan for one URL: extract high-signal leads (emails, phones, domains, docs, socials, and notable outbound links). Uses only normal public HTTP/HTTPS fetches.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -257,7 +258,7 @@ pub const SCHEMA =
 /// withholds the ability. The scout can read context, search/read the web, store facts, save skills, and
 /// message teammates — its only outputs are KNOWLEDGE. Keep these defs in sync with their twins in SCHEMA.
 pub const SCOUT_SCHEMA =
-    \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — find URLs + snippets for a query. Use this FIRST to discover sources, then read_url the best result.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"]},"limit":{"type":"integer"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — returns the top results, each WITH a short excerpt of the source's actual page text (auto-fetched + fit to your query), so you usually don't need a separate fetch. For current events just search the topic + a date.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"]},"limit":{"type":"integer"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS. Prefer this over web_fetch for real articles/specs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean readable text (our in-house crawler strips tags + prunes boilerplate). Optional 'query' fits the page to your topic.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"osint_scan","description":"Public-source OSINT scan for one URL: extract high-signal leads (emails, phones, domains, docs, socials, and notable outbound links).","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -1702,28 +1703,29 @@ fn enrichResults(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []con
     defer out.deinit(gpa); // toOwnedSlice empties `out` on success (no-op); frees the buffer on the OOM-catch path
     var seen_host: std.StringHashMapUnmanaged(void) = .empty;
     defer seen_host.deinit(gpa);
-    var fetched: usize = 0;
+    var got: usize = 0;
+    var tried: usize = 0;
     var it = std.mem.splitScalar(u8, list, '\n');
     while (it.next()) |ln| {
         out.appendSlice(gpa, ln) catch {};
         out.append(gpa, '\n') catch {};
-        if (fetched >= k) continue;
+        if (got >= k or tried >= k + 3) continue;
         const t = std.mem.trim(u8, ln, " \r\t");
         const hp = std.mem.indexOf(u8, t, "http") orelse continue;
         var url = t[hp..];
         if (std.mem.indexOfAny(u8, url, " \t)\"<>]")) |sp| url = url[0..sp];
         if (url.len < 12) continue;
         const host = crawl.hostOf(url);
-        if (host.len > 0 and seen_host.contains(host)) continue;
-        fetched += 1;
-        if (host.len > 0) seen_host.put(gpa, host, {}) catch {};
+        if (host.len == 0 or isSearchOrAggregator(host) or seen_host.contains(host)) continue;
+        seen_host.put(gpa, host, {}) catch {};
+        tried += 1;
         const raw = curlBrowserTo(io, gpa, tmp, url, 9000, 512 << 10);
         defer gpa.free(raw);
-        if (raw.len < 300) continue;
+        if (raw.len < 300 or looksBlocked(raw)) continue;
         const r = crawl.extract(gpa, raw, url);
         defer gpa.free(@constCast(r.title));
         defer gpa.free(@constCast(r.markdown));
-        if (r.markdown.len < 160) continue;
+        if (r.markdown.len < 160 or looksBlocked(r.markdown)) continue;
         const fit = crawl.fitToQuery(gpa, r.markdown, query, 360);
         defer gpa.free(@constCast(fit));
         var ex: std.ArrayListUnmanaged(u8) = .empty;
@@ -1742,9 +1744,22 @@ fn enrichResults(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []con
             out.appendSlice(gpa, "    ") catch {};
             out.appendSlice(gpa, clip(exs, 340)) catch {};
             out.append(gpa, '\n') catch {};
+            got += 1;
         }
     }
     return out.toOwnedSlice(gpa) catch dupe(gpa, list);
+}
+
+fn isSearchOrAggregator(host: []const u8) bool {
+    const skip = [_][]const u8{ "duckduckgo.com", "bing.com", "google.", "marginalia.nu", "jina.ai", "searx", "baidu.com", "yandex.", "youtube.com", "facebook.com", "twitter.com", "x.com", "reddit.com", "newsapi.org", "gdeltproject.org" };
+    for (skip) |s| if (std.ascii.indexOfIgnoreCase(host, s) != null) return true;
+    return false;
+}
+
+fn looksBlocked(text: []const u8) bool {
+    const sig = [_][]const u8{ "SecurityCompromiseError", "Access Denied", "captcha", "are you a robot", "unusual traffic", "enable JavaScript", "403 Forbidden", "Just a moment", "Attention Required", "blocked until", "verify you are human" };
+    for (sig) |s| if (std.ascii.indexOfIgnoreCase(text, s) != null) return true;
+    return false;
 }
 
 pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, run_dir: []const u8, workdir: []const u8, tag: []const u8, source: []const u8, query: []const u8, limit: u32) []const u8 {
@@ -2538,4 +2553,18 @@ fn clip(s: []const u8, n: usize) []const u8 {
 }
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("error");
+}
+
+test "isSearchOrAggregator skips engines + social, keeps real outlets" {
+    try std.testing.expect(isSearchOrAggregator("html.duckduckgo.com"));
+    try std.testing.expect(isSearchOrAggregator("www.bing.com"));
+    try std.testing.expect(isSearchOrAggregator("x.com"));
+    try std.testing.expect(!isSearchOrAggregator("understandingwar.org"));
+    try std.testing.expect(!isSearchOrAggregator("www.reuters.com"));
+}
+
+test "looksBlocked flags anti-bot/paywall walls" {
+    try std.testing.expect(looksBlocked("{\"code\":451,\"name\":\"SecurityCompromiseError\"}"));
+    try std.testing.expect(looksBlocked("Just a moment... verify you are human"));
+    try std.testing.expect(!looksBlocked("Ukrainian forces struck a facility on June 27, officials said."));
 }
