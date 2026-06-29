@@ -21,6 +21,13 @@ pub var tokens_in_free: std.atomic.Value(u64) = .init(0);
 pub var tokens_out_free: std.atomic.Value(u64) = .init(0);
 pub var calls_made: std.atomic.Value(u64) = .init(0);
 
+pub const Caps = struct { probed: bool = false, ollama_native: bool = false, reasoning: bool = false };
+var caps: Caps = .{};
+
+pub fn capsSnapshot() Caps {
+    return caps;
+}
+
 pub const ToolCall = struct {
     id: []u8,
     name: []u8,
@@ -56,6 +63,7 @@ fn isLocal(base_url: []const u8) bool {
         std.mem.indexOf(u8, base_url, "[::1]") != null;
 }
 fn isOllama(base_url: []const u8) bool {
+    if (caps.probed) return caps.ollama_native;
     return isLocal(base_url) and std.mem.indexOf(u8, base_url, "11434") != null;
 }
 /// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer, so a
@@ -68,6 +76,7 @@ const NATIVE_THINK_TOKENS: u32 = 24576;
 /// flooring IT to 2048 forces it to GENERATE 2048 tokens for a 200-token task, which turned the local relay into a
 /// multi-minute stall. So the floor must be gated on the model, not just on "is it local".
 fn isThinking(model: []const u8) bool {
+    if (caps.probed and caps.ollama_native) return caps.reasoning;
     var buf: [64]u8 = undefined;
     const n = @min(model.len, buf.len);
     for (model[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
@@ -236,6 +245,77 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
     return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
 }
 
+fn parseOllamaVersion(raw: []const u8) bool {
+    const V = struct { version: ?[]const u8 = null };
+    const parsed = std.json.parseFromSlice(V, std.heap.page_allocator, raw, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    const v = parsed.value.version orelse return false;
+    return v.len > 0;
+}
+
+fn responseHasReasoning(raw: []const u8) bool {
+    const R = struct {
+        message: ?struct {
+            thinking: ?[]const u8 = null,
+            reasoning: ?[]const u8 = null,
+        } = null,
+        reasoning_content: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(R, std.heap.page_allocator, raw, .{ .ignore_unknown_fields = true }) catch return false;
+    defer parsed.deinit();
+    if (parsed.value.message) |msg| {
+        if (msg.thinking) |t| if (t.len > 0) return true;
+        if (msg.reasoning) |r| if (r.len > 0) return true;
+    }
+    if (parsed.value.reasoning_content) |rc| if (rc.len > 0) return true;
+    return false;
+}
+
+pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, base_url: []const u8, key: []const u8, model: []const u8) void {
+    var host = trimSlash(base_url);
+    if (std.mem.endsWith(u8, host, "/v1")) host = host[0 .. host.len - 3];
+
+    const ver_url = std.fmt.allocPrint(gpa, "{s}/api/version", .{host}) catch return;
+    defer gpa.free(ver_url);
+    const ver = blk: {
+        const run = std.process.run(gpa, io, .{
+            .argv = &.{ "curl", "-sS", "--max-time", "5", ver_url },
+            .stdout_limit = .limited(64 << 10),
+        }) catch break :blk null;
+        gpa.free(run.stderr);
+        if (run.term != .exited or run.term.exited != 0) {
+            gpa.free(run.stdout);
+            break :blk null;
+        }
+        break :blk run.stdout;
+    };
+    if (ver == null) return;
+    const ver_body = ver.?;
+    defer gpa.free(ver_body);
+
+    caps.ollama_native = parseOllamaVersion(ver_body);
+    caps.probed = true;
+
+    if (caps.ollama_native) {
+        const chat_url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{host}) catch return;
+        defer gpa.free(chat_url);
+        var msg: std.ArrayListUnmanaged(u8) = .empty;
+        defer msg.deinit(gpa);
+        msg.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return;
+        jstr(gpa, &msg, "Reply with the single word ok.") catch return;
+        msg.appendSlice(gpa, "}") catch return;
+        const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":64}}}}", .{ model, msg.items }) catch return;
+        defer gpa.free(body);
+        const r = postUrl(gpa, io, run_dir, "probe", chat_url, key, body, true);
+        if (r.ok) {
+            defer gpa.free(r.content);
+            if (responseHasReasoning(r.content)) caps.reasoning = true;
+        } else {
+            gpa.free(r.content);
+        }
+    }
+}
+
 fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
     const r = post(gpa, io, run_dir, tag, base_url, key, body);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
@@ -392,4 +472,42 @@ test "parseOllamaNative content-only (no tool call) returns text and no calls" {
     try std.testing.expectEqual(@as(usize, 0), step.calls.len);
     try std.testing.expectEqualStrings("the answer is 391", step.content);
     try std.testing.expectEqualStrings("", step.reasoning);
+}
+
+test "parseOllamaVersion: an Ollama /api/version shape -> true, a hosted 404/error -> false" {
+    try std.testing.expect(parseOllamaVersion("{\"version\":\"0.5.7\"}"));
+    try std.testing.expect(!parseOllamaVersion("{\"error\":{\"message\":\"Unknown request URL: GET /api/version\",\"type\":\"invalid_request_error\"}}"));
+    try std.testing.expect(!parseOllamaVersion("{\"version\":\"\"}"));
+    try std.testing.expect(!parseOllamaVersion("<html><body>404 Not Found</body></html>"));
+}
+
+test "responseHasReasoning: an /api/chat msg with thinking -> true, content-only -> false" {
+    try std.testing.expect(responseHasReasoning("{\"message\":{\"content\":\"ok\",\"thinking\":\"I should answer ok.\"}}"));
+    try std.testing.expect(responseHasReasoning("{\"message\":{\"content\":\"ok\",\"reasoning\":\"some chain\"}}"));
+    try std.testing.expect(responseHasReasoning("{\"reasoning_content\":\"x\",\"message\":{\"content\":\"ok\"}}"));
+    try std.testing.expect(!responseHasReasoning("{\"message\":{\"content\":\"the answer is 391\"}}"));
+    try std.testing.expect(!responseHasReasoning("{\"message\":{\"content\":\"ok\",\"thinking\":\"\"}}"));
+    try std.testing.expect(!responseHasReasoning("not json"));
+}
+
+test "probe-first override: a probed cap wins over the port/name heuristics; unprobed falls back" {
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{};
+    try std.testing.expect(isOllama("http://localhost:11434/v1"));
+    try std.testing.expect(!isOllama("http://localhost:1234/v1"));
+    try std.testing.expect(isThinking("gpt-oss:20b"));
+    try std.testing.expect(!isThinking("llama3.1:8b"));
+
+    caps = .{ .probed = true, .ollama_native = true, .reasoning = false };
+    try std.testing.expect(isOllama("http://localhost:9999/v1"));
+    try std.testing.expect(!isThinking("gpt-oss:20b"));
+    caps.reasoning = true;
+    try std.testing.expect(isThinking("some-unlisted-model"));
+
+    caps = .{ .probed = true, .ollama_native = false, .reasoning = false };
+    try std.testing.expect(!isOllama("http://localhost:11434/v1"));
+    try std.testing.expect(isThinking("o1-preview"));
+    try std.testing.expect(!isThinking("gpt-4o"));
 }

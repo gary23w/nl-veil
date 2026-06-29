@@ -361,6 +361,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     const db_path = try std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir});
     defer gpa.free(db_path);
 
+    if (live) llm.probeCapabilities(gpa, io, run_dir, base_url, key, model);
+
     var w = Worker{
         .gpa = gpa,
         .io = io,
@@ -394,6 +396,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
+    if (live) {
+        const c = llm.capsSnapshot();
+        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, w.fence_writes, if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
+    }
     if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)");
     w.breakout_on = m.breakout;
     w.publish_on = m.publish;
@@ -2017,11 +2023,34 @@ fn salvageLeadConversational(body: []const u8) bool {
 }
 
 fn salvageHasToolFragment(body: []const u8) bool {
-    return std.mem.indexOf(u8, body, "{\"action\"") != null or
-        std.mem.indexOf(u8, body, "{\"path\"") != null or
-        std.mem.indexOf(u8, body, "{\"tool\"") != null or
-        std.mem.indexOf(u8, body, "{\"name\":\"write_file\"") != null or
-        std.mem.indexOf(u8, body, "\"tool_call\"") != null;
+    const t = std.mem.trim(u8, body, " \r\n\t");
+    if (t.len == 0) return false;
+    const prefixes = [_][]const u8{ "{\"path\"", "{\"name\":\"write_file\"", "{\"action\"", "{\"tool\"", "{\"tool_call\"" };
+    for (prefixes) |p| if (std.mem.startsWith(u8, t, p)) return true;
+    if (t.len < 600 and t[0] == '{' and t[t.len - 1] == '}') {
+        if (containsKeyValue(t, "name", "write_file")) return true;
+        if (std.mem.indexOf(u8, t, "\"tool_call\":") != null) return true;
+    }
+    return false;
+}
+
+fn containsKeyValue(s: []const u8, key: []const u8, val: []const u8) bool {
+    const kbuf = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{key}) catch return false;
+    defer std.heap.page_allocator.free(kbuf);
+    const vbuf = std.fmt.allocPrint(std.heap.page_allocator, "\"{s}\"", .{val}) catch return false;
+    defer std.heap.page_allocator.free(vbuf);
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, s, i, kbuf)) |kpos| {
+        i = kpos + kbuf.len;
+        var j = i;
+        while (j < s.len and (s[j] == ' ' or s[j] == '\t')) j += 1;
+        if (j < s.len and s[j] == ':') {
+            j += 1;
+            while (j < s.len and (s[j] == ' ' or s[j] == '\t')) j += 1;
+            if (std.mem.startsWith(u8, s[j..], vbuf)) return true;
+        }
+    }
+    return false;
 }
 
 fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
@@ -4193,34 +4222,44 @@ fn fileNeedsMore(content: []const u8) bool {
 }
 
 fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(mpath);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, mpath, gpa, .limited(256 << 10)) catch "";
+    defer if (data.len > 0) gpa.free(data);
+    return assignSlot(gpa, data, blueprint, deps, incomplete, idx, team);
+}
+
+fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
     if (blueprint.len == 0 or team == 0) return gpa.dupe(u8, "") catch @constCast("");
     var files: std.ArrayListUnmanaged([]const u8) = .empty;
     defer files.deinit(gpa);
     var it = std.mem.splitScalar(u8, blueprint, '\n');
     while (it.next()) |ln| if (bpPath(ln)) |bp| (files.append(gpa, bp) catch {});
     if (files.items.len == 0) return gpa.dupe(u8, "") catch @constCast("");
-    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return gpa.dupe(u8, files.items[idx % files.items.len]) catch @constCast("");
-    defer gpa.free(mpath);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, mpath, gpa, .limited(256 << 10)) catch "";
-    defer if (data.len > 0) gpa.free(data);
     const isDone = struct {
         fn f(d: []const u8, inc: []const u8, p: []const u8) bool {
             const b = std.fs.path.basename(p);
             return builtInManifest(d, b) and !inSpaceList(inc, b);
         }
     }.f;
+    var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer frontier.deinit(gpa);
+    for (files.items) |bp| {
+        if (!isDone(data, incomplete, bp) and depsReady(deps, data, bp)) (frontier.append(gpa, bp) catch {});
+    }
+    const frontier_n = frontier.items.len;
     var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
     defer ordered.deinit(gpa);
-    for (files.items) |bp| {
-        if (!isDone(data, incomplete, bp) and depsReady(deps, data, bp)) (ordered.append(gpa, bp) catch {});
-    }
+    ordered.appendSlice(gpa, frontier.items) catch {};
     for (files.items) |bp| {
         if (isDone(data, incomplete, bp)) (ordered.append(gpa, bp) catch {});
     }
+    var ceiling = frontier_n;
     if (ordered.items.len == 0) {
         for (files.items) |bp| {
             if (!isDone(data, incomplete, bp)) (ordered.append(gpa, bp) catch {});
         }
+        ceiling = ordered.items.len;
     }
     const ri = roleIndices(team);
     if (ri.scout >= 0 and @as(i64, @intCast(idx)) == ri.scout) return gpa.dupe(u8, "") catch @constCast("");
@@ -4229,7 +4268,9 @@ fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint:
     while (j < idx) : (j += 1) {
         if (!(ri.scout >= 0 and @as(i64, @intCast(j)) == ri.scout)) rank += 1;
     }
-    if (rank < ordered.items.len) return gpa.dupe(u8, ordered.items[rank]) catch @constCast("");
+    if (rank < ceiling) return gpa.dupe(u8, ordered.items[rank]) catch @constCast("");
+    if (rank == 0 and frontier_n == 0 and ordered.items.len > 0)
+        return gpa.dupe(u8, ordered.items[0]) catch @constCast("");
     return gpa.dupe(u8, "") catch @constCast("");
 }
 
@@ -4575,6 +4616,81 @@ test "depsReady executes the AI-declared decomposition: independent parallel, de
     try std.testing.expect(depsReady(deps, empty, "README.md"));
 }
 
+test "assignSlot ADVANCES a builder past its built slice instead of re-pinning a done file (titan1 fix)" {
+    const A = std.testing.allocator;
+    const bp = "lexer.py — tokenizer\nparser.py — AST builder\ninterpreter.py — tree walker\nbuiltins.py — stdlib\nnox.py — CLI entry\n";
+    {
+        const s0 = assignSlot(A, "", bp, "", "", 0, 4);
+        defer A.free(s0);
+        const s2 = assignSlot(A, "", bp, "", "", 2, 4);
+        defer A.free(s2);
+        const s3 = assignSlot(A, "", bp, "", "", 3, 4);
+        defer A.free(s3);
+        const s1 = assignSlot(A, "", bp, "", "", 1, 4);
+        defer A.free(s1);
+        try std.testing.expectEqualStrings("lexer.py", s0);
+        try std.testing.expectEqualStrings("parser.py", s2);
+        try std.testing.expectEqualStrings("interpreter.py", s3);
+        try std.testing.expectEqualStrings("", s1);
+        try std.testing.expect(!std.mem.eql(u8, s0, s2));
+        try std.testing.expect(!std.mem.eql(u8, s2, s3));
+    }
+    {
+        const m = "lexer.py|820\nbuiltins.py|640\n";
+        const s0 = assignSlot(A, m, bp, "", "", 0, 4);
+        defer A.free(s0);
+        const s2 = assignSlot(A, m, bp, "", "", 2, 4);
+        defer A.free(s2);
+        const s3 = assignSlot(A, m, bp, "", "", 3, 4);
+        defer A.free(s3);
+        try std.testing.expectEqualStrings("parser.py", s0);
+        try std.testing.expectEqualStrings("interpreter.py", s2);
+        try std.testing.expectEqualStrings("nox.py", s3);
+        for ([_][]const u8{ s0, s2, s3 }) |s| {
+            try std.testing.expect(!builtInManifest(m, std.fs.path.basename(s)));
+            try std.testing.expect(s.len > 0);
+        }
+    }
+}
+
+test "assignSlot: surplus builders get no slot, and a fully-built project deepens only its lead" {
+    const A = std.testing.allocator;
+    const bp = "a.py\nb.py\n";
+    {
+        const s0 = assignSlot(A, "", bp, "", "", 0, 3);
+        defer A.free(s0);
+        const s1 = assignSlot(A, "", bp, "", "", 1, 3);
+        defer A.free(s1);
+        const s2 = assignSlot(A, "", bp, "", "", 2, 3);
+        defer A.free(s2);
+        try std.testing.expectEqualStrings("a.py", s0);
+        try std.testing.expectEqualStrings("b.py", s1);
+        try std.testing.expectEqualStrings("", s2);
+    }
+    {
+        const m = "a.py|500\nb.py|500\n";
+        const s0 = assignSlot(A, m, bp, "", "", 0, 3);
+        defer A.free(s0);
+        const s1 = assignSlot(A, m, bp, "", "", 1, 3);
+        defer A.free(s1);
+        const s2 = assignSlot(A, m, bp, "", "", 2, 3);
+        defer A.free(s2);
+        try std.testing.expectEqualStrings("a.py", s0);
+        try std.testing.expectEqualStrings("", s1);
+        try std.testing.expectEqualStrings("", s2);
+    }
+    {
+        const m = "a.py|500\n";
+        const dps = "b.py: c.py\n";
+        const s0 = assignSlot(A, m, bp, dps, "", 0, 3);
+        defer A.free(s0);
+        const s1 = assignSlot(A, m, bp, dps, "", 1, 3);
+        defer A.free(s1);
+        try std.testing.expectEqualStrings("a.py", s0);
+        try std.testing.expectEqualStrings("", s1);
+    }
+}
+
 test "tierFromStr pins explicit tiers and lets auto/unknown fall through to RSI" {
     try std.testing.expect(rsi.tierFromStr("author").? == .author);
     try std.testing.expect(rsi.tierFromStr("assembler").? == .assembler);
@@ -4690,4 +4806,34 @@ test "fenceSchema removes ONLY write_file and leaves the others as valid JSON" {
     var parsed_full = try std.json.parseFromSlice(std.json.Value, gpa, arr_full, .{});
     defer parsed_full.deinit();
     try std.testing.expect(parsed_full.value.array.items.len > 10);
+}
+
+test "salvageHasToolFragment rejects a bare tool-call blob but keeps a real file that merely mentions one" {
+    try std.testing.expect(salvageHasToolFragment("{\"path\":\"x.py\",\"content\":\"print(1)\"}"));
+    try std.testing.expect(salvageHasToolFragment("{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.py\"}}"));
+    try std.testing.expect(salvageHasToolFragment("{\"action\":\"write\",\"path\":\"a\"}"));
+    try std.testing.expect(salvageHasToolFragment("{ \"tool_call\": {\"name\":\"write_file\"} }"));
+
+    const real_py =
+        \\import json
+        \\
+        \\def build_call(p):
+        \\    # emit a write_file request shaped like {"path": "out.txt", "content": "..."}
+        \\    return json.dumps({"path": p, "content": "hello"})
+        \\
+        \\if __name__ == "__main__":
+        \\    print(build_call("out.txt"))
+    ;
+    try std.testing.expect(!salvageHasToolFragment(real_py));
+
+    const real_cfg =
+        \\{
+        \\  "name": "my-app",
+        \\  "tools": ["write_file", "read_file"],
+        \\  "action": "build"
+        \\}
+    ;
+    try std.testing.expect(!salvageHasToolFragment(real_cfg));
+
+    try std.testing.expect(!salvageHasToolFragment("   \n  "));
 }
