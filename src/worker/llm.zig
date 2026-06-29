@@ -29,11 +29,13 @@ pub const ToolCall = struct {
 
 pub const Step = struct {
     content: []u8,
+    reasoning: []u8,
     calls: []ToolCall,
     ok: bool,
 
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
         gpa.free(self.content);
+        gpa.free(self.reasoning);
         for (self.calls) |c| {
             gpa.free(c.id);
             gpa.free(c.name);
@@ -148,13 +150,15 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 
 fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
     const r = post(gpa, io, run_dir, tag, base_url, key, body);
-    if (!r.ok) return .{ .content = r.content, .calls = &.{}, .ok = false };
+    if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
     defer gpa.free(r.content);
 
     const Resp = struct {
         choices: []const struct {
             message: struct {
                 content: ?[]const u8 = null,
+                reasoning: ?[]const u8 = null,
+                reasoning_content: ?[]const u8 = null,
                 tool_calls: ?[]const struct {
                     id: []const u8 = "",
                     function: struct { name: []const u8 = "", arguments: []const u8 = "" },
@@ -192,7 +196,8 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         }
     }
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
-    return .{ .content = content, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
+    const reasoning = gpa.dupe(u8, msg.reasoning orelse msg.reasoning_content orelse "") catch return stepErr(gpa, "oom");
+    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
 }
 
 fn trimSlash(s: []const u8) []const u8 {
@@ -205,7 +210,7 @@ fn err(gpa: std.mem.Allocator, msg: []const u8) Reply {
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .ok = false };
 }
 fn stepErr(gpa: std.mem.Allocator, msg: []const u8) Step {
-    return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .calls = &.{}, .ok = false };
+    return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
 }
 
 /// Append a JSON-escaped, quoted string. Multibyte runs are copied verbatim only when they decode as
