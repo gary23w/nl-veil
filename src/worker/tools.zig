@@ -947,6 +947,40 @@ fn bareIp(s: []const u8) []const u8 {
     return if (std.mem.indexOfScalar(u8, s, ':')) |i| s[0..i] else s;
 }
 
+fn isNumeric(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+fn wellFormedVerb(v: []const u8) bool {
+    if (v.len == 0 or v.len > 40) return false;
+    if (!std.ascii.isAlphabetic(v[0])) return false;
+    for (v) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+    }
+    return true;
+}
+
+fn resolveProcName(ctx: *ToolCtx, target: []const u8) ?[]u8 {
+    if (!isNumeric(target)) return null;
+    const gpa = ctx.gpa;
+    const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return null;
+    defer gpa.free(tp);
+    const tel = std.Io.Dir.cwd().readFileAlloc(ctx.io, tp, gpa, .limited(65536)) catch return null;
+    defer gpa.free(tel);
+    const Proc = struct { name: []const u8 = "", pid: i64 = 0 };
+    const Tel = struct { processes: []const Proc = &.{} };
+    const parsed = std.json.parseFromSlice(Tel, gpa, tel, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    var pidbuf: [24]u8 = undefined;
+    for (parsed.value.processes) |pr| {
+        const pids = std.fmt.bufPrint(&pidbuf, "{d}", .{pr.pid}) catch continue;
+        if (std.mem.eql(u8, pids, target) and pr.name.len > 0) return gpa.dupe(u8, pr.name) catch null;
+    }
+    return null;
+}
+
 /// TARGET GUARD: a verb that names a specific threat (block_ip / kill_proc / remove_persistence) must point at a
 /// target that EXISTS in the live telemetry's threat set. A weak 8b sometimes issues a command at a HALLUCINATED
 /// target (e.g. block_ip on a benign internal IP that was never on the scoreboard) — wasting the moment and, worse,
@@ -1123,22 +1157,17 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer if (cmd.ptr != cmd0.ptr) gpa.free(@constCast(cmd));
     var it = std.mem.tokenizeAny(u8, cmd, " \t");
     const verb = it.next() orelse "";
-    const allowed = [_][]const u8{ "kill_proc", "block_ip", "remove_persistence", "restore_file", "isolate", "quarantine", "unisolate", "resume", "scan", "status", "safe_mode", "heater", "drive", "task_restart", "mutex_inherit", "set_phase", "set_green", "grant_walk", "set_mode", "restart_proc", "set_param" };
-    var ok = false;
-    for (allowed) |a| {
-        if (std.mem.eql(u8, verb, a)) {
-            ok = true;
-            break;
-        }
-    }
-    if (!ok) return std.fmt.allocPrint(gpa, "rejected: '{s}' is not an allowed host command", .{verb}) catch dupe(gpa, "rejected");
+    if (!wellFormedVerb(verb)) return std.fmt.allocPrint(gpa, "rejected: '{s}' is not a well-formed host command (a host command is a single verb token; the host decides which verbs it implements)", .{clip(verb, 60)}) catch dupe(gpa, "rejected: malformed command");
     const target = std.mem.trim(u8, cmd[@min(verb.len + 1, cmd.len)..], " \t");
     if (targetGuard(ctx, verb, target)) |rej| return rej;
     const irreversible = std.mem.eql(u8, verb, "kill_proc") or std.mem.eql(u8, verb, "block_ip") or std.mem.eql(u8, verb, "remove_persistence");
     if (irreversible and target.len > 0) {
         const is_pers = std.mem.eql(u8, verb, "remove_persistence");
-        var adjudicated = if (is_pers) persOwnsAdjudicated(ctx, target) else memMentions(ctx, bareIp(target));
-        if (!adjudicated and std.mem.eql(u8, verb, "kill_proc")) adjudicated = procOwnsAdjudicatedConn(ctx, target);
+        const resolved = if (std.mem.eql(u8, verb, "kill_proc")) resolveProcName(ctx, target) else null;
+        defer if (resolved) |r| gpa.free(r);
+        const adj_target = resolved orelse target;
+        var adjudicated = if (is_pers) persOwnsAdjudicated(ctx, target) else memMentions(ctx, bareIp(adj_target));
+        if (!adjudicated and std.mem.eql(u8, verb, "kill_proc")) adjudicated = procOwnsAdjudicatedConn(ctx, adj_target);
         if (!adjudicated) {
             stageAction(ctx, cmd);
             if (is_pers) return std.fmt.allocPrint(gpa, "STAGED (not executed): 'remove_persistence {s}' is irreversible and you hold NO adjudicating intel for the PROCESS this unit launches. Investigate that linked process first — recall_hive it, or web_fetch a threat-intel feed for its outbound C2 and observe what you learn; once your memory identifies the process or its connection as malicious, reissue and it executes. (This stops you deleting a legitimate scheduled task / service.)", .{target}) catch dupe(gpa, "staged: investigate the unit's process first");
@@ -2574,4 +2603,29 @@ test "looksBlocked flags anti-bot/paywall walls" {
     try std.testing.expect(looksBlocked("{\"code\":451,\"name\":\"SecurityCompromiseError\"}"));
     try std.testing.expect(looksBlocked("Just a moment... verify you are human"));
     try std.testing.expect(!looksBlocked("Ukrainian forces struck a facility on June 27, officials said."));
+}
+
+test "isNumeric detects a bare PID target (drives the interlock identifier resolver)" {
+    try std.testing.expect(isNumeric("1009"));
+    try std.testing.expect(isNumeric("7"));
+    try std.testing.expect(!isNumeric(""));
+    try std.testing.expect(!isNumeric("sh"));
+    try std.testing.expect(!isNumeric("php-fpm"));
+    try std.testing.expect(!isNumeric("185.220.101.34"));
+    try std.testing.expect(!isNumeric("100a"));
+}
+
+test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {
+    try std.testing.expect(wellFormedVerb("kill_proc"));
+    try std.testing.expect(wellFormedVerb("block_ip"));
+    try std.testing.expect(wellFormedVerb("set_phase"));
+    try std.testing.expect(wellFormedVerb("patch_verify"));
+    try std.testing.expect(wellFormedVerb("replay_attack"));
+    try std.testing.expect(wellFormedVerb("rotate-credentials"));
+    try std.testing.expect(wellFormedVerb("snapshotVM"));
+    try std.testing.expect(!wellFormedVerb(""));
+    try std.testing.expect(!wellFormedVerb("2fa_enable"));
+    try std.testing.expect(!wellFormedVerb("rm -rf /"));
+    try std.testing.expect(!wellFormedVerb("kill;reboot"));
+    try std.testing.expect(!wellFormedVerb("a" ** 41));
 }
