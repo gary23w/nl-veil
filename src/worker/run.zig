@@ -120,6 +120,7 @@ pub const Worker = struct {
     base_url: []const u8,
     key: []const u8,
     model: []const u8,
+    fence_writes: bool = false,
     roster: []const u8 = "",
     last_bench: BenchResult = .{},
     last_bench_str: []const u8 = "",
@@ -375,6 +376,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .autonomous = m.autonomous,
         .internet = m.internet,
         .want_net = m.internet,
+        .fence_writes = llm.fenceWrites(base_url, model),
     };
     w.mem.trust = true;
     defer w.scratch.deinit();
@@ -392,6 +394,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
+    if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)");
     w.breakout_on = m.breakout;
     w.publish_on = m.publish;
     {
@@ -1552,9 +1555,20 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_kb std.fmt.allocPrint(gpa, "WHAT THE HIVE HAS LEARNED — call recall_hive('<topic>') for the detail of any of these:\n{s}\nRelevant to your task right now:\n{s}\n\n", .{ idx, rel }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(know_block);
-    const fullsys = std.fmt.allocPrint(gpa, "You are {s}, an autonomous mind in a swarm of [{s}] working toward a shared goal. Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}{s}{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, set_directive, send_message, add_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns; pick a distinct piece, announce it with add_task/send_message, and check the task board + your inbox before you build. Write each file in ONE write_file call at the TOP LEVEL of your working directory — pass just a filename like 'lib.py', NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.", .{ mi.name, w.roster, voice, date_clause, constitution_clause, lane_clause, scout_clause, playbook_clause, space_clause, discourse_clause, dissent_clause, offline_clause }) catch (gpa.dupe(u8, "You are a mind with tools.") catch unreachable);
+    const fence_build = w.fence_writes and !operate and !mi.scout;
+    const fence_clause = if (fence_build)
+        "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE or UPDATE your assigned file, reply with its COMPLETE contents as a single fenced code block — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the full file, and a closing ```. The engine saves your fenced reply to your file automatically. Use read_file / recall_hive / send_message normally."
+    else
+        "";
+    const fence_sys_full = if (fence_build)
+        " NOTE: write_file is unavailable in this session — to create or update a file, reply with its FULL contents as a single fenced code block led by the file's relative path on its own line; the engine saves it automatically. read_file/recall_hive/send_message/observe work normally."
+    else
+        "";
+    const fullsys = std.fmt.allocPrint(gpa, "You are {s}, an autonomous mind in a swarm of [{s}] working toward a shared goal. Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}{s}{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, set_directive, send_message, add_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns; pick a distinct piece, announce it with add_task/send_message, and check the task board + your inbox before you build. Write each file in ONE write_file call at the TOP LEVEL of your working directory — pass just a filename like 'lib.py', NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}", .{ mi.name, w.roster, voice, date_clause, constitution_clause, lane_clause, scout_clause, playbook_clause, space_clause, discourse_clause, dissent_clause, offline_clause, fence_sys_full }) catch (gpa.dupe(u8, "You are a mind with tools.") catch unreachable);
     defer gpa.free(fullsys);
-    const leansys = if (assembler)
+    const leansys = if (assembler and fence_build)
+        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, and recall_hive — write_file is NOT available this session. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then a fenced code block (```lang … ```) containing the COMPLETE file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch unreachable)
+    else if (assembler)
         std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, and recall_hive. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
@@ -1624,14 +1638,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "\nDISCOVERED MAP: (empty — no cell probed yet; start probing YOUR region with probe(x,y))\n") catch @constCast("");
     defer gpa.free(map_str);
-    const fulluser = std.fmt.allocPrint(gpa, "{s}{s}Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.", .{ veil_inject, host_inject, if (goal.len > 0) goal else "explore something interesting", intent_str, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
+    const fulluser = std.fmt.allocPrint(gpa, "{s}{s}Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.{s}", .{ veil_inject, host_inject, if (goal.len > 0) goal else "explore something interesting", intent_str, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)", fence_clause }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
     defer gpa.free(fulluser);
-    const research_clause = if (w.plan_str.len > 0)
+    const research_clause = if (fence_build)
+        "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action EMITTING your file's FULL content as the fenced code block described below (read_file first ONLY if it already exists). Match any example's shape and quality."
+    else if (w.plan_str.len > 0)
         "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action calling write_file with your file's FULL content (read_file first ONLY if it already exists). Match any example's shape and quality."
     else
         "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -1666,8 +1682,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     // A discourse/research run needs web tools, but the lean ASSEMBLER_SCHEMA is build-only — route lean-tier
     // discourse minds to the research SCOUT_SCHEMA so they can actually research (the engine consolidates the briefing).
     const base_schema_raw = if (mi.scout or (w.discourse and w.cap.lean_schema)) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
-    const base_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
-    defer if (!w.internet) gpa.free(@constCast(base_schema));
+    const fence_now = w.fence_writes and !operate and !mi.scout;
+    const off_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
+    const off_owned = !w.internet;
+    const base_schema = if (fence_now) fenceSchema(gpa, off_schema) else off_schema;
+    const base_owned = off_owned or fence_now;
+    if (off_owned and fence_now) gpa.free(@constCast(off_schema));
+    defer if (base_owned) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
     defer gpa.free(authored_defs);
     const live_schema = if (authored_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}", .{ base_schema, authored_defs }) catch base_schema) else base_schema;
@@ -4316,28 +4337,37 @@ fn promoteVerified(w: *Worker, run_dir: []const u8) void {
 /// OFFLINE runs strip the web-access tools from the catalog the model sees. SCHEMA is one comma-joined
 /// function def per line (see tools.zig), so this is a clean per-line filter — drop any def naming a web
 /// tool, rejoin the rest comma-separated (no trailing comma). Caller frees.
-fn offlineSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
-    const web = [_][]const u8{
-        "\"name\":\"web_search\"", "\"name\":\"web_fetch\"", "\"name\":\"read_url\"",
-        "\"name\":\"fetch_json\"", "\"name\":\"osint_scan\"", "\"name\":\"deep_crawl\"",
-    };
+fn stripTools(gpa: std.mem.Allocator, schema: []const u8, drop: []const []const u8) []u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var first = true;
     var it = std.mem.splitScalar(u8, schema, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t,");
         if (ln.len == 0) continue;
-        var is_web = false;
-        for (web) |wname| if (std.mem.indexOf(u8, ln, wname) != null) {
-            is_web = true;
+        var drop_it = false;
+        for (drop) |name| if (std.mem.indexOf(u8, ln, name) != null) {
+            drop_it = true;
             break;
         };
-        if (is_web) continue;
+        if (drop_it) continue;
         if (!first) out.append(gpa, ',') catch break;
         out.appendSlice(gpa, ln) catch break;
         first = false;
     }
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
+fn offlineSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
+    const web = [_][]const u8{
+        "\"name\":\"web_search\"", "\"name\":\"web_fetch\"", "\"name\":\"read_url\"",
+        "\"name\":\"fetch_json\"", "\"name\":\"osint_scan\"", "\"name\":\"deep_crawl\"",
+    };
+    return stripTools(gpa, schema, &web);
+}
+
+fn fenceSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
+    const drop = [_][]const u8{"\"name\":\"write_file\""};
+    return stripTools(gpa, schema, &drop);
 }
 
 /// whole tools array (it's skipped); capped at MAX_TOOLS. Caller frees.
@@ -4633,4 +4663,31 @@ test "mindMonologue slices one mind's writing out of the round digest" {
 test "countOccurrences counts every case-insensitive hit" {
     try std.testing.expectEqual(@as(usize, 2), countOccurrences("Dread and dread again", "dread"));
     try std.testing.expectEqual(@as(usize, 0), countOccurrences("calm", "storm"));
+}
+
+test "fenceSchema removes ONLY write_file and leaves the others as valid JSON" {
+    const gpa = std.testing.allocator;
+    const fenced = fenceSchema(gpa, tools.ASSEMBLER_SCHEMA);
+    defer gpa.free(fenced);
+    try std.testing.expect(std.mem.indexOf(u8, fenced, "\"name\":\"write_file\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced, "\"name\":\"read_file\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced, "\"name\":\"observe\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced, "\"name\":\"recall_hive\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced, "\"name\":\"send_message\"") != null);
+    const arr = std.fmt.allocPrint(gpa, "[{s}]", .{fenced}) catch unreachable;
+    defer gpa.free(arr);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 4), parsed.value.array.items.len);
+
+    const fenced_full = fenceSchema(gpa, tools.SCHEMA);
+    defer gpa.free(fenced_full);
+    try std.testing.expect(std.mem.indexOf(u8, fenced_full, "\"name\":\"write_file\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced_full, "\"name\":\"run_python\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fenced_full, "\"name\":\"read_file\"") != null);
+    const arr_full = std.fmt.allocPrint(gpa, "[{s}]", .{fenced_full}) catch unreachable;
+    defer gpa.free(arr_full);
+    var parsed_full = try std.json.parseFromSlice(std.json.Value, gpa, arr_full, .{});
+    defer parsed_full.deinit();
+    try std.testing.expect(parsed_full.value.array.items.len > 10);
 }
