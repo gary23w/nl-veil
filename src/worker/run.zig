@@ -396,6 +396,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
+    if (live and !w.operating) {
+        const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
+        defer if (tp.len > 0) gpa.free(tp);
+        if (tp.len > 0) {
+            if (std.Io.Dir.cwd().access(io, tp, .{})) |_| {
+                w.operating = true;
+                w.discourse = false;
+                w.fence_writes = false;
+                w.act("engine", 0, "mode", "operate", "live host attached at startup — operational task; build-only faculties (blueprint / file-ownership) NOT scaffolded; fence-writes disabled (no file build)");
+            } else |_| {}
+        }
+    }
     if (live) {
         const c = llm.capsSnapshot();
         w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, w.fence_writes, if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
@@ -474,6 +486,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         const ri = roleIndices(@intCast(minds.items.len));
         for (minds.items, 0..) |*mi, i| {
             const ii: i64 = @intCast(i);
+            if (w.operating) {
+                mi.lane = if (ri.lead == ii)
+                    "LEAD/coordinator — read the live host state, decide the operation's priorities, split the work (which root cause each teammate takes), and keep the team converging on a healthy host; act via host_command, don't write files about it"
+                else if (ri.qa == ii)
+                    "VERIFY — after teammates act, re-read the live host state (host_status) and CONFIRM each action had the intended effect; catch regressions and flag anything still wrong, so the team fixes real root causes instead of re-issuing done work"
+                else if (ri.scout == ii and w.internet) blk_op_lane: {
+                    mi.scout = true;
+                    break :blk_op_lane SCOUT_LANE;
+                } else "OPERATE — take a distinct facet of the live host (a process, a service, a persistence/network issue); assess it, fix it with host_command, and verify the effect, without duplicating a teammate's facet";
+                continue;
+            }
             mi.lane = if (ri.lead == ii)
                 "LEAD/coordinator — set the plan, break it into concrete tasks and assign them to teammates with add_task, integrate their work into the final artifact, and keep everyone aligned (don't build it all yourself)"
             else if (ri.qa == ii)
@@ -547,17 +570,6 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.act("engine", 0, "mode", "discourse", "operator-pinned DISCOURSE (manifest style) — research/debate; no build scaffolding");
         } else {
             w.discourse = discourseMode(&w, goal);
-        }
-    }
-    if (live and !w.operating) {
-        const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
-        defer if (tp.len > 0) gpa.free(tp);
-        if (tp.len > 0) {
-            if (std.Io.Dir.cwd().access(io, tp, .{})) |_| {
-                w.operating = true;
-                w.discourse = false;
-                w.act("engine", 0, "mode", "operate", "live host attached at startup — operational task; build-only faculties (blueprint / file-ownership) NOT scaffolded");
-            } else |_| {}
         }
     }
     if (live and !w.discourse and !w.operating) {
@@ -945,6 +957,16 @@ pub fn fitnessSource(b: BenchResult, operating: bool, doc_target: u32, discourse
         return if (discourse or doc_target > 0 or goal_doc_only) .doc else .@"test";
     }
     return .none;
+}
+
+pub const Schema = enum { full, assembler, scout };
+pub const ModeGate = struct { schema: Schema, fence: bool };
+pub fn modeGate(operating: bool, lean_schema: bool, fence_writes: bool, scout: bool, discourse: bool) ModeGate {
+    if (scout) return .{ .schema = .scout, .fence = false };
+    if (operating) return .{ .schema = .full, .fence = false };
+    if (discourse and lean_schema) return .{ .schema = .scout, .fence = false };
+    const schema: Schema = if (lean_schema) .assembler else .full;
+    return .{ .schema = schema, .fence = fence_writes };
 }
 
 const MAX_TURNS = 6;
@@ -1433,7 +1455,7 @@ fn runMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: boo
 fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool, environ: *const std.process.Environ.Map) Moment {
     const gpa = w.gpa;
     const t0 = w.nowSecs();
-    const intent_key = if (w.goal_brief.len > 0) clipWords(w.goal_brief, 80) else if (goal.len > 0) clipWords(goal, 80) else "exploration";
+    const intent_key = if (w.goal_brief.len > 0) intentKey(w.goal_brief) else if (goal.len > 0) clipNWords(goal, 10) else "exploration";
     const query = if (mi.stances.items.len > 0)
         std.fmt.allocPrint(gpa, "{s} {s}", .{ intent_key, mi.stances.items[mi.stances.items.len - 1] }) catch (gpa.dupe(u8, intent_key) catch @constCast("exploration"))
     else
@@ -1575,7 +1597,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(offline_clause);
     const constitution_clause = " CONSTITUTION (binding for anything that could become public): your private thoughts, feelings, and internal debate are FREE — be honest there. But protect EVERYONE in anything you publish or share outward: do not name, attack, demean, praise, or take a partisan side for/against any real person, group, party, government, company, or religion; debate IDEAS and interpretations, never persons; nothing hateful, harassing, or that could endanger a real individual; keep charged personal feelings in your private journal, and keep public writing fair, humane, and respectful of real people.";
-    const operate = blk_op: {
+    const operate = w.operating or blk_op: {
         const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_op false;
         defer gpa.free(tp);
         const probe = std.Io.Dir.cwd().readFileAlloc(w.io, tp, gpa, .limited(65536)) catch break :blk_op false;
@@ -1583,6 +1605,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_op probe.len > 0;
     };
     const assembler = (w.cap.tier != .author) and !operate;
+    const gate = modeGate(operate, w.cap.lean_schema, w.fence_writes, mi.scout, w.discourse);
     if (operate) ctx.learn_scope = tools.INTEL_SCOPE;
     const ex_key = if (assembler_slot.len > 0) std.fs.path.basename(assembler_slot) else if (goal.len > 0) goal else "exemplar";
     const exemplar = if (assembler and w.cap.exemplar) w.mem.recall(tools.VERIFIED_SCOPE, ex_key) else (gpa.dupe(u8, "") catch @constCast(""));
@@ -1616,7 +1639,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_kb std.fmt.allocPrint(gpa, "WHAT THE HIVE HAS LEARNED — call recall_hive('<topic>') for the detail of any of these:\n{s}\nRelevant to your task right now:\n{s}\n\n", .{ idx, rel }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(know_block);
-    const fence_build = w.fence_writes and !operate and !mi.scout;
+    const fence_build = gate.fence;
     const fence_clause = if (fence_build)
         "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE or UPDATE your assigned file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block — just the one block with the full file. The engine saves your fenced reply to your file automatically. Use read_file / recall_hive / send_message normally."
     else
@@ -1749,8 +1772,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     w.act(mi.name, round, "thinking", "starting", if (mi.lane.len > 0) clip(mi.lane, 240) else "begins the round");
     // A discourse/research run needs web tools, but the lean ASSEMBLER_SCHEMA is build-only — route lean-tier
     // discourse minds to the research SCOUT_SCHEMA so they can actually research (the engine consolidates the briefing).
-    const base_schema_raw = if (mi.scout or (w.discourse and w.cap.lean_schema)) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
-    const fence_now = w.fence_writes and !operate and !mi.scout;
+    const base_schema_raw = switch (gate.schema) {
+        .scout => tools.SCOUT_SCHEMA,
+        .assembler => tools.ASSEMBLER_SCHEMA,
+        .full => tools.SCHEMA,
+    };
+    const fence_now = gate.fence;
     const off_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
     const off_owned = !w.internet;
     const base_schema = if (fence_now) fenceSchema(gpa, off_schema) else off_schema;
@@ -2212,6 +2239,42 @@ fn clipWords(s: []const u8, n: usize) []const u8 {
     if (s[end] != ' ') end = n;
     while (end > 0 and (s[end - 1] == ' ' or s[end - 1] == ',' or s[end - 1] == ';' or s[end - 1] == ':' or s[end - 1] == '-')) end -= 1;
     return s[0..end];
+}
+
+fn clipNWords(s: []const u8, words: usize) []const u8 {
+    var seen: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    while (i < s.len) {
+        const ws = i;
+        while (i < s.len and s[i] != ' ' and s[i] != '\t' and s[i] != '\n' and s[i] != '\r') i += 1;
+        if (i > ws) seen += 1;
+        if (seen >= words) return s[0..i];
+        while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or s[i] == '\r')) i += 1;
+    }
+    return s[0..i];
+}
+
+fn intentKey(brief: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, brief, '\n');
+    while (it.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        while (line.len >= 2 and (line[0] == '-' or line[0] == '*') and line[1] == ' ') line = std.mem.trimStart(u8, line[1..], " ");
+        if (line.len >= 3 and line[0] >= '0' and line[0] <= '9') {
+            var k: usize = 1;
+            while (k < line.len and line[k] >= '0' and line[k] <= '9') k += 1;
+            if (k < line.len and (line[k] == ')' or line[k] == '.' or line[k] == ':')) line = std.mem.trimStart(u8, line[k + 1 ..], " ");
+        }
+        if (std.mem.indexOfScalar(u8, line, ':')) |ci| {
+            if (ci > 0 and ci <= 18 and std.mem.indexOfScalar(u8, line[0..ci], ' ') == null) {
+                const after = std.mem.trimStart(u8, line[ci + 1 ..], " \t-");
+                if (after.len >= 8) line = after;
+            }
+        }
+        if (line.len >= 8) return clipNWords(line, 10);
+    }
+    return clipNWords(brief, 10);
 }
 
 /// Like clip but keeps the LAST n bytes (aligned to a line boundary), not the first. For a newline-separated list
@@ -4806,6 +4869,50 @@ test "fitnessSource follows the dominant LIVE fitness the situation provides (FI
     try std.testing.expect(fitnessSource(tests_ok, false, 0, true, false) == .doc);
     try std.testing.expect(fitnessSource(tests_ok, false, 0, false, true) == .doc);
     try std.testing.expect(fitnessSource(no_score, false, 0, false, false) == .none);
+}
+
+test "modeGate routes build-vs-operate on the SITUATION (operate → full schema + fence OFF; build unchanged)" {
+    try std.testing.expectEqual(Schema.full, modeGate(true, true, true, false, false).schema);
+    try std.testing.expect(!modeGate(true, true, true, false, false).fence);
+    try std.testing.expectEqual(Schema.assembler, modeGate(false, true, true, false, false).schema);
+    try std.testing.expect(modeGate(false, true, true, false, false).fence);
+    try std.testing.expectEqual(Schema.full, modeGate(false, false, false, false, false).schema);
+    try std.testing.expect(!modeGate(false, false, false, false, false).fence);
+    try std.testing.expectEqual(Schema.scout, modeGate(false, true, true, true, false).schema);
+    try std.testing.expect(!modeGate(false, true, true, true, false).fence);
+    try std.testing.expectEqual(Schema.scout, modeGate(true, true, true, true, false).schema);
+    try std.testing.expectEqual(Schema.scout, modeGate(false, true, true, false, true).schema);
+    try std.testing.expect(!modeGate(false, true, true, false, true).fence);
+}
+
+test "clipNWords clips to a word budget, not a byte budget" {
+    try std.testing.expectEqualStrings("one two three", clipNWords("one two three four five", 3));
+    try std.testing.expectEqualStrings("alpha", clipNWords("alpha beta", 1));
+    try std.testing.expectEqualStrings("just two", clipNWords("just two", 10));
+    try std.testing.expectEqualStrings("  hello world", clipNWords("  hello world there", 2));
+    try std.testing.expectEqualStrings("", clipNWords("", 5));
+}
+
+test "intentKey (FIX 4) keys recall on the brief's first CONTENT line, not its boilerplate skeleton" {
+    const brief =
+        \\1) The actual intent: keep the live host healthy and evict the cryptominer that pinned the CPU.
+        \\2) A strong outcome looks like a clean process table and a restored service.
+        \\3) Success criteria: threat_score returns to zero.
+    ;
+    const k = intentKey(brief);
+    try std.testing.expect(std.mem.startsWith(u8, k, "The actual intent"));
+    try std.testing.expect(std.mem.indexOf(u8, k, "cryptominer") == null);
+    try std.testing.expect(k.len <= 80);
+
+    const labeled = "Objective: build a REST API in Rust with axum and a sqlite store";
+    const lk = intentKey(labeled);
+    try std.testing.expect(std.mem.startsWith(u8, lk, "build a REST API"));
+
+    const blanks = "\n\n   \nFirst real content line of the working brief here\n";
+    try std.testing.expect(std.mem.startsWith(u8, intentKey(blanks), "First real content"));
+
+    const dashed = "Defend the host and remove persistence - then verify the service is back up";
+    try std.testing.expect(std.mem.startsWith(u8, intentKey(dashed), "Defend the host"));
 }
 
 test "isJunkFact rejects meta-narration and tool-call fragments, keeps real facts" {
