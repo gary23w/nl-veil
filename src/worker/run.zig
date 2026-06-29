@@ -959,11 +959,11 @@ pub fn fitnessSource(b: BenchResult, operating: bool, doc_target: u32, discourse
     return .none;
 }
 
-pub const Schema = enum { full, assembler, scout };
+pub const Schema = enum { full, assembler, scout, operate };
 pub const ModeGate = struct { schema: Schema, fence: bool };
 pub fn modeGate(operating: bool, lean_schema: bool, fence_writes: bool, scout: bool, discourse: bool) ModeGate {
     if (scout) return .{ .schema = .scout, .fence = false };
-    if (operating) return .{ .schema = .full, .fence = false };
+    if (operating) return .{ .schema = .operate, .fence = false };
     if (discourse and lean_schema) return .{ .schema = .scout, .fence = false };
     const schema: Schema = if (lean_schema) .assembler else .full;
     return .{ .schema = schema, .fence = fence_writes };
@@ -1742,7 +1742,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your operating toolset: host_status (read the live state), host_command (act on the device), read_file + write_file (inspect/patch a config, or write a report), recall + recall_hive (ground a decision in your own + the hive's intel), observe, send_message, set_directive. Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn. Before any DESTRUCTIVE or irreversible action (terminating a process, cutting a connection, removing or deleting something), first CONFIRM the target itself is the problem — identify what it is and the specific evidence it is hostile (its provenance/known-bad intel), not merely that it looks unusual or busy. A legitimate component that a problem is attached to, spawned from, or running under is NOT itself the problem: act on the hostile artifact, never on the healthy part of the device hosting it. Disabling, killing, or cutting off something legitimate is a FAILURE that is penalized and sets you back — when unsure whether a target is hostile, investigate it (read its details, recall its intel) before you act, not after.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
@@ -1775,6 +1775,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const base_schema_raw = switch (gate.schema) {
         .scout => tools.SCOUT_SCHEMA,
         .assembler => tools.ASSEMBLER_SCHEMA,
+        .operate => tools.OPERATE_SCHEMA,
         .full => tools.SCHEMA,
     };
     const fence_now = gate.fence;
@@ -4904,9 +4905,10 @@ test "fitnessSource follows the dominant LIVE fitness the situation provides (FI
     try std.testing.expect(fitnessSource(no_score, false, 0, false, false) == .none);
 }
 
-test "modeGate routes build-vs-operate on the SITUATION (operate → full schema + fence OFF; build unchanged)" {
-    try std.testing.expectEqual(Schema.full, modeGate(true, true, true, false, false).schema);
+test "modeGate routes build-vs-operate on the SITUATION (operate → lean OPERATE schema + fence OFF; build unchanged)" {
+    try std.testing.expectEqual(Schema.operate, modeGate(true, true, true, false, false).schema);
     try std.testing.expect(!modeGate(true, true, true, false, false).fence);
+    try std.testing.expectEqual(Schema.operate, modeGate(true, false, false, false, false).schema);
     try std.testing.expectEqual(Schema.assembler, modeGate(false, true, true, false, false).schema);
     try std.testing.expect(modeGate(false, true, true, false, false).fence);
     try std.testing.expectEqual(Schema.full, modeGate(false, false, false, false, false).schema);
