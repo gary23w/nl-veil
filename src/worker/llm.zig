@@ -55,9 +55,13 @@ fn isLocal(base_url: []const u8) bool {
         std.mem.indexOf(u8, base_url, "0.0.0.0") != null or
         std.mem.indexOf(u8, base_url, "[::1]") != null;
 }
+fn isOllama(base_url: []const u8) bool {
+    return isLocal(base_url) and std.mem.indexOf(u8, base_url, "11434") != null;
+}
 /// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer, so a
 /// 160-token retro/gap call would come back empty. Give those calls room to think AND answer.
 const LOCAL_MIN_TOKENS: u32 = 2048;
+const NATIVE_THINK_TOKENS: u32 = 24576;
 
 /// Is this a THINKING/reasoning model (hidden chain-of-thought before the answer)? Only those need the token floor.
 /// A plain relay model (llama3.1, qwen-instruct, mistral, gemma, phi) answers fine at a small max_tokens — and
@@ -85,6 +89,12 @@ fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
 /// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv. `tag`
 /// makes the scratch request/config files per-caller (per-mind) so concurrent minds don't clobber each other.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Reply {
+    const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
+    defer gpa.free(url);
+    return postUrl(gpa, io, run_dir, tag, url, key, body, isLocal(base_url));
+}
+
+fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, url: []const u8, key: []const u8, body: []const u8, local: bool) Reply {
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.llmreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
     defer gpa.free(reqpath);
     const cfgpath = std.fmt.allocPrint(gpa, "{s}/.curlcfg{s}{s}", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
@@ -94,13 +104,10 @@ fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8
     defer gpa.free(cfg);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch return err(gpa, "could not write curl config");
 
-    const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
-    defer gpa.free(url);
     const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return oom(gpa);
     defer gpa.free(data_at);
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
-    const local = isLocal(base_url);
     av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", if (local) "240" else "90" }) catch return oom(gpa);
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
     av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, url }) catch return oom(gpa);
@@ -134,6 +141,7 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
 /// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
+    if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     const mt = effTokens(base_url, model, max_tokens);
     const temp_frag = if (temperature >= 0)
         std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
@@ -146,6 +154,82 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     return completeBody(gpa, io, run_dir, tag, base_url, key, body);
+}
+
+fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
+    const np: u32 = if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens;
+    const temp_frag = if (temperature >= 0)
+        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
+    else
+        gpa.dupe(u8, "") catch return stepErr(gpa, "oom");
+    defer gpa.free(temp_frag);
+    var root = trimSlash(base_url);
+    if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
+    const url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return stepErr(gpa, "oom");
+    defer gpa.free(url);
+    const body = if (tools_json.len > 0)
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, temp_frag }) catch return stepErr(gpa, "oom")
+    else
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d}{s}}}}}", .{ model, messages_json, np, temp_frag }) catch return stepErr(gpa, "oom");
+    defer gpa.free(body);
+    const r = postUrl(gpa, io, run_dir, tag, url, key, body, true);
+    if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
+    defer gpa.free(r.content);
+    return parseOllamaNative(gpa, base_url, r.content);
+}
+
+fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8) Step {
+    const Resp = struct {
+        message: ?struct {
+            content: ?[]const u8 = null,
+            thinking: ?[]const u8 = null,
+            tool_calls: ?[]const struct {
+                function: struct { name: []const u8 = "", arguments: std.json.Value = .null },
+            } = null,
+        } = null,
+        done_reason: ?[]const u8 = null,
+        eval_count: ?u64 = 0,
+        prompt_eval_count: ?u64 = 0,
+        @"error": ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Resp, gpa, raw, .{ .ignore_unknown_fields = true }) catch
+        return stepErr(gpa, std.fmt.allocPrint(gpa, "bad Ollama response: {s}", .{raw[0..@min(raw.len, 300)]}) catch "unparseable response");
+    defer parsed.deinit();
+    if (parsed.value.eval_count) |ec| {
+        if (isLocal(base_url)) {
+            _ = tokens_in_free.fetchAdd(parsed.value.prompt_eval_count orelse 0, .monotonic);
+            _ = tokens_out_free.fetchAdd(ec, .monotonic);
+        } else {
+            _ = tokens_in.fetchAdd(parsed.value.prompt_eval_count orelse 0, .monotonic);
+            _ = tokens_out.fetchAdd(ec, .monotonic);
+        }
+        _ = calls_made.fetchAdd(1, .monotonic);
+    }
+    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
+    const msg = parsed.value.message orelse return stepErr(gpa, "no message in Ollama response");
+
+    var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+    if (msg.tool_calls) |tcs| {
+        for (tcs) |tc| {
+            const args = std.json.Stringify.valueAlloc(gpa, tc.function.arguments, .{}) catch continue;
+            calls.append(gpa, .{
+                .id = gpa.dupe(u8, "") catch {
+                    gpa.free(args);
+                    continue;
+                },
+                .name = gpa.dupe(u8, tc.function.name) catch {
+                    gpa.free(args);
+                    continue;
+                },
+                .args = args,
+            }) catch {
+                gpa.free(args);
+            };
+        }
+    }
+    const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
+    const reasoning = gpa.dupe(u8, msg.thinking orelse "") catch return stepErr(gpa, "oom");
+    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
 }
 
 fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
@@ -270,4 +354,38 @@ test "jstr sanitizes invalid UTF-8 and stays valid JSON" {
     const v = parsed.value.object.get("k").?.string;
     try std.testing.expect(std.mem.startsWith(u8, v, "ok\t\"q\\\" é中😀"));
     try std.testing.expect(std.mem.indexOf(u8, v, "\u{FFFD}") != null);
+}
+
+test "parseOllamaNative re-serializes an arguments OBJECT into a JSON-string ToolCall" {
+    const gpa = std.testing.allocator;
+    const raw =
+        \\{"model":"gpt-oss:20b","message":{"role":"assistant","content":"","thinking":"I should write the file now.",
+        \\"tool_calls":[{"function":{"name":"write_file","arguments":{"path":"x.py","content":"print(1)"}}}]},
+        \\"done_reason":"stop","eval_count":42,"prompt_eval_count":100}
+    ;
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    defer step.deinit(gpa);
+    try std.testing.expect(step.ok);
+    try std.testing.expectEqual(@as(usize, 1), step.calls.len);
+    try std.testing.expectEqualStrings("write_file", step.calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, step.calls[0].args, "x.py") != null);
+    const ap = try std.json.parseFromSlice(std.json.Value, gpa, step.calls[0].args, .{});
+    defer ap.deinit();
+    try std.testing.expectEqualStrings("x.py", ap.value.object.get("path").?.string);
+    try std.testing.expectEqualStrings("print(1)", ap.value.object.get("content").?.string);
+    try std.testing.expectEqualStrings("I should write the file now.", step.reasoning);
+}
+
+test "parseOllamaNative content-only (no tool call) returns text and no calls" {
+    const gpa = std.testing.allocator;
+    const raw =
+        \\{"model":"gpt-oss:20b","message":{"role":"assistant","content":"the answer is 391"},
+        \\"done_reason":"stop","eval_count":7,"prompt_eval_count":20}
+    ;
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    defer step.deinit(gpa);
+    try std.testing.expect(step.ok);
+    try std.testing.expectEqual(@as(usize, 0), step.calls.len);
+    try std.testing.expectEqualStrings("the answer is 391", step.content);
+    try std.testing.expectEqualStrings("", step.reasoning);
 }
