@@ -1718,7 +1718,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const issued = if (operate) issuedActions(gpa, w.io, w.run_dir) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued);
     const issued_block = if (issued.len > 0)
-        std.fmt.allocPrint(gpa, "ACTIONS YOU HAVE ALREADY ISSUED to the host (most recent first — do NOT re-issue one that is done; verify its EFFECT in the live state above and move to the next root cause):\n{s}\n", .{clip(issued, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, "ACTIONS PREVIOUSLY ATTEMPTED on this device (most recent first) — these are NOT confirmed done. The LIVE DEVICE STATE ABOVE is the ONLY source of truth; do not trust this list over it. For EACH item, check the live state: if what it targeted is STILL present/active there (an item still flagged unresolved, a channel still open, a process respawned under a new id, a resource still flagged bad), then the action did NOT hold — it failed, or something re-established it — so RE-ISSUE it now. Only skip an action whose effect you can SEE confirmed in the live state. If repeating the same fix never makes it stick, something deeper is re-creating the problem each time — stop repeating the surface fix and find and remove that ROOT CAUSE (the seam/misconfiguration/artifact that lets it return):\n{s}\n", .{clip(issued, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued_block);
@@ -1742,7 +1742,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
@@ -1816,6 +1816,39 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 if (rep.ok and rep.content.len > 0) {
                     gpa.free(monologue);
                     monologue = gpa.dupe(u8, rep.content) catch @constCast("");
+                }
+            }
+            if (operate and isToolParseError(step.content)) {
+                w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse the host_command call — re-issuing WITHOUT tools to recover the action as text");
+                var rconv: std.ArrayListUnmanaged(u8) = .empty;
+                defer rconv.deinit(gpa);
+                rconv.appendSlice(gpa, conv.items) catch {};
+                rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool. Reply with ONLY your single host action on one line, in the form: <verb> <target> — use the verb you intended and the EXACT identifier (pid/name/ip/unit/path) shown verbatim in the device state above; never invent an identifier. No prose, no explanation — just the one action line.\"}") catch {};
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                defer rep.deinit(gpa);
+                if (rep.ok and rep.content.len > 0) {
+                    if (rep.reasoning.len > 0) w.act(mi.name, round, "thinking", "", clip(rep.reasoning, 600));
+                    if (recoverHostCall(gpa, rep.content)) |rc| {
+                        defer gpa.free(rc.name);
+                        defer gpa.free(rc.args);
+                        w.act(mi.name, round, "recover", rc.name, "recovered the host action from the tools-off retry and executing");
+                        conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                        llm.jstr(gpa, &conv, rep.content) catch {};
+                        conv.appendSlice(gpa, ",\"tool_calls\":[{\"id\":\"recovered\",\"type\":\"function\",\"function\":{\"name\":") catch {};
+                        llm.jstr(gpa, &conv, rc.name) catch {};
+                        conv.appendSlice(gpa, ",\"arguments\":") catch {};
+                        llm.jstr(gpa, &conv, rc.args) catch {};
+                        conv.appendSlice(gpa, "}}]}") catch {};
+                        const result = tools.execute(&ctx, rc.name, rc.args);
+                        defer gpa.free(result);
+                        if (std.mem.eql(u8, rc.name, "host_command")) acted = true;
+                        tool_calls += 1;
+                        w.act(mi.name, round, rc.name, rc.args, result);
+                        conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":\"recovered\",\"content\":") catch {};
+                        llm.jstr(gpa, &conv, result) catch {};
+                        conv.append(gpa, '}') catch {};
+                        continue;
+                    }
                 }
             }
             break;
@@ -3622,7 +3655,7 @@ fn isToolParseError(msg: []const u8) bool {
     const n = @min(msg.len, buf.len);
     for (msg[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
     const low = buf[0..n];
-    const markers = [_][]const u8{ "parsing tool call", "error parsing tool", "tool call" };
+    const markers = [_][]const u8{ "parsing tool call", "error parsing tool", "tool call", "looks like object", "closing '}'", "can't find closing" };
     for (markers) |mk| if (std.mem.indexOf(u8, low, mk) != null) return true;
     return false;
 }
