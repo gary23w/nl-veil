@@ -549,7 +549,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.discourse = discourseMode(&w, goal);
         }
     }
-    if (live and !w.discourse) {
+    if (live and !w.operating) {
+        const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
+        defer if (tp.len > 0) gpa.free(tp);
+        if (tp.len > 0) {
+            if (std.Io.Dir.cwd().access(io, tp, .{})) |_| {
+                w.operating = true;
+                w.discourse = false;
+                w.act("engine", 0, "mode", "operate", "live host attached at startup — operational task; build-only faculties (blueprint / file-ownership) NOT scaffolded");
+            } else |_| {}
+        }
+    }
+    if (live and !w.discourse and !w.operating) {
         w.blueprint = planProject(&w, goal, w.goal_brief);
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
@@ -724,7 +735,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 if (std.Io.Dir.cwd().access(io, tp, .{})) |_| {
                     w.operating = true;
                     w.discourse = false;
-                    w.act("engine", round, "mode", "operate", "live host attached — operational task; fitness/oracle ENABLED, build-only faculties (role planner / blueprint) DISABLED");
+                    if (w.blueprint.len > 0) {
+                        gpa.free(@constCast(w.blueprint));
+                        w.blueprint = "";
+                    }
+                    w.act("engine", round, "mode", "operate", "live host attached — operational task; fitness/oracle ENABLED, build-only faculties (role planner / blueprint) DISABLED + any build blueprint TORN DOWN");
                 } else |_| {}
             }
         }
@@ -745,7 +760,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
             var bench = runBenchmark(&w, run_dir);
             w.deliverable_missing = false;
-            if (bench.status == .ok) {
+            if (bench.status == .ok and !bench.host and !w.operating) {
                 var gn: u32 = 0;
                 const gtree = extractGoalPaths(gpa, goal, &gn);
                 defer gpa.free(@constCast(gtree));
@@ -921,6 +936,16 @@ pub const BenchResult = struct {
     host: bool = false,
     failures: []u8 = &.{},
 };
+
+pub const FitnessSource = enum { host, doc, @"test", none };
+pub fn fitnessSource(b: BenchResult, operating: bool, doc_target: u32, discourse: bool, goal_doc_only: bool) FitnessSource {
+    if (b.host) return .host;
+    if (operating) return .host;
+    if (b.status == .ok and b.total > 0) {
+        return if (discourse or doc_target > 0 or goal_doc_only) .doc else .@"test";
+    }
+    return .none;
+}
 
 const MAX_TURNS = 6;
 const API_FAIL_MAX = 5;
@@ -1268,10 +1293,39 @@ fn hostScoreboard(gpa: std.mem.Allocator, tel: []const u8) []u8 {
     return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
+fn issuedActions(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) []u8 {
+    const cp = std.fmt.allocPrint(gpa, "{s}/work/commands.jsonl", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(cp);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, cp, gpa, .limited(256 << 10)) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(data);
+    if (std.mem.trim(u8, data, " \r\n\t").len == 0) return gpa.dupe(u8, "") catch @constCast("");
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\n\t");
+        if (t.len > 0) lines.append(gpa, t) catch {};
+    }
+    if (lines.items.len == 0) return gpa.dupe(u8, "") catch @constCast("");
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer b.deinit(gpa);
+    const max_lines: usize = 12;
+    const start = if (lines.items.len > max_lines) lines.items.len - max_lines else 0;
+    var i = lines.items.len;
+    while (i > start) {
+        i -= 1;
+        b.appendSlice(gpa, "  - ") catch {};
+        b.appendSlice(gpa, clip(lines.items[i], 160)) catch {};
+        b.append(gpa, '\n') catch {};
+    }
+    return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
 const HOST_VERBS = [_][]const u8{
     "remove_persistence", "block_ip", "kill_proc",  "restore_file", "restart_proc", "set_phase", "set_green",
     "grant_walk",         "set_mode", "set_param",  "task_restart", "heater",       "drive",
     "isolate", "quarantine", "unisolate", "resume", "scan", "safe_mode",
+    "patch_verify", "replay_attack",
 };
 const HOST_TARGET_VERBS = 13;
 
@@ -1379,10 +1433,11 @@ fn runMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: boo
 fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool, environ: *const std.process.Environ.Map) Moment {
     const gpa = w.gpa;
     const t0 = w.nowSecs();
+    const intent_key = if (w.goal_brief.len > 0) clipWords(w.goal_brief, 80) else if (goal.len > 0) clipWords(goal, 80) else "exploration";
     const query = if (mi.stances.items.len > 0)
-        std.fmt.allocPrint(gpa, "{s} {s}", .{ if (goal.len > 0) goal else "exploration", mi.stances.items[mi.stances.items.len - 1] }) catch (gpa.dupe(u8, if (goal.len > 0) goal else "exploration") catch unreachable)
+        std.fmt.allocPrint(gpa, "{s} {s}", .{ intent_key, mi.stances.items[mi.stances.items.len - 1] }) catch (gpa.dupe(u8, intent_key) catch @constCast("exploration"))
     else
-        gpa.dupe(u8, if (goal.len > 0) goal else "exploration") catch @constCast("exploration");
+        gpa.dupe(u8, intent_key) catch @constCast("exploration");
     defer gpa.free(query);
     const recalled = w.mem.assoc(mi.scope, query, 4, 8);
     defer gpa.free(recalled);
@@ -1637,6 +1692,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_h hostScoreboard(gpa, tel);
     };
     defer gpa.free(host_inject);
+    const issued = if (operate) issuedActions(gpa, w.io, w.run_dir) else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(issued);
+    const issued_block = if (issued.len > 0)
+        std.fmt.allocPrint(gpa, "ACTIONS YOU HAVE ALREADY ISSUED to the host (most recent first — do NOT re-issue one that is done; verify its EFFECT in the live state above and move to the next root cause):\n{s}\n", .{clip(issued, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(issued_block);
     const map_str = if (w.space.len == 0)
         gpa.dupe(u8, "") catch @constCast("")
     else if (spacemap.len > 0)
@@ -1657,7 +1719,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act.", .{ veil_inject, host_inject, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your full toolset (host_status, host_command, web_fetch, web_search, recall, recall_hive, observe, send_message, and the rest). Assess the device state above, decide what it needs, and act.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
@@ -1863,7 +1925,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         }
     }
 
-    if (!mi.scout and files == 0) {
+    if (!mi.scout and files == 0 and !operate) {
         const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
         if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
             const body = salvageFileBody(gpa, monologue);
@@ -3866,7 +3928,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
     if (has_score) {
         var solved = b.passed >= b.total and b.tier <= 1;
         var doc_oracle: ?u32 = null;
-        const doc_style = w.discourse or w.doc_target > 0 or goalIsDocOnly(gpa, goal);
+        const doc_style = fitnessSource(b, w.operating, w.doc_target, w.discourse, goalIsDocOnly(gpa, goal)) == .doc;
         if (doc_style) {
             doc_oracle = acceptanceOracle(w, goal, round);
             if (doc_oracle) |ov| {
@@ -3917,6 +3979,17 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
         prog_now = b.pct;
         prog_best = w.best_pct;
         prog_flat = w.flat_rounds;
+    } else if (w.operating) {
+        w.flat_rounds += 1;
+        phase = if (w.flat_rounds >= PLATEAU_ROUNDS) "plateau" else "progressing";
+        prog_now = w.best_pct;
+        prog_best = w.best_pct;
+        prog_flat = w.flat_rounds;
+        if (w.phase_str.len > 0) gpa.free(@constCast(w.phase_str));
+        w.phase_str = buildPhaseClause(gpa, phase, prog_best, prog_now, prog_flat, w.open_ended, restored);
+        w.emit("phase", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"phase\":\"{s}\",\"now\":{d},\"best\":{d},\"flat\":{d},\"open_ended\":{},\"unbounded\":{}", .{ round, phase, prog_now, prog_best, prog_flat, w.open_ended, w.never_stops }) catch ",\"phase\":\"?\"");
+        w.act("engine", round, "phase", phase, w.phase_str);
+        return;
     } else {
         const k = w.mem.factCount(tools.KNOWLEDGE_SCOPE) + w.mem.factCount(tools.SKILL_SCOPE);
         const oracle = acceptanceOracle(w, goal, round);
@@ -4720,6 +4793,19 @@ test "profileForTier maps each tier to its knob set" {
     try std.testing.expect(!rsi.profileForTier(.author).lean_schema);
     try std.testing.expect(rsi.profileForTier(.assembler).lean_schema and rsi.profileForTier(.assembler).exemplar);
     try std.testing.expectEqual(@as(u32, 2), rsi.profileForTier(.extractor).max_turns);
+}
+
+test "fitnessSource follows the dominant LIVE fitness the situation provides (FIX 1 keystone — no use-case flag)" {
+    const tests_ok = BenchResult{ .status = .ok, .passed = 8, .total = 10, .pct = 80 };
+    const host_ok = BenchResult{ .status = .ok, .host = true, .passed = 15, .total = 100, .pct = 15 };
+    const no_score = BenchResult{ .status = .no_tests };
+    try std.testing.expect(fitnessSource(host_ok, true, 500, true, true) == .host);
+    try std.testing.expect(fitnessSource(no_score, true, 0, false, false) == .host);
+    try std.testing.expect(fitnessSource(tests_ok, false, 0, false, false) == .@"test");
+    try std.testing.expect(fitnessSource(tests_ok, false, 800, false, false) == .doc);
+    try std.testing.expect(fitnessSource(tests_ok, false, 0, true, false) == .doc);
+    try std.testing.expect(fitnessSource(tests_ok, false, 0, false, true) == .doc);
+    try std.testing.expect(fitnessSource(no_score, false, 0, false, false) == .none);
 }
 
 test "isJunkFact rejects meta-narration and tool-call fragments, keeps real facts" {
