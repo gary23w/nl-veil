@@ -278,14 +278,16 @@ pub const SCOUT_SCHEMA =
 
 /// The ASSEMBLER's tool set — the minimal authoring set for a small model (8B) in scaffold-and-fill mode. The full
 /// 28-tool SCHEMA (~6k tokens, re-sent every turn) drowns a weak model and confuses weak tool-calling, so the
-/// assembler is given ONLY what it needs: read what exists, write the fill, record a fact, and recall_hive — so it
-/// can PULL the exact concept/pattern the hive already learned before it builds (without recall, learned knowledge
-/// is stored-and-forgotten). No web/search (the scout's job), no run_python/run_tests. Keep defs in sync with SCHEMA.
+/// assembler is given ONLY what it needs: read what exists, write the fill, record a fact, recall_hive — so it can
+/// PULL the exact concept/pattern the hive already learned before it builds (without recall, learned knowledge is
+/// stored-and-forgotten) — AND send_message, so parallel minds building separate files can agree on the interfaces
+/// between them. No web/search (the scout's job), no run_python/run_tests. Keep defs in sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
-    \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
+    \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"send_message","description":"Tell a teammate (or 'all') the ONE thing they must know to stay consistent with your file — the exact function name + signature you expose, or a decision the others must match. Read your inbox (shown above) and reply when a teammate needs something.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
 /// Run one tool. `args_json` is the raw arguments string from the tool_call. Returns a gpa-owned result
