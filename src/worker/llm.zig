@@ -79,6 +79,10 @@ fn isThinking(model: []const u8) bool {
         std.mem.indexOf(u8, m, "gpt-5") != null or std.mem.indexOf(u8, m, "o4") != null;
 }
 
+pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
+    return isOllama(base_url) and isThinking(model);
+}
+
 /// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or a
 /// local NON-thinking relay model) uses the caller's value verbatim — so the relay generates only what it needs.
 fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
