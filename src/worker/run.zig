@@ -1662,7 +1662,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     trace.appendSlice(gpa, "\"recall\"") catch {};
     var monologue: []u8 = gpa.dupe(u8, "") catch @constCast("");
 
-    w.act(mi.name, round, "thinking", "", "");
+    w.act(mi.name, round, "thinking", "starting", if (mi.lane.len > 0) clip(mi.lane, 240) else "begins the round");
     // A discourse/research run needs web tools, but the lean ASSEMBLER_SCHEMA is build-only — route lean-tier
     // discourse minds to the research SCOUT_SCHEMA so they can actually research (the engine consolidates the briefing).
     const base_schema_raw = if (mi.scout or (w.discourse and w.cap.lean_schema)) tools.SCOUT_SCHEMA else if (w.cap.lean_schema and !operate) tools.ASSEMBLER_SCHEMA else tools.SCHEMA;
