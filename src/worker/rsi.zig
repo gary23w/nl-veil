@@ -482,21 +482,21 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
         for (minds) |*mi| {
             if (!std.ascii.eqlIgnoreCase(mi.name, a.mind)) continue;
             if (std.mem.eql(u8, mi.lane, focus)) {
-                mi.scout = a.research;
+                mi.scout = a.research and w.internet;
                 break;
             }
             const newlane = gpa.dupe(u8, clip(focus, 300)) catch break;
             if (mi.lane_owned and mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
             mi.lane = newlane;
             mi.lane_owned = true;
-            mi.scout = a.research;
+            mi.scout = a.research and w.internet;
             changed += 1;
             if (plan_ev.items.len > 0) plan_ev.appendSlice(gpa, " | ") catch {};
             plan_ev.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}: {s}", .{ a.mind, clip(newlane, 60) }) catch "") catch {};
             break;
         }
     }
-    if (minds.len >= 4) {
+    if (minds.len >= 4 and w.internet) {
         var has_scout = false;
         for (minds) |mi| {
             if (mi.scout) has_scout = true;

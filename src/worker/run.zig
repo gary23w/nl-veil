@@ -469,7 +469,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 "LEAD/coordinator — set the plan, break it into concrete tasks and assign them to teammates with add_task, integrate their work into the final artifact, and keep everyone aligned (don't build it all yourself)"
             else if (ri.qa == ii)
                 "REVIEW & QA — verify teammates' facts and files, fill gaps, and assemble/polish the final deliverable; OWN the test suite (write/expand real test_*.py with assertions about INTENDED behavior, never trivial asserts that game the score), and each round fix the deliverable's single biggest failing test"
-            else if (ri.scout == ii) blk: {
+            else if (ri.scout == ii and w.internet) blk: {
                 mi.scout = true;
                 break :blk SCOUT_LANE;
             } else LANES[i % LANES.len];
@@ -1686,14 +1686,29 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         defer step.deinit(gpa);
         if (!step.ok) {
             if (isFatalLlm(step.content)) llm_fatal = true;
+            if (step.content.len > 0) w.act(mi.name, round, "thinking", "", clip(step.content, 1400));
             gpa.free(monologue);
             monologue = std.fmt.allocPrint(gpa, "[llm error] {s}", .{step.content}) catch (gpa.dupe(u8, "[llm error]") catch unreachable);
+            if (!operate and std.mem.indexOf(u8, live_schema, "write_file") != null and isToolParseError(step.content)) {
+                w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse a large tool call — re-issuing the turn WITHOUT tools to recover the file as text");
+                var rconv: std.ArrayListUnmanaged(u8) = .empty;
+                defer rconv.deinit(gpa);
+                rconv.appendSlice(gpa, conv.items) catch {};
+                rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool. Reply with ONLY the file: the first line is the relative path, then a fenced code block containing the COMPLETE file contents.\"}") catch {};
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                defer rep.deinit(gpa);
+                if (rep.ok and rep.content.len > 0) {
+                    gpa.free(monologue);
+                    monologue = gpa.dupe(u8, rep.content) catch @constCast("");
+                }
+            }
             break;
         }
         llm_ok = true;
         {
             const reasoning = std.mem.trim(u8, step.content, " \r\n\t");
-            if (step.calls.len > 0 and reasoning.len > 0) w.act(mi.name, round, "thinking", "", clip(reasoning, 1400));
+            const think = if (step.reasoning.len > 0) step.reasoning else reasoning;
+            if (think.len > 0) w.act(mi.name, round, "thinking", "", clip(think, 1400));
         }
         if (step.calls.len == 0) {
             if (operate) {
@@ -3423,6 +3438,16 @@ fn isRetryable(msg: []const u8) bool {
     return false;
 }
 
+fn isToolParseError(msg: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    const n = @min(msg.len, buf.len);
+    for (msg[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const markers = [_][]const u8{ "parsing tool call", "error parsing tool", "tool call" };
+    for (markers) |mk| if (std.mem.indexOf(u8, low, mk) != null) return true;
+    return false;
+}
+
 /// SELF-HEALING REASONING CALL — the mind detects when its primary (paid) model is rate-limited / overloaded /
 /// transiently failing and FALLS BACK to the gateway model + endpoint (the local, never-rate-limited model in a hybrid
 /// setup) so the swarm keeps thinking instead of losing the turn. The fallback is degraded (a weaker model) but alive;
@@ -4105,7 +4130,6 @@ fn roleIndices(team: u32) RoleIdx {
 
 fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
     const want = std.fs.path.basename(path);
-    if (std.mem.startsWith(u8, want, "test_") and std.mem.endsWith(u8, want, ".py")) return true;
     if (deps.len == 0) return true;
     var it = std.mem.splitScalar(u8, deps, '\n');
     while (it.next()) |ln| {
@@ -4513,9 +4537,11 @@ test "depsReady executes the AI-declared decomposition: independent parallel, de
     try std.testing.expect(!depsReady(deps, empty, "api.py"));
     try std.testing.expect(!depsReady(deps, "models.py|400\n", "api.py"));
     try std.testing.expect(depsReady(deps, some, "api.py"));
-    try std.testing.expect(depsReady(deps, some, "test_api.py"));
-    try std.testing.expect(depsReady(deps, empty, "test_api.py"));
+    try std.testing.expect(!depsReady(deps, some, "test_api.py"));
+    try std.testing.expect(!depsReady(deps, empty, "test_api.py"));
     try std.testing.expect(depsReady(deps, "api.py|900\n", "test_api.py"));
+    try std.testing.expect(depsReady("test_util.py: none\n", empty, "test_util.py"));
+    try std.testing.expect(depsReady(deps, empty, "test_smoke.py"));
     try std.testing.expect(depsReady(deps, empty, "README.md"));
 }
 
