@@ -761,7 +761,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
             w.last_bench = bench;
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.doc_target, prev_pct);
+            const cov = goalCoverage(&w, goal);
+            defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.doc_target, prev_pct, cov);
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
                 _ = w.mem.observe(tools.PLAYBOOK_SCOPE, "Write an objective test suite (test_*.py with real assertions about intended behavior) for the deliverable before adding more features — the swarm is scored by its pass rate.");
@@ -795,6 +797,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse and w.doc_target == 0) deliverableGate(&w, run_dir);
         if (live and !w.discourse and w.doc_target == 0) interfaceScan(&w, run_dir);
         if (live and w.discourse) markDeliverableGaps(&w, goal, round);
+        if (live and w.discourse) reconcileDeliverables(&w, goal, round);
         if (live) trackConvergence(&w, run_dir, goal, round);
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
@@ -922,6 +925,7 @@ const SATURATE_ROUNDS = 3;
 const GRADUATE_PCT = 85;
 const GRADUATE_FLAT = 3;
 const NOVELTY_MIN = 1;
+const ACCEPT_PCT = 70;
 
 /// The model-capacity tiers. `author` = a capable model handed a problem authors the solution (the engine's
 /// existing full-context behavior). `assembler` = a small model (8B) that cannot author but CAN fill a shown
@@ -1820,8 +1824,25 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     if (!mi.scout and files == 0) {
         const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
         if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
-            const body = salvageFileBody(monologue);
-            if (body.len >= 40) {
+            const body = salvageFileBody(gpa, monologue);
+            defer if (body.len > 0) gpa.free(@constCast(body));
+            const base = std.fs.path.basename(salvage_slot);
+            const is_py = std.mem.endsWith(u8, base, ".py");
+            var reject: ?[]const u8 = null;
+            if (body.len < 80) reject = "too short (<80 chars)" else if (salvageLeadConversational(body)) reject = "conversational lead-in (chatter, not a file body)" else if (salvageHasToolFragment(body)) reject = "contains a raw tool-call fragment" else if (is_py and !pyCompileOk(w, body)) reject = "fails py_compile (syntax error)";
+            if (reject == null) {
+                const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch "";
+                defer if (full.len > 0) gpa.free(full);
+                if (full.len > 0) {
+                    const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
+                    defer if (existing.len > 0) gpa.free(existing);
+                    const cur = std.mem.trim(u8, existing, " \r\n\t");
+                    if (cur.len >= 40 and cur.len >= body.len) reject = "slot already holds a longer/equal file (no clobber)";
+                }
+            }
+            if (reject) |why| {
+                w.act(mi.name, round, "salvage_reject", salvage_slot, why);
+            } else if (body.len >= 80) {
                 var wargs: std.ArrayListUnmanaged(u8) = .empty;
                 defer wargs.deinit(gpa);
                 wargs.appendSlice(gpa, "{\"path\":") catch {};
@@ -1883,7 +1904,100 @@ fn firstSentenceEnd(s: []const u8) usize {
     return s.len;
 }
 
-fn salvageFileBody(monologue: []const u8) []const u8 {
+fn jsonUnescape(gpa: std.mem.Allocator, s: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.ensureTotalCapacity(gpa, s.len) catch return gpa.dupe(u8, s) catch @constCast("");
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] != '\\' or i + 1 >= s.len) {
+            out.append(gpa, s[i]) catch {};
+            continue;
+        }
+        i += 1;
+        switch (s[i]) {
+            'n' => out.append(gpa, '\n') catch {},
+            't' => out.append(gpa, '\t') catch {},
+            'r' => out.append(gpa, '\r') catch {},
+            '"' => out.append(gpa, '"') catch {},
+            '\\' => out.append(gpa, '\\') catch {},
+            '/' => out.append(gpa, '/') catch {},
+            'b' => out.append(gpa, 0x08) catch {},
+            'f' => out.append(gpa, 0x0c) catch {},
+            'u' => {
+                if (i + 4 < s.len) {
+                    const cp = std.fmt.parseInt(u21, s[i + 1 .. i + 5], 16) catch 0;
+                    out.append(gpa, if (cp >= 0x20 and cp < 0x7f) @intCast(cp) else '?') catch {};
+                    i += 4;
+                } else out.append(gpa, '?') catch {};
+            },
+            else => out.append(gpa, s[i]) catch {},
+        }
+    }
+    return out.toOwnedSlice(gpa) catch @constCast("");
+}
+
+fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
+    const looks_envelope = (std.mem.indexOf(u8, monologue, "\"content\"") != null) and
+        ((std.mem.indexOf(u8, monologue, "write_file") != null) or (std.mem.indexOf(u8, monologue, "\"path\"") != null));
+    if (!looks_envelope) return null;
+    const ckey = std.mem.indexOf(u8, monologue, "\"content\"") orelse return null;
+    var i = ckey + "\"content\"".len;
+    while (i < monologue.len and monologue[i] != '"') : (i += 1) {
+        if (monologue[i] != ' ' and monologue[i] != ':' and monologue[i] != '\t' and monologue[i] != '\r' and monologue[i] != '\n') return null;
+    }
+    if (i >= monologue.len) return null;
+    i += 1;
+    const start = i;
+    while (i < monologue.len) : (i += 1) {
+        if (monologue[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (monologue[i] == '"') break;
+    }
+    if (i >= monologue.len) return null;
+    const raw = monologue[start..i];
+    if (raw.len < 4) return null;
+    return jsonUnescape(gpa, raw);
+}
+
+fn salvageLeadConversational(body: []const u8) bool {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    var first: []const u8 = "";
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len > 0) {
+            first = t;
+            break;
+        }
+    }
+    if (first.len == 0) return true;
+    const lead = clip(first, 48);
+    const bad = [_][]const u8{ "we'll", "we need", "we will", "i will", "i'll", "let me", "sure", "here", "okay", "ok,", "title:", "list ", "include ", "ensure ", "at end", "first,", "next,", "step ", "now ", "this file", "this document", "below is", "below,", "as an ai", "i cannot", "i can't" };
+    for (bad) |b| {
+        if (lead.len >= b.len and std.ascii.eqlIgnoreCase(lead[0..b.len], b)) return true;
+    }
+    return false;
+}
+
+fn salvageHasToolFragment(body: []const u8) bool {
+    return std.mem.indexOf(u8, body, "{\"action\"") != null or
+        std.mem.indexOf(u8, body, "{\"path\"") != null or
+        std.mem.indexOf(u8, body, "{\"tool\"") != null or
+        std.mem.indexOf(u8, body, "{\"name\":\"write_file\"") != null or
+        std.mem.indexOf(u8, body, "\"tool_call\"") != null;
+}
+
+fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
+    if (embeddedWriteContent(gpa, monologue)) |c| {
+        const t = std.mem.trim(u8, c, " \r\n\t");
+        if (t.len >= 40) {
+            const owned = gpa.dupe(u8, t) catch "";
+            gpa.free(c);
+            return owned;
+        }
+        gpa.free(c);
+    }
     if (std.mem.indexOf(u8, monologue, "```")) |open| {
         const after = open + 3;
         var bodystart = after;
@@ -1891,7 +2005,7 @@ fn salvageFileBody(monologue: []const u8) []const u8 {
         if (bodystart < monologue.len) bodystart += 1;
         if (std.mem.indexOfPos(u8, monologue, bodystart, "```")) |close| {
             const body = std.mem.trim(u8, monologue[bodystart..close], " \r\n\t");
-            if (body.len >= 40) return body;
+            if (body.len >= 40) return gpa.dupe(u8, body) catch "";
         }
     }
     const t = std.mem.trim(u8, monologue, " \r\n\t");
@@ -1901,11 +2015,25 @@ fn salvageFileBody(monologue: []const u8) []const u8 {
         if (c == '\n') nl += 1;
     }
     if (nl < 4) return "";
-    const lead = clip(t, 24);
-    if (std.ascii.indexOfIgnoreCase(lead, "sure") != null or std.ascii.indexOfIgnoreCase(lead, "here") != null or
-        std.ascii.indexOfIgnoreCase(lead, "i will") != null or std.ascii.indexOfIgnoreCase(lead, "i'll") != null or
-        std.ascii.indexOfIgnoreCase(lead, "let me") != null or std.ascii.indexOfIgnoreCase(lead, "this ") != null) return "";
-    return t;
+    return gpa.dupe(u8, t) catch "";
+}
+
+fn pyCompileOk(w: *Worker, source: []const u8) bool {
+    const gpa = w.gpa;
+    const pe = w.mem.environ orelse return true;
+    var env = pe.clone(gpa) catch return true;
+    defer env.deinit();
+    env.put("NL_SALVAGE_SRC", source) catch return true;
+    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const code = "import os,sys\ntry:\n compile(os.environ.get('NL_SALVAGE_SRC',''),'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\n";
+    const argv = [_][]const u8{ py, "-c", code };
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return true;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return switch (r.term) {
+        .exited => |c| c != 7,
+        else => true,
+    };
 }
 
 fn urlFromArgs(args: []const u8) ?[]const u8 {
@@ -2311,10 +2439,43 @@ fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
     return res;
 }
 
+const Coverage = struct { present: u32 = 0, total: u32 = 0, missing: []const u8 = "" };
+fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
+    const gpa = w.gpa;
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer gpa.free(@constCast(tree));
+    if (n == 0) return .{};
+    var present: u32 = 0;
+    var total: u32 = 0;
+    var miss: std.ArrayListUnmanaged(u8) = .empty;
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        total += 1;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
+        defer if (data.len > 0) gpa.free(data);
+        if (std.mem.trim(u8, data, " \r\n\t").len > 40) {
+            present += 1;
+        } else {
+            if (miss.items.len > 0) miss.appendSlice(gpa, ", ") catch {};
+            miss.appendSlice(gpa, std.fs.path.basename(bp)) catch {};
+        }
+    }
+    return .{ .present = present, .total = total, .missing = miss.toOwnedSlice(gpa) catch "" };
+}
+
 /// The FITNESS block injected into every mind's user prompt — the score turned into a concrete "raise this"
 /// instruction. gpa-owned (caller frees on replace + teardown).
-fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, doc_target: u32, prev_pct: u32) []const u8 {
+fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, doc_target: u32, prev_pct: u32, cov: Coverage) []const u8 {
     const fails = if (b.failures.len > 0) clip(b.failures, 900) else "(none — all green)";
+    const cover_lead = if (cov.total > 0 and cov.present < cov.total)
+        std.fmt.allocPrint(gpa, "COVERAGE {d}/{d} required files present. CREATE the MISSING required files FIRST (write_file, full substantive content — not stubs): {s}. ", .{ cov.present, cov.total, clip(cov.missing, 400) }) catch ""
+    else
+        "";
+    defer if (cover_lead.len > 0) gpa.free(@constCast(cover_lead));
     if (b.host) {
         const nudge = if (b.pct <= prev_pct and b.pct < 90)
             " Your last actions did NOT raise it — if a threat is still live it is likely RESPAWNING from a ROOT CAUSE you have not removed yet; address what is SUSTAINING the threat (not just the symptom you already hit), and keep acting until it recovers."
@@ -2322,13 +2483,12 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, do
         else "";
         return std.fmt.allocPrint(gpa, "HOST FITNESS (raise this — your device's MEASURED health, 0-100): {d}/100 (last round it was {d}). State: {s}. Computed from the host ITSELF, not from your words — only an actual host_command that changes the host moves it; describing a plan leaves it unchanged, and a false_positive (killing/blocking something legitimate) drops it HARD.{s}", .{ b.pct, prev_pct, fails, nudge }) catch (gpa.dupe(u8, "HOST FITNESS: raise the host's measured health.") catch @constCast(""));
     }
-    if (doc_target > 0) {
-        return switch (b.status) {
-            .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
+    const base: []const u8 = if (doc_target > 0)
+        switch (b.status) {
+            .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Once every required file exists, your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
             else => gpa.dupe(u8, "LENGTH FITNESS: grow each file toward its word target by APPENDING scenes — this is prose, no tests or tools are needed.") catch @constCast(""),
-        };
-    }
-    return switch (b.status) {
+        }
+    else switch (b.status) {
         .ok => if (protected)
             std.fmt.allocPrint(gpa, "FITNESS (raise this number): last round scored {d}/{d} ({d}%, tier{d}). FAILING: {s}. spec_test.py is the FIXED engine-protected spec and the ONLY thing scored — you CANNOT raise your score by editing or adding tests (it is restored each round). The only way up is to make the DELIVERABLE pass more of it.", .{ b.passed, b.total, b.pct, b.tier, fails }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
         else
@@ -2336,6 +2496,9 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, do
         .no_tests => gpa.dupe(u8, "FITNESS: no test suite exists yet — the swarm has no scoreboard. Before adding features, write a runnable test_<name>.py with concrete assertions about intended behavior so progress can be measured.") catch @constCast(""),
         .err => if (protected) (gpa.dupe(u8, "FITNESS: the protected spec (spec_test.py) could not run against your deliverable — the deliverable likely errors on import or is missing the required function. Make it import and run cleanly.") catch @constCast("")) else (gpa.dupe(u8, "FITNESS: the benchmark could not run last round — make sure the deliverable AND its test file execute cleanly (a build that doesn't run scores zero).") catch @constCast("")),
     };
+    if (cover_lead.len == 0) return base;
+    defer gpa.free(@constCast(base));
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ cover_lead, base }) catch (gpa.dupe(u8, base) catch @constCast(""));
 }
 
 /// Format a Unix timestamp (UTC) as "Wkd YYYY-MM-DD HH:MM UTC". Zig 0.16 has no strftime, so this does the
@@ -2416,17 +2579,56 @@ fn flagUncitedSources(w: *Worker, md: []const u8, round: u32) void {
 /// writes it to work/briefing.md, and reuses it as the working-memory digest. NOTHING about any use-case lives here —
 /// the subject/persona/tone come from the swarm GOAL. If posting is enabled it hands off to publishArtifact (grounding
 /// gates + the general constitution screen + the telegraph capability).
+fn stripLeadingFence(text: []const u8) []const u8 {
+    var s = std.mem.trimStart(u8, text, " \r\n\t");
+    if (!std.mem.startsWith(u8, s, "```") and !std.mem.startsWith(u8, s, "~~~")) return text;
+    const nl = std.mem.indexOfScalar(u8, s, '\n') orelse return text;
+    const first = std.mem.trim(u8, s[0..nl], " \r\t");
+    if (first.len > 16) return text;
+    s = s[nl + 1 ..];
+    const st = std.mem.trimEnd(u8, s, " \r\n\t");
+    if (std.mem.lastIndexOf(u8, st, "```")) |ci| {
+        if (std.mem.trim(u8, st[ci..], " \r\n\t`").len == 0) return std.mem.trimEnd(u8, st[0..ci], " \r\n\t");
+    }
+    if (std.mem.lastIndexOf(u8, st, "~~~")) |ci| {
+        if (std.mem.trim(u8, st[ci..], " \r\n\t~").len == 0) return std.mem.trimEnd(u8, st[0..ci], " \r\n\t");
+    }
+    return s;
+}
+
+fn soleNamedDoc(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer gpa.free(@constCast(tree));
+    if (n != 1) return "";
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        if (isDocPath(bp)) return gpa.dupe(u8, bp) catch "";
+        return "";
+    }
+    return "";
+}
+
 fn consolidateBriefing(w: *Worker, goal: []const u8, round: u32, discussion: []const u8) void {
     const gpa = w.gpa;
     const doc = writer.compose(w, w.publish_on and w.internet, goal, discussion, round);
     if (doc.md.len == 0) return;
     defer gpa.free(@constCast(doc.md));
-    const md = doc.md;
+    const md = stripLeadingFence(doc.md);
     const wd = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch return;
     defer gpa.free(wd);
     if (std.Io.Dir.cwd().createDirPathStatus(w.io, wd, .default_dir)) |_| {} else |_| {}
-    const path = std.fmt.allocPrint(gpa, "{s}/work/briefing.md", .{w.run_dir}) catch return;
+    const sole = soleNamedDoc(gpa, goal);
+    defer if (sole.len > 0) gpa.free(@constCast(sole));
+    const path = if (sole.len > 0)
+        std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, sole }) catch return
+    else
+        std.fmt.allocPrint(gpa, "{s}/work/briefing.md", .{w.run_dir}) catch return;
     defer gpa.free(path);
+    if (std.fs.path.dirname(path)) |dir| {
+        if (std.Io.Dir.cwd().createDirPathStatus(w.io, dir, .default_dir)) |_| {} else |_| {}
+    }
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = md }) catch {};
     w.act("engine", round, "briefing", "consolidated the hive's findings + debate", clip(md, 600));
     w.emit("briefing", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"bytes\":{d}", .{ round, md.len }) catch ",\"round\":0");
@@ -2653,9 +2855,11 @@ fn markIncomplete(w: *Worker, round: u32) void {
         defer gpa.free(fp);
         const fdata = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch continue;
         defer gpa.free(fdata);
-        if (fileNeedsMore(fdata)) {
+        const broken_py = std.mem.endsWith(u8, base, ".py") and std.mem.trim(u8, fdata, " \r\n\t").len > 40 and !pyCompileOk(w, fdata);
+        if (fileNeedsMore(fdata) or broken_py) {
             out.appendSlice(gpa, base) catch {};
             out.append(gpa, ' ') catch {};
+            if (broken_py) w.act("engine", round, "compile_fail", base, "a built .py file does not compile — re-queued to its owner to FIX");
         }
     }
     if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
@@ -2695,6 +2899,90 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
     const miss = std.mem.trim(u8, missing.items, " ,");
     w.act("engine", round, "deliverable_gap", "the goal REQUIRES these files and they do not exist yet — WRITE them this round", miss);
     const directive = std.fmt.allocPrint(gpa, "the goal REQUIRES these deliverable files and they DO NOT EXIST yet: {s}. WRITE them THIS round with write_file (full, substantive content — not a stub). Do NOT run code, run tests, or build packages — this is a research/writing task and the only thing that completes it is the written file landing on disk.", .{miss}) catch return;
+    if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
+    w.strategy_str = directive;
+}
+
+fn refLabelLen(corpus: []const u8, i: usize) usize {
+    const labels = [_][]const u8{ "Article", "Section", "Clause", "Chapter", "Appendix", "Part", "Rule" };
+    for (labels) |lb| {
+        if (i + lb.len <= corpus.len and std.ascii.eqlIgnoreCase(corpus[i .. i + lb.len], lb)) {
+            if (i > 0 and (std.ascii.isAlphabetic(corpus[i - 1]) or corpus[i - 1] == '_')) continue;
+            return lb.len;
+        }
+    }
+    return 0;
+}
+
+fn reconcileDeliverables(w: *Worker, goal: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    if (w.deliverable_missing) return;
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer gpa.free(@constCast(tree));
+    if (n < 2) return;
+    var corpus: std.ArrayListUnmanaged(u8) = .empty;
+    defer corpus.deinit(gpa);
+    var docs: u32 = 0;
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        if (!isDocPath(bp)) continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(128 << 10)) catch "";
+        defer if (data.len > 0) gpa.free(data);
+        if (std.mem.trim(u8, data, " \r\n\t").len <= 40) continue;
+        corpus.appendSlice(gpa, data) catch {};
+        corpus.appendSlice(gpa, "\n") catch {};
+        docs += 1;
+    }
+    if (docs < 2 or corpus.items.len < 80) return;
+    const c = corpus.items;
+    var dangling: std.ArrayListUnmanaged(u8) = .empty;
+    defer dangling.deinit(gpa);
+    var dn: u32 = 0;
+    var i: usize = 0;
+    while (i < c.len and dn < 6) : (i += 1) {
+        const ll = refLabelLen(c, i);
+        if (ll == 0) continue;
+        var j = i + ll;
+        while (j < c.len and c[j] == ' ') j += 1;
+        const num_start = j;
+        while (j < c.len and (std.ascii.isDigit(c[j]) or std.mem.indexOfScalar(u8, "IVXLC", c[j]) != null)) j += 1;
+        const num = c[num_start..j];
+        if (num.len == 0 or num.len > 8) {
+            i = j;
+            continue;
+        }
+        const tokstr = std.fmt.allocPrint(gpa, "{s} {s}", .{ c[i .. i + ll], num }) catch {
+            i = j;
+            continue;
+        };
+        defer gpa.free(tokstr);
+        var occ: u32 = 0;
+        var p: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(c, p, tokstr)) |hit| {
+            occ += 1;
+            p = hit + tokstr.len;
+            if (occ > 1) break;
+        }
+        if (occ <= 1) {
+            var dup = false;
+            if (std.mem.indexOf(u8, dangling.items, tokstr) != null) dup = true;
+            if (!dup) {
+                if (dn > 0) dangling.appendSlice(gpa, ", ") catch {};
+                dangling.appendSlice(gpa, tokstr) catch {};
+                dn += 1;
+            }
+        }
+        i = j;
+    }
+    if (dn == 0) return;
+    const dlist = std.mem.trim(u8, dangling.items, " ,");
+    w.act("engine", round, "reconcile", "a deliverable cites a cross-reference that nothing defines (dangling)", clip(dlist, 300));
+    const prior = if (w.strategy_str.len > 0) w.strategy_str else "";
+    const directive = std.fmt.allocPrint(gpa, "{s}{s}CROSS-REFERENCE MISMATCH: a produced deliverable CITES {s}, but no file DEFINES it (it appears only as the citation). Either add the missing section/article so the reference resolves, or correct the citation to point at a heading that actually exists — keep the documents internally consistent.", .{ clip(prior, 1200), if (prior.len > 0) " " else "", clip(dlist, 200) }) catch return;
     if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
     w.strategy_str = directive;
 }
@@ -2964,7 +3252,7 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
         if (n >= 40) break;
     }
     out_n.* = n;
-    if (n < 3) {
+    if (n == 0) {
         bp.deinit(gpa);
         return gpa.dupe(u8, "") catch @constCast("");
     }
@@ -3369,17 +3657,18 @@ fn tierStrength(tier: u8) u8 {
 }
 
 fn parseOracleScore(s: []const u8) ?u32 {
+    var out: ?u32 = null;
     var i: usize = 0;
     while (i < s.len) {
         if (s[i] >= '0' and s[i] <= '9') {
             var j = i;
             var v: u32 = 0;
             while (j < s.len and s[j] >= '0' and s[j] <= '9' and j - i < 4) : (j += 1) v = v * 10 + (s[j] - '0');
-            if (v <= 100) return v;
+            if (v <= 100) out = v;
             i = j;
         } else i += 1;
     }
-    return null;
+    return out;
 }
 
 fn scoutQuery(w: *Worker, goal: []const u8) []const u8 {
@@ -3452,12 +3741,34 @@ fn acceptanceOracle(w: *Worker, goal: []const u8, round: u32) ?u32 {
     const sys = "You are a strict acceptance judge. Given a GOAL (with its success criteria) and the CURRENT DELIVERABLE the swarm has produced, rate how well the deliverable MEETS the goal on a 0-100 scale: 0 = absent or off-task, 100 = fully meets every stated requirement and constraint. Judge ONLY the deliverable text shown — do not reward intentions, plans, or facts that are not reflected in the actual deliverable. Reply with ONLY the integer.";
     const user = std.fmt.allocPrint(gpa, "GOAL (and success criteria):\n{s}\n\nCURRENT DELIVERABLE:\n{s}\n\nHow well (0-100) does the current deliverable meet the goal? Reply with ONLY the integer.", .{ clip(if (w.goal_brief.len > 0) w.goal_brief else goal, 1400), clip(body.items, 6000) }) catch return null;
     defer gpa.free(user);
-    const r = llm.chat(gpa, w.io, w.run_dir, "oracle", w.gw_base, w.gw_key, w.gateway_model, sys, user, 24);
+    const r = llm.chat(gpa, w.io, w.run_dir, "oracle", w.gw_base, w.gw_key, w.gateway_model, sys, user, 64);
     defer gpa.free(r.content);
-    if (!r.ok) return null;
-    const v = parseOracleScore(r.content) orelse return null;
+    if (!r.ok) {
+        w.act("engine", round, "oracle", "goal-derived acceptance UNAVAILABLE (gateway call failed) — fell back to the fact-count floor", "n/a");
+        return null;
+    }
+    const v = parseOracleScore(r.content) orelse {
+        w.act("engine", round, "oracle", "goal-derived acceptance UNPARSEABLE (no integer in the judge reply) — fell back to the fact-count floor", "n/a");
+        return null;
+    };
     w.act("engine", round, "oracle", "goal-derived acceptance (how well the current deliverable meets the goal, 0-100)", std.fmt.allocPrint(w.a(), "{d}", .{v}) catch "?");
     return v;
+}
+
+fn goalIsDocOnly(gpa: std.mem.Allocator, goal: []const u8) bool {
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer gpa.free(@constCast(tree));
+    if (n == 0) return false;
+    var has_doc = false;
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const base = std.fs.path.basename(bp);
+        if (isCodeExt(base)) return false;
+        if (isDocPath(bp)) has_doc = true;
+    }
+    return has_doc;
 }
 
 /// SELF-COMPLETION AWARENESS — read the fitness trajectory each round and classify the phase. ONLY a provably-met
@@ -3466,7 +3777,7 @@ fn acceptanceOracle(w: *Worker, goal: []const u8, round: u32) ?u32 {
 /// "give up" ceilings would defeat RSI — the only terminators of an unsolved task are operator STOP + the failsafes.
 fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
-    const b = w.last_bench;
+    var b = w.last_bench;
     const has_score = b.status == .ok and b.total > 0;
     var phase: []const u8 = "progressing";
     var restored = false;
@@ -3474,7 +3785,16 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
     var prog_best: u32 = 0;
     var prog_flat: u32 = 0;
     if (has_score) {
-        const solved = b.passed >= b.total and b.tier <= 1;
+        var solved = b.passed >= b.total and b.tier <= 1;
+        var doc_oracle: ?u32 = null;
+        const doc_style = w.discourse or w.doc_target > 0 or goalIsDocOnly(gpa, goal);
+        if (doc_style) {
+            doc_oracle = acceptanceOracle(w, goal, round);
+            if (doc_oracle) |ov| {
+                if (ov < b.pct) b.pct = ov;
+                if (ov < ACCEPT_PCT) solved = false;
+            }
+        }
         const cur_strength = tierStrength(b.tier);
         const best_strength = tierStrength(w.best_tier);
         const rigor_increase = cur_strength > best_strength;
@@ -3784,8 +4104,9 @@ fn roleIndices(team: u32) RoleIdx {
 }
 
 fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
-    if (deps.len == 0) return true;
     const want = std.fs.path.basename(path);
+    if (std.mem.startsWith(u8, want, "test_") and std.mem.endsWith(u8, want, ".py")) return true;
+    if (deps.len == 0) return true;
     var it = std.mem.splitScalar(u8, deps, '\n');
     while (it.next()) |ln| {
         const line = std.mem.trim(u8, ln, " \r\t");
@@ -4192,7 +4513,8 @@ test "depsReady executes the AI-declared decomposition: independent parallel, de
     try std.testing.expect(!depsReady(deps, empty, "api.py"));
     try std.testing.expect(!depsReady(deps, "models.py|400\n", "api.py"));
     try std.testing.expect(depsReady(deps, some, "api.py"));
-    try std.testing.expect(!depsReady(deps, some, "test_api.py"));
+    try std.testing.expect(depsReady(deps, some, "test_api.py"));
+    try std.testing.expect(depsReady(deps, empty, "test_api.py"));
     try std.testing.expect(depsReady(deps, "api.py|900\n", "test_api.py"));
     try std.testing.expect(depsReady(deps, empty, "README.md"));
 }
