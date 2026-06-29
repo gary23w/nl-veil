@@ -138,15 +138,17 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
 pub fn interpretGoal(w: *Worker, goal: []const u8) []const u8 {
     const gpa = w.gpa;
     if (std.mem.trim(u8, goal, " \r\n\t").len == 0) return gpa.dupe(u8, "") catch @constCast("");
-    const sys = "You turn a user's brief, possibly-vague instruction to an autonomous AI swarm into an explicit working brief. Infer what the user ACTUALLY wants, what a great result looks like, and concrete success criteria — even when the instruction is open-ended (e.g. 'do X until I stop you'). Be specific and actionable. Do not ask questions; commit to the most sensible interpretation.";
+    const sys = "You turn a user's brief, possibly-vague instruction to an autonomous AI swarm into an explicit working brief. Infer what the user ACTUALLY wants, what a great result looks like, and concrete success criteria — even when the instruction is open-ended (e.g. 'do X until I stop you'). CRITICAL: you must PRESERVE, verbatim, every output file the goal names (e.g. worldbook.md, ch01.md) and every hard constraint or process requirement it states (e.g. 'a crisis must be handled', 'cite real sources', 'record dissent') — never paraphrase them away or drop them. Be specific and actionable. Do not ask questions; commit to the most sensible interpretation.";
     const user = std.fmt.allocPrint(gpa,
         \\The user gave this instruction to the swarm:
         \\"{s}"
         \\
-        \\Write a SHORT brief (3-5 sentences) the swarm should treat as its real objective:
+        \\Write a SHORT brief the swarm should treat as its real objective:
         \\1) the actual intent behind the words — what they are really after;
         \\2) what a strong outcome looks like, concretely;
-        \\3) the success criteria — what "good" or "done" means; if it's open-ended, define what continuous progress looks like.
+        \\3) the success criteria — what "good" or "done" means; if it's open-ended, define what continuous progress looks like;
+        \\4) REQUIRED DELIVERABLES — list EVERY output file the goal names, verbatim (exact filenames, do not paraphrase or drop any);
+        \\5) HARD CONSTRAINTS — list EVERY hard constraint and process requirement the goal states, verbatim (e.g. a mandated event/crisis, "cite real sources", "record dissent"). If the goal names none, say "none".
         \\Reply with ONLY the brief. No preamble, no questions.
     , .{clip(goal, 600)}) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(user);
@@ -312,8 +314,29 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
         .err => gpa.dupe(u8, "the benchmark could not run (deliverable or tests don't execute)") catch @constCast(""),
     };
     defer gpa.free(score_line);
-    const sys = "You are the swarm's retrospective facilitator. After each round you maintain the swarm's OPERATING PLAYBOOK: short, concrete process rules (about coordination, verifying work, building on what exists, not duplicating effort, and RAISING THE BENCHMARK PASS RATE) that every mind must follow next round. You add a rule only when it would genuinely change behaviour for the better.";
-    const user = std.fmt.allocPrint(gpa,
+    const sys = if (w.discourse)
+        "You are the swarm's retrospective facilitator for a RESEARCH and WRITING task. There is NO code repo, NO test suite, and NO build — do not invent one. After each round you maintain the swarm's OPERATING PLAYBOOK: short, concrete RESEARCH/WRITING process rules (close a coverage gap, source an unsourced claim, record dissent where minds disagreed, WRITE a named deliverable file that doesn't exist yet, sharpen a weakly-calibrated view) that every mind must follow next round. Never propose a software/engineering rule (no 'add a unit test', 'py_compile', 'set __all__', 'fix imports', 'run the benchmark'). You add a rule only when it would genuinely change behaviour for the better."
+    else
+        "You are the swarm's retrospective facilitator. After each round you maintain the swarm's OPERATING PLAYBOOK: short, concrete process rules (about coordination, verifying work, building on what exists, not duplicating effort, and RAISING THE BENCHMARK PASS RATE) that every mind must follow next round. You add a rule only when it would genuinely change behaviour for the better.";
+    const user = if (w.discourse) std.fmt.allocPrint(gpa,
+        \\Goal: {s}
+        \\
+        \\What the minds reported this round:
+        \\{s}
+        \\
+        \\Written deliverable so far: {s}
+        \\
+        \\Rules already in force (do NOT restate these):
+        \\{s}
+        \\
+        \\This is a research/writing task — there is no benchmark or test suite. Name the SINGLE most valuable NEW research/writing process rule for next round, drawn ONLY from: a coverage gap to close, an unsourced claim to ground with a real source, missing dissent to record, a named deliverable file the goal requires that has NOT been written yet (write it with write_file), or weak calibration to sharpen. Do NOT propose any software/engineering rule (no unit tests, py_compile, __all__, imports, benchmarks — there is no code). If the playbook already covers what matters, answer exactly: none
+        \\Reply with ONLY the one-line imperative rule (or the word none). No preamble, no quotes.
+    , .{
+        if (goal.len > 0) clip(goal, 240) else "explore",
+        if (summaries.len > 0) clip(summaries, 1600) else "(no summaries)",
+        if (build.len > 0) clip(build, 400) else "(nothing written yet)",
+        if (playbook.len > 0) clipTail(playbook, 1200) else "(empty — no rules yet)",
+    }) catch return else std.fmt.allocPrint(gpa,
         \\Goal: {s}
         \\
         \\Benchmark this round: {s}
