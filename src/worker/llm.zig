@@ -70,6 +70,7 @@ fn isOllama(base_url: []const u8) bool {
 /// 160-token retro/gap call would come back empty. Give those calls room to think AND answer.
 const LOCAL_MIN_TOKENS: u32 = 2048;
 const NATIVE_THINK_TOKENS: u32 = 24576;
+const NATIVE_CTX: u32 = 32768;
 
 /// Is this a THINKING/reasoning model (hidden chain-of-thought before the answer)? Only those need the token floor.
 /// A plain relay model (llama3.1, qwen-instruct, mistral, gemma, phi) answers fine at a small max_tokens — and
@@ -180,15 +181,19 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
     const url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return stepErr(gpa, "oom");
     defer gpa.free(url);
-    const body = if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, temp_frag }) catch return stepErr(gpa, "oom")
-    else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d}{s}}}}}", .{ model, messages_json, np, temp_frag }) catch return stepErr(gpa, "oom");
+    const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, temp_frag) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     const r = postUrl(gpa, io, run_dir, tag, url, key, body, true);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
     defer gpa.free(r.content);
     return parseOllamaNative(gpa, base_url, r.content);
+}
+
+fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, temp_frag: []const u8) ![]u8 {
+    return if (tools_json.len > 0)
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, NATIVE_CTX, temp_frag })
+    else
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, np, NATIVE_CTX, temp_frag });
 }
 
 fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8) Step {
@@ -510,4 +515,19 @@ test "probe-first override: a probed cap wins over the port/name heuristics; unp
     try std.testing.expect(!isOllama("http://localhost:11434/v1"));
     try std.testing.expect(isThinking("o1-preview"));
     try std.testing.expect(!isThinking("gpt-4o"));
+}
+
+test "ollamaNativeBody pins num_ctx=32768 in the options (titan1 truncation fix)" {
+    const gpa = std.testing.allocator;
+    const with_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "{\"name\":\"write_file\"}", 24576, ",\"temperature\":0.70");
+    defer gpa.free(with_tools);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"num_ctx\":32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"num_predict\":24576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"tools\":") != null);
+
+    const no_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "", 24576, "");
+    defer gpa.free(no_tools);
+    try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"num_ctx\":32768") != null);
+    try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"tools\":") == null);
+    try std.testing.expectEqual(@as(u32, 32768), NATIVE_CTX);
 }

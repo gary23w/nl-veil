@@ -1563,17 +1563,17 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(know_block);
     const fence_build = w.fence_writes and !operate and !mi.scout;
     const fence_clause = if (fence_build)
-        "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE or UPDATE your assigned file, reply with its COMPLETE contents as a single fenced code block — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the full file, and a closing ```. The engine saves your fenced reply to your file automatically. Use read_file / recall_hive / send_message normally."
+        "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE or UPDATE your assigned file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block — just the one block with the full file. The engine saves your fenced reply to your file automatically. Use read_file / recall_hive / send_message normally."
     else
         "";
     const fence_sys_full = if (fence_build)
-        " NOTE: write_file is unavailable in this session — to create or update a file, reply with its FULL contents as a single fenced code block led by the file's relative path on its own line; the engine saves it automatically. read_file/recall_hive/send_message/observe work normally."
+        " NOTE: write_file is unavailable in this session — to create or update a file, reply with EXACTLY ONE fenced code block holding the file's FULL contents, led by its relative path on its own line; no prose, no \"Note:\" commentary, NO second code block — just the one block with the whole file. The engine saves it automatically. read_file/recall_hive/send_message/observe work normally."
     else
         "";
     const fullsys = std.fmt.allocPrint(gpa, "You are {s}, an autonomous mind in a swarm of [{s}] working toward a shared goal. Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}{s}{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, set_directive, send_message, add_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns; pick a distinct piece, announce it with add_task/send_message, and check the task board + your inbox before you build. Write each file in ONE write_file call at the TOP LEVEL of your working directory — pass just a filename like 'lib.py', NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}", .{ mi.name, w.roster, voice, date_clause, constitution_clause, lane_clause, scout_clause, playbook_clause, space_clause, discourse_clause, dissent_clause, offline_clause, fence_sys_full }) catch (gpa.dupe(u8, "You are a mind with tools.") catch unreachable);
     defer gpa.free(fullsys);
     const leansys = if (assembler and fence_build)
-        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, and recall_hive — write_file is NOT available this session. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then a fenced code block (```lang … ```) containing the COMPLETE file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch unreachable)
+        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, and recall_hive — write_file is NOT available this session. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then EXACTLY ONE fenced code block (```lang … ```) containing the COMPLETE file. NO prose, NO \"Note:\" commentary, NO second code block — just the one block with the whole file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch unreachable)
     else if (assembler)
         std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, and recall_hive. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch unreachable)
     else
@@ -2063,15 +2063,19 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
         }
         gpa.free(c);
     }
-    if (std.mem.indexOf(u8, monologue, "```")) |open| {
-        const after = open + 3;
-        var bodystart = after;
-        while (bodystart < monologue.len and monologue[bodystart] != '\n') bodystart += 1;
-        if (bodystart < monologue.len) bodystart += 1;
-        if (std.mem.indexOfPos(u8, monologue, bodystart, "```")) |close| {
+    {
+        var best: []const u8 = "";
+        var scan: usize = 0;
+        while (std.mem.indexOfPos(u8, monologue, scan, "```")) |open| {
+            var bodystart = open + 3;
+            while (bodystart < monologue.len and monologue[bodystart] != '\n') bodystart += 1;
+            if (bodystart < monologue.len) bodystart += 1;
+            const close = std.mem.indexOfPos(u8, monologue, bodystart, "```") orelse break;
             const body = std.mem.trim(u8, monologue[bodystart..close], " \r\n\t");
-            if (body.len >= 40) return gpa.dupe(u8, body) catch "";
+            if (body.len > best.len) best = body;
+            scan = close + 3;
         }
+        if (best.len >= 40) return gpa.dupe(u8, best) catch "";
     }
     const t = std.mem.trim(u8, monologue, " \r\n\t");
     if (t.len < 120) return "";
@@ -4836,4 +4840,48 @@ test "salvageHasToolFragment rejects a bare tool-call blob but keeps a real file
     try std.testing.expect(!salvageHasToolFragment(real_cfg));
 
     try std.testing.expect(!salvageHasToolFragment("   \n  "));
+}
+
+test "salvageFileBody picks the LARGEST fenced block, skipping a small Note block" {
+    const gpa = std.testing.allocator;
+    const monologue =
+        \\Here is a short note then the file.
+        \\
+        \\```
+        \\(Note: I assumed the input is a list of ints.)
+        \\```
+        \\
+        \\interpreter.py
+        \\```python
+        \\import sys
+        \\
+        \\def run(tokens):
+        \\    total = 0
+        \\    for t in tokens:
+        \\        total += int(t)
+        \\    return total
+        \\
+        \\if __name__ == "__main__":
+        \\    print(run(sys.argv[1:]))
+        \\```
+    ;
+    const body = salvageFileBody(gpa, monologue);
+    defer if (body.len > 0) gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "def run(tokens):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "(Note:") == null);
+
+    const single =
+        \\out.py
+        \\```python
+        \\def total(values):
+        \\    acc = 0
+        \\    for v in values:
+        \\        acc += v
+        \\    return acc
+        \\```
+    ;
+    const one = salvageFileBody(gpa, single);
+    defer if (one.len > 0) gpa.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, "def total(values):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "```") == null);
 }
