@@ -115,6 +115,7 @@ pub const ToolCtx = struct {
     owned_by_others: []const u8 = "",
     share_obs: bool = false,
     internet: bool = true,
+    discourse: bool = false,
     one_slot: bool = false,
     slot_path: []const u8 = "",
     blueprint: []const u8 = "",
@@ -213,6 +214,7 @@ pub const SPACE_SCOPE = "space";
 /// shared), its schema is injected into every mind's tools array, and it becomes callable by name. Each record
 /// is `name \x1f params_json \x1f base64(python_body)` (base64 so newlines/quotes can't corrupt the db line).
 pub const TOOL_SCOPE = "tools";
+pub const SOURCES_SCOPE = "sources";
 pub const MAX_TOOLS = 16;
 pub const MAX_TOOL_BODY = 8 * 1024;
 pub const MAX_TOOL_PARAMS = 4 * 1024;
@@ -290,6 +292,9 @@ pub const ASSEMBLER_SCHEMA =
 /// (caller frees) — always a string, even on error, so it can feed back to the model.
 pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
+    if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
+        std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
+        return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
     if (std.mem.eql(u8, name, "run_python")) return runPython(ctx, args_json);
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);

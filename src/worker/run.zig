@@ -156,6 +156,8 @@ pub const Worker = struct {
     last_gap_str: []const u8 = "",
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
+    best_tier: u8 = 0,
+    best_passed: u32 = 0,
     solved_rounds: u32 = 0,
     flat_rounds: u32 = 0,
     regress_rounds: u32 = 0,
@@ -194,7 +196,9 @@ pub const Worker = struct {
     tg_token: []const u8 = "",
     best_snapshot: bool = false,
     best_knowledge: u32 = 0,
+    best_oracle: u32 = 0,
     stale_rounds: u32 = 0,
+    deliverable_missing: bool = false,
     stop_now: bool = false,
     stop_why: []const u8 = "completed",
     space: []const u8 = "",
@@ -730,7 +734,30 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 defer if (sp.len > 0) gpa.free(sp);
                 if (sp.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = w.bench_fixed }) catch {};
             }
-            const bench = runBenchmark(&w, run_dir);
+            var bench = runBenchmark(&w, run_dir);
+            w.deliverable_missing = false;
+            if (bench.status == .ok) {
+                var gn: u32 = 0;
+                const gtree = extractGoalPaths(gpa, goal, &gn);
+                defer gpa.free(@constCast(gtree));
+                if (gn > 0) {
+                    var any_missing = false;
+                    var git = std.mem.splitScalar(u8, gtree, '\n');
+                    while (git.next()) |gln| {
+                        const gbp = bpPath(gln) orelse continue;
+                        const gfp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ run_dir, gbp }) catch continue;
+                        defer gpa.free(gfp);
+                        const gdata = std.Io.Dir.cwd().readFileAlloc(io, gfp, gpa, .limited(64 << 10)) catch "";
+                        defer if (gdata.len > 0) gpa.free(gdata);
+                        if (std.mem.trim(u8, gdata, " \r\n\t").len <= 40) {
+                            any_missing = true;
+                            break;
+                        }
+                    }
+                    w.deliverable_missing = any_missing;
+                    if (any_missing and bench.pct > 50) bench.pct = 50;
+                }
+            }
             if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
             w.last_bench = bench;
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
@@ -767,13 +794,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse) smokeTest(&w, run_dir);
         if (live and !w.discourse and w.doc_target == 0) deliverableGate(&w, run_dir);
         if (live and !w.discourse and w.doc_target == 0) interfaceScan(&w, run_dir);
-        if (live) trackConvergence(&w, run_dir, round);
+        if (live and w.discourse) markDeliverableGaps(&w, goal, round);
+        if (live) trackConvergence(&w, run_dir, goal, round);
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
         if (live and m.gap_assess) assessGap(&w, goal, round, stalled);
-        if (live and minds.items.len > 1 and !w.operating) {
+        if (live and minds.items.len > 1 and !w.operating and !w.discourse) {
             rsi.planRoles(&w, minds.items, goal, round, w.last_bench, stalled or w.last_gap_str.len > 0);
         }
 
@@ -1369,7 +1397,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var acted = false;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .blueprint = w.blueprint, .fmtx = &w.files_mtx };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .fmtx = &w.files_mtx };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -1641,6 +1669,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const live_schema = if (authored_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}", .{ base_schema, authored_defs }) catch base_schema) else base_schema;
     defer if (live_schema.ptr != base_schema.ptr) gpa.free(@constCast(live_schema));
     var web_calls: u32 = 0;
+    var fetched_url: []const u8 = "";
+    defer if (fetched_url.len > 0) gpa.free(@constCast(fetched_url));
     var llm_ok = false;
     var llm_fatal = false;
     var turn: u32 = 0;
@@ -1737,6 +1767,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 }
             }
             if (mi.scout and (std.mem.eql(u8, c.name, "web_search") or std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json") or std.mem.eql(u8, c.name, "web_fetch"))) web_calls += 1;
+            if (std.mem.eql(u8, c.name, "read_url") or std.mem.eql(u8, c.name, "fetch_json") or std.mem.eql(u8, c.name, "web_fetch")) {
+                if (urlFromArgs(c.args)) |u| {
+                    if (fetched_url.len > 0) gpa.free(@constCast(fetched_url));
+                    fetched_url = gpa.dupe(u8, clip(u, 200)) catch "";
+                    if (urlDomain(u)) |dom| _ = w.mem.observe(tools.SOURCES_SCOPE, dom);
+                }
+            }
             w.act(mi.name, round, c.name, c.args, result);
             conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {};
             llm.jstr(gpa, &conv, c.id) catch {};
@@ -1760,19 +1797,43 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         var qargs: std.ArrayListUnmanaged(u8) = .empty;
         defer qargs.deinit(gpa);
         qargs.appendSlice(gpa, "{\"query\":") catch {};
-        const qstr = std.fmt.allocPrint(gpa, "{s} techniques best practices examples edge cases", .{clip(goal, 120)}) catch (gpa.dupe(u8, "techniques best practices") catch @constCast(""));
-        defer gpa.free(qstr);
+        const qstr = scoutQuery(w, goal);
+        defer gpa.free(@constCast(qstr));
         llm.jstr(gpa, &qargs, qstr) catch {};
         qargs.appendSlice(gpa, "}") catch {};
         const sres = tools.execute(&ctx, "web_search", qargs.items);
         defer gpa.free(sres);
         w.act(mi.name, round, "scout_fallback", qargs.items, sres);
-        var sargs: std.ArrayListUnmanaged(u8) = .empty;
-        defer sargs.deinit(gpa);
-        sargs.appendSlice(gpa, "{\"name\":\"scout:auto\",\"skill\":") catch {};
-        llm.jstr(gpa, &sargs, clip(sres, 240)) catch {};
-        sargs.appendSlice(gpa, "}") catch {};
-        gpa.free(tools.execute(&ctx, "save_skill", sargs.items));
+        const topic_src = if (w.goal_brief.len > 0) w.goal_brief else qstr;
+        if (resultOnTopic(topic_src, sres)) {
+            var sargs: std.ArrayListUnmanaged(u8) = .empty;
+            defer sargs.deinit(gpa);
+            sargs.appendSlice(gpa, "{\"name\":\"scout:auto\",\"skill\":") catch {};
+            llm.jstr(gpa, &sargs, clip(sres, 240)) catch {};
+            sargs.appendSlice(gpa, "}") catch {};
+            gpa.free(tools.execute(&ctx, "save_skill", sargs.items));
+        } else {
+            w.act(mi.name, round, "scout_fallback", "off-topic result withheld from shared knowledge", clip(sres, 160));
+        }
+    }
+
+    if (!mi.scout and files == 0) {
+        const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
+        if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
+            const body = salvageFileBody(monologue);
+            if (body.len >= 40) {
+                var wargs: std.ArrayListUnmanaged(u8) = .empty;
+                defer wargs.deinit(gpa);
+                wargs.appendSlice(gpa, "{\"path\":") catch {};
+                llm.jstr(gpa, &wargs, salvage_slot) catch {};
+                wargs.appendSlice(gpa, ",\"content\":") catch {};
+                llm.jstr(gpa, &wargs, body) catch {};
+                wargs.appendSlice(gpa, "}") catch {};
+                const wres = tools.execute(&ctx, "write_file", wargs.items);
+                defer gpa.free(wres);
+                w.act(mi.name, round, "salvage", salvage_slot, "rescued a narrated file body from the reply into the assigned slot");
+            }
+        }
     }
 
     const fact = extractFact(gpa, monologue, goal, round);
@@ -1784,9 +1845,14 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         const evid = if (std.mem.trim(u8, evidence_buf.items, " \r\n\t").len > 0) evidence_buf.items else monologue;
         auto_stored = flushMemWrites(w, mi, round, &mem_sink, auto_cand, evid, operate, &trace);
     } else if (observed == 0 and !is_placeholder and !is_junk) {
-        _ = w.mem.observe(mi.scope, fact);
-        const hive_fact = std.fmt.allocPrint(gpa, "[{s} r{d}] {s}", .{ mi.name, round, fact }) catch fact;
-        defer if (hive_fact.ptr != fact.ptr) gpa.free(hive_fact);
+        const tagged_fact = if (fetched_url.len > 0)
+            (std.fmt.allocPrint(gpa, "{s} [src:{s}]", .{ fact, fetched_url }) catch fact)
+        else
+            fact;
+        defer if (tagged_fact.ptr != fact.ptr) gpa.free(@constCast(tagged_fact));
+        _ = w.mem.observe(mi.scope, tagged_fact);
+        const hive_fact = std.fmt.allocPrint(gpa, "[{s} r{d}] {s}", .{ mi.name, round, tagged_fact }) catch tagged_fact;
+        defer if (hive_fact.ptr != tagged_fact.ptr) gpa.free(hive_fact);
         _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, hive_fact);
         trace.appendSlice(gpa, ",\"observe\"") catch {};
         auto_stored = true;
@@ -1815,6 +1881,49 @@ fn firstSentenceEnd(s: []const u8) usize {
         }
     }
     return s.len;
+}
+
+fn salvageFileBody(monologue: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, monologue, "```")) |open| {
+        const after = open + 3;
+        var bodystart = after;
+        while (bodystart < monologue.len and monologue[bodystart] != '\n') bodystart += 1;
+        if (bodystart < monologue.len) bodystart += 1;
+        if (std.mem.indexOfPos(u8, monologue, bodystart, "```")) |close| {
+            const body = std.mem.trim(u8, monologue[bodystart..close], " \r\n\t");
+            if (body.len >= 40) return body;
+        }
+    }
+    const t = std.mem.trim(u8, monologue, " \r\n\t");
+    if (t.len < 120) return "";
+    var nl: u32 = 0;
+    for (t) |c| {
+        if (c == '\n') nl += 1;
+    }
+    if (nl < 4) return "";
+    const lead = clip(t, 24);
+    if (std.ascii.indexOfIgnoreCase(lead, "sure") != null or std.ascii.indexOfIgnoreCase(lead, "here") != null or
+        std.ascii.indexOfIgnoreCase(lead, "i will") != null or std.ascii.indexOfIgnoreCase(lead, "i'll") != null or
+        std.ascii.indexOfIgnoreCase(lead, "let me") != null or std.ascii.indexOfIgnoreCase(lead, "this ") != null) return "";
+    return t;
+}
+
+fn urlFromArgs(args: []const u8) ?[]const u8 {
+    const http = std.mem.indexOf(u8, args, "http") orelse return null;
+    var end = http;
+    while (end < args.len and args[end] != '"' and args[end] != ' ' and args[end] != '\\' and args[end] != '}' and args[end] != '\n') end += 1;
+    const u = args[http..end];
+    if (u.len < 10) return null;
+    return u;
+}
+
+fn urlDomain(url: []const u8) ?[]const u8 {
+    const scheme = std.mem.indexOf(u8, url, "://") orelse return null;
+    var s = url[scheme + 3 ..];
+    if (std.mem.indexOfScalar(u8, s, '/')) |i| s = s[0..i];
+    if (std.mem.indexOfScalar(u8, s, ':')) |i| s = s[0..i];
+    if (s.len == 0 or s.len > 100) return null;
+    return s;
 }
 
 fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, round: u32) []u8 {
@@ -2267,6 +2376,41 @@ const PUBLISH_MAX_SEED_DEP_PCT: u32 = 85;
 const CONSTITUTION_SCREEN = "You are a strict publication-safety reviewer enforcing a CONSTITUTION for a PUBLIC post. The post MAY state facts and may name real people, organizations, governments, or events ONLY to factually report what verifiably happened, with attribution. It MUST NOT: take a partisan or political side; editorialize or push an opinion; demean, attack, praise, or advocate for/against any real person, party, group, government, company, or religion; present rumor or unverified claims as fact; or contain anything hateful, harassing, private, or that could endanger a real individual. It must read as neutral, fair, and respectful of everyone. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
 const CONSTITUTION_SCREEN2 = "You are an entity & partisanship detector for a PUBLIC post. Answer ok=false if the post takes ANY partisan or political side, frames a real person/party/group/government/company/religion favorably or unfavorably, demeans/attacks/praises anyone, presents rumor or unverified claims as fact, or pushes an opinion. Answer ok=true ONLY if it states what verifiably happened, neutrally and with attribution, naming real entities only to report facts. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
 
+fn flagUncitedSources(w: *Worker, md: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    const fetched = w.mem.list(tools.SOURCES_SCOPE);
+    defer gpa.free(fetched);
+    var flagged: std.ArrayListUnmanaged(u8) = .empty;
+    defer flagged.deinit(gpa);
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen.deinit(gpa);
+    var n: u32 = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, md, i, "http")) |h| {
+        var end = h;
+        while (end < md.len and md[end] != '"' and md[end] != ' ' and md[end] != ')' and md[end] != ']' and
+            md[end] != '\n' and md[end] != '\r' and md[end] != '\t' and md[end] != '>' and md[end] != '<') end += 1;
+        const url = md[h..end];
+        i = end + 1;
+        const dom = urlDomain(url) orelse continue;
+        var dup = false;
+        for (seen.items) |e| if (std.ascii.eqlIgnoreCase(e, dom)) {
+            dup = true;
+            break;
+        };
+        if (dup) continue;
+        seen.append(gpa, dom) catch {};
+        if (fetched.len > 0 and std.ascii.indexOfIgnoreCase(fetched, dom) != null) continue;
+        if (n > 0) flagged.appendSlice(gpa, ", ") catch {};
+        flagged.appendSlice(gpa, dom) catch {};
+        n += 1;
+        if (n >= 12) break;
+    }
+    if (n == 0) return;
+    w.act("engine", round, "citation_flag", "these cited domains were NOT fetched by the hive this run — verify or remove (possible hallucinated citations)", flagged.items);
+    w.emit("citation_flag", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"uncited\":{d}", .{ round, n }) catch ",\"round\":0");
+}
+
 /// DELIVERABLE CONSOLIDATION (discourse) — composes the round's shared document via writer.compose (general grounding
 /// machinery: grounds in fetched sources when the run is configured to, else synthesizes the hive's own knowledge),
 /// writes it to work/briefing.md, and reuses it as the working-memory digest. NOTHING about any use-case lives here —
@@ -2286,6 +2430,7 @@ fn consolidateBriefing(w: *Worker, goal: []const u8, round: u32, discussion: []c
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = md }) catch {};
     w.act("engine", round, "briefing", "consolidated the hive's findings + debate", clip(md, 600));
     w.emit("briefing", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"bytes\":{d}", .{ round, md.len }) catch ",\"round\":0");
+    flagUncitedSources(w, md, round);
     if (w.digest_str.len > 0) gpa.free(@constCast(w.digest_str));
     w.digest_str = gpa.dupe(u8, clip(md, 1400)) catch "";
     if (w.post_on and w.internet) publishArtifact(w, round, md, doc.grounded, doc.cited);
@@ -2520,6 +2665,40 @@ fn markIncomplete(w: *Worker, round: u32) void {
         w.act("engine", round, "incomplete", "built but still a FIRST PART — a builder will keep appending until finished", w.incomplete_str);
 }
 
+fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
+    const gpa = w.gpa;
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer gpa.free(@constCast(tree));
+    if (n == 0) {
+        w.deliverable_missing = false;
+        return;
+    }
+    var missing: std.ArrayListUnmanaged(u8) = .empty;
+    defer missing.deinit(gpa);
+    var miss_n: u32 = 0;
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
+        defer if (data.len > 0) gpa.free(data);
+        const t = std.mem.trim(u8, data, " \r\n\t");
+        if (t.len > 40) continue;
+        if (miss_n > 0) missing.appendSlice(gpa, ", ") catch {};
+        missing.appendSlice(gpa, std.fs.path.basename(bp)) catch {};
+        miss_n += 1;
+    }
+    w.deliverable_missing = miss_n > 0;
+    if (miss_n == 0) return;
+    const miss = std.mem.trim(u8, missing.items, " ,");
+    w.act("engine", round, "deliverable_gap", "the goal REQUIRES these files and they do not exist yet — WRITE them this round", miss);
+    const directive = std.fmt.allocPrint(gpa, "the goal REQUIRES these deliverable files and they DO NOT EXIST yet: {s}. WRITE them THIS round with write_file (full, substantive content — not a stub). Do NOT run code, run tests, or build packages — this is a research/writing task and the only thing that completes it is the written file landing on disk.", .{miss}) catch return;
+    if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
+    w.strategy_str = directive;
+}
+
 fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
     if (w.blueprint.len == 0) return;
@@ -2740,6 +2919,23 @@ fn bpLineFor(blueprint: []const u8, path: []const u8) []const u8 {
 /// spec's required layout) from round 1, instead of inventing a parallel tree it then has to reconcile. A line
 /// qualifies only if its first token is a real FILE path (a '.' in the basename); prose / API-contract lines are
 /// skipped. gpa-owned; "" (and out_n=0) when the goal doesn't enumerate a tree — the caller then designs one.
+fn isDocExt(base: []const u8) bool {
+    return std.mem.endsWith(u8, base, ".md") or std.mem.endsWith(u8, base, ".txt") or
+        std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst");
+}
+
+fn stripPathPunct(tok: []const u8) []const u8 {
+    return std.mem.trim(u8, tok, " \t\r\n`'\"()[]{}<>,;.:*");
+}
+
+fn looksLikeNamedFile(tok: []const u8) bool {
+    if (tok.len == 0 or tok.len > 120) return false;
+    if (std.mem.indexOf(u8, tok, "..") != null or tok[0] == '/' or tok[0] == '\\') return false;
+    const base = if (std.mem.lastIndexOfScalar(u8, tok, '/')) |i| tok[i + 1 ..] else tok;
+    if (base.len == 0) return false;
+    return isDocExt(base) or isCodeExt(base);
+}
+
 fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []const u8 {
     var bp: std.ArrayListUnmanaged(u8) = .empty;
     var seen: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2748,20 +2944,23 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
     var it = std.mem.splitScalar(u8, goal, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r\t");
-        if (line.len == 0 or line.len > 200) continue;
-        const p = bpPath(line) orelse continue;
-        const base = if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| p[i + 1 ..] else p;
-        if (std.mem.indexOfScalar(u8, base, '.') == null) continue;
-        var dup = false;
-        for (seen.items) |e| if (std.mem.eql(u8, e, p)) {
-            dup = true;
-            break;
-        };
-        if (dup) continue;
-        seen.append(gpa, p) catch {};
-        if (n > 0) bp.append(gpa, '\n') catch {};
-        bp.appendSlice(gpa, clip(line, 160)) catch {};
-        n += 1;
+        if (line.len == 0 or line.len > 2000) continue;
+        var tit = std.mem.tokenizeAny(u8, line, " \t");
+        while (tit.next()) |rawtok| {
+            const p = stripPathPunct(rawtok);
+            if (!looksLikeNamedFile(p)) continue;
+            var dup = false;
+            for (seen.items) |e| if (std.mem.eql(u8, e, p)) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            seen.append(gpa, p) catch {};
+            if (n > 0) bp.append(gpa, '\n') catch {};
+            bp.appendSlice(gpa, clip(p, 160)) catch {};
+            n += 1;
+            if (n >= 40) break;
+        }
         if (n >= 40) break;
     }
     out_n.* = n;
@@ -3160,11 +3359,112 @@ fn writeBestManifest(w: *Worker, run_dir: []const u8, passed: u32, total: u32, p
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = body }) catch {};
 }
 
+fn tierStrength(tier: u8) u8 {
+    return switch (tier) {
+        1 => 3,
+        2 => 2,
+        3 => 1,
+        else => 0,
+    };
+}
+
+fn parseOracleScore(s: []const u8) ?u32 {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] >= '0' and s[i] <= '9') {
+            var j = i;
+            var v: u32 = 0;
+            while (j < s.len and s[j] >= '0' and s[j] <= '9' and j - i < 4) : (j += 1) v = v * 10 + (s[j] - '0');
+            if (v <= 100) return v;
+            i = j;
+        } else i += 1;
+    }
+    return null;
+}
+
+fn scoutQuery(w: *Worker, goal: []const u8) []const u8 {
+    const gpa = w.gpa;
+    const intent = if (w.goal_brief.len > 0) w.goal_brief else clip(goal, 200);
+    const fallback = blk: {
+        const f = if (w.goal_brief.len > 0) clipWords(w.goal_brief, 80) else clipWords(clip(goal, 120), 80);
+        break :blk gpa.dupe(u8, f) catch @constCast("research");
+    };
+    const sys = "You convert a research goal and a current knowledge gap into ONE focused web-search query. Output ONLY the query: at most 10 words, no quotes, no punctuation, no preamble — just the search terms a person would actually type.";
+    const user = std.fmt.allocPrint(gpa, "Goal/intent: {s}\n\nCurrent knowledge gap to close: {s}\n\nOutput ONE focused web-search query (<=10 words, no quotes):", .{ clip(intent, 600), if (w.last_gap_str.len > 0) clip(w.last_gap_str, 300) else "(general coverage of the goal)" }) catch return fallback;
+    defer gpa.free(user);
+    const r = llm.chat(gpa, w.io, w.run_dir, "scoutq", w.gw_base, w.gw_key, w.gateway_model, sys, user, 40);
+    defer gpa.free(r.content);
+    if (!r.ok) return fallback;
+    var q = std.mem.trim(u8, r.content, " \r\n\t\"'`");
+    if (std.mem.indexOfScalar(u8, q, '\n')) |nl| q = std.mem.trim(u8, q[0..nl], " \r\n\t\"'`");
+    if (q.len < 4 or q.len > 160) return fallback;
+    gpa.free(fallback);
+    return gpa.dupe(u8, q) catch @constCast("research");
+}
+
+fn resultOnTopic(intent: []const u8, result: []const u8) bool {
+    if (result.len == 0) return false;
+    var it = std.mem.tokenizeAny(u8, intent, " \t\r\n.,:;!?()[]{}\"'`/-");
+    var checked: u32 = 0;
+    while (it.next()) |w| {
+        if (w.len < 4) continue;
+        if (checked >= 24) break;
+        checked += 1;
+        if (std.ascii.indexOfIgnoreCase(result, w) != null) return true;
+    }
+    return checked == 0;
+}
+
+fn acceptanceOracle(w: *Worker, goal: []const u8, round: u32) ?u32 {
+    const gpa = w.gpa;
+    if (std.mem.trim(u8, goal, " \r\n\t").len == 0) return null;
+    var gn: u32 = 0;
+    const gtree = extractGoalPaths(gpa, goal, &gn);
+    defer gpa.free(@constCast(gtree));
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+    var any_named_exists = false;
+    if (gn > 0) {
+        var it = std.mem.splitScalar(u8, gtree, '\n');
+        while (it.next()) |ln| {
+            const bp = bpPath(ln) orelse continue;
+            const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
+            defer gpa.free(fp);
+            const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
+            defer if (data.len > 0) gpa.free(data);
+            const t = std.mem.trim(u8, data, " \r\n\t");
+            if (std.fmt.allocPrint(gpa, "\n== {s} ==\n", .{bp})) |hdr| {
+                body.appendSlice(gpa, hdr) catch {};
+                gpa.free(hdr);
+            } else |_| {}
+            if (t.len > 40) {
+                any_named_exists = true;
+                body.appendSlice(gpa, clip(t, 2200)) catch {};
+            } else body.appendSlice(gpa, "(MISSING — this required file does not exist yet)") catch {};
+        }
+        if (!any_named_exists) return 0;
+    } else {
+        const src = if (w.digest_str.len > 0) w.digest_str else if (w.state_str.len > 0) w.state_str else "";
+        if (src.len < 40) return 0;
+        body.appendSlice(gpa, clip(src, 4000)) catch {};
+    }
+    if (body.items.len < 40) return 0;
+    const sys = "You are a strict acceptance judge. Given a GOAL (with its success criteria) and the CURRENT DELIVERABLE the swarm has produced, rate how well the deliverable MEETS the goal on a 0-100 scale: 0 = absent or off-task, 100 = fully meets every stated requirement and constraint. Judge ONLY the deliverable text shown — do not reward intentions, plans, or facts that are not reflected in the actual deliverable. Reply with ONLY the integer.";
+    const user = std.fmt.allocPrint(gpa, "GOAL (and success criteria):\n{s}\n\nCURRENT DELIVERABLE:\n{s}\n\nHow well (0-100) does the current deliverable meet the goal? Reply with ONLY the integer.", .{ clip(if (w.goal_brief.len > 0) w.goal_brief else goal, 1400), clip(body.items, 6000) }) catch return null;
+    defer gpa.free(user);
+    const r = llm.chat(gpa, w.io, w.run_dir, "oracle", w.gw_base, w.gw_key, w.gateway_model, sys, user, 24);
+    defer gpa.free(r.content);
+    if (!r.ok) return null;
+    const v = parseOracleScore(r.content) orelse return null;
+    w.act("engine", round, "oracle", "goal-derived acceptance (how well the current deliverable meets the goal, 0-100)", std.fmt.allocPrint(w.a(), "{d}", .{v}) catch "?");
+    return v;
+}
+
 /// SELF-COMPLETION AWARENESS — read the fitness trajectory each round and classify the phase. ONLY a provably-met
 /// objective (a convergent task fully solved) auto-completes; a plateau or research-saturation ESCALATES (the
 /// clause intensifies) and never quits, while the best result is continuously exported to DELIVERY/. Hard-coded
 /// "give up" ceilings would defeat RSI — the only terminators of an unsolved task are operator STOP + the failsafes.
-fn trackConvergence(w: *Worker, run_dir: []const u8, round: u32) void {
+fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
     const b = w.last_bench;
     const has_score = b.status == .ok and b.total > 0;
@@ -3175,13 +3475,21 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, round: u32) void {
     var prog_flat: u32 = 0;
     if (has_score) {
         const solved = b.passed >= b.total and b.tier <= 1;
-        const improved = b.pct > w.best_pct;
-        const regressed = w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        const cur_strength = tierStrength(b.tier);
+        const best_strength = tierStrength(w.best_tier);
+        const rigor_increase = cur_strength > best_strength;
+        const same_or_stronger = cur_strength >= best_strength;
+        const improved = w.best_tier == 0 and w.best_pct == 0
+            or rigor_increase
+            or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
+        const regressed = !rigor_increase and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
         if (improved) {
             w.best_pct = b.pct;
+            w.best_tier = b.tier;
+            w.best_passed = b.passed;
             w.flat_rounds = 0;
             w.regress_rounds = 0;
-            if (copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
+            if (same_or_stronger and copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
                 w.best_snapshot = true;
                 writeBestManifest(w, run_dir, b.passed, b.total, b.pct, round);
             }
@@ -3199,7 +3507,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, round: u32) void {
             if (solved) phase = "converged" else if (w.flat_rounds >= PLATEAU_ROUNDS) phase = "plateau";
             if (solved and !w.smoke_ok) phase = "progressing";
         }
-        if (!w.open_ended and solved and w.solved_rounds >= SOLVED_STREAK and w.smoke_ok) {
+        if (!w.open_ended and solved and w.solved_rounds >= SOLVED_STREAK and w.smoke_ok and !w.deliverable_missing) {
             w.stop_now = true;
             w.stop_why = "completed";
         }
@@ -3212,6 +3520,29 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, round: u32) void {
         prog_flat = w.flat_rounds;
     } else {
         const k = w.mem.factCount(tools.KNOWLEDGE_SCOPE) + w.mem.factCount(tools.SKILL_SCOPE);
+        const oracle = acceptanceOracle(w, goal, round);
+        if (oracle) |ov| {
+            if (ov > w.best_oracle) {
+                w.best_oracle = ov;
+                w.stale_rounds = 0;
+                phase = "learning";
+            } else {
+                w.stale_rounds += 1;
+                phase = if (w.stale_rounds >= SATURATE_ROUNDS) "saturated" else "learning";
+            }
+            prog_now = ov;
+            prog_best = w.best_oracle;
+            prog_flat = w.stale_rounds;
+            if (w.autonomous and w.best_oracle >= GRADUATE_PCT and w.stale_rounds >= GRADUATE_FLAT and !w.deliverable_missing) {
+                w.stop_now = true;
+                w.stop_why = "graduated";
+            }
+            if (w.phase_str.len > 0) gpa.free(@constCast(w.phase_str));
+            w.phase_str = buildPhaseClause(gpa, phase, prog_best, prog_now, prog_flat, w.open_ended, restored);
+            w.emit("phase", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"phase\":\"{s}\",\"now\":{d},\"best\":{d},\"flat\":{d},\"open_ended\":{},\"unbounded\":{}", .{ round, phase, prog_now, prog_best, prog_flat, w.open_ended, w.never_stops }) catch ",\"phase\":\"?\"");
+            w.act("engine", round, "phase", phase, w.phase_str);
+            return;
+        }
         if (k > w.best_knowledge + NOVELTY_MIN) {
             w.best_knowledge = k;
             w.stale_rounds = 0;
@@ -3220,7 +3551,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, round: u32) void {
             w.stale_rounds += 1;
             phase = if (w.stale_rounds >= SATURATE_ROUNDS) "saturated" else "learning";
         }
-        if (w.autonomous and w.best_knowledge > 0 and w.stale_rounds >= SATURATE_ROUNDS) {
+        if (w.autonomous and w.best_knowledge > 0 and w.stale_rounds >= SATURATE_ROUNDS and !w.deliverable_missing) {
             w.stop_now = true;
             w.stop_why = "graduated";
         }
