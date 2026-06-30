@@ -17,7 +17,8 @@ const builtin = @import("builtin");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const commons = @import("commons.zig");
-const Mem = @import("memory.zig").Mem;
+const oscillation = @import("oscillation.zig");
+const Mem = oscillation.Mem;
 const rsi = @import("rsi.zig");
 const agi = @import("agi.zig");
 const writer = @import("writer.zig");
@@ -1346,11 +1347,11 @@ fn issuedActions(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) []u8 {
 }
 
 fn seedBaseline(gpa: std.mem.Allocator, mem: Mem) void {
-    const probe = mem.recall(tools.KNOWLEDGE_SCOPE, "shield of the Americas charter baseline");
+    const probe = mem.recall(tools.KNOWLEDGE_SCOPE, "defender ethics baseline charter identity");
     defer gpa.free(probe);
-    if (std.mem.indexOf(u8, probe, "shield of the Americas") != null) return;
+    if (std.mem.indexOf(u8, probe, "[src:charter]") != null) return;
     var buf: [4096]u8 = undefined;
-    const txt = commons.baseText(&buf);
+    const txt = oscillation.baseText(&buf);
     var it = std.mem.splitScalar(u8, txt, '\n');
     while (it.next()) |ln| {
         const t = std.mem.trim(u8, ln, " \r\t");
@@ -1380,6 +1381,79 @@ fn intelHostile(gpa: std.mem.Allocator, mem: Mem, name: []const u8) bool {
         if (std.mem.indexOf(u8, line, seg) != null and std.mem.indexOf(u8, line, "[verified]") != null) return true;
     }
     return false;
+}
+
+/// Ingest the bridge's read-only discoveries into the map. Each line of work/explore_results.jsonl is
+/// "<scope> <fact>" (scope = map|node); we observe the fact into MAP_SCOPE/NODE_SCOPE through the one memory
+/// seam, advancing a line cursor so each discovery lands exactly once. This is how a traversal becomes a graph.
+fn ingestExplore(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem) void {
+    const rp = std.fmt.allocPrint(gpa, "{s}/work/explore_results.jsonl", .{run_dir}) catch return;
+    defer gpa.free(rp);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, rp, gpa, .limited(512 << 10)) catch return;
+    defer gpa.free(data);
+    const cp = std.fmt.allocPrint(gpa, "{s}/work/.explore_seen", .{run_dir}) catch return;
+    defer gpa.free(cp);
+    var seen: usize = 0;
+    if (std.Io.Dir.cwd().readFileAlloc(io, cp, gpa, .limited(32))) |sb| {
+        defer gpa.free(sb);
+        seen = std.fmt.parseInt(usize, std.mem.trim(u8, sb, " \r\n\t"), 10) catch 0;
+    } else |_| {}
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        n += 1;
+        if (n <= seen) continue;
+        const sp = std.mem.indexOfScalar(u8, ln, ' ') orelse continue;
+        const fact = std.mem.trim(u8, ln[sp + 1 ..], " \r\t");
+        if (fact.len == 0) continue;
+        if (std.mem.eql(u8, ln[0..sp], "map")) {
+            _ = mem.observe(tools.MAP_SCOPE, fact);
+        } else if (std.mem.eql(u8, ln[0..sp], "node")) {
+            _ = mem.observe(tools.NODE_SCOPE, fact);
+        }
+    }
+    if (n > seen) {
+        const ns = std.fmt.allocPrint(gpa, "{d}", .{n}) catch return;
+        defer gpa.free(ns);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cp, .data = ns }) catch {};
+    }
+}
+
+/// frontierPlan — the memory-graph half of the explore loop (sibling of operatePlan; NO telemetry parse, NO
+/// per-node shelling). ONE assoc surfaces the frontier (nodes discovered but not yet expanded, marked
+/// "[frontier] <node>" in MAP_SCOPE); we inject the top few as exact `host_explore expand <node>` moves so the
+/// model grows its map SELECTIVELY toward the goal instead of blindly enumerating the whole tree.
+fn frontierPlan(gpa: std.mem.Allocator, mem: Mem) []u8 {
+    const fr = mem.assoc(tools.MAP_SCOPE, "[frontier]", 2, 16);
+    defer gpa.free(fr);
+    if (fr.len == 0) return gpa.dupe(u8, "") catch @constCast("");
+    var plan: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer plan.deinit(gpa);
+    plan.appendSlice(gpa, "MAP FRONTIER — you have discovered these nodes but not yet expanded them. Use host_explore expand <node> on the goal-relevant ones to grow your map, then chain/recall over the map to reach the root:\n") catch {};
+    var k: usize = 0;
+    const marker = "[frontier]";
+    var it = std.mem.splitScalar(u8, fr, '\n');
+    while (it.next()) |raw| {
+        if (k >= 6) break;
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        const fi = std.mem.indexOf(u8, ln, marker) orelse continue;
+        const after = std.mem.trim(u8, ln[fi + marker.len ..], " \r\t");
+        if (after.len == 0) continue;
+        const end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+        const node = after[0..end];
+        if (node.len == 0) continue;
+        const linep = std.fmt.allocPrint(gpa, "  - host_explore expand {s}\n", .{clip(node, 80)}) catch continue;
+        defer gpa.free(linep);
+        plan.appendSlice(gpa, linep) catch {};
+        k += 1;
+    }
+    if (k == 0) {
+        plan.deinit(gpa);
+        return gpa.dupe(u8, "") catch @constCast("");
+    }
+    return plan.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
 fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem) []u8 {
@@ -1829,7 +1903,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(offline_clause);
-    const constitution_clause = commons.preamble;
+    var prebuf: [1100]u8 = undefined;
+    const constitution_clause = oscillation.preambleText(&prebuf);
     const operate = w.operating or blk_op: {
         const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_op false;
         defer gpa.free(tp);
@@ -1959,9 +2034,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(host_inject);
     const issued = if (operate) issuedActions(gpa, w.io, w.run_dir) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued);
+    if (operate) ingestExplore(gpa, w.io, w.run_dir, w.mem); // fold the bridge's read-only discoveries into the map first
     const op_plan_block = if (operate) operatePlan(gpa, w.io, w.run_dir, w.mem) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(op_plan_block);
-    const issued_block = if (issued.len > 0 or op_plan_block.len > 0) blk_ib: {
+    const frontier_block = if (operate) frontierPlan(gpa, w.mem) else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(frontier_block);
+    const issued_block = if (issued.len > 0 or op_plan_block.len > 0 or frontier_block.len > 0) blk_ib: {
         var ib: std.ArrayListUnmanaged(u8) = .empty;
         errdefer ib.deinit(gpa);
         if (issued.len > 0) {
@@ -1972,6 +2050,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         if (op_plan_block.len > 0) {
             ib.appendSlice(gpa, "\nYOUR PERSISTENT OPERATING PLAN (recalled from your memory — this survives across rounds even when your attention does not; the live state is authoritative, but THIS tells you the ROOT CAUSE you keep walking past):\n") catch {};
             ib.appendSlice(gpa, op_plan_block) catch {};
+        }
+        if (frontier_block.len > 0) {
+            ib.append(gpa, '\n') catch {};
+            ib.appendSlice(gpa, frontier_block) catch {};
         }
         break :blk_ib ib.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
@@ -2004,7 +2086,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
-    const sys_bound = if (std.mem.indexOf(u8, sys, commons.preamble) != null) sys else "";
+    var sbuf: [1100]u8 = undefined;
+    const sys_bound = if (std.mem.indexOf(u8, sys, oscillation.preambleText(&sbuf)) != null) sys else "";
     llm.jstr(gpa, &conv, sys_bound) catch {};
     conv.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch {};
     llm.jstr(gpa, &conv, user) catch {};
