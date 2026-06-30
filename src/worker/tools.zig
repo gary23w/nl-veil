@@ -1255,7 +1255,7 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
 
 // The read-only exploration vocabulary. Domain-neutral on purpose: the SAME verbs walk a filesystem, a
 // process tree, a network, or a directory service — the bridge adapter maps them to that environment.
-const EXPLORE_VERBS = [_][]const u8{ "enumerate", "expand", "describe" };
+pub const EXPLORE_VERBS = [_][]const u8{ "enumerate", "expand", "describe" };
 const EXPLORE_BUDGET: usize = 96; // per-run cap on queued explorations (fail-closed against runaway enumeration)
 
 // host_explore: queue a READ-ONLY traversal request on the explore bus lane. Fire-and-forget like
