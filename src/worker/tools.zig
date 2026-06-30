@@ -61,6 +61,9 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "--speed-limit", "1", "--speed-time", "15", "-o", tmp, "-A", "neuron-loops-mind/1.0" }) catch return dupe(gpa, "oom");
+    // Under an active egress allowlist, a redirect could hop OFF the allowlist (the gate only sees the seed URL),
+    // so forbid redirect-following entirely — the allowlisted host must answer directly.
+    if (ctx.egress_allow.len > 0) av.appendSlice(gpa, &.{"--max-redirs", "0"}) catch {};
     if (json) av.appendSlice(gpa, &.{ "-H", "Accept: application/json" }) catch {};
     av.append(gpa, url) catch {};
     spawnGuarded(ctx.io, av.items, deadline_ms);
@@ -120,6 +123,7 @@ pub const ToolCtx = struct {
     one_slot: bool = false,
     slot_path: []const u8 = "",
     blueprint: []const u8 = "",
+    egress_allow: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
 };
 
@@ -1355,6 +1359,51 @@ fn urlAllowed(url: []const u8) bool {
     return host.len > 0;
 }
 
+/// Extract the bare host from an http(s) URL (no scheme, no userinfo, no port, no path). "" on a non-URL.
+fn urlHost(url: []const u8) []const u8 {
+    var host: []const u8 = if (std.mem.startsWith(u8, url, "https://")) url[8..] else if (std.mem.startsWith(u8, url, "http://")) url[7..] else return "";
+    if (std.mem.indexOfAny(u8, host, "/?#")) |i| host = host[0..i];
+    if (std.mem.indexOfScalar(u8, host, '@')) |i| host = host[i + 1 ..];
+    if (std.mem.indexOfScalar(u8, host, ':')) |i| host = host[0..i];
+    return host;
+}
+
+/// Optional host-suffix egress allowlist atop urlAllowed's SSRF block. `allow` = comma-separated host suffixes;
+/// EMPTY = fail-open (no extra restriction). When set, the host must equal a suffix or be a dot-boundary
+/// subdomain of one (bare substring is not enough — "a.org.evil.com" is blocked by "a.org").
+pub fn egressAllowed(allow: []const u8, url: []const u8) bool {
+    const a = std.mem.trim(u8, allow, " \t\r\n");
+    if (a.len == 0) return true;
+    const host = urlHost(url);
+    if (host.len == 0) return false;
+    var it = std.mem.splitScalar(u8, a, ',');
+    while (it.next()) |raw| {
+        const suf = std.mem.trim(u8, raw, " \t\r\n");
+        if (suf.len == 0) continue;
+        if (std.mem.eql(u8, host, suf)) return true;
+        if (host.len > suf.len + 1 and host[host.len - suf.len - 1] == '.' and std.mem.endsWith(u8, host, suf)) return true;
+    }
+    return false;
+}
+
+test "egressAllowed host-suffix allowlist" {
+    // unset allowlist -> fail-open (no extra restriction)
+    try std.testing.expect(egressAllowed("", "https://example.com/x"));
+    try std.testing.expect(egressAllowed("   ", "https://anything.net"));
+    // a set allowlist confines to the named host + its dot-boundary subdomains
+    try std.testing.expect(egressAllowed("example.org", "https://example.org/a"));
+    try std.testing.expect(egressAllowed("example.org", "https://docs.example.org/a"));
+    try std.testing.expect(!egressAllowed("example.org", "https://example.com/a"));
+    // the classic suffix-confusion bypass must be BLOCKED (substring, not dot-boundary)
+    try std.testing.expect(!egressAllowed("example.org", "https://example.org.evil.com/a"));
+    try std.testing.expect(!egressAllowed("attack.mitre.org", "https://notattack.mitre.org/a"));
+    // multi-entry list
+    try std.testing.expect(egressAllowed("attack.mitre.org, urlhaus.abuse.ch", "https://urlhaus.abuse.ch/feed"));
+    try std.testing.expect(!egressAllowed("attack.mitre.org, urlhaus.abuse.ch", "https://evil.test/feed"));
+    // non-URL / scheme-less -> blocked under an active allowlist
+    try std.testing.expect(!egressAllowed("example.org", "ftp://example.org"));
+}
+
 /// Strip HTML to readable text in pure Zig (no extra process): drop &lt;script&gt;/&lt;style&gt; bodies and all tags,
 /// unescape the common entities, and collapse whitespace. Good enough for "read this page" research.
 fn htmlToText(gpa: std.mem.Allocator, html: []const u8) []u8 {
@@ -1657,9 +1706,12 @@ fn webFetch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
-    const cm = crawlPageFit(ctx, p.value.url, p.value.query, 1800);
-    if (cm.len > 0) return cm;
-    gpa.free(cm);
+    if (!egressAllowed(ctx.egress_allow, p.value.url)) return dupe(gpa, "blocked: host not on the egress allowlist (NL_EGRESS_ALLOWLIST)");
+    if (ctx.egress_allow.len == 0) {
+        const cm = crawlPageFit(ctx, p.value.url, p.value.query, 1800);
+        if (cm.len > 0) return cm;
+        gpa.free(cm);
+    }
     const raw = curlToText(ctx, p.value.url, false, 26000, 512 << 10);
     defer gpa.free(raw);
     if (raw.len == 0) return dupe(gpa, "(fetch returned nothing or timed out — try another source)");
@@ -1761,6 +1813,7 @@ fn fetchJson(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    if (!egressAllowed(ctx.egress_allow, p.value.url)) return dupe(gpa, "blocked: host not on the egress allowlist (NL_EGRESS_ALLOWLIST)");
     const raw = curlToText(ctx, p.value.url, true, 26000, 512 << 10);
     defer gpa.free(raw);
     if (raw.len == 0) return dupe(gpa, "(fetch returned nothing or timed out — try another source)");
@@ -1776,6 +1829,7 @@ fn readUrl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    if (ctx.egress_allow.len > 0) return dupe(gpa, "read_url is disabled under an egress allowlist (it routes through a third-party reader proxy) — use web_fetch on a specific allowlisted URL");
     const cm = crawlPage(ctx, p.value.url, 2200);
     if (cm.len > 0) return cm;
     gpa.free(cm);
@@ -1794,6 +1848,7 @@ fn osintScan(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    if (ctx.egress_allow.len > 0) return dupe(gpa, "osint_scan is disabled under an egress allowlist (it fans out to arbitrary hosts) — use web_fetch/fetch_json on a specific allowlisted URL");
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
@@ -1818,6 +1873,7 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
+    if (ctx.egress_allow.len > 0) return dupe(gpa, "deep_crawl is disabled under an egress allowlist (it fans out to arbitrary hosts) — use web_fetch/fetch_json on a specific allowlisted URL");
 
     const depth = @min(@as(u32, 4), if (p.value.depth == 0) @as(u32, 2) else p.value.depth);
     const pages = @min(@as(u32, 120), if (p.value.max_pages == 0) @as(u32, 30) else p.value.max_pages);
@@ -1951,6 +2007,7 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "empty query");
+    if (ctx.egress_allow.len > 0) return dupe(gpa, "web_search is disabled under an egress allowlist (search returns arbitrary hosts) — fetch a specific allowlisted URL with web_fetch/fetch_json");
     const lim = if (p.value.limit == 0 or p.value.limit > 10) 5 else p.value.limit;
     const out = searchWeb(ctx.io, gpa, ctx.environ, ctx.run_dir, ctx.workdir, ctx.mind, p.value.source, p.value.query, lim);
     defer gpa.free(@constCast(out));
