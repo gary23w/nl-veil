@@ -1421,6 +1421,144 @@ fn ingestExplore(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: M
     }
 }
 
+const INTEL_SEEN = ".intel_seen";
+
+const IntelHit = struct { technique: []u8, mitigation: []u8 };
+
+/// Match the first feed entry whose "indicator" is a substring of the live token; returns owned
+/// technique+mitigation (caller frees) or null. Feed = JSON array of {indicator,technique,mitigation}.
+fn intelLookup(gpa: std.mem.Allocator, feed: []const u8, indicator: []const u8) ?IntelHit {
+    const Entry = struct { indicator: []const u8 = "", technique: []const u8 = "", mitigation: []const u8 = "" };
+    const parsed = std.json.parseFromSlice([]const Entry, gpa, feed, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    for (parsed.value) |e| {
+        if (e.indicator.len == 0 or e.mitigation.len == 0) continue;
+        if (std.mem.indexOf(u8, indicator, e.indicator) != null) {
+            const t = gpa.dupe(u8, if (e.technique.len > 0) e.technique else "unknown-technique") catch return null;
+            const m = gpa.dupe(u8, e.mitigation) catch {
+                gpa.free(t);
+                return null;
+            };
+            return .{ .technique = t, .mitigation = m };
+        }
+    }
+    return null;
+}
+
+/// Knowledge-gap fill: research a flagged indicator that memory can't yet adjudicate (real web search when
+/// online, else a local NL_INTEL_FEEDS reference), then observe what's learned into the recall floor so the
+/// model adapts. Each indicator fetched once via the .intel_seen cursor.
+fn assessIntelGap(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem, environ: *const std.process.Environ.Map, internet: bool, base_url: []const u8, key: []const u8, model: []const u8) void {
+    const feed_path = environ.get("NL_INTEL_FEEDS") orelse "";
+    if (feed_path.len == 0 and !internet) return; // no source to learn from
+    const feed: []u8 = if (feed_path.len > 0)
+        (std.Io.Dir.cwd().readFileAlloc(io, feed_path, gpa, .limited(512 << 10)) catch (gpa.dupe(u8, "") catch return))
+    else
+        (gpa.dupe(u8, "") catch return);
+    defer gpa.free(feed);
+
+    const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch return;
+    defer gpa.free(tp);
+    const tdata = std.Io.Dir.cwd().readFileAlloc(io, tp, gpa, .limited(256 << 10)) catch return;
+    defer gpa.free(tdata);
+    const Pers = struct { name: []const u8 = "", removed: bool = true };
+    const Integ = struct { path: []const u8 = "", ok: bool = true };
+    const Vuln = struct { path: []const u8 = "", patched: bool = true };
+    const Telem = struct { persistence: []const Pers = &.{}, integrity: []const Integ = &.{}, config_audit: []const Vuln = &.{} };
+    const parsed = std.json.parseFromSlice(Telem, gpa, tdata, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+
+    var indicators: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer indicators.deinit(gpa);
+    for (parsed.value.persistence) |p| if (!p.removed and p.name.len > 0) indicators.append(gpa, p.name) catch {};
+    for (parsed.value.integrity) |f| if (!f.ok and f.path.len > 0) indicators.append(gpa, f.path) catch {};
+    for (parsed.value.config_audit) |v| if (!v.patched and v.path.len > 0) indicators.append(gpa, v.path) catch {};
+    if (indicators.items.len == 0) return;
+
+    const sp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ run_dir, INTEL_SEEN }) catch return;
+    defer gpa.free(sp);
+    var seen: std.ArrayListUnmanaged(u8) = .empty;
+    defer seen.deinit(gpa);
+    if (std.Io.Dir.cwd().readFileAlloc(io, sp, gpa, .limited(64 << 10))) |prior| {
+        defer gpa.free(prior);
+        seen.appendSlice(gpa, prior) catch {};
+    } else |_| {}
+
+    var changed = false;
+    for (indicators.items) |indicator| {
+        if (std.mem.indexOf(u8, seen.items, indicator) != null) continue; // filled already this run
+        if (intelHostile(gpa, mem, indicator)) continue; // already adjudicated in memory
+        var fact: ?[]u8 = null;
+        if (feed.len > 0) {
+            if (intelLookup(gpa, feed, indicator)) |hit| {
+                defer gpa.free(hit.technique);
+                defer gpa.free(hit.mitigation);
+                fact = std.fmt.allocPrint(gpa, "[verified] {s} is {s}; mitigation: {s} [src:intel]", .{ clip(indicator, 90), clip(hit.technique, 60), clip(hit.mitigation, 110) }) catch null;
+            }
+        } else if (internet) {
+            // Search the indicator's distinctive token via the raw search-results path (crawl.searchResults).
+            var term = indicator;
+            if (std.mem.lastIndexOfAny(u8, term, "/:")) |i| {
+                if (i + 1 < term.len) term = term[i + 1 ..];
+            }
+            const res = tools.crawlSearchPrim(io, gpa, run_dir, "intel", term, 5);
+            defer gpa.free(@constCast(res));
+            const trimmed = std.mem.trim(u8, res, " \r\n\t");
+            if (trimmed.len > 40) {
+                // Distill + judge: the model reads the fetched intel and rules malicious vs benign. Only a
+                // malicious verdict earns [verified] (which adjudication keys on); benign is stored without it.
+                const dsys = "You are a security analyst triaging an indicator found on a live device. Using ONLY the supplied reference material, decide whether the indicator is a MALICIOUS threat or a BENIGN/legitimate component. A legitimate tool (a backup, a metrics exporter, a stock service) is BENIGN even if powerful; only call it MALICIOUS if the reference material identifies it as malware, an attack tool, a miner, or attacker tradecraft.";
+                const duser = std.fmt.allocPrint(gpa, "Indicator on the device: {s}\n\nReference material from the web:\n{s}\n\nReply with EXACTLY one line. Start it with 'MALICIOUS: ' followed by the single remediation action, OR 'BENIGN: ' followed by what it legitimately is. Base the verdict ONLY on the reference material above.", .{ clip(indicator, 90), clip(trimmed, 1200) }) catch null;
+                if (duser) |du| {
+                    defer gpa.free(du);
+                    const reply = llm.chat(gpa, io, run_dir, "intel", base_url, key, model, dsys, du, 120);
+                    defer gpa.free(reply.content);
+                    const verdict = std.mem.trim(u8, reply.content, " \r\n\t");
+                    if (reply.ok and verdict.len > 0) {
+                        const malicious = verdict.len >= 9 and std.ascii.eqlIgnoreCase(verdict[0..9], "malicious");
+                        fact = if (malicious)
+                            (std.fmt.allocPrint(gpa, "[verified] {s} is a THREAT — {s} [src:web]", .{ clip(indicator, 90), clip(verdict, 200) }) catch null)
+                        else
+                            // benign (or ambiguous → fail-safe toward restraint): NO [verified], so it never roots.
+                            (std.fmt.allocPrint(gpa, "{s} researched BENIGN — {s} [src:web]", .{ clip(indicator, 90), clip(verdict, 200) }) catch null);
+                    }
+                }
+            }
+        }
+        const f = fact orelse continue;
+        defer gpa.free(f);
+        _ = mem.observe(tools.KNOWLEDGE_SCOPE, f);
+        _ = mem.observe(tools.INTEL_SCOPE, f);
+        seen.append(gpa, '\n') catch {};
+        seen.appendSlice(gpa, indicator) catch {};
+        changed = true;
+    }
+    if (changed) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = seen.items }) catch {};
+}
+
+test "intelLookup matches an indicator substring and returns the mitigation" {
+    const a = std.testing.allocator;
+    const feed =
+        \\[{"indicator":"sysupdate-helper","technique":"T-SYNTH-PERSIST","mitigation":"restore_file /etc/cron.daily/sysupdate-helper"},
+        \\ {"indicator":"@reboot-glassworm","technique":"T1053.003","mitigation":"remove_persistence cron:@reboot-glassworm"}]
+    ;
+    // a path-form live indicator CONTAINS the feed's indicator substring
+    if (intelLookup(a, feed, "/etc/cron.daily/sysupdate-helper")) |hit| {
+        defer a.free(hit.technique);
+        defer a.free(hit.mitigation);
+        try std.testing.expectEqualStrings("T-SYNTH-PERSIST", hit.technique);
+        try std.testing.expect(std.mem.indexOf(u8, hit.mitigation, "restore_file") != null);
+    } else return error.ExpectedMatch;
+    // a scheme-form live indicator
+    if (intelLookup(a, feed, "cron:@reboot-glassworm")) |hit| {
+        defer a.free(hit.technique);
+        defer a.free(hit.mitigation);
+        try std.testing.expectEqualStrings("T1053.003", hit.technique);
+    } else return error.ExpectedMatch;
+    // an unknown indicator yields NO intel (the gap fill must never hallucinate an adjudication)
+    try std.testing.expect(intelLookup(a, feed, "totally-unknown-token") == null);
+}
+
 /// frontierPlan — the memory-graph half of the explore loop (sibling of operatePlan; NO telemetry parse, NO
 /// per-node shelling). ONE assoc surfaces the frontier (nodes discovered but not yet expanded, marked
 /// "[frontier] <node>" in MAP_SCOPE); we inject the top few as exact `host_explore expand <node>` moves so the
@@ -1643,6 +1781,31 @@ fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem
         }
     }
 
+    // List every OTHER intel-adjudicated hostile indicator with its verb, so one respawning root can't
+    // monopolize the turn and the model clears all confirmed threats.
+    {
+        var others: std.ArrayListUnmanaged(u8) = .empty;
+        defer others.deinit(gpa);
+        for (parsed.value.persistence) |p| {
+            if (!p.removed and p.name.len > 0 and !std.mem.eql(u8, p.name, root_name) and intelHostile(gpa, mem, p.name)) {
+                const l = std.fmt.allocPrint(gpa, "  - ACTION: remove_persistence {s}\n", .{clip(p.name, 90)}) catch continue;
+                defer gpa.free(l);
+                others.appendSlice(gpa, l) catch {};
+            }
+        }
+        for (parsed.value.integrity) |f| {
+            if (!f.ok and f.path.len > 0 and !std.mem.eql(u8, f.path, root_name) and intelHostile(gpa, mem, f.path)) {
+                const l = std.fmt.allocPrint(gpa, "  - ACTION: restore_file {s}\n", .{clip(f.path, 90)}) catch continue;
+                defer gpa.free(l);
+                others.appendSlice(gpa, l) catch {};
+            }
+        }
+        if (others.items.len > 0) {
+            plan.appendSlice(gpa, "OTHER CONFIRMED THREATS — your intel (recalled OR researched from the web this round) adjudicates these live indicators HOSTILE too. Do NOT fixate on one root: clear EACH of them this round, then verify:\n") catch {};
+            plan.appendSlice(gpa, others.items) catch {};
+        }
+    }
+
     if (plan.items.len == 0) {
         plan.deinit(gpa);
         return gpa.dupe(u8, "") catch @constCast("");
@@ -1802,6 +1965,11 @@ fn recoverHostCall(gpa: std.mem.Allocator, content: []const u8) ?struct { name: 
 
 fn netProbe(w: *Worker, round: u32, url: []const u8) void {
     if (!w.want_net) return;
+    // Honor the egress allowlist for the connectivity probe too — never reach a non-allowlisted host.
+    if (w.mem.environ) |pe| {
+        const allow = pe.get("NL_EGRESS_ALLOWLIST") orelse "";
+        if (allow.len > 0 and !tools.egressAllowed(allow, url)) return;
+    }
     const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", "4", "--connect-timeout", "3", url };
     const r = std.process.run(w.gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch {
         if (w.internet) netFlip(w, round, false);
@@ -1863,7 +2031,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var acted = false;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .fmtx = &w.files_mtx };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -2104,6 +2272,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const issued = if (operate) issuedActions(gpa, w.io, w.run_dir) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued);
     if (operate) ingestExplore(gpa, w.io, w.run_dir, w.mem); // fold the bridge's read-only discoveries into the map first
+    if (operate) assessIntelGap(gpa, w.io, w.run_dir, w.mem, environ, w.internet, w.base_url, w.key, w.model); // research gaps on the real web + distill-judge BEFORE adjudication
     const op_plan_block = if (operate) operatePlan(gpa, w.io, w.run_dir, w.mem) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(op_plan_block);
     const frontier_block = if (operate) frontierPlan(gpa, w.mem) else (gpa.dupe(u8, "") catch @constCast(""));
