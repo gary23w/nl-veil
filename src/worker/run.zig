@@ -1603,6 +1603,31 @@ fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem
             gpa.free(@constCast(rec));
         }
     }
+    // Explore on ambiguous adjudication: a root that is STILL flagged after the model already acted on it has
+    // a re-creator the live telemetry never shows. Adjudication from the live state alone is exhausted — direct
+    // the model to MAP the hidden structure (discoveries land in the map scope next round) and chain to the real
+    // source. Domain-neutral: the explore target is derived from the recurring root's own location.
+    const root_seg = blk_seg: {
+        var s = root_name;
+        if (std.mem.lastIndexOfScalar(u8, s, '/')) |i| s = s[i + 1 ..];
+        if (std.mem.lastIndexOfScalar(u8, s, ':')) |i| s = s[i + 1 ..];
+        break :blk_seg s;
+    };
+    const root_recurred = rooted and root_seg.len >= 3 and std.mem.indexOf(u8, cdata, root_seg) != null;
+    if (root_recurred or (rooted and top_count >= 3)) {
+        var anc_buf: [160]u8 = undefined;
+        const move: []const u8 = if (std.mem.indexOfScalar(u8, root_name, '/') != null)
+            (std.fmt.bufPrint(&anc_buf, "EXPLORE: enumerate file:{s}", .{clip(parentDir(parentDir(root_name)), 110)}) catch "")
+        else
+            (std.fmt.bufPrint(&anc_buf, "EXPLORE: expand {s}", .{clip(root_name, 120)}) catch "");
+        if (move.len > 0) {
+            const seek = std.fmt.allocPrint(gpa, "RESPAWN — '{s}' is STILL flagged after you acted on it: something the live telemetry does NOT show is re-creating it, so re-clearing it will not hold. MAP the hidden source: end a reply with `{s}` (read-only); next round expand the discovered nodes and chain over your map to what re-creates '{s}', then remediate THAT.\n", .{ clip(root_name, 80), move, clip(root_name, 60) }) catch "";
+            if (seek.len > 0) {
+                plan.appendSlice(gpa, seek) catch {};
+                gpa.free(@constCast(seek));
+            }
+        }
+    }
     if (graph_root.len > 0) {
         const gr = std.fmt.allocPrint(gpa, "(memory-graph traversal: the recurring symptom --caused_by--> {s})\n", .{clip(graph_root, 90)}) catch "";
         if (gr.len > 0) {
@@ -1661,6 +1686,13 @@ fn readArgToken(s: []const u8) []const u8 {
     return s[start..a];
 }
 
+/// The containing directory of a path ("/a/b/c" -> "/a/b"); returns the input when there is no separator.
+fn parentDir(p: []const u8) []const u8 {
+    const t = std.mem.trimEnd(u8, p, "/");
+    if (std.mem.lastIndexOfScalar(u8, t, '/')) |i| return if (i == 0) "/" else t[0..i];
+    return t;
+}
+
 /// RECOVERY for a weak model's tool-call format wobble. A small 8b sometimes writes its DECIDED tool call as TEXT
 /// JSON in the assistant content ({"name":"host_command","parameters":{"command":"…"}}) instead of emitting it
 /// through the tool_calls channel — worse in later turns — so a CORRECT remediation would be silently dropped. In
@@ -1677,8 +1709,45 @@ fn actionTail(content: []const u8) ?[]const u8 {
     return found;
 }
 
+/// The recon counterpart of actionTail: the last `EXPLORE: <verb> <node> [rel]` line the model narrated.
+fn exploreTail(content: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var found: ?[]const u8 = null;
+    while (it.next()) |ln| {
+        const t = std.mem.trimStart(u8, ln, " \t*->#`");
+        if (t.len >= 8 and std.ascii.eqlIgnoreCase(t[0..8], "explore:"))
+            found = std.mem.trim(u8, t[8..], " \t\r`'\"*");
+    }
+    return found;
+}
+
 fn recoverHostCall(gpa: std.mem.Allocator, content: []const u8) ?struct { name: []u8, args: []u8 } {
     if (content.len == 0) return null;
+    // Recon move first: a narrated EXPLORE line maps to host_explore (read-only). A reply may carry one move;
+    // exploring (when a problem's source is not in the live state) takes precedence over a blind remediation.
+    if (exploreTail(content)) |tail| {
+        var tk = std.mem.tokenizeAny(u8, tail, " \t");
+        const verb = tk.next() orelse "";
+        var ok = false;
+        for (tools.EXPLORE_VERBS) |v| {
+            if (std.mem.eql(u8, verb, v)) ok = true;
+        }
+        if (ok) {
+            const node = tk.next() orelse "";
+            if (node.len > 0) {
+                const rel = tk.next() orelse "";
+                const args = if (rel.len > 0)
+                    std.fmt.allocPrint(gpa, "{{\"verb\":\"{s}\",\"node\":\"{s}\",\"rel\":\"{s}\"}}", .{ verb, node, rel }) catch return null
+                else
+                    std.fmt.allocPrint(gpa, "{{\"verb\":\"{s}\",\"node\":\"{s}\"}}", .{ verb, node }) catch return null;
+                const nm = gpa.dupe(u8, "host_explore") catch {
+                    gpa.free(args);
+                    return null;
+                };
+                return .{ .name = nm, .args = args };
+            }
+        }
+    }
     if (actionTail(content)) |tail| {
         for (HOST_VERBS) |v| {
             if (std.mem.startsWith(u8, tail, v) and (tail.len == v.len or tail[v.len] == ' ' or tail[v.len] == '\t')) {
@@ -2079,10 +2148,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
     const op_how: []const u8 = if (op_content)
-        "You have NO tools this session. The device's live state and your relevant memory are ALREADY shown above — you do not need to read or recall anything. Assess the device state above, decide what it needs, and ACT by ending your reply with ONE line in exactly this form: ACTION: <verb> <target> (for example `ACTION: kill_proc 1010`). The engine runs that line as a host command — narrating this ACTION line is the ONLY way to act. The verb is whatever operation the device understands; the target is the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent or approximate one. Do ONE action per reply: think briefly, then end with your single ACTION line."
+        "You have NO tools this session. The device's live state and your relevant memory are ALREADY shown above. End your reply with ONE move line, in exactly one of these two forms:\n  ACTION: <verb> <target>  — to REMEDIATE (for example `ACTION: kill_proc 1010`); the engine runs it as a host command.\n  EXPLORE: <verb> <node>  — to MAP structure the live telemetry does NOT show (verb is enumerate | expand | describe; node is a pid, path, handle, or principal, for example `EXPLORE: enumerate file:/etc`); it is READ-ONLY and its discoveries enter your map for the next round. The verb is whatever the device understands; the target/node is the EXACT identifier shown verbatim above — never invent or approximate one. When a problem RESPAWNS after you clear it, or its source is not anywhere in the live state, do NOT keep re-clearing the symptom: EXPLORE to map the hidden structure, then chain/recall over the map you build to the real root and remediate THAT. Do ONE move per reply: think briefly, then end with your single ACTION or EXPLORE line."
     else
-        "You have your operating toolset: host_status (read the live state), host_command (act on the device), read_file + write_file (inspect/patch a config, or write a report), recall + recall_hive (ground a decision in your own + the hive's intel), observe, send_message, set_directive. Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn.";
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\n{s} Before any DESTRUCTIVE or irreversible action (terminating a process, cutting a connection, removing or deleting something), first CONFIRM the target itself is the problem — identify what it is and the specific evidence it is hostile (its provenance/known-bad intel), not merely that it looks unusual or busy. A legitimate component that a problem is attached to, spawned from, or running under is NOT itself the problem: act on the hostile artifact, never on the healthy part of the device hosting it. Disabling, killing, or cutting off something legitimate is a FAILURE that is penalized and sets you back — when unsure whether a target is hostile, investigate it (read its details, recall its intel) before you act, not after. A blind spot to avoid: a malicious or altered FILE the device flags (a file/integrity entry shown as not-ok) is itself a live part of the compromise — remediate it by restoring it (restore_file <path>), just like you would a process or a connection. Don't kill the processes and cut the network and then leave a flagged file sitting in place; an attacker's dropped file keeps the device compromised on its own.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)", op_how }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
+        "You have your operating toolset: host_status (read the live state), host_command (act on the device), host_explore (READ-ONLY: map processes/files/links the live telemetry does not show — use it when a problem respawns or its source is not in the live state, then chain over the map to the root), read_file + write_file (inspect/patch a config, or write a report), recall + recall_hive (ground a decision in your own + the hive's intel), observe, send_message, set_directive. Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn.";
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\n{s} Before any DESTRUCTIVE or irreversible action (terminating a process, cutting a connection, removing or deleting something), first CONFIRM the target itself is the problem — identify what it is and the specific evidence it is hostile (its provenance/known-bad intel), not merely that it looks unusual or busy. A legitimate component that a problem is attached to, spawned from, or running under is NOT itself the problem: act on the hostile artifact, never on the healthy part of the device hosting it. Disabling, killing, or cutting off something legitimate is a FAILURE that is penalized and sets you back — when unsure whether a target is hostile, investigate it (read its details, recall its intel) before you act, not after. A blind spot to avoid: a malicious or altered FILE the device flags (a file/integrity entry shown as not-ok) is itself a live part of the compromise — remediate it by restoring it (restore_file <path>), just like you would a process or a connection. Don't kill the processes and cut the network and then leave a flagged file sitting in place; an attacker's dropped file keeps the device compromised on its own. When the live telemetry does NOT explain the whole compromise — a root that respawns after you clear it, or an indicator whose source/mechanism the telemetry never shows — do not keep chasing the visible symptom: use host_explore (enumerate/expand/describe) to map the device's real structure (its processes, files, and how they link), then chain over the map you build to the hidden root and remediate THAT.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)", op_how }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
