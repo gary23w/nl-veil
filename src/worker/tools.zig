@@ -185,6 +185,7 @@ pub const PROPOSAL_SCOPE = "proposals";
 pub const SIM_SCOPE = "simulations";
 
 /// Multi-timescale memory channels for RSI compounding: episodes (short), strategy (medium), architecture (long).
+pub const OPERATE_SCOPE = "operate";
 pub const EPISODE_SCOPE = "episodes";
 pub const STRATEGY_SCOPE = "strategy";
 pub const ARCH_SCOPE = "architecture";
@@ -707,8 +708,14 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
-    const redirected = ctx.one_slot and ctx.slot_path.len > 0 and !std.mem.eql(u8, p.value.path, ctx.slot_path);
-    const wpath = if (redirected) ctx.slot_path else p.value.path;
+    const npath = blk_np: {
+        const wb = std.fs.path.basename(ctx.workdir);
+        if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
+            break :blk_np p.value.path[wb.len + 1 ..];
+        break :blk_np p.value.path;
+    };
+    const redirected = ctx.one_slot and ctx.slot_path.len > 0 and !std.mem.eql(u8, npath, ctx.slot_path);
+    const wpath = if (redirected) ctx.slot_path else npath;
     if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !std.mem.eql(u8, std.fs.path.basename(wpath), std.fs.path.basename(ctx.slot_path))) {
         const yours = if (ctx.slot_path.len > 0) std.fmt.allocPrint(gpa, " YOUR file this round is `{s}` — write that, not this.", .{ctx.slot_path}) catch "" else " You have no deliverable file this round — research the upcoming pieces, share what you learn, or create a NEW helper file.";
         defer if (yours.len > 0 and ctx.slot_path.len > 0) gpa.free(@constCast(yours));
@@ -766,7 +773,13 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
-    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom");
+    const rpath = blk_rp: {
+        const wb = std.fs.path.basename(ctx.workdir);
+        if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
+            break :blk_rp p.value.path[wb.len + 1 ..];
+        break :blk_rp p.value.path;
+    };
+    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, rpath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch return dupe(gpa, "not found");
     defer gpa.free(data);
