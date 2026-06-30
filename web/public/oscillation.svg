@@ -1,0 +1,123 @@
+<svg viewBox="0 0 1000 660" xmlns="http://www.w3.org/2000/svg" role="img" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">
+<title>How data oscillates through neuron-db</title>
+<desc>Every turn the mind writes to the neuron-db substrate via observe, reinforce, import and trust_reward, and reads back via recall, chain and assoc; the loop repeats so context is rebuilt from a trust-weighted graph query.</desc>
+<style>
+ svg{--w:#1D9E75;--wd:#5DCAA5;--wbg:#E1F5EE;--r:#534AB7;--rd:#AFA9EC;--rbg:#EEEDFE;--n:#5F5E5A;--nl:#D3D1C7;--nbg:#F1EFE8;--ink:#2C2C2A;}
+ .t{fill:var(--ink);}.m{fill:#888780;}.mono{font-family:ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;}
+</style>
+<defs>
+ <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#1D9E75"/></marker>
+ <marker id="al" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#534AB7"/></marker>
+ <marker id="ag" markerWidth="8" markerHeight="8" refX="6" refY="2.5" orient="auto"><path d="M0,0 L6,2.5 L0,5 Z" fill="#888780"/></marker>
+</defs>
+
+<rect x="0" y="0" width="1000" height="660" rx="0" fill="#FBFAF7"/>
+
+<text x="500" y="30" text-anchor="middle" font-size="21" font-weight="700" class="t">How data oscillates through neuron-db</text>
+<text x="500" y="51" text-anchor="middle" font-size="12.5" class="m">every turn: the mind imprints the substrate · the substrate re-grounds the mind</text>
+
+<rect x="40" y="138" width="172" height="402" rx="16" fill="#F1EFE8" stroke="#D3D1C7" stroke-width="1.5"/>
+<text x="126" y="170" text-anchor="middle" font-size="14.5" font-weight="700" class="t">THE MIND</text>
+<text x="126" y="187" text-anchor="middle" font-size="10.5" class="m">gpt-oss · operate loop</text>
+<g class="mono" font-size="11">
+ <rect x="56" y="208" width="140" height="48" rx="9" fill="#fff" stroke="#D3D1C7"/>
+ <text x="126" y="229" text-anchor="middle" class="t">① perceive</text><text x="126" y="245" text-anchor="middle" font-size="9.5" class="m">read live host state</text>
+ <rect x="56" y="296" width="140" height="48" rx="9" fill="#fff" stroke="#D3D1C7"/>
+ <text x="126" y="317" text-anchor="middle" class="t">② reason</text><text x="126" y="333" text-anchor="middle" font-size="9.5" class="m">over the recalled graph</text>
+ <rect x="56" y="384" width="140" height="48" rx="9" fill="#fff" stroke="#D3D1C7"/>
+ <text x="126" y="405" text-anchor="middle" class="t">③ act</text><text x="126" y="421" text-anchor="middle" font-size="9.5" class="m">host_command</text>
+</g>
+<line x1="126" y1="256" x2="126" y2="294" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ag)"/>
+<line x1="126" y1="344" x2="126" y2="382" stroke="#5F5E5A" stroke-width="1.5" marker-end="url(#ag)"/>
+<path d="M56,460 C30,460 30,224 54,224" fill="none" stroke="#5F5E5A" stroke-width="1.4" stroke-dasharray="3 3" marker-end="url(#ag)"/>
+<text x="126" y="470" text-anchor="middle" font-size="9.5" class="m">⟲ next turn</text>
+
+<rect x="224" y="132" width="404" height="196" rx="12" fill="#E1F5EE" opacity="0.45"/>
+<text x="240" y="125" font-size="11.5" font-weight="700" fill="#1D9E75">WRITES ▶ imprint inward</text>
+<g class="mono">
+ <g><line x1="216" y1="162" x2="632" y2="162" stroke="#5DCAA5" stroke-width="2" marker-end="url(#ar)"/>
+  <rect x="300" y="148" width="232" height="28" rx="14" fill="#fff" stroke="#1D9E75"/>
+  <text x="316" y="166" font-size="11" class="t">observe(scope, fact)</text>
+  <text x="524" y="166" text-anchor="end" font-size="8.5" font-weight="700" fill="#1D9E75">PERCEIVE</text>
+  <text x="416" y="190" text-anchor="middle" font-size="9.3" class="m">state → neurons + caused_by edges</text></g>
+ <g><line x1="216" y1="212" x2="632" y2="212" stroke="#5DCAA5" stroke-width="2" marker-end="url(#ar)"/>
+  <rect x="300" y="198" width="232" height="28" rx="14" fill="#fff" stroke="#1D9E75"/>
+  <text x="316" y="216" font-size="11" class="t">reinforce(topic, feel)</text>
+  <text x="524" y="216" text-anchor="end" font-size="8.5" font-weight="700" fill="#1D9E75">LEARN</text>
+  <text x="416" y="240" text-anchor="middle" font-size="9.3" class="m">recurrence strengthens the edge (Hebbian)</text></g>
+ <g><line x1="216" y1="262" x2="632" y2="262" stroke="#5DCAA5" stroke-width="2" marker-end="url(#ar)"/>
+  <rect x="300" y="248" width="232" height="28" rx="14" fill="#fff" stroke="#1D9E75"/>
+  <text x="316" y="266" font-size="11" class="t">import ▸ bake</text>
+  <text x="524" y="266" text-anchor="end" font-size="8.5" font-weight="700" fill="#1D9E75">INGEST</text>
+  <text x="416" y="290" text-anchor="middle" font-size="9.3" class="m">attribution corpus → knowledge scope</text></g>
+ <g><line x1="216" y1="312" x2="632" y2="312" stroke="#5DCAA5" stroke-width="2" marker-end="url(#ar)"/>
+  <rect x="300" y="298" width="232" height="28" rx="14" fill="#fff" stroke="#1D9E75"/>
+  <text x="316" y="316" font-size="11" class="t">trust_reward(Δscore)</text>
+  <text x="524" y="316" text-anchor="end" font-size="8.5" font-weight="700" fill="#1D9E75">BELIEVE</text>
+  <text x="416" y="340" text-anchor="middle" font-size="9.3" class="m">oracle delta → per-tag-class trust</text></g>
+</g>
+
+<rect x="224" y="360" width="404" height="158" rx="12" fill="#EEEDFE" opacity="0.5"/>
+<text x="240" y="353" font-size="11.5" font-weight="700" fill="#534AB7">READS ◀ recall outward</text>
+<g class="mono">
+ <g><line x1="636" y1="392" x2="216" y2="392" stroke="#AFA9EC" stroke-width="2" marker-end="url(#al)"/>
+  <rect x="300" y="378" width="232" height="28" rx="14" fill="#fff" stroke="#534AB7"/>
+  <text x="316" y="396" font-size="11" class="t">recall(scope, query)</text>
+  <text x="524" y="396" text-anchor="end" font-size="8.5" font-weight="700" fill="#534AB7">RECALL</text>
+  <text x="416" y="420" text-anchor="middle" font-size="9.3" class="m">relevance × trust, top-k</text></g>
+ <g><line x1="636" y1="442" x2="216" y2="442" stroke="#AFA9EC" stroke-width="2" marker-end="url(#al)"/>
+  <rect x="300" y="428" width="232" height="28" rx="14" fill="#fff" stroke="#534AB7"/>
+  <text x="316" y="446" font-size="11" class="t">chain(start, caused_by)</text>
+  <text x="524" y="446" text-anchor="end" font-size="8.5" font-weight="700" fill="#534AB7">REASON</text>
+  <text x="416" y="470" text-anchor="middle" font-size="9.3" class="m">walk the edges → the root</text></g>
+ <g><line x1="636" y1="492" x2="216" y2="492" stroke="#AFA9EC" stroke-width="2" marker-end="url(#al)"/>
+  <rect x="300" y="478" width="232" height="28" rx="14" fill="#fff" stroke="#534AB7"/>
+  <text x="316" y="496" font-size="11" class="t">assoc / spreading</text>
+  <text x="524" y="496" text-anchor="end" font-size="8.5" font-weight="700" fill="#534AB7">ATTRIBUTE</text>
+  <text x="416" y="516" text-anchor="middle" font-size="9.3" class="m">multi-hop: C2 → … → actor</text></g>
+</g>
+
+<rect x="640" y="96" width="320" height="452" rx="16" fill="#fff" stroke="#AFA9EC" stroke-width="1.5"/>
+<text x="800" y="124" text-anchor="middle" font-size="14.5" font-weight="700" class="t">NEURON-DB</text>
+<text x="800" y="140" text-anchor="middle" font-size="10.5" class="m">the live cognitive substrate</text>
+
+<text x="656" y="166" font-size="10" font-weight="700" class="m">CAUSAL GRAPH · typed neurons + synapses</text>
+<g class="mono" font-size="9.5">
+ <rect x="656" y="176" width="74" height="26" rx="8" fill="#F1EFE8" stroke="#D3D1C7"/><text x="693" y="193" text-anchor="middle" class="t">symptom</text>
+ <line x1="730" y1="189" x2="772" y2="189" stroke="#5F5E5A" stroke-width="1.4" marker-end="url(#ag)"/>
+ <rect x="774" y="176" width="172" height="26" rx="8" fill="#E1F5EE" stroke="#1D9E75"/><text x="860" y="193" text-anchor="middle" fill="#1D9E75" font-weight="700">root: cron:@reboot-glassworm</text>
+ <line x1="860" y1="202" x2="860" y2="222" stroke="#5F5E5A" stroke-width="1.4" marker-end="url(#ag)"/>
+ <text x="872" y="217" font-size="8" class="m">caused_by</text>
+ <rect x="800" y="224" width="120" height="24" rx="8" fill="#F1EFE8" stroke="#D3D1C7"/><text x="860" y="240" text-anchor="middle" class="t">vuln: upload.php</text>
+</g>
+
+<text x="656" y="278" font-size="10" font-weight="700" class="m">SCOPES · isolated memory regions</text>
+<g class="mono" font-size="9" fill="#2C2C2A">
+ <rect x="656" y="286" width="58" height="22" rx="11" fill="#EEEDFE" stroke="#AFA9EC"/><text x="685" y="301" text-anchor="middle">operate</text>
+ <rect x="718" y="286" width="68" height="22" rx="11" fill="#EEEDFE" stroke="#AFA9EC"/><text x="752" y="301" text-anchor="middle">knowledge</text>
+ <rect x="790" y="286" width="44" height="22" rx="11" fill="#EEEDFE" stroke="#AFA9EC"/><text x="812" y="301" text-anchor="middle">intel</text>
+ <rect x="838" y="286" width="58" height="22" rx="11" fill="#EEEDFE" stroke="#AFA9EC"/><text x="867" y="301" text-anchor="middle">verified</text>
+ <rect x="900" y="286" width="44" height="22" rx="11" fill="#EEEDFE" stroke="#AFA9EC"/><text x="922" y="301" text-anchor="middle">…</text>
+</g>
+
+<text x="656" y="338" font-size="10" font-weight="700" class="m">256-d SEMANTIC SPACE · ranking</text>
+<rect x="656" y="346" width="288" height="14" rx="7" fill="#F1EFE8" stroke="#D3D1C7"/>
+<circle cx="690" cy="353" r="3.5" fill="#534AB7"/><circle cx="740" cy="353" r="3.5" fill="#AFA9EC"/><circle cx="812" cy="353" r="3.5" fill="#534AB7"/><circle cx="880" cy="353" r="3.5" fill="#AFA9EC"/><circle cx="918" cy="353" r="3.5" fill="#534AB7"/>
+
+<text x="656" y="392" font-size="10" font-weight="700" class="m">TRUST LEDGER · per-tag-class belief</text>
+<rect x="656" y="400" width="200" height="9" rx="4.5" fill="#F1EFE8"/><rect x="656" y="400" width="150" height="9" rx="4.5" fill="#1D9E75"/>
+<rect x="656" y="413" width="200" height="9" rx="4.5" fill="#F1EFE8"/><rect x="656" y="413" width="86" height="9" rx="4.5" fill="#5DCAA5"/>
+<text x="864" y="416" font-size="8.5" class="m">[verified] ≫ [self]</text>
+
+<text x="656" y="452" font-size="10" font-weight="700" class="m">PLASTICITY</text>
+<g class="mono" font-size="9.5">
+ <rect x="656" y="460" width="138" height="24" rx="8" fill="#E1F5EE" stroke="#1D9E75"/><text x="725" y="476" text-anchor="middle" fill="#1D9E75">⊕ reinforce recurrence</text>
+ <rect x="802" y="460" width="120" height="24" rx="8" fill="#F1EFE8" stroke="#D3D1C7"/><text x="862" y="476" text-anchor="middle" class="m">⊖ decay dead-ends</text>
+</g>
+
+<text x="800" y="524" text-anchor="middle" font-size="10.5" font-weight="700" fill="#534AB7">→ context rebuilt from a trust-weighted</text>
+<text x="800" y="539" text-anchor="middle" font-size="10.5" font-weight="700" fill="#534AB7">graph query, every single turn</text>
+
+<text x="416" y="556" text-anchor="middle" font-size="11" font-weight="700" class="t">⟲ THE OSCILLATION — write ▶ consolidate ▶ read, then repeat</text>
+<text x="416" y="574" text-anchor="middle" font-size="9.5" class="m">the graph makes the true root the highest-activation action — so the whack-a-mole dissolves</text>
+</svg>

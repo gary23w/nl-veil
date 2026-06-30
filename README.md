@@ -237,6 +237,13 @@ Open <http://127.0.0.1:8787> and sign in.
 
 ## Memory engine
 
+Every turn, the mind **imprints** the substrate and the substrate **re-grounds** the mind:
+perception becomes graph, reasoning becomes graph traversal, and the prompt context is rebuilt from
+a trust-weighted recall instead of carried as flat text. That round-trip — the **oscillation** — is
+what gives a small local model a floor to stand on: cheaper in tokens, richer in context.
+
+![how data oscillates through neuron-db](web/public/oscillation.svg)
+
 The hive's memory is **neuron-db** ([source](https://github.com/gary23w/neuron-db)), a small
 associative store compiled to a single `neuron` binary that `veil` shells out to for every
 recall/observe.
