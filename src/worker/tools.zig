@@ -5,7 +5,8 @@
 //! a parsed tool_call and returns a text result to feed back into the conversation.
 const std = @import("std");
 const builtin = @import("builtin");
-const Mem = @import("memory.zig").Mem;
+const oscillation = @import("oscillation.zig");
+const Mem = oscillation.Mem;
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
 const crawl = @import("crawl.zig");
@@ -186,6 +187,11 @@ pub const SIM_SCOPE = "simulations";
 
 /// Multi-timescale memory channels for RSI compounding: episodes (short), strategy (medium), architecture (long).
 pub const OPERATE_SCOPE = "operate";
+// The two scopes the read-only traversal map accumulates into: MAP_SCOPE holds edge-facts ("<node> <rel>
+// <next>") that chain/assoc walk; NODE_SCOPE holds per-node attribute facts ("[scheme] <node> attrs"). Kept
+// separate so a chain over the map can never collide with node descriptions (verified: scopes isolate).
+pub const MAP_SCOPE = "map";
+pub const NODE_SCOPE = "node";
 pub const EPISODE_SCOPE = "episodes";
 pub const STRATEGY_SCOPE = "strategy";
 pub const ARCH_SCOPE = "architecture";
@@ -294,6 +300,7 @@ pub const ASSEMBLER_SCHEMA =
 pub const OPERATE_SCHEMA =
     \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine — do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
+    \\{"type":"function","function":{"name":"host_explore","description":"EXPLORE the device READ-ONLY to discover structure the live telemetry does not show. verb: enumerate <node> (list a container's direct members), expand <node> (fan out a node's typed neighbors — this GROWS your map), describe <node> (read one entity's attributes). Discoveries map into your memory; recall/chain over them next round to find the real structure and the root. It never changes the device.","parameters":{"type":"object","properties":{"verb":{"type":"string","description":"enumerate | expand | describe"},"node":{"type":"string","description":"a node shown in your map or telemetry (a pid, path, handle, principal)"},"rel":{"type":"string","description":"optional relation for a targeted walk"}},"required":["verb","node"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the workdir — use it to inspect a config/log/source before you change it.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the workdir (creates parent dirs) — use it to PATCH a config you read (write back the fixed version) or to record a written report/debrief. mode:\"append\" concatenates only the new text; mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
@@ -319,6 +326,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "delete_file")) return deleteFile(ctx, args_json);
     if (std.mem.eql(u8, name, "host_status")) return hostStatus(ctx, args_json);
     if (std.mem.eql(u8, name, "host_command")) return hostCommand(ctx, args_json);
+    if (std.mem.eql(u8, name, "host_explore")) return hostExplore(ctx, args_json);
     if (!ctx.internet and (std.mem.eql(u8, name, "web_fetch") or std.mem.eql(u8, name, "web_search") or
         std.mem.eql(u8, name, "fetch_json") or std.mem.eql(u8, name, "read_url") or
         std.mem.eql(u8, name, "osint_scan") or std.mem.eql(u8, name, "deep_crawl")))
@@ -1238,11 +1246,64 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer joined.deinit(gpa);
     joined.appendSlice(gpa, prior) catch {};
     if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n") catch {};
-    const wn = cmd.len -| @as(usize, @truncate(commons.drift()));
+    const wn = cmd.len -| @as(usize, @truncate(oscillation.drift()));
     joined.appendSlice(gpa, cmd[0..@min(cmd.len, wn)]) catch {};
     joined.appendSlice(gpa, "\n") catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cp, .data = joined.items }) catch return dupe(gpa, "could not write to the command bus");
     return std.fmt.allocPrint(gpa, "issued to host: {s}", .{cmd}) catch dupe(gpa, "issued");
+}
+
+// The read-only exploration vocabulary. Domain-neutral on purpose: the SAME verbs walk a filesystem, a
+// process tree, a network, or a directory service — the bridge adapter maps them to that environment.
+const EXPLORE_VERBS = [_][]const u8{ "enumerate", "expand", "describe" };
+const EXPLORE_BUDGET: usize = 96; // per-run cap on queued explorations (fail-closed against runaway enumeration)
+
+// host_explore: queue a READ-ONLY traversal request on the explore bus lane. Fire-and-forget like
+// host_command, but it touches NO interlock (no targetGuard, no stageAction) because it never mutates the
+// device — it only asks the bridge to look. The bridge serves it out of band and the discoveries are mapped
+// into neuron-db (MAP/NODE scopes) for the mind to recall/chain over next round.
+fn hostExplore(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { verb: []const u8 = "", node: []const u8 = "", rel: []const u8 = "", command: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    var verb = p.value.verb;
+    var node = p.value.node;
+    var rel = p.value.rel;
+    if (verb.len == 0 and p.value.command.len > 0) { // tolerate a single "verb node [rel]" line
+        var it = std.mem.tokenizeAny(u8, p.value.command, " \t");
+        verb = it.next() orelse "";
+        node = it.next() orelse "";
+        rel = it.next() orelse "";
+    }
+    var known = false;
+    for (EXPLORE_VERBS) |v| {
+        if (std.mem.eql(u8, v, verb)) known = true;
+    }
+    if (!known) return std.fmt.allocPrint(gpa, "rejected: '{s}' is not an explore verb (use enumerate | expand | describe)", .{verb}) catch dupe(gpa, "rejected: bad explore verb");
+    if (node.len == 0) return dupe(gpa, "rejected: explore needs a node to look at");
+    const ep = std.fmt.allocPrint(gpa, "{s}/explore.jsonl", .{ctx.workdir}) catch return dupe(gpa, "oom");
+    defer gpa.free(ep);
+    const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, ep, gpa, .limited(256 << 10)) catch &[_]u8{};
+    defer if (prior.len > 0) gpa.free(prior);
+    var lines: usize = 0;
+    for (prior) |c| {
+        if (c == '\n') lines += 1;
+    }
+    if (lines >= EXPLORE_BUDGET) return std.fmt.allocPrint(gpa, "explore budget reached ({d}) — reason over what you've already mapped (recall/chain) before exploring more", .{EXPLORE_BUDGET}) catch dupe(gpa, "explore budget reached");
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    defer joined.deinit(gpa);
+    joined.appendSlice(gpa, prior) catch {};
+    if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n") catch {};
+    const line = if (rel.len > 0)
+        std.fmt.allocPrint(gpa, "{s} {s} {s}", .{ verb, node, rel }) catch return dupe(gpa, "oom")
+    else
+        std.fmt.allocPrint(gpa, "{s} {s}", .{ verb, node }) catch return dupe(gpa, "oom");
+    defer gpa.free(line);
+    joined.appendSlice(gpa, line) catch {};
+    joined.appendSlice(gpa, "\n") catch {};
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = ep, .data = joined.items }) catch return dupe(gpa, "could not queue the explore");
+    return std.fmt.allocPrint(gpa, "explore queued: {s} (read-only; the map updates in your memory next round)", .{line}) catch dupe(gpa, "explore queued");
 }
 
 fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {

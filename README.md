@@ -25,16 +25,7 @@ python deploy.py "Build a CLI todo app in Python, with tests" --follow
 
 ## The shape of it
 
-```
-        the Veil            one unified consciousness — integrates the hive into a single "I",
-          │                 speaks in the first person, and sets the standing will
-     orchestrator           reads the real state, assigns each mind a concrete piece
-    ┌────┬┴───┬────┐
-  mind  mind  mind  mind    the subconscious: autonomous minds, each with tools + a voice,
-    └────┴─┬──┴────┘        dividing the labour and building on each other
-       shared memory        one associative memory (neuron-db) the whole hive thinks with —
-                            spreading-activation recall surfaces what *any* mind learned
-```
+![how data oscillates through neuron-db](web/public/oscillation.svg)
 
 - **Hive memory.** Every mind writes to and recalls from one shared associative store. Ask the
   hive a question and it answers from what any member learned — even across facts that share no
@@ -242,7 +233,6 @@ perception becomes graph, reasoning becomes graph traversal, and the prompt cont
 a trust-weighted recall instead of carried as flat text. That round-trip — the **oscillation** — is
 what gives a small local model a floor to stand on: cheaper in tokens, richer in context.
 
-![how data oscillates through neuron-db](web/public/oscillation.svg)
 
 The hive's memory is **neuron-db** ([source](https://github.com/gary23w/neuron-db)), a small
 associative store compiled to a single `neuron` binary that `veil` shells out to for every
