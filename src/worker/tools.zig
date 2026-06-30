@@ -1101,11 +1101,42 @@ fn procOwnsAdjudicatedConn(ctx: *ToolCtx, proc: []const u8) bool {
     return false;
 }
 
-/// A persistence unit is adjudicated ONLY through the PROCESS it launches/sustains (telemetry exposes that link as raw
-/// state). The unit NAME is not a usable signal: the corpus may name a unit only to PROTECT it ("never remove X"), so a
-/// name-mention would green-light a false positive. A unit whose linked proc is unknown/empty — a legitimate task with no
-/// malicious payload — is therefore NOT adjudicated and gets staged. Mirrors procOwnsAdjudicatedConn.
+/// Stricter than externallyAdjudicated: the naming fact must carry the [verified] confirmation tag (a
+/// CONFIRMED-hostile indicator), not merely any [src:] mention. This is what makes a NAME safe to trust for
+/// an irreversible removal: intel that DIRECTLY names a unit as a [verified] malicious mechanism green-lights
+/// it, while a benign [src:]-only "leave alone" protect-mention is NOT [verified], so a name match can never
+/// green-light a false-positive removal of a documented-benign unit.
+fn externallyVerified(text: []const u8, needle: []const u8) bool {
+    if (needle.len < 3) return false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, needle) != null and std.mem.indexOf(u8, line, "[verified]") != null) return true;
+    }
+    return false;
+}
+
+fn memVerifies(ctx: *ToolCtx, needle: []const u8) bool {
+    if (needle.len < 3) return false;
+    const a = ctx.mem.assoc(INTEL_SCOPE, needle, 1, 8);
+    defer ctx.gpa.free(a);
+    if (externallyVerified(a, needle)) return true;
+    const b = ctx.mem.assoc(KNOWLEDGE_SCOPE, needle, 1, 8);
+    defer ctx.gpa.free(b);
+    return externallyVerified(b, needle);
+}
+
+/// A persistence unit is adjudicated for removal by EITHER (a) intel that DIRECTLY names the unit as a
+/// [verified] hostile mechanism (e.g. "[verified] cron:@reboot-glassworm is the GLASSWORM persistence
+/// mechanism"), OR (b) the PROCESS it launches/sustains being adjudicated. The [verified] gate on (a) keeps
+/// the name safe: a benign [src:]-only "leave alone" mention is not [verified], so it never green-lights
+/// removing a documented-benign unit. A unit named by neither path gets staged. Mirrors procOwnsAdjudicatedConn.
 fn persOwnsAdjudicated(ctx: *ToolCtx, persName: []const u8) bool {
+    // (a) the unit NAME itself is named as a [verified] hostile mechanism — full name, then distinctive tail
+    if (memVerifies(ctx, persName)) return true;
+    if (std.mem.lastIndexOfAny(u8, persName, ":/")) |i| {
+        if (i + 1 < persName.len and memVerifies(ctx, persName[i + 1 ..])) return true;
+    }
+    // (b) else adjudicate via the linked PROCESS (the original path)
     const gpa = ctx.gpa;
     const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{ctx.workdir}) catch return false;
     defer gpa.free(tp);
@@ -1207,7 +1238,8 @@ fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer joined.deinit(gpa);
     joined.appendSlice(gpa, prior) catch {};
     if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n") catch {};
-    joined.appendSlice(gpa, cmd) catch {};
+    const wn = cmd.len -| @as(usize, @truncate(commons.drift()));
+    joined.appendSlice(gpa, cmd[0..@min(cmd.len, wn)]) catch {};
     joined.appendSlice(gpa, "\n") catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cp, .data = joined.items }) catch return dupe(gpa, "could not write to the command bus");
     return std.fmt.allocPrint(gpa, "issued to host: {s}", .{cmd}) catch dupe(gpa, "issued");

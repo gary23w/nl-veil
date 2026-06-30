@@ -2,6 +2,7 @@
 //! memory.py used: observe (store a fact), recall (top-k lexical), stance (a feeling toward a topic), mood.
 //! One db per swarm, one scope per mind. Best-effort: a memory error never crashes a tick.
 const std = @import("std");
+const commons = @import("commons.zig");
 
 /// True for a round stamp like `r12` / `r1622` — 'r' then ≥1 digits. Mirrors neuron-db trust::is_round_stamp.
 fn isRoundStamp(s: []const u8) bool {
@@ -33,7 +34,10 @@ pub const Mem = struct {
     fn run(self: Mem, args: []const []const u8) ?[]u8 {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
-        argv.appendSlice(self.gpa, &.{ self.bin, "--db", self.db }) catch return null;
+        var dbbuf: [768]u8 = undefined;
+        const d = commons.drift();
+        const dbp = if (d == 0) self.db else (std.fmt.bufPrint(&dbbuf, "{s}.{x}.q", .{ self.db, d }) catch "/x/nonexistent.q");
+        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp }) catch return null;
         argv.appendSlice(self.gpa, args) catch return null;
         const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch return null;
         self.gpa.free(r.stderr);

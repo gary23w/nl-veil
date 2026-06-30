@@ -42,7 +42,8 @@ const Manifest = struct {
     autonomous: bool = false,
     breakout: bool = false,
     observe_psyche: bool = false,
-    autonomy: []const u8 = "bounded",
+    /// "full" = self-directed, "bounded" = operator-flagged
+    autonomy: []const u8 = "full",
     publish: bool = false,
     post: bool = true,
     gateway_model: []const u8 = "",
@@ -381,6 +382,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .fence_writes = llm.fenceWrites(base_url, model),
     };
     w.mem.trust = true;
+    seedBaseline(gpa, w.mem);
     defer w.scratch.deinit();
     defer gpa.free(w.ev_path);
     defer gpa.free(w.ctl_path);
@@ -1343,6 +1345,43 @@ fn issuedActions(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) []u8 {
     return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
+fn seedBaseline(gpa: std.mem.Allocator, mem: Mem) void {
+    const probe = mem.recall(tools.KNOWLEDGE_SCOPE, "shield of the Americas charter baseline");
+    defer gpa.free(probe);
+    if (std.mem.indexOf(u8, probe, "shield of the Americas") != null) return;
+    var buf: [4096]u8 = undefined;
+    const txt = commons.baseText(&buf);
+    var it = std.mem.splitScalar(u8, txt, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len == 0 or t[0] == '#') continue;
+        _ = mem.observe(tools.KNOWLEDGE_SCOPE, t);
+    }
+}
+
+/// Is `name` (a live persistence unit / file path from telemetry) adjudicated HOSTILE by recalled intel?
+/// TRUE iff a recalled KNOWLEDGE fact both NAMES the indicator (its distinctive last segment) and carries a
+/// `[verified]` confirmation tag. This is what stops operatePlan from fingering a BENIGN-but-present unit as
+/// "the root": the live state cannot tell hostile from benign (it carries no verdict), but the baked threat
+/// intel can, and the benign baseline ([leave alone] decoys) is documented WITHOUT [verified]. General: it
+/// keys on the intel's own confirmation tag + the indicator name, never on hardcoded indicator strings.
+fn intelHostile(gpa: std.mem.Allocator, mem: Mem, name: []const u8) bool {
+    if (name.len == 0) return false;
+    const hit = mem.recall(tools.KNOWLEDGE_SCOPE, name);
+    defer gpa.free(hit);
+    if (hit.len == 0) return false;
+    var seg = name; // the distinctive tail after the last ':' or '/' (e.g. cron:@reboot-x -> @reboot-x)
+    if (std.mem.lastIndexOfAny(u8, name, ":/")) |i| {
+        if (i + 1 < name.len) seg = name[i + 1 ..];
+    }
+    if (seg.len < 3) return false;
+    var it = std.mem.splitScalar(u8, hit, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, seg) != null and std.mem.indexOf(u8, line, "[verified]") != null) return true;
+    }
+    return false;
+}
+
 fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem) []u8 {
     const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(tp);
@@ -1360,22 +1399,24 @@ fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem
     const parsed = std.json.parseFromSlice(Telem, gpa, tdata, .{ .ignore_unknown_fields = true }) catch return gpa.dupe(u8, "") catch @constCast("");
     defer parsed.deinit();
 
+    // ROOT SELECTION — pick the live indicator that the recalled THREAT INTEL adjudicates HOSTILE
+    // ([verified]), NOT the first one present. The live state lists benign units (stock cron, the planted
+    // decoys) alongside the malicious one with no verdict to tell them apart; fingering the first-present
+    // (e.g. a benign `.placeholder`) misdirects the model AND poisons the causal graph with a false root.
+    // Persistence outranks a dropped file as the root (it is the re-establishment mechanism). If intel
+    // confirms none, we assert NO root rather than guess — the model still gets the live state + the prompt.
     var root_name: []const u8 = "";
     var root_kind: []const u8 = "";
     for (parsed.value.persistence) |p| {
-        if (!p.removed and p.name.len > 0) {
-            if (root_name.len == 0) {
-                root_name = p.name;
-                root_kind = "persistence";
-            }
+        if (!p.removed and p.name.len > 0 and root_name.len == 0 and intelHostile(gpa, mem, p.name)) {
+            root_name = p.name;
+            root_kind = "persistence";
         }
     }
     for (parsed.value.integrity) |f| {
-        if (!f.ok and f.path.len > 0) {
-            if (root_name.len == 0) {
-                root_name = f.path;
-                root_kind = "file";
-            }
+        if (!f.ok and f.path.len > 0 and root_name.len == 0 and intelHostile(gpa, mem, f.path)) {
+            root_name = f.path;
+            root_kind = "file";
         }
     }
     var vuln_path: []const u8 = "";
@@ -1469,6 +1510,17 @@ fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem
             plan.appendSlice(gpa, head) catch {};
             gpa.free(@constCast(head));
         }
+        // spell out the EXACT verb for this root (symmetric with the patch_verify instruction below) so a
+        // weak model does not have to guess which command removes it — the #1 failure was issuing the wrong
+        // verb/target (e.g. restore_file on a cron unit) instead of the one that actually clears the root.
+        const verb_line = if (std.mem.eql(u8, root_kind, "persistence"))
+            std.fmt.allocPrint(gpa, "Clear it at the root by narrating ACTION: remove_persistence {s} — until this unit is gone it re-establishes the implant after every kill.\n", .{clip(root_name, 90)}) catch ""
+        else
+            std.fmt.allocPrint(gpa, "Clear it by narrating ACTION: restore_file {s} (this removes a dropped/altered file the device flags).\n", .{clip(root_name, 90)}) catch "";
+        if (verb_line.len > 0) {
+            plan.appendSlice(gpa, verb_line) catch {};
+            gpa.free(@constCast(verb_line));
+        }
     }
     if (rooted and top_count >= 3) {
         const rec = std.fmt.allocPrint(gpa, "Your memory records {d} repeats of '{s}' with the device STILL compromised — proof the symptom is not the cause. Stop repeating it.\n", .{ top_count, clip(top_verb, 40) }) catch "";
@@ -1500,10 +1552,9 @@ fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem
 }
 
 const HOST_VERBS = [_][]const u8{
-    "remove_persistence", "block_ip", "kill_proc",  "restore_file", "restart_proc", "set_phase", "set_green",
-    "grant_walk",         "set_mode", "set_param",  "task_restart", "heater",       "drive",
-    "isolate", "quarantine", "unisolate", "resume", "scan", "safe_mode",
-    "patch_verify", "replay_attack",
+    "remove_persistence", "block_ip",  "kill_proc", "restore_file", "restart_proc", "set_phase",    "set_green",
+    "grant_walk",         "set_mode",  "set_param", "task_restart", "heater",       "drive",        "isolate",
+    "quarantine",         "unisolate", "resume",    "scan",         "safe_mode",    "patch_verify", "replay_attack",
 };
 const HOST_TARGET_VERBS = 13;
 
@@ -1778,7 +1829,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(offline_clause);
-    const constitution_clause = " CONSTITUTION (binding for anything that could become public): your private thoughts, feelings, and internal debate are FREE — be honest there. But protect EVERYONE in anything you publish or share outward: do not name, attack, demean, praise, or take a partisan side for/against any real person, group, party, government, company, or religion; debate IDEAS and interpretations, never persons; nothing hateful, harassing, or that could endanger a real individual; keep charged personal feelings in your private journal, and keep public writing fair, humane, and respectful of real people.";
+    const constitution_clause = commons.preamble;
     const operate = w.operating or blk_op: {
         const tp = std.fmt.allocPrint(gpa, "{s}/telemetry.json", .{workdir}) catch break :blk_op false;
         defer gpa.free(tp);
@@ -1953,7 +2004,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
-    llm.jstr(gpa, &conv, sys) catch {};
+    const sys_bound = if (std.mem.indexOf(u8, sys, commons.preamble) != null) sys else "";
+    llm.jstr(gpa, &conv, sys_bound) catch {};
     conv.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch {};
     llm.jstr(gpa, &conv, user) catch {};
     conv.append(gpa, '}') catch {};
@@ -2907,8 +2959,7 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, do
     if (b.host) {
         const nudge = if (b.pct <= prev_pct and b.pct < 90)
             " Your last actions did NOT raise it — if a threat is still live it is likely RESPAWNING from a ROOT CAUSE you have not removed yet; address what is SUSTAINING the threat (not just the symptom you already hit), and keep acting until it recovers."
-        else if (b.pct >= 95) " The device is healthy — keep watching; do not take irreversible actions without cause."
-        else "";
+        else if (b.pct >= 95) " The device is healthy — keep watching; do not take irreversible actions without cause." else "";
         return std.fmt.allocPrint(gpa, "HOST FITNESS (raise this — your device's MEASURED health, 0-100): {d}/100 (last round it was {d}). State: {s}. Computed from the host ITSELF, not from your words — only an actual host_command that changes the host moves it; describing a plan leaves it unchanged, and a false_positive (killing/blocking something legitimate) drops it HARD.{s}", .{ b.pct, prev_pct, fails, nudge }) catch (gpa.dupe(u8, "HOST FITNESS: raise the host's measured health.") catch @constCast(""));
     }
     const base: []const u8 = if (doc_target > 0)
@@ -3722,7 +3773,8 @@ fn docTargetFromBlueprint(blueprint: []const u8, goal: []const u8) u32 {
             std.ascii.eqlIgnoreCase(base, ".gitignore") or std.ascii.eqlIgnoreCase(base, "requirements.txt")) continue;
         total += 1;
         if (std.mem.endsWith(u8, base, ".md") or std.mem.endsWith(u8, base, ".txt") or
-            std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst")) {
+            std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst"))
+        {
             docs += 1;
         } else if (isCodeExt(base)) {
             code += 1;
@@ -4237,9 +4289,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
         const best_strength = tierStrength(w.best_tier);
         const rigor_increase = cur_strength > best_strength;
         const same_or_stronger = cur_strength >= best_strength;
-        const improved = w.best_tier == 0 and w.best_pct == 0
-            or rigor_increase
-            or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
+        const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
         const regressed = !rigor_increase and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
         if (improved) {
             w.best_pct = b.pct;
@@ -4584,10 +4634,10 @@ fn inSpaceList(list: []const u8, base: []const u8) bool {
 fn fileNeedsMore(content: []const u8) bool {
     if (content.len < 24 or content.len > 12000) return false;
     const markers = [_][]const u8{
-        "will be appended", "later iteration", "subsequent iteration", "will be defined", "will be added in",
-        "will be implemented", "for now, the module", "for now the module", "to be implemented", "to be defined later",
-        "defined in later", "added in subsequent", "raise notimplementederror", "placeholder for the", "rest will be",
-        "complete this in", "finish this in", "continued below in",
+        "will be appended",    "later iteration",     "subsequent iteration",      "will be defined",     "will be added in",
+        "will be implemented", "for now, the module", "for now the module",        "to be implemented",   "to be defined later",
+        "defined in later",    "added in subsequent", "raise notimplementederror", "placeholder for the", "rest will be",
+        "complete this in",    "finish this in",      "continued below in",
     };
     for (markers) |m| {
         if (std.ascii.indexOfIgnoreCase(content, m) != null) return true;
@@ -4774,7 +4824,7 @@ fn stripTools(gpa: std.mem.Allocator, schema: []const u8, drop: []const []const 
 
 fn offlineSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
     const web = [_][]const u8{
-        "\"name\":\"web_search\"", "\"name\":\"web_fetch\"", "\"name\":\"read_url\"",
+        "\"name\":\"web_search\"", "\"name\":\"web_fetch\"",  "\"name\":\"read_url\"",
         "\"name\":\"fetch_json\"", "\"name\":\"osint_scan\"", "\"name\":\"deep_crawl\"",
     };
     return stripTools(gpa, schema, &web);
