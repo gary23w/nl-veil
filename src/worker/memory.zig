@@ -111,6 +111,34 @@ pub const Mem = struct {
         return out orelse self.gpa.dupe(u8, "") catch @constCast("");
     }
 
+    pub fn chain(self: Mem, scope: []const u8, start: []const u8, rels: []const []const u8) []u8 {
+        const miss = self.gpa.dupe(u8, "") catch @constCast("");
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv.deinit(self.gpa);
+        argv.appendSlice(self.gpa, &.{ "--json", "chain", scope, start }) catch return miss;
+        argv.appendSlice(self.gpa, rels) catch return miss;
+        const out = self.run(argv.items) orelse return miss;
+        defer self.gpa.free(out);
+        const key = "\"value\":";
+        const i = std.mem.indexOf(u8, out, key) orelse return miss;
+        var p = i + key.len;
+        while (p < out.len and (out[p] == ' ' or out[p] == '\t')) p += 1;
+        if (p >= out.len or out[p] != '"') return miss;
+        p += 1;
+        const s = p;
+        while (p < out.len and out[p] != '"') : (p += 1) {
+            if (out[p] == '\\' and p + 1 < out.len) p += 1;
+        }
+        self.gpa.free(miss);
+        return self.gpa.dupe(u8, out[s..@min(p, out.len)]) catch @constCast("");
+    }
+
+    pub fn reinforce(self: Mem, scope: []const u8, topic: []const u8, feeling: []const u8) void {
+        self.lockW();
+        defer self.unlockW();
+        if (self.run(&.{ "reinforce", scope, topic, feeling })) |o| self.gpa.free(o);
+    }
+
     /// Reward the tag-classes recalled this round by the grounded fitness Δ (delta in [-1,1]). Writes the
     /// global trust ledger in this DB (lazily created on first reward). Write-locked; best-effort. ENGINE-
     /// DRIVEN ONLY — the minds never call this, so a mind cannot inflate its own class's trust.

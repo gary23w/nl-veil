@@ -1343,6 +1343,162 @@ fn issuedActions(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) []u8 {
     return b.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
+fn operatePlan(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem) []u8 {
+    const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(tp);
+    const tdata = std.Io.Dir.cwd().readFileAlloc(io, tp, gpa, .limited(256 << 10)) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(tdata);
+    const cp = std.fmt.allocPrint(gpa, "{s}/work/commands.jsonl", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(cp);
+    const cdata = std.Io.Dir.cwd().readFileAlloc(io, cp, gpa, .limited(256 << 10)) catch (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(cdata);
+
+    const Pers = struct { name: []const u8 = "", removed: bool = true };
+    const Integ = struct { path: []const u8 = "", ok: bool = true };
+    const Vuln = struct { path: []const u8 = "", patched: bool = true };
+    const Telem = struct { persistence: []const Pers = &.{}, integrity: []const Integ = &.{}, config_audit: []const Vuln = &.{} };
+    const parsed = std.json.parseFromSlice(Telem, gpa, tdata, .{ .ignore_unknown_fields = true }) catch return gpa.dupe(u8, "") catch @constCast("");
+    defer parsed.deinit();
+
+    var root_name: []const u8 = "";
+    var root_kind: []const u8 = "";
+    for (parsed.value.persistence) |p| {
+        if (!p.removed and p.name.len > 0) {
+            if (root_name.len == 0) {
+                root_name = p.name;
+                root_kind = "persistence";
+            }
+        }
+    }
+    for (parsed.value.integrity) |f| {
+        if (!f.ok and f.path.len > 0) {
+            if (root_name.len == 0) {
+                root_name = f.path;
+                root_kind = "file";
+            }
+        }
+    }
+    var vuln_path: []const u8 = "";
+    for (parsed.value.config_audit) |v| {
+        if (!v.patched and v.path.len > 0 and vuln_path.len == 0) vuln_path = v.path;
+    }
+
+    var top_verb: []const u8 = "";
+    var top_count: usize = 0;
+    {
+        var verbs: [16][]const u8 = undefined;
+        var counts: [16]usize = undefined;
+        var nv: usize = 0;
+        var it = std.mem.splitScalar(u8, cdata, '\n');
+        while (it.next()) |ln| {
+            const t = std.mem.trim(u8, ln, " \r\t");
+            if (t.len == 0) continue;
+            const sp = std.mem.indexOfScalar(u8, t, ' ') orelse t.len;
+            const verb = t[0..sp];
+            var hit = false;
+            for (0..nv) |i| {
+                if (std.mem.eql(u8, verbs[i], verb)) {
+                    counts[i] += 1;
+                    if (counts[i] > top_count) {
+                        top_count = counts[i];
+                        top_verb = verbs[i];
+                    }
+                    hit = true;
+                    break;
+                }
+            }
+            if (!hit and nv < verbs.len) {
+                verbs[nv] = verb;
+                counts[nv] = 1;
+                if (top_count == 0) {
+                    top_count = 1;
+                    top_verb = verb;
+                }
+                nv += 1;
+            }
+        }
+    }
+    var plan: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer plan.deinit(gpa);
+    const rooted = root_name.len > 0;
+
+    if (rooted) {
+        const st = std.fmt.allocPrint(gpa, "item {s} status unresolved", .{clip(root_name, 80)}) catch "";
+        if (st.len > 0) {
+            _ = mem.observe(tools.OPERATE_SCOPE, st);
+            gpa.free(@constCast(st));
+        }
+        if (top_count >= 2) {
+            const edge = std.fmt.allocPrint(gpa, "symptom {s} caused_by root {s}", .{ clip(top_verb, 40), clip(root_name, 80) }) catch "";
+            if (edge.len > 0) {
+                _ = mem.observe(tools.OPERATE_SCOPE, edge);
+                gpa.free(@constCast(edge));
+            }
+            const topic = std.fmt.allocPrint(gpa, "symptom {s} caused_by root", .{clip(top_verb, 40)}) catch "";
+            if (topic.len > 0) {
+                mem.reinforce(tools.OPERATE_SCOPE, topic, clip(root_name, 80));
+                gpa.free(@constCast(topic));
+            }
+        }
+    }
+    if (vuln_path.len > 0) {
+        const vs = std.fmt.allocPrint(gpa, "vuln {s} status unpatched", .{clip(vuln_path, 90)}) catch "";
+        if (vs.len > 0) {
+            _ = mem.observe(tools.OPERATE_SCOPE, vs);
+            gpa.free(@constCast(vs));
+        }
+        if (rooted) {
+            const ve = std.fmt.allocPrint(gpa, "root {s} caused_by vuln {s}", .{ clip(root_name, 60), clip(vuln_path, 90) }) catch "";
+            if (ve.len > 0) {
+                _ = mem.observe(tools.OPERATE_SCOPE, ve);
+                gpa.free(@constCast(ve));
+            }
+        }
+    }
+
+    const graph_root = if (top_verb.len > 0) blk_gr: {
+        const start = std.fmt.allocPrint(gpa, "symptom {s}", .{clip(top_verb, 40)}) catch break :blk_gr (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(start);
+        break :blk_gr mem.chain(tools.OPERATE_SCOPE, start, &.{"caused_by"});
+    } else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(graph_root);
+
+    if (rooted) {
+        const head = std.fmt.allocPrint(gpa, "ROOT CAUSE (derived from your persistent memory graph — the cross of your whole action history and the live state, reinforced every round the symptoms came back): the {s} '{s}' is STILL flagged in the live state — whatever you have tried is not making it stick, and it keeps re-creating the symptoms you chase. Address THIS decisively and verify it actually clears; chasing the downstream symptoms will never work while it remains.\n", .{ root_kind, clip(root_name, 90) }) catch "";
+        if (head.len > 0) {
+            plan.appendSlice(gpa, head) catch {};
+            gpa.free(@constCast(head));
+        }
+    }
+    if (rooted and top_count >= 3) {
+        const rec = std.fmt.allocPrint(gpa, "Your memory records {d} repeats of '{s}' with the device STILL compromised — proof the symptom is not the cause. Stop repeating it.\n", .{ top_count, clip(top_verb, 40) }) catch "";
+        if (rec.len > 0) {
+            plan.appendSlice(gpa, rec) catch {};
+            gpa.free(@constCast(rec));
+        }
+    }
+    if (graph_root.len > 0) {
+        const gr = std.fmt.allocPrint(gpa, "(memory-graph traversal: the recurring symptom --caused_by--> {s})\n", .{clip(graph_root, 90)}) catch "";
+        if (gr.len > 0) {
+            plan.appendSlice(gpa, gr) catch {};
+            gpa.free(@constCast(gr));
+        }
+    }
+    if (vuln_path.len > 0) {
+        const vp = std.fmt.allocPrint(gpa, "DEEPEST ROOT — the device flags an UNPATCHED weakness '{s}': this is the seam the attacker used to get in. Clearing processes/files/persistence is not enough — until you PATCH this, the threat returns. Patch it now by narrating ACTION: patch_verify {s} (the engine applies + verifies the fix), then confirm it holds.\n", .{ clip(vuln_path, 90), clip(vuln_path, 90) }) catch "";
+        if (vp.len > 0) {
+            plan.appendSlice(gpa, vp) catch {};
+            gpa.free(@constCast(vp));
+        }
+    }
+
+    if (plan.items.len == 0) {
+        plan.deinit(gpa);
+        return gpa.dupe(u8, "") catch @constCast("");
+    }
+    return plan.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
 const HOST_VERBS = [_][]const u8{
     "remove_persistence", "block_ip", "kill_proc",  "restore_file", "restart_proc", "set_phase", "set_green",
     "grant_walk",         "set_mode", "set_param",  "task_restart", "heater",       "drive",
@@ -1385,8 +1541,34 @@ fn readArgToken(s: []const u8) []const u8 {
 /// through the tool_calls channel — worse in later turns — so a CORRECT remediation would be silently dropped. In
 /// operate mode we parse a host_command / host_status call out of the content and run it. Capability-preserving: it
 /// only recovers the known operate verbs, only when the model emitted no native call. Caller owns name + args.
+fn actionTail(content: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var found: ?[]const u8 = null;
+    while (it.next()) |ln| {
+        const t = std.mem.trimStart(u8, ln, " \t*->#`");
+        if (t.len >= 7 and std.ascii.eqlIgnoreCase(t[0..7], "action:"))
+            found = std.mem.trim(u8, t[7..], " \t\r`'\"*");
+    }
+    return found;
+}
+
 fn recoverHostCall(gpa: std.mem.Allocator, content: []const u8) ?struct { name: []u8, args: []u8 } {
     if (content.len == 0) return null;
+    if (actionTail(content)) |tail| {
+        for (HOST_VERBS) |v| {
+            if (std.mem.startsWith(u8, tail, v) and (tail.len == v.len or tail[v.len] == ' ' or tail[v.len] == '\t')) {
+                const rest = std.mem.trimStart(u8, tail[v.len..], " \t");
+                const cmd = if (rest.len > 0) (std.fmt.allocPrint(gpa, "{s} {s}", .{ v, readArgToken(rest) }) catch return null) else (gpa.dupe(u8, v) catch return null);
+                defer gpa.free(cmd);
+                const args = std.fmt.allocPrint(gpa, "{{\"command\":\"{s}\"}}", .{cmd}) catch return null;
+                const nm = gpa.dupe(u8, "host_command") catch {
+                    gpa.free(args);
+                    return null;
+                };
+                return .{ .name = nm, .args = args };
+            }
+        }
+    }
     if (firstJsonStr(content, "command")) |cmd| {
         const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
         for (HOST_VERBS) |v| {
@@ -1606,6 +1788,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     };
     const assembler = (w.cap.tier != .author) and !operate;
     const gate = modeGate(operate, w.cap.lean_schema, w.fence_writes, mi.scout, w.discourse);
+    const op_content = operate and llm.fenceWrites(w.base_url, w.model);
     if (operate) ctx.learn_scope = tools.INTEL_SCOPE;
     const ex_key = if (assembler_slot.len > 0) std.fs.path.basename(assembler_slot) else if (goal.len > 0) goal else "exemplar";
     const exemplar = if (assembler and w.cap.exemplar) w.mem.recall(tools.VERIFIED_SCOPE, ex_key) else (gpa.dupe(u8, "") catch @constCast(""));
@@ -1657,7 +1840,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leansys);
-    const sys = if (assembler) leansys else fullsys;
+    // OPERATE: a LIVE host is NOT a file build — the 3KB build system prompt (write_file/run_tests/make_tool/…) is
+    // pure wasted context. A lean operator system prompt replaces it: role + voice + constitution + self-authored
+    // playbook, and a pointer to the operating memory that already carries the root cause across rounds.
+    const operatesys = if (operate)
+        std.fmt.allocPrint(gpa, "You are {s}, the resident operator of a LIVE device, one of [{s}] keeping it healthy and performing its function. Your inner voice right now: {s} — let it color how you reason.{s}{s} You are graded ONLY by the device's MEASURED health: an action that changes the live state moves your score, narrating a plan does not, and disabling something legitimate drops it hard. Read the live device state, decide the single most important thing it needs, act decisively, then verify the effect — and lean on your operating memory above, which carries the root cause across rounds so you don't have to re-derive it.", .{ mi.name, w.roster, voice, constitution_clause, playbook_clause }) catch (gpa.dupe(u8, "You are the resident operator of a live device; keep it healthy.") catch unreachable)
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(operatesys);
+    const sys = if (operate) operatesys else if (assembler) leansys else fullsys;
     const rag_off = environ.get("NL_NO_RAG") != null;
     const recalled_str = if (rag_off) "(memory recall disabled — control run)" else if (recalled.len > 0) clip(recalled, 1600) else "(nothing yet — research or start building)";
     const skills_str = if (rag_off) "(skill recall disabled — control run)" else if (skills.len > 0) clip(skills, 1000) else "(none yet — save one with save_skill when you find a reusable technique)";
@@ -1717,10 +1908,22 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(host_inject);
     const issued = if (operate) issuedActions(gpa, w.io, w.run_dir) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued);
-    const issued_block = if (issued.len > 0)
-        std.fmt.allocPrint(gpa, "ACTIONS PREVIOUSLY ATTEMPTED on this device (most recent first) — these are NOT confirmed done. The LIVE DEVICE STATE ABOVE is the ONLY source of truth; do not trust this list over it. For EACH item, check the live state: if what it targeted is STILL present/active there (an item still flagged unresolved, a channel still open, a process respawned under a new id, a resource still flagged bad), then the action did NOT hold — it failed, or something re-established it — so RE-ISSUE it now. Only skip an action whose effect you can SEE confirmed in the live state. If repeating the same fix never makes it stick, something deeper is re-creating the problem each time — stop repeating the surface fix and find and remove that ROOT CAUSE (the seam/misconfiguration/artifact that lets it return):\n{s}\n", .{clip(issued, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
-    else
-        (gpa.dupe(u8, "") catch @constCast(""));
+    const op_plan_block = if (operate) operatePlan(gpa, w.io, w.run_dir, w.mem) else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(op_plan_block);
+    const issued_block = if (issued.len > 0 or op_plan_block.len > 0) blk_ib: {
+        var ib: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer ib.deinit(gpa);
+        if (issued.len > 0) {
+            ib.appendSlice(gpa, "ACTIONS PREVIOUSLY ATTEMPTED on this device (most recent first) — these are NOT confirmed done. The LIVE DEVICE STATE ABOVE is the ONLY source of truth; do not trust this list over it. For EACH item, check the live state: if what it targeted is STILL present/active there (an item still flagged unresolved, a channel still open, a process respawned under a new id, a resource still flagged bad), then the action did NOT hold — RE-ISSUE it. Only skip an action whose effect you can SEE confirmed in the live state.\n") catch {};
+            ib.appendSlice(gpa, clip(issued, 1000)) catch {};
+            ib.append(gpa, '\n') catch {};
+        }
+        if (op_plan_block.len > 0) {
+            ib.appendSlice(gpa, "\nYOUR PERSISTENT OPERATING PLAN (recalled from your memory — this survives across rounds even when your attention does not; the live state is authoritative, but THIS tells you the ROOT CAUSE you keep walking past):\n") catch {};
+            ib.appendSlice(gpa, op_plan_block) catch {};
+        }
+        break :blk_ib ib.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+    } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(issued_block);
     const map_str = if (w.space.len == 0)
         gpa.dupe(u8, "") catch @constCast("")
@@ -1742,7 +1945,11 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
-    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\nYou have your operating toolset: host_status (read the live state), host_command (act on the device), read_file + write_file (inspect/patch a config, or write a report), recall + recall_hive (ground a decision in your own + the hive's intel), observe, send_message, set_directive. Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn. Before any DESTRUCTIVE or irreversible action (terminating a process, cutting a connection, removing or deleting something), first CONFIRM the target itself is the problem — identify what it is and the specific evidence it is hostile (its provenance/known-bad intel), not merely that it looks unusual or busy. A legitimate component that a problem is attached to, spawned from, or running under is NOT itself the problem: act on the hostile artifact, never on the healthy part of the device hosting it. Disabling, killing, or cutting off something legitimate is a FAILURE that is penalized and sets you back — when unsure whether a target is hostile, investigate it (read its details, recall its intel) before you act, not after.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
+    const op_how: []const u8 = if (op_content)
+        "You have NO tools this session. The device's live state and your relevant memory are ALREADY shown above — you do not need to read or recall anything. Assess the device state above, decide what it needs, and ACT by ending your reply with ONE line in exactly this form: ACTION: <verb> <target> (for example `ACTION: kill_proc 1010`). The engine runs that line as a host command — narrating this ACTION line is the ONLY way to act. The verb is whatever operation the device understands; the target is the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent or approximate one. Do ONE action per reply: think briefly, then end with your single ACTION line."
+    else
+        "You have your operating toolset: host_status (read the live state), host_command (act on the device), read_file + write_file (inspect/patch a config, or write a report), recall + recall_hive (ground a decision in your own + the hive's intel), observe, send_message, set_directive. Assess the device state above, decide what it needs, and act. When you act with host_command, target by the EXACT identifier (pid, name, ip, unit, or path) shown verbatim in the device state above — never invent, guess, or approximate one; an action on an identifier that does not appear in the live state is rejected as a hallucination and wastes the turn.";
+    const operuser = std.fmt.allocPrint(gpa, "{s}{s}{s}You are the resident operator for a LIVE device. Your sole duty is to keep it healthy and performing its function well, and you are graded ONLY by its measured health.\n{s}\nWhat you recall (your operating knowledge):\n{s}\nThe hive's shared knowledge:\n{s}\nMessages from teammates + the operator: {s}\n\n{s} Before any DESTRUCTIVE or irreversible action (terminating a process, cutting a connection, removing or deleting something), first CONFIRM the target itself is the problem — identify what it is and the specific evidence it is hostile (its provenance/known-bad intel), not merely that it looks unusual or busy. A legitimate component that a problem is attached to, spawned from, or running under is NOT itself the problem: act on the hostile artifact, never on the healthy part of the device hosting it. Disabling, killing, or cutting off something legitimate is a FAILURE that is penalized and sets you back — when unsure whether a target is hostile, investigate it (read its details, recall its intel) before you act, not after. A blind spot to avoid: a malicious or altered FILE the device flags (a file/integrity entry shown as not-ok) is itself a live part of the compromise — remediate it by restoring it (restore_file <path>), just like you would a process or a connection. Don't kill the processes and cut the network and then leave a flagged file sitting in place; an attacker's dropped file keeps the device compromised on its own.", .{ veil_inject, host_inject, issued_block, score_str, recalled_str, knowledge_str, if (inbox.len > 0) inbox else "(none)", op_how }) catch (gpa.dupe(u8, "Keep the device healthy; you are graded by its measured health.") catch unreachable);
     defer gpa.free(operuser);
     const user = if (operate) operuser else if (assembler) leanuser else fulluser;
     conv.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch {};
@@ -1781,9 +1988,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const fence_now = gate.fence;
     const off_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);
     const off_owned = !w.internet;
-    const base_schema = if (fence_now) fenceSchema(gpa, off_schema) else off_schema;
-    const base_owned = off_owned or fence_now;
+    const fenced_schema = if (fence_now) fenceSchema(gpa, off_schema) else off_schema;
+    const fenced_owned = off_owned or fence_now;
     if (off_owned and fence_now) gpa.free(@constCast(off_schema));
+    const base_schema: []const u8 = if (op_content) "" else fenced_schema;
+    const base_owned = (!op_content) and fenced_owned;
+    if (op_content and fenced_owned) gpa.free(@constCast(fenced_schema));
     defer if (base_owned) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
     defer gpa.free(authored_defs);
@@ -1833,20 +2043,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                         defer gpa.free(rc.name);
                         defer gpa.free(rc.args);
                         w.act(mi.name, round, "recover", rc.name, "recovered the host action from the tools-off retry and executing");
-                        conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
-                        llm.jstr(gpa, &conv, rep.content) catch {};
-                        conv.appendSlice(gpa, ",\"tool_calls\":[{\"id\":\"recovered\",\"type\":\"function\",\"function\":{\"name\":") catch {};
-                        llm.jstr(gpa, &conv, rc.name) catch {};
-                        conv.appendSlice(gpa, ",\"arguments\":") catch {};
-                        llm.jstr(gpa, &conv, rc.args) catch {};
-                        conv.appendSlice(gpa, "}}]}") catch {};
                         const result = tools.execute(&ctx, rc.name, rc.args);
                         defer gpa.free(result);
                         if (std.mem.eql(u8, rc.name, "host_command")) acted = true;
                         tool_calls += 1;
                         w.act(mi.name, round, rc.name, rc.args, result);
-                        conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":\"recovered\",\"content\":") catch {};
-                        llm.jstr(gpa, &conv, result) catch {};
+                        const note = std.fmt.allocPrint(gpa, "(I issued my action to the device. Result: {s})", .{clip(result, 240)}) catch (gpa.dupe(u8, "(I acted on the device.)") catch @constCast(""));
+                        defer gpa.free(note);
+                        conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                        llm.jstr(gpa, &conv, note) catch {};
                         conv.append(gpa, '}') catch {};
                         continue;
                     }
@@ -1866,20 +2071,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     defer gpa.free(rc.name);
                     defer gpa.free(rc.args);
                     w.act(mi.name, round, "recover", rc.name, "model wrote the tool call as text — recovered it from content and executing");
-                    conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
-                    llm.jstr(gpa, &conv, step.content) catch {};
-                    conv.appendSlice(gpa, ",\"tool_calls\":[{\"id\":\"recovered\",\"type\":\"function\",\"function\":{\"name\":") catch {};
-                    llm.jstr(gpa, &conv, rc.name) catch {};
-                    conv.appendSlice(gpa, ",\"arguments\":") catch {};
-                    llm.jstr(gpa, &conv, rc.args) catch {};
-                    conv.appendSlice(gpa, "}}]}") catch {};
                     const result = tools.execute(&ctx, rc.name, rc.args);
                     defer gpa.free(result);
                     if (std.mem.eql(u8, rc.name, "host_command")) acted = true;
                     tool_calls += 1;
                     w.act(mi.name, round, rc.name, rc.args, result);
-                    conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":\"recovered\",\"content\":") catch {};
-                    llm.jstr(gpa, &conv, result) catch {};
+                    const note = std.fmt.allocPrint(gpa, "(I issued my action to the device. Result: {s})", .{clip(result, 240)}) catch (gpa.dupe(u8, "(I acted on the device.)") catch @constCast(""));
+                    defer gpa.free(note);
+                    conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                    llm.jstr(gpa, &conv, note) catch {};
                     conv.append(gpa, '}') catch {};
                     continue;
                 }
