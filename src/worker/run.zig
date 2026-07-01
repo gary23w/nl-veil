@@ -135,8 +135,8 @@ pub const Worker = struct {
     base_url: []const u8,
     key: []const u8,
     model: []const u8,
-    fence_writes: bool = false,
-    tool_parse_fails: u32 = 0, // provider large-tool-call parse failures — 2 strikes flips fence_writes on adaptively
+    fence_writes: bool = false, // written ONLY between rounds (single-threaded); moments read it freely
+    tool_parse_fails: std.atomic.Value(u32) = .init(0), // strikes recorded from parallel moments; flip applied between rounds
     max_tokens_eff: u32 = 8192, // per-turn completion budget: NL_MAX_TOKENS override, else scaled to the probed ctx
     clip_scale: f32 = 1.0, // prompt-section byte budgets scale with the probed context window (1.0 = full 32k)
     hyperspace: bool = false, // Lever 2: settle a dense hierarchy of grounding in-process before each model call
@@ -164,6 +164,8 @@ pub const Worker = struct {
     cap_pinned: bool = false,
     cap_streak: u32 = 0,
     promo_streak: u32 = 0, // consecutive fully-strong rounds — 2 promotes the tier back up (RSI, both directions)
+    tier_was_promoted: bool = false, // the current tier was reached via promotion (so a demote = the promote failed)
+    promo_locked: bool = false, // a promote->demote round-trip happened: the higher tier measurably drowns this model — stop flapping
     goals_done: u32 = 0,
     strategy_str: []const u8 = "",
     blueprint: []const u8 = "",
@@ -922,6 +924,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live) trackConvergence(&w, run_dir, goal, round);
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
+        // ADAPTIVE FENCE flip (single-threaded here): a backend that failed to PARSE large tool calls twice
+        // will keep failing on every full-file write_file (llama3.1:8b lost 6/6 writes this way) — switch the
+        // whole worker to fenced writes, exactly what a probed thinking model gets from the start.
+        if (live and !w.operating and !w.fence_writes and w.tool_parse_fails.load(.monotonic) >= 2) {
+            w.fence_writes = true;
+            llm.recordLargeToolWall(gpa, w.io, w.run_dir, w.model); // persist: future runs of this model fence from round 1
+            w.act("engine", round, "fence_writes", "adaptive", "the provider failed to parse large tool calls twice — switching this swarm to FENCED writes from the next round (write_file leaves the schema; files are emitted as fenced blocks / SEARCH-REPLACE edits and the salvage commits them), and caching the verdict for future runs");
+        }
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
         if (live and !w.quick) applyScoutRewards(&w, round); // grounded APPLICATION anchor: a scouted token in a built file -> +0.40 source trust
@@ -2322,8 +2332,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const chunk_clause = " If this file would run more than ~40 lines, do NOT try to emit it all in one call — THIS round write a strong FIRST PART (imports/setup + the first function or section, correct as far as it goes) with write_file, then GROW it using write_file mode:\"append\" over the next rounds. A partial runnable file is real progress; producing nothing is a wasted round.";
     const slot = if (assembler) blk_slot: {
         if (assembler_slot.len > 0) {
-            if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot)))
+            if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot))) {
+                // fence mode has NO write_file — telling a fenced mind to use mode:"append" makes obedience
+                // impossible; the fenced continuation is a SEARCH/REPLACE that extends the file's tail.
+                if (gate.fence)
+                    break :blk_slot std.fmt.allocPrint(gpa, "The file `{s}` is PARTIAL — only its first part exists (its current content appears below when small; otherwise read_file it first). CONTINUE it with SEARCH/REPLACE blocks: SEARCH the file's current LAST line(s), REPLACE them with themselves plus the missing functions/sections, and DELETE any 'to be appended / defined in later iterations / for now the module exposes' placeholder comments, until it is COMPLETE and runnable. Do NOT re-emit the whole file or the imports.", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
                 break :blk_slot std.fmt.allocPrint(gpa, "The file `{s}` is PARTIAL — only its first part exists (its current content appears below when small; otherwise read_file it first). CONTINUE it with write_file mode:\"append\": add ONLY the missing functions/sections — do NOT re-emit the imports or anything already there — and DELETE any 'to be appended / defined in later iterations / for now the module exposes' placeholder comments, until it is COMPLETE and runnable.", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
+            }
             const bpl = bpLineFor(w.blueprint, assembler_slot);
             if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.{s}", .{ assembler_slot, clip(bpl, 200), chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
             break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order.{s}", .{ assembler_slot, chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
@@ -2361,8 +2376,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         const slice = w.mem.assoc(tools.KNOWLEDGE_SCOPE, kq, 1, 6);
         defer gpa.free(slice);
         const idx = if (w.kindex_str.len > 0) clip(w.kindex_str, scaledClip(w, 900)) else "(nothing learned yet — research it first)";
-        const rel = if (slice.len > 0) clip(slice, scaledClip(w, 1000)) else "(nothing specific yet — recall_hive a topic above, or research it)";
-        break :blk_kb std.fmt.allocPrint(gpa, "FOLLOW THESE CONVENTIONS — what the hive has LEARNED about your exact task; your file MUST match these names, signatures, and constants (they outrank your own defaults):\n{s}\nMore topics the hive knows — recall_hive('<topic>') for detail:\n{s}\n\n", .{ rel, idx }) catch (gpa.dupe(u8, "") catch @constCast(""));
+        const rel = if (slice.len > 0) clip(slice, scaledClip(w, 1000)) else "(nothing specific yet — recall_hive a topic listed below, or research it)";
+        break :blk_kb std.fmt.allocPrint(gpa, "FOLLOW THESE CONVENTIONS — what the hive has LEARNED about your exact task; your file MUST match these names, signatures, and constants. PRECEDENCE when things conflict: these conventions > the file's current content > your own defaults (correct the file to match the conventions):\n{s}\nMore topics the hive knows — recall_hive('<topic>') for detail:\n{s}\n\n", .{ rel, idx }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(know_block);
     // WRITE-TIME FILE STATE: a weak model told to "read_file it first" routinely skips the call and edits from
@@ -2374,7 +2389,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         const cur = std.Io.Dir.cwd().readFileAlloc(w.io, sfull, gpa, .limited(scaledClip(w, 8 << 10))) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
         defer gpa.free(cur);
         if (std.mem.trim(u8, cur, " \r\n\t").len == 0) break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
-        break :blk_sf std.fmt.allocPrint(gpa, "YOUR FILE AS IT EXISTS RIGHT NOW — `{s}` (CONTINUE/IMPROVE this exact content; do NOT restart it from scratch):\n```\n{s}\n```\n\n", .{ assembler_slot, cur }) catch (gpa.dupe(u8, "") catch @constCast(""));
+        // when the failing signal implicates THIS file, the engine's no-clobber guard already stands aside —
+        // tell the model so, or it obeys "do NOT restart" while the engine waits for exactly that rewrite.
+        const guidance = if (slotImplicatedInFailure(w, assembler_slot))
+            "this file is IMPLICATED in the failing signal shown under PROGRESS — if its STRUCTURE is wrong, reply with a corrected FULL rewrite (a shorter correct file is accepted); otherwise fix just the broken part"
+        else
+            "CONTINUE/IMPROVE this exact content; do NOT restart it from scratch";
+        break :blk_sf std.fmt.allocPrint(gpa, "YOUR FILE AS IT EXISTS RIGHT NOW — `{s}` ({s}):\n```\n{s}\n```\n\n", .{ assembler_slot, guidance, cur }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(slot_file_block);
     const fence_build = gate.fence;
@@ -2598,17 +2619,11 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             monologue = std.fmt.allocPrint(gpa, "[llm error] {s}", .{step.content}) catch (gpa.dupe(u8, "[llm error]") catch unreachable);
             if (!operate and (fence_build or std.mem.indexOf(u8, live_schema, "write_file") != null) and isToolParseError(step.content)) {
                 w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse a large tool call — re-issuing the turn WITHOUT tools to recover the change as text");
-                // ADAPTIVE FENCE (emergent — no model-name casing): a backend that fails to PARSE large tool
-                // calls will keep failing on every full-file write_file (llama3.1:8b lost 6/6 writes this way).
-                // Two strikes flips the whole worker to fenced writes — exactly what a probed thinking model
-                // gets from the start — so the fix comes from the live failure signal, not a hardcoded list.
-                if (!w.fence_writes) {
-                    w.tool_parse_fails += 1;
-                    if (w.tool_parse_fails >= 2) {
-                        w.fence_writes = true;
-                        w.act(mi.name, round, "fence_writes", "adaptive", "the provider failed to parse large tool calls twice — switching this swarm to FENCED writes from the next moment (write_file leaves the schema; files are emitted as fenced blocks / SEARCH-REPLACE edits and the salvage commits them)");
-                    }
-                }
+                // ADAPTIVE FENCE strike (emergent — no model-name casing): record the parse failure atomically;
+                // moments run in PARALLEL threads sharing this Worker, so the two-strike aggregation and the
+                // fence_writes flip happen in the single-threaded between-rounds section (a plain += here lost
+                // strikes to the race, and a mid-moment bool write was UB for concurrent readers).
+                if (!w.fence_writes) _ = w.tool_parse_fails.fetchAdd(1, .monotonic);
                 var rconv: std.ArrayListUnmanaged(u8) = .empty;
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
@@ -2871,7 +2886,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     }
 
     if (!mi.scout and files == 0 and !operate) editblk: {
-        const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
+        const salvage_slot0 = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
+        // SLOTLESS RESCUE: a surplus-rank mind sometimes narrates a COMPLETE missing blueprint file (observed
+        // live: a correct test_store.py, dropped with zero trace because it had no slot). If the reply's head
+        // names exactly ONE unbuilt blueprint file and carries a fenced body, salvage into that file.
+        const derived = if (salvage_slot0.len == 0) deriveSlotFromReply(w, monologue) else "";
+        const salvage_slot = if (salvage_slot0.len > 0) salvage_slot0 else derived;
+        if (derived.len > 0) w.act(mi.name, round, "salvage_derive", derived, "slotless reply names exactly one unbuilt blueprint file — salvaging into it");
         // SURGICAL EDIT first: if the reply carries narrated SEARCH/REPLACE blocks, apply them through the SAME
         // edit_file executor (resolves the path, buffers the file, applies the ops all-or-nothing). This is how a
         // fenced local model changes a LARGE existing file — it emits only anchors + changes, never the whole file.
@@ -2916,22 +2937,62 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     defer rconv.deinit(gpa);
                     rconv.appendSlice(gpa, conv.items) catch {};
                     rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch {};
-                    const cmsg = std.fmt.allocPrint(gpa, "Your reply could not be saved as your file — {s}. Reply again with ONLY the file `{s}`: its relative path on the first line, then EXACTLY ONE fenced code block (```lang … ```) holding the COMPLETE corrected file. No prose before or after the block, no tool-call JSON, no SEARCH/REPLACE markers.", .{ why, salvage_slot }) catch "";
+                    // FORM-AWARE correction: for a LARGE existing file the right re-emit is a surgical
+                    // SEARCH/REPLACE (a full re-emit may not even fit the completion budget); a small or
+                    // absent file gets the full-fenced-file form. The retry reply accepts EITHER — the edit
+                    // route is tried first below, exactly like the primary salvage path.
+                    const exist_len = blk_el: {
+                        const fullp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch break :blk_el @as(usize, 0);
+                        defer gpa.free(fullp);
+                        const st = std.Io.Dir.cwd().readFileAlloc(w.io, fullp, gpa, .limited(256 << 10)) catch break :blk_el @as(usize, 0);
+                        defer gpa.free(st);
+                        break :blk_el st.len;
+                    };
+                    const cmsg = if (exist_len > 2048)
+                        std.fmt.allocPrint(gpa, "Your reply could not be saved — {s}. The file `{s}` already EXISTS ({d} bytes), so do NOT re-emit it whole: reply with its relative path on the first line, then one or more SEARCH/REPLACE blocks (<<<<<<< SEARCH / ======= / >>>>>>> REPLACE) whose SEARCH lines are copied VERBATIM from the file shown earlier. No prose, no tool-call JSON.", .{ why, salvage_slot, exist_len }) catch ""
+                    else
+                        std.fmt.allocPrint(gpa, "Your reply could not be saved as your file — {s}. Reply again with ONLY the file `{s}`: its relative path on the first line, then EXACTLY ONE fenced code block (```lang … ```) holding the COMPLETE corrected file. No prose before or after the block, no tool-call JSON, no SEARCH/REPLACE markers.", .{ why, salvage_slot }) catch "";
                     defer if (cmsg.len > 0) gpa.free(@constCast(cmsg));
                     llm.jstr(gpa, &rconv, if (cmsg.len > 0) cmsg else "Reply with ONLY your complete file as one fenced code block led by its relative path.") catch {};
                     rconv.append(gpa, '}') catch {};
                     var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
                     defer rep.deinit(gpa);
                     if (rep.ok and rep.content.len > 0) {
-                        const body2 = salvageFileBody(gpa, rep.content);
-                        if (salvageRejectReason(w, salvage_slot, body2)) |why2| {
-                            if (body2.len > 0) gpa.free(@constCast(body2));
-                            w.act(mi.name, round, "salvage_retry_reject", salvage_slot, why2);
+                        if (bufedit.parseNarratedSlot(gpa, rep.content, salvage_slot)) |n2| {
+                            // the retry answered in the surgical form — route it through the same edit_file
+                            // executor as the primary path (all-or-nothing, path-resolved, VCS-aware)
+                            defer bufedit.freeNarrated(gpa, n2);
+                            var eargs2: std.ArrayListUnmanaged(u8) = .empty;
+                            defer eargs2.deinit(gpa);
+                            eargs2.appendSlice(gpa, "{\"path\":") catch {};
+                            llm.jstr(gpa, &eargs2, n2.path) catch {};
+                            eargs2.appendSlice(gpa, ",\"ops\":[") catch {};
+                            for (n2.ops, 0..) |op, oi| {
+                                if (oi > 0) eargs2.appendSlice(gpa, ",") catch {};
+                                eargs2.appendSlice(gpa, "{\"op\":\"") catch {};
+                                eargs2.appendSlice(gpa, @tagName(op.kind)) catch {};
+                                eargs2.appendSlice(gpa, "\",\"anchor\":") catch {};
+                                llm.jstr(gpa, &eargs2, op.anchor) catch {};
+                                eargs2.appendSlice(gpa, ",\"text\":") catch {};
+                                llm.jstr(gpa, &eargs2, op.text) catch {};
+                                eargs2.appendSlice(gpa, "}") catch {};
+                            }
+                            eargs2.appendSlice(gpa, "]}") catch {};
+                            const eres2 = tools.execute(&ctx, "edit_file", eargs2.items);
+                            defer gpa.free(eres2);
+                            const applied2 = std.mem.startsWith(u8, eres2, "edited ");
+                            w.act(mi.name, round, if (applied2) "salvage_retry" else "salvage_retry_reject", n2.path, clip(eres2, 220));
                         } else {
-                            if (body.len > 0) gpa.free(@constCast(body));
-                            body = body2;
-                            reject = null;
-                            w.act(mi.name, round, "salvage_retry", salvage_slot, "corrective feedback produced a valid file body on the second attempt");
+                            const body2 = salvageFileBody(gpa, rep.content);
+                            if (salvageRejectReason(w, salvage_slot, body2)) |why2| {
+                                if (body2.len > 0) gpa.free(@constCast(body2));
+                                w.act(mi.name, round, "salvage_retry_reject", salvage_slot, why2);
+                            } else {
+                                if (body.len > 0) gpa.free(@constCast(body));
+                                body = body2;
+                                reject = null;
+                                w.act(mi.name, round, "salvage_retry", salvage_slot, "corrective feedback produced a valid file body on the second attempt");
+                            }
                         }
                     }
                 }
@@ -3078,23 +3139,78 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     return null;
 }
 
-/// The no-clobber rule must not LOCK IN a failing file: when the live fitness/smoke/interface signal names
-/// THIS slot (a failing import or test implicating it), a valid replacement may shrink the file — that is the
-/// fix converging, not a clobber. (Observed live: a wrong class-shaped store.py could never be replaced by the
-/// corrected function-shaped rewrite because the bad version was longer.)
+/// A slotless mind's narrated file, matched to the ONE unbuilt blueprint file its reply names near the head.
+/// Conservative: requires a fenced body, and exactly one distinct unbuilt basename match — ambiguity means no
+/// derivation (better to drop one rescue than to write the wrong file). Returned slice is gpa-owned ("" = none).
+fn deriveSlotFromReply(w: *Worker, monologue: []const u8) []const u8 {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0) return "";
+    if (std.mem.indexOf(u8, monologue, "```") == null) return "";
+    const head = monologue[0..@min(monologue.len, 600)];
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return "";
+    defer gpa.free(mpath);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch "";
+    defer if (manifest.len > 0) gpa.free(manifest);
+    var match: []const u8 = "";
+    var matches: u32 = 0;
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const base = std.fs.path.basename(bp);
+        if (base.len < 4) continue;
+        if (builtInManifest(manifest, base)) continue;
+        if (std.mem.indexOf(u8, head, base) == null) continue;
+        matches += 1;
+        match = bp;
+    }
+    if (matches != 1) return "";
+    return gpa.dupe(u8, match) catch "";
+}
+
+/// The no-clobber rule must not LOCK IN a failing file: when a FAILURE signal names THIS slot (a failing
+/// import or test implicating it), a valid replacement may shrink the file — that is the fix converging, not
+/// a clobber. (Observed live: a wrong class-shaped store.py could never be replaced by the corrected
+/// function-shaped rewrite because the bad version was longer.) Only FAILURE-shaped text counts: the
+/// benchmark's FAILING tail, a smoke that actually failed, and interface mismatches — a "RUNTIME OK:
+/// `app.py` boots" success line must NOT hold the escape hatch open for the healthy entry file. Matches are
+/// word-boundary (so `store.py` inside `test_store.py` does not implicate store.py by substring accident).
 fn slotImplicatedInFailure(w: *Worker, salvage_slot: []const u8) bool {
     const base = std.fs.path.basename(salvage_slot);
     var qbuf: [140]u8 = undefined;
     const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |d| base[0..d] else base;
     // "'store'" — how a Python ImportError names the module of store.py
     const quoted = std.fmt.bufPrint(&qbuf, "'{s}'", .{stem}) catch base;
-    const signals = [_][]const u8{ w.last_bench_str, w.smoke_str, w.iface_str, w.build_str };
+    const bench_fail: []const u8 = if (std.mem.indexOf(u8, w.last_bench_str, "FAILING:")) |p| w.last_bench_str[p..] else "";
+    const smoke_fail: []const u8 = if (!w.smoke_ok) w.smoke_str else "";
+    const signals = [_][]const u8{ bench_fail, smoke_fail, w.iface_str };
     for (signals) |s| {
         if (s.len == 0) continue;
-        if (std.mem.indexOf(u8, s, base) != null) return true;
+        if (containsWordBounded(s, base)) return true;
         if (std.mem.indexOf(u8, s, quoted) != null) return true;
     }
     return false;
+}
+
+/// `needle` occurs in `s` with non-word characters (or edges) on both sides — `_`, letters, and digits count
+/// as word characters, so "store.py" does NOT match inside "test_store.py".
+fn containsWordBounded(s: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, s, from, needle)) |p| {
+        from = p + 1;
+        const pre_ok = p == 0 or !(std.ascii.isAlphanumeric(s[p - 1]) or s[p - 1] == '_');
+        const end = p + needle.len;
+        const post_ok = end >= s.len or !(std.ascii.isAlphanumeric(s[end]) or s[end] == '_');
+        if (pre_ok and post_ok) return true;
+    }
+    return false;
+}
+
+test "slot implication: failure text implicates, success text and substring cousins do not" {
+    try std.testing.expect(containsWordBounded("ERROR test_store -> ImportError from `store.py` line 3", "store.py"));
+    try std.testing.expect(!containsWordBounded("ERROR in test_store.py collection", "store.py")); // substring cousin
+    try std.testing.expect(containsWordBounded("cli.py: SYNTAX ERROR line 25", "cli.py"));
+    try std.testing.expect(!containsWordBounded("", "store.py"));
 }
 
 fn salvageLeadConversational(body: []const u8) bool {
@@ -5650,7 +5766,10 @@ fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
         if (!std.mem.eql(u8, std.fs.path.basename(lhs), want)) continue;
         const rhs = std.mem.trim(u8, line[colon + 1 ..], " \r\t");
         if (rhs.len == 0 or std.ascii.eqlIgnoreCase(rhs, "none")) return true;
-        var dit = std.mem.splitScalar(u8, rhs, ',');
+        // tokenize on commas AND whitespace: the weak models routinely emit `a.py: b.py c.py` (space-
+        // separated) despite the comma format the prompt asks for — split on ',' alone glued the two
+        // names into one token that could never match a manifest entry, deps-blocking the file FOREVER.
+        var dit = std.mem.tokenizeAny(u8, rhs, ", \t");
         while (dit.next()) |d| {
             const dep = std.mem.trim(u8, d, " \r\t`");
             if (dep.len == 0 or std.ascii.eqlIgnoreCase(dep, "none")) continue;
@@ -5707,6 +5826,15 @@ fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, d
     defer frontier.deinit(gpa);
     for (files.items) |bp| {
         if (!isDone(data, incomplete, bp) and depsReady(deps, data, bp)) (frontier.append(gpa, bp) catch {});
+    }
+    if (frontier.items.len == 0) {
+        // DEADLOCK BREAK: nothing is deps-ready yet files remain unbuilt. Everything buildable is already
+        // built, so those deps can never BECOME ready — the block is stale (typically a malformed AI-declared
+        // dep token naming a file that is not a blueprint entry). Treat the blocked files as the frontier
+        // instead of silently pinning the lead to a finished file while the benchmark demands the missing one.
+        for (files.items) |bp| {
+            if (!isDone(data, incomplete, bp)) (frontier.append(gpa, bp) catch {});
+        }
     }
     const frontier_n = frontier.items.len;
     var ordered: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -6077,6 +6205,11 @@ test "depsReady executes the AI-declared decomposition: independent parallel, de
     try std.testing.expect(depsReady("test_util.py: none\n", empty, "test_util.py"));
     try std.testing.expect(depsReady(deps, empty, "test_smoke.py"));
     try std.testing.expect(depsReady(deps, empty, "README.md"));
+    // the live-run failure shape: the 8B declared `test_store.py: store.py cli.py` (SPACE-separated) —
+    // comma-only splitting glued both names into one unmatchable token and blocked the file forever.
+    const sloppy = "test_store.py: store.py cli.py\n";
+    try std.testing.expect(!depsReady(sloppy, "store.py|400\n", "test_store.py"));
+    try std.testing.expect(depsReady(sloppy, "store.py|400\ncli.py|300\n", "test_store.py"));
 }
 
 test "assignSlot ADVANCES a builder past its built slice instead of re-pinning a done file (titan1 fix)" {
@@ -6143,13 +6276,17 @@ test "assignSlot: surplus builders get no slot, and a fully-built project deepen
         try std.testing.expectEqualStrings("", s2);
     }
     {
+        // b.py is deps-blocked on c.py, which is NOT a blueprint file and can never be built. The old code
+        // masked this deadlock by re-pinning the lead to the DONE a.py forever (observed live: test_store.py
+        // frozen out while the benchmark demanded it every round). The deadlock break now treats the blocked
+        // unbuilt file as the frontier — the stale dep cannot hold the build hostage.
         const m = "a.py|500\n";
         const dps = "b.py: c.py\n";
         const s0 = assignSlot(A, m, bp, dps, "", 0, 3);
         defer A.free(s0);
         const s1 = assignSlot(A, m, bp, dps, "", 1, 3);
         defer A.free(s1);
-        try std.testing.expectEqualStrings("a.py", s0);
+        try std.testing.expectEqualStrings("b.py", s0);
         try std.testing.expectEqualStrings("", s1);
     }
 }
