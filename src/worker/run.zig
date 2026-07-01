@@ -2293,7 +2293,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const slot = if (assembler) blk_slot: {
         if (assembler_slot.len > 0) {
             if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot)))
-                break :blk_slot std.fmt.allocPrint(gpa, "The file `{s}` is PARTIAL — only its first part exists. read_file it, then CONTINUE it with write_file mode:\"append\": add the missing functions/sections and DELETE any 'to be appended / defined in later iterations / for now the module exposes' placeholder comments, until it is COMPLETE and runnable. Do NOT rewrite what's already there; just append what's missing.", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
+                break :blk_slot std.fmt.allocPrint(gpa, "The file `{s}` is PARTIAL — only its first part exists (its current content appears below when small; otherwise read_file it first). CONTINUE it with write_file mode:\"append\": add ONLY the missing functions/sections — do NOT re-emit the imports or anything already there — and DELETE any 'to be appended / defined in later iterations / for now the module exposes' placeholder comments, until it is COMPLETE and runnable.", .{assembler_slot}) catch (gpa.dupe(u8, "") catch @constCast(""));
             const bpl = bpLineFor(w.blueprint, assembler_slot);
             if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.{s}", .{ assembler_slot, clip(bpl, 200), chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
             break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order.{s}", .{ assembler_slot, chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
@@ -2305,14 +2305,48 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(slot);
     const know_block = if (assembler) blk_kb: {
-        const kq = if (mi.lane.len > 0) clip(mi.lane, 120) else if (assembler_slot.len > 0) std.fs.path.basename(assembler_slot) else if (goal.len > 0) clip(goal, 120) else "knowledge";
+        // WRITE-TIME GROUNDING (the RAG floor): the hive's conventions must arrive in the builder's OWN
+        // prompt — a weak model does not choose to call recall_hive, and a bare basename query ("store.py")
+        // shares no words with convention facts ("load_tasks(path) returns …"). Query on everything known
+        // about the slot: its blueprint entry + the mind's lane + the goal itself.
+        var kqb: std.ArrayListUnmanaged(u8) = .empty;
+        defer kqb.deinit(gpa);
+        if (assembler_slot.len > 0) {
+            kqb.appendSlice(gpa, std.fs.path.basename(assembler_slot)) catch {};
+            const kbpl = bpLineFor(w.blueprint, assembler_slot);
+            if (kbpl.len > 0) {
+                kqb.append(gpa, ' ') catch {};
+                kqb.appendSlice(gpa, clip(kbpl, 160)) catch {};
+            }
+        }
+        if (mi.lane.len > 0) {
+            if (kqb.items.len > 0) kqb.append(gpa, ' ') catch {};
+            kqb.appendSlice(gpa, clip(mi.lane, 120)) catch {};
+        }
+        if (goal.len > 0) {
+            if (kqb.items.len > 0) kqb.append(gpa, ' ') catch {};
+            kqb.appendSlice(gpa, clip(goal, 160)) catch {};
+        }
+        const kq: []const u8 = if (kqb.items.len > 0) kqb.items else "knowledge";
         const slice = w.mem.assoc(tools.KNOWLEDGE_SCOPE, kq, 1, 6);
         defer gpa.free(slice);
         const idx = if (w.kindex_str.len > 0) clip(w.kindex_str, 900) else "(nothing learned yet — research it first)";
-        const rel = if (slice.len > 0) clip(slice, 800) else "(nothing specific yet — recall_hive a topic above, or research it)";
-        break :blk_kb std.fmt.allocPrint(gpa, "WHAT THE HIVE HAS LEARNED — call recall_hive('<topic>') for the detail of any of these:\n{s}\nRelevant to your task right now:\n{s}\n\n", .{ idx, rel }) catch (gpa.dupe(u8, "") catch @constCast(""));
+        const rel = if (slice.len > 0) clip(slice, 1000) else "(nothing specific yet — recall_hive a topic above, or research it)";
+        break :blk_kb std.fmt.allocPrint(gpa, "FOLLOW THESE CONVENTIONS — what the hive has LEARNED about your exact task; your file MUST match these names, signatures, and constants (they outrank your own defaults):\n{s}\nMore topics the hive knows — recall_hive('<topic>') for detail:\n{s}\n\n", .{ rel, idx }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(know_block);
+    // WRITE-TIME FILE STATE: a weak model told to "read_file it first" routinely skips the call and edits from
+    // stale memory — inject the CURRENT slot file (when small) so continuing it needs zero tool calls, and a
+    // fenced SEARCH/REPLACE edit can copy its anchors verbatim. Larger files still require read_file.
+    const slot_file_block = if (assembler and assembler_slot.len > 0) blk_sf: {
+        const sfull = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, assembler_slot }) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(sfull);
+        const cur = std.Io.Dir.cwd().readFileAlloc(w.io, sfull, gpa, .limited(8 << 10)) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(cur);
+        if (std.mem.trim(u8, cur, " \r\n\t").len == 0) break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
+        break :blk_sf std.fmt.allocPrint(gpa, "YOUR FILE AS IT EXISTS RIGHT NOW — `{s}` (CONTINUE/IMPROVE this exact content; do NOT restart it from scratch):\n```\n{s}\n```\n\n", .{ assembler_slot, cur }) catch (gpa.dupe(u8, "") catch @constCast(""));
+    } else (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(slot_file_block);
     const fence_build = gate.fence;
     const fence_clause = if (fence_build)
         "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE a NEW file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block. To CHANGE an EXISTING file (read_file it first — especially a LARGE one), do NOT re-emit the whole file: reply with one or more SEARCH/REPLACE blocks. Put the file's relative path on its own line, then for each change:\n<<<<<<< SEARCH\n(paste the exact original lines, copied VERBATIM from the file — enough to appear exactly once)\n=======\n(the new lines that replace them)\n>>>>>>> REPLACE\nThe SEARCH text must match the current file byte-for-byte (copy it, don't retype). To INSERT, SEARCH one nearby line and REPLACE it with itself plus the new lines. To DELETE, put the lines in SEARCH and leave REPLACE empty. Emit one block per distinct change. The engine finds each SEARCH span and swaps it, leaving the rest of the file untouched. Use read_file / recall_hive / send_message normally."
@@ -2444,7 +2478,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -2467,6 +2501,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     if (!assembler and (skills.len > 0 or rag_off)) w.act(mi.name, round, "skills", "shared library", skills_str);
     if (!assembler and (knowledge.len > 0 or rag_off)) w.act(mi.name, round, "knowledge", "hive (shared)", knowledge_str);
     if (assembler and slot.len > 0) w.act(mi.name, round, "slot", "assigned fill", slot);
+    if (assembler and know_block.len > 0) w.act(mi.name, round, "grounding", "write-time conventions (auto-assoc, no recall_hive needed)", clip(know_block, 500));
+    if (assembler and slot_file_block.len > 0) w.act(mi.name, round, "slot_file", "current content injected into the prompt", clip(slot_file_block, 300));
     if (assembler and exemplar.len > 0) w.act(mi.name, round, "exemplar", "verified few-shot", clip(exemplar, 1400));
     if (authored_names.len > 0) w.act(mi.name, round, "tools", "authored (callable by name)", authored_names);
     if (my_files.len > 0) w.act(mi.name, round, "my_files", "this mind's blueprint slice", my_files);
