@@ -127,6 +127,7 @@ pub const Worker = struct {
     fence_writes: bool = false,
     hyperspace: bool = false, // Lever 2: settle a dense hierarchy of grounding in-process before each model call
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
+    quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
     roster: []const u8 = "",
     last_bench: BenchResult = .{},
     last_bench_str: []const u8 = "",
@@ -457,6 +458,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     w.mem.wmtx = &w.db_mtx;
     w.mem.environ = environ;
 
+    // INTERACTIVE fast-path (opt-in, explicit only — NO global env, which would silently force every swarm into
+    // one-shot mode). style="quick" or the (otherwise-dead) mode="oneshot" field select it. A small edit skips
+    // all plan scaffolding + round-end engine calls and stops after one moment.
+    w.quick = std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, std.mem.trim(u8, m.mode, " \t"), "oneshot");
     {
         const tenv = dupeEnv(gpa, environ, "NL_TIER");
         defer if (tenv) |t| gpa.free(t);
@@ -467,6 +472,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         } else {
             w.cap = rsi.profileForTier(rsi.seedTier(model));
             w.cap_pinned = false;
+        }
+        if (w.quick) {
+            // an EDIT profile, not a build profile: lean + temp-floor like extractor, but max_turns=3 so a 20B can
+            // read_file -> write_file -> confirm, and one_slot=false (edit an existing file, don't scaffold a tree).
+            w.cap = rsi.profileForTier(.extractor);
+            w.cap.max_turns = 3;
+            w.cap.one_slot = false;
+            w.cap.exemplar = false;
+            w.cap_pinned = true; // RSI stays out of a one-shot edit
         }
     }
     w.act("engine", 0, "capacity", @tagName(w.cap.tier), std.fmt.allocPrint(w.a(), "{s} regime (lean_schema={}, {d} turns/moment, one_slot={}, exemplar={}) — {s}", .{ @tagName(w.cap.tier), w.cap.lean_schema, w.cap.max_turns, w.cap.one_slot, w.cap.exemplar, if (w.cap_pinned) "PINNED by manifest tier" else "RSI: seeded from the model name, re-derived each round from measured behavior" }) catch "capacity");
@@ -564,7 +578,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.act("veil", 0, "originate", "chose its own purpose (no human prompt)", goal);
         }
     }
-    if (live) {
+    if (live and !w.quick) { // quick: the raw task IS the instruction — skip the goal-rewrite round-trip
         w.goal_brief = rsi.interpretGoal(&w, goal);
         if (w.goal_brief.len > 0) {
             w.emit("intent", std.fmt.allocPrint(w.a(), ",\"goal\":\"{s}\",\"brief\":\"{s}\"", .{ w.esc(clip(goal, 200)), w.esc(clip(w.goal_brief, 1200)) }) catch ",\"brief\":\"\"");
@@ -584,7 +598,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.dream_str.len > 0) gpa.free(@constCast(w.dream_str));
     defer if (w.pending_will.len > 0) gpa.free(@constCast(w.pending_will));
     if (live) {
-        if (std.mem.eql(u8, m.style, "build") or std.mem.eql(u8, m.style, "build_use")) {
+        if (w.quick) {
+            w.discourse = false; // a direct edit — no research classify round-trip
+            w.act("engine", 0, "mode", "quick", "INTERACTIVE one-shot edit — skipping goal-rewrite, classify, and blueprint; single mind, edit-and-stop");
+        } else if (std.mem.eql(u8, m.style, "build") or std.mem.eql(u8, m.style, "build_use")) {
             w.discourse = false;
             w.act("engine", 0, "mode", "build", "operator-pinned BUILD (manifest style) — file/artifact build with blueprint + file-ownership");
         } else if (std.mem.eql(u8, m.style, "discourse") or std.mem.eql(u8, m.style, "investigate") or std.mem.eql(u8, m.style, "debate")) {
@@ -594,7 +611,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.discourse = discourseMode(&w, goal);
         }
     }
-    if (live and !w.discourse and !w.operating) {
+    if (live and !w.discourse and !w.operating and !w.quick) { // quick: no blueprint -> never scaffolds a file tree over --embed
         w.blueprint = planProject(&w, goal, w.goal_brief);
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
@@ -861,21 +878,21 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
-        if (live and m.gap_assess) assessGap(&w, goal, round, stalled);
+        if (live and m.gap_assess and !w.quick) assessGap(&w, goal, round, stalled);
         if (live and minds.items.len > 1 and !w.operating and !w.discourse) {
             rsi.planRoles(&w, minds.items, goal, round, w.last_bench, stalled or w.last_gap_str.len > 0);
         }
 
-        if (live and !w.operating) {
+        if (live and !w.operating and !w.quick) {
             rsi.rsiGovernance(&w, round, prev_pct, tok0_in, tok0_out, tok0_calls);
             rsi.distillRsiMemory(&w, goal, round);
             rsi.updateRsiCurriculum(&w, goal, round, stalled);
         }
 
-        if (live) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
+        if (live and !w.quick) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
         if (live and w.breakout_on and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items);
         if (live and w.psyche_on) emitPsyche(&w, minds.items, round, retro_in.items);
-        if (live and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
+        if (live and !w.quick and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
             if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
         }
         if (live and !w.discourse and w.blueprint.len > 0) markIncomplete(&w, round);
@@ -884,7 +901,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
 
-        if (live and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
+        if (live and !w.quick and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
 
         if (live and w.resting and !w.stop_now) agi.dream(&w, goal, round);
 
@@ -906,6 +923,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
         }
 
+        // INTERACTIVE one-shot: after the single edit moment ran, stop — do not loop continuous.
+        if (w.quick and live and any_llm_ok and !w.stop_now) {
+            w.stop_now = true;
+            w.stop_why = "quick_done";
+        }
         if (w.stop_now) {
             const evolved = w.autonomous and live and (std.mem.eql(u8, w.stop_why, "completed") or std.mem.eql(u8, w.stop_why, "graduated"));
             if (evolved) agi.archiveCompletedGoal(&w, run_dir, goal, w.goals_done);
@@ -1225,6 +1247,30 @@ fn builtInManifest(data: []const u8, base: []const u8) bool {
 /// isn't built yet — so the mind ADVANCES through its slice one file at a time instead of scattering; if every
 /// slice file is built, the first (to DEEPEN it). Reads .build_manifest (basename match). "" if no slice. The
 /// returned slice points into `my_files` (alive for the moment); `gpa` only backs the transient manifest read.
+fn endsWithIC(s: []const u8, suf: []const u8) bool {
+    if (s.len < suf.len) return false;
+    const tail = s[s.len - suf.len ..];
+    for (tail, suf) |a, b| if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    return true;
+}
+
+/// QUICK mode target: the file the interactive edit lands on. On the local fenced path the model narrates the
+/// edited file and the salvage commits it to a SLOT — quick skips planProject so there is no blueprint slot, so we
+/// derive one from the task itself: the first filename-shaped token (basename with a known code/markup extension).
+/// Returns a gpa-owned basename, or "" if the task names no file. No I/O.
+fn quickTargetFromGoal(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
+    const exts = [_][]const u8{ ".html", ".htm", ".css", ".js", ".mjs", ".ts", ".jsx", ".tsx", ".py", ".md", ".json", ".txt", ".toml", ".yaml", ".yml", ".sh", ".c", ".h", ".cpp", ".hpp", ".go", ".rs", ".php", ".rb", ".sql", ".xml", ".svg", ".vue", ".zig", ".ini", ".cfg", ".conf" };
+    var it = std.mem.tokenizeAny(u8, goal, " \t\r\n\"'`(),;:!?<>[]{}");
+    while (it.next()) |tok| {
+        var t = tok;
+        while (t.len > 0 and t[t.len - 1] == '.') t = t[0 .. t.len - 1]; // strip prose trailing period
+        for (exts) |e| {
+            if (t.len > e.len and endsWithIC(t, e)) return gpa.dupe(u8, std.fs.path.basename(t)) catch "";
+        }
+    }
+    return "";
+}
+
 fn slotPath(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, my_files: []const u8) []const u8 {
     const s = std.mem.trim(u8, my_files, " \r\n\t");
     if (s.len == 0) return "";
@@ -2134,7 +2180,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
     ctx.one_slot = w.cap.one_slot;
-    const assembler_slot = if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
+    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
+    defer if (w.quick and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
     const dg_block = if (w.depgraph_str.len > 0)
         std.fmt.allocPrint(gpa, "\nIMPORT GRAPH (who imports what — when you change a file, update the files that import it so they stay consistent):\n{s}", .{clip(w.depgraph_str, 1400)}) catch (gpa.dupe(u8, "") catch @constCast(""))
@@ -2636,7 +2683,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
                     defer if (existing.len > 0) gpa.free(existing);
                     const cur = std.mem.trim(u8, existing, " \r\n\t");
-                    if (cur.len >= 40 and cur.len >= body.len) reject = "slot already holds a longer/equal file (no clobber)";
+                    if (!w.quick and cur.len >= 40 and cur.len >= body.len) reject = "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
                 }
             }
             if (reject) |why| {

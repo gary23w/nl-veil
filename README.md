@@ -122,6 +122,11 @@ veil "add a header search to my landing page and wire the remote-auth login DB" 
   stays open for follow-up edits.
 - **`--detach`** — cast fully detached from the terminal (survives closing it); reattach with `deploy.py chat
   <run>`. Lighter than `--service` (no OS daemon).
+- **`--quick`** — *interactive one-shot* for co-working. A single mind does **one small edit in ~1-2 model
+  calls**: it skips the goal-rewrite / classify / blueprint scaffolding and stops right after the edit, instead
+  of the full multi-mind planning loop. Pair with `--embed` to edit your project in place — e.g.
+  `veil "in index.html change the h1 to Welcome Home" --embed . --quick` lands in seconds, not minutes. Best
+  for quick tweaks ("center that div"); use the normal path (planning, multi-mind) for real builds.
 
 ## What can it do?
 
