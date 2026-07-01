@@ -764,16 +764,22 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(clean);
     const is_append = std.mem.eql(u8, p.value.mode, "append") and p.value.content.len > 0;
     var final_bytes: usize = clean.len;
+    var restarted = false;
     if (is_append) {
         const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch &[_]u8{};
         defer if (prior.len > 0) gpa.free(prior);
-        var joined: std.ArrayListUnmanaged(u8) = .empty;
-        defer joined.deinit(gpa);
-        joined.appendSlice(gpa, prior) catch {};
-        if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n\n") catch {};
-        joined.appendSlice(gpa, clean) catch {};
-        if (!writeWorkFileAtomic(ctx, full, joined.items)) return dupe(gpa, "could not write file");
-        final_bytes = joined.items.len;
+        if (appendRestartsFile(prior, clean)) {
+            restarted = true;
+            if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
+        } else {
+            var joined: std.ArrayListUnmanaged(u8) = .empty;
+            defer joined.deinit(gpa);
+            joined.appendSlice(gpa, prior) catch {};
+            if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n\n") catch {};
+            joined.appendSlice(gpa, clean) catch {};
+            if (!writeWorkFileAtomic(ctx, full, joined.items)) return dupe(gpa, "could not write file");
+            final_bytes = joined.items.len;
+        }
     } else {
         if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
     }
@@ -795,7 +801,28 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     if (redirected)
         return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.", .{ wpath, final_bytes, p.value.path }) catch dupe(gpa, "wrote");
+    if (restarted)
+        return std.fmt.allocPrint(gpa, "rewrote {s} — your append RE-STARTED the file (its body opens with the same line the file already starts with), so it REPLACED the old attempt instead of gluing two half-programs together; file is now {d} bytes. To truly append, send only the NEW lines that continue the existing file.", .{ wpath, final_bytes }) catch dupe(gpa, "rewrote");
     return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes }) catch dupe(gpa, "wrote");
+}
+
+/// An "append" whose body RE-OPENS the file (the same first meaningful line as the existing head — the same
+/// shebang or the same first import) is a fresh ATTEMPT, not a continuation: gluing it on produced files like
+/// cli.py = two half-programs (a truncated `if` followed by a second `import argparse`) that can never parse.
+/// Treat it as the rewrite the model actually meant. Lines shorter than 6 chars (`}`, `"""`) never match.
+fn appendRestartsFile(prior: []const u8, body: []const u8) bool {
+    const a = firstMeaningfulLine(prior);
+    if (a.len < 6) return false;
+    return std.mem.eql(u8, a, firstMeaningfulLine(body));
+}
+
+fn firstMeaningfulLine(s: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len > 0) return t;
+    }
+    return "";
 }
 
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
@@ -2904,6 +2931,20 @@ test "isNumeric detects a bare PID target (drives the interlock identifier resol
     try std.testing.expect(!isNumeric("php-fpm"));
     try std.testing.expect(!isNumeric("185.220.101.34"));
     try std.testing.expect(!isNumeric("100a"));
+}
+
+test "appendRestartsFile: a restarted attempt is caught; a real continuation appends" {
+    // the observed cli.py failure: a truncated first attempt + a second attempt glued on via append
+    const attempt1 = "import argparse\nimport json\n\ndef load_tasks():\n    if\n";
+    const attempt2 = "import argparse\nimport json\nfrom pathlib import Path\n\ndef main():\n    pass\n";
+    try std.testing.expect(appendRestartsFile(attempt1, attempt2));
+    try std.testing.expect(appendRestartsFile("#!/usr/bin/env python3\nprint(1)\n", "\n#!/usr/bin/env python3\nprint(2)\n"));
+    // a genuine continuation (new functions, different opening line) must still append
+    try std.testing.expect(!appendRestartsFile(attempt1, "def save_tasks(tasks):\n    pass\n"));
+    // tiny/structural first lines never match (a `}` or docstring quote is not a module header)
+    try std.testing.expect(!appendRestartsFile("}\nrest\n", "}\nother\n"));
+    try std.testing.expect(!appendRestartsFile("", "import argparse\n"));
+    try std.testing.expect(!appendRestartsFile("import argparse\n", ""));
 }
 
 test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {
