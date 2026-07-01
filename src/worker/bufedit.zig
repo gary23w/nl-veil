@@ -320,6 +320,33 @@ pub fn parseNarrated(gpa: std.mem.Allocator, reply: []const u8) ?Narrated {
     return .{ .path = gpa.dupe(u8, path) catch return null, .ops = ops.toOwnedSlice(gpa) catch return null };
 }
 
+/// The one physical line above and below an anchor's UNIQUE match in `haystack` — the anchor's line identity.
+/// A rebase guard captures these against a mind's base, then re-checks them against current HEAD: if they differ,
+/// the target moved or changed shape and the edit must NOT auto-merge. null when the anchor is not uniquely present.
+pub const Brackets = struct { before: []u8 = "", after: []u8 = "" };
+pub fn anchorBrackets(gpa: std.mem.Allocator, haystack: []const u8, anchor: []const u8) ?Brackets {
+    if (anchor.len == 0) return null;
+    const hlf = normalizeLF(gpa, haystack);
+    defer gpa.free(hlf);
+    var hlines = splitLines(gpa, hlf);
+    defer hlines.deinit(gpa);
+    const alf = normalizeLF(gpa, anchor);
+    defer gpa.free(alf);
+    var alines = splitLines(gpa, alf);
+    defer alines.deinit(gpa);
+    var start: usize = 0;
+    var loose: bool = false;
+    if (matchAnchor(hlines.items, alines.items, &start, &loose) != null) return null; // not found or ambiguous
+    const before = if (start > 0) hlines.items[start - 1] else "";
+    const after_idx = start + alines.items.len;
+    const after = if (after_idx < hlines.items.len) hlines.items[after_idx] else "";
+    return .{ .before = gpa.dupe(u8, before) catch @constCast(""), .after = gpa.dupe(u8, after) catch @constCast("") };
+}
+pub fn freeBrackets(gpa: std.mem.Allocator, b: Brackets) void {
+    if (b.before.len > 0) gpa.free(b.before);
+    if (b.after.len > 0) gpa.free(b.after);
+}
+
 pub fn freeNarrated(gpa: std.mem.Allocator, n: Narrated) void {
     for (n.ops) |op| {
         if (op.anchor.len > 0) gpa.free(@constCast(op.anchor));
@@ -458,6 +485,23 @@ test "loci report post-splice byte offsets in op-index order" {
     // line by op 0's insert — proving loci track a match through a lower splice.
     try std.testing.expect(r.loci[0].op_index == 0 and r.loci[0].matched_offset == 3);
     try std.testing.expect(r.loci[1].op_index == 1 and r.loci[1].matched_offset == 13);
+}
+
+test "anchorBrackets returns bracketing lines of a unique match; null when ambiguous" {
+    const gpa = std.testing.allocator;
+    {
+        const bk = anchorBrackets(gpa, "a\nb\nTARGET\nc\nd\n", "TARGET") orelse return error.NoMatch;
+        defer freeBrackets(gpa, bk);
+        try std.testing.expectEqualStrings("b", bk.before);
+        try std.testing.expectEqualStrings("c", bk.after);
+    }
+    try std.testing.expect(anchorBrackets(gpa, "x\nx\n", "x") == null); // ambiguous
+    {
+        const bk = anchorBrackets(gpa, "HEAD\nnext\n", "HEAD") orelse return error.NoMatch;
+        defer freeBrackets(gpa, bk);
+        try std.testing.expectEqualStrings("", bk.before); // top of file
+        try std.testing.expectEqualStrings("next", bk.after);
+    }
 }
 
 test "parseNarrated reads multiple SEARCH/REPLACE blocks with a multi-line anchor" {

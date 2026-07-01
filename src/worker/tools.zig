@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
 const bufedit = @import("bufedit.zig");
+const vcs = @import("vcs.zig");
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
 const crawl = @import("crawl.zig");
@@ -126,6 +127,7 @@ pub const ToolCtx = struct {
     blueprint: []const u8 = "",
     egress_allow: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
+    vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -823,6 +825,19 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             if (std.mem.eql(u8, o.op, "replace")) .replace else if (std.mem.eql(u8, o.op, "insert_before")) .insert_before else if (std.mem.eql(u8, o.op, "insert_after")) .insert_after else if (std.mem.eql(u8, o.op, "insert_at")) .insert_at else if (std.mem.eql(u8, o.op, "delete")) .delete else return std.fmt.allocPrint(gpa, "unknown op '{s}' — use replace | insert_before | insert_after | insert_at | delete", .{o.op}) catch dupe(gpa, "unknown op");
         ops.append(gpa, .{ .kind = kind, .anchor = o.anchor, .text = o.text, .at = o.at }) catch {};
     }
+    // When minds run concurrently, route through the micro-VCS: it reads HEAD in-lock and re-applies these ops
+    // against it, so two minds editing one file merge instead of clobbering. `original` is this mind's base.
+    if (ctx.vcs_enabled) if (ctx.fmtx) |m| {
+        const outcome = vcs.commitEdit(ctx.io, gpa, m, ctx.run_dir, npath, full, ops.items, original, ctx.mind);
+        switch (outcome) {
+            .committed => |c| {
+                ctx.files_written.* += 1;
+                return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied{s}, file is now {d} bytes", .{ npath, ops.items.len, if (c.rebased) " and merged with a teammate's concurrent change (unverified — re-check the file still builds)" else "", c.len }) catch dupe(gpa, "edited");
+            },
+            .conflict => |msg| return msg,
+            .failed => |msg| return msg,
+        }
+    };
     const res = bufedit.apply(gpa, original, ops.items);
     if (!res.ok) return res.reject; // owned; caller frees. original file untouched.
     defer gpa.free(res.bytes);
