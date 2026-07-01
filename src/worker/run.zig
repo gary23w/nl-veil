@@ -137,6 +137,8 @@ pub const Worker = struct {
     model: []const u8,
     fence_writes: bool = false,
     tool_parse_fails: u32 = 0, // provider large-tool-call parse failures — 2 strikes flips fence_writes on adaptively
+    max_tokens_eff: u32 = 8192, // per-turn completion budget: NL_MAX_TOKENS override, else scaled to the probed ctx
+    clip_scale: f32 = 1.0, // prompt-section byte budgets scale with the probed context window (1.0 = full 32k)
     hyperspace: bool = false, // Lever 2: settle a dense hierarchy of grounding in-process before each model call
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
     quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
@@ -161,6 +163,7 @@ pub const Worker = struct {
     cap: CapacityProfile = .{},
     cap_pinned: bool = false,
     cap_streak: u32 = 0,
+    promo_streak: u32 = 0, // consecutive fully-strong rounds — 2 promotes the tier back up (RSI, both directions)
     goals_done: u32 = 0,
     strategy_str: []const u8 = "",
     blueprint: []const u8 = "",
@@ -437,6 +440,33 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
     }
     if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)");
+    {
+        // BUDGET COHERENCE: the per-turn completion budget and every prompt-section byte budget derive from
+        // the PROBED window instead of fixed literals — a genuinely small-ctx model must not be handed a
+        // 32k-shaped prompt plus an 8k completion budget. On a full-window backend (or unprobed) everything
+        // stays exactly as before (scale 1.0). NL_MAX_TOKENS overrides the completion budget directly.
+        const bc = llm.capsSnapshot();
+        const ctx_eff: u32 = if (bc.ctx_tokens > 0) @min(bc.ctx_tokens, 32768) else 32768;
+        w.clip_scale = std.math.clamp(@as(f32, @floatFromInt(ctx_eff)) / 32768.0, 0.25, 1.0);
+        w.max_tokens_eff = @max(1024, @as(u32, @intFromFloat(8192.0 * w.clip_scale)));
+        if (environ.get("NL_MAX_TOKENS")) |mts| {
+            if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| {
+                w.max_tokens_eff = std.math.clamp(v, 256, 32768);
+            } else |_| {}
+        }
+        if (live and (w.max_tokens_eff != 8192 or w.clip_scale < 1.0))
+            w.act("engine", 0, "budget", "ctx-scaled", std.fmt.allocPrint(gpa, "probed ctx={d} -> max_tokens={d}, prompt-section scale={d:.2} (set NL_MAX_TOKENS to override the completion budget)", .{ ctx_eff, w.max_tokens_eff, w.clip_scale }) catch "budget");
+    }
+    if (live) {
+        // PREFLIGHT: every model call and web fetch shells out to curl — a missing curl fails as a cryptic
+        // per-call "curl failed to run" storm. Say it ONCE, plainly, at startup.
+        if (std.process.run(gpa, io, .{ .argv = &.{ "curl", "--version" }, .stdout_limit = .limited(4096) })) |cv| {
+            gpa.free(cv.stdout);
+            gpa.free(cv.stderr);
+        } else |_| {
+            w.act("engine", 0, "preflight", "curl missing", "`curl` was not found on PATH — the LLM client and every web tool shell out to it, so ALL model calls will fail. Windows 10+ ships C:\\Windows\\System32\\curl.exe (check PATH); Linux/macOS: install curl.");
+        }
+    }
     w.breakout_on = m.breakout;
     w.publish_on = m.publish;
     {
@@ -2186,12 +2216,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const tree = buildTree(gpa, w.io, w.run_dir, w.blueprint, w.doc_target);
     defer gpa.free(tree);
     const plan_block = if (w.plan_str.len > 0)
-        std.fmt.allocPrint(gpa, "PROJECT PLAN — the shared CONTRACT every piece must honor (the canon: names, world, rules; the arc; each piece's beat). Keep your piece CONSISTENT with this so it fits the others built in parallel:\n{s}\n\n", .{clip(w.plan_str, 3000)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, "PROJECT PLAN — the shared CONTRACT every piece must honor (the canon: names, world, rules; the arc; each piece's beat). Keep your piece CONSISTENT with this so it fits the others built in parallel:\n{s}\n\n", .{clip(w.plan_str, scaledClip(w, 3000))}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(plan_block);
     const build = if (w.state_str.len > 0)
-        std.fmt.allocPrint(gpa, "{s}CURRENT STATE OF THE WHOLE WORK — what's ACTUALLY been built so far; continue the thread (same world, names, decisions):\n{s}\n\nFILE TREE (sizes):\n{s}", .{ plan_block, clip(w.state_str, 1600), tree }) catch (gpa.dupe(u8, tree) catch @constCast(""))
+        std.fmt.allocPrint(gpa, "{s}CURRENT STATE OF THE WHOLE WORK — what's ACTUALLY been built so far; continue the thread (same world, names, decisions):\n{s}\n\nFILE TREE (sizes):\n{s}", .{ plan_block, clip(w.state_str, scaledClip(w, 1600)), tree }) catch (gpa.dupe(u8, tree) catch @constCast(""))
     else if (plan_block.len > 0)
         std.fmt.allocPrint(gpa, "{s}FILE TREE (sizes):\n{s}", .{ plan_block, tree }) catch (gpa.dupe(u8, tree) catch @constCast(""))
     else
@@ -2285,7 +2315,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const exemplar = if (assembler and w.cap.exemplar) w.mem.recall(tools.VERIFIED_SCOPE, ex_key) else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar);
     const exemplar_block = if (assembler and exemplar.len > 0)
-        std.fmt.allocPrint(gpa, "AN EXAMPLE — a piece the team already got right; MATCH its shape, format, and quality:\n{s}\n\n", .{clip(exemplar, 1400)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, "AN EXAMPLE — a piece the team already got right; MATCH its shape, format, and quality:\n{s}\n\n", .{clip(exemplar, scaledClip(w, 1400))}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(exemplar_block);
@@ -2330,8 +2360,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         const kq: []const u8 = if (kqb.items.len > 0) kqb.items else "knowledge";
         const slice = w.mem.assoc(tools.KNOWLEDGE_SCOPE, kq, 1, 6);
         defer gpa.free(slice);
-        const idx = if (w.kindex_str.len > 0) clip(w.kindex_str, 900) else "(nothing learned yet — research it first)";
-        const rel = if (slice.len > 0) clip(slice, 1000) else "(nothing specific yet — recall_hive a topic above, or research it)";
+        const idx = if (w.kindex_str.len > 0) clip(w.kindex_str, scaledClip(w, 900)) else "(nothing learned yet — research it first)";
+        const rel = if (slice.len > 0) clip(slice, scaledClip(w, 1000)) else "(nothing specific yet — recall_hive a topic above, or research it)";
         break :blk_kb std.fmt.allocPrint(gpa, "FOLLOW THESE CONVENTIONS — what the hive has LEARNED about your exact task; your file MUST match these names, signatures, and constants (they outrank your own defaults):\n{s}\nMore topics the hive knows — recall_hive('<topic>') for detail:\n{s}\n\n", .{ rel, idx }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(know_block);
@@ -2341,7 +2371,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const slot_file_block = if (assembler and assembler_slot.len > 0) blk_sf: {
         const sfull = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, assembler_slot }) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
         defer gpa.free(sfull);
-        const cur = std.Io.Dir.cwd().readFileAlloc(w.io, sfull, gpa, .limited(8 << 10)) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
+        const cur = std.Io.Dir.cwd().readFileAlloc(w.io, sfull, gpa, .limited(scaledClip(w, 8 << 10))) catch break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
         defer gpa.free(cur);
         if (std.mem.trim(u8, cur, " \r\n\t").len == 0) break :blk_sf (gpa.dupe(u8, "") catch @constCast(""));
         break :blk_sf std.fmt.allocPrint(gpa, "YOUR FILE AS IT EXISTS RIGHT NOW — `{s}` (CONTINUE/IMPROVE this exact content; do NOT restart it from scratch):\n```\n{s}\n```\n\n", .{ assembler_slot, cur }) catch (gpa.dupe(u8, "") catch @constCast(""));
@@ -2375,10 +2405,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(operatesys);
     const sys = if (operate) operatesys else if (assembler) leansys else fullsys;
     const rag_off = environ.get("NL_NO_RAG") != null;
-    const recalled_str = if (rag_off) "(memory recall disabled — control run)" else if (recalled.len > 0) clip(recalled, if (w.hyperspace) 2600 else 1600) else "(nothing yet — research or start building)";
-    const skills_str = if (rag_off) "(skill recall disabled — control run)" else if (skills.len > 0) clip(skills, 1000) else "(none yet — save one with save_skill when you find a reusable technique)";
-    const know_core = if (rag_off) "(hive knowledge disabled — control run)" else if (w.digest_str.len > 0) clip(w.digest_str, 1400) else if (knowledge.len > 0) clip(knowledge, 1000) else "(none yet — the scout's findings will appear here for everyone)";
-    const know_idx_owned: ?[]u8 = if (!rag_off and w.kindex_str.len > 0) (std.fmt.allocPrint(gpa, "HIVE KNOWS — recall_hive any topic for detail: {s}\n{s}", .{ clip(w.kindex_str, 700), know_core }) catch null) else null;
+    const recalled_str = if (rag_off) "(memory recall disabled — control run)" else if (recalled.len > 0) clip(recalled, scaledClip(w, if (w.hyperspace) 2600 else 1600)) else "(nothing yet — research or start building)";
+    const skills_str = if (rag_off) "(skill recall disabled — control run)" else if (skills.len > 0) clip(skills, scaledClip(w, 1000)) else "(none yet — save one with save_skill when you find a reusable technique)";
+    const know_core = if (rag_off) "(hive knowledge disabled — control run)" else if (w.digest_str.len > 0) clip(w.digest_str, scaledClip(w, 1400)) else if (knowledge.len > 0) clip(knowledge, scaledClip(w, 1000)) else "(none yet — the scout's findings will appear here for everyone)";
+    const know_idx_owned: ?[]u8 = if (!rag_off and w.kindex_str.len > 0) (std.fmt.allocPrint(gpa, "HIVE KNOWS — recall_hive any topic for detail: {s}\n{s}", .{ clip(w.kindex_str, scaledClip(w, 700)), know_core }) catch null) else null;
     defer if (know_idx_owned) |p| gpa.free(p);
     const knowledge_str: []const u8 = if (know_idx_owned) |p| p else know_core;
     const score_base = if (w.discourse) "(research/discussion task — there is no software score; your progress is the depth of research, the range of recorded views, and the quality of the shared briefing)" else if (w.last_bench_str.len > 0) w.last_bench_str else if (w.doc_target > 0) "(length-scored build — your progress is total WORD coverage vs the per-file target; grow each file toward its target by appending scenes, not by writing tests)" else "(no benchmark yet — if the deliverable is code, write a test_*.py with real assertions so progress can be measured)";
@@ -2546,11 +2576,20 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var llm_ok = false;
     var llm_fatal = false;
     var turn: u32 = 0;
+    var cap_warned = false;
+    const conv_limit = scaledClip(w, w.cap.conv_cap);
     const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
     while (turn < op_turns) : (turn += 1) {
         if (w.stopRequested()) break;
-        if (turn >= 2 and conv.items.len > w.cap.conv_cap) break;
-        var step = completeAdaptive(w, mi, round, conv.items, live_schema, 8192, w.cap.temperature);
+        if (turn >= 2 and conv.items.len > conv_limit) break;
+        // NEAR-LIMIT WARNING: tell the model the window is closing instead of silently cutting the moment
+        // off next turn — a weak model given one explicit "finish NOW" turn ships its file; one cut mid-plan
+        // ships nothing.
+        if (!cap_warned and turn >= 1 and conv.items.len * 4 > conv_limit * 3) {
+            cap_warned = true;
+            conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"NOTE: your working context for this moment is nearly full. Finish NOW — make your single most important remaining action this turn (write/append your file, or your final tool call); the next turn may be your last this moment.\"}") catch {};
+        }
+        var step = completeAdaptive(w, mi, round, conv.items, live_schema, w.max_tokens_eff, w.cap.temperature);
         defer step.deinit(gpa);
         if (!step.ok) {
             if (isFatalLlm(step.content)) llm_fatal = true;
@@ -2574,7 +2613,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
                 rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool — reply with plain text only. To CHANGE an EXISTING file, put its relative path on its own line, then one or more edit blocks copied EXACTLY in this form:\\n<<<<<<< SEARCH\\n(the exact current lines, copied verbatim)\\n=======\\n(the new lines)\\n>>>>>>> REPLACE\\nTo CREATE a NEW file, put its relative path on its own line, then a single fenced code block with the COMPLETE file. No other prose.\"}") catch {};
-                var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
                 defer rep.deinit(gpa);
                 if (rep.ok and rep.content.len > 0) {
                     gpa.free(monologue);
@@ -2587,7 +2626,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
                 rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool. Reply with ONLY your single host action on one line, in the form: <verb> <target> — use the verb you intended and the EXACT identifier (pid/name/ip/unit/path) shown verbatim in the device state above; never invent an identifier. No prose, no explanation — just the one action line.\"}") catch {};
-                var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
                 defer rep.deinit(gpa);
                 if (rep.ok and rep.content.len > 0) {
                     if (rep.reasoning.len > 0) w.act(mi.name, round, "thinking", "", clip(rep.reasoning, 600));
@@ -2794,7 +2833,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             sigTokenOverlap(d.note, d.evidence_span) >= 3 and
                             !hasVacuity(d.note) and !spanSeen(w, d.evidence_span);
                         if (admit) {
-                            const note_fact = std.fmt.allocPrint(gpa, "[{s}] {s}", .{ sc, clip(d.note, 600) }) catch @constCast(d.note);
+                            // a verbatim code exemplar makes the note CODE-SHAPED — builders copy signatures
+                            // instead of re-deriving them from prose (it passed the same in-page verbatim gate)
+                            const note_fact = if (d.code.len > 0)
+                                (std.fmt.allocPrint(gpa, "[{s}] {s} | code: {s}", .{ sc, clip(d.note, 600), d.code }) catch @constCast(d.note))
+                            else
+                                (std.fmt.allocPrint(gpa, "[{s}] {s}", .{ sc, clip(d.note, 600) }) catch @constCast(d.note));
                             defer if (note_fact.ptr != d.note.ptr) gpa.free(note_fact);
                             _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, note_fact); // the NOTE, never the raw page
                             if (w.hyperspace) if (mi.hfield) |*hf| hf.observeLine(note_fact);
@@ -2876,7 +2920,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     defer if (cmsg.len > 0) gpa.free(@constCast(cmsg));
                     llm.jstr(gpa, &rconv, if (cmsg.len > 0) cmsg else "Reply with ONLY your complete file as one fenced code block led by its relative path.") catch {};
                     rconv.append(gpa, '}') catch {};
-                    var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                    var rep = completeAdaptive(w, mi, round, rconv.items, "", w.max_tokens_eff, w.cap.temperature);
                     defer rep.deinit(gpa);
                     if (rep.ok and rep.content.len > 0) {
                         const body2 = salvageFileBody(gpa, rep.content);
@@ -3029,8 +3073,28 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
     defer if (existing.len > 0) gpa.free(existing);
     const cur = std.mem.trim(u8, existing, " \r\n\t");
-    if (!w.quick and cur.len >= 40 and cur.len >= body.len) return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
+    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot))
+        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
     return null;
+}
+
+/// The no-clobber rule must not LOCK IN a failing file: when the live fitness/smoke/interface signal names
+/// THIS slot (a failing import or test implicating it), a valid replacement may shrink the file — that is the
+/// fix converging, not a clobber. (Observed live: a wrong class-shaped store.py could never be replaced by the
+/// corrected function-shaped rewrite because the bad version was longer.)
+fn slotImplicatedInFailure(w: *Worker, salvage_slot: []const u8) bool {
+    const base = std.fs.path.basename(salvage_slot);
+    var qbuf: [140]u8 = undefined;
+    const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |d| base[0..d] else base;
+    // "'store'" — how a Python ImportError names the module of store.py
+    const quoted = std.fmt.bufPrint(&qbuf, "'{s}'", .{stem}) catch base;
+    const signals = [_][]const u8{ w.last_bench_str, w.smoke_str, w.iface_str, w.build_str };
+    for (signals) |s| {
+        if (s.len == 0) continue;
+        if (std.mem.indexOf(u8, s, base) != null) return true;
+        if (std.mem.indexOf(u8, s, quoted) != null) return true;
+    }
+    return false;
 }
 
 fn salvageLeadConversational(body: []const u8) bool {
@@ -3230,6 +3294,13 @@ fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, 
 
 pub fn clip(s: []const u8, n: usize) []const u8 {
     return if (s.len > n) s[0..n] else s;
+}
+
+/// Scale a prompt-section byte budget to the probed context window: 1.0 on a full 32k window (identical to
+/// the old fixed literals), proportionally less on a genuinely small-ctx model, floored at 1/4 so no section
+/// ever vanishes entirely.
+pub fn scaledClip(w: *const Worker, n: usize) usize {
+    return @max(n / 4, @as(usize, @intFromFloat(@as(f32, @floatFromInt(n)) * w.clip_scale)));
 }
 
 /// Clip to AT MOST n bytes but break on a WORD boundary (the last space within the window), so a short LABEL — like
@@ -4885,10 +4956,11 @@ fn parseOracleScore(s: []const u8) ?u32 {
 // keyword-stuffed page is refused mechanically — no domain blocklist. Cost knob, not a use-case:
 const SCOUT_COV_TARGET: f32 = 0.75; // scout while the goal's hive coverage is below this
 
-const Distilled = struct { applicable: bool, evidence_span: []u8, note: []u8 };
+const Distilled = struct { applicable: bool, evidence_span: []u8, note: []u8, code: []u8 = @constCast("") };
 fn freeDistilled(gpa: std.mem.Allocator, d: Distilled) void {
     if (d.evidence_span.len > 0) gpa.free(d.evidence_span);
     if (d.note.len > 0) gpa.free(d.note);
+    if (d.code.len > 0) gpa.free(d.code);
 }
 
 // The first BALANCED {..} object in a reply, so a self-correcting multi-object reply yields the first, not a union.
@@ -4920,20 +4992,23 @@ fn firstBalancedObject(s: []const u8) ?[]const u8 {
 // unparseable => null (caller refuses; never ingests raw page text).
 fn screenDistill(w: *Worker, goal: []const u8, gap: []const u8, dom: []const u8, page: []const u8) ?Distilled {
     const gpa = w.gpa;
-    const sys = "You are a strict extractor. Output ONLY one JSON object: {\"applicable\":true|false,\"evidence_span\":\"...\",\"note\":\"...\"}. evidence_span = copied VERBATIM from the page: the exact sentence or code line (at least 40 chars) that states the concrete technique/API/config/value; it MUST appear in the page character-for-character. note = at most 3 lines a builder can act on, derived ONLY from evidence_span, quoting the exact API/signature/value. If the page has no such concrete span, set applicable=false with empty strings. No preamble, no markdown, no phrases like 'see above'.";
+    const sys = "You are a strict extractor. Output ONLY one JSON object: {\"applicable\":true|false,\"evidence_span\":\"...\",\"note\":\"...\",\"code\":\"...\"}. evidence_span = copied VERBATIM from the page: the exact sentence or code line (at least 40 chars) that states the concrete technique/API/config/value; it MUST appear in the page character-for-character. note = at most 3 lines a builder can act on, derived ONLY from evidence_span, quoting the exact API/signature/value. code = OPTIONAL: when the page shows actual CODE (a signature, call, or config line), copy the single most reusable code line(s) VERBATIM from the page (max ~200 chars); otherwise an empty string — builders paste this directly, so never invent or paraphrase it. If the page has no concrete span, set applicable=false with empty strings. No preamble, no markdown, no phrases like 'see above'.";
     const user = std.fmt.allocPrint(gpa, "GOAL: {s}\nGAP: {s}\nPAGE (source {s}):\n{s}\n", .{ clip(goal, 300), clip(gap, 200), dom, clip(page, 4000) }) catch return null;
     defer gpa.free(user);
     const r = llm.chat(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, sys, user, 320);
     defer gpa.free(r.content);
     if (!r.ok) return null;
     const obj = firstBalancedObject(r.content) orelse return null;
-    const P = struct { applicable: bool = false, evidence_span: []const u8 = "", note: []const u8 = "" };
+    const P = struct { applicable: bool = false, evidence_span: []const u8 = "", note: []const u8 = "", code: []const u8 = "" };
     const parsed = std.json.parseFromSlice(P, gpa, obj, .{ .ignore_unknown_fields = true }) catch return null;
     defer parsed.deinit();
+    // the code exemplar rides the SAME provenance rule as the span: verbatim-in-page or it does not exist
+    const code_ok = parsed.value.code.len >= 8 and std.mem.indexOf(u8, page, parsed.value.code) != null;
     return .{
         .applicable = parsed.value.applicable,
         .evidence_span = gpa.dupe(u8, parsed.value.evidence_span) catch return null,
         .note = gpa.dupe(u8, parsed.value.note) catch @constCast(""),
+        .code = if (code_ok) (gpa.dupe(u8, clip(parsed.value.code, 220)) catch @constCast("")) else @constCast(""),
     };
 }
 
