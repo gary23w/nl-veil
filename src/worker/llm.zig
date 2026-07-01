@@ -436,7 +436,9 @@ fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, h
     jstr(gpa, &msg, umsg.items) catch return true;
     msg.appendSlice(gpa, "}") catch return true;
     const tool_def = "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"write a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}";
-    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":2048}}}}", .{ model, msg.items, tool_def }) catch return true;
+    // temperature 0: the probe must measure the backend's MODAL behavior, not a sampling coin-flip — at the
+    // default temperature the same model alternates between a structured call and the text-emission failure.
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":2048,\"temperature\":0}}}}", .{ model, msg.items, tool_def }) catch return true;
     defer gpa.free(body);
     const r = postUrl(gpa, io, run_dir, "probe-write", chat_url, key, body, true);
     defer gpa.free(r.content);
