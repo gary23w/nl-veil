@@ -348,9 +348,16 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
 
     // LARGE-TOOL-CALL PROBE: only the ambiguous case is probed (native + tools listed + non-thinking) —
     // thinking models already get fenced writes, and a model without the tools capability never sends
-    // structured calls at all. One echo round-trip at startup buys round 1's writes.
+    // structured calls at all. The verdict is a MODEL property, so it is CACHED across runs (the echo
+    // round-trip costs ~75s of wall on a slow local model), and a runtime-observed wall overwrites a
+    // false pass via recordLargeToolWall — measured behavior always outranks the synthetic probe.
     if (caps.ollama_native and caps.caps_listed and caps.tools and !caps.thinking) {
-        caps.tools_ok_large = probeLargeToolCall(gpa, io, run_dir, host, key, model);
+        if (cachedLargeVerdict(gpa, io, run_dir, model)) |v| {
+            caps.tools_ok_large = v;
+        } else {
+            caps.tools_ok_large = probeLargeToolCall(gpa, io, run_dir, host, key, model);
+            storeLargeVerdict(gpa, io, run_dir, model, caps.tools_ok_large);
+        }
     }
 
     if (caps.ollama_native and caps.caps_listed) {
@@ -408,6 +415,58 @@ fn parseShowCaps(raw: []const u8) void {
             }
         }
     }
+}
+
+/// The probe-verdict cache lives NEXT TO the run dirs (one backend serves many runs): `<run_dir>/../probe-cache.tsv`,
+/// one `model\t0|1` line per model. A miss means "probe it"; the runtime fence flip rewrites a false pass to 0.
+fn probeCachePath(gpa: std.mem.Allocator, run_dir: []const u8) ?[]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/../probe-cache.tsv", .{run_dir}) catch null;
+}
+
+fn cachedLargeVerdict(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, model: []const u8) ?bool {
+    const p = probeCachePath(gpa, run_dir) orelse return null;
+    defer gpa.free(p);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 << 10)) catch return null;
+    defer gpa.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |ln| {
+        var f = std.mem.splitScalar(u8, ln, '\t');
+        const m = f.next() orelse continue;
+        if (!std.mem.eql(u8, m, model)) continue;
+        const v = f.next() orelse continue;
+        return std.mem.eql(u8, std.mem.trim(u8, v, " \r"), "1");
+    }
+    return null;
+}
+
+fn storeLargeVerdict(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, model: []const u8, ok: bool) void {
+    const p = probeCachePath(gpa, run_dir) orelse return;
+    defer gpa.free(p);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(64 << 10)) catch "";
+    defer if (data.len > 0) gpa.free(data);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |ln| {
+        if (std.mem.trim(u8, ln, " \r").len == 0) continue;
+        var f = std.mem.splitScalar(u8, ln, '\t');
+        const m = f.next() orelse continue;
+        if (std.mem.eql(u8, m, model)) continue; // replaced below
+        out.appendSlice(gpa, ln) catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    out.appendSlice(gpa, model) catch return;
+    out.append(gpa, '\t') catch return;
+    out.appendSlice(gpa, if (ok) "1" else "0") catch return;
+    out.append(gpa, '\n') catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = out.items }) catch {};
+}
+
+/// The RUNTIME fence flip observed a real large-tool-call wall the startup probe missed. Persist the verdict —
+/// it is a model property — so every FUTURE run of this model fences from round 1 instead of re-learning it.
+pub fn recordLargeToolWall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, model: []const u8) void {
+    caps.tools_ok_large = false;
+    storeLargeVerdict(gpa, io, run_dir, model, false);
 }
 
 /// Ask the model to echo a file-sized payload through ONE write_file call, and judge whether the backend
