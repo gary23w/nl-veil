@@ -439,6 +439,17 @@ pub const Mem = struct {
         if (self.run(argv.items)) |out| self.gpa.free(out);
     }
 
+    /// The learned trust WEIGHT for a tag-class (via `trust_get`), so the engine can rank sources by earned
+    /// experience. NEUTRAL (1.0) when the class is unknown, the trust feature is off, or the binary lacks the
+    /// verb — fail-safe: a missing signal never distorts routing. Read-only. Output is "weight\trewards\tpenalties".
+    pub fn classTrust(self: Mem, class: []const u8) f32 {
+        const out = self.run(&.{ "trust_get", class }) orelse return 1.0;
+        defer self.gpa.free(out);
+        const t = std.mem.trim(u8, out, " \r\n\t");
+        const end = std.mem.indexOfScalar(u8, t, '\t') orelse t.len;
+        return std.fmt.parseFloat(f32, std.mem.trim(u8, t[0..end], " \r\n\t")) catch 1.0;
+    }
+
     /// PLAIN (untrusted) wide recall on `scope` for `query`, returning the DISTINCT tag-classes of the
     /// surfaced facts — leading "[tok]" -> tok, else the scope; lowercased; caller owns each + the slice.
     /// The engine uses this to choose which classes to reward; forcing NO --trust keeps the sample honest
