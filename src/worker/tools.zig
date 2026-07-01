@@ -135,6 +135,19 @@ fn unlockFiles(ctx: *ToolCtx) void {
     if (ctx.fmtx) |m| m.unlock(ctx.io);
 }
 
+/// Land `data` at `full` via a same-directory temp + atomic rename (createFileAtomic → replace), so a crash or a
+/// concurrent reader never sees a torn/half-written file — old bytes stand until the new file swaps in atomically.
+/// The temp shares the target's directory, so the rename is always same-volume (never a byte-copy). Returns false
+/// on any I/O error, leaving the previous file intact (the caller reports it, nothing partial is committed).
+fn writeWorkFileAtomic(ctx: *ToolCtx, full: []const u8, data: []const u8) bool {
+    var af = std.Io.Dir.cwd().createFileAtomic(ctx.io, full, .{ .replace = true, .make_path = true }) catch return false;
+    defer af.deinit(ctx.io);
+    af.file.writeStreamingAll(ctx.io, data) catch return false;
+    af.file.sync(ctx.io) catch {}; // best-effort durability; not fatal where fsync is unsupported
+    af.replace(ctx.io) catch return false;
+    return true;
+}
+
 /// Write a fact to the SHARED hive, TAGGED with who/when ("[Noor r7] ..."). A hive fact is a mind's own first-person
 /// sentence; tagging it tells every reader it is a TEAMMATE's report, not their own memory — preventing the identity
 /// merge where one mind absorbs another's "I" as its own. The tag also gives a free recency stamp for the read path.
@@ -757,10 +770,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         joined.appendSlice(gpa, prior) catch {};
         if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n\n") catch {};
         joined.appendSlice(gpa, clean) catch {};
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = joined.items }) catch return dupe(gpa, "could not write file");
+        if (!writeWorkFileAtomic(ctx, full, joined.items)) return dupe(gpa, "could not write file");
         final_bytes = joined.items.len;
     } else {
-        std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = clean }) catch return dupe(gpa, "could not write file");
+        if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
     }
     ctx.files_written.* += 1;
     {
@@ -813,7 +826,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const res = bufedit.apply(gpa, original, ops.items);
     if (!res.ok) return res.reject; // owned; caller frees. original file untouched.
     defer gpa.free(res.bytes);
-    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = res.bytes }) catch return dupe(gpa, "could not write the edited file");
+    defer if (res.loci.len > 0) gpa.free(res.loci);
+    if (!writeWorkFileAtomic(ctx, full, res.bytes)) return dupe(gpa, "could not write the edited file");
     ctx.files_written.* += 1;
     {
         lockFiles(ctx);
