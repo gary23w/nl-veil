@@ -34,3 +34,4 @@ bin/*
 Thumbs.db
 .vscode/
 .idea/
+SWARM_VCS_BLUEPRINT.md
