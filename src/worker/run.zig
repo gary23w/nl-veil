@@ -174,6 +174,8 @@ pub const Worker = struct {
     smoke_str: []const u8 = "",
     build_str: []const u8 = "",
     iface_str: []const u8 = "",
+    exports_str: []const u8 = "", // per-module public export contract (from the live import graph) — the shared
+    // names every builder must import against so parallel one-slot minds converge instead of guessing
     bench_fixed: []const u8 = "",
     corpus_facts: u32 = 0,
     internet: bool = true,
@@ -424,6 +426,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
+    defer if (w.exports_str.len > 0) gpa.free(@constCast(w.exports_str));
     defer if (w.tg_token.len > 0) gpa.free(@constCast(w.tg_token));
     if (live and !w.operating) {
         const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
@@ -2398,6 +2401,14 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk_sf std.fmt.allocPrint(gpa, "YOUR FILE AS IT EXISTS RIGHT NOW — `{s}` ({s}):\n```\n{s}\n```\n\n", .{ assembler_slot, guidance, cur }) catch (gpa.dupe(u8, "") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(slot_file_block);
+    // THE EXPORT CONTRACT: the exact public names every project module already defines. A one-slot builder
+    // cannot edit a teammate's file, so importing a name a module actually exports is the ONLY way parallel
+    // minds converge — this replaces "guess the teammate's function name" with the ground truth.
+    const exports_block = if (assembler and w.exports_str.len > 0)
+        std.fmt.allocPrint(gpa, "PROJECT MODULE EXPORTS — the EXACT public names each module defines; when you import from another project module, use ONLY a name in its list (do NOT invent one), and make YOUR module export exactly what its callers need:\n{s}\n\n", .{clip(w.exports_str, scaledClip(w, 1200))}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(exports_block);
     const fence_build = gate.fence;
     const fence_clause = if (fence_build)
         "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE a NEW file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block. To CHANGE an EXISTING file (read_file it first — especially a LARGE one), do NOT re-emit the whole file: reply with one or more SEARCH/REPLACE blocks. Put the file's relative path on its own line, then for each change:\n<<<<<<< SEARCH\n(paste the exact original lines, copied VERBATIM from the file — enough to appear exactly once)\n=======\n(the new lines that replace them)\n>>>>>>> REPLACE\nThe SEARCH text must match the current file byte-for-byte (copy it, don't retype). To INSERT, SEARCH one nearby line and REPLACE it with itself plus the new lines. To DELETE, put the lines in SEARCH and leave REPLACE empty. Emit one block per distinct change. The engine finds each SEARCH span and swaps it, leaving the rest of the file untouched. Use read_file / recall_hive / send_message normally."
@@ -2529,7 +2540,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", slot, know_block, exports_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -3748,9 +3759,36 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
     defer gpa.free(r.stderr);
     const line = std.mem.trim(u8, r.stdout, " \r\n\t");
     if (line.len == 0 or line[0] != '{') return;
-    const S = struct { mismatches: [][]const u8 = &.{}, count: u32 = 0 };
+    const S = struct {
+        mismatches: [][]const u8 = &.{},
+        count: u32 = 0,
+        exports: std.json.Value = .null, // {module: [public names]} — the shared export contract
+    };
     var parsed = std.json.parseFromSlice(S, gpa, line, .{ .ignore_unknown_fields = true }) catch return;
     defer parsed.deinit();
+    // The EXPORT CONTRACT (published every round the moment ≥1 module defines a public name): the exact public
+    // names each project module defines. Under one_slot each mind owns ONE file and cannot edit a teammate's,
+    // so cross-file name disagreement can only converge if every caller imports names that ACTUALLY exist — the
+    // module's definitions are canonical, and this is how the engine makes them visible to every importer.
+    if (parsed.value.exports == .object) {
+        var xb: std.ArrayListUnmanaged(u8) = .empty;
+        defer xb.deinit(gpa);
+        var it = parsed.value.exports.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.startsWith(u8, e.key_ptr.*, "test_")) continue; // tests import, they aren't imported
+            if (e.value_ptr.* != .array or e.value_ptr.*.array.items.len == 0) continue;
+            if (xb.items.len > 0) xb.appendSlice(gpa, " | ") catch {};
+            xb.appendSlice(gpa, e.key_ptr.*) catch {};
+            xb.appendSlice(gpa, ": ") catch {};
+            for (e.value_ptr.*.array.items, 0..) |nm, i| {
+                if (nm != .string) continue;
+                if (i > 0) xb.appendSlice(gpa, ", ") catch {};
+                xb.appendSlice(gpa, nm.string) catch {};
+            }
+        }
+        if (w.exports_str.len > 0) gpa.free(@constCast(w.exports_str));
+        w.exports_str = gpa.dupe(u8, xb.items) catch "";
+    }
     if (parsed.value.count == 0) return;
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(gpa);
@@ -3759,7 +3797,7 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
         if (i > 0) b.appendSlice(gpa, "; ") catch {};
         b.appendSlice(gpa, m) catch {};
     }
-    b.appendSlice(gpa, ". read_file the named module and match its ACTUAL names (or add the missing function) — never assume a teammate's interface.") catch {};
+    b.appendSlice(gpa, ". The MODULE's definitions are canonical: if YOUR file is the importer, change your import to a name from that module's export list (shown in PROJECT MODULE EXPORTS); if YOUR file IS the module, add the name the callers expect. Never invent a teammate's interface.") catch {};
     w.iface_str = gpa.dupe(u8, b.items) catch "";
     if (w.iface_str.len > 0) w.act("engine", 0, "interfaces", std.fmt.allocPrint(w.a(), "{d} cross-file mismatch(es)", .{parsed.value.count}) catch "mismatches", w.iface_str);
 }
