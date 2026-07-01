@@ -810,10 +810,14 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// shebang or the same first import) is a fresh ATTEMPT, not a continuation: gluing it on produced files like
 /// cli.py = two half-programs (a truncated `if` followed by a second `import argparse`) that can never parse.
 /// Treat it as the rewrite the model actually meant. Lines shorter than 6 chars (`}`, `"""`) never match.
+/// SIZE GUARD: a real re-attempt is a whole file, so the body must be at least HALF the prior — a 15-line
+/// fragment that merely re-emits the import line is a sloppy continuation, and replacing a 200-line module
+/// with it would be silent data loss (a repeated import mid-file is a harmless no-op; glue it instead).
 fn appendRestartsFile(prior: []const u8, body: []const u8) bool {
     const a = firstMeaningfulLine(prior);
     if (a.len < 6) return false;
-    return std.mem.eql(u8, a, firstMeaningfulLine(body));
+    if (!std.mem.eql(u8, a, firstMeaningfulLine(body))) return false;
+    return body.len * 2 >= prior.len;
 }
 
 fn firstMeaningfulLine(s: []const u8) []const u8 {
@@ -2963,6 +2967,11 @@ test "appendRestartsFile: a restarted attempt is caught; a real continuation app
     try std.testing.expect(!appendRestartsFile("}\nrest\n", "}\nother\n"));
     try std.testing.expect(!appendRestartsFile("", "import argparse\n"));
     try std.testing.expect(!appendRestartsFile("import argparse\n", ""));
+    // SIZE GUARD: a short fragment that re-emits the header is a sloppy continuation, NOT a re-attempt —
+    // replacing a large module with it would silently destroy the file. Glue it (repeated import = no-op).
+    const big_prior = "import json\n" ++ ("def f():\n    return 1\n\n" ** 12);
+    try std.testing.expect(!appendRestartsFile(big_prior, "import json\n\ndef save_tasks(t):\n    pass\n"));
+    try std.testing.expect(appendRestartsFile(big_prior, big_prior)); // a full same-size re-attempt still rewrites
 }
 
 test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {

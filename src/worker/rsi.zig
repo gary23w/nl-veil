@@ -101,21 +101,27 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
         if (r.tool_calls > 0) with_real_tool += 1;
         if (r.narrated) narrated += 1;
     }
-    if (live_moments == 0) return;
+    if (live_moments == 0) {
+        w.promo_streak = 0; // "two CONSECUTIVE strong rounds" must not straddle a total-outage round
+        return;
+    }
     const tool_ok = (with_tool * 100) / live_moments;
     const drowning = narrated > 0 or tool_ok < 60;
     if (!drowning) {
         w.cap_streak = 0;
         // PROMOTE (the seed comment above always promised this; now it is real): two consecutive rounds of
         // full GENUINE tool competence (every live moment made structured tool calls, nothing narrated) lift
-        // the tier one step, so a capable model seeded low gets its full toolset back. Salvage-landed files
-        // do NOT count here — a fenced weak model stays in the lean regime that is carrying it.
+        // the tier one step, so a capable model seeded low gets its full toolset back. Guards against the
+        // false-positive flap measured in review: a FENCED worker's strong signal is the lean regime
+        // carrying it (read-only calls still parse; its file lands via salvage) — promoting it to author
+        // strips exactly that machinery, so fence mode blocks promotion; and one promote->demote round-trip
+        // proves the higher tier drowns this model, locking further promotion for the run.
         const stronger: ?Tier = switch (w.cap.tier) {
             .author => null,
             .assembler => .author,
             .extractor => .assembler,
         };
-        if (stronger != null and with_real_tool == live_moments and narrated == 0) {
+        if (stronger != null and !w.fence_writes and !w.promo_locked and with_real_tool == live_moments and narrated == 0) {
             w.promo_streak += 1;
             if (w.promo_streak >= 2) {
                 w.promo_streak = 0;
@@ -123,6 +129,7 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
                 const keep_temp = w.cap.temperature;
                 w.cap = profileForTier(stronger.?);
                 w.cap.temperature = keep_temp;
+                w.tier_was_promoted = true;
                 w.act("engine", round, "capacity", @tagName(stronger.?), std.fmt.allocPrint(w.a(), "RSI promote {s} -> {s}: two strong rounds running (100% structured tool use, nothing narrated) — the model earned its fuller toolset back", .{ @tagName(from), @tagName(stronger.?) }) catch "rsi promote");
                 w.emit("capacity", std.fmt.allocPrint(w.a(), ",\"tier\":\"{s}\",\"turns\":{d},\"conv_cap\":{d},\"promoted\":true", .{ @tagName(stronger.?), w.cap.max_turns, w.cap.conv_cap }) catch ",\"promoted\":true");
             }
@@ -156,6 +163,12 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     if (w.cap_streak < 2) return;
     w.cap_streak = 0;
     const from = w.cap.tier;
+    if (w.tier_was_promoted) {
+        // demoting OUT of a tier we promoted INTO = the higher tier measurably drowns this model; lock
+        // promotion for the rest of the run so the promote/demote pair cannot flap.
+        w.promo_locked = true;
+        w.tier_was_promoted = false;
+    }
     w.cap = profileForTier(leaner.?);
     w.cap.temperature = TEMP_FLOOR;
     w.act("engine", round, "capacity", @tagName(leaner.?), std.fmt.allocPrint(w.a(), "RSI demote {s} -> {s}: low temp was not enough — the model still DROWNS ({d}% of moments used tools, {d} narrated, 2 rounds running) — leaning the context flow down to its measured ability", .{ @tagName(from), @tagName(leaner.?), tool_ok, narrated }) catch "rsi demote");
