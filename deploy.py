@@ -685,8 +685,158 @@ def chat(name):
 
 # -------------------------------------------------------------------------------------- launch
 
+def _llm_chat(base_url, key, model, system, user, timeout=120):
+    """One OpenAI-compatible chat completion via stdlib urllib (no extra deps — keeps deploy.py plug-and-play).
+    Returns the assistant text, or "" on any failure (the caller degrades gracefully)."""
+    import urllib.request
+    url = (base_url or "http://localhost:11434/v1").rstrip("/") + "/chat/completions"
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        "temperature": 0.3, "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + (key or "ollama")})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        return ((data.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
+    except Exception as e:
+        print(f"  (Veil clarify: model call failed - {type(e).__name__}: {e})")
+        return ""
+
+
+def _clarify(args, where):
+    """Ask the user a few AI-generated clarifying questions and fold the answers back into a sharper request.
+    Returns the (possibly) refined goal text. Degrades to the original goal if the model is unreachable/skipped."""
+    goal = (args.goal or "").strip()
+    if not goal:
+        return goal
+    qs = _llm_chat(args.base_url, args.key, args.model,
+        "You are the Veil, about to direct a hive of AI minds to carry out a task for a user. BEFORE starting, ask "
+        "the 2-4 MOST useful clarifying questions whose answers would materially change HOW you do it (scope, exact "
+        "target, tech stack, constraints, and what 'done' looks like). Output ONLY a short numbered list of "
+        "questions, nothing else. If the request is already fully clear, output the single line: NONE.",
+        f"The user's request: {goal}\n\nWorking directory: {where}")
+    if not qs or qs.strip().upper().startswith("NONE"):
+        return goal
+    print("  A few quick questions so the hive nails it:\n")
+    print("  " + qs.replace("\n", "\n  ") + "\n")
+    print("  Answer what matters (press Enter on an empty line when done):")
+    answers = []
+    try:
+        while len(answers) < 6:
+            line = input("  > ").strip()
+            if not line:
+                break
+            answers.append(line)
+    except (EOFError, KeyboardInterrupt):
+        pass
+    if not answers:
+        return goal
+    refined = _llm_chat(args.base_url, args.key, args.model,
+        "Rewrite the user's request into ONE clear, complete, self-contained task specification: what to do, WHERE, "
+        "the concrete deliverable(s)/done-criteria, and any constraints. Preserve every filename, path, and hard "
+        "constraint the user gave VERBATIM. Output ONLY the rewritten task, no preamble.",
+        f"Original request: {goal}\nWorking directory: {where}\n\nClarifying questions:\n{qs}\n\n"
+        f"Answers (in order, may be partial):\n" + "\n".join(answers))
+    return (refined or "").strip() or goal
+
+
+def _make_plan(args, goal, where, revision=""):
+    """Ask the model for a concrete, reviewable execution plan (numbered steps; note which write files vs run
+    shell). `revision` folds in a change the user asked for in the REPL. Returns the plan text."""
+    extra = ("\n\nThe user reviewed a prior plan and asked for this change; produce the REVISED plan:\n" + revision) if revision else ""
+    return _llm_chat(args.base_url, args.key, args.model,
+        "You are the Veil planning work for a hive of AI minds. Produce a CONCRETE, reviewable execution plan for "
+        "the task: a short numbered list of steps, each naming the file(s) it creates/edits or the shell command it "
+        "runs, and a one-line 'Done when:' at the end. Be specific to the actual working directory. No preamble, "
+        "just the plan.",
+        f"Task: {goal}\nWorking directory: {where}{extra}")
+
+
+def plan_and_approve(args):
+    """--repl: the plan-approve gate. Clarify -> propose a concrete plan -> the user APPROVES once (then the hive
+    runs autonomously) or refines it in place until they approve. On approval, args.goal carries the task + the
+    approved plan and autonomy is set to full (approval IS the grant). Aborts the cast if the user declines."""
+    where = os.path.abspath(os.path.expanduser(args.embed)) if getattr(args, "embed", None) else os.getcwd()
+    print("\n  The Veil is reading your request...\n")
+    goal = _clarify(args, where)
+    plan = _make_plan(args, goal, where)
+    if not plan:
+        print("  (could not reach the model to plan - casting on your request as-is.)")
+        args.goal = goal
+        return
+    while True:
+        print("\n  ===== PLAN =====")
+        print("  " + plan.replace("\n", "\n  "))
+        print("  ================\n")
+        print("  [a] approve -> the hive runs this autonomously   [r] refine (tell me what to change)   [q] cancel")
+        try:
+            choice = input("  > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = "q"
+        low = choice.lower()
+        if low in ("a", "approve", "y", "yes", ""):
+            args.goal = f"{goal}\n\nAPPROVED PLAN (execute this, in order):\n{plan}"
+            args.autonomy = "full"   # the user approved the plan; run it without further gating
+            print("\n  Approved. Casting the hive to execute autonomously...\n")
+            return
+        if low in ("q", "quit", "n", "no", "cancel"):
+            sys.exit("  cancelled - nothing cast.")
+        # anything else (or 'r <change>') is treated as a refinement instruction
+        change = choice[1:].strip() if low.startswith("r ") else (choice if low not in ("r", "refine") else "")
+        if not change:
+            try:
+                change = input("  What should change? ").strip()
+            except (EOFError, KeyboardInterrupt):
+                change = ""
+        if not change:
+            continue
+        print("\n  Revising the plan...")
+        revised = _make_plan(args, goal, where, revision=change)
+        if revised:
+            plan = revised
+
+
+def embed_workdir(run_dir, embed_dir):
+    """--embed: point <run_dir>/work AT the user's project dir so the hive reads+writes their REAL files in place.
+    Directory junction on Windows (no admin/dev-mode needed) / symlink elsewhere. Returns the resolved abs dir."""
+    embed_dir = os.path.abspath(os.path.expanduser(embed_dir))
+    if not os.path.isdir(embed_dir):
+        sys.exit(f"ERROR: --embed dir does not exist: {embed_dir}")
+    work = os.path.join(run_dir, "work")
+    if os.path.islink(work) or os.path.exists(work):
+        try:
+            os.unlink(work)              # existing junction / symlink
+        except OSError:
+            try:
+                os.rmdir(work)           # fresh empty scaffold dir
+            except OSError:
+                shutil.rmtree(work, ignore_errors=True)
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["cmd", "/c", "mklink", "/J", work, embed_dir], capture_output=True, text=True)
+            if r.returncode != 0:
+                raise OSError((r.stderr or r.stdout).strip() or "mklink /J failed")
+        else:
+            os.symlink(embed_dir, work, target_is_directory=True)
+    except Exception as e:
+        sys.exit(f"ERROR: could not embed into {embed_dir}: {e}")
+    return embed_dir
+
+
 def deploy(args):
     args.name = args.name or ("swarm_" + time.strftime("%Y%m%d_%H%M%S"))
+    if getattr(args, "host", False):
+        sys.exit(
+            "  --host (supervised host shell-ops) is not wired yet - it is the next slice.\n"
+            "  It will: seed a host snapshot so the hive operates on THIS machine, then run a supervised\n"
+            "  executor that asks you to confirm EVERY real shell command (with a hard denylist).\n"
+            "  For now, to build the artifacts for a host task safely, cast it in-place instead, e.g.:\n"
+            f'      python deploy.py "{(args.goal or "<task>")[:60]}" --embed . --repl')
+    if getattr(args, "repl", False):
+        plan_and_approve(args)   # clarify -> propose a plan -> user approves once -> run autonomously
     service = getattr(args, "service", False)
     binary = find_binary(args.bin, getattr(args, "yes", False))
     # an embedded box may have no llama runtime yet — detect + install/pull it as part of the deployment
@@ -697,6 +847,13 @@ def deploy(args):
     run_dir = os.path.join(DATA, args.name)
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(os.path.join(run_dir, "work"), exist_ok=True)
+
+    # --embed: work IN-PLACE in the user's project dir (the hive's work/ becomes a junction/symlink to it), and
+    # force BOUNDED autonomy — editing someone's real files is exactly when the hive should propose, not self-run.
+    embed_dir = None
+    if getattr(args, "embed", None):
+        embed_dir = embed_workdir(run_dir, args.embed)
+        args.autonomy = "bounded"
 
     n = max(1, min(args.minds, len(MIND_NAMES)))
     manifest = {
@@ -757,16 +914,38 @@ def deploy(args):
         print(f"\n  events: {os.path.join(run_dir, 'events.jsonl')}   |   talk to the Veil: python deploy.py chat {args.name}")
         return
 
+    # --detach: fully cut the worker loose from this terminal so it survives the shell closing (a new session /
+    # detached process group), and return immediately with attach/stop hints. Lighter than --service (no daemon).
+    detach = getattr(args, "detach", False)
+    popen_kw = {}
+    if detach:
+        if os.name == "nt":
+            popen_kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kw["start_new_session"] = True
+
     logf = open(os.path.join(run_dir, "worker.log"), "w", encoding="utf-8")
     proc = subprocess.Popen([binary, "worker", run_dir, neuron, args.model],
-                            cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT)
+                            cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT, **popen_kw)
     print(f"  hive running (pid {proc.pid})  -  events: {os.path.join(run_dir, 'events.jsonl')}")
+    if embed_dir:
+        print(f"  working IN-PLACE in: {embed_dir}")
     print(f"  talk to the Veil:  python deploy.py chat {args.name}")
     print(f"  stop:  python deploy.py stop {args.name}")
-    if args.follow:
+    if getattr(args, "repl", False) and not detach:
+        # stay-open chat: the plan is running; the user keeps giving follow-up edits. Small tweaks the hive just
+        # does; the REPL stays a live conversation with the swarm (see `chat`). Ctrl-C / 'exit' leaves it running.
+        print("\n  Plan approved and running. The chat stays open for follow-up edits - type them anytime.\n")
+        try:
+            chat(args.name)
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n  (left the chat; hive still running - reattach: python deploy.py chat {args.name})")
+    elif args.follow:
         follow(run_dir, proc)
+    elif detach:
+        print(f"\n  detached - the hive runs on without this terminal. Reattach with:  python deploy.py chat {args.name}")
     else:
-        print("\n  (running in the background. Add --follow to watch it live.)")
+        print("\n  (running in the background. Add --follow to watch it live, or --detach to leave this terminal.)")
 
 # -------------------------------------------------------------------------------- setup wizard
 
@@ -1398,6 +1577,19 @@ def main():
     ap.add_argument("--service", action="store_true", help="install as a long-lived OS service/daemon (systemd on Linux) that starts on boot and restarts on failure, instead of a foreground run")
     ap.add_argument("--rebuild-neuron", dest="rebuild_neuron", action="store_true", help="re-fetch + rebuild the neuron memory engine from source before launching (always on for --service)")
     ap.add_argument("--follow", action="store_true", help="stream the hive's activity live")
+    # ---- cast-on-the-fly ergonomics ----
+    ap.add_argument("--embed", default=None, metavar="DIR",
+                    help="work IN-PLACE inside DIR (your project): the hive reads AND writes your real files there "
+                         "instead of a fresh data/<run>/work scaffold. Forces bounded autonomy for safety.")
+    ap.add_argument("--repl", action="store_true",
+                    help="before launching, the Veil asks you a few clarifying questions and rewrites your one-liner "
+                         "into a sharp task spec you approve; then it casts the swarm and drops you into the chat.")
+    ap.add_argument("--detach", action="store_true",
+                    help="cast the swarm fully detached from this terminal (survives closing it) and return immediately "
+                         "with how to attach/stop. Lighter than --service (no OS daemon install).")
+    ap.add_argument("--host", action="store_true",
+                    help="HOST OPS: let the hive operate on THIS machine (run shell tasks / edit system files) under a "
+                         "supervised executor that asks you to confirm every real command. Powerful — use with care.")
     deploy(ap.parse_args())
 
 if __name__ == "__main__":
