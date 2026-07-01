@@ -1,0 +1,10 @@
+store.py exposes load_tasks(path) returning a list of task dicts, and save_tasks(path, tasks) writing JSON with json.dump(tasks, fh, indent=2).
+Each task dict has exactly the keys: id (int), title (str), done (bool), created_ts (float from time.time()).
+load_tasks(path) must return [] when the file does not exist (check os.path.exists before opening).
+cli.py uses argparse with subparsers dest='cmd' and subcommands: add <title>, list, done <id>.
+cli.py 'add' assigns the new id via next_task_id(tasks) which returns max of existing ids plus 1, starting at 1.
+cli.py 'done' marks the matching task's done=True and calls save_tasks immediately.
+test_store.py uses tempfile.TemporaryDirectory() so tests never touch a real data file.
+test_store.py asserts the round-trip: save_tasks then load_tasks returns an equal list.
+The tasks file default path is the constant TASKS_PATH = 'tasks.json' defined in store.py.
+The list command prints one line per task: '[x]' if done else '[ ]', then the id and title.
