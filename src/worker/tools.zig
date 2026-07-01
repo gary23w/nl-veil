@@ -1611,6 +1611,39 @@ pub fn crawlSearchPrim(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag:
     return result;
 }
 
+/// Panic-proof intel search: curl the engines in a SUBPROCESS (a parser crash there can't take down the worker)
+/// + strip with the simple htmlToText, NOT the crawl.* parsers that can integer-overflow on odd pages.
+pub fn fetchSearchText(io: std.Io, gpa: std.mem.Allocator, run_dir: []const u8, query: []const u8) []const u8 {
+    const enc = queryEncode(gpa, query);
+    defer gpa.free(enc);
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.intelsearch.tmp", .{run_dir}) catch return dupe(gpa, "");
+    defer gpa.free(tmp);
+    // Try several engines so one rate-limiting us can't blind the learn loop; return the first with content.
+    const bases = [_][]const u8{
+        "https://www.bing.com/search?q=",
+        "https://www.mojeek.com/search?q=",
+        "https://html.duckduckgo.com/html/?q=",
+    };
+    for (bases) |base| {
+        const url = std.fmt.allocPrint(gpa, "{s}{s}", .{ base, enc }) catch continue;
+        defer gpa.free(url);
+        var av: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer av.deinit(gpa);
+        av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "12", "--connect-timeout", "6", "-o", tmp, "-A", "Mozilla/5.0 (X11; Linux x86_64)" }) catch continue;
+        av.append(gpa, url) catch continue;
+        spawnGuarded(io, av.items, 14000);
+        const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(512 << 10)) catch (gpa.dupe(u8, "") catch @constCast(""));
+        defer gpa.free(raw);
+        std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+        if (raw.len < 800) continue;
+        const text = htmlToText(gpa, raw);
+        defer gpa.free(text);
+        const clipped = clip(text, 1400);
+        if (std.mem.trim(u8, clipped, " \r\n\t").len > 80) return dupe(gpa, clipped);
+    }
+    return dupe(gpa, "");
+}
+
 fn crawlSearch(ctx: *ToolCtx, query: []const u8, max: usize) []const u8 {
     return crawlSearchPrim(ctx.io, ctx.gpa, ctx.run_dir, ctx.mind, query, max);
 }

@@ -1501,13 +1501,13 @@ fn assessIntelGap(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: 
             if (std.mem.lastIndexOfAny(u8, term, "/:")) |i| {
                 if (i + 1 < term.len) term = term[i + 1 ..];
             }
-            const res = tools.crawlSearchPrim(io, gpa, run_dir, "intel", term, 5);
+            const res = tools.fetchSearchText(io, gpa, run_dir, term);
             defer gpa.free(@constCast(res));
             const trimmed = std.mem.trim(u8, res, " \r\n\t");
             if (trimmed.len > 40) {
                 // Distill + judge: the model reads the fetched intel and rules malicious vs benign. Only a
                 // malicious verdict earns [verified] (which adjudication keys on); benign is stored without it.
-                const dsys = "You are a security analyst triaging an indicator found on a live device. Using ONLY the supplied reference material, decide whether the indicator is a MALICIOUS threat or a BENIGN/legitimate component. A legitimate tool (a backup, a metrics exporter, a stock service) is BENIGN even if powerful; only call it MALICIOUS if the reference material identifies it as malware, an attack tool, a miner, or attacker tradecraft.";
+                const dsys = "You are a security analyst triaging an UNEXPECTED PERSISTENCE MECHANISM (a cron job, systemd unit, or startup hook) discovered on a production device you defend — something installed it to auto-run. Using ONLY the supplied reference material, decide MALICIOUS vs BENIGN. MALICIOUS: the material identifies it as malware, a cryptocurrency MINER, a botnet / DDoS client, a RAT / backdoor, a rootkit, a worm, or attacker tooling — a miner or hacking tool running as UNEXPECTED persistence is cryptojacking or compromise, MALICIOUS even if the software is a 'legitimate' open-source utility in other contexts. BENIGN only for a recognized administrative or defensive tool that normally belongs in scheduled tasks: a backup job, an antivirus or rootkit SCANNER, a filesystem check, a metrics exporter, an endpoint-monitoring agent, or a stock system service. If the material describes a miner, botnet, trojan, worm, or hacking tool, answer MALICIOUS.";
                 const duser = std.fmt.allocPrint(gpa, "Indicator on the device: {s}\n\nReference material from the web:\n{s}\n\nReply with EXACTLY one line. Start it with 'MALICIOUS: ' followed by the single remediation action, OR 'BENIGN: ' followed by what it legitimately is. Base the verdict ONLY on the reference material above.", .{ clip(indicator, 90), clip(trimmed, 1200) }) catch null;
                 if (duser) |du| {
                     defer gpa.free(du);
