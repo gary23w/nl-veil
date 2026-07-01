@@ -7,6 +7,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
+const bufedit = @import("bufedit.zig");
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
 const crawl = @import("crawl.zig");
@@ -233,7 +234,8 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 /// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
-    \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
+    \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
+    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"patch_system","description":"RSI engine edit tool. Read/write/replace/apply_patch under NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT). Mutating edits are gated: provide proposal + measurable success_criterion; high-impact edits also require simulate_change; privileged zones require explicit operator approval.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative file path under the configured patch-system root (required for read/write/replace)"},"mode":{"type":"string","enum":["read","write","replace","patch"],"description":"operation (default: read)"},"content":{"type":"string","description":"new file content for write mode"},"find":{"type":"string","description":"exact text to replace (replace mode)"},"replace":{"type":"string","description":"replacement text (replace mode)"},"patch":{"type":"string","description":"apply_patch payload with *** Begin Patch / *** End Patch markers (patch mode)"},"proposal":{"type":"string","description":"proposal title/id from propose_change (required for mutating edits)"},"success_criterion":{"type":"string","description":"measurable success criterion tied to the proposal (required for mutating edits)"},"limit":{"type":"integer","description":"max bytes to read (default 12000, max 262144)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
@@ -294,7 +296,8 @@ pub const SCOUT_SCHEMA =
 /// stored-and-forgotten) — AND send_message, so parallel minds building separate files can agree on the interfaces
 /// between them. No web/search (the scout's job), no run_python/run_tests. Keep defs in sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
-    \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
+    \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
+    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
@@ -323,6 +326,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
     if (std.mem.eql(u8, name, "run_python")) return runPython(ctx, args_json);
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
+    if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, args_json);
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);
     if (std.mem.eql(u8, name, "patch_system")) return patchSystem(ctx, args_json);
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, args_json);
@@ -620,7 +624,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
@@ -777,6 +781,56 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (redirected)
         return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.", .{ wpath, final_bytes, p.value.path }) catch dupe(gpa, "wrote");
     return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes }) catch dupe(gpa, "wrote");
+}
+
+fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", text: []const u8 = "", at: usize = 0 };
+    const A = struct { path: []const u8 = "", ops: []const OpJson = &.{} };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
+        return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
+    defer p.deinit();
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (p.value.ops.len == 0) return dupe(gpa, "edit_file needs an ops array — each op is replace/insert_before/insert_after/delete with an exact anchor snippet.");
+    const npath = blk_np: {
+        const wb = std.fs.path.basename(ctx.workdir);
+        if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
+            break :blk_np p.value.path[wb.len + 1 ..];
+        break :blk_np p.value.path;
+    };
+    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, npath }) catch return dupe(gpa, "oom");
+    defer gpa.free(full);
+    const original = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20)) catch
+        return std.fmt.allocPrint(gpa, "{s} does not exist (or is over 1MiB) — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
+    defer gpa.free(original);
+    var ops: std.ArrayListUnmanaged(bufedit.EditOp) = .empty;
+    defer ops.deinit(gpa);
+    for (p.value.ops) |o| {
+        const kind: bufedit.OpKind =
+            if (std.mem.eql(u8, o.op, "replace")) .replace else if (std.mem.eql(u8, o.op, "insert_before")) .insert_before else if (std.mem.eql(u8, o.op, "insert_after")) .insert_after else if (std.mem.eql(u8, o.op, "insert_at")) .insert_at else if (std.mem.eql(u8, o.op, "delete")) .delete else return std.fmt.allocPrint(gpa, "unknown op '{s}' — use replace | insert_before | insert_after | insert_at | delete", .{o.op}) catch dupe(gpa, "unknown op");
+        ops.append(gpa, .{ .kind = kind, .anchor = o.anchor, .text = o.text, .at = o.at }) catch {};
+    }
+    const res = bufedit.apply(gpa, original, ops.items);
+    if (!res.ok) return res.reject; // owned; caller frees. original file untouched.
+    defer gpa.free(res.bytes);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = full, .data = res.bytes }) catch return dupe(gpa, "could not write the edited file");
+    ctx.files_written.* += 1;
+    {
+        lockFiles(ctx);
+        defer unlockFiles(ctx);
+        const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{ctx.run_dir}) catch "";
+        defer if (mpath.len > 0) gpa.free(mpath);
+        if (mpath.len > 0) {
+            const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, mpath, gpa, .limited(64 << 10)) catch &[_]u8{};
+            defer if (existing.len > 0) gpa.free(existing);
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(gpa);
+            buf.appendSlice(gpa, existing) catch {};
+            buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, res.bytes.len }) catch "") catch {};
+            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
+        }
+    }
+    return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes", .{ npath, ops.items.len, res.bytes.len }) catch dupe(gpa, "edited");
 }
 
 fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
