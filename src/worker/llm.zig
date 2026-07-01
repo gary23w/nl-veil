@@ -21,7 +21,18 @@ pub var tokens_in_free: std.atomic.Value(u64) = .init(0);
 pub var tokens_out_free: std.atomic.Value(u64) = .init(0);
 pub var calls_made: std.atomic.Value(u64) = .init(0);
 
-pub const Caps = struct { probed: bool = false, ollama_native: bool = false, reasoning: bool = false };
+pub const Caps = struct {
+    probed: bool = false,
+    ollama_native: bool = false,
+    reasoning: bool = false,
+    /// From /api/show model_info "<arch>.context_length": the model's REAL maximum context window. 0 = unknown.
+    ctx_tokens: u32 = 0,
+    /// capabilities[] from /api/show parsed OK — when true, `tools`/`thinking` are authoritative and replace
+    /// the model-NAME heuristics entirely (a new model needs no code change to be classified correctly).
+    caps_listed: bool = false,
+    tools: bool = false,
+    thinking: bool = false,
+};
 var caps: Caps = .{};
 
 pub fn capsSnapshot() Caps {
@@ -77,6 +88,7 @@ const NATIVE_CTX: u32 = 32768;
 /// flooring IT to 2048 forces it to GENERATE 2048 tokens for a 200-token task, which turned the local relay into a
 /// multi-minute stall. So the floor must be gated on the model, not just on "is it local".
 fn isThinking(model: []const u8) bool {
+    if (caps.probed and caps.caps_listed) return caps.thinking or caps.reasoning;
     if (caps.probed and caps.ollama_native) return caps.reasoning;
     var buf: [64]u8 = undefined;
     const n = @min(model.len, buf.len);
@@ -181,7 +193,7 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
     const url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return stepErr(gpa, "oom");
     defer gpa.free(url);
-    const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, temp_frag) catch return stepErr(gpa, "oom");
+    const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, effectiveCtx(), temp_frag) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     const r = postUrl(gpa, io, run_dir, tag, url, key, body, true);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
@@ -189,11 +201,18 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     return parseOllamaNative(gpa, base_url, r.content);
 }
 
-fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, temp_frag: []const u8) ![]u8 {
+/// The num_ctx actually requested: never MORE than the model's probed maximum (asking beyond it is silently
+/// clamped or errors depending on backend), and never more than the engine budget (NATIVE_CTX). Unprobed
+/// keeps the engine budget verbatim (the titan1 truncation fix).
+fn effectiveCtx() u32 {
+    return if (caps.ctx_tokens > 0) @min(NATIVE_CTX, caps.ctx_tokens) else NATIVE_CTX;
+}
+
+fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, ctx: u32, temp_frag: []const u8) ![]u8 {
     return if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, NATIVE_CTX, temp_frag })
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, ctx, temp_frag })
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, np, NATIVE_CTX, temp_frag });
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, np, ctx, temp_frag });
 }
 
 fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8) Step {
@@ -302,6 +321,24 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
     caps.probed = true;
 
     if (caps.ollama_native) {
+        // /api/show is the backend's own capability record: capabilities[] ("tools"/"thinking") replaces the
+        // model-NAME heuristics, and model_info's "<arch>.context_length" bounds num_ctx so the engine never
+        // requests a window the model cannot actually serve. Cheap (no model load) and exact.
+        const show_url = std.fmt.allocPrint(gpa, "{s}/api/show", .{host}) catch return;
+        defer gpa.free(show_url);
+        var sbody: std.ArrayListUnmanaged(u8) = .empty;
+        defer sbody.deinit(gpa);
+        sbody.appendSlice(gpa, "{\"model\":") catch return;
+        jstr(gpa, &sbody, model) catch return;
+        sbody.appendSlice(gpa, "}") catch return;
+        const sr = postUrl(gpa, io, run_dir, "probe-show", show_url, key, sbody.items, true);
+        if (sr.ok) parseShowCaps(sr.content);
+        gpa.free(sr.content);
+    }
+
+    if (caps.ollama_native and caps.caps_listed) {
+        caps.reasoning = caps.thinking; // authoritative record — no need to load the model just to ask it
+    } else if (caps.ollama_native) {
         const chat_url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{host}) catch return;
         defer gpa.free(chat_url);
         var msg: std.ArrayListUnmanaged(u8) = .empty;
@@ -317,6 +354,38 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
             if (responseHasReasoning(r.content)) caps.reasoning = true;
         } else {
             gpa.free(r.content);
+        }
+    }
+}
+
+/// Fold an /api/show response into the caps record. capabilities[] is the authoritative tools/thinking
+/// classification; model_info's "<arch>.context_length" is the model's real maximum window — the rope-scaling
+/// "…original_context_length" sibling (the PRE-scaling window, e.g. gpt-oss's 4096-of-131072) is ignored.
+fn parseShowCaps(raw: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const root = parsed.value.object;
+    if (root.get("capabilities")) |cv| {
+        if (cv == .array) {
+            caps.caps_listed = true;
+            for (cv.array.items) |item| {
+                if (item != .string) continue;
+                if (std.mem.eql(u8, item.string, "tools")) caps.tools = true;
+                if (std.mem.eql(u8, item.string, "thinking")) caps.thinking = true;
+            }
+        }
+    }
+    if (root.get("model_info")) |mv| {
+        if (mv == .object) {
+            var it = mv.object.iterator();
+            while (it.next()) |e| {
+                const k = e.key_ptr.*;
+                if (!std.mem.endsWith(u8, k, ".context_length")) continue;
+                if (std.mem.endsWith(u8, k, ".original_context_length")) continue;
+                if (e.value_ptr.* == .integer and e.value_ptr.*.integer > 0)
+                    caps.ctx_tokens = std.math.cast(u32, e.value_ptr.*.integer) orelse std.math.maxInt(u32);
+            }
         }
     }
 }
@@ -515,19 +584,59 @@ test "probe-first override: a probed cap wins over the port/name heuristics; unp
     try std.testing.expect(!isOllama("http://localhost:11434/v1"));
     try std.testing.expect(isThinking("o1-preview"));
     try std.testing.expect(!isThinking("gpt-4o"));
+
+    // capabilities[] from /api/show outranks both the name heuristics and the reasoning probe
+    caps = .{ .probed = true, .ollama_native = true, .caps_listed = true, .thinking = false, .reasoning = false };
+    try std.testing.expect(!isThinking("gpt-oss:20b")); // the name says thinking; the capability record says no
+    caps.thinking = true;
+    try std.testing.expect(isThinking("llama3.1:8b")); // and vice versa
 }
 
-test "ollamaNativeBody pins num_ctx=32768 in the options (titan1 truncation fix)" {
+test "ollamaNativeBody pins num_ctx in the options (titan1 truncation fix)" {
     const gpa = std.testing.allocator;
-    const with_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "{\"name\":\"write_file\"}", 24576, ",\"temperature\":0.70");
+    const with_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "{\"name\":\"write_file\"}", 24576, 32768, ",\"temperature\":0.70");
     defer gpa.free(with_tools);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"num_ctx\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"num_predict\":24576") != null);
     try std.testing.expect(std.mem.indexOf(u8, with_tools, "\"tools\":") != null);
 
-    const no_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "", 24576, "");
+    const no_tools = try ollamaNativeBody(gpa, "gpt-oss:20b", "{\"role\":\"user\"}", "", 24576, 32768, "");
     defer gpa.free(no_tools);
     try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"num_ctx\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"tools\":") == null);
     try std.testing.expectEqual(@as(u32, 32768), NATIVE_CTX);
+}
+
+test "effectiveCtx: the probed model maximum bounds num_ctx; unprobed keeps the engine budget" {
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{};
+    try std.testing.expectEqual(NATIVE_CTX, effectiveCtx());
+    caps.ctx_tokens = 8192; // a genuinely small model must not be asked for a 32k window
+    try std.testing.expectEqual(@as(u32, 8192), effectiveCtx());
+    caps.ctx_tokens = 131072; // a huge model still gets only the engine budget
+    try std.testing.expectEqual(NATIVE_CTX, effectiveCtx());
+}
+
+test "parseShowCaps: capabilities[] + context_length parsed; rope original_context_length ignored" {
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{};
+    parseShowCaps("{\"capabilities\":[\"completion\",\"tools\"],\"model_info\":{\"llama.context_length\":131072,\"llama.embedding_length\":4096}}");
+    try std.testing.expect(caps.caps_listed);
+    try std.testing.expect(caps.tools);
+    try std.testing.expect(!caps.thinking);
+    try std.testing.expectEqual(@as(u32, 131072), caps.ctx_tokens);
+
+    caps = .{};
+    parseShowCaps("{\"capabilities\":[\"completion\",\"tools\",\"thinking\"],\"model_info\":{\"gptoss.context_length\":131072,\"gptoss.rope.scaling.original_context_length\":4096}}");
+    try std.testing.expect(caps.thinking);
+    try std.testing.expectEqual(@as(u32, 131072), caps.ctx_tokens); // NOT the 4096 pre-rope-scaling window
+
+    caps = .{};
+    parseShowCaps("<html>404</html>"); // a hosted endpoint answering garbage must change nothing
+    try std.testing.expect(!caps.caps_listed);
+    try std.testing.expectEqual(@as(u32, 0), caps.ctx_tokens);
 }
