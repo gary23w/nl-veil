@@ -20,6 +20,7 @@ pub const Applied = struct {
     bytes: []u8 = "",
     reject: []u8 = "",
     loci: []MatchLocus = &.{}, // owned; one per op in op-index order, only when ok (empty under OOM fallback)
+    reindented: u32 = 0, // ops whose replacement was auto-reindented to the file (loose match) — surfaced, not silent
 };
 
 fn trimTrail(s: []const u8) []const u8 {
@@ -115,6 +116,38 @@ fn rejectMsg(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Ap
     return .{ .ok = false, .reject = std.fmt.allocPrint(gpa, fmt, args) catch @constCast("edit rejected") };
 }
 
+fn firstNonEmpty(lines: []const []const u8) []const u8 {
+    for (lines) |ln| {
+        if (trimBoth(ln).len > 0) return ln;
+    }
+    return "";
+}
+
+/// A weak model's anchor usually misses by a FEW characters (retyped, wrong indent, curly quote). Show it the
+/// closest real file line (by shared-character prefix/token overlap) with its line number, so the corrective
+/// turn can copy the true text instead of guessing again. Returns a borrowed slice of `lines` content in a
+/// caller-provided buffer ("" when the file is empty or nothing is remotely close).
+fn nearestLineHint(lines: []const []const u8, anchor_first: []const u8, buf: []u8) []const u8 {
+    const want = trimBoth(anchor_first);
+    if (want.len == 0 or lines.len == 0) return "";
+    var best_i: usize = 0;
+    var best_score: usize = 0;
+    for (lines, 0..) |ln, i| {
+        const have = trimBoth(ln);
+        if (have.len == 0) continue;
+        var score: usize = 0;
+        const n = @min(want.len, have.len);
+        while (score < n and want[score] == have[score]) score += 1; // shared prefix
+        if (std.mem.indexOf(u8, have, want) != null or std.mem.indexOf(u8, want, have) != null) score += n / 2;
+        if (score > best_score) {
+            best_score = score;
+            best_i = i;
+        }
+    }
+    if (best_score < 4) return "";
+    return std.fmt.bufPrint(buf, " Closest file line is {d}: `{s}`", .{ best_i + 1, lines[best_i][0..@min(lines[best_i].len, 120)] }) catch "";
+}
+
 /// Apply all ops to `original`. Pure (no I/O). Returns owned rewritten bytes, or an owned reject reason.
 /// Corruption-safe: every span resolves against the ORIGINAL, overlaps reject before any mutation, and the splice
 /// runs highest-offset-first so earlier edits never invalidate a later span. All-or-nothing.
@@ -139,6 +172,7 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
         for (reindent_scratch.items) |s| gpa.free(s);
         reindent_scratch.deinit(gpa);
     }
+    var reindent_count: u32 = 0;
 
     for (ops, 0..) |op, i| {
         if (op.kind == .insert_at) {
@@ -155,8 +189,9 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
         var start: usize = 0;
         var loose: bool = false;
         if (matchAnchor(lines.items, anc_lines.items, &start, &loose)) |err| {
+            var hbuf: [180]u8 = undefined;
             return switch (err) {
-                .not_found => rejectMsg(gpa, "op{d}: anchor not found — copy an exact snippet (leading spaces included) from the current file", .{i + 1}),
+                .not_found => rejectMsg(gpa, "op{d}: anchor not found — copy an exact snippet (leading spaces included) from the current file.{s}", .{ i + 1, nearestLineHint(lines.items, firstNonEmpty(anc_lines.items), &hbuf) }),
                 .ambiguous => rejectMsg(gpa, "op{d}: anchor matches more than one place — add surrounding lines so it appears exactly once", .{i + 1}),
             };
         }
@@ -171,6 +206,7 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
                 const ri = reindentToFile(gpa, op.text, file_ws);
                 reindent_scratch.append(gpa, ri) catch {};
                 text = ri;
+                reindent_count += 1;
             }
         }
         switch (op.kind) {
@@ -251,10 +287,10 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
 
     // per-op match loci = the byte offset in `bytes` where each op's landing line begins (op-index order).
     // OOM here degrades to an ok result with no loci rather than failing the whole edit.
-    const loci = gpa.alloc(MatchLocus, landings.items.len) catch return .{ .ok = true, .bytes = bytes };
+    const loci = gpa.alloc(MatchLocus, landings.items.len) catch return .{ .ok = true, .bytes = bytes, .reindented = reindent_count };
     const prefix = gpa.alloc(u64, lines.items.len + 1) catch {
         gpa.free(loci);
-        return .{ .ok = true, .bytes = bytes };
+        return .{ .ok = true, .bytes = bytes, .reindented = reindent_count };
     };
     defer gpa.free(prefix);
     prefix[0] = 0;
@@ -268,7 +304,7 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
             return x.op_index < y.op_index;
         }
     }.lt);
-    return .{ .ok = true, .bytes = bytes, .loci = loci };
+    return .{ .ok = true, .bytes = bytes, .loci = loci, .reindented = reindent_count };
 }
 
 pub const Narrated = struct { path: []u8, ops: []EditOp };

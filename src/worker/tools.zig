@@ -886,6 +886,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
         }
     }
+    if (res.reindented > 0)
+        return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes. NOTE: {d} op(s) matched only after auto-reindenting your text to the file's indentation — your SEARCH lines had the wrong leading whitespace; copy them exactly next time.", .{ npath, ops.items.len, res.bytes.len, res.reindented }) catch dupe(gpa, "edited");
     return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes", .{ npath, ops.items.len, res.bytes.len }) catch dupe(gpa, "edited");
 }
 
@@ -1456,6 +1458,10 @@ fn urlAllowed(url: []const u8) bool {
     var host = after;
     if (std.mem.indexOfAny(u8, host, "/?#")) |i| host = host[0..i];
     if (std.mem.indexOfScalar(u8, host, '@')) |i| host = host[i + 1 ..];
+    // A bracketed IPv6 literal is REJECTED outright: loopback (::1), link-local (fe80::/10), unique-local
+    // (fc00::/7), and v4-mapped (::ffff:127.0.0.1) forms can't be reliably told apart by substring — and a
+    // research fetch never needs a bare v6 literal (public sites have names). Fail closed, not through.
+    if (host.len > 0 and host[0] == '[') return false;
     if (std.mem.indexOfScalar(u8, host, ':')) |i| host = host[0..i];
     const blocked = [_][]const u8{ "localhost", "127.", "0.0.0.0", "169.254.", "10.", "192.168.", "::1", "metadata" };
     for (blocked) |b| if (std.mem.startsWith(u8, host, b)) return false;
@@ -1494,6 +1500,18 @@ pub fn egressAllowed(allow: []const u8, url: []const u8) bool {
         if (host.len > suf.len + 1 and host[host.len - suf.len - 1] == '.' and std.mem.endsWith(u8, host, suf)) return true;
     }
     return false;
+}
+
+test "urlAllowed SSRF guard: IPv6 literals fail closed; private v4 + metadata stay blocked" {
+    try std.testing.expect(!urlAllowed("http://[::1]:8080/admin"));
+    try std.testing.expect(!urlAllowed("http://[fe80::1]/x"));
+    try std.testing.expect(!urlAllowed("http://[fd00::1]/x"));
+    try std.testing.expect(!urlAllowed("https://user@[::ffff:127.0.0.1]/x"));
+    try std.testing.expect(!urlAllowed("http://169.254.169.254/latest/meta-data/"));
+    try std.testing.expect(!urlAllowed("http://172.16.0.1/x"));
+    try std.testing.expect(urlAllowed("https://172.32.1.1/x")); // 172.32+ is public space
+    try std.testing.expect(urlAllowed("https://example.com/x"));
+    try std.testing.expect(!urlAllowed("ftp://example.com/x"));
 }
 
 test "egressAllowed host-suffix allowlist" {
