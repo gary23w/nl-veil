@@ -32,6 +32,13 @@ pub const Caps = struct {
     caps_listed: bool = false,
     tools: bool = false,
     thinking: bool = false,
+    /// From /api/show model_info "general.parameter_count" — a measured tier prior (0 = unknown).
+    param_count: u64 = 0,
+    /// One-shot startup probe: can this backend PARSE a file-sized tool call? Ollama's chat templates on some
+    /// small non-thinking models return a large call as raw text / a parse error — every full-file write_file
+    /// would be lost. Defaults to trusted; only clear parse-failure evidence flips it (the runtime adaptive
+    /// fence flip remains the safety net for anything the probe misses).
+    tools_ok_large: bool = true,
 };
 var caps: Caps = .{};
 
@@ -102,7 +109,10 @@ fn isThinking(model: []const u8) bool {
 }
 
 pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
-    return isOllama(base_url) and isThinking(model);
+    if (!isOllama(base_url)) return false;
+    if (isThinking(model)) return true;
+    // a probed backend that cannot parse file-sized tool calls gets fenced writes from round 1
+    return caps.probed and caps.caps_listed and !caps.tools_ok_large;
 }
 
 /// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or a
@@ -336,6 +346,13 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
         gpa.free(sr.content);
     }
 
+    // LARGE-TOOL-CALL PROBE: only the ambiguous case is probed (native + tools listed + non-thinking) —
+    // thinking models already get fenced writes, and a model without the tools capability never sends
+    // structured calls at all. One echo round-trip at startup buys round 1's writes.
+    if (caps.ollama_native and caps.caps_listed and caps.tools and !caps.thinking) {
+        caps.tools_ok_large = probeLargeToolCall(gpa, io, run_dir, host, key, model);
+    }
+
     if (caps.ollama_native and caps.caps_listed) {
         caps.reasoning = caps.thinking; // authoritative record — no need to load the model just to ask it
     } else if (caps.ollama_native) {
@@ -386,8 +403,75 @@ fn parseShowCaps(raw: []const u8) void {
                 if (e.value_ptr.* == .integer and e.value_ptr.*.integer > 0)
                     caps.ctx_tokens = std.math.cast(u32, e.value_ptr.*.integer) orelse std.math.maxInt(u32);
             }
+            if (mv.object.get("general.parameter_count")) |pv| {
+                if (pv == .integer and pv.integer > 0) caps.param_count = @intCast(pv.integer);
+            }
         }
     }
+}
+
+/// Ask the model to echo a file-sized payload through ONE write_file call, and judge whether the backend
+/// returned it as a STRUCTURED tool call. The bias is trust: only clear parse-failure evidence (an error
+/// naming the tool-call parse, or the call emitted as raw text) reports false — an uncooperative model or a
+/// transport flake stays trusted, and the runtime adaptive fence flip covers whatever the probe misses.
+fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, host: []const u8, key: []const u8, model: []const u8) bool {
+    const chat_url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{host}) catch return true;
+    defer gpa.free(chat_url);
+    var payload: std.ArrayListUnmanaged(u8) = .empty;
+    defer payload.deinit(gpa);
+    var lb: [96]u8 = undefined;
+    var i: u32 = 1;
+    while (i <= 56) : (i += 1) { // ~3.6KB — the size class where the parser wall was observed (~4KB)
+        const ln = std.fmt.bufPrint(&lb, "line {d:0>3}: the quick brown fox jumps over the lazy dog 0123456789\n", .{i}) catch break;
+        payload.appendSlice(gpa, ln) catch return true;
+    }
+    var umsg: std.ArrayListUnmanaged(u8) = .empty;
+    defer umsg.deinit(gpa);
+    umsg.appendSlice(gpa, "Call the write_file tool exactly once: path=\"probe.txt\", content = EXACTLY the text between <BEGIN> and <END>, all lines verbatim. Do not reply with prose.\n<BEGIN>\n") catch return true;
+    umsg.appendSlice(gpa, payload.items) catch return true;
+    umsg.appendSlice(gpa, "<END>") catch return true;
+    var msg: std.ArrayListUnmanaged(u8) = .empty;
+    defer msg.deinit(gpa);
+    msg.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return true;
+    jstr(gpa, &msg, umsg.items) catch return true;
+    msg.appendSlice(gpa, "}") catch return true;
+    const tool_def = "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"write a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}";
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":2048}}}}", .{ model, msg.items, tool_def }) catch return true;
+    defer gpa.free(body);
+    const r = postUrl(gpa, io, run_dir, "probe-write", chat_url, key, body, true);
+    defer gpa.free(r.content);
+    if (!r.ok) return true; // network flake ≠ parser wall
+    return largeToolCallVerdict(r.content);
+}
+
+fn largeToolCallVerdict(raw: []const u8) bool {
+    const Resp = struct {
+        message: ?struct {
+            content: ?[]const u8 = null,
+            tool_calls: ?[]const struct {
+                function: struct { name: []const u8 = "", arguments: std.json.Value = .null },
+            } = null,
+        } = null,
+        @"error": ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(Resp, std.heap.page_allocator, raw, .{ .ignore_unknown_fields = true }) catch return true;
+    defer parsed.deinit();
+    if (parsed.value.@"error") |e| {
+        var buf: [300]u8 = undefined;
+        const n = @min(e.len, buf.len);
+        for (e[0..n], 0..) |c, j| buf[j] = std.ascii.toLower(c);
+        const low = buf[0..n];
+        if (std.mem.indexOf(u8, low, "tool") != null or std.mem.indexOf(u8, low, "pars") != null or std.mem.indexOf(u8, low, "closing") != null) return false;
+        return true; // an unrelated error (busy/oom) is not parser evidence
+    }
+    const m = parsed.value.message orelse return true;
+    if (m.tool_calls) |tcs| {
+        if (tcs.len > 0) return true; // the backend parsed the large call — trustworthy
+    }
+    const c = m.content orelse return true;
+    // the failure signature: the CALL itself came back as raw text instead of a structured tool_calls entry
+    if (std.mem.indexOf(u8, c, "write_file") != null and std.mem.indexOfScalar(u8, c, '{') != null) return false;
+    return true;
 }
 
 fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
@@ -636,7 +720,36 @@ test "parseShowCaps: capabilities[] + context_length parsed; rope original_conte
     try std.testing.expectEqual(@as(u32, 131072), caps.ctx_tokens); // NOT the 4096 pre-rope-scaling window
 
     caps = .{};
+    parseShowCaps("{\"capabilities\":[\"completion\",\"tools\"],\"model_info\":{\"llama.context_length\":131072,\"general.parameter_count\":8030261312}}");
+    try std.testing.expectEqual(@as(u64, 8030261312), caps.param_count);
+
+    caps = .{};
     parseShowCaps("<html>404</html>"); // a hosted endpoint answering garbage must change nothing
     try std.testing.expect(!caps.caps_listed);
     try std.testing.expectEqual(@as(u32, 0), caps.ctx_tokens);
+}
+
+test "largeToolCallVerdict: a structured call trusts; a text-emitted call or a tool-parse error fences" {
+    // the backend parsed the large call into tool_calls — the transport is trustworthy
+    try std.testing.expect(largeToolCallVerdict("{\"message\":{\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"probe.txt\",\"content\":\"line 001 ...\"}}}]}}"));
+    // the observed llama3.1:8b wall: Ollama's template errors on the large call
+    try std.testing.expect(!largeToolCallVerdict("{\"error\":\"Value looks like object, but can't find closing '}' symbol\"}"));
+    // the other wall shape: the call comes back as raw TEXT in content
+    try std.testing.expect(!largeToolCallVerdict("{\"message\":{\"content\":\"{\\\"name\\\": \\\"write_file\\\", \\\"parameters\\\": {\\\"path\\\": \\\"probe.txt\\\", \\\"content\\\": \\\"line 001\\\"}}\"}}"));
+    // inconclusive shapes stay trusted — the runtime adaptive flip is the safety net
+    try std.testing.expect(largeToolCallVerdict("{\"message\":{\"content\":\"I wrote the file for you.\"}}"));
+    try std.testing.expect(largeToolCallVerdict("{\"error\":\"model is out of memory\"}"));
+    try std.testing.expect(largeToolCallVerdict("not json at all"));
+}
+
+test "fenceWrites: probed non-thinking model with a broken large-tool-call transport gets fenced from round 1" {
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{ .probed = true, .ollama_native = true, .caps_listed = true, .tools = true, .thinking = false, .tools_ok_large = false };
+    try std.testing.expect(fenceWrites("http://localhost:9999/v1", "llama3.1:8b"));
+    caps.tools_ok_large = true;
+    try std.testing.expect(!fenceWrites("http://localhost:9999/v1", "llama3.1:8b"));
+    caps.thinking = true; // a thinking model is fenced regardless of the transport probe
+    try std.testing.expect(fenceWrites("http://localhost:9999/v1", "whatever-model"));
 }
