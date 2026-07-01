@@ -109,6 +109,16 @@ pub fn personaDesc(p: [6]f32, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "openness {s}, conscientiousness {s}, extraversion {s}, agreeableness {s}, neuroticism {s}", .{ lvl(p[0]), lvl(p[1]), lvl(p[2]), lvl(p[3]), lvl(p[4]) }) catch "balanced";
 }
 
+// One admitted scout note, held until round end so the engine can check whether a builder actually USED it
+// (a concrete token landed in a written file) — the grounded APPLICATION signal that earns a source durable trust.
+const ScoutNote = struct {
+    src: [72]u8 = [_]u8{0} ** 72, // the source trust-class, e.g. "src:developer.mozilla.org"
+    src_len: u8 = 0,
+    toks: [220]u8 = [_]u8{0} ** 220, // space-joined concrete tokens extracted from the note
+    toks_len: u16 = 0,
+    applied: bool = false,
+};
+
 pub const Worker = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -164,6 +174,8 @@ pub const Worker = struct {
     want_net: bool = true,
     seen_spans: [48]u64 = [_]u64{0} ** 48, // ring of normalized evidence-span hashes — scout ingest dedup (RSI)
     seen_spans_n: u32 = 0,
+    scout_ledger: [24]ScoutNote = [_]ScoutNote{.{}} ** 24, // admitted notes awaiting the round-end application check
+    scout_ledger_n: u32 = 0,
     last_gap_str: []const u8 = "",
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
@@ -881,6 +893,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
+        if (live and !w.quick) applyScoutRewards(&w, round); // grounded APPLICATION anchor: a scouted token in a built file -> +0.40 source trust
         if (live and m.gap_assess and !w.quick) assessGap(&w, goal, round, stalled);
         if (live and minds.items.len > 1 and !w.operating and !w.discourse) {
             rsi.planRoles(&w, minds.items, goal, round, w.last_bench, stalled or w.last_gap_str.len > 0);
@@ -2703,7 +2716,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         w.act(mi.name, round, "scout_search", qstr, clip(sres, 200));
         const topic_src = if (w.goal_brief.len > 0) w.goal_brief else qstr;
         if (resultOnTopic(topic_src, sres)) {
-            if (firstUrl(sres)) |url| {
+            if (pickTrustedUrl(w, sres)) |url| { // v1b: prefer a SOURCE the swarm has learned to trust
                 var uargs: std.ArrayListUnmanaged(u8) = .empty;
                 defer uargs.deinit(gpa);
                 uargs.appendSlice(gpa, "{\"url\":") catch {};
@@ -2712,9 +2725,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 const page = tools.execute(&ctx, "read_url", uargs.items);
                 defer gpa.free(page);
                 const dom = urlDomain(url) orelse "web";
-                const src_class: ?[]u8 = std.fmt.allocPrint(gpa, "source:{s}", .{dom}) catch null;
+                // the trust class MUST equal what class_of derives from the note tag (first token, lowercased),
+                // so tag notes `[src:<dom>] …` and reward the same `src:<dom>` — v1a's mismatch made trust a no-op.
+                var domlc_buf: [128]u8 = undefined;
+                const dom_lc = if (dom.len <= domlc_buf.len) blk: {
+                    for (dom, 0..) |ch, k| domlc_buf[k] = std.ascii.toLower(ch);
+                    break :blk domlc_buf[0..dom.len];
+                } else dom;
+                const src_class: ?[]u8 = std.fmt.allocPrint(gpa, "src:{s}", .{dom_lc}) catch null;
                 defer if (src_class) |s| gpa.free(s);
-                const sc = src_class orelse "source:web";
+                const sc = src_class orelse "src:web";
                 if (page.len > 300 and !tools.looksBlocked(page)) {
                     const gapstr = if (w.last_gap_str.len > 0) w.last_gap_str else goal;
                     if (screenDistill(w, goal, gapstr, dom, page)) |d| {
@@ -2726,12 +2746,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             sigTokenOverlap(d.note, d.evidence_span) >= 3 and
                             !hasVacuity(d.note) and !spanSeen(w, d.evidence_span);
                         if (admit) {
-                            const note_fact = std.fmt.allocPrint(gpa, "[scout r{d} src:{s}] {s}", .{ round, dom, clip(d.note, 600) }) catch @constCast(d.note);
+                            const note_fact = std.fmt.allocPrint(gpa, "[{s}] {s}", .{ sc, clip(d.note, 600) }) catch @constCast(d.note);
                             defer if (note_fact.ptr != d.note.ptr) gpa.free(note_fact);
                             _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, note_fact); // the NOTE, never the raw page
                             if (w.hyperspace) if (mi.hfield) |*hf| hf.observeLine(note_fact);
-                            _ = w.mem.observe(tools.SOURCES_SCOPE, dom);
-                            w.mem.trustReward(0.10, &.{sc}); // small prior; durable trust = application (v1b)
+                            _ = w.mem.observe(tools.SOURCES_SCOPE, dom_lc);
+                            w.mem.trustReward(0.10, &.{sc}); // small prior; durable trust = APPLICATION (below)
+                            recordScoutNote(w, sc, d.note); // hold for the round-end application check
                             rememberSpan(w, d.evidence_span);
                             w.act(mi.name, round, "scout_learn", url, clip(d.note, 220));
                         } else {
@@ -3043,31 +3064,33 @@ fn urlFromArgs(args: []const u8) ?[]const u8 {
 
 /// The first real result URL in a web_search result blob — skipping the search engine's own domain and obvious
 /// non-article links, so the engine can read_url an actual source page. null when there is nothing worth fetching.
-fn firstUrl(text: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, text, i, "http")) |h| {
-        i = h + 4;
+// The next candidate result URL at or after `pos.*`, advancing `pos.*` past it. Skips ONLY structural self-links
+// that are never documents (a mechanical fact, not a quality opinion) — the search engine's own pages. Page
+// QUALITY (incl. JS-rendered SPA playgrounds like CodePen) is judged emergently downstream: it yields no verbatim
+// evidence span, is refused at ingest, and its source earns no trust — so it sinks without a hardcoded blocklist.
+fn nextUrl(text: []const u8, pos: *usize) ?[]const u8 {
+    while (std.mem.indexOfPos(u8, text, pos.*, "http")) |h| {
+        pos.* = h + 4;
         if (!std.mem.startsWith(u8, text[h..], "http://") and !std.mem.startsWith(u8, text[h..], "https://")) continue;
         var e = h;
         while (e < text.len and text[e] != '"' and text[e] != ' ' and text[e] != '\\' and text[e] != ')' and text[e] != ']' and text[e] != '<' and text[e] != '\n' and text[e] != '\r' and text[e] != '\t') e += 1;
+        pos.* = e;
         const u = text[h..e];
         if (u.len < 14) continue;
-        // Skip ONLY structural self-links that are never documents (a mechanical fact, not a quality opinion) —
-        // the search engine's own pages. Page QUALITY (incl. JS-rendered SPA playgrounds like CodePen that yield
-        // no readable content) is judged emergently downstream: such a fetch produces no verbatim evidence span,
-        // is refused at ingest, and its source earns no trust — so it sinks without a hardcoded blocklist.
         const skip = [_][]const u8{ "duckduckgo.com", "google.com/search", "bing.com/search", "w3.org/2000" };
         var skipit = false;
-        for (skip) |bad| {
-            if (std.mem.indexOf(u8, u, bad) != null) {
-                skipit = true;
-                break;
-            }
-        }
+        for (skip) |bad| if (std.mem.indexOf(u8, u, bad) != null) {
+            skipit = true;
+            break;
+        };
         if (skipit) continue;
         return u;
     }
     return null;
+}
+fn firstUrl(text: []const u8) ?[]const u8 {
+    var p: usize = 0;
+    return nextUrl(text, &p);
 }
 
 test "provenance-gate helpers: balanced object, span overlap, vacuity, span dedup" {
@@ -3083,6 +3106,16 @@ test "provenance-gate helpers: balanced object, span overlap, vacuity, span dedu
     // verbatim + whitespace-variant spans collide (dedup); different content does not
     try std.testing.expect(spanNormHash("  Foo   Bar  ") == spanNormHash("foo bar"));
     try std.testing.expect(spanNormHash("foo bar") != spanNormHash("foo baz"));
+}
+
+test "extractConcreteTokens keeps API-shaped fingerprints, skips prose" {
+    var buf: [220]u8 = undefined;
+    const n = extractConcreteTokens("Use ctx.fillText(text, x, y) and call requestAnimationFrame each frame", &buf);
+    const out = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, out, "ctx.fillText") != null); // has . and ( -> API-shaped
+    try std.testing.expect(std.mem.indexOf(u8, out, "requestAnimationFrame") != null); // long identifier
+    try std.testing.expect(std.mem.indexOf(u8, out, "call") == null); // short prose word dropped
+    try std.testing.expect(std.mem.indexOf(u8, out, "frame") == null); // len<8, no API char -> dropped
 }
 
 test "firstUrl picks the first real result URL, skipping the search-engine domain" {
@@ -4880,6 +4913,132 @@ fn spanSeen(w: *Worker, span: []const u8) bool {
 fn rememberSpan(w: *Worker, span: []const u8) void {
     w.seen_spans[w.seen_spans_n % w.seen_spans.len] = spanNormHash(span);
     w.seen_spans_n +%= 1;
+}
+
+// ---- v1b: trust-ranked source routing + the grounded application reward (neuron-db classTrust / trust_reward) ----
+const EXPLORE_C: f32 = 0.6; // cost knob: a mild bias to the search engine's own rank so a fresh source is still tried
+
+// Pick a result URL, preferring a SOURCE the swarm has learned to trust (classTrust), with a small rank prior so an
+// untried source still gets sampled. Cold start = all NEUTRAL => the top result wins (identical to firstUrl).
+fn pickTrustedUrl(w: *Worker, sres: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_score: f32 = -1.0e9;
+    var pos: usize = 0;
+    var n: u32 = 0;
+    while (n < 5) : (n += 1) {
+        const url = nextUrl(sres, &pos) orelse break;
+        const dom = urlDomain(url) orelse continue;
+        var cbuf: [96]u8 = undefined;
+        const cls = std.fmt.bufPrint(&cbuf, "src:{s}", .{dom}) catch continue;
+        for (cbuf[0..cls.len]) |*ch| ch.* = std.ascii.toLower(ch.*); // class_of lowercases the tag
+        const score = w.mem.classTrust(cls) + EXPLORE_C / @sqrt(@as(f32, @floatFromInt(n + 1)));
+        if (score > best_score) {
+            best_score = score;
+            best = url;
+        }
+    }
+    return best;
+}
+
+// Concrete, API-shaped tokens from a distilled note (a long-enough identifier, or one carrying a .():_ ) — the
+// fingerprints we later look for in a built file to prove the knowledge was APPLIED. Space-joined into `buf`.
+fn extractConcreteTokens(note: []const u8, buf: []u8) usize {
+    var n: usize = 0;
+    var count: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, note, " \t\r\n,;\"'`");
+    while (it.next()) |t0| {
+        if (count >= 10) break;
+        const t = std.mem.trim(u8, t0, ".!?*#>[]");
+        if (t.len < 5) continue;
+        const apiish = std.mem.indexOfAny(u8, t, "(.:_") != null;
+        if (t.len < 8 and !apiish) continue;
+        if (isStopTok(t)) continue;
+        if (n + t.len + 1 > buf.len) break;
+        if (n > 0) {
+            buf[n] = ' ';
+            n += 1;
+        }
+        @memcpy(buf[n .. n + t.len], t);
+        n += t.len;
+        count += 1;
+    }
+    return n;
+}
+
+fn recordScoutNote(w: *Worker, src_class: []const u8, note: []const u8) void {
+    if (src_class.len == 0 or src_class.len > 71) return;
+    const sn = &w.scout_ledger[w.scout_ledger_n % w.scout_ledger.len];
+    sn.* = .{};
+    @memcpy(sn.src[0..src_class.len], src_class);
+    sn.src_len = @intCast(src_class.len);
+    sn.toks_len = @intCast(extractConcreteTokens(note, sn.toks[0..]));
+    sn.applied = sn.toks_len == 0; // no concrete token -> nothing to detect; retire it
+    w.scout_ledger_n +%= 1;
+}
+
+// The current contents of every built file (deduped), capped — to detect whether a scouted token was applied.
+fn readWorkFilesBlob(w: *Worker) []u8 {
+    const gpa = w.gpa;
+    const empty = gpa.dupe(u8, "") catch @constCast("");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return empty;
+    defer gpa.free(mpath);
+    const mani = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(64 << 10)) catch return empty;
+    defer gpa.free(mani);
+    gpa.free(empty);
+    var seen: [64]u64 = [_]u64{0} ** 64;
+    var seen_n: usize = 0;
+    var it = std.mem.splitScalar(u8, mani, '\n');
+    while (it.next()) |line| {
+        const bar = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+        const path = std.mem.trim(u8, line[0..bar], " \r\t");
+        if (path.len == 0) continue;
+        const h = std.hash.XxHash64.hash(0, path);
+        var dup = false;
+        for (seen[0..seen_n]) |s| if (s == h) {
+            dup = true;
+            break;
+        };
+        if (dup) continue;
+        if (seen_n < seen.len) {
+            seen[seen_n] = h;
+            seen_n += 1;
+        }
+        const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, path }) catch continue;
+        defer gpa.free(full);
+        const content = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(128 << 10)) catch continue;
+        defer gpa.free(content);
+        out.appendSlice(gpa, content) catch {};
+        out.append(gpa, '\n') catch {};
+        if (out.items.len > 400 << 10) break;
+    }
+    return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
+// Round-end (single-threaded): a scouted note whose concrete token now appears in a built file earned its SOURCE
+// durable trust — the grounded APPLICATION anchor. Single-source + causal: only the note whose OWN token landed is
+// credited, so co-occurring sources cannot free-ride.
+fn applyScoutRewards(w: *Worker, round: u32) void {
+    if (w.scout_ledger_n == 0) return;
+    const blob = readWorkFilesBlob(w);
+    defer if (blob.len > 0) w.gpa.free(blob);
+    if (blob.len < 8) return;
+    const cap = @min(w.scout_ledger_n, @as(u32, @intCast(w.scout_ledger.len)));
+    for (w.scout_ledger[0..cap]) |*sn| {
+        if (sn.applied or sn.src_len == 0 or sn.toks_len == 0) continue;
+        var used = false;
+        var it = std.mem.tokenizeScalar(u8, sn.toks[0..sn.toks_len], ' ');
+        while (it.next()) |tok| if (tok.len >= 5 and std.mem.indexOf(u8, blob, tok) != null) {
+            used = true;
+            break;
+        };
+        if (used) {
+            sn.applied = true;
+            const cls = sn.src[0..sn.src_len];
+            w.mem.trustReward(0.40, &.{cls});
+            w.act("engine", round, "scout_applied", cls, "a scouted technique landed in a built file — source trust +0.40");
+        }
+    }
 }
 
 fn scoutQuery(w: *Worker, goal: []const u8) []const u8 {
