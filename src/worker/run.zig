@@ -2681,19 +2681,43 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             (gpa.dupe(u8, "(reached the step limit for this moment)") catch @constCast(""));
     }
 
-    if (mi.scout and web_calls == 0) {
+    // ENGINE-DRIVEN RAG: the gap loop only WORKS if the low-param model does not have to choose to search. When the
+    // scout produced no memory of its own this round, the engine closes the loop itself — search the detected gap,
+    // READ the top result page, and observe its REAL content into the shared hive so every builder is grounded next
+    // round instead of re-deriving from weak weights. A snippet-only save (the old behavior) grounds nobody.
+    if (mi.scout and w.internet and observed == 0) {
         var qargs: std.ArrayListUnmanaged(u8) = .empty;
         defer qargs.deinit(gpa);
         qargs.appendSlice(gpa, "{\"query\":") catch {};
-        const qstr = scoutQuery(w, goal);
+        const qstr = scoutQuery(w, goal); // gap-targeted: scoutQuery folds in w.last_gap_str
         defer gpa.free(@constCast(qstr));
         llm.jstr(gpa, &qargs, qstr) catch {};
         qargs.appendSlice(gpa, "}") catch {};
         const sres = tools.execute(&ctx, "web_search", qargs.items);
         defer gpa.free(sres);
-        w.act(mi.name, round, "scout_fallback", qargs.items, sres);
+        w.act(mi.name, round, "scout_search", qstr, clip(sres, 200));
         const topic_src = if (w.goal_brief.len > 0) w.goal_brief else qstr;
         if (resultOnTopic(topic_src, sres)) {
+            if (firstUrl(sres)) |url| {
+                var uargs: std.ArrayListUnmanaged(u8) = .empty;
+                defer uargs.deinit(gpa);
+                uargs.appendSlice(gpa, "{\"url\":") catch {};
+                llm.jstr(gpa, &uargs, url) catch {};
+                uargs.appendSlice(gpa, "}") catch {};
+                const page = tools.execute(&ctx, "read_url", uargs.items);
+                defer gpa.free(page);
+                if (page.len > 300 and !tools.looksBlocked(page)) {
+                    const dom = urlDomain(url) orelse "web";
+                    const hive_fact = std.fmt.allocPrint(gpa, "[scout r{d} src:{s}] {s}", .{ round, dom, clip(page, 1600) }) catch @constCast(page);
+                    defer if (hive_fact.ptr != page.ptr) gpa.free(hive_fact);
+                    _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, hive_fact); // fills the hive => grounds all builders
+                    if (w.hyperspace) if (mi.hfield) |*hf| hf.observeLine(hive_fact);
+                    _ = w.mem.observe(tools.SOURCES_SCOPE, dom);
+                    w.act(mi.name, round, "scout_rag", url, clip(page, 220));
+                } else {
+                    w.act(mi.name, round, "scout_rag", url, "page blocked/empty — kept the search snippet only");
+                }
+            }
             var sargs: std.ArrayListUnmanaged(u8) = .empty;
             defer sargs.deinit(gpa);
             sargs.appendSlice(gpa, "{\"name\":\"scout:auto\",\"skill\":") catch {};
@@ -2701,7 +2725,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             sargs.appendSlice(gpa, "}") catch {};
             gpa.free(tools.execute(&ctx, "save_skill", sargs.items));
         } else {
-            w.act(mi.name, round, "scout_fallback", "off-topic result withheld from shared knowledge", clip(sres, 160));
+            w.act(mi.name, round, "scout_search", "off-topic result withheld from shared knowledge", clip(sres, 160));
         }
     }
 
@@ -2987,6 +3011,29 @@ fn urlFromArgs(args: []const u8) ?[]const u8 {
     const u = args[http..end];
     if (u.len < 10) return null;
     return u;
+}
+
+/// The first real result URL in a web_search result blob — skipping the search engine's own domain and obvious
+/// non-article links, so the engine can read_url an actual source page. null when there is nothing worth fetching.
+fn firstUrl(text: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "http")) |h| {
+        i = h + 4;
+        if (!std.mem.startsWith(u8, text[h..], "http://") and !std.mem.startsWith(u8, text[h..], "https://")) continue;
+        var e = h;
+        while (e < text.len and text[e] != '"' and text[e] != ' ' and text[e] != '\\' and text[e] != ')' and text[e] != ']' and text[e] != '<' and text[e] != '\n' and text[e] != '\r' and text[e] != '\t') e += 1;
+        const u = text[h..e];
+        if (u.len < 14) continue;
+        if (std.mem.indexOf(u8, u, "duckduckgo.com") != null or std.mem.indexOf(u8, u, "google.com/search") != null or std.mem.indexOf(u8, u, "bing.com/search") != null or std.mem.indexOf(u8, u, "w3.org/2000") != null) continue;
+        return u;
+    }
+    return null;
+}
+
+test "firstUrl picks the first real result URL, skipping the search-engine domain" {
+    try std.testing.expect(firstUrl("no urls in here at all") == null);
+    try std.testing.expectEqualStrings("https://developer.mozilla.org/en-US/docs/Canvas", firstUrl("Result: https://duckduckgo.com/l/?x=1 -> https://developer.mozilla.org/en-US/docs/Canvas more").?);
+    try std.testing.expectEqualStrings("https://css-tricks.com/matrix-rain", firstUrl("title\nhttps://css-tricks.com/matrix-rain\nsnippet text").?);
 }
 
 fn urlDomain(url: []const u8) ?[]const u8 {

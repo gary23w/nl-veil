@@ -2082,7 +2082,7 @@ fn isSearchOrAggregator(host: []const u8) bool {
     return false;
 }
 
-fn looksBlocked(text: []const u8) bool {
+pub fn looksBlocked(text: []const u8) bool {
     const sig = [_][]const u8{ "SecurityCompromiseError", "Access Denied", "captcha", "are you a robot", "unusual traffic", "enable JavaScript", "403 Forbidden", "Just a moment", "Attention Required", "blocked until", "verify you are human" };
     for (sig) |s| if (std.ascii.indexOfIgnoreCase(text, s) != null) return true;
     return false;
