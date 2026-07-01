@@ -2706,10 +2706,14 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     }
 
     if (!mi.scout and files == 0 and !operate) editblk: {
+        const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
         // SURGICAL EDIT first: if the reply carries narrated SEARCH/REPLACE blocks, apply them through the SAME
         // edit_file executor (resolves the path, buffers the file, applies the ops all-or-nothing). This is how a
         // fenced local model changes a LARGE existing file — it emits only anchors + changes, never the whole file.
-        if (bufedit.parseNarrated(gpa, monologue)) |n| {
+        // Fall back to the mind's assigned slot when the model omitted the path line above its SEARCH block (the
+        // assembler models routinely do this on a "continue/refine the existing file" turn); otherwise those raw
+        // markers would leak into the file via the full-file salvage below.
+        if (bufedit.parseNarratedSlot(gpa, monologue, salvage_slot)) |n| {
             defer bufedit.freeNarrated(gpa, n);
             var eargs: std.ArrayListUnmanaged(u8) = .empty;
             defer eargs.deinit(gpa);
@@ -2733,14 +2737,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             w.act(mi.name, round, if (applied) "edit" else "edit_reject", n.path, clip(eres, 220));
             break :editblk; // a narrated edit-block is handled here; never fall through to the full-file salvage
         }
-        const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
         if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
             const body = salvageFileBody(gpa, monologue);
             defer if (body.len > 0) gpa.free(@constCast(body));
             const base = std.fs.path.basename(salvage_slot);
             const is_py = std.mem.endsWith(u8, base, ".py");
             var reject: ?[]const u8 = null;
-            if (body.len < 80) reject = "too short (<80 chars)" else if (salvageLeadConversational(body)) reject = "conversational lead-in (chatter, not a file body)" else if (salvageHasToolFragment(body)) reject = "contains a raw tool-call fragment" else if (is_py and !pyCompileOk(w, body)) reject = "fails py_compile (syntax error)";
+            // Never commit raw edit narration as a file body: if parseNarratedSlot above could not route it
+            // (malformed / zero-op blocks), the SEARCH/REPLACE markers would otherwise corrupt the file.
+            if (bufedit.hasSearchReplace(body)) reject = "narrated edit markers, not a file body — put the file's path on its own line above the SEARCH block, or reply with the full file" else if (body.len < 80) reject = "too short (<80 chars)" else if (salvageLeadConversational(body)) reject = "conversational lead-in (chatter, not a file body)" else if (salvageHasToolFragment(body)) reject = "contains a raw tool-call fragment" else if (is_py and !pyCompileOk(w, body)) reject = "fails py_compile (syntax error)";
             if (reject == null) {
                 const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch "";
                 defer if (full.len > 0) gpa.free(full);
