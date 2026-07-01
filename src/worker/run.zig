@@ -20,6 +20,7 @@ const commons = @import("commons.zig");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
 const hyperspace = @import("hyperspace.zig");
+const bufedit = @import("bufedit.zig");
 const rsi = @import("rsi.zig");
 const agi = @import("agi.zig");
 const writer = @import("writer.zig");
@@ -1265,7 +1266,14 @@ fn quickTargetFromGoal(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
         var t = tok;
         while (t.len > 0 and t[t.len - 1] == '.') t = t[0 .. t.len - 1]; // strip prose trailing period
         for (exts) |e| {
-            if (t.len > e.len and endsWithIC(t, e)) return gpa.dupe(u8, std.fs.path.basename(t)) catch "";
+            if (t.len > e.len and endsWithIC(t, e)) {
+                var rel = t;
+                if (std.mem.startsWith(u8, rel, "./")) rel = rel[2 .. rel.len]; // normalize a leading ./
+                // keep the RELATIVE path (so subdir files like assets/css/style.scss land correctly); fall back to
+                // the basename only if the token is unsafe (absolute, or a .. path-escape).
+                if (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\' or std.mem.indexOf(u8, rel, "..") != null)) rel = std.fs.path.basename(rel);
+                return gpa.dupe(u8, rel) catch "";
+            }
         }
     }
     return "";
@@ -2291,7 +2299,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(know_block);
     const fence_build = gate.fence;
     const fence_clause = if (fence_build)
-        "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE or UPDATE your assigned file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block — just the one block with the full file. The engine saves your fenced reply to your file automatically. Use read_file / recall_hive / send_message normally."
+        "\n\nIMPORTANT: the write_file tool is unavailable to you. To CREATE a NEW file, reply with EXACTLY ONE fenced code block holding the COMPLETE file — start your reply with the file's relative path on its own line, then the ``` fence (with the language), the WHOLE file, and a closing ```. No prose, no \"Note:\" commentary, and NO second code block. To CHANGE an EXISTING file (read_file it first — especially a LARGE one), do NOT re-emit the whole file: reply with one or more SEARCH/REPLACE blocks. Put the file's relative path on its own line, then for each change:\n<<<<<<< SEARCH\n(paste the exact original lines, copied VERBATIM from the file — enough to appear exactly once)\n=======\n(the new lines that replace them)\n>>>>>>> REPLACE\nThe SEARCH text must match the current file byte-for-byte (copy it, don't retype). To INSERT, SEARCH one nearby line and REPLACE it with itself plus the new lines. To DELETE, put the lines in SEARCH and leave REPLACE empty. Emit one block per distinct change. The engine finds each SEARCH span and swaps it, leaving the rest of the file untouched. Use read_file / recall_hive / send_message normally."
     else
         "";
     const fence_sys_full = if (fence_build)
@@ -2497,12 +2505,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             if (step.content.len > 0) w.act(mi.name, round, "thinking", "", clip(step.content, 1400));
             gpa.free(monologue);
             monologue = std.fmt.allocPrint(gpa, "[llm error] {s}", .{step.content}) catch (gpa.dupe(u8, "[llm error]") catch unreachable);
-            if (!operate and std.mem.indexOf(u8, live_schema, "write_file") != null and isToolParseError(step.content)) {
-                w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse a large tool call — re-issuing the turn WITHOUT tools to recover the file as text");
+            if (!operate and (fence_build or std.mem.indexOf(u8, live_schema, "write_file") != null) and isToolParseError(step.content)) {
+                w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse a large tool call — re-issuing the turn WITHOUT tools to recover the change as text");
                 var rconv: std.ArrayListUnmanaged(u8) = .empty;
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
-                rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool. Reply with ONLY the file: the first line is the relative path, then a fenced code block containing the COMPLETE file contents.\"}") catch {};
+                rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Your previous tool call could not be parsed. Do NOT call any tool — reply with plain text only. To CHANGE an EXISTING file, put its relative path on its own line, then one or more edit blocks copied EXACTLY in this form:\\n<<<<<<< SEARCH\\n(the exact current lines, copied verbatim)\\n=======\\n(the new lines)\\n>>>>>>> REPLACE\\nTo CREATE a NEW file, put its relative path on its own line, then a single fenced code block with the COMPLETE file. No other prose.\"}") catch {};
                 var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
                 defer rep.deinit(gpa);
                 if (rep.ok and rep.content.len > 0) {
@@ -2569,20 +2577,37 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             monologue = gpa.dupe(u8, step.content) catch @constCast("");
             break;
         }
-        conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
-        llm.jstr(gpa, &conv, step.content) catch {};
-        conv.appendSlice(gpa, ",\"tool_calls\":[") catch {};
-        for (step.calls, 0..) |c, i| {
-            if (i > 0) conv.append(gpa, ',') catch {};
-            conv.appendSlice(gpa, "{\"id\":") catch {};
-            llm.jstr(gpa, &conv, c.id) catch {};
-            conv.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":") catch {};
-            llm.jstr(gpa, &conv, c.name) catch {};
-            conv.appendSlice(gpa, ",\"arguments\":") catch {};
-            llm.jstr(gpa, &conv, c.args) catch {};
-            conv.appendSlice(gpa, "}}") catch {};
+        if (w.fence_writes) {
+            // Ollama's gpt-oss template 500s any request carrying OpenAI tool_calls / role=tool messages whose
+            // content has braces (code/CSS/JSON) — it parses the content as an object. Use plain assistant+user text.
+            var note: std.ArrayListUnmanaged(u8) = .empty;
+            defer note.deinit(gpa);
+            note.appendSlice(gpa, step.content) catch {};
+            note.appendSlice(gpa, if (step.content.len > 0) " [calling" else "[calling") catch {};
+            for (step.calls) |c| {
+                note.append(gpa, ' ') catch {};
+                note.appendSlice(gpa, c.name) catch {};
+            }
+            note.appendSlice(gpa, "]") catch {};
+            conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+            llm.jstr(gpa, &conv, note.items) catch {};
+            conv.append(gpa, '}') catch {};
+        } else {
+            conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+            llm.jstr(gpa, &conv, step.content) catch {};
+            conv.appendSlice(gpa, ",\"tool_calls\":[") catch {};
+            for (step.calls, 0..) |c, i| {
+                if (i > 0) conv.append(gpa, ',') catch {};
+                conv.appendSlice(gpa, "{\"id\":") catch {};
+                llm.jstr(gpa, &conv, c.id) catch {};
+                conv.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":") catch {};
+                llm.jstr(gpa, &conv, c.name) catch {};
+                conv.appendSlice(gpa, ",\"arguments\":") catch {};
+                llm.jstr(gpa, &conv, c.args) catch {};
+                conv.appendSlice(gpa, "}}") catch {};
+            }
+            conv.appendSlice(gpa, "]}") catch {};
         }
-        conv.appendSlice(gpa, "]}") catch {};
         for (step.calls) |c| {
             trace.append(gpa, ',') catch {};
             llm.jstr(gpa, &trace, c.name) catch {};
@@ -2625,11 +2650,24 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 }
             }
             w.act(mi.name, round, c.name, c.args, result);
-            conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {};
-            llm.jstr(gpa, &conv, c.id) catch {};
-            conv.appendSlice(gpa, ",\"content\":") catch {};
-            llm.jstr(gpa, &conv, result) catch {};
-            conv.append(gpa, '}') catch {};
+            if (w.fence_writes) {
+                // plain user message on the Ollama gpt-oss path (see the assistant-echo note above)
+                var tr: std.ArrayListUnmanaged(u8) = .empty;
+                defer tr.deinit(gpa);
+                tr.appendSlice(gpa, "[result of ") catch {};
+                tr.appendSlice(gpa, c.name) catch {};
+                tr.appendSlice(gpa, "]\n") catch {};
+                tr.appendSlice(gpa, result) catch {};
+                conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch {};
+                llm.jstr(gpa, &conv, tr.items) catch {};
+                conv.append(gpa, '}') catch {};
+            } else {
+                conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {};
+                llm.jstr(gpa, &conv, c.id) catch {};
+                conv.appendSlice(gpa, ",\"content\":") catch {};
+                llm.jstr(gpa, &conv, result) catch {};
+                conv.append(gpa, '}') catch {};
+            }
         }
     }
     if (monologue.len == 0) {
@@ -2667,7 +2705,34 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         }
     }
 
-    if (!mi.scout and files == 0 and !operate) {
+    if (!mi.scout and files == 0 and !operate) editblk: {
+        // SURGICAL EDIT first: if the reply carries narrated SEARCH/REPLACE blocks, apply them through the SAME
+        // edit_file executor (resolves the path, buffers the file, applies the ops all-or-nothing). This is how a
+        // fenced local model changes a LARGE existing file — it emits only anchors + changes, never the whole file.
+        if (bufedit.parseNarrated(gpa, monologue)) |n| {
+            defer bufedit.freeNarrated(gpa, n);
+            var eargs: std.ArrayListUnmanaged(u8) = .empty;
+            defer eargs.deinit(gpa);
+            eargs.appendSlice(gpa, "{\"path\":") catch {};
+            llm.jstr(gpa, &eargs, n.path) catch {};
+            eargs.appendSlice(gpa, ",\"ops\":[") catch {};
+            for (n.ops, 0..) |op, i| {
+                if (i > 0) eargs.appendSlice(gpa, ",") catch {};
+                eargs.appendSlice(gpa, "{\"op\":\"") catch {};
+                eargs.appendSlice(gpa, @tagName(op.kind)) catch {};
+                eargs.appendSlice(gpa, "\",\"anchor\":") catch {};
+                llm.jstr(gpa, &eargs, op.anchor) catch {};
+                eargs.appendSlice(gpa, ",\"text\":") catch {};
+                llm.jstr(gpa, &eargs, op.text) catch {};
+                eargs.appendSlice(gpa, "}") catch {};
+            }
+            eargs.appendSlice(gpa, "]}") catch {};
+            const eres = tools.execute(&ctx, "edit_file", eargs.items);
+            defer gpa.free(eres);
+            const applied = std.mem.startsWith(u8, eres, "edited ");
+            w.act(mi.name, round, if (applied) "edit" else "edit_reject", n.path, clip(eres, 220));
+            break :editblk; // a narrated edit-block is handled here; never fall through to the full-file salvage
+        }
         const salvage_slot = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
         if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
             const body = salvageFileBody(gpa, monologue);
@@ -5262,7 +5327,9 @@ fn offlineSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
 }
 
 fn fenceSchema(gpa: std.mem.Allocator, schema: []const u8) []u8 {
-    const drop = [_][]const u8{"\"name\":\"write_file\""};
+    // local Ollama models fail on large tool-call JSON, so write_file AND edit_file are stripped — the model
+    // narrates a fenced full file / a ```edit block instead, and the salvage commits it.
+    const drop = [_][]const u8{ "\"name\":\"write_file\"", "\"name\":\"edit_file\"" };
     return stripTools(gpa, schema, &drop);
 }
 
