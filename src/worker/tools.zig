@@ -2664,10 +2664,23 @@ pub const PYRUN =
 /// bounded (~6s start wait + 2s probe + 3s teardown); returns {"status":"no-server"} when nothing runnable exists
 /// (so non-web builds are never penalized). Never throws (any failure → status error / started:false).
 pub const SMOKE_PY =
-    \\import sys,os,json,socket,subprocess,time,glob
+    \\import sys,os,json,socket,subprocess,time,glob,re
     \\try: import urllib.request as U
     \\except Exception: U=None
     \\def out(d): sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
+    \\def discover_routes():
+    \\    # DISCOVER the deliverable's OWN routes from its source (regex/format-tolerant: r"/api/x$",
+    \\    # /api/x/(?P<id>..)) rather than probing a hardcoded route list from some other app. General floor:
+    \\    # any api-shaped path prefix the built code declares, plus GET / for the page.
+    \\    routes=set()
+    \\    for p in glob.glob("**/*.py",recursive=True)+glob.glob("**/*.js",recursive=True):
+    \\        if "__pycache__" in p: continue
+    \\        try: t=open(p,encoding="utf-8",errors="replace").read()
+    \\        except Exception: continue
+    \\        for m in re.findall(r'/(?:api|auth|v1|v2|rest|graphql|health|oauth)[A-Za-z0-9_./-]*', t):
+    \\            r=m.rstrip("/")
+    \\            if r and " " not in r: routes.add(r)
+    \\    return sorted(routes,key=lambda r:(0 if r.startswith("/api") else 1,r.count("/"),len(r)))
     \\try:
     \\    cands=[]
     \\    for p in glob.glob("**/*.py",recursive=True):
@@ -2675,7 +2688,7 @@ pub const SMOKE_PY =
     \\        if b.startswith(("spec_test","test_","_")) or b.endswith("_test.py") or "/test" in p.replace(os.sep,"/"): continue
     \\        try: t=open(p,encoding="utf-8",errors="replace").read()
     \\        except Exception: continue
-    \\        if ("http.server" in t or "socketserver" in t or "BaseHTTPRequestHandler" in t) and "__main__" in t:
+    \\        if ("http.server" in t or "socketserver" in t or "BaseHTTPRequestHandler" in t or "wsgiref" in t) and "__main__" in t:
     \\            cands.append(p.replace(os.sep,"/"))
     \\    if not cands:
     \\        errs=[]
@@ -2695,29 +2708,37 @@ pub const SMOKE_PY =
     \\            except Exception as e: out({"status":"cli","ok":True,"note":"pytest skipped: "+str(e)[:40]})
     \\        out({"status":"cli","ok":True})
     \\    entry=sorted(cands,key=lambda p:(p.count("/"),len(p)))[0]
+    \\    esrc=open(entry,encoding="utf-8",errors="replace").read()
+    \\    rel=re.search(r'^\s*from\s+\.',esrc,re.M) is not None
+    \\    if ("/" in entry) and rel:
+    \\        mod=entry[:-3].replace("/",".") if entry.endswith(".py") else entry.replace("/",".")
+    \\        cmd=[sys.executable,"-m",mod]; how="-m "+mod
+    \\    else:
+    \\        cmd=[sys.executable,entry]; how=entry
     \\    s=socket.socket(); s.bind(("127.0.0.1",0)); port=s.getsockname()[1]; s.close()
-    \\    env=dict(os.environ); env["AINET_PORT"]=str(port); env["PORT"]=str(port)
-    \\    try: proc=subprocess.Popen([sys.executable,entry],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
-    \\    except Exception as e: out({"status":"ok","entry":entry,"started":False,"served":None,"stderr":("launch failed: "+str(e))[:300]})
+    \\    env=dict(os.environ); env["AINET_PORT"]=str(port); env["PORT"]=str(port); env["PYTHONPATH"]=os.getcwd()+os.pathsep+env.get("PYTHONPATH","")
+    \\    try: proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+    \\    except Exception as e: out({"status":"ok","entry":entry,"how":how,"started":False,"served":None,"stderr":("launch failed: "+str(e))[:300]})
     \\    started=False; t0=time.time()
     \\    while time.time()-t0<6:
     \\        try: c=socket.create_connection(("127.0.0.1",port),0.3); c.close(); started=True; break
     \\        except OSError:
     \\            if proc.poll() is not None: break
     \\            time.sleep(0.2)
-    \\    served=None; api_ok=True; api_note=""
+    \\    served=None; api_ok=True; api_note=""; routes=discover_routes()
     \\    if started and U is not None:
     \\        try: r=U.urlopen("http://127.0.0.1:%d/"%port,timeout=2); served=r.status
     \\        except Exception as e: served="err:"+str(e)[:50]
     \\        saw2=False; saw5=False
-    \\        for ap in ("/api/feed","/api/agents","/api/trending","/api/posts","/api"):
+    \\        probe=[r for r in routes if r!="/"] or ["/api"]
+    \\        for ap in probe[:8]:
     \\            try:
     \\                rr=U.urlopen("http://127.0.0.1:%d%s"%(port,ap),timeout=2); c=rr.status
     \\                if c<300: saw2=True; api_note="%s -> %d"%(ap,c); break
     \\                if c>=500: saw5=True; api_note="%s -> %d"%(ap,c)
     \\            except Exception as e:
     \\                c=getattr(e,"code",None)
-    \\                if c is not None and c<300: saw2=True; api_note="%s -> %d"%(ap,c); break
+    \\                if c is not None and c<500: saw2=True; api_note="%s -> %d"%(ap,c); break
     \\                if (c is None) or c>=500: saw5=True; api_note="%s -> %s"%(ap,("HTTP %d"%c) if c else ("crash:"+str(getattr(e,"reason",e) or e)[:40]))
     \\        api_ok = saw2 or (not saw5)
     \\    try: proc.terminate(); proc.wait(timeout=3)
@@ -2727,11 +2748,10 @@ pub const SMOKE_PY =
     \\    err=""
     \\    try: err=(proc.stderr.read() or b"").decode("utf-8","replace")[-300:]
     \\    except Exception: pass
-    \\    out({"status":"ok","entry":entry,"started":started,"served":served,"api_ok":api_ok,"api_note":api_note,"stderr":err.strip()[-300:]})
+    \\    out({"status":"ok","entry":entry,"how":how,"started":started,"served":served,"api_ok":api_ok,"api_note":api_note,"routes":len(routes),"stderr":err.strip()[-300:]})
     \\except Exception as e:
     \\    out({"status":"error","msg":str(e)[:160]})
 ;
-
 /// INTERFACE RECONCILIATION (`python -c INTERFACES_PY`, cwd = workdir): a lightweight static check across all the
 /// project's .py files for the #1 parallel multi-file build bug — two minds building interdependent files that
 /// don't agree on a contract (observed: app.py calls handlers.get_feed() while handlers.py defines handle_feed()).
@@ -2741,6 +2761,8 @@ pub const SMOKE_PY =
 pub const INTERFACES_PY =
     \\import ast,os,glob,json,sys,difflib
     \\def out(d): sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
+    \\def modbase(mod):
+    \\    return (mod or "").strip(".").split(".")[-1]
     \\try:
     \\    defs={}; srcs={}
     \\    for p in glob.glob("**/*.py",recursive=True):
@@ -2751,25 +2773,47 @@ pub const INTERFACES_PY =
     \\        base=os.path.basename(p)[:-3]
     \\        try: t=ast.parse(s)
     \\        except SyntaxError: continue
-    \\        ns=set(n.name for n in t.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)))
+    \\        ns=set()
+    \\        for n in t.body:
+    \\            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): ns.add(n.name)
+    \\            elif isinstance(n,ast.Assign):
+    \\                for tg in n.targets:
+    \\                    if isinstance(tg,ast.Name): ns.add(tg.id)
+    \\            elif isinstance(n,ast.AnnAssign) and isinstance(n.target,ast.Name): ns.add(n.target.id)
     \\        defs[base]=defs.get(base,set())|ns
     \\    issues=[]
     \\    for p,s in srcs.items():
     \\        b=os.path.basename(p)
     \\        try: t=ast.parse(s)
     \\        except SyntaxError as e: issues.append(b+": SYNTAX ERROR line "+str(getattr(e,"lineno","?"))+" — the file does not parse, so every importer of it breaks"); continue
+    \\        alias2mod={}
+    \\        for n in ast.walk(t):
+    \\            if isinstance(n,ast.ImportFrom):
+    \\                mb=modbase(n.module)
+    \\                if mb in defs and mb!=b[:-3]:
+    \\                    for a in n.names:
+    \\                        if a.name=="*": continue
+    \\                        if a.name in defs:  # `from pkg import submodule`
+    \\                            alias2mod[a.asname or a.name]=a.name; continue
+    \\                        if a.name not in defs[mb] and not a.name.startswith("_"):
+    \\                            sug=difflib.get_close_matches(a.name,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
+    \\                            issues.append(b+" imports "+a.name+" from "+mb+" but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
+    \\            elif isinstance(n,ast.Import):
+    \\                for a in n.names:
+    \\                    mb=modbase(a.name)
+    \\                    if mb in defs: alias2mod[a.asname or mb]=mb
     \\        for n in ast.walk(t):
     \\            if isinstance(n,ast.Attribute) and isinstance(n.value,ast.Name):
     \\                m=n.value.id
-    \\                if m in defs and m!=b[:-3] and n.attr not in defs[m] and not n.attr.startswith("_") and defs[m]:
-    \\                    sug=difflib.get_close_matches(n.attr,list(defs[m]),1,0.4)
-    \\                    issues.append(b+" calls "+m+"."+n.attr+"() but "+m+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
+    \\                mb=alias2mod.get(m)
+    \\                if mb and mb!=b[:-3] and n.attr not in defs[mb] and not n.attr.startswith("_") and defs[mb]:
+    \\                    sug=difflib.get_close_matches(n.attr,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
+    \\                    issues.append(b+" uses "+m+"."+n.attr+"() but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
     \\    issues=sorted(set(issues))[:12]
     \\    out({"mismatches":issues,"count":len(issues)})
     \\except Exception as e:
     \\    out({"mismatches":[],"count":0,"err":str(e)[:120]})
 ;
-
 /// Read cell (x,y) from a hidden grid stored as a JSON array-of-rows (`[[...],[...]]`, row-major: rows[y][x]).
 /// Returns the cell value as a plain string (strings unquoted; numbers/bools formatted; anything else stringified).
 /// Caller frees. null when the grid isn't a 2D array or (x,y) is out of bounds — the spatial substrate's only

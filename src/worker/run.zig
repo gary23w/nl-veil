@@ -3682,7 +3682,8 @@ fn smokeTest(w: *Worker, run_dir: []const u8) void {
     const S = struct {
         status: []const u8 = "",
         entry: []const u8 = "",
-        started: bool = false,
+        how: []const u8 = "", // the ACTUAL launch command the smoke used (e.g. "-m src.main.app") — the model
+        started: bool = false, // must fix the app to boot THAT way, not the raw `python file.py` we no longer use
         served: std.json.Value = .null,
         api_ok: bool = true,
         api_note: []const u8 = "",
@@ -3717,7 +3718,12 @@ fn smokeTest(w: *Worker, run_dir: []const u8) void {
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: `{s}` starts but GET / did not return a 2xx — the server runs but does not serve the app. Make `GET /` serve the page and the API routes respond.", .{clip(s.entry, 80)}) catch "";
     } else {
         w.smoke_ok = false;
-        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: your server entry `{s}` does NOT start — `python {s}` crashes on launch, so the app does not run at all (passing the unit tests is not enough). Fix it to boot (it must add its package dir to sys.path and read the port from the AINET_PORT/PORT env). stderr: {s}", .{ clip(s.entry, 80), clip(s.entry, 80), clip(std.mem.trim(u8, s.stderr, " \r\n\t"), 300) }) catch "";
+        // Report the EXACT invocation the engine used (a package-nested entry with relative imports is launched
+        // as `python -m dotted.path`, not `python file.py`), so a stderr like ModuleNotFoundError points the
+        // model at the real wiring bug (a wrong-depth relative import, a missing sibling package) instead of a
+        // phantom "relative import with no parent" the raw-script launch used to manufacture.
+        const how = if (s.how.len > 0) s.how else s.entry;
+        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: your server entry `{s}` does NOT start — `python {s}` crashes on launch, so the app does not run at all (passing the unit tests is not enough). The stderr below is the REAL wiring error — fix THAT (a wrong-depth relative import, a name the imported module never defines, a missing config file). Read the port from the AINET_PORT/PORT env. stderr: {s}", .{ clip(s.entry, 80), clip(how, 80), clip(std.mem.trim(u8, s.stderr, " \r\n\t"), 300) }) catch "";
     }
     if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
 }
