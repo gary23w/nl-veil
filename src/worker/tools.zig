@@ -2810,7 +2810,8 @@ pub const INTERFACES_PY =
     \\                    sug=difflib.get_close_matches(n.attr,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
     \\                    issues.append(b+" uses "+m+"."+n.attr+"() but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
     \\    issues=sorted(set(issues))[:12]
-    \\    out({"mismatches":issues,"count":len(issues)})
+    \\    exports={b:sorted(n for n in ns if not n.startswith("_")) for b,ns in defs.items() if any(not n.startswith("_") for n in ns)}
+    \\    out({"mismatches":issues,"count":len(issues),"exports":exports})
     \\except Exception as e:
     \\    out({"mismatches":[],"count":0,"err":str(e)[:120]})
 ;
