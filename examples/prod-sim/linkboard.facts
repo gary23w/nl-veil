@@ -1,0 +1,14 @@
+linkboard uses a single SQLite database file linkboard.db opened with sqlite3.connect and row_factory = sqlite3.Row.
+The links table is created with: CREATE TABLE IF NOT EXISTS links (id INTEGER PRIMARY KEY AUTOINCREMENT, board TEXT NOT NULL DEFAULT 'inbox', url TEXT NOT NULL, title TEXT NOT NULL, note TEXT DEFAULT '', created_ts REAL NOT NULL).
+db.py exposes module-level functions: init_db(path) creating tables idempotently, add_link(path, board, url, title, note) returning the new integer id, list_links(path, board=None) returning a list of dicts newest-first, and delete_link(path, link_id) returning True if a row was deleted.
+Every HTTP API route lives under the /api/ prefix and returns Content-Type application/json; the server is built on Python's stdlib http.server.ThreadingHTTPServer with no third-party packages.
+GET /api/links returns {"links": [...]} and accepts an optional ?board= query filter; POST /api/links takes a JSON body {"url": ..., "title": ..., "board": ..., "note": ...} and returns {"id": <new id>} with status 201.
+DELETE /api/links/<id> returns {"deleted": true} on success and status 404 with {"error": "not found"} when the id does not exist.
+GET /api/boards returns {"boards": ["inbox", ...]} — the distinct board names present in the links table.
+app.py reads config.json for {"port": 8020, "db_path": "linkboard.db", "static_dir": "static"} and serves the frontend files from static/ at the root path (/ maps to static/index.html).
+The frontend static/app.js uses fetch('/api/links') to load, fetch('/api/links', {method:'POST', ...}) to add, and fetch('/api/links/'+id, {method:'DELETE'}) to remove entries, then re-renders the list; it never hardcodes a hostname or port.
+static/index.html has a form with inputs named url, title, board and a <ul id="links"> that app.js fills; app.js escapes titles with textContent (never innerHTML with raw strings) to avoid XSS.
+cli.py is an argparse tool with subcommands add/list/delete that calls db.py functions directly (not the HTTP API); it prints one link per line as "[id] title - url (board)".
+test_db.py uses pytest with tmp_path to exercise a full round-trip: init_db, add_link, list_links ordering (newest first), board filtering, and delete_link returning True then False.
+test_api.py starts the real server on port 0 (ephemeral) in a thread against a tmp_path database, then exercises GET/POST/DELETE /api/links and GET /api/boards with urllib.request and asserts the exact JSON shapes.
+Timestamps are stored as time.time() floats in the created_ts column; JSON responses serialize them unchanged (no datetime objects anywhere in the API layer).
