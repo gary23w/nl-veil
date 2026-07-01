@@ -32,7 +32,7 @@ NEU = "neuron.exe" if WIN else "neuron"
 ZIG_VERSION = "0.16.0"
 DATA = os.path.join(ROOT, "data")
 MIND_NAMES = ["vega", "orion", "lyra", "atlas", "nova", "echo", "sol", "kai", "ember", "rhea", "wren", "iris"]
-STYLES = ["auto", "build", "build_use", "discourse", "investigate", "debate"]
+STYLES = ["auto", "build", "build_use", "discourse", "investigate", "debate", "quick"]
 
 # Preset OpenAI-compatible endpoints. base_url ends at /v1; "custom" lets the user type their own.
 PROVIDERS = {
@@ -828,6 +828,12 @@ def embed_workdir(run_dir, embed_dir):
 
 def deploy(args):
     args.name = args.name or ("swarm_" + time.strftime("%Y%m%d_%H%M%S"))
+    # --quick: interactive one-shot small-edit mode. Single mind, no plan/clarify scaffolding, edit-and-stop in
+    # 1-2 model calls. Explicit opt-in only. Takes precedence over --repl's plan gate (goes straight to the edit).
+    if getattr(args, "quick", False):
+        args.style = "quick"
+        args.minds = 1
+        args.repl = False   # skip the clarify->plan->approve gate; the task IS the instruction
     if getattr(args, "host", False):
         sys.exit(
             "  --host (supervised host shell-ops) is not wired yet - it is the next slice.\n"
@@ -858,7 +864,8 @@ def deploy(args):
     n = max(1, min(args.minds, len(MIND_NAMES)))
     manifest = {
         "swarm": args.name, "provider": args.provider, "model": args.model,
-        "base_url": args.base_url, "style": args.style, "mode": "continuous",
+        "base_url": args.base_url, "style": args.style,
+        "mode": "oneshot" if args.style == "quick" else "continuous",
         "minutes": args.minutes, "internet": not args.offline, "gap_assess": True,
         "breakout": bool(args.breakout),
         "autonomy": getattr(args, "autonomy", "bounded") or "bounded",
@@ -1590,6 +1597,10 @@ def main():
     ap.add_argument("--host", action="store_true",
                     help="HOST OPS: let the hive operate on THIS machine (run shell tasks / edit system files) under a "
                          "supervised executor that asks you to confirm every real command. Powerful — use with care.")
+    ap.add_argument("--quick", action="store_true",
+                    help="INTERACTIVE one-shot: a single mind does ONE small edit in ~1-2 model calls — skips the "
+                         "goal-rewrite/classify/blueprint scaffolding and stops after the edit. Pair with --embed to "
+                         "edit your project in place. Best for quick co-working ('center that div'); not big builds.")
     deploy(ap.parse_args())
 
 if __name__ == "__main__":
