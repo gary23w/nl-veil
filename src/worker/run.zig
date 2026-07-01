@@ -2142,7 +2142,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var acted = false;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1 };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
