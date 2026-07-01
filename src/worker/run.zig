@@ -136,6 +136,7 @@ pub const Worker = struct {
     key: []const u8,
     model: []const u8,
     fence_writes: bool = false,
+    tool_parse_fails: u32 = 0, // provider large-tool-call parse failures — 2 strikes flips fence_writes on adaptively
     hyperspace: bool = false, // Lever 2: settle a dense hierarchy of grounding in-process before each model call
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
     quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
@@ -433,7 +434,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     if (live) {
         const c = llm.capsSnapshot();
-        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, w.fence_writes, if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
+        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
     }
     if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)");
     w.breakout_on = m.breakout;
@@ -2522,6 +2523,17 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             monologue = std.fmt.allocPrint(gpa, "[llm error] {s}", .{step.content}) catch (gpa.dupe(u8, "[llm error]") catch unreachable);
             if (!operate and (fence_build or std.mem.indexOf(u8, live_schema, "write_file") != null) and isToolParseError(step.content)) {
                 w.act(mi.name, round, "tool_recover", clip(step.content, 200), "provider failed to parse a large tool call — re-issuing the turn WITHOUT tools to recover the change as text");
+                // ADAPTIVE FENCE (emergent — no model-name casing): a backend that fails to PARSE large tool
+                // calls will keep failing on every full-file write_file (llama3.1:8b lost 6/6 writes this way).
+                // Two strikes flips the whole worker to fenced writes — exactly what a probed thinking model
+                // gets from the start — so the fix comes from the live failure signal, not a hardcoded list.
+                if (!w.fence_writes) {
+                    w.tool_parse_fails += 1;
+                    if (w.tool_parse_fails >= 2) {
+                        w.fence_writes = true;
+                        w.act(mi.name, round, "fence_writes", "adaptive", "the provider failed to parse large tool calls twice — switching this swarm to FENCED writes from the next moment (write_file leaves the schema; files are emitted as fenced blocks / SEARCH-REPLACE edits and the salvage commits them)");
+                    }
+                }
                 var rconv: std.ArrayListUnmanaged(u8) = .empty;
                 defer rconv.deinit(gpa);
                 rconv.appendSlice(gpa, conv.items) catch {};
@@ -2811,27 +2823,40 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             break :editblk; // a narrated edit-block is handled here; never fall through to the full-file salvage
         }
         if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
-            const body = salvageFileBody(gpa, monologue);
-            defer if (body.len > 0) gpa.free(@constCast(body));
-            const base = std.fs.path.basename(salvage_slot);
-            const is_py = std.mem.endsWith(u8, base, ".py");
-            var reject: ?[]const u8 = null;
-            // Never commit raw edit narration as a file body: if parseNarratedSlot above could not route it
-            // (malformed / zero-op blocks), the SEARCH/REPLACE markers would otherwise corrupt the file.
-            if (bufedit.hasSearchReplace(body)) reject = "narrated edit markers, not a file body — put the file's path on its own line above the SEARCH block, or reply with the full file" else if (body.len < 80) reject = "too short (<80 chars)" else if (salvageLeadConversational(body)) reject = "conversational lead-in (chatter, not a file body)" else if (salvageHasToolFragment(body)) reject = "contains a raw tool-call fragment" else if (is_py and !pyCompileOk(w, body)) reject = "fails py_compile (syntax error)";
-            if (reject == null) {
-                const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch "";
-                defer if (full.len > 0) gpa.free(full);
-                if (full.len > 0) {
-                    const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
-                    defer if (existing.len > 0) gpa.free(existing);
-                    const cur = std.mem.trim(u8, existing, " \r\n\t");
-                    if (!w.quick and cur.len >= 40 and cur.len >= body.len) reject = "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
-                }
-            }
+            var body = salvageFileBody(gpa, monologue);
+            var reject = salvageRejectReason(w, salvage_slot, body);
             if (reject) |why| {
                 w.act(mi.name, round, "salvage_reject", salvage_slot, why);
-            } else if (body.len >= 80) {
+                // CORRECTIVE RETRY (mirrors tool_recover): a weak model that flubbed the fenced form gets the
+                // rejection REASON back and one more text-only turn to re-emit the file. Without this the round
+                // is silently lost — the model never learns WHY nothing landed. The no-clobber reject is final
+                // (protective, not a form error): re-emitting the same file cannot beat it, so don't retry.
+                if (!std.mem.startsWith(u8, why, "slot already holds")) {
+                    var rconv: std.ArrayListUnmanaged(u8) = .empty;
+                    defer rconv.deinit(gpa);
+                    rconv.appendSlice(gpa, conv.items) catch {};
+                    rconv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch {};
+                    const cmsg = std.fmt.allocPrint(gpa, "Your reply could not be saved as your file — {s}. Reply again with ONLY the file `{s}`: its relative path on the first line, then EXACTLY ONE fenced code block (```lang … ```) holding the COMPLETE corrected file. No prose before or after the block, no tool-call JSON, no SEARCH/REPLACE markers.", .{ why, salvage_slot }) catch "";
+                    defer if (cmsg.len > 0) gpa.free(@constCast(cmsg));
+                    llm.jstr(gpa, &rconv, if (cmsg.len > 0) cmsg else "Reply with ONLY your complete file as one fenced code block led by its relative path.") catch {};
+                    rconv.append(gpa, '}') catch {};
+                    var rep = completeAdaptive(w, mi, round, rconv.items, "", 8192, w.cap.temperature);
+                    defer rep.deinit(gpa);
+                    if (rep.ok and rep.content.len > 0) {
+                        const body2 = salvageFileBody(gpa, rep.content);
+                        if (salvageRejectReason(w, salvage_slot, body2)) |why2| {
+                            if (body2.len > 0) gpa.free(@constCast(body2));
+                            w.act(mi.name, round, "salvage_retry_reject", salvage_slot, why2);
+                        } else {
+                            if (body.len > 0) gpa.free(@constCast(body));
+                            body = body2;
+                            reject = null;
+                            w.act(mi.name, round, "salvage_retry", salvage_slot, "corrective feedback produced a valid file body on the second attempt");
+                        }
+                    }
+                }
+            }
+            if (reject == null and body.len >= 80) {
                 var wargs: std.ArrayListUnmanaged(u8) = .empty;
                 defer wargs.deinit(gpa);
                 wargs.appendSlice(gpa, "{\"path\":") catch {};
@@ -2843,6 +2868,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer gpa.free(wres);
                 w.act(mi.name, round, "salvage", salvage_slot, "rescued a narrated file body from the reply into the assigned slot");
             }
+            if (body.len > 0) gpa.free(@constCast(body));
         }
     }
 
@@ -2949,6 +2975,26 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
     const raw = monologue[start..i];
     if (raw.len < 4) return null;
     return jsonUnescape(gpa, raw);
+}
+
+/// Why a salvaged reply body must NOT be committed to the slot file (null = commit it). Factored out so the
+/// corrective retry judges the model's SECOND attempt with exactly the rules that rejected its first. The
+/// SEARCH/REPLACE check guards against parseNarratedSlot leftovers (malformed / zero-op blocks) — committing
+/// those markers as file contents would corrupt the file.
+fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?[]const u8 {
+    const gpa = w.gpa;
+    if (bufedit.hasSearchReplace(body)) return "narrated edit markers, not a file body — put the file's path on its own line above the SEARCH block, or reply with the full file";
+    if (body.len < 80) return "too short (<80 chars)";
+    if (salvageLeadConversational(body)) return "conversational lead-in (chatter, not a file body)";
+    if (salvageHasToolFragment(body)) return "contains a raw tool-call fragment";
+    if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py") and !pyCompileOk(w, body)) return "fails py_compile (syntax error)";
+    const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch return null;
+    defer gpa.free(full);
+    const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
+    defer if (existing.len > 0) gpa.free(existing);
+    const cur = std.mem.trim(u8, existing, " \r\n\t");
+    if (!w.quick and cur.len >= 40 and cur.len >= body.len) return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
+    return null;
 }
 
 fn salvageLeadConversational(body: []const u8) bool {
