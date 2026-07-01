@@ -282,6 +282,19 @@ pub const Narrated = struct { path: []u8, ops: []EditOp };
 ///   <replacement lines>
 ///   >>>>>>> REPLACE
 pub fn parseNarrated(gpa: std.mem.Allocator, reply: []const u8) ?Narrated {
+    return parseNarratedSlot(gpa, reply, "");
+}
+
+/// True when a reply carries at least one SEARCH/REPLACE marker — i.e. it is edit narration, not a file body.
+/// The full-file salvage uses this to refuse committing raw edit markers as a file's contents.
+pub fn hasSearchReplace(reply: []const u8) bool {
+    return std.mem.indexOf(u8, reply, "<<<<<<< SEARCH") != null;
+}
+
+/// Parse SEARCH/REPLACE blocks, preferring a path line detected in the reply but falling back to `slot` (the file
+/// the engine already knows this mind is editing) when the model omitted the path line. With slot="" this is the
+/// strict form: no detected path => null. Every block maps to a replace op. Fail-closed: never a partial edit.
+pub fn parseNarratedSlot(gpa: std.mem.Allocator, reply: []const u8, slot: []const u8) ?Narrated {
     const S = "<<<<<<< SEARCH";
     const M = "\n=======";
     const R = "\n>>>>>>> REPLACE";
@@ -299,6 +312,7 @@ pub fn parseNarrated(gpa: std.mem.Allocator, reply: []const u8) ?Narrated {
             if (last.len > 0 and std.mem.indexOfScalar(u8, last, '.') != null) path = last;
         }
     }
+    if (path.len == 0) path = slot; // recover a pathless edit against the file the engine assigned this mind
     if (path.len == 0) return null;
 
     var ops: std.ArrayListUnmanaged(EditOp) = .empty;
@@ -485,6 +499,23 @@ test "loci report post-splice byte offsets in op-index order" {
     // line by op 0's insert — proving loci track a match through a lower splice.
     try std.testing.expect(r.loci[0].op_index == 0 and r.loci[0].matched_offset == 3);
     try std.testing.expect(r.loci[1].op_index == 1 and r.loci[1].matched_offset == 13);
+}
+
+test "parseNarratedSlot recovers a pathless SEARCH/REPLACE against the assigned slot" {
+    const gpa = std.testing.allocator;
+    // the real failure: the model led straight with the SEARCH marker, no path line above it
+    const reply = "<<<<<<< SEARCH\nfunction initMatrix() {}\n=======\nfunction initMatrix() { rain(); }\n>>>>>>> REPLACE\n";
+    try std.testing.expect(hasSearchReplace(reply));
+    try std.testing.expect(parseNarrated(gpa, reply) == null); // strict form: no path -> null (would leak to salvage)
+    const n = parseNarratedSlot(gpa, reply, "app.js") orelse return error.NoParse;
+    defer freeNarrated(gpa, n);
+    try std.testing.expectEqualStrings("app.js", n.path);
+    try std.testing.expect(n.ops.len == 1 and n.ops[0].kind == .replace);
+    try std.testing.expectEqualStrings("function initMatrix() {}", n.ops[0].anchor);
+    // a real path line still wins over the slot fallback
+    const n2 = parseNarratedSlot(gpa, "lib/x.js\n<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n", "app.js") orelse return error.NoParse;
+    defer freeNarrated(gpa, n2);
+    try std.testing.expectEqualStrings("lib/x.js", n2.path);
 }
 
 test "anchorBrackets returns bracketing lines of a unique match; null when ambiguous" {
