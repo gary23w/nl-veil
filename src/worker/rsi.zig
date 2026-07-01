@@ -1,6 +1,6 @@
 //! Recursive self-improvement (RSI) for the neuron-loops worker — the engine-owned faculties that tune the
 //! swarm's OWN operating parameters and strategy from measured outcomes, while the safety floor stays fixed:
-//!   * the model-CAPACITY self-tuner (name seed + demote-only adaptation from measured tool-use vs narration),
+//!   * the model-CAPACITY self-tuner (probe/name seed + two-way adaptation from measured tool-use vs narration),
 //!   * the intuitive goal INTERPRETER (a terse instruction rebuilt into an explicit working brief),
 //!   * the GOVERNOR (proposal accept/rollback by trial confidence + token-utility) and its score helpers, and
 //!   * the multi-timescale RSI MEMORY distill, the weakness-driven CURRICULUM, the end-of-round RETROSPECTIVE,
@@ -63,13 +63,18 @@ pub fn tierFromStr(s: []const u8) ?Tier {
     return null;
 }
 
-/// The round-0 SEED from the model name — a weak PRIOR only (RSI corrects it from real behavior by ~round 2).
-/// Unknown ⇒ assembler: it is the safe default, because a strong model still works under the lean scaffold (and
-/// RSI promotes it on its first strong round), whereas the full author setup DROWNS a weak model on round 1.
+/// The round-0 SEED — a weak PRIOR only (RSI corrects it from real behavior by ~round 2). A MEASURED prior
+/// outranks the name prior: the /api/show probe exposes the model's true parameter count, so a local 70B is
+/// seeded author no matter what it is named. Unknown ⇒ assembler: it is the safe default, because a strong
+/// model still works under the lean scaffold (and RSI promotes it on its first strong round), whereas the
+/// full author setup DROWNS a weak model on round 1.
 pub fn seedTier(model: []const u8) Tier {
+    const c = llm.capsSnapshot();
+    if (c.probed and c.param_count > 0)
+        return if (c.param_count >= 60_000_000_000) .author else .assembler;
     var buf: [96]u8 = undefined;
     const n = @min(model.len, buf.len);
-    for (model[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    for (model[0..n], 0..) |c2, i| buf[i] = std.ascii.toLower(c2);
     const m = buf[0..n];
     const big = [_][]const u8{ "gpt-4", "gpt-5", "gpt4", "claude", "opus", "sonnet", "gemini-1.5-pro", "gemini-2", "70b", "72b", "405b", "-large", "command-r-plus" };
     for (big) |k| if (std.mem.indexOf(u8, m, k) != null) return .author;
@@ -85,11 +90,15 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     if (w.cap_pinned) return;
     var live_moments: u32 = 0;
     var with_tool: u32 = 0;
+    var with_real_tool: u32 = 0;
     var narrated: u32 = 0;
     for (results) |r| {
         if (!r.llm_ok) continue;
         live_moments += 1;
-        if (r.tool_calls > 0) with_tool += 1;
+        // a FENCED moment that landed its file via the salvage did its job with zero tool calls — count the
+        // outcome, not the transport, or every fenced worker reads as "drowning" and gets demoted for working.
+        if (r.tool_calls > 0 or r.files > 0) with_tool += 1;
+        if (r.tool_calls > 0) with_real_tool += 1;
         if (r.narrated) narrated += 1;
     }
     if (live_moments == 0) return;
@@ -97,8 +106,30 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     const drowning = narrated > 0 or tool_ok < 60;
     if (!drowning) {
         w.cap_streak = 0;
+        // PROMOTE (the seed comment above always promised this; now it is real): two consecutive rounds of
+        // full GENUINE tool competence (every live moment made structured tool calls, nothing narrated) lift
+        // the tier one step, so a capable model seeded low gets its full toolset back. Salvage-landed files
+        // do NOT count here — a fenced weak model stays in the lean regime that is carrying it.
+        const stronger: ?Tier = switch (w.cap.tier) {
+            .author => null,
+            .assembler => .author,
+            .extractor => .assembler,
+        };
+        if (stronger != null and with_real_tool == live_moments and narrated == 0) {
+            w.promo_streak += 1;
+            if (w.promo_streak >= 2) {
+                w.promo_streak = 0;
+                const from = w.cap.tier;
+                const keep_temp = w.cap.temperature;
+                w.cap = profileForTier(stronger.?);
+                w.cap.temperature = keep_temp;
+                w.act("engine", round, "capacity", @tagName(stronger.?), std.fmt.allocPrint(w.a(), "RSI promote {s} -> {s}: two strong rounds running (100% structured tool use, nothing narrated) — the model earned its fuller toolset back", .{ @tagName(from), @tagName(stronger.?) }) catch "rsi promote");
+                w.emit("capacity", std.fmt.allocPrint(w.a(), ",\"tier\":\"{s}\",\"turns\":{d},\"conv_cap\":{d},\"promoted\":true", .{ @tagName(stronger.?), w.cap.max_turns, w.cap.conv_cap }) catch ",\"promoted\":true");
+            }
+        } else w.promo_streak = 0;
         return;
     }
+    w.promo_streak = 0;
     if (w.cap.temperature < 0 or w.cap.temperature > TEMP_FLOOR) {
         const prev = w.cap.temperature;
         w.cap.temperature = TEMP_FLOOR;
@@ -377,6 +408,33 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     w.emit("growth", std.fmt.allocPrint(w.a(), ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
 }
 
+/// The string value of `"<key>": "<value>"` inside possibly-malformed JSON text — a last-resort extractor for
+/// when the whole document does not parse (weak-model truncation). Backslash-escaped quotes are skipped.
+fn textField(s: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [48]u8 = undefined;
+    const kq = std.fmt.bufPrint(&kbuf, "\"{s}\"", .{key}) catch return null;
+    const kpos = std.mem.indexOf(u8, s, kq) orelse return null;
+    var i = kpos + kq.len;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == ':')) i += 1;
+    if (i >= s.len or s[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (s[i] == '"') return s[start..i];
+    }
+    return s[start..]; // truncated mid-string — keep what's there
+}
+
+test "textField extracts a value from prose-wrapped or truncated JSON" {
+    try std.testing.expectEqualStrings("fix the store API", textField("Here is my plan: {\"bottleneck\": \"fix the store API\", \"assignments\": [", "bottleneck").?);
+    try std.testing.expectEqualStrings("cut off mid", textField("{\"bottleneck\":\"cut off mid", "bottleneck").?);
+    try std.testing.expect(textField("no such key here", "bottleneck") == null);
+}
+
 pub fn matchArchetype(role: []const u8) ?Archetype {
     const t = std.mem.trim(u8, role, " \r\n\t");
     for (ARCHETYPES) |x| if (std.ascii.eqlIgnoreCase(x.key, t)) return x;
@@ -436,7 +494,27 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
         assignments: []const struct { mind: []const u8 = "", focus: []const u8 = "", research: bool = false } = &.{},
         blueprint_add: []const []const u8 = &.{},
     };
-    var parsed = std.json.parseFromSlice(P, gpa, std.mem.trim(u8, reply.content, " \r\n\t`"), .{ .ignore_unknown_fields = true }) catch return;
+    const trimmed = std.mem.trim(u8, reply.content, " \r\n\t`");
+    var parsed = std.json.parseFromSlice(P, gpa, trimmed, .{ .ignore_unknown_fields = true }) catch blk_fb: {
+        // FALLBACK 1: a weak model wraps its JSON in prose or a ```json fence — parse the outermost {...} span.
+        const lb = std.mem.indexOfScalar(u8, trimmed, '{');
+        const rb = std.mem.lastIndexOfScalar(u8, trimmed, '}');
+        if (lb != null and rb != null and rb.? > lb.?) {
+            if (std.json.parseFromSlice(P, gpa, trimmed[lb.? .. rb.? + 1], .{ .ignore_unknown_fields = true })) |p2| {
+                break :blk_fb p2;
+            } else |_| {}
+        }
+        // FALLBACK 2: the JSON is truly broken (truncated mid-string) — salvage at least the bottleneck text
+        // so the round keeps a STRATEGY instead of discarding the whole plan; roles stay as they were.
+        if (textField(trimmed, "bottleneck")) |b| {
+            if (std.mem.trim(u8, b, " \r\n\t").len > 3) {
+                if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
+                w.strategy_str = gpa.dupe(u8, clip(std.mem.trim(u8, b, " \r\n\t"), 280)) catch "";
+                w.act("orchestrator", round, "strategy", w.strategy_str, "(the plan JSON was unparseable — kept the bottleneck as this round's strategy; roles unchanged)");
+            }
+        }
+        return;
+    };
     defer parsed.deinit();
     if (parsed.value.assignments.len == 0 and parsed.value.bottleneck.len == 0) return;
     if (std.mem.trim(u8, parsed.value.bottleneck, " \r\n\t").len > 3) {
