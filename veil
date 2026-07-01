@@ -1,0 +1,7 @@
+#!/bin/sh
+# veil - cast a hive-mind swarm on the fly. A thin wrapper over deploy.py so you can type
+#   veil "add a header search to my landing page" --embed . --repl
+# instead of `python deploy.py ...`. Put this dir on your PATH (or symlink this file into one).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="$(command -v python3 || command -v python)"
+exec "$PY" "$DIR/deploy.py" "$@"

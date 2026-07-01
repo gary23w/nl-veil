@@ -19,7 +19,12 @@ device as a self-healing security daemon.
 ```bash
 python deploy.py                                  # interactive setup wizard
 python deploy.py "Build a CLI todo app in Python, with tests" --follow
+veil "add a search box to my landing page and wire the login DB" --embed . --repl
 ```
+
+> `veil` is a one-line shim for `python deploy.py` (`veil` / `veil.cmd` at the repo root — put it on your
+> PATH). Type a task and it casts a swarm on the fly; the **mode emerges from the words** (build / research /
+> operate). See [Cast on the fly](#cast-on-the-fly).
 
 ---
 
@@ -30,6 +35,15 @@ python deploy.py "Build a CLI todo app in Python, with tests" --follow
 - **Hive memory.** Every mind writes to and recalls from one shared associative store. Ask the
   hive a question and it answers from what any member learned — even across facts that share no
   words, by following the links between them.
+- **Hyperspace grounding** *(opt-in — `NL_HYPERSPACE=1`).* Before each model call the harness settles a
+  *dense hierarchy* of the most relevant memory in a **warm, in-RAM field** — spreading activation out from the
+  current focus, then a hyperbolic-like pack (general hubs + local specifics). The field is seeded from the
+  store once and then grown from the swarm's own new facts in-process, so a typical round does **zero database
+  subprocess calls** for grounding — only real model inference and web fetches take time. A small model gets
+  large-model-grade context per round-trip instead of a flat, one-shot slice, so it converges in fewer steps.
+  The field is **bounded** (~45 KB/mind at the default cap of 160 facts — it evicts, never grows with the
+  corpus) and scales to the hardware: `NL_HYPERSPACE_CAP=48` gives a lean ~15 KB/mind profile for an
+  IoT/appliance, higher caps buy richer grounding on a server.
 - **The Veil.** Periodically the hive is integrated into a single self — *I am / I know / I have /
   my will* — that persists across runs, answers you directly, and folds your intent into the
   hive's next move.
@@ -90,6 +104,25 @@ python deploy.py stop <run-name>     # stop a run
 The hive writes its files to `data/<run>/work/`, its memory to `data/<run>/mind.sqlite`, and a
 live event stream to `data/<run>/events.jsonl`.
 
+### Cast on the fly
+
+`veil "<task>"` (a shim for `python deploy.py "<task>"`) casts a swarm from a single line. You don't pick a
+mode — the engine interprets your words, so *build*, *research*, and *operate* all come from the same command:
+
+```bash
+veil "research the state of the global economy and brief me" --detach
+veil "add a header search to my landing page and wire the remote-auth login DB" --embed . --repl
+```
+
+- **`--embed <dir>`** — work **in place** in your project: the hive reads *and writes* your real files there
+  (not a fresh `data/<run>/work` scaffold). Autonomy is held to **bounded** when embedded, since it's touching
+  your files.
+- **`--repl`** — the Veil first asks a few clarifying questions, turns your one-liner into a concrete **plan**,
+  and lets you **approve it once** (or refine it in place). On approval the hive runs autonomously and the chat
+  stays open for follow-up edits.
+- **`--detach`** — cast fully detached from the terminal (survives closing it); reattach with `deploy.py chat
+  <run>`. Lighter than `--service` (no OS daemon).
+
 ## What can it do?
 
 The same binary and the same launcher cover very different jobs. Four worked use cases:
@@ -118,7 +151,10 @@ remove persistence → block C2 → kill process → verify), and a **blue-team 
 stealth implant the host itself rates `NOMINAL` by cross-referencing every outbound connection against a
 baked threat-intel corpus (`threatintel.facts`, sourced from abuse.ch). Nothing in the engine is
 security-specific, though — the same operate loop drives **any** device that speaks telemetry: an IoT
-signal controller, an application server, a sensor. Swap the corpus and the telemetry, not the code.
+signal controller, an application server, a sensor. Swap the corpus and the telemetry, not the code. The
+same loop also runs **positive dev-ops**: pointed at a live dev stack it acts as a resident **sysadmin**,
+bringing a broken service back up and running a pending database migration — graded purely by the stack's
+measured health (a local `gpt-oss:20b` scored a clean **100%** on that ladder with no engine changes).
 `veil_chat.py` is an offline-first operator console (`status` / `log` / `ask` answer straight from
 neuron-db with no model and no network; live `veil` / `cmd` drive the running device). Verified operating
 a live host on a local 8B model. See **[`examples/embedded/`](examples/embedded/)**.
