@@ -2464,16 +2464,22 @@ const PATCH_SYSTEM_PATCH_PY =
 /// never throws (so a broken deliverable scores 0, it never crashes a round). 3 tiers so the curve moves at
 /// every stage of a build: TIER 1 = real tests (pytest if present, else `unittest discover`; pass/total), with
 /// a hard subprocess timeout so a runaway test can't hang the round; TIER 2 = no tests yet, score = how many
-/// .py files compile (nudges the swarm toward authoring tests); TIER 3 = non-code artifacts, a presence
-/// heuristic capped below 100 so only real tests reach a perfect score. Model-uneditable: it runs via
-/// `python -c BENCH_PY`, so the swarm cannot fake or dodge its own fitness function.
+/// .py files compile (nudges the swarm toward authoring tests); TIER 3 = non-code artifacts scored by each
+/// format's OWN parser (json/xml/toml well-formedness, non-empty otherwise — no content opinions; the
+/// goal-parameterized word-coverage path applies only when NL_DOC_TARGET_WORDS is set). The failure extractor
+/// ff() reads BOTH runners' native formats — unittest `FAIL:`/`ERROR:` blocks AND pytest's
+/// `FAILED node - reason` summary lines (a 0/7 round once reported "FAILING: (none)" because only the
+/// unittest shape was parsed, starving the steering loop of the very messages that named the fixes) — and
+/// malformed non-Python layer files (a broken config.json) ride along in `failures` even when tests score,
+/// so a multi-layer build hears about every layer. Model-uneditable: it runs via `python -c BENCH_PY`, so
+/// the swarm cannot fake or dodge its own fitness function.
 pub const BENCH_PY =
     \\import sys,json,os,glob,subprocess,re,py_compile
     \\def out(d):
     \\    sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
     \\def ff(txt):
-    \\    body=re.split(r"-{3,}[\r\n]+Ran \d",txt)[0]
     \\    r=[]
+    \\    body=re.split(r"-{3,}[\r\n]+Ran \d",txt)[0]
     \\    for b in re.split(r"={3,}",body):
     \\        ls=[l for l in b.splitlines() if l.strip()]
     \\        if not ls or not ls[0].strip().startswith(("FAIL:","ERROR:")): continue
@@ -2484,7 +2490,36 @@ pub const BENCH_PY =
     \\            if re.match(r"^[A-Za-z_.]*(Error|Exception|Failure)\b",s): ex=s
     \\        if not ex: ex=ls[-1].strip()
     \\        r.append((k+" "+nm+" -> "+ex)[:160])
-    \\    return r[:6]
+    \\    for l in txt.splitlines():
+    \\        s=l.strip()
+    \\        m=re.match(r"^(FAILED|ERROR)\s+(\S+?)(?:\s+-\s+(.*))?$",s)
+    \\        if not m or m.group(2).startswith("("): continue
+    \\        r.append((m.group(1)+" "+m.group(2)+" -> "+(m.group(3) or "see traceback"))[:160])
+    \\    seen=set(); u=[]
+    \\    for x in r:
+    \\        if x in seen: continue
+    \\        seen.add(x); u.append(x)
+    \\    return u[:6]
+    \\def wf():
+    \\    fails=[]; ok=0; tot=0
+    \\    for f in sorted(glob.glob("*")+glob.glob("*/*")):
+    \\        if not os.path.isfile(f) or os.path.basename(f).startswith((".","_")): continue
+    \\        lf=f.lower()
+    \\        if lf.endswith((".py",".pyc")): continue
+    \\        tot+=1
+    \\        try: t=open(f,encoding="utf-8",errors="replace").read()
+    \\        except Exception: fails.append((f+": unreadable")[:90]); continue
+    \\        try:
+    \\            if not t.strip(): raise ValueError("empty file")
+    \\            if lf.endswith(".json"): json.loads(t)
+    \\            elif lf.endswith(".xml"):
+    \\                import xml.etree.ElementTree as ET; ET.fromstring(t)
+    \\            elif lf.endswith(".toml"):
+    \\                try: import tomllib; tomllib.loads(t)
+    \\                except ImportError: pass
+    \\            ok+=1
+    \\        except Exception as ex: fails.append((f+": "+str(ex).splitlines()[0])[:90])
+    \\    return ok,tot,fails
     \\try:
     \\    only=os.environ.get("NL_BENCH_ONLY","")
     \\    if only:
@@ -2505,6 +2540,7 @@ pub const BENCH_PY =
     \\    pys=[f for f in glob.glob("*.py")+glob.glob("*/*.py") if not os.path.basename(f).startswith("_")]
     \\    tests=[f for f in pys if os.path.basename(f).startswith("test_") or os.path.basename(f).endswith("_test.py")]
     \\    if os.path.isdir("tests"): tests+=glob.glob("tests/**/*.py",recursive=True)
+    \\    aux=wf()[2]
     \\    if tests:
     \\        for runner in (["-m","pytest","-q","--no-header"],["-m","unittest","discover","-q"]):
     \\            try:
@@ -2525,7 +2561,7 @@ pub const BENCH_PY =
     \\                f=(int(mfa.group(1)) if mfa else 0)+(int(mer.group(1)) if mer else 0); p=tot0-f
     \\            tot=p+f
     \\            if tot>0:
-    \\                fails=ff(txt)
+    \\                fails=(ff(txt)+aux)[:6]
     \\                out({"status":"ok","passed":p,"total":tot,"failures":fails,"tier":1})
     \\    if pys:
     \\        ok=0; tot=0; fails=[]
@@ -2533,27 +2569,31 @@ pub const BENCH_PY =
     \\            tot+=1
     \\            try: py_compile.compile(f,doraise=True); ok+=1
     \\            except Exception as e: fails.append((f+": "+str(e).splitlines()[0])[:90])
-    \\        out({"status":"ok","passed":ok,"total":tot,"failures":fails[:5],"tier":2})
+    \\        out({"status":"ok","passed":ok,"total":tot,"failures":(fails+aux)[:5],"tier":2})
+    \\    tw=int(os.environ.get("NL_DOC_TARGET_WORDS","0") or 0)
     \\    docs=[f for f in glob.glob("*")+glob.glob("*/*") if os.path.isfile(f) and not os.path.basename(f).startswith((".","_"))]
-    \\    if docs:
+    \\    if docs and tw>0:
     \\        sc=0.0
-    \\        tw=int(os.environ.get("NL_DOC_TARGET_WORDS","0") or 0)
     \\        for f in docs:
     \\            try: t=open(f,encoding="utf-8",errors="replace").read()
     \\            except Exception: t=""
-    \\            if f.lower().endswith(".html"): sc+= 1 if ("<title" in t.lower() and "<body" in t.lower()) else 0
-    \\            elif f.lower().endswith(".md"):
-    \\                if tw>0: sc+= min(1.0, sum(len(ln.split()) for ln in t.split("\n") if ln.strip() and not ln.strip().startswith("#"))/tw)
-    \\                else: sc+= 1 if t.count("#")>0 and len(t)>200 else 0
-    \\            else: sc+= 1 if len(t)>40 else 0
+    \\            if f.lower().endswith(".md"): sc+= min(1.0, sum(len(ln.split()) for ln in t.split("\n") if ln.strip() and not ln.strip().startswith("#"))/tw)
+    \\            else: sc+= 1 if len(t.strip())>0 else 0
     \\        denom=max(len(docs), int(os.environ.get("NL_DOC_FILE_COUNT","0") or 0))
     \\        pct=min(99,int(sc*100/denom)) if denom else 0
     \\        out({"status":"ok","passed":pct,"total":100,"failures":[],"tier":3})
+    \\    if docs:
+    \\        ok,tot,fails=wf()
+    \\        pyok=0
+    \\        for f in [x for x in docs if x.lower().endswith(".py")]:
+    \\            tot+=1
+    \\            try: py_compile.compile(f,doraise=True); ok+=1; pyok+=1
+    \\            except Exception as e: fails.append((f+": "+str(e).splitlines()[0])[:90])
+    \\        if tot>0: out({"status":"ok","passed":ok,"total":tot,"failures":fails[:5],"tier":3})
     \\    out({"status":"no-tests"})
     \\except Exception as e:
     \\    out({"status":"error","msg":str(e)[:120]})
 ;
-
 /// The engine-owned IMPORT-GRAPH analyzer — run once per round (cwd = workdir) via `python -c DEPGRAPH_PY`. It
 /// `ast`-parses every project .py file, resolves each import to the project file it points at, and prints a
 /// compact dependency map ("foo.py -> imports: bar.py  <- used by: baz.py"). This is structural RAG context for
