@@ -4190,13 +4190,13 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
     if (w.probes_str.len == 0) return; // nothing declared to answer — vacuously ok; the VERIFY rows carry the gradient
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return;
     defer gpa.free(workdir);
-    const boot = if (builtin.os.tag == .windows)
-        std.fmt.allocPrint(gpa, "cd /d \"{s}\" && {s}", .{ workdir, w.smoke_cmd }) catch return
-    else
-        std.fmt.allocPrint(gpa, "cd \"{s}\" && exec {s}", .{ workdir, w.smoke_cmd }) catch return;
-    defer gpa.free(boot);
-    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", boot } else .{ "/bin/sh", "-c", boot };
-    var child = std.process.spawn(w.io, .{ .argv = &argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
+    // The declared command rides to the shell VERBATIM with the workdir set via .cwd — never a `cd`-prefix
+    // wrapper (embedded path quotes inside a `cmd /C` argument misparse under CreateProcess quoting; the
+    // probe silently saw status 0 forever when the wrapper ate the boot command).
+    const posix_boot = if (builtin.os.tag != .windows) std.fmt.allocPrint(gpa, "exec {s}", .{w.smoke_cmd}) catch return else "";
+    defer if (posix_boot.len > 0) gpa.free(@constCast(posix_boot));
+    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", w.smoke_cmd } else .{ "/bin/sh", "-c", posix_boot };
+    var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
         w.smoke_ok = false;
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the declared smoke `{s}` could not be spawned at all.", .{clip(w.smoke_cmd, 120)}) catch "";
         if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", "runtime fail", w.smoke_str);
