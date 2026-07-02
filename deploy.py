@@ -1798,6 +1798,517 @@ def deploy(args):
         print("\n  (running in the background. Add --follow to watch it live, or --detach to leave this terminal.)")
     return proc
 
+# ----------------------------------------------------- hive as a SUB-AGENT: cast / report / mcp
+#
+# The doors that let ANOTHER AI use a hive as its side agent: a primary assistant (Claude, or any
+# tool-capable model) casts a swarm at a question or task — optionally seeded with the caller's own
+# files so the research happens INSIDE the context of their application — and gets back ONE
+# structured FINDINGS object it can act on, instead of walking the problem step-by-step in its own
+# context window. Three doors, all harness-side (zero engine change):
+#   cast    veil cast "<goal>" [--context PATH] [--json]     blocking one-shot for CLI agents
+#   report  veil report <run> [--json]                       distill findings from ANY run, any time
+#   mcp     veil mcp                                          stdio MCP server for chat clients
+
+_CTX_SKIP_DIRS = {".git", ".hg", "node_modules", "__pycache__", "venv", ".venv", "dist",
+                  "build", "target", "zig-out", ".idea", ".vscode"}
+
+def _pack_context_paths(paths, cap_facts=2500):
+    """Flatten the caller's files/dirs into a .facts pack (one fact line per ~paragraph of text,
+    tagged [relpath]) so the hive researches the CALLER'S actual application, not generic priors.
+    Binary files, huge files, and dependency dirs are skipped. Returns the pack path or None."""
+    facts = []
+    def add_file(fp, rel):
+        try:
+            with open(fp, "rb") as f:
+                if b"\0" in f.read(2048):
+                    return
+            if os.path.getsize(fp) > 400_000:
+                return
+            text = open(fp, encoding="utf-8", errors="replace").read()
+        except Exception:
+            return
+        buf = ""
+        for ln in text.splitlines():
+            if len(buf) + len(ln) > 380 and buf.strip():
+                facts.append(f"[{rel}] " + " ".join(buf.split()))
+                buf = ""
+                if len(facts) >= cap_facts:
+                    return
+            buf += ln + "\n"
+        if buf.strip() and len(facts) < cap_facts:
+            facts.append(f"[{rel}] " + " ".join(buf.split()))
+    for p in paths or []:
+        p = os.path.abspath((p or "").strip().strip('"').strip("'"))
+        if os.path.isfile(p):
+            add_file(p, os.path.basename(p))
+        elif os.path.isdir(p):
+            n_files = 0
+            for root, ds, fs in os.walk(p):
+                ds[:] = [d for d in ds if d not in _CTX_SKIP_DIRS and not d.startswith(".")]
+                for fn in sorted(fs):
+                    if n_files >= 400 or len(facts) >= cap_facts:
+                        break
+                    add_file(os.path.join(root, fn),
+                             os.path.relpath(os.path.join(root, fn), p).replace(os.sep, "/"))
+                    n_files += 1
+        else:
+            print(f"    context path not found (skipped): {p}", file=sys.stderr)
+    if not facts:
+        return None
+    os.makedirs(os.path.join(DATA, ".packs"), exist_ok=True)
+    out = os.path.join(DATA, ".packs", "ctx_" + time.strftime("%Y%m%d_%H%M%S") + ".facts")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write("\n".join(facts) + "\n")
+    print(f"    context pack: {len(facts)} facts -> {os.path.basename(out)}", file=sys.stderr)
+    return out
+
+def _gather_run_evidence(run_dir, budget=9000):
+    """Everything a findings report can honestly rest on, harvested from the run's own artifacts:
+    the goal chain, provenance-gated learnings (scout_learn), self-authored directives, fitness,
+    the built file tree, doc heads, and the skills library. Returns (goal, evidence_text, facts)."""
+    name = os.path.basename(run_dir.rstrip("/\\"))
+    try:
+        sw = json.load(open(os.path.join(run_dir, "swarm.json"), encoding="utf-8"))
+    except Exception:
+        sw = {}
+    goal = sw.get("goal", "")
+    goals, learned, directives, scores, marks = [], [], [], [], []
+    rounds = 0
+    try:
+        with open(os.path.join(run_dir, "events.jsonl"), "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 600_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except Exception:
+        lines = []
+    for ln in lines:
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        try:
+            rounds = max(rounds, int(e.get("round") or 0))
+        except Exception:
+            pass
+        k, t = e.get("kind"), e.get("tool", "")
+        if k == "goal":
+            goals.append(str(e.get("goal", ""))[:300])
+        elif k == "act":
+            r = str(e.get("result", ""))
+            if t == "scout_learn":
+                learned.append((str(e.get("args", ""))[:90], r[:280]))
+            elif t == "scout_applied":
+                marks.append("scout_applied: " + r[:160])
+            elif t == "set_directive":
+                directives.append(r[:160])
+            elif t in ("score", "benchmark"):
+                scores.append(r[:120])
+            elif t in ("originate", "goal_choice", "new_goal", "stage_delivery", "smoke", "archived"):
+                marks.append(f"{t}: {r[:160]}")
+    files, skills = [], []
+    wroot = os.path.join(run_dir, "work")
+    for root, ds, fs in os.walk(wroot):
+        ds[:] = [d for d in ds if d not in _CTX_SKIP_DIRS and not d.startswith(".")]
+        for fn in sorted(fs):
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, wroot).replace(os.sep, "/")
+            try:
+                sz = os.path.getsize(fp)
+            except Exception:
+                sz = 0
+            if rel.startswith("skills/"):
+                skills.append(rel[len("skills/"):])
+            elif not rel.startswith("journal/") and len(files) < 120:
+                files.append((rel, sz))
+    prio = ("readme", "briefing", "findings", "design", "report")
+    md = [(rel, sz) for rel, sz in files if rel.lower().endswith(".md")]
+    md.sort(key=lambda x: (0 if any(p in x[0].lower() for p in prio) else 1, x[0].count("/"), x[0]))
+    doc_heads = []
+    for rel, _sz in md[:5]:
+        try:
+            doc_heads.append((rel, open(os.path.join(wroot, rel), encoding="utf-8", errors="replace").read(1500)))
+        except Exception:
+            pass
+    ev = []
+    if goals:
+        ev.append("GOAL CHAIN:\n- " + "\n- ".join(goals[-4:]))
+    if marks:
+        ev.append("KEY EVENTS:\n- " + "\n- ".join(marks[-10:]))
+    if learned:
+        ev.append("PROVENANCE-GATED LEARNINGS (each backed by a verbatim span of a fetched page):\n- "
+                  + "\n- ".join(f"{u} => {n}" for u, n in learned[-8:]))
+    if directives:
+        ev.append("SELF-AUTHORED PROCESS DIRECTIVES:\n- " + "\n- ".join(directives[-6:]))
+    if scores:
+        ev.append("FITNESS: " + " | ".join(scores[-4:]))
+    if files:
+        ev.append("FILES BUILT:\n" + "\n".join(f"  {rel} ({sz}b)" for rel, sz in files[:40]))
+    for rel, head in doc_heads:
+        ev.append(f"--- {rel} (head) ---\n{head}")
+    facts = {"run": name, "goal": goal, "rounds": rounds,
+             "score": scores[-1] if scores else "",
+             "files": [r for r, _ in files], "skills": skills,
+             "learned": [n for _u, n in learned][-8:],
+             "delivery": os.path.isdir(os.path.join(run_dir, "DELIVERY"))}
+    return goal, "\n\n".join(ev)[:budget], facts
+
+def _first_json_obj(text):
+    """First balanced {...} in `text` parsed as JSON, else None (models wrap JSON in prose/fences)."""
+    s = text or ""
+    i = s.find("{")
+    while i != -1:
+        depth, j, instr, esc = 0, i, False, False
+        while j < len(s):
+            c = s[j]
+            if instr:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    instr = False
+            else:
+                if c == '"':
+                    instr = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(s[i:j + 1])
+                        except Exception:
+                            break
+            j += 1
+        i = s.find("{", i + 1)
+    return None
+
+def _distill_findings(run_dir, question=None):
+    """The cast's RETURN VALUE: one structured findings object distilled from the run's artifacts.
+    Machine facts (files, score, learnings, run dir) are included verbatim; the narrative fields
+    (answer/recommendation/key_findings) come from one veil-voiced synthesis call over the evidence.
+    Never raises — with no reachable model the machine facts still come back, confidence 0."""
+    goal, evidence, facts = _gather_run_evidence(run_dir)
+    try:
+        base, model, key = _run_endpoint(run_dir)
+    except Exception:
+        base, model, key = _default_endpoint()
+    sysp = ("You are the veil — the one voice of a hive-mind swarm that just finished working. Distill an "
+            "honest FINDINGS report for another AI (your caller) that will act on it. Reply with ONLY one "
+            "JSON object, no code fences: "
+            '{"answer": "<direct answer / what was accomplished, one paragraph>", '
+            '"recommendation": "<the single best next direction for the caller>", '
+            '"key_findings": [{"finding": "...", "evidence": "<the source/file/score it rests on>"}], '
+            '"open_questions": ["..."], "confidence": <0.0-1.0>} '
+            "Ground every field ONLY in the evidence shown; if the evidence is thin, say so and lower confidence.")
+    user = (f"The swarm's goal: {goal or '(free-roam)'}\n"
+            + (f"The caller's question: {question}\n" if question and question != goal else "")
+            + f"\nEVIDENCE FROM THE RUN:\n{evidence or '(no evidence captured)'}")
+    rep = ""
+    try:
+        rep = _llm_chat(base, key, model, sysp, user, timeout=180) or ""
+    except Exception:
+        rep = ""
+    obj = _first_json_obj(rep)
+    if not isinstance(obj, dict):
+        obj = {"answer": (rep.strip()[:800] or "(no synthesis available — machine facts only)"),
+               "recommendation": "", "key_findings": [], "open_questions": [],
+               "confidence": 0.2 if rep.strip() else 0.0}
+    obj.update(facts)
+    obj["data_dir"] = run_dir
+    return obj
+
+def _print_findings(f):
+    print("\n  ── FINDINGS ─────────────────────────────────────────────")
+    print(f"  run: {f.get('run')}   rounds: {f.get('rounds')}   score: {f.get('score') or '(none)'}   confidence: {f.get('confidence')}")
+    if f.get("answer"):
+        print(f"\n  {f['answer']}")
+    if f.get("recommendation"):
+        print(f"\n  RECOMMENDATION: {f['recommendation']}")
+    for kf in f.get("key_findings", [])[:8]:
+        print(f"    • {kf.get('finding', '')}"
+              + (f"  [{kf.get('evidence', '')}]" if kf.get("evidence") else ""))
+    if f.get("open_questions"):
+        print("  open questions: " + "; ".join(f["open_questions"][:4]))
+    if f.get("files"):
+        print(f"  files: {len(f['files'])} built" + (f" (delivery staged in {f.get('run')}/DELIVERY)" if f.get("delivery") else ""))
+    print(f"  full data: data/{f.get('run')}/\n")
+
+def _do_cast(goal, minutes=8, minds=3, context=None, embed=None, corpus=None, name=None,
+             style="auto", offline=False, detach=False, quiet=False,
+             model=None, provider=None, base_url=None, key=None):
+    """Launch a cast through the SAME deploy() path a human uses (blueprint, scout, fitness, veil —
+    nothing forked) with agent-safe settings: no prompts, no breakout, bounded autonomy. In quiet
+    mode every launch print goes to stderr so stdout stays a pure findings channel."""
+    cfg = load_config()
+    pack = _pack_context_paths(context) if context else None
+    if context and not pack:
+        raise RuntimeError("no readable text found in the given --context path(s)")
+    ns = argparse.Namespace(
+        goal=goal, name=name or ("cast_" + time.strftime("%Y%m%d_%H%M%S")),
+        minds=minds, minutes=minutes,
+        model=model or cfg.get("model", "gpt-oss:20b"),
+        provider=provider or cfg.get("provider", "ollama"),
+        base_url=base_url or cfg.get("base_url", "http://localhost:11434/v1"),
+        key=key or os.environ.get("NL_LLM_KEY") or cfg.get("key") or "ollama",
+        style=style, offline=offline, breakout=False, autonomy="bounded",
+        observe_psyche=False, veil_population=False,
+        corpus=pack or corpus, corpus_cap=20000,
+        gateway_model=None, gateway_base_url="", gateway_key="",
+        bin=None, neuron_bin=None, yes=True, service=False, rebuild_neuron=False,
+        follow=False, embed=embed, repl=False, detach=detach, host=False, quick=False)
+    if quiet:
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            proc = deploy(ns)
+    else:
+        proc = deploy(ns)
+    return ns.name, os.path.join(DATA, ns.name), proc
+
+def _wait_cast(run_dir, proc, minutes):
+    """Wait for a cast to finish. The engine self-stops at its minutes budget; past a grace window
+    we ask for a clean round-boundary halt (STOP file), and only then terminate."""
+    try:
+        proc.wait(timeout=max(120, minutes * 60 + 240))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    open(os.path.join(run_dir, "STOP"), "w").close()
+    try:
+        proc.wait(timeout=180)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            pass
+
+def cast_cmd(argv):
+    ap = argparse.ArgumentParser(
+        prog="deploy.py cast",
+        description="Agent-callable one-shot: cast a hive at a goal/question, wait, and return one "
+                    "structured FINDINGS report. Made to be called BY another AI as its sub-agent.")
+    ap.add_argument("goal", help="the question to research or the task to run")
+    ap.add_argument("--minutes", type=int, default=8, help="hard time budget (default 8)")
+    ap.add_argument("--minds", type=int, default=3)
+    ap.add_argument("--context", action="append", default=None, metavar="PATH",
+                    help="file or directory whose contents seed the hive's memory (repeatable) — "
+                         "grounds the cast in YOUR application instead of generic priors")
+    ap.add_argument("--embed", default=None, metavar="DIR",
+                    help="work IN-PLACE in DIR: the hive reads and writes your real files")
+    ap.add_argument("--corpus", default=None, help="a prepared .facts/.jsonl pack or URL to preload")
+    ap.add_argument("--style", default="auto", choices=STYLES)
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--name", default=None)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--provider", default=None)
+    ap.add_argument("--base-url", dest="base_url", default=None)
+    ap.add_argument("--key", default=None)
+    ap.add_argument("--json", action="store_true",
+                    help="machine mode: stdout carries ONLY the findings JSON (progress -> stderr)")
+    ap.add_argument("--detach", action="store_true",
+                    help="async: start the cast and return the run name at once; collect later with "
+                         "`report <run>` (or stop with `stop <run>`)")
+    a = ap.parse_args(argv)
+    name, rd, proc = _do_cast(a.goal, minutes=a.minutes, minds=a.minds, context=a.context,
+                              embed=a.embed, corpus=a.corpus, name=a.name, style=a.style,
+                              offline=a.offline, detach=a.detach, quiet=a.json,
+                              model=a.model, provider=a.provider, base_url=a.base_url, key=a.key)
+    if a.detach:
+        out = {"run": name, "status": "running",
+               "collect": f"python deploy.py report {name} --json",
+               "stop": f"python deploy.py stop {name}"}
+        print(json.dumps(out, indent=2) if a.json
+              else f"  cast '{name}' running detached — findings later:  python deploy.py report {name}")
+        return
+    if a.json:
+        _wait_cast(rd, proc, a.minutes)
+    else:
+        try:
+            follow(rd, proc)
+        except KeyboardInterrupt:
+            print("\n  (stopped watching; finishing the cast...)")
+        _wait_cast(rd, proc, a.minutes)
+    f = _distill_findings(rd, question=a.goal)
+    if a.json:
+        print(json.dumps(f, ensure_ascii=False, indent=2))
+    else:
+        _print_findings(f)
+
+def cmd_report(argv):
+    as_json = "--json" in argv
+    names = [x for x in argv if not x.startswith("-")]
+    if not names:
+        sys.exit("usage: python deploy.py report <run-name> [--json]")
+    run_dir = os.path.join(DATA, names[0])
+    if not os.path.isfile(os.path.join(run_dir, "swarm.json")):
+        sys.exit(f"no such run: {names[0]}  (see `python deploy.py list`)")
+    f = _distill_findings(run_dir)
+    print(json.dumps(f, ensure_ascii=False, indent=2) if as_json else "", end="")
+    if not as_json:
+        _print_findings(f)
+
+# --------------------------------------------------------------- the MCP door (stdio, no deps)
+
+def _mcp_tools():
+    S = {"type": "string"}
+    I = {"type": "integer"}
+    B = {"type": "boolean"}
+    def tool(name, desc, props, req):
+        return {"name": name, "description": desc,
+                "inputSchema": {"type": "object", "properties": props, "required": req}}
+    return [
+        tool("hive_research",
+             "Cast a hive-mind swarm of research agents at a question and BLOCK until it returns "
+             "structured findings (recommendation + key findings, each backed by provenance-gated web "
+             "evidence). Pass context_path to ground the research inside YOUR application's own files. "
+             "Budget with minutes (default 6). For long jobs prefer hive_cast + hive_collect.",
+             {"question": S,
+              "context_path": {"type": "string", "description": "file or directory that grounds the research (your app's code, an issue text, a spec)"},
+              "minutes": I, "minds": I}, ["question"]),
+        tool("hive_task",
+             "Cast a hive to BUILD or FIX something and block until done; returns findings + the built "
+             "file list (full output under the run's data dir / DELIVERY). Pass dir to work IN-PLACE on "
+             "real files (bounded autonomy, engine-verified edits).",
+             {"goal": S,
+              "dir": {"type": "string", "description": "project directory to edit in-place (omit for a fresh scaffold)"},
+              "minutes": I, "minds": I}, ["goal"]),
+        tool("hive_cast",
+             "Start a hive ASYNCHRONOUSLY and return its run name immediately. Poll hive_status; fetch "
+             "findings any time with hive_collect (stop=true to halt it first).",
+             {"goal": S, "context_path": S, "dir": S, "minutes": I, "minds": I}, ["goal"]),
+        tool("hive_status", "Live status of a cast: running?, round, fitness, recent activity.",
+             {"run": S}, ["run"]),
+        tool("hive_collect",
+             "Distill the findings-so-far from a run (works mid-run or after exit). stop=true asks the "
+             "hive to halt at its next round boundary first.",
+             {"run": S, "stop": B}, ["run"]),
+        tool("hive_stop", "Ask a running cast to halt cleanly at its next round boundary.",
+             {"run": S}, ["run"]),
+    ]
+
+def _mcp_dispatch(name, a):
+    if name == "hive_research":
+        q = str(a.get("question", "")).strip()
+        if not q:
+            return {"error": "question is required"}
+        minutes = int(a.get("minutes") or 6)
+        ctx = [a["context_path"]] if a.get("context_path") else None
+        goal = ("Research this thoroughly and write a briefing that ANSWERS it for the AI that asked "
+                "(concrete findings + a recommended direction, grounded in real sources): " + q)
+        rn, rd, proc = _do_cast(goal, minutes=minutes, minds=int(a.get("minds") or 3),
+                                context=ctx, style="discourse", quiet=True)
+        _wait_cast(rd, proc, minutes)
+        return _distill_findings(rd, question=q)
+    if name == "hive_task":
+        g = str(a.get("goal", "")).strip()
+        if not g:
+            return {"error": "goal is required"}
+        minutes = int(a.get("minutes") or 10)
+        rn, rd, proc = _do_cast(g, minutes=minutes, minds=int(a.get("minds") or 3),
+                                embed=a.get("dir") or None, quiet=True)
+        _wait_cast(rd, proc, minutes)
+        return _distill_findings(rd, question=g)
+    if name == "hive_cast":
+        g = str(a.get("goal", "")).strip()
+        if not g:
+            return {"error": "goal is required"}
+        ctx = [a["context_path"]] if a.get("context_path") else None
+        rn, rd, proc = _do_cast(g, minutes=int(a.get("minutes") or 15), minds=int(a.get("minds") or 3),
+                                context=ctx, embed=a.get("dir") or None, detach=True, quiet=True)
+        return {"run": rn, "status": "running",
+                "next": "poll hive_status, then hive_collect for findings"}
+    run = str(a.get("run", "")).strip()
+    d = os.path.join(DATA, run)
+    if not run or not os.path.isfile(os.path.join(d, "swarm.json")):
+        return {"error": f"no such run: {run or '(missing)'}"}
+    if name == "hive_status":
+        recent, rounds, score = [], 0, ""
+        try:
+            with open(os.path.join(d, "events.jsonl"), "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 60_000))
+                lines = f.read().decode("utf-8", "replace").splitlines()
+        except Exception:
+            lines = []
+        for ln in lines:
+            try:
+                e = json.loads(ln)
+            except Exception:
+                continue
+            try:
+                rounds = max(rounds, int(e.get("round") or 0))
+            except Exception:
+                pass
+            if e.get("kind") == "act":
+                t = e.get("tool", "")
+                if t in ("score", "benchmark"):
+                    score = str(e.get("result", ""))[:120]
+                if t not in ("thinking", "recall", "grounding", "build_state", "playbook", "knowledge", "skills"):
+                    recent.append(f"{e.get('mind', '?')}:{t} {str(e.get('result', ''))[:70]}")
+        try:
+            m = json.load(open(os.path.join(d, "swarm.json"), encoding="utf-8"))
+        except Exception:
+            m = {}
+        return {"run": run, "running": _veil_running(d), "round": rounds, "score": score,
+                "goal": m.get("goal", ""), "recent": recent[-6:]}
+    if name == "hive_collect":
+        if a.get("stop"):
+            open(os.path.join(d, "STOP"), "w").close()
+            for _ in range(45):
+                if not _veil_running(d):
+                    break
+                time.sleep(2)
+        return _distill_findings(d)
+    if name == "hive_stop":
+        open(os.path.join(d, "STOP"), "w").close()
+        return {"run": run, "status": "stopping at the next round boundary (state preserved, resumable)"}
+    return {"error": f"unknown tool: {name}"}
+
+def mcp_cmd():
+    """A stdio MCP server (newline-delimited JSON-RPC 2.0, stdlib only) so any MCP client — Claude
+    Code/Desktop, Cursor, anything — can wire the hive in as tools for its primary AI:
+        claude mcp add nl-veil -- python deploy.py mcp
+    stdout carries ONLY protocol frames; every diagnostic goes to stderr."""
+    def send(obj):
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    print("nl-veil mcp server up (stdio) — tools: " + ", ".join(t["name"] for t in _mcp_tools()),
+          file=sys.stderr)
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        rid, method = req.get("id"), req.get("method", "")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": (req.get("params") or {}).get("protocolVersion", "2024-11-05"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "nl-veil", "version": "1.0"}}})
+        elif method.startswith("notifications/"):
+            continue
+        elif method == "ping":
+            send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": rid, "result": {"tools": _mcp_tools()}})
+        elif method == "tools/call":
+            p = req.get("params") or {}
+            try:
+                result = _mcp_dispatch(p.get("name", ""), p.get("arguments") or {})
+            except Exception as e:
+                result = {"error": f"{type(e).__name__}: {e}"}
+            send({"jsonrpc": "2.0", "id": rid, "result": {
+                "content": [{"type": "text", "text": json.dumps(result, ensure_ascii=False)}],
+                "isError": bool(isinstance(result, dict) and result.get("error"))}})
+        elif rid is not None:
+            send({"jsonrpc": "2.0", "id": rid,
+                  "error": {"code": -32601, "message": f"method not found: {method}"}})
+
 # -------------------------------------------------------------------------------- setup wizard
 
 def _input(prompt):
@@ -2405,6 +2916,12 @@ def main():
         # the fleet hub: connect + monitor + steer many veils at once. `veil hub serve|agent|console`.
         import hub as _hub
         return _hub.main(argv[1:])
+    if argv[0] == "cast":
+        return cast_cmd(argv[1:])
+    if argv[0] == "report":
+        return cmd_report(argv[1:])
+    if argv[0] == "mcp":
+        return mcp_cmd()
     if argv[0] in ("chat", "shell"):
         name, mnt, rest = None, None, argv[1:]
         i = 0
@@ -2422,7 +2939,9 @@ def main():
         prog="deploy.py", description="Deploy a hive mind controlled by the Veil.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="also:  python deploy.py            (interactive setup wizard)\n"
-               "       python deploy.py list   |   resume <run>   |   stop <run>")
+               "       python deploy.py list   |   resume <run>   |   stop <run>\n"
+               "agent: python deploy.py cast \"<goal>\" --json     (hive as a sub-agent: one findings JSON back)\n"
+               "       python deploy.py report <run> [--json]   |   python deploy.py mcp   (stdio MCP server)")
     # `veil configure` writes the user's endpoint once; bare casts then default to it (flags still win).
     cfg = load_config()
     ap.add_argument("goal", help="the goal / task for the hive")
