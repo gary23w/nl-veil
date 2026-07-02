@@ -156,8 +156,16 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     return .{ .content = run.stdout, .ok = true };
 }
 
-/// One-shot system+user completion → the assistant text.
+/// One-shot system+user completion → the assistant text. Uses the backend's default sampling.
 pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, system: []const u8, user: []const u8, max_tokens: u32) Reply {
+    return chatTemp(gpa, io, run_dir, tag, base_url, key, model, system, user, max_tokens, -1);
+}
+
+/// As `chat`, but PINS the sampling temperature. `temperature < 0` omits it (backend default = `chat`).
+/// The mechanical classifiers (the emotional-flare read, the constitution screens) pass 0 so their verdicts
+/// are DETERMINISTIC: the same hive state yields the same label instead of resampling a fresh emotion — the
+/// old default-temperature call let an identical round replay as intensity 4–9 across runs.
+pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, system: []const u8, user: []const u8, max_tokens: u32, temperature: f32) Reply {
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
     msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return oom(gpa);
@@ -166,7 +174,12 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
     jstr(gpa, &msgs, user) catch return oom(gpa);
     msgs.appendSlice(gpa, "}") catch return oom(gpa);
     const mt = effTokens(base_url, model, max_tokens);
-    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, msgs.items, mt }) catch return oom(gpa);
+    const temp_frag = if (temperature >= 0)
+        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return oom(gpa)
+    else
+        gpa.dupe(u8, "") catch return oom(gpa);
+    defer gpa.free(temp_frag);
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
     var s = completeBody(gpa, io, run_dir, tag, base_url, key, body);
     defer s.deinit(gpa);

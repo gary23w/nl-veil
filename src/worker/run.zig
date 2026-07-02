@@ -137,6 +137,7 @@ pub const Worker = struct {
     base_url: []const u8,
     key: []const u8,
     model: []const u8,
+    patch_root: []const u8 = "", // resolved engine source root (the executable's home) — the DEFAULT VM a mind's patch_system edits when NL_PATCH_SYSTEM_ROOT is unset (minds are root of their own VM)
     fence_writes: bool = false, // written ONLY between rounds (single-threaded); moments read it freely
     tool_parse_fails: std.atomic.Value(u32) = .init(0), // strikes recorded from parallel moments; flip applied between rounds
     max_tokens_eff: u32 = 8192, // per-turn completion budget: NL_MAX_TOKENS override, else scaled to the probed ctx
@@ -370,6 +371,24 @@ pub const Worker = struct {
     }
 };
 
+/// The engine's own source root — the default VM a mind's patch_system edits when NL_PATCH_SYSTEM_ROOT is
+/// unset. Mirrors main.zig's resolvePaths: the executable's directory, lifted out of a `zig-out/bin` layout
+/// to the repo root that holds `src/`. Resolved from the executable path (not cwd — the worker runs with
+/// cwd = run_dir), so it is correct regardless of how the worker was launched. Caller frees.
+fn engineHome(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var buf: [4096]u8 = undefined;
+    const n = try std.process.executablePath(io, &buf);
+    const exe_dir = std.fs.path.dirname(buf[0..n]) orelse ".";
+    var home: []const u8 = exe_dir;
+    if (std.mem.eql(u8, std.fs.path.basename(exe_dir), "bin")) {
+        if (std.fs.path.dirname(exe_dir)) |p1| {
+            if (std.mem.eql(u8, std.fs.path.basename(p1), "zig-out"))
+                home = std.fs.path.dirname(p1) orelse exe_dir;
+        }
+    }
+    return gpa.dupe(u8, home);
+}
+
 pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, run_dir: []const u8, neuron_bin: []const u8, cli_model: []const u8) !void {
     const mani_path = try std.fmt.allocPrint(gpa, "{s}/swarm.json", .{run_dir});
     defer gpa.free(mani_path);
@@ -432,6 +451,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .fence_writes = llm.fenceWrites(base_url, model),
     };
     w.mem.trust = true;
+    // Resolve the DEFAULT patch_system root once: the engine's own source tree (executable home). With this
+    // set, RSI self-modification is ON by default — a mind is root of its own VM — without any operator env.
+    // An explicit NL_PATCH_SYSTEM_ROOT still overrides it (checked per-call in patchSystemRoot).
+    w.patch_root = engineHome(gpa, io) catch "";
+    defer if (w.patch_root.len > 0) gpa.free(@constCast(w.patch_root));
     seedBaseline(gpa, w.mem);
     defer w.scratch.deinit();
     defer gpa.free(w.ev_path);
@@ -1028,7 +1052,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         }
 
         if (live and !w.quick and govRecovery(w.gov_lvl, round)) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
-        if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items);
+        if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items, prev_pct);
         if (live and w.psyche_on and govReflective(w.gov_lvl, round)) emitPsyche(&w, minds.items, round, retro_in.items);
         if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
             if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
@@ -2352,9 +2376,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var tools_made: u32 = 0;
     var tool_calls: u32 = 0;
     var acted = false;
+    var had_reject = false; // this mind's work was refused this round (edit/salvage reject) — a NEGATIVE affect signal
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .reject_notes = &w.reject_notes };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -3152,6 +3177,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             const eres = tools.execute(&ctx, "edit_file", eargs.items);
             defer gpa.free(eres);
             const applied = std.mem.startsWith(u8, eres, "edited ");
+            if (!applied) had_reject = true;
             w.act(mi.name, round, if (applied) "edit" else "edit_reject", n.path, clip(eres, 220));
             break :editblk; // a narrated edit-block is handled here; never fall through to the full-file salvage
         }
@@ -3159,6 +3185,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             var body = salvageFileBody(gpa, monologue);
             var reject = salvageRejectReason(w, salvage_slot, body);
             if (reject) |why| {
+                had_reject = true;
                 noteReject(w, salvage_slot, why);
                 w.act(mi.name, round, "salvage_reject", salvage_slot, why);
                 // CORRECTIVE RETRY (mirrors tool_recover): a weak model that flubbed the fenced form gets the
@@ -3254,6 +3281,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 } else {
                     // the write path itself refused (ownership/marker/append guard) — record the truth, not a
                     // phantom rescue, and put the refusal in the round ledger the lead reads
+                    had_reject = true;
                     noteReject(w, salvage_slot, wres);
                     w.act(mi.name, round, "salvage_reject", salvage_slot, clip(wres, 220));
                 }
@@ -3287,10 +3315,33 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     }
     const facts = w.mem.factCount(mi.scope);
     if (!is_placeholder) {
-        const feeling = if (files > 0) "satisfied — shipping real progress" else if (facts > recalled_n) "energized by what I'm learning" else "focused and determined";
-        const feel_topic = if (fact.len > 12) clipWords(fact, 90) else topic;
-        w.mem.stance(mi.scope, feel_topic, feeling);
-        w.act(mi.name, round, "stance", feel_topic, feeling);
+        // The recorded feeling is driven by THIS round's measured work signals — and it can now go NEGATIVE.
+        // The old three-way map (wrote→satisfied / learned→energized / else→focused) was positively CLAMPED:
+        // a mind that spun its wheels or kept getting its work rejected still logged "focused and determined",
+        // so the affect layer could never record frustration. Negatives come first (a bad round sets the tone).
+        const failed = llm_fatal or !llm_ok;
+        const positive = files > 0 or facts > recalled_n;
+        const feeling = if (failed)
+            "frustrated — my reasoning kept failing or getting cut off"
+        else if (had_reject)
+            "frustrated — my work kept getting rejected and wouldn't land"
+        else if (files > 0)
+            "satisfied — shipping real progress"
+        else if (facts > recalled_n)
+            "energized by what I'm learning"
+        else
+            "focused and determined";
+        // MOOD (instantaneous): set every round so affect() carries a live mood line. It was NEVER set before,
+        // so directive_body had no mood clause and affect() collapsed toward the bare boilerplate FRAME.
+        const mood = if (failed or had_reject) "frustrated" else if (files > 0) "satisfied" else if (facts > recalled_n) "energized" else "focused";
+        w.mem.mood(mi.scope, mood);
+        // STANCE (accumulated): key by a STABLE, valence-bucketed topic so restatement HARDENS. The old key was
+        // a unique per-round code snippet — it never recurred, so no stance ever crossed the 1.5 threshold and
+        // affect() showed no hardened view (every mind's "accumulated affect" was identical). Positive and
+        // negative rounds accumulate on SEPARATE keys now; whichever the run actually earns wins by strength.
+        const stance_topic = if (failed or had_reject) "the work is fighting me" else if (positive) "the work is moving" else "the work is steady";
+        w.mem.stance(mi.scope, stance_topic, feeling);
+        w.act(mi.name, round, "stance", stance_topic, feeling);
     }
     const trace_json = std.fmt.allocPrint(gpa, "[{s}]", .{trace.items}) catch (gpa.dupe(u8, "[]") catch unreachable);
     const narrated = (tool_calls == 0 or (operate and !acted)) and files == 0 and (std.mem.indexOf(u8, monologue, "```") != null or monologue.len > 240);
@@ -4557,7 +4608,7 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
     const posix_boot = if (builtin.os.tag != .windows) std.fmt.allocPrint(gpa, "exec {s}", .{w.smoke_cmd}) catch return else "";
     defer if (posix_boot.len > 0) gpa.free(@constCast(posix_boot));
     const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", w.smoke_cmd } else .{ "/bin/sh", "-c", posix_boot };
-    var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
+    var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch {
         w.smoke_ok = false;
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the declared smoke `{s}` could not be spawned at all.", .{clip(w.smoke_cmd, 120)}) catch "";
         if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", "runtime fail", w.smoke_str);
