@@ -11,6 +11,10 @@ __pycache__/
 # Runtime: per-run swarm dirs (work, sqlite memory, event streams)
 data/
 
+# Fleet hub (hub.py serve) roster/audit snapshot — runtime state, not source
+hub_state.json
+hub_state.json.tmp
+
 # Example run outputs — the embedded harnesses write forensics here per run.
 examples/embedded/debug/
 examples/**/data/
