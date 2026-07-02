@@ -24,7 +24,7 @@ const bufedit = @import("bufedit.zig");
 const rsi = @import("rsi.zig");
 const agi = @import("agi.zig");
 const writer = @import("writer.zig");
-const locs = @import("locs/libraries.zig");
+const locs = @import("locs/atlas.zig");
 
 const MindSpec = struct { name: []const u8 = "mind", role: []const u8 = "", duty: []const u8 = "", lead: bool = false };
 const Manifest = struct {
@@ -4142,6 +4142,40 @@ fn checkDiag(out: []const u8) []const u8 {
     return if (t.len > 700) t[t.len - 700 ..] else t;
 }
 
+/// EVERY failing point, not just the first: up to 12 lines starting with "error" (rustc/go/tsc/gcc/pytest
+/// headers), each clipped, joined compactly. "" when fewer than two — the single-error case is already
+/// covered by checkDiag's full first diagnostic. Observed live (sim_synapse2): each round's fitness showed
+/// only the next E0583 while TEN errors existed — four parallel minds were serialized onto one error per
+/// round when each could have taken a different one. gpa-owned when non-empty.
+fn errorHeaders(gpa: std.mem.Allocator, out: []const u8) []const u8 {
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    var n: u32 = 0;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (!std.mem.startsWith(u8, ln, "error")) continue;
+        n += 1;
+        if (n > 12) break;
+        if (b.items.len > 0) b.appendSlice(gpa, " ; ") catch {};
+        b.appendSlice(gpa, clip(ln, 120)) catch {};
+    }
+    if (n < 2) return "";
+    return gpa.dupe(u8, b.items) catch "";
+}
+
+test "errorHeaders: lists every failing point when several exist, stays silent for one" {
+    const gpa = std.testing.allocator;
+    const multi = "Compiling synapse\nerror[E0583]: file not found for module `auth`\n --> src/lib.rs:14:1\nerror[E0425]: cannot find function `register_routes`\n --> src/api.rs:20:5\nerror[E0255]: the name `Router` is defined multiple times\nerror: could not compile `synapse` (lib) due to 3 previous errors\n";
+    const h = errorHeaders(gpa, multi);
+    defer if (h.len > 0) gpa.free(@constCast(h));
+    try std.testing.expect(std.mem.indexOf(u8, h, "E0583") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "E0425") != null);
+    try std.testing.expect(std.mem.indexOf(u8, h, "E0255") != null);
+    const single = errorHeaders(gpa, "error[E0583]: file not found\n --> src/lib.rs:14:1\n");
+    try std.testing.expectEqual(@as(usize, 0), single.len);
+}
+
 test "checkDiag: slices from the first error line; falls back to the tail when nothing says error" {
     const rustc = "Compiling synapse v0.1.0\nerror[E0433]: failed to resolve: use of undeclared crate\n --> src/main.rs:2:5";
     try std.testing.expect(std.mem.startsWith(u8, checkDiag(rustc), "error[E0433]"));
@@ -4195,10 +4229,20 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
         }
         const diag_src = if (std.mem.trim(u8, r.stderr, " \r\n\t").len > 0) r.stderr else r.stdout;
         if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
-        const entry = std.fmt.allocPrint(gpa, "`{s}` exit {d} — {s}", .{ cmd, code, clip(checkDiag(diag_src), 650) }) catch {
-            fl.appendSlice(gpa, cmd) catch {};
-            continue;
-        };
+        // With several failing points, list EVERY header so parallel minds each take a different one,
+        // then give the first diagnostic in full; a single failure keeps the full-detail-only shape.
+        const heads = errorHeaders(gpa, diag_src);
+        defer if (heads.len > 0) gpa.free(@constCast(heads));
+        const entry = if (heads.len > 0)
+            std.fmt.allocPrint(gpa, "`{s}` exit {d} — ALL failing points: {s} || first in detail: {s}", .{ cmd, code, clip(heads, 700), clip(checkDiag(diag_src), 400) }) catch {
+                fl.appendSlice(gpa, cmd) catch {};
+                continue;
+            }
+        else
+            std.fmt.allocPrint(gpa, "`{s}` exit {d} — {s}", .{ cmd, code, clip(checkDiag(diag_src), 650) }) catch {
+                fl.appendSlice(gpa, cmd) catch {};
+                continue;
+            };
         defer gpa.free(entry);
         fl.appendSlice(gpa, entry) catch {};
     }
@@ -4433,7 +4477,9 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, de
     // re-narrate it (observed live: an all-.txt LLM blueprint doc-classified a run whose goal declared
     // VERIFY rows, and the prose nudge buried the real gradient).
     const base: []const u8 = if (declared and b.status == .ok)
-        std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, fails }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
+        // wider failure budget than the legacy 900: the multi-error header list is the parallelism lever —
+        // each mind takes a DIFFERENT failing point instead of the whole team serializing on the first
+        std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — when it lists SEVERAL failing points, fix the one in YOUR file (each mind a different one); read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, if (b.failures.len > 0) clip(b.failures, 1700) else "(none — all green)" }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
     else if (doc_target > 0)
         switch (b.status) {
             .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Once every required file exists, your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
