@@ -195,6 +195,8 @@ pub const Worker = struct {
     scout_ledger_n: u32 = 0,
     last_gap_str: []const u8 = "",
     last_src_str: []const u8 = "", // the atlas CANONICAL SOURCES block for the current gaps — held SEPARATE from last_gap_str so no consumer's clip() can silently drop the tail
+    short_rejects: [16]ShortReject = [_]ShortReject{.{}} ** 16, // per-slot count of too-short salvage refusals — the escalation signal that opens the length-floor valve
+    reject_notes: std.ArrayListUnmanaged(u8) = .empty, // this round's write-path refusals (path — why), folded into the fitness block so the lead can fix the CAUSE instead of watching coverage stall
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
     best_tier: u8 = 0,
@@ -655,6 +657,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.goal_brief.len > 0) gpa.free(@constCast(w.goal_brief));
     defer if (w.last_gap_str.len > 0) gpa.free(@constCast(w.last_gap_str));
     defer if (w.last_src_str.len > 0) gpa.free(@constCast(w.last_src_str));
+    defer w.reject_notes.deinit(gpa);
     defer if (w.phase_str.len > 0) gpa.free(@constCast(w.phase_str));
     defer if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
     defer if (w.depgraph_str.len > 0) gpa.free(@constCast(w.depgraph_str));
@@ -930,7 +933,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
             const cov = goalCoverage(&w, goal);
             defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov);
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov, w.reject_notes.items);
+            w.reject_notes.clearRetainingCapacity(); // folded into this round's fitness — start the next round's ledger clean
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
                 _ = w.mem.observe(tools.PLAYBOOK_SCOPE, "Write an objective test suite (test_*.py with real assertions about intended behavior) for the deliverable before adding more features — the swarm is scored by its pass rate.");
@@ -2262,7 +2266,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var acted = false;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch unreachable);
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1 };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .reject_notes = &w.reject_notes };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -2560,7 +2564,11 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk (sb.toOwnedSlice(gpa) catch (gpa.dupe(u8, score_base) catch @constCast("")));
     };
     defer gpa.free(score_str);
-    const intent_str = if (w.goal_brief.len > 0) clip(w.goal_brief, 1000) else "(take the goal above at face value)";
+    // 2400 covers the interpreter's full output (bounded at 400 tokens): the OLD 1000-byte clip cut most
+    // briefs mid-structure, silently dropping exactly the sections that steer minds — success criteria and
+    // verbatim hard constraints sit at the TAIL of the brief (the kotlin run's 1478-byte brief lost both).
+    // Same failure class as the atlas-sources clip: a composed directive must not lose its tail to a budget.
+    const intent_str = if (w.goal_brief.len > 0) clip(w.goal_brief, 2400) else "(take the goal above at face value)";
     const authored_names = authoredToolNames(gpa, w.mem);
     defer gpa.free(authored_names);
     const tools_str = if (authored_names.len > 0) authored_names else "(none yet — if you hit a capability gap, author one with make_tool instead of giving up)";
@@ -3060,6 +3068,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             var body = salvageFileBody(gpa, monologue);
             var reject = salvageRejectReason(w, salvage_slot, body);
             if (reject) |why| {
+                noteReject(w, salvage_slot, why);
                 w.act(mi.name, round, "salvage_reject", salvage_slot, why);
                 // CORRECTIVE RETRY (mirrors tool_recover): a weak model that flubbed the fenced form gets the
                 // rejection REASON back and one more text-only turn to re-emit the file. Without this the round
@@ -3119,6 +3128,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             const body2 = salvageFileBody(gpa, rep.content);
                             if (salvageRejectReason(w, salvage_slot, body2)) |why2| {
                                 if (body2.len > 0) gpa.free(@constCast(body2));
+                                noteReject(w, salvage_slot, why2);
                                 w.act(mi.name, round, "salvage_retry_reject", salvage_slot, why2);
                             } else {
                                 if (body.len > 0) gpa.free(@constCast(body));
@@ -3251,6 +3261,58 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
     return jsonUnescape(gpa, raw);
 }
 
+const ShortReject = struct { key: u64 = 0, n: u16 = 0 };
+
+// The ring is shared Worker state and both helpers run inside the CONCURRENT moment phase (one per mind),
+// so each takes the files mutex — the free-slot search would otherwise let two minds claim one slot. The
+// count is a heuristic; a benign check-then-act gap across the two calls only shifts the valve by a round.
+fn shortRejects(w: *Worker, path: []const u8) u16 {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    const h = std.hash.Wyhash.hash(0x5a17, path);
+    for (&w.short_rejects) |*e| if (e.key == h) return e.n;
+    return 0;
+}
+fn bumpShortReject(w: *Worker, path: []const u8) void {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    const h = std.hash.Wyhash.hash(0x5a17, path);
+    for (&w.short_rejects) |*e| if (e.key == h) {
+        e.n +|= 1;
+        return;
+    };
+    for (&w.short_rejects) |*e| if (e.key == 0) {
+        e.* = .{ .key = h, .n = 1 };
+        return;
+    };
+    w.short_rejects[0] = .{ .key = h, .n = 1 }; // full ring: recycle a slot rather than lose the signal entirely
+}
+
+/// Record a write-path refusal for this round's fitness block — the lead can only route around a stall it
+/// can SEE (sim_atlas_kotlin2: the same file bounced off the length floor 16 times across 6 rounds while
+/// the bench text only ever said "CREATE the missing file"). Minds run CONCURRENTLY (grp.concurrent), so
+/// this shared list is appended under the same files mutex that guards every other shared-state write.
+fn noteReject(w: *Worker, path: []const u8, why: []const u8) void {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    if (w.reject_notes.items.len > 600) return; // bounded — the fitness block clips anyway
+    w.reject_notes.appendSlice(w.gpa, path) catch return;
+    w.reject_notes.appendSlice(w.gpa, " — ") catch return;
+    w.reject_notes.appendSlice(w.gpa, clip(why, 90)) catch return;
+    w.reject_notes.appendSlice(w.gpa, "; ") catch return;
+}
+
+/// True only when the slot file genuinely does NOT exist on disk (read error). An existing (even empty)
+/// file reads back and returns false — the valve stays shut for anything already present. Alloc failure is
+/// treated as "present" so the length floor stays STRICT under memory pressure rather than opening wide.
+fn slotFileMissing(w: *Worker, slot: []const u8) bool {
+    const fp = std.fmt.allocPrint(w.gpa, "{s}/work/{s}", .{ w.run_dir, slot }) catch return false;
+    defer w.gpa.free(fp);
+    const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, w.gpa, .limited(1 << 20)) catch return true;
+    w.gpa.free(data);
+    return false;
+}
+
 /// Why a salvaged reply body must NOT be committed to the slot file (null = commit it). Factored out so the
 /// corrective retry judges the model's SECOND attempt with exactly the rules that rejected its first. The
 /// SEARCH/REPLACE check guards against parseNarratedSlot leftovers (malformed / zero-op blocks) — committing
@@ -3258,7 +3320,20 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
 fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?[]const u8 {
     const gpa = w.gpa;
     if (bufedit.hasSearchReplace(body)) return "narrated edit markers, not a file body — put the file's path on its own line above the SEARCH block, or reply with the full file";
-    if (body.len < 80) return "too short (<80 chars)";
+    if (body.len < 80) {
+        // ESCALATION VALVE (r1 strict, later rescue — same precedent as the ownership guard's r2+ rescue).
+        // The floor exists to stop vacuous fragment replies, but some required files are CORRECT at under
+        // 80 chars (observed live, sim_atlas_kotlin2: expenses.json's right content is "[]", refused every
+        // round for 6 rounds — the build never escaped). Open the valve ONLY when the SAME slot has been
+        // floor-rejected twice already AND the file STILL does not exist on disk; then a >=2-char body
+        // falls through to the remaining salvage gates (markers, chatter, tool fragments) and commits.
+        const trimmed = std.mem.trim(u8, body, " \r\n\t");
+        const valve_open = trimmed.len >= 2 and shortRejects(w, salvage_slot) >= 2 and slotFileMissing(w, salvage_slot);
+        if (!valve_open) {
+            bumpShortReject(w, salvage_slot);
+            return "too short (<80 chars)";
+        }
+    }
     if (salvageLeadConversational(body)) return "conversational lead-in (chatter, not a file body)";
     if (salvageHasToolFragment(body)) return "contains a raw tool-call fragment";
     if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py")) switch (pySalvageCheck(w, body)) {
@@ -4494,10 +4569,19 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
 
 /// The FITNESS block injected into every mind's user prompt — the score turned into a concrete "raise this"
 /// instruction. gpa-owned (caller frees on replace + teardown).
-fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage) []const u8 {
+fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage, rejects: []const u8) []const u8 {
     const fails = if (b.failures.len > 0) clip(b.failures, 900) else "(none — all green)";
+    // the write-path refusal ledger rides the coverage lead: "CREATE the missing file" is useless advice
+    // when the engine itself refused every attempt — the lead needs the WHY to route around the block
+    const reject_lead = if (rejects.len > 0)
+        std.fmt.allocPrint(gpa, "WRITE-PATH NOTE — these saves were REFUSED last round (path — why): {s}. Don't retry the identical move: the file's OWNER should emit its complete body (a short-but-complete body for a still-missing required file is accepted after repeated refusals), and a missing file that heads the build order may be written by ANY mind. ", .{clip(rejects, 500)}) catch ""
+    else
+        "";
+    defer if (reject_lead.len > 0) gpa.free(@constCast(reject_lead));
     const cover_lead = if (cov.total > 0 and cov.present < cov.total)
-        std.fmt.allocPrint(gpa, "COVERAGE {d}/{d} required files present. CREATE the MISSING required files FIRST (write_file, full substantive content — not stubs): {s}. ", .{ cov.present, cov.total, clip(cov.missing, 400) }) catch ""
+        std.fmt.allocPrint(gpa, "COVERAGE {d}/{d} required files present. CREATE the MISSING required files FIRST (write_file, full substantive content — not stubs): {s}. {s}", .{ cov.present, cov.total, clip(cov.missing, 400), reject_lead }) catch ""
+    else if (reject_lead.len > 0)
+        (gpa.dupe(u8, reject_lead) catch "")
     else
         "";
     defer if (cover_lead.len > 0) gpa.free(@constCast(cover_lead));

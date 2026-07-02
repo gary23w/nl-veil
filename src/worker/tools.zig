@@ -102,7 +102,7 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
     av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "--speed-limit", "1", "--speed-time", "15", "-o", tmp, "-A", "neuron-loops-mind/1.0" }) catch return dupe(gpa, "oom");
     // Under an active egress allowlist, a redirect could hop OFF the allowlist (the gate only sees the seed URL),
     // so forbid redirect-following entirely — the allowlisted host must answer directly.
-    if (ctx.egress_allow.len > 0) av.appendSlice(gpa, &.{"--max-redirs", "0"}) catch {};
+    if (ctx.egress_allow.len > 0) av.appendSlice(gpa, &.{ "--max-redirs", "0" }) catch {};
     if (json) av.appendSlice(gpa, &.{ "-H", "Accept: application/json" }) catch {};
     av.append(gpa, url) catch {};
     spawnGuarded(ctx.io, av.items, deadline_ms);
@@ -174,6 +174,7 @@ pub const ToolCtx = struct {
     egress_allow: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
     vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
+    reject_notes: ?*std.ArrayListUnmanaged(u8) = null, // per-round write-refusal ledger (owned by the Worker) — folded into the fitness block so refusals are visible, not silent
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -181,6 +182,18 @@ fn lockFiles(ctx: *ToolCtx) void {
 }
 fn unlockFiles(ctx: *ToolCtx) void {
     if (ctx.fmtx) |m| m.unlock(ctx.io);
+}
+
+/// Append a write-path refusal to the round-shared ledger under the files mutex (minds run concurrently, so
+/// this bare ArrayList would otherwise race). Called only from writeFile's early guard returns, before the
+/// function reaches its own lockFiles — so there is no nested acquisition of the same lock.
+fn noteWriteReject(ctx: *ToolCtx, path: []const u8, why: []const u8) void {
+    const rn = ctx.reject_notes orelse return;
+    lockFiles(ctx);
+    defer unlockFiles(ctx);
+    if (rn.items.len > 600) return;
+    rn.appendSlice(ctx.gpa, path) catch {};
+    rn.appendSlice(ctx.gpa, why) catch {};
 }
 
 /// Land `data` at `full` via a same-directory temp + atomic rename (createFileAtomic → replace), so a crash or a
@@ -794,9 +807,19 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const redirected = ctx.one_slot and ctx.slot_path.len > 0 and !std.mem.eql(u8, npath, ctx.slot_path);
     const wpath = if (redirected) ctx.slot_path else npath;
     if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !pathKeyMatch(ctx.slot_path, wpath)) {
-        const yours = if (ctx.slot_path.len > 0) std.fmt.allocPrint(gpa, " YOUR file this round is `{s}` — write that, not this.", .{ctx.slot_path}) catch "" else " You have no deliverable file this round — research the upcoming pieces, share what you learn, or create a NEW helper file.";
-        defer if (yours.len > 0 and ctx.slot_path.len > 0) gpa.free(@constCast(yours));
-        return std.fmt.allocPrint(gpa, "`{s}` is an ordered deliverable file with a single author this round — overwriting it would clobber finished work or jump ahead of the team's current piece.{s}", .{ wpath, yours }) catch dupe(gpa, "that ordered file belongs to its builder this round — don't overwrite it");
+        // r2+ FRONTIER RESCUE, mirroring the teammate-guard rescue below: the first still-unbuilt
+        // blueprint file IS the team's current piece — writing it cannot jump ahead, and with nothing
+        // in the manifest there is nothing to clobber. Without this valve the guard composed with the
+        // salvage length floor into a deadlock no mind could escape (sim_atlas_kotlin2: 6 straight
+        // rounds stuck on a 2-char expenses.json — the owner's every salvage was floor-rejected while
+        // every teammate's correct write bounced HERE).
+        const frontier_rescue = ctx.round > 1 and !builtAlready(ctx, wpath) and isFrontierFile(ctx, wpath);
+        if (!frontier_rescue) {
+            noteWriteReject(ctx, wpath, " — write refused: single-author ordered file, not this mind's slot; ");
+            const yours = if (ctx.slot_path.len > 0) std.fmt.allocPrint(gpa, " YOUR file this round is `{s}` — write that, not this.", .{ctx.slot_path}) catch "" else " You have no deliverable file this round — research the upcoming pieces, share what you learn, or create a NEW helper file.";
+            defer if (yours.len > 0 and ctx.slot_path.len > 0) gpa.free(@constCast(yours));
+            return std.fmt.allocPrint(gpa, "`{s}` is an ordered deliverable file with a single author this round — overwriting it would clobber finished work or jump ahead of the team's current piece.{s}", .{ wpath, yours }) catch dupe(gpa, "that ordered file belongs to its builder this round — don't overwrite it");
+        }
     }
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, wpath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
@@ -807,8 +830,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const is_own_slot = ctx.slot_path.len > 0 and pathKeyMatch(ctx.slot_path, wpath);
     if (!is_own_slot and ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
         const rescue = ctx.round > 1 and !builtAlready(ctx, wpath);
-        if (!rescue)
+        if (!rescue) {
+            noteWriteReject(ctx, wpath, " — write refused: a teammate owns it this round; ");
             return std.fmt.allocPrint(gpa, "{s} is a teammate's file this round — they own it in the blueprint and are building it in parallel, so writing it would collide (last-writer-wins) and waste the work. YOUR files: {s}. Write or DEEPEN one of yours that isn't done, or create a genuinely NEW file in nobody's slice. To change a file you don't own, read_file it and send_message its owner — don't rewrite it.", .{ wpath, if (ctx.my_files.len > 0) ctx.my_files else "(none assigned — take an unbuilt blueprint file or a new one)" }) catch dupe(gpa, "that file is a teammate's this round — write one of yours instead");
+        }
     }
     if (std.fs.path.dirname(full)) |dir| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
     const clean = sanitizeModelText(gpa, p.value.content);
@@ -1486,8 +1511,8 @@ fn stageAction(ctx: *ToolCtx, cmd: []const u8) void {
 /// (kill_process -> kill_proc, block -> block_ip, setphase -> set_phase, ...). Returns gpa-owned only if rewritten.
 fn normalizeCmd(gpa: std.mem.Allocator, cmd: []const u8) []const u8 {
     const pairs = .{
-        .{ "kill_process", "kill_proc" }, .{ "killproc", "kill_proc" }, .{ "kill", "kill_proc" },
-        .{ "block_address", "block_ip" }, .{ "blockip", "block_ip" },   .{ "block", "block_ip" },
+        .{ "kill_process", "kill_proc" }, .{ "killproc", "kill_proc" },   .{ "kill", "kill_proc" },
+        .{ "block_address", "block_ip" }, .{ "blockip", "block_ip" },     .{ "block", "block_ip" },
         .{ "setphase", "set_phase" },     .{ "set_signal", "set_phase" }, .{ "grant_pedestrian_walk", "grant_walk" },
     };
     inline for (pairs) |pr| {
@@ -3265,6 +3290,28 @@ pub fn fileOwnedBy(list: []const u8, path: []const u8) bool {
     }
     return false;
 }
+/// True when `path` is the FIRST blueprint entry not yet in the build manifest — the frontier piece of an
+/// ordered build. Writing the frontier is by definition not jumping ahead, and an unbuilt file has nothing
+/// to clobber — together those two facts open the ordered-deliverable guard for a stuck required file.
+/// Lines whose first token carries no '.' (prose/section headers, dirs) are skipped so a non-file line can
+/// never become a permanent phantom frontier that keeps the valve shut.
+fn isFrontierFile(ctx: *ToolCtx, path: []const u8) bool {
+    if (ctx.blueprint.len == 0) return false;
+    var it = std.mem.splitScalar(u8, ctx.blueprint, '\n');
+    while (it.next()) |line| {
+        var s = std.mem.trim(u8, line, " \r\t");
+        if (s.len > 0 and (s[0] == '-' or s[0] == '*' or s[0] == '+')) s = std.mem.trim(u8, s[1..], " \r\t");
+        var end: usize = 0;
+        while (end < s.len and s[end] != ' ' and s[end] != '\t' and s[end] != ':' and s[end] != '`') : (end += 1) {}
+        if (end == 0) continue;
+        const bp = s[0..end];
+        if (std.mem.indexOfScalar(u8, std.fs.path.basename(bp), '.') == null) continue;
+        if (builtAlready(ctx, bp)) continue;
+        return pathKeyMatch(bp, path);
+    }
+    return false;
+}
+
 fn blueprintHas(blueprint: []const u8, path: []const u8) bool {
     if (blueprint.len == 0) return false;
     const pb = std.fs.path.basename(path);
