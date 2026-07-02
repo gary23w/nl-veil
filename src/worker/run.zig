@@ -1321,12 +1321,32 @@ fn buildKnowledgeIndex(w: *Worker) []u8 {
 }
 
 /// True if a file with this BASENAME has been built (recorded in .build_manifest with a non-trivial size).
-fn builtInManifest(data: []const u8, base: []const u8) bool {
+/// Separator-blind path equality ('/' == '\\'), so a manifest line written with either separator still
+/// matches a '/'-normalized blueprint path.
+fn pathEq(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xn: u8 = if (x == '\\') '/' else x;
+        const yn: u8 = if (y == '\\') '/' else y;
+        if (xn != yn) return false;
+    }
+    return true;
+}
+
+/// A `key` carrying a '/' (a full blueprint-relative path) must match the manifest line's FULL path —
+/// basename matching collapsed every same-named file into one (observed live, sim_forum6: once ONE package
+/// __init__.py existed, the frontier believed all five were built and coverage stalled at 15/19 forever;
+/// a Rust mod.rs layout makes that collision the NORM, not the edge). A bare key keeps whole-basename
+/// matching for callers that only hold a filename token (LLM-derived deps, task-text file mentions).
+fn builtInManifest(data: []const u8, key: []const u8) bool {
+    const want_full = std.mem.indexOfScalar(u8, key, '/') != null or std.mem.indexOfScalar(u8, key, '\\') != null;
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t");
         const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
-        if (std.mem.eql(u8, std.fs.path.basename(ln[0..bar]), base)) {
+        const fp = ln[0..bar];
+        const hit = if (want_full) pathEq(fp, key) else std.mem.eql(u8, std.fs.path.basename(fp), key);
+        if (hit) {
             const sz = std.fmt.parseInt(u64, std.mem.trim(u8, ln[bar + 1 ..], " \r\t"), 10) catch 0;
             if (sz >= 40) return true;
         }
@@ -1380,7 +1400,7 @@ fn slotPath(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, my_files: [
     while (it.next()) |raw| {
         const p = std.mem.trim(u8, raw, " \r\n\t");
         if (p.len == 0) continue;
-        if (!builtInManifest(data, std.fs.path.basename(p))) return p;
+        if (!builtInManifest(data, p)) return p; // full-path key: same-basename siblings advance independently
     }
     return firstPath(my_files);
 }
@@ -3345,7 +3365,7 @@ fn slotIsBuilt(w: *Worker, slot: []const u8) bool {
     defer gpa.free(mpath);
     const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch return false;
     defer if (manifest.len > 0) gpa.free(manifest);
-    return builtInManifest(manifest, std.fs.path.basename(slot));
+    return builtInManifest(manifest, slot); // full-path key: a built sibling of the same NAME is not this slot
 }
 
 fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []const u8 {
@@ -3374,7 +3394,7 @@ fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []co
     }
     if (total != 1) return "";
     const mbase = std.fs.path.basename(match);
-    if (!builtInManifest(manifest, mbase)) return ""; // unbuilt => coverage frontier handles it
+    if (!builtInManifest(manifest, match)) return ""; // unbuilt (THIS path, not a same-named sibling) => frontier handles it
     if (inSpaceList(w.incomplete_str, mbase)) return ""; // mid-chunk => its owner is still growing it
     if (tools.fileOwnedBy(others_files, match)) return ""; // a teammate's slice holds it this round (end-game deepen) — edit_file still works
     return gpa.dupe(u8, match) catch "";
@@ -4360,7 +4380,9 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
             present += 1;
         } else {
             if (miss.items.len > 0) miss.appendSlice(gpa, ", ") catch {};
-            miss.appendSlice(gpa, std.fs.path.basename(bp)) catch {};
+            // FULL path, not basename: "create __init__.py, __init__.py, __init__.py" names no directory
+            // and the minds cannot act on it (observed live, sim_forum6)
+            miss.appendSlice(gpa, bp) catch {};
         }
     }
     return .{ .present = present, .total = total, .missing = miss.toOwnedSlice(gpa) catch "" };
@@ -4796,7 +4818,7 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
         const t = std.mem.trim(u8, data, " \r\n\t");
         if (t.len > 40) continue;
         if (miss_n > 0) missing.appendSlice(gpa, ", ") catch {};
-        missing.appendSlice(gpa, std.fs.path.basename(bp)) catch {};
+        missing.appendSlice(gpa, bp) catch {}; // full path — a bare basename names no directory
         miss_n += 1;
     }
     w.deliverable_missing = miss_n > 0;
@@ -6768,6 +6790,21 @@ test "builtInManifest matches by basename + non-trivial size (the slot-advance s
     try std.testing.expect(!builtInManifest(m, "routes.rs"));
     try std.testing.expect(!builtInManifest("", "anything"));
     try std.testing.expect(builtInManifest("PROJECT_TREE/main.rs|600\n", "main.rs"));
+}
+
+test "builtInManifest: a path key distinguishes same-basename siblings (sim_forum6 __init__.py stall / Rust mod.rs)" {
+    const m = "src/main/__init__.py|64\nsrc/api/mod.rs|512\n";
+    // full-path key: only the path actually in the manifest reads as built
+    try std.testing.expect(builtInManifest(m, "src/main/__init__.py"));
+    try std.testing.expect(!builtInManifest(m, "src/api/__init__.py"));
+    try std.testing.expect(!builtInManifest(m, "src/db/__init__.py"));
+    try std.testing.expect(!builtInManifest(m, "src/store/mod.rs"));
+    try std.testing.expect(builtInManifest(m, "src/api/mod.rs"));
+    // a bare key keeps whole-basename semantics (LLM-derived tokens carry no directory)
+    try std.testing.expect(builtInManifest(m, "__init__.py"));
+    try std.testing.expect(builtInManifest(m, "mod.rs"));
+    // separator-blind: a manifest line written with '\\' still matches a '/'-normalized blueprint path
+    try std.testing.expect(builtInManifest("src\\auth\\tokens.rs|300\n", "src/auth/tokens.rs"));
 }
 
 test "depsReady executes the AI-declared decomposition: independent parallel, dependent ordered" {
