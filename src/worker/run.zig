@@ -1356,7 +1356,7 @@ fn builtInManifest(data: []const u8, key: []const u8) bool {
 
 /// The assembler's ONE canonical slot this moment: the first file in the mind's slice (comma-sep my_files) that
 /// isn't built yet — so the mind ADVANCES through its slice one file at a time instead of scattering; if every
-/// slice file is built, the first (to DEEPEN it). Reads .build_manifest (basename match). "" if no slice. The
+/// slice file is built, the first (to DEEPEN it). Reads .build_manifest (full-path keys). "" if no slice. The
 /// returned slice points into `my_files` (alive for the moment); `gpa` only backs the transient manifest read.
 fn endsWithIC(s: []const u8, suf: []const u8) bool {
     if (s.len < suf.len) return false;
@@ -2400,7 +2400,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         if (assembler_slot.len > 0) {
             if (lane_slot.len > 0)
                 break :blk_slot std.fmt.allocPrint(gpa, "FIX the ONE file `{s}` — the orchestrator's bottleneck task for YOU this round: {s}. Change it surgically (edit_file / SEARCH-REPLACE on its exact current lines — NEVER paste a whole second copy of the file); a corrected FULL rewrite is accepted only when the file's structure is wrong.", .{ assembler_slot, clip(mi.lane, 280) }) catch (gpa.dupe(u8, "") catch @constCast(""));
-            if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot))) {
+            if (inSpaceList(w.incomplete_str, assembler_slot)) {
                 // fence mode has NO write_file — telling a fenced mind to use mode:"append" makes obedience
                 // impossible; the fenced continuation is a SEARCH/REPLACE that extends the file's tail.
                 if (gate.fence)
@@ -3259,7 +3259,7 @@ fn deriveSlotFromReply(w: *Worker, monologue: []const u8, others_files: []const 
         const bp = bpPath(ln) orelse continue;
         const base = std.fs.path.basename(bp);
         if (base.len < 4) continue;
-        if (builtInManifest(manifest, base)) continue;
+        if (builtInManifest(manifest, bp)) continue; // full-path key: a built same-named sibling doesn't retire THIS file
         if (tools.fileOwnedBy(others_files, bp)) continue;
         if (std.mem.indexOf(u8, head, base) == null) continue;
         matches += 1;
@@ -3393,9 +3393,8 @@ fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []co
         match = bp;
     }
     if (total != 1) return "";
-    const mbase = std.fs.path.basename(match);
     if (!builtInManifest(manifest, match)) return ""; // unbuilt (THIS path, not a same-named sibling) => frontier handles it
-    if (inSpaceList(w.incomplete_str, mbase)) return ""; // mid-chunk => its owner is still growing it
+    if (inSpaceList(w.incomplete_str, match)) return ""; // mid-chunk (THIS path) => its owner is still growing it
     if (tools.fileOwnedBy(others_files, match)) return ""; // a teammate's slice holds it this round (end-game deepen) — edit_file still works
     return gpa.dupe(u8, match) catch "";
 }
@@ -4740,9 +4739,10 @@ fn revisePlan(w: *Worker, goal: []const u8, round: u32) void {
     var it = std.mem.splitScalar(u8, w.blueprint, '\n');
     while (it.next()) |ln| {
         const p = bpPath(ln) orelse continue;
-        const b = std.fs.path.basename(p);
-        const dst = if (builtInManifest(mdata, b)) &built else &unbuilt;
-        dst.appendSlice(gpa, b) catch {};
+        // full-path keys: with five same-named siblings, basename keying listed all five as BUILT (canon
+        // locked) the moment the first landed; full paths classify — and name — each sibling itself.
+        const dst = if (builtInManifest(mdata, p)) &built else &unbuilt;
+        dst.appendSlice(gpa, p) catch {};
         dst.append(gpa, ' ') catch {};
     }
     if (built.items.len == 0) return;
@@ -4775,18 +4775,21 @@ fn markIncomplete(w: *Worker, round: u32) void {
     var it = std.mem.splitScalar(u8, w.blueprint, '\n');
     while (it.next()) |ln| {
         const bp = bpPath(ln) orelse continue;
-        const base = std.fs.path.basename(bp);
-        if (!builtInManifest(mdata, base)) continue;
-        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, base }) catch continue;
+        // full blueprint-relative path throughout: reading work/{basename} never found a NESTED file
+        // (src/db/store.py read work/store.py), so nested files silently skipped this whole scan —
+        // never marked incomplete, never compile-checked. incomplete_str entries carry the same
+        // full-path keys as the manifest; inSpaceList resolves them like builtInManifest does.
+        if (!builtInManifest(mdata, bp)) continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
         defer gpa.free(fp);
         const fdata = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch continue;
         defer gpa.free(fdata);
-        const pycheck: u8 = if (std.mem.endsWith(u8, base, ".py") and std.mem.trim(u8, fdata, " \r\n\t").len > 40) pySalvageCheck(w, fdata) else 0;
+        const pycheck: u8 = if (std.mem.endsWith(u8, bp, ".py") and std.mem.trim(u8, fdata, " \r\n\t").len > 40) pySalvageCheck(w, fdata) else 0;
         if (fileNeedsMore(fdata) or pycheck != 0) {
-            out.appendSlice(gpa, base) catch {};
+            out.appendSlice(gpa, bp) catch {};
             out.append(gpa, ' ') catch {};
-            if (pycheck == 7) w.act("engine", round, "compile_fail", base, "a built .py file does not compile — re-queued to its owner to FIX");
-            if (pycheck == 8) w.act("engine", round, "compile_fail", base, "a built .py file defines the same top-level name TWICE (two glued copies) — re-queued to its owner to collapse it into ONE clean copy");
+            if (pycheck == 7) w.act("engine", round, "compile_fail", bp, "a built .py file does not compile — re-queued to its owner to FIX");
+            if (pycheck == 8) w.act("engine", round, "compile_fail", bp, "a built .py file defines the same top-level name TWICE (two glued copies) — re-queued to its owner to collapse it into ONE clean copy");
         }
     }
     if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
@@ -6383,10 +6386,18 @@ fn depsReady(deps: []const u8, manifest: []const u8, path: []const u8) bool {
     return true;
 }
 
-fn inSpaceList(list: []const u8, base: []const u8) bool {
-    if (list.len == 0 or base.len == 0) return false;
+/// Membership in a space-separated file-key list (incomplete_str), under builtInManifest's key convention:
+/// a key carrying a directory ('/' or '\\') matches an entry only by FULL separator-blind path; a bare key
+/// matches any entry by whole basename. Entries are blueprint-relative paths, so same-named siblings (five
+/// __init__.py in a package tree, five mod.rs in a Rust one) stay distinct.
+fn inSpaceList(list: []const u8, key: []const u8) bool {
+    if (list.len == 0 or key.len == 0) return false;
+    const want_full = std.mem.indexOfScalar(u8, key, '/') != null or std.mem.indexOfScalar(u8, key, '\\') != null;
     var it = std.mem.tokenizeScalar(u8, list, ' ');
-    while (it.next()) |tok| if (std.mem.eql(u8, tok, base)) return true;
+    while (it.next()) |tok| {
+        const hit = if (want_full) pathEq(tok, key) else std.mem.eql(u8, std.fs.path.basename(tok), key);
+        if (hit) return true;
+    }
     return false;
 }
 
@@ -6421,8 +6432,9 @@ fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, d
     if (files.items.len == 0) return gpa.dupe(u8, "") catch @constCast("");
     const isDone = struct {
         fn f(d: []const u8, inc: []const u8, p: []const u8) bool {
-            const b = std.fs.path.basename(p);
-            return builtInManifest(d, b) and !inSpaceList(inc, b);
+            // full-path keys: basename keying read five __init__.py as ONE file — once the first was
+            // built the frontier believed all five were, and coverage stalled (sim_forum6, 15/19).
+            return builtInManifest(d, p) and !inSpaceList(inc, p);
         }
     }.f;
     var frontier: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -6909,6 +6921,20 @@ test "assignSlot: surplus builders get no slot, and a fully-built project deepen
     }
 }
 
+test "assignSlot: same-basename siblings advance independently, and a nested mid-chunk file stays frontier work" {
+    const A = std.testing.allocator;
+    const bp = "src/api/__init__.py — api package\nsrc/db/__init__.py — db package\n";
+    const m = "src/api/__init__.py|120\n";
+    // the built api/__init__.py must not retire db/__init__.py (basename keying read them as ONE file)
+    const s0 = assignSlot(A, m, bp, "", "", 0, 2);
+    defer A.free(s0);
+    try std.testing.expectEqualStrings("src/db/__init__.py", s0);
+    // a nested incomplete entry (full-path key, as markIncomplete now emits) keeps ITS file assignable
+    const s1 = assignSlot(A, m, bp, "", "src/api/__init__.py", 0, 2);
+    defer A.free(s1);
+    try std.testing.expectEqualStrings("src/api/__init__.py", s1);
+}
+
 test "tierFromStr pins explicit tiers and lets auto/unknown fall through to RSI" {
     try std.testing.expect(rsi.tierFromStr("author").? == .author);
     try std.testing.expect(rsi.tierFromStr("assembler").? == .assembler);
@@ -7022,11 +7048,17 @@ test "fileNeedsMore detects a chunk-built first part, passes a finished file" {
     try std.testing.expect(!fileNeedsMore("x"));
 }
 
-test "inSpaceList matches whole basenames only" {
+test "inSpaceList: bare key = whole basename, path key = full path (same-named siblings stay distinct)" {
     try std.testing.expect(inSpaceList("seed_discourse.py models.py", "models.py"));
     try std.testing.expect(inSpaceList("seed_discourse.py", "seed_discourse.py"));
     try std.testing.expect(!inSpaceList("myapp.py", "app.py"));
     try std.testing.expect(!inSpaceList("", "anything.py"));
+    // path keys resolve like builtInManifest: only the sibling actually in the list matches
+    try std.testing.expect(inSpaceList("src/db/__init__.py app.py", "src/db/__init__.py"));
+    try std.testing.expect(!inSpaceList("src/db/__init__.py app.py", "src/api/__init__.py"));
+    try std.testing.expect(inSpaceList("src\\db\\__init__.py", "src/db/__init__.py")); // separator-blind
+    // a bare key still reaches a nested entry by basename (LLM-derived tokens carry no directory)
+    try std.testing.expect(inSpaceList("src/db/store.py", "store.py"));
 }
 
 test "psycheValence scores emotional content, not temperament adjectives" {

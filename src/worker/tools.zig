@@ -747,7 +747,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     const redirected = ctx.one_slot and ctx.slot_path.len > 0 and !std.mem.eql(u8, npath, ctx.slot_path);
     const wpath = if (redirected) ctx.slot_path else npath;
-    if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !std.mem.eql(u8, std.fs.path.basename(wpath), std.fs.path.basename(ctx.slot_path))) {
+    if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !pathKeyMatch(ctx.slot_path, wpath)) {
         const yours = if (ctx.slot_path.len > 0) std.fmt.allocPrint(gpa, " YOUR file this round is `{s}` — write that, not this.", .{ctx.slot_path}) catch "" else " You have no deliverable file this round — research the upcoming pieces, share what you learn, or create a NEW helper file.";
         defer if (yours.len > 0 and ctx.slot_path.len > 0) gpa.free(@constCast(yours));
         return std.fmt.allocPrint(gpa, "`{s}` is an ordered deliverable file with a single author this round — overwriting it would clobber finished work or jump ahead of the team's current piece.{s}", .{ wpath, yours }) catch dupe(gpa, "that ordered file belongs to its builder this round — don't overwrite it");
@@ -758,7 +758,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // being FIXED) can simultaneously sit in a teammate's deepen-phase my_files list, and without this
     // exemption the pinned mind's every write_file was rejected as "a teammate's file" — write_file fully dead
     // for exactly the mind the orchestrator sent to fix the bottleneck.
-    const is_own_slot = ctx.slot_path.len > 0 and std.mem.eql(u8, std.fs.path.basename(wpath), std.fs.path.basename(ctx.slot_path));
+    const is_own_slot = ctx.slot_path.len > 0 and pathKeyMatch(ctx.slot_path, wpath);
     if (!is_own_slot and ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
         const rescue = ctx.round > 1 and !builtAlready(ctx, wpath);
         if (!rescue)
@@ -3144,38 +3144,58 @@ fn safeRel(p: []const u8) bool {
     return true;
 }
 
-/// True if a file with `path`'s basename was already written this run (recorded in run_dir/.build_manifest as
-/// "path|bytes" lines). The engine-authoritative record — avoids a racy filesystem stat. Used by writeFile's
-/// round-2+ coverage rescue: a teammate's file that does NOT exist yet may be created by anyone.
+/// run.zig's builtInManifest key convention, mirrored: a probe carrying a directory ('/' or '\\') matches
+/// `entry` only by FULL separator-blind path; a bare probe matches by whole basename (minds often write bare
+/// filenames while slices/manifest carry full blueprint paths). Pure basename matching collapses same-named
+/// siblings (five mod.rs in a Rust tree, five __init__.py in a Python package) into ONE identity, misfiring
+/// every guard keyed on it. A leading "./" on the probe is noise, not a directory.
+fn pathKeyMatch(entry: []const u8, probe: []const u8) bool {
+    var pr = probe;
+    while (std.mem.startsWith(u8, pr, "./")) pr = pr[2..];
+    if (entry.len == 0 or pr.len == 0) return false;
+    const has_dir = std.mem.indexOfScalar(u8, pr, '/') != null or std.mem.indexOfScalar(u8, pr, '\\') != null;
+    if (!has_dir) return std.mem.eql(u8, std.fs.path.basename(entry), pr);
+    if (entry.len != pr.len) return false;
+    for (entry, pr) |x, y| {
+        const xn: u8 = if (x == '\\') '/' else x;
+        const yn: u8 = if (y == '\\') '/' else y;
+        if (xn != yn) return false;
+    }
+    return true;
+}
+
+/// True if a file matching `path` (pathKeyMatch: full path when it carries a directory, else basename) was
+/// already written this run (recorded in run_dir/.build_manifest as "path|bytes" lines). The engine-
+/// authoritative record — avoids a racy filesystem stat. Used by writeFile's round-2+ coverage rescue: a
+/// teammate's file that does NOT exist yet may be created by anyone — and a built same-named SIBLING must
+/// not veto rescuing the one that is genuinely missing.
 fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
     const gpa = ctx.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{ctx.run_dir}) catch return false;
     defer gpa.free(mpath);
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, mpath, gpa, .limited(64 << 10)) catch return false;
     defer gpa.free(data);
-    const pb = std.fs.path.basename(path);
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |ln| {
         const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
         const fp = std.mem.trim(u8, ln[0..bar], " \r\t");
-        if (fp.len > 0 and std.mem.eql(u8, std.fs.path.basename(fp), pb)) return true;
+        if (fp.len > 0 and pathKeyMatch(fp, path)) return true;
     }
     return false;
 }
 
-/// True if `path` matches a comma+space entry of `list` (the format mindFiles emits) by BASENAME — because the
-/// system prompt makes minds write bare filenames (e.g. 'errors.py') while the slices carry full blueprint paths
-/// (e.g. 'src/todolib/errors.py'). Whole-basename equality (not substring), so 'errors.py' never matches
-/// 'myerrors.py'. Used by writeFile's file-partition guard and run.zig's slotless-salvage derivation.
+/// True if `path` matches a comma+space entry of `list` (the format mindFiles emits) under pathKeyMatch:
+/// a bare filename (what minds usually write, e.g. 'errors.py') matches any entry by whole basename — never
+/// substring, so 'errors.py' never matches 'myerrors.py' — while a directory-carrying path matches only the
+/// entry with that exact path, so owning src/api/__init__.py claims no sibling __init__.py. Used by
+/// writeFile's file-partition guard and run.zig's slotless-salvage derivation.
 pub fn fileOwnedBy(list: []const u8, path: []const u8) bool {
-    if (list.len == 0) return false;
-    const pb = std.fs.path.basename(path);
-    if (pb.len == 0) return false;
+    if (list.len == 0 or path.len == 0) return false;
     var it = std.mem.splitSequence(u8, list, ", ");
     while (it.next()) |e| {
         const t = std.mem.trim(u8, e, " \r\n\t");
         if (t.len == 0) continue;
-        if (std.mem.eql(u8, std.fs.path.basename(t), pb)) return true;
+        if (pathKeyMatch(t, path)) return true;
     }
     return false;
 }
@@ -3199,6 +3219,18 @@ fn clip(s: []const u8, n: usize) []const u8 {
 }
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("error");
+}
+
+test "fileOwnedBy/pathKeyMatch: bare probe = whole basename, path probe = exact sibling only" {
+    // bare filename (what minds write) reaches a full-path entry by basename — never substring
+    try std.testing.expect(fileOwnedBy("src/todolib/errors.py, src/app.py", "errors.py"));
+    try std.testing.expect(!fileOwnedBy("src/todolib/errors.py", "myerrors.py"));
+    // a directory-carrying probe claims only ITS path — owning api/__init__.py claims no sibling
+    try std.testing.expect(fileOwnedBy("src/api/__init__.py, src/db/models.py", "src/api/__init__.py"));
+    try std.testing.expect(!fileOwnedBy("src/api/__init__.py, src/db/models.py", "src/db/__init__.py"));
+    try std.testing.expect(fileOwnedBy("src\\api\\__init__.py", "src/api/__init__.py")); // separator-blind
+    try std.testing.expect(fileOwnedBy("src/api/__init__.py", "./src/api/__init__.py")); // ./ is noise
+    try std.testing.expect(!fileOwnedBy("", "anything.py"));
 }
 
 test "isSearchOrAggregator skips engines + social, keeps real outlets" {
