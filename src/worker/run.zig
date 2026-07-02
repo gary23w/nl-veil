@@ -3064,7 +3064,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             w.act(mi.name, round, if (applied) "edit" else "edit_reject", n.path, clip(eres, 220));
             break :editblk; // a narrated edit-block is handled here; never fall through to the full-file salvage
         }
-        if (salvage_slot.len > 0 and std.mem.indexOfScalar(u8, std.fs.path.basename(salvage_slot), '.') != null) {
+        if (salvage_slot.len > 0 and fileShapedToken(salvage_slot)) {
             var body = salvageFileBody(gpa, monologue);
             var reject = salvageRejectReason(w, salvage_slot, body);
             if (reject) |why| {
@@ -5328,6 +5328,17 @@ pub fn bpPath(line: []const u8) ?[]const u8 {
     return tok;
 }
 
+/// A blueprint/slot token names a FILE when its basename carries an extension OR the token is
+/// path-shaped (contains '/'). This mirrors bpPath's own accept rule, so every layer gating on
+/// "is this a real file?" agrees with what the blueprint could contain in the first place: a dotless
+/// deliverable under a directory (app/Makefile, api/Dockerfile) is a real slot, while a bare prose
+/// word ("Overview", "Notes") stays excluded and can never become a phantom slot or frontier.
+pub fn fileShapedToken(tok: []const u8) bool {
+    if (tok.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, std.fs.path.basename(tok), '.') != null) return true;
+    return std.mem.indexOfScalar(u8, tok, '/') != null;
+}
+
 fn bpLineFor(blueprint: []const u8, path: []const u8) []const u8 {
     const want = std.fs.path.basename(path);
     if (want.len == 0 or blueprint.len == 0) return "";
@@ -7424,4 +7435,14 @@ test "salvageFileBody returns a TINY fenced body whole — length policy belongs
     const b2 = salvageFileBody(gpa, mixed);
     defer if (b2.len > 0) gpa.free(b2);
     try std.testing.expectEqualStrings("[]", b2);
+}
+
+test "fileShapedToken: extension or path-shape marks a real slot (app/Makefile salvageable); bare prose words and root dotless stay excluded, matching bpPath" {
+    try std.testing.expect(fileShapedToken("Main.kt"));
+    try std.testing.expect(fileShapedToken("pulse/data/seed.json"));
+    try std.testing.expect(fileShapedToken("app/Makefile")); // dotless deliverable under a dir: real slot
+    try std.testing.expect(fileShapedToken("api/Dockerfile"));
+    try std.testing.expect(!fileShapedToken("Overview")); // prose word: never a slot
+    try std.testing.expect(!fileShapedToken("Makefile")); // root dotless: bpPath rejects it too — invisible, not stalled
+    try std.testing.expect(!fileShapedToken(""));
 }
