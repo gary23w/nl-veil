@@ -767,6 +767,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (std.fs.path.dirname(full)) |dir| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
     const clean = sanitizeModelText(gpa, p.value.content);
     defer gpa.free(clean);
+    // A file body must never carry the engine's own edit protocol — language-blind by construction (this
+    // detects OUR markers, not any language's syntax), so it guards every toolchain the goal can declare.
+    if (bufedit.editMarkerCorruption(clean))
+        return dupe(gpa, "write REJECTED — your content contains SEARCH/REPLACE or merge-conflict marker lines (<<<<<<< / >>>>>>>): that is an EDIT SCRIPT, not a file body. To change an existing file, call edit_file with ops; to write this file, send the complete final body with ZERO marker lines.");
     const is_append = std.mem.eql(u8, p.value.mode, "append") and p.value.content.len > 0;
     var final_bytes: usize = clean.len;
     var restarted = false;
@@ -943,6 +947,13 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const original = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20)) catch
         return std.fmt.allocPrint(gpa, "{s} does not exist (or is over 1MiB) — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
     defer gpa.free(original);
+    // A marker-corrupted file is structurally edit-hostile: its repeated `<<<<<<<`/`=======`/`>>>>>>>` lines
+    // make anchors ambiguous ("matches more than one place") and partial cleanups strand residue — observed
+    // live (sim_synapse r10-r14): five straight rounds of correctly-targeted fix attempts all bounced off
+    // anchoring while the corrupted crate root held the build at 0%. The only reliable repair is a clean
+    // full rewrite, so route there instead of letting ops fight the markers.
+    if (bufedit.editMarkerCorruption(original))
+        return std.fmt.allocPrint(gpa, "{s} currently contains unresolved SEARCH/REPLACE / merge-conflict marker lines from an earlier bad edit — anchors are unreliable in it and partial cleanups leave broken residue. Do NOT edit it: REWRITE it clean in full with write_file path:\"{s}\" mode:\"overwrite\", sending the complete final code with ZERO marker lines.", .{ npath, npath }) catch dupe(gpa, "file is marker-corrupted — rewrite it in full with write_file mode:\"overwrite\"");
     var ops: std.ArrayListUnmanaged(bufedit.EditOp) = .empty;
     defer ops.deinit(gpa);
     for (p.value.ops) |o| {
@@ -960,6 +971,11 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             path: []const u8,
             fn check(vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8 {
                 const g: *@This() = @ptrCast(@alignCast(vctx));
+                // Language-blind, runs for EVERY file: an op's `text` must not smuggle the edit protocol
+                // itself into the file (only rejects NEWLY-introduced markers — a head that already carries
+                // them stays editable, mirroring the NL_CHK_ORIG baseline rule).
+                if (bufedit.editMarkerCorruption(candidate) and !bufedit.editMarkerCorruption(head))
+                    return dupe(g.tc.gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
                 if (!std.mem.endsWith(u8, g.path, ".py")) return null;
                 const perr = pyCompileError(g.tc, candidate, head) orelse return null;
                 defer g.tc.gpa.free(perr);
@@ -981,6 +997,10 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!res.ok) return res.reject; // owned; caller frees. original file untouched.
     defer gpa.free(res.bytes);
     defer if (res.loci.len > 0) gpa.free(res.loci);
+    // Same language-blind protocol gate as the VCS path (original is marker-free here — the corrupted-file
+    // case already returned above), so a single-mind run gets identical protection.
+    if (bufedit.editMarkerCorruption(res.bytes))
+        return dupe(gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
     // POST-EDIT COMPILE GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py unparseable —
     // observed live: an edit dropped a function body, users.py:85 IndentationError, and edit_file reported
     // "edited" so the mind only learned two rounds later via the global scan. Reject a parse-breaking edit and

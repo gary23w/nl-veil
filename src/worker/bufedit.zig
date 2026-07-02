@@ -327,6 +327,35 @@ pub fn hasSearchReplace(reply: []const u8) bool {
     return std.mem.indexOf(u8, reply, "<<<<<<< SEARCH") != null;
 }
 
+/// Line-anchored edit-protocol / merge-conflict markers INSIDE file content — always corruption, in any
+/// language: a line starting `<<<<<<<` or `>>>>>>>` never belongs in a real file body. A bare `=======`
+/// line alone deliberately does NOT trigger (a legitimate markdown H1 underline). Broader than
+/// hasSearchReplace on purpose: it also catches partial RESIDUE (a lone `>>>>>>> REPLACE` left behind
+/// after a cleanup consumed the opening fence). Observed live (sim_synapse r10): an edit op whose `text`
+/// carried a whole multi-file SEARCH/REPLACE script was committed into src/lib.rs — the crate root — and
+/// the repeated marker lines then defeated every follow-up edit_file's anchoring for five straight rounds
+/// while `cargo build` pinned the swarm at 0%.
+pub fn editMarkerCorruption(body: []const u8) bool {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trimEnd(u8, raw, " \r\t");
+        inline for (.{ "<<<<<<<", ">>>>>>>" }) |m| {
+            if (std.mem.startsWith(u8, ln, m) and (ln.len == m.len or ln[m.len] == ' ')) return true;
+        }
+    }
+    return false;
+}
+
+test "editMarkerCorruption: line-anchored conflict/edit fences trigger; markdown H1 underline does not" {
+    try std.testing.expect(editMarkerCorruption("pub mod a;\n=======\n>>>>>>> REPLACE\n")); // residue, no opening fence
+    try std.testing.expect(editMarkerCorruption("x\n<<<<<<< SEARCH\ny\n"));
+    try std.testing.expect(editMarkerCorruption("<<<<<<<\n"));
+    try std.testing.expect(editMarkerCorruption("a\n>>>>>>> theirs\r\nb\n")); // git-style, CRLF
+    try std.testing.expect(!editMarkerCorruption("Title\n=======\nprose paragraph\n")); // markdown H1
+    try std.testing.expect(!editMarkerCorruption("let x = a >> b; // operators mid-line\n"));
+    try std.testing.expect(!editMarkerCorruption(""));
+}
+
 /// Parse SEARCH/REPLACE blocks, preferring a path line detected in the reply but falling back to `slot` (the file
 /// the engine already knows this mind is editing) when the model omitted the path line. With slot="" this is the
 /// strict form: no detected path => null. Every block maps to a replace op. Fail-closed: never a partial edit.
