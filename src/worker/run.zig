@@ -24,6 +24,7 @@ const bufedit = @import("bufedit.zig");
 const rsi = @import("rsi.zig");
 const agi = @import("agi.zig");
 const writer = @import("writer.zig");
+const locs = @import("locs/libraries.zig");
 
 const MindSpec = struct { name: []const u8 = "mind", role: []const u8 = "", duty: []const u8 = "", lead: bool = false };
 const Manifest = struct {
@@ -724,6 +725,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         const acc = std.fmt.allocPrint(gpa, "checks:\n{s}\nsmoke: {s}\nprobes:\n{s}", .{ w.checks_str, w.smoke_cmd, w.probes_str }) catch "";
         defer if (acc.len > 0) gpa.free(acc);
         w.act("engine", 0, "acceptance", "goal DECLARES its own acceptance interface (VERIFY/SMOKE/PROBE) — adopted verbatim; engine-run, language-blind", acc);
+    }
+    if (live and w.internet) {
+        const srcs = locs.sourcesBlock(gpa, goal, 3);
+        if (srcs.len > 0) {
+            defer gpa.free(@constCast(srcs));
+            w.act("engine", 0, "atlas", "curated source atlas matched this goal — research directives will steer scouts to canonical documentation first", srcs);
+        }
     }
     if (m.benchmark.len > 0) w.bench_fixed = gpa.dupe(u8, m.benchmark) catch "";
     defer if (w.bench_fixed.len > 0) gpa.free(@constCast(w.bench_fixed));
@@ -3758,6 +3766,24 @@ fn assessGap(w: *Worker, goal: []const u8, round: u32, stalled: bool) void {
         if (stalled) w.last_gap_str = gpa.dupe(u8, "KNOWLEDGE GAPS: the score has STALLED yet the corpus reads as complete — the missing knowledge is whatever the failing benchmark needs; research the latest failures/edge cases externally, do NOT just re-derive the corpus.") catch "";
     } else {
         w.last_gap_str = std.fmt.allocPrint(gpa, "KNOWLEDGE GAPS (the ingested corpus does NOT cover these — research them, do NOT re-derive what's already in hive knowledge): {s}. The corpus is a STARTING POINT, not the whole truth — go learn what's missing.", .{gaps}) catch "";
+    }
+    // SOURCE ATLAS: when the gap/goal text matches a curated knowledge domain, the research directive
+    // carries the canonical doc roots — a small model has no reliable built-in coding weights, and a bare
+    // DDG search often can't rank the right page; the atlas removes the WHERE problem. A prior, not a
+    // switch: matching is a general word-scan over live signals, admission still requires a verbatim
+    // quote, and only APPLIED sources earn lasting trust. No match or offline ⇒ byte-identical directive.
+    if (w.internet and w.last_gap_str.len > 0) {
+        const probe_txt = std.fmt.allocPrint(gpa, "{s} {s}", .{ gaps, goal }) catch "";
+        defer if (probe_txt.len > 0) gpa.free(@constCast(probe_txt));
+        const srcs = locs.sourcesBlock(gpa, if (probe_txt.len > 0) probe_txt else goal, 3);
+        if (srcs.len > 0) {
+            defer gpa.free(@constCast(srcs));
+            const joined = std.fmt.allocPrint(gpa, "{s}{s}", .{ w.last_gap_str, srcs }) catch "";
+            if (joined.len > 0) {
+                gpa.free(@constCast(w.last_gap_str));
+                w.last_gap_str = joined;
+            }
+        }
     }
     _ = w.mem.observe(tools.GAP_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: coverage {d}% gaps {s}", .{ round, @as(u32, @intFromFloat(cov * 100)), clip(gaps, 200) }) catch "round");
     w.emit("gap", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"coverage\":{d},\"gaps\":\"{s}\"", .{ round, @as(u32, @intFromFloat(cov * 100)), w.esc(clip(gaps, 200)) }) catch ",\"round\":0");
