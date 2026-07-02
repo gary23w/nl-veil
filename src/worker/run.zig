@@ -3140,7 +3140,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     }
                 }
             }
-            if (reject == null and body.len >= 80) {
+            // reject == null means the body cleared every salvage gate INCLUDING the length floor (or its
+            // escalation valve) — re-imposing a size check here would silently drop a valve-admitted body.
+            if (reject == null and body.len > 0) {
                 var wargs: std.ArrayListUnmanaged(u8) = .empty;
                 defer wargs.deinit(gpa);
                 wargs.appendSlice(gpa, "{\"path\":") catch {};
@@ -3150,7 +3152,18 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 wargs.appendSlice(gpa, "}") catch {};
                 const wres = tools.execute(&ctx, "write_file", wargs.items);
                 defer gpa.free(wres);
-                w.act(mi.name, round, "salvage", salvage_slot, "rescued a narrated file body from the reply into the assigned slot");
+                const landed = std.mem.startsWith(u8, wres, "wrote") or std.mem.startsWith(u8, wres, "rewrote") or std.mem.startsWith(u8, wres, "appended");
+                if (landed) {
+                    w.act(mi.name, round, "salvage", salvage_slot, if (body.len < 80)
+                        "rescued a SHORT narrated file body via the length-floor valve (slot floor-rejected twice, file still missing)"
+                    else
+                        "rescued a narrated file body from the reply into the assigned slot");
+                } else {
+                    // the write path itself refused (ownership/marker/append guard) — record the truth, not a
+                    // phantom rescue, and put the refusal in the round ledger the lead reads
+                    noteReject(w, salvage_slot, wres);
+                    w.act(mi.name, round, "salvage_reject", salvage_slot, clip(wres, 220));
+                }
             }
             if (body.len > 0) gpa.free(@constCast(body));
         }
@@ -3585,7 +3598,11 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
             if (body.len > best.len) best = body;
             scan = close + 3;
         }
-        if (best.len >= 40) return gpa.dupe(u8, best) catch "";
+        // A fenced block is the mind's EXPLICIT file-body signal — return it whatever its size and let
+        // salvageRejectReason's floor+valve own the length policy. A pre-floor here starved the valve of
+        // the very bodies it exists to admit (sim_atlas_kotlin3: expenses.json's "[]" fence was extracted
+        // as "" every round, so the slot deadlocked exactly as before the valve shipped).
+        if (best.len > 0) return gpa.dupe(u8, best) catch "";
     }
     const t = std.mem.trim(u8, monologue, " \r\n\t");
     if (t.len < 120) return "";
@@ -7379,4 +7396,32 @@ test "salvageFileBody picks the LARGEST fenced block, skipping a small Note bloc
     defer if (one.len > 0) gpa.free(one);
     try std.testing.expect(std.mem.indexOf(u8, one, "def total(values):") != null);
     try std.testing.expect(std.mem.indexOf(u8, one, "```") == null);
+}
+
+test "salvageFileBody returns a TINY fenced body whole — length policy belongs to salvageRejectReason's floor+valve, not the extractor (sim_atlas_kotlin3: \"[]\" extracted as \"\" starved the valve every round)" {
+    const gpa = std.testing.allocator;
+    const tiny =
+        \\expenses.json
+        \\```json
+        \\[]
+        \\```
+    ;
+    const body = salvageFileBody(gpa, tiny);
+    defer if (body.len > 0) gpa.free(body);
+    try std.testing.expectEqualStrings("[]", body);
+
+    // prose around a tiny fence: the fence is the explicit file-body signal and must win over the
+    // whole-reply desperation fallback (which would commit the prose as the file)
+    const mixed =
+        \\The seed store must start empty so the first add command has a well-formed document to append into.
+        \\I considered a schema wrapper object here but the plain top-level array is what the store parses.
+        \\
+        \\expenses.json
+        \\```json
+        \\[]
+        \\```
+    ;
+    const b2 = salvageFileBody(gpa, mixed);
+    defer if (b2.len > 0) gpa.free(b2);
+    try std.testing.expectEqualStrings("[]", b2);
 }
