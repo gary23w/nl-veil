@@ -305,7 +305,7 @@ pub const Worker = struct {
         while (it.next()) |raw| {
             const ln = std.mem.trim(u8, raw, " \r\t");
             if (ln.len == 0) continue;
-            const C = struct { op: []const u8 = "", text: []const u8 = "", goal: []const u8 = "" };
+            const C = struct { op: []const u8 = "", text: []const u8 = "", goal: []const u8 = "", answered: u8 = 0, steer: u8 = 0, reply: []const u8 = "", directive: []const u8 = "" };
             const p = std.json.parseFromSlice(C, self.gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
             defer p.deinit();
             if (std.mem.eql(u8, p.value.op, "stop")) {
@@ -318,7 +318,12 @@ pub const Worker = struct {
                 commons.sendMessage(self.gpa, self.io, self.run_dir, "operator", "all", p.value.text, self.cur_round);
                 self.emit("control", std.fmt.allocPrint(self.a(), ",\"applied\":1,\"text\":\"{s}\"", .{self.esc(p.value.text)}) catch ",\"applied\":1");
             } else if (std.mem.eql(u8, p.value.op, "veil") and p.value.text.len > 0) {
-                agi.veilConverse(self, goal.*, p.value.text);
+                // answered=1: the veil SHELL already replied out-of-band in the veil's voice — record the
+                // exchange (+ optional steer) instead of composing a duplicate reply at round latency.
+                if (p.value.answered != 0)
+                    agi.veilShellNote(self, p.value.text, p.value.reply, p.value.directive, p.value.steer != 0)
+                else
+                    agi.veilConverse(self, goal.*, p.value.text);
             }
         }
         self.ctl_cursor = data.len;
@@ -2252,7 +2257,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     ctx.one_slot = w.cap.one_slot;
     // STRATEGY-FIX OVERRIDE: the orchestrator's task for THIS mind naming one BUILT blueprint file outranks
     // the coverage frontier — one mind carries the deliberated bottleneck fix while teammates keep covering.
-    const lane_slot = if (!w.quick and w.cap.one_slot and mi.lane.len > 0) laneSlotOverride(w, mi.lane) else "";
+    // Never for a scout: its schema has no write tools, so a pinned slot would only starve the file.
+    const lane_slot = if (!w.quick and w.cap.one_slot and !mi.scout and mi.lane.len > 0) laneSlotOverride(w, mi.lane, others_files) else "";
     defer if (lane_slot.len > 0) gpa.free(@constCast(lane_slot));
     const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
     defer if (w.quick and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // quick slot is gpa-owned
@@ -2928,6 +2934,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         // live: a correct test_store.py, dropped with zero trace because it had no slot). If the reply's head
         // names exactly ONE unbuilt blueprint file and carries a fenced body, salvage into that file.
         const derived = if (salvage_slot0.len == 0) deriveSlotFromReply(w, monologue, others_files) else "";
+        defer if (derived.len > 0) gpa.free(@constCast(derived)); // gpa-owned per its contract; salvage_slot only borrows it
         const salvage_slot = if (salvage_slot0.len > 0) salvage_slot0 else derived;
         if (derived.len > 0) w.act(mi.name, round, "salvage_derive", derived, "slotless reply names exactly one unbuilt blueprint file — salvaging into it");
         // SURGICAL EDIT first: if the reply carries narrated SEARCH/REPLACE blocks, apply them through the SAME
@@ -3283,6 +3290,13 @@ test "extractGoalPaths adopts data files (config.json) and expands a bare __init
     const flat = extractGoalPaths(gpa, "Build a lib: core.py, __init__.py, test_core.py", &n2);
     defer if (flat.len > 0) gpa.free(@constCast(flat));
     try std.testing.expect(std.mem.indexOf(u8, flat, "__init__.py") != null);
+    // URL/endpoint tokens are NEVER adopted as deliverables (their basenames carry file-looking extensions)
+    var n3: u32 = 0;
+    const urls = extractGoalPaths(gpa, "Build a dashboard that polls https://api.site.com/stats.json and https://api.site.com/users.csv into dash.py", &n3);
+    defer if (urls.len > 0) gpa.free(@constCast(urls));
+    try std.testing.expect(std.mem.indexOf(u8, urls, "http") == null);
+    try std.testing.expect(std.mem.indexOf(u8, urls, "dash.py") != null);
+    try std.testing.expectEqual(@as(u32, 1), n3);
 }
 
 /// STRATEGY-FIX SLOT OVERRIDE — when the orchestrator's task for this mind names exactly ONE blueprint file
@@ -3292,7 +3306,7 @@ test "extractGoalPaths adopts data files (config.json) and expands a bare __init
 /// finally landed in round 8 — two rounds starved, then corrupted. Unbuilt/incomplete files stay with the
 /// frontier assigner (someone gets them by rank), and planRoles' per-file exclusivity guarantees at most one
 /// mind holds a task naming any file. Returned slice is gpa-owned ("" = none).
-fn laneSlotOverride(w: *Worker, lane: []const u8) []const u8 {
+fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []const u8 {
     const gpa = w.gpa;
     if (w.blueprint.len == 0 or lane.len == 0) return "";
     const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return "";
@@ -3300,20 +3314,27 @@ fn laneSlotOverride(w: *Worker, lane: []const u8) []const u8 {
     const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch "";
     defer if (manifest.len > 0) gpa.free(manifest);
     if (manifest.len == 0) return "";
+    // the task must name exactly ONE blueprint file IN TOTAL — a task like "write test_users.py covering
+    // users.py" names two, and pinning the mind to whichever happens to be built would aim the one-slot
+    // write redirect at the WRONG file (audit finding: the built context file gets overwritten with the
+    // test the task actually asked for). Ambiguity => no override; the frontier assigner stays in charge.
     var match: []const u8 = "";
-    var matches: u32 = 0;
+    var total: u32 = 0;
     var it = std.mem.splitScalar(u8, w.blueprint, '\n');
     while (it.next()) |ln| {
         const bp = bpPath(ln) orelse continue;
         const base = std.fs.path.basename(bp);
         if (base.len < 4) continue;
         if (!containsWordBounded(lane, base)) continue;
-        if (!builtInManifest(manifest, base)) continue; // unbuilt => coverage frontier handles it
-        if (inSpaceList(w.incomplete_str, base)) continue; // mid-chunk => its owner is still growing it
-        matches += 1;
+        total += 1;
+        if (total > 1) return "";
         match = bp;
     }
-    if (matches != 1) return "";
+    if (total != 1) return "";
+    const mbase = std.fs.path.basename(match);
+    if (!builtInManifest(manifest, mbase)) return ""; // unbuilt => coverage frontier handles it
+    if (inSpaceList(w.incomplete_str, mbase)) return ""; // mid-chunk => its owner is still growing it
+    if (tools.fileOwnedBy(others_files, match)) return ""; // a teammate's slice holds it this round (end-game deepen) — edit_file still works
     return gpa.dupe(u8, match) catch "";
 }
 
@@ -3406,14 +3427,16 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
 /// alone passed it; observed live as users.py doubled end to end).
 fn pySalvageCheck(w: *Worker, source: []const u8) u8 {
     const gpa = w.gpa;
+    if (source.len > 80_000) return 0; // Linux per-env-string cap — beyond it the spawn E2BIGs; fail open explicitly
     const pe = w.mem.environ orelse return 0;
     var env = pe.clone(gpa) catch return 0;
     defer env.deinit();
     env.put("NL_SALVAGE_SRC", source) catch return 0;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const code = "import os,sys,ast\nsrc=os.environ.get('NL_SALVAGE_SRC','')\ntry:\n compile(src,'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n seen=set()\n for n in ast.parse(src).body:\n  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):\n   if n.name in seen: sys.exit(8)\n   seen.add(n.name)\nexcept Exception:\n pass\nsys.exit(0)\n";
+    // dup check counts only UNDECORATED defs (@overload / @singledispatch.register legitimately repeat a name)
+    const code = "import os,sys,ast\nsrc=os.environ.get('NL_SALVAGE_SRC','')\ntry:\n compile(src,'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n seen=set()\n for n in ast.parse(src).body:\n  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n   if n.name in seen: sys.exit(8)\n   seen.add(n.name)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return 0;
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return 0;
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     return switch (r.term) {
@@ -4772,6 +4795,10 @@ fn stripPathPunct(tok: []const u8) []const u8 {
 fn looksLikeNamedFile(tok: []const u8) bool {
     if (tok.len == 0 or tok.len > 120) return false;
     if (std.mem.indexOf(u8, tok, "..") != null or tok[0] == '/' or tok[0] == '\\') return false;
+    // a deliverable's RELATIVE path never contains ':' — this rejects URLs ("polls https://api.x.com/stats.json"
+    // must not adopt an endpoint as a required file; 3 such tokens would hijack the whole explicit-tree gate),
+    // Windows drive paths, and port-ish tokens in one stroke.
+    if (std.mem.indexOfScalar(u8, tok, ':') != null) return false;
     const base = if (std.mem.lastIndexOfScalar(u8, tok, '/')) |i| tok[i + 1 ..] else tok;
     if (base.len == 0) return false;
     return isDocExt(base) or isCodeExt(base) or isDataExt(base);

@@ -754,7 +754,12 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, wpath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
-    if (ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
+    // A write into the mind's OWN engine-assigned slot always stands: a strategy-override slot (a built file
+    // being FIXED) can simultaneously sit in a teammate's deepen-phase my_files list, and without this
+    // exemption the pinned mind's every write_file was rejected as "a teammate's file" — write_file fully dead
+    // for exactly the mind the orchestrator sent to fix the bottleneck.
+    const is_own_slot = ctx.slot_path.len > 0 and std.mem.eql(u8, std.fs.path.basename(wpath), std.fs.path.basename(ctx.slot_path));
+    if (!is_own_slot and ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
         const rescue = ctx.round > 1 and !builtAlready(ctx, wpath);
         if (!rescue)
             return std.fmt.allocPrint(gpa, "{s} is a teammate's file this round — they own it in the blueprint and are building it in parallel, so writing it would collide (last-writer-wins) and waste the work. YOUR files: {s}. Write or DEEPEN one of yours that isn't done, or create a genuinely NEW file in nobody's slice. To change a file you don't own, read_file it and send_message its owner — don't rewrite it.", .{ wpath, if (ctx.my_files.len > 0) ctx.my_files else "(none assigned — take an unbuilt blueprint file or a new one)" }) catch dupe(gpa, "that file is a teammate's this round — write one of yours instead");
@@ -768,17 +773,18 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (is_append) {
         const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch &[_]u8{};
         defer if (prior.len > 0) gpa.free(prior);
-        // A .py append that RE-DEFINES a top-level name the file already has is a fresh attempt at the same
-        // module, whatever its first line is — the first-line restart guard misses a re-attempt that opens with
-        // a different import, and gluing it on doubles every definition (observed live: users.py doubled end to
-        // end). Big enough to be the whole file => it IS the rewrite; a small redefining fragment is rejected
-        // outright (gluing corrupts, replacing 200 lines with 15 is silent data loss).
+        // A .py append that RE-DEFINES a top-level name the file already has can NOT be glued (it doubles the
+        // definition — observed live: users.py doubled end to end via an append whose first line differed, so
+        // the restart guard missed it) and can NOT be trusted as a whole-file rewrite either (a chunked build's
+        // next part often sloppily re-emits one earlier def; replacing the file would destroy chunk 1's other
+        // definitions). The only safe move is REJECT with the exact conflicting name and route the model to
+        // edit_file / a clean append / an explicit overwrite.
         const redef: ?[]const u8 = if (std.mem.endsWith(u8, wpath, ".py")) pyAppendRedefines(prior, clean) else null;
-        if (appendRestartsFile(prior, clean) or (redef != null and clean.len * 2 >= prior.len)) {
+        if (appendRestartsFile(prior, clean)) {
             restarted = true;
             if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
         } else if (redef) |nm| {
-            return std.fmt.allocPrint(gpa, "append REJECTED — your body RE-DEFINES `{s}`, which {s} already defines at top level; gluing it on would leave two copies of the same definition. To CHANGE an existing definition use edit_file (SEARCH its exact current lines, REPLACE with the fix); to truly append, send only NEW code that does not re-define existing names.", .{ nm, wpath }) catch dupe(gpa, "append rejected: body re-defines existing top-level names — use edit_file instead");
+            return std.fmt.allocPrint(gpa, "append REJECTED — your body RE-DEFINES `{s}`, which {s} already defines at top level; gluing it on would leave two copies of the same definition, and replacing the file could destroy earlier work. To CHANGE an existing definition use edit_file (SEARCH its exact current lines, REPLACE with the fix); to truly append, send only NEW code that does not re-define existing names; to intentionally REWRITE the whole file, use write_file mode:\"overwrite\".", .{ nm, wpath }) catch dupe(gpa, "append rejected: body re-defines existing top-level names — use edit_file instead");
         } else {
             var joined: std.ArrayListUnmanaged(u8) = .empty;
             defer joined.deinit(gpa);
@@ -850,14 +856,25 @@ fn pyTopDefName(line: []const u8) ?[]const u8 {
 }
 
 /// First top-level def/class name the append `body` shares with the existing `prior` — a genuine continuation
-/// never re-defines a module-level name the file already has. null = no overlap (safe to glue).
+/// never re-defines a module-level name the file already has. DECORATED defs are exempt on both sides
+/// (@overload / @singledispatch.register / @prop.setter legitimately repeat a name). null = safe to glue.
 fn pyAppendRedefines(prior: []const u8, body: []const u8) ?[]const u8 {
+    var bprev: []const u8 = "";
     var bit = std.mem.splitScalar(u8, body, '\n');
     while (bit.next()) |bl| {
+        defer if (std.mem.trim(u8, bl, " \r\t").len > 0) {
+            bprev = std.mem.trim(u8, bl, " \r\t");
+        };
         const name = pyTopDefName(bl) orelse continue;
+        if (bprev.len > 0 and bprev[0] == '@') continue; // decorated — a legitimate repeated-name form
+        var pprev: []const u8 = "";
         var pit = std.mem.splitScalar(u8, prior, '\n');
         while (pit.next()) |pl| {
+            defer if (std.mem.trim(u8, pl, " \r\t").len > 0) {
+                pprev = std.mem.trim(u8, pl, " \r\t");
+            };
             const pn = pyTopDefName(pl) orelse continue;
+            if (pprev.len > 0 and pprev[0] == '@') continue;
             if (std.mem.eql(u8, name, pn)) return name;
         }
     }
@@ -873,14 +890,22 @@ fn pyAppendRedefines(prior: []const u8, body: []const u8) ?[]const u8 {
 /// NEWLY-introduced duplicates reject. Sources ride env vars so no scratch file is needed.
 fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
+    // Linux caps a single env string at ~128KB (MAX_ARG_STRLEN) — beyond it the spawn E2BIGs and the gate
+    // would silently fail open anyway; make that degradation explicit and platform-consistent. An oversized
+    // ORIG only disables the dup DIFF (orig := source ⇒ tops(src)-tops(orig) = ∅), keeping the compile gate.
+    if (source.len > 80_000) return null;
     var env = ctx.environ.clone(gpa) catch return null;
     defer env.deinit();
     env.put("NL_CHK_SRC", source) catch return null;
-    env.put("NL_CHK_ORIG", orig) catch return null;
+    env.put("NL_CHK_ORIG", if (orig.len > 80_000) source else orig) catch return null;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
+    // dup check counts only UNDECORATED defs: @overload / @singledispatch.register / @property setters
+    // legitimately repeat a top-level name (verified live) — a decorator means "not a plain redefinition".
+    const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return null;
+    // TIMEOUT: this gate can run while vcs.commitEdit holds the ONE worker file mutex — an unbounded child
+    // (or a Windows handle-inheritance stall) would freeze every mind until the hang watchdog kills the run.
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return null;
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     return switch (r.term) {
@@ -2868,8 +2893,7 @@ pub const INTERFACES_PY =
     \\    req=pos[:len(pos)-len(a.defaults)] if a.defaults else pos[:]
     \\    kwonly=[x.arg for x in a.kwonlyargs]
     \\    kwreq=[x.arg for x,d in zip(a.kwonlyargs,a.kw_defaults) if d is None]
-    \\    if pos and pos[0] in ("self","cls"): pos=pos[1:]; req=[r for r in req if r not in ("self","cls")]
-    \\    return {"pos":pos,"req":req,"kwonly":kwonly,"kwreq":kwreq,"var":a.vararg is not None,"kw":a.kwarg is not None}
+    \\    return {"pos":pos,"req":req,"kwonly":kwonly,"kwreq":kwreq,"var":a.vararg is not None,"kw":a.kwarg is not None,"dec":bool(fn.decorator_list)}
     \\def sigstr(name,si):
     \\    ps=[p if i<len(si["req"]) else p+"=?" for i,p in enumerate(si["pos"])]
     \\    if si["var"]: ps.append("*args")
@@ -2902,6 +2926,7 @@ pub const INTERFACES_PY =
     \\    def argcheck(caller,mb,fname,call):
     \\        si=sigs.get(mb,{}).get(fname)
     \\        if not si: return
+    \\        if si["dec"]: return  # a decorator can rewrite the signature (e.g. inject a conn arg) — the raw def is not the call contract
     \\        if any(isinstance(x,ast.Starred) for x in call.args): return
     \\        kwn=[k.arg for k in call.keywords]
     \\        if None in kwn: return
@@ -2919,6 +2944,17 @@ pub const INTERFACES_PY =
     \\        try: t=ast.parse(s)
     \\        except SyntaxError as e: issues.append(b+": SYNTAX ERROR line "+str(getattr(e,"lineno","?"))+" — the file does not parse, so every importer of it breaks"); continue
     \\        alias2mod={}; name2modfn={}
+    \\        shadow=set()  # names re-bound in this file (params, lambda args, assignments) — a `store` PARAM is not the store module
+    \\        for n in ast.walk(t):
+    \\            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.Lambda)):
+    \\                aa=n.args
+    \\                for x in aa.posonlyargs+aa.args+aa.kwonlyargs: shadow.add(x.arg)
+    \\                if aa.vararg: shadow.add(aa.vararg.arg)
+    \\                if aa.kwarg: shadow.add(aa.kwarg.arg)
+    \\            elif isinstance(n,ast.Assign):
+    \\                for tg in n.targets:
+    \\                    if isinstance(tg,ast.Name): shadow.add(tg.id)
+    \\            elif isinstance(n,(ast.For,ast.AsyncFor)) and isinstance(n.target,ast.Name): shadow.add(n.target.id)
     \\        for n in ast.walk(t):
     \\            if isinstance(n,ast.ImportFrom):
     \\                mb=modbase(n.module)
@@ -2939,6 +2975,7 @@ pub const INTERFACES_PY =
     \\        for n in ast.walk(t):
     \\            if isinstance(n,ast.Attribute) and isinstance(n.value,ast.Name):
     \\                m=n.value.id
+    \\                if m in shadow: continue
     \\                mb=alias2mod.get(m)
     \\                if mb and mb!=b[:-3] and n.attr not in defs[mb] and not n.attr.startswith("_") and defs[mb]:
     \\                    demand(mb,n.attr)
@@ -2948,9 +2985,10 @@ pub const INTERFACES_PY =
     \\            if not isinstance(n,ast.Call): continue
     \\            f=n.func
     \\            if isinstance(f,ast.Attribute) and isinstance(f.value,ast.Name):
+    \\                if f.value.id in shadow: continue
     \\                mb=alias2mod.get(f.value.id)
     \\                if mb and mb!=b[:-3]: argcheck(b,mb,f.attr,n)
-    \\            elif isinstance(f,ast.Name) and f.id in name2modfn:
+    \\            elif isinstance(f,ast.Name) and f.id in name2modfn and f.id not in shadow:
     \\                mb,orig=name2modfn[f.id]; argcheck(b,mb,orig,n)
     \\    issues=sorted(set(issues))[:12]
     \\    exports={}
@@ -3220,6 +3258,9 @@ test "pyAppendRedefines: a re-attempt that re-defines existing top-level names i
     try std.testing.expectEqualStrings("verify", pyAppendRedefines("async def verify(t):\n    pass\n", "async def verify(t):\n    return 1\n").?);
     try std.testing.expectEqualStrings("Store", pyAppendRedefines("class Store:\n    pass\n", "class Store:\n    x = 1\n").?);
     try std.testing.expect(pyAppendRedefines("", "def a():\n    pass\n") == null);
+    // DECORATED repeats are legitimate (@singledispatch.register / @overload) — never flagged, either side
+    try std.testing.expect(pyAppendRedefines("from functools import singledispatch\n@singledispatch\ndef convert(x):\n    pass\n", "@convert.register\ndef convert(x: int):\n    return x\n") == null);
+    try std.testing.expect(pyAppendRedefines("@overload\ndef f(x):\n    pass\n", "@overload\ndef f(x, y):\n    pass\n") == null);
 }
 
 test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {
