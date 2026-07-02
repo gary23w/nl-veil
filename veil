@@ -1,7 +1,14 @@
 #!/bin/sh
-# veil - cast a hive-mind swarm on the fly. A thin wrapper over deploy.py so you can type
+# veil - the front door. Alone it opens the veil shell; with a task it casts a swarm on the fly:
+#   veil
 #   veil "add a header search to my landing page" --embed . --repl
-# instead of `python deploy.py ...`. Put this dir on your PATH (or symlink this file into one).
-DIR="$(cd "$(dirname "$0")" && pwd)"
+# A thin wrapper over deploy.py. The installer symlinks this into ~/.local/bin, so resolve
+# symlinks back to the real repo before looking for deploy.py next to it.
+SRC=$0
+while [ -h "$SRC" ]; do
+  T=$(readlink "$SRC")
+  case $T in /*) SRC=$T ;; *) SRC=$(dirname "$SRC")/$T ;; esac
+done
+DIR="$(cd "$(dirname "$SRC")" && pwd)"
 PY="$(command -v python3 || command -v python)"
 exec "$PY" "$DIR/deploy.py" "$@"
