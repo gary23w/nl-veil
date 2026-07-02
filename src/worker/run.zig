@@ -510,7 +510,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     {
         const envv = if (environ.get("NL_AUTONOMY")) |v| v else "";
         w.autonomy_full = std.ascii.eqlIgnoreCase(std.mem.trim(u8, m.autonomy, " \t"), "full") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, envv, " \t"), "full");
-        if (live) w.act("engine", 0, "autonomy", if (w.autonomy_full) "full" else "bounded", if (w.autonomy_full) "FULL self-direction — the hive may act on discovered powers, approve its own work, and grow its own goal freely (operator-set, dev environment)" else "bounded — the hive discovers + proposes capability growth, but flags risky self-expansion for the operator");
+        // FULL autonomy IS self-direction. w.autonomous gates self-origination (empty goal → pick a purpose)
+        // and goal-chaining (completed → evolve to the next self-chosen goal); it was a separate config bool
+        // that no CLI path ever set, so both were dead — sim_freeroam1 ran its whole life on an EMPTY goal
+        // and self-completed in 5 rounds without ever originating OR chaining. The operator's "--autonomy full"
+        // grant is exactly the permission those two behaviors need, so derive it here. Bounded stays
+        // autonomous=false (propose-and-hold via goal_growth), preserving the human-in-the-loop path.
+        if (w.autonomy_full) w.autonomous = true;
+        if (live) w.act("engine", 0, "autonomy", if (w.autonomy_full) "full" else "bounded", if (w.autonomy_full) "FULL self-direction — the hive may act on discovered powers, approve its own work, ORIGINATE its own purpose from an empty goal, and CHAIN to a new self-chosen goal after each completion (operator-set, dev environment)" else "bounded — the hive discovers + proposes capability growth, but flags risky self-expansion for the operator");
     }
     {
         const envv = if (environ.get("NL_PSYCHE")) |v| v else "";
