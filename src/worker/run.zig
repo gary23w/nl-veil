@@ -2981,8 +2981,22 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             rememberSpan(w, d.evidence_span);
                             w.act(mi.name, round, "scout_learn", url, clip(d.note, 220));
                         } else {
-                            // a fooled/empty judge only UNDER-ingests; a reject does NOT demote the source (judge-competence, not source-quality)
-                            w.act(mi.name, round, "scout_reject", url, "no verbatim evidence span / vacuous / duplicate — refused (not ingested)");
+                            // a fooled/empty judge only UNDER-ingests; a reject does NOT demote the source (judge-competence, not source-quality).
+                            // Name the FIRST failing check: 8 fetches across the two atlas-kotlin runs produced 7 rejects
+                            // under one catch-all message, and diagnosing WHY required re-deriving the whole gate by hand.
+                            const why = if (!d.applicable)
+                                "screen: applicable=false — no concrete span in the shown page window"
+                            else if (d.evidence_span.len < 40)
+                                "evidence span too short (<40 chars)"
+                            else if (std.mem.indexOf(u8, page, d.evidence_span) == null)
+                                "evidence span not verbatim in the page"
+                            else if (sigTokenOverlap(d.note, d.evidence_span) < 3)
+                                "note does not derive from its span (sig-token overlap <3)"
+                            else if (hasVacuity(d.note))
+                                "vacuous note"
+                            else
+                                "duplicate span (already ingested this run)";
+                            w.act(mi.name, round, "scout_reject", url, why);
                         }
                     } else {
                         w.act(mi.name, round, "scout_reject", url, "screen unavailable (gateway) — refused, hive untouched");
