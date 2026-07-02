@@ -3232,8 +3232,8 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
     defer if (existing.len > 0) gpa.free(existing);
     const cur = std.mem.trim(u8, existing, " \r\n\t");
-    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot))
-        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size
+    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !bufedit.editMarkerCorruption(cur))
+        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a marker-corrupted file is KNOWN broken — any clean full body may replace it
     return null;
 }
 
