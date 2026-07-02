@@ -2255,12 +2255,19 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
     ctx.one_slot = w.cap.one_slot;
-    // STRATEGY-FIX OVERRIDE: the orchestrator's task for THIS mind naming one BUILT blueprint file outranks
-    // the coverage frontier — one mind carries the deliberated bottleneck fix while teammates keep covering.
-    // Never for a scout: its schema has no write tools, so a pinned slot would only starve the file.
-    const lane_slot = if (!w.quick and w.cap.one_slot and !mi.scout and mi.lane.len > 0) laneSlotOverride(w, mi.lane, others_files) else "";
+    // COVERAGE FIRST. The frontier assigner (slotPath over my_files) hands each mind its next UNBUILT required
+    // file; a strategy override only claims a mind the frontier left WITHOUT unbuilt work — a surplus mind, or
+    // the lead aimlessly re-deepening a finished file. Without this gate the override pinned 3 of 4 minds to
+    // re-polish already-built src files while 9 required files (all 3 tests + 5 __init__.py + README) never got
+    // a builder — coverage crawled 3→5→6→7 over 5 rounds and the score froze at the tier-3 floor (sim_forum5).
+    // A mind you cannot test a file that does not exist: build everything, THEN redirect surplus minds to fix.
+    const frontier_slot = if (!w.quick and w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
+    const frontier_has_unbuilt = frontier_slot.len > 0 and !slotIsBuilt(w, frontier_slot);
+    // STRATEGY-FIX OVERRIDE: the orchestrator's task naming one BUILT blueprint file becomes this (otherwise
+    // idle) mind's slot. Never for a scout (no write tools ⇒ would only starve the file).
+    const lane_slot = if (!w.quick and w.cap.one_slot and !mi.scout and mi.lane.len > 0 and !frontier_has_unbuilt) laneSlotOverride(w, mi.lane, others_files) else "";
     defer if (lane_slot.len > 0) gpa.free(@constCast(lane_slot));
-    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
+    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else frontier_slot;
     defer if (w.quick and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
     const dg_block = if (w.depgraph_str.len > 0)
@@ -3306,6 +3313,18 @@ test "extractGoalPaths adopts data files (config.json) and expands a bare __init
 /// finally landed in round 8 — two rounds starved, then corrupted. Unbuilt/incomplete files stay with the
 /// frontier assigner (someone gets them by rank), and planRoles' per-file exclusivity guarantees at most one
 /// mind holds a task naming any file. Returned slice is gpa-owned ("" = none).
+/// Does the frontier's chosen slot point at a file already BUILT (≥40 bytes in the manifest)? True ⇒ the
+/// frontier has no unbuilt required work for this mind (it fell back to a deepen/firstPath pick), so a
+/// strategy override may claim it; false ⇒ the mind has real coverage work and the override must stand aside.
+fn slotIsBuilt(w: *Worker, slot: []const u8) bool {
+    const gpa = w.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return false;
+    defer gpa.free(mpath);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch return false;
+    defer if (manifest.len > 0) gpa.free(manifest);
+    return builtInManifest(manifest, std.fs.path.basename(slot));
+}
+
 fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []const u8 {
     const gpa = w.gpa;
     if (w.blueprint.len == 0 or lane.len == 0) return "";
