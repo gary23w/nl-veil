@@ -91,6 +91,34 @@ veil "add a search box to my landing page" --embed . --repl
   fast co-working ("center that div").
 - `--detach` / `--service` — run past this terminal, or install as a boot-persistent daemon.
 
+## Your AI's sub-agent — cast a hive from another assistant
+
+The hive is also a **side agent for whatever AI you already talk to**. Instead of your primary
+assistant grinding through a research question or a side-build step by step inside its own context
+window, it casts a swarm, keeps working, and gets back **one structured findings report** —
+recommendation, key findings (each tied to provenance-gated evidence), open questions, confidence,
+and the built file list.
+
+Three doors, pick what your assistant can reach:
+
+```sh
+# CLI agents (Claude Code, or anything that can run a command):
+veil cast "why does saving a note drop the last line? recommend a fix" --context ./src --json
+
+# collect findings from any run, any time (also mid-run):
+veil report <run> --json
+
+# chat clients (Claude Code / Desktop, Cursor, ...): wire the hive in as MCP tools
+claude mcp add nl-veil -- python deploy.py mcp
+```
+
+The MCP server exposes `hive_research` / `hive_task` (blocking, findings back in one call),
+`hive_cast` + `hive_status` + `hive_collect` / `hive_stop` (async: start it, keep chatting, pull
+the findings when ready). `--context <file-or-dir>` seeds the swarm's memory with *your
+application's own files*, so the research happens inside the context of your app — and `hive_task`
+with `dir` works in-place on real files, bounded-autonomy, engine-verified. Casts made this way
+never prompt, never post publicly, and always stay bounded.
+
 ## How it works
 
 Three pieces, each its own repo, that snap together:
