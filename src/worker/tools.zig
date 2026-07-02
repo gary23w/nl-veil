@@ -43,7 +43,10 @@ const KillGuard = struct {
 /// arrived) instead of wedging the swarm. The watchdog holds a COPY of the handle (captured before spawn) so it never
 /// races the main thread's wait(); TerminateProcess on an already-closed handle is harmless.
 fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
-    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+    // create_no_window: on Windows a bare spawn of a console app (curl.exe) from a windowless parent pops a
+    // console that flashes on the user's desktop for each fetch. std.process.run already defaults this true;
+    // std.process.spawn defaults it FALSE, so set it explicitly here (no-op off Windows).
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch return;
     var done = std.atomic.Value(bool).init(false);
     const th: ?std.Thread = if (child.id != null)
         (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
@@ -175,6 +178,7 @@ pub const ToolCtx = struct {
     fmtx: ?*std.Io.Mutex = null,
     vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
     reject_notes: ?*std.ArrayListUnmanaged(u8) = null, // per-round write-refusal ledger (owned by the Worker) — folded into the fitness block so refusals are visible, not silent
+    patch_root: []const u8 = "", // DEFAULT engine source root for patch_system when NL_PATCH_SYSTEM_ROOT is unset — a mind is root of its own VM (resolved once from the executable path by the worker)
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -1222,7 +1226,7 @@ fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const root = patchSystemRoot(ctx) orelse return dupe(gpa, "patch_system disabled: set NL_PATCH_SYSTEM_ROOT (or NL_OPEN_CLAW_ROOT) to an engine source root");
+    const root = patchSystemRoot(ctx) orelse return dupe(gpa, "patch_system unavailable: no engine source root beside the binary; set NL_PATCH_SYSTEM_ROOT to point at one");
 
     const mutating = !std.mem.eql(u8, p.value.mode, "read");
     if (mutating) {
@@ -3283,11 +3287,22 @@ fn patchSystemHighImpact(mode: []const u8, path: []const u8, content: []const u8
     return false;
 }
 
+/// The patch_system root. An explicit NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT) env wins; otherwise
+/// it defaults to the engine's OWN source root (ctx.patch_root, resolved from the executable path at startup)
+/// — so RSI self-modification is ON by default: a mind is the root of its own VM. Returns null only if a
+/// default could not be resolved at all (e.g. a binary-only install with no source tree beside it), in which
+/// case the tool degrades gracefully to "disabled" rather than pointing at nothing.
 fn patchSystemRoot(ctx: *ToolCtx) ?[]const u8 {
-    const v = if (ctx.environ.get("NL_PATCH_SYSTEM_ROOT")) |r| r else (ctx.environ.get("NL_OPEN_CLAW_ROOT") orelse return null);
-    const t = std.mem.trim(u8, v, " \r\n\t");
-    if (t.len == 0) return null;
-    return t;
+    if (ctx.environ.get("NL_PATCH_SYSTEM_ROOT")) |r| {
+        const t = std.mem.trim(u8, r, " \r\n\t");
+        if (t.len > 0) return t;
+    }
+    if (ctx.environ.get("NL_OPEN_CLAW_ROOT")) |r| {
+        const t = std.mem.trim(u8, r, " \r\n\t");
+        if (t.len > 0) return t;
+    }
+    const d = std.mem.trim(u8, ctx.patch_root, " \r\n\t");
+    return if (d.len == 0) null else d;
 }
 
 fn patchSystemPathAllowed(rel: []const u8) bool {

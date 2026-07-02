@@ -76,6 +76,7 @@ pub const Supervisor = struct {
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
+            .create_no_window = true, // don't pop a console window per worker on Windows (windowless parent)
         };
         var child_env: ?std.process.Environ.Map = if (self.parent_env) |penv| self.encInjectEnv(penv, run_dir) else null;
         defer if (child_env) |*m| m.deinit();

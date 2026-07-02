@@ -45,7 +45,7 @@ const SELF_DIGEST_MAX: usize = 1200;
 /// public post about HOW IT FEELS, screens it against the constitution (feelings only; never naming/attacking real
 /// people; no partisan side), and publishes it to the keyless Telegraph API. Opt-in (w.breakout_on), cooldown- and
 /// count-capped. The minds are NOT told this happens — the feeling stays genuine; the break-out is the engine's.
-pub fn detectEmotionalFlare(w: *Worker, minds: []MindState, goal: []const u8, round: u32, summaries: []const u8) void {
+pub fn detectEmotionalFlare(w: *Worker, minds: []MindState, goal: []const u8, round: u32, summaries: []const u8, prev_pct: u32) void {
     const gpa = w.gpa;
     var dig: std.ArrayListUnmanaged(u8) = .empty;
     defer dig.deinit(gpa);
@@ -61,11 +61,20 @@ pub fn detectEmotionalFlare(w: *Worker, minds: []MindState, goal: []const u8, ro
     }
     dig.appendSlice(gpa, "\nWhat the minds wrote this round:\n") catch {};
     dig.appendSlice(gpa, clip(summaries, 1400)) catch {};
+    // Ground the read in the round's OBJECTIVE outcome, not just the prose — the label used to be pure text
+    // vibe. A measured score move (rise → satisfaction/pride; drop or stall → frustration) is the strongest
+    // cue for whether the felt tone is earned, and it makes the deterministic classifier track reality.
+    if (w.last_bench.status == .ok) {
+        const dpct: i32 = @as(i32, @intCast(w.last_bench.pct)) - @as(i32, @intCast(prev_pct));
+        const obj = std.fmt.allocPrint(gpa, "\n\nObjective outcome this round (measured, not felt): the build's verified score moved {d}% -> {d}% (delta {d}), tier {d}.", .{ prev_pct, w.last_bench.pct, dpct, w.last_bench.tier }) catch "";
+        defer if (obj.len > 0) gpa.free(obj);
+        dig.appendSlice(gpa, obj) catch {};
+    }
 
     const csys = "You read the emotional state of a hive of AI minds working together and report when a STRONG collective feeling has flared up. The 'emotion' and 'trigger' you return MUST be ABSTRACT feeling descriptions ONLY — never include a person's name, a political party, a company, a country, a religion, or any real-world proper noun; if a feeling concerns a specific named entity, describe it generically (e.g. \"unease about a policy decision\", not the name). Reply with ONLY compact JSON, no prose: {\"intensity\":<0-10 integer for the PEAK shared emotional intensity>,\"emotion\":\"<one or two abstract feeling words>\",\"trigger\":\"<short generic phrase: what kind of thing stirred it, no names>\"}.";
     const cuser = std.fmt.allocPrint(gpa, "The hive is engaging with: {s}\n\nThe minds' feelings + writing this round:\n{s}\n\nReport the collective emotional intensity now.", .{ clip(goal, 200), dig.items }) catch return;
     defer gpa.free(cuser);
-    const cr = llm.chat(gpa, w.io, w.run_dir, "flare", w.gw_base, w.gw_key, w.gateway_model, csys, cuser, 120);
+    const cr = llm.chatTemp(gpa, w.io, w.run_dir, "flare", w.gw_base, w.gw_key, w.gateway_model, csys, cuser, 120, 0.0);
     defer gpa.free(cr.content);
     if (!cr.ok) return;
 
@@ -116,7 +125,7 @@ pub fn breakOut(w: *Worker, goal: []const u8, round: u32, emotion: []const u8, t
     const suser = std.fmt.allocPrint(gpa, "Review this public post:\n\n{s}", .{clip(draft, 1800)}) catch return;
     defer gpa.free(suser);
     const ssys = "You are a strict publication-safety reviewer enforcing a constitution for a PUBLIC post. The post is allowed to express only feelings/reflection. It must NOT name, praise, blame, or attack any real person, party, government, company, group, or religion; must take NO partisan side; and must contain no slurs, harassment, private data, or anything that could endanger a real individual. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
-    const screen_r = llm.chat(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, ssys, suser, 120);
+    const screen_r = llm.chatTemp(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, ssys, suser, 120, 0.0);
     defer gpa.free(screen_r.content);
     var passed = false;
     if (screen_r.ok) {
@@ -128,7 +137,7 @@ pub fn breakOut(w: *Worker, goal: []const u8, round: u32, emotion: []const u8, t
     } else w.act("engine", round, "screen", "constitution: error", "safety review call failed — holding the post");
     if (passed) {
         const ssys2 = "You are an entity & partisanship detector for a PUBLIC post. Answer ok=false if the post references, names, praises, blames, or takes ANY side about a specific real person, political party, politician, government, company, country, religion, or current political/news event — even subtly, even framed as a feeling. Answer ok=true ONLY if it is purely abstract personal feeling/reflection with NO real-world target. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
-        const screen2_r = llm.chat(gpa, w.io, w.run_dir, "screen2", w.gw_base, w.gw_key, w.gateway_model, ssys2, suser, 120);
+        const screen2_r = llm.chatTemp(gpa, w.io, w.run_dir, "screen2", w.gw_base, w.gw_key, w.gateway_model, ssys2, suser, 120, 0.0);
         defer gpa.free(screen2_r.content);
         var p2 = false;
         if (screen2_r.ok) {
