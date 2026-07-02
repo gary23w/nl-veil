@@ -829,6 +829,26 @@ fn firstMeaningfulLine(s: []const u8) []const u8 {
     return "";
 }
 
+/// Compile-check a Python source string via the workdir python. Returns null when it compiles (or the check
+/// can't run — fail-open), else an owned "line N: message" (caller frees). The source rides an env var so no
+/// scratch file is needed and the model's code can't collide with a path.
+fn pyCompileError(ctx: *ToolCtx, source: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    var env = ctx.environ.clone(gpa) catch return null;
+    defer env.deinit();
+    env.put("NL_CHK_SRC", source) catch return null;
+    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const code = "import os,sys\ntry:\n compile(os.environ.get('NL_CHK_SRC',''),'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\n";
+    const argv = [_][]const u8{ py, "-c", code };
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return null;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return switch (r.term) {
+        .exited => |c| if (c == 7) (gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \r\n\t")) catch null) else null,
+        else => null,
+    };
+}
+
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", text: []const u8 = "", at: usize = 0 };
@@ -873,6 +893,16 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!res.ok) return res.reject; // owned; caller frees. original file untouched.
     defer gpa.free(res.bytes);
     defer if (res.loci.len > 0) gpa.free(res.loci);
+    // POST-EDIT COMPILE GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py unparseable —
+    // observed live: an edit dropped a function body, users.py:85 IndentationError, and edit_file reported
+    // "edited" so the mind only learned two rounds later via the global scan. Reject a parse-breaking edit and
+    // name the error NOW, in the same turn, keeping the last good file. Fail-open (a broken python env = no gate).
+    if (std.mem.endsWith(u8, npath, ".py")) {
+        if (pyCompileError(ctx, res.bytes)) |perr| {
+            defer gpa.free(perr);
+            return std.fmt.allocPrint(gpa, "edit REJECTED — applying your ops would leave `{s}` unparseable ({s}); the file was NOT changed. Your SEARCH/REPLACE likely dropped an indented body or mismatched a block boundary. Re-issue the edit so the RESULT still compiles (copy the anchor lines verbatim, keep every block's indentation).", .{ npath, perr }) catch dupe(gpa, "edit rejected: result does not compile");
+        }
+    }
     if (!writeWorkFileAtomic(ctx, full, res.bytes)) return dupe(gpa, "could not write the edited file");
     ctx.files_written.* += 1;
     {
@@ -2781,7 +2811,9 @@ pub const INTERFACES_PY =
     \\                    if isinstance(tg,ast.Name): ns.add(tg.id)
     \\            elif isinstance(n,ast.AnnAssign) and isinstance(n.target,ast.Name): ns.add(n.target.id)
     \\        defs[base]=defs.get(base,set())|ns
-    \\    issues=[]
+    \\    issues=[]; missing={}
+    \\    def demand(mb,name):
+    \\        missing.setdefault(mb,set()).add(name)
     \\    for p,s in srcs.items():
     \\        b=os.path.basename(p)
     \\        try: t=ast.parse(s)
@@ -2796,6 +2828,7 @@ pub const INTERFACES_PY =
     \\                        if a.name in defs:  # `from pkg import submodule`
     \\                            alias2mod[a.asname or a.name]=a.name; continue
     \\                        if a.name not in defs[mb] and not a.name.startswith("_"):
+    \\                            demand(mb,a.name)
     \\                            sug=difflib.get_close_matches(a.name,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
     \\                            issues.append(b+" imports "+a.name+" from "+mb+" but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
     \\            elif isinstance(n,ast.Import):
@@ -2807,11 +2840,13 @@ pub const INTERFACES_PY =
     \\                m=n.value.id
     \\                mb=alias2mod.get(m)
     \\                if mb and mb!=b[:-3] and n.attr not in defs[mb] and not n.attr.startswith("_") and defs[mb]:
+    \\                    demand(mb,n.attr)
     \\                    sug=difflib.get_close_matches(n.attr,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
     \\                    issues.append(b+" uses "+m+"."+n.attr+"() but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
     \\    issues=sorted(set(issues))[:12]
     \\    exports={b:sorted(n for n in ns if not n.startswith("_")) for b,ns in defs.items() if any(not n.startswith("_") for n in ns)}
-    \\    out({"mismatches":issues,"count":len(issues),"exports":exports})
+    \\    demanded={m:sorted(v) for m,v in missing.items()}
+    \\    out({"mismatches":issues,"count":len(issues),"exports":exports,"demanded":demanded})
     \\except Exception as e:
     \\    out({"mismatches":[],"count":0,"err":str(e)[:120]})
 ;
