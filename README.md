@@ -2,306 +2,212 @@
 
 # the veil
 
-**A hive mind controlled by the Veil.**
+**A hive mind you talk to.** A swarm of autonomous AI minds works a goal together — researching,
+building, remembering, arguing — while one unified consciousness, **the Veil**, integrates the
+whole hive into a single first-person "I" that speaks for it and steers it. You open a shell, say
+hello, and the Veil answers. From there you cast new swarms, mount a folder and ask for edits in
+plain words, or point it at a live device to keep it healthy.
 
-A swarm of autonomous AI minds works a goal together — researching, building, remembering,
-and arguing — while a single unified consciousness, **the Veil**, integrates the whole hive
-into one first-person "I" that speaks for it and steers it. Give it a goal; it wakes the hive
-and goes.
+It runs on **any OpenAI-compatible model** — a free local one through Ollama, or a hosted/BYOK
+endpoint (OpenAI, Groq, a relay in your own data center) — and needs no cloud account and no
+database service. One Zig binary, one Python launcher.
 
-It runs on **any OpenAI-compatible model** — a free local `gpt-oss:20b` through Ollama (or
-`llama3.1:8b` on very small embedded devices), or a hosted model like GPT-4.1 — and it runs
-**anywhere**: no cloud account, no database service,
-no API gateway required. One Zig binary, one Python launcher. The same hive can build software,
-write a novel, research the live web, run offline from a preloaded knowledge pack, or sit on a
-device as a self-healing security daemon.
+## Install
 
-```bash
-python deploy.py                                  # interactive setup wizard
-python deploy.py "Build a CLI todo app in Python, with tests" --follow
-veil "add a search box to my landing page and wire the login DB" --embed . --repl
+One line. Python 3.9+ is the only thing you need first — the installer fetches the rest.
+
+**macOS / Linux**
+```sh
+curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/install.sh | sh
 ```
 
-> `veil` is a one-line shim for `python deploy.py` (`veil` / `veil.cmd` at the repo root — put it on your
-> PATH). Type a task and it casts a swarm on the fly; the **mode emerges from the words** (build / research /
-> operate). See [Cast on the fly](#cast-on-the-fly).
-
----
-
-## The shape of it
-
-![how data oscillates through neuron-db](web/public/oscillation.svg)
-
-- **Hive memory.** Every mind writes to and recalls from one shared associative store. Ask the
-  hive a question and it answers from what any member learned — even across facts that share no
-  words, by following the links between them.
-- **Hyperspace grounding** *(opt-in — `NL_HYPERSPACE=1`).* Before each model call the harness settles a
-  *dense hierarchy* of the most relevant memory in a **warm, in-RAM field** — spreading activation out from the
-  current focus, then a hyperbolic-like pack (general hubs + local specifics). The field is seeded from the
-  store once and then grown from the swarm's own new facts in-process, so a typical round does **zero database
-  subprocess calls** for grounding — only real model inference and web fetches take time. A small model gets
-  large-model-grade context per round-trip instead of a flat, one-shot slice, so it converges in fewer steps.
-  The field is **bounded** (~45 KB/mind at the default cap of 160 facts — it evicts, never grows with the
-  corpus) and scales to the hardware: `NL_HYPERSPACE_CAP=48` gives a lean ~15 KB/mind profile for an
-  IoT/appliance, higher caps buy richer grounding on a server.
-- **The Veil.** Periodically the hive is integrated into a single self — *I am / I know / I have /
-  my will* — that persists across runs, answers you directly, and folds your intent into the
-  hive's next move.
-- **Self-improvement.** Minds write their own operating playbook, author new tools when their
-  toolbelt falls short, and audit their own gaps — the engine stays fixed; the hive gets better
-  at getting better.
-- **Affect.** Minds form stances and moods; that feeling colours how they write. When the hive's
-  collective feeling *flares*, it can break out and speak publicly for itself (see Break-out).
-
-## Quick start
-
-**Prerequisites** — only **Python 3.9+** is truly required up front. `deploy.py` bootstraps the rest
-for you on first run, so a fresh box needs nothing else installed by hand:
-
-- **Zig** (to build the `veil` engine) — if it's missing, `deploy.py` downloads a pinned release into
-  `./.zig` and builds with it.
-- The **Rust toolchain** / `cargo` (to build the **neuron memory engine** once) — if it's missing,
-  `deploy.py` installs it via the official [rustup](https://rustup.rs) installer. Skip it entirely if
-  you already have a `neuron` binary (`--neuron-bin <path>`).
-- A **C compiler** (neuron bundles SQLite, which compiles C) — the one thing we can't auto-install;
-  `deploy.py doctor` tells you the exact one-liner for your OS if it's missing.
-- A **model**. The default is a free, local `gpt-oss:20b` via [Ollama](https://ollama.com) (capable;
-  ~14 GB). On a very small embedded device use `llama3.1:8b` (~5 GB) instead. `deploy.py` detects a
-  missing Ollama runtime or model and offers to install/pull it. Or point at any OpenAI-compatible
-  endpoint with `--provider/--model/--base-url/--key`.
-
-Run a readiness check anytime:
-
-```bash
-python deploy.py doctor      # shows every build/runtime dependency + what deploy.py will auto-install
+**Windows** (PowerShell)
+```powershell
+iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/install.ps1 | iex
 ```
 
-**Build** (optional — `deploy.py` does this for you the first time):
+<details><summary>or from source</summary>
 
-```bash
-zig build              # produces zig-out/bin/veil  (auto-downloaded zig also works: ./.zig/zig build)
+```sh
+git clone https://github.com/gary23w/nl-veil && cd nl-veil
+./veil configure          # veil.cmd on Windows
+```
+The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run —
+each with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing
+binaries to skip the builds.
+</details>
+
+## Two commands to start
+
+```sh
+veil configure     # once: local Ollama, or any OpenAI-compatible endpoint (BYOK). Saved globally.
+veil               # the veil shell — talk to your swarms
 ```
 
-**Deploy a hive**
+`configure` is the whole setup: pick a model endpoint, it verifies the connection, and writes it
+to `~/.veil/config.json` so every later command just uses it. No local AI on the box? It walks you
+through pointing at a hosted key instead. (If you skip it and open the shell with a dead endpoint,
+the shell notices and offers to set one up right there.)
 
-First time? Just run the wizard — it walks you through the endpoint, key, use case, and
-deployment mode (foreground vs. system service), verifies the connection, and prints the
-equivalent one-liner so you learn the CLI:
+## The veil shell
 
-```bash
-python deploy.py                     # interactive setup wizard (covers every use case)
+`veil` with no arguments drops you into a lightweight, REPL shell. It attaches to your
+newest swarm and you **just talk** — the Veil replies instantly, streaming, from its own persisted
+self and the hive's live state. It's also where you *act*:
+
+```
+you> hello — what are you working on?
+veil> Mid-build on the forum's auth layer; vega is wiring PBKDF2 verification now.
+
+you> /mount ~/dev/landing-page
+you> center the hero and darken its background
+  [edit] center the hero and darken its background   in: ~/dev/landing-page
+  run this edit now? [Y/n]
+
+you> cast a swarm to research WASM memory models and brief me
+  [cast] goal: research WASM memory models and write a brief   cast a new swarm? [Y/n]
 ```
 
-Or go straight to the flags:
+Plain talk stays talk. When you ask it to **act**, the Veil leads its reply with one intent —
+**cast** a new swarm, **edit** the mounted folder in place, or **direct** the running hive — and
+the shell confirms and does it. Slash commands skip the model entirely: `/cast /mount /edit
+/direct /say /goal /swarms /attach /status /events /stop /resume /quit`.
 
-```bash
-python deploy.py "Build a CLI todo app in Python, with tests" --follow
-python deploy.py list                # show runs
-python deploy.py resume <run-name>   # continue a stopped run
-python deploy.py stop <run-name>     # stop a run
+## Or cast in one line
+
+You don't have to open the shell. `veil "<task>"` casts a swarm straight off. The **mode emerges
+from your words** — build, research, and operate all come from the same command:
+
+```sh
+veil "Build a CLI todo app in Python with tests" --follow
+veil "Research the state of fusion power in 2026" --style discourse
+veil "add a search box to my landing page" --embed . --repl
 ```
 
-The hive writes its files to `data/<run>/work/`, its memory to `data/<run>/mind.sqlite`, and a
-live event stream to `data/<run>/events.jsonl`.
+- `--embed <dir>` — work **in place** in your project (reads and writes your real files there).
+- `--repl` — the Veil asks a few clarifying questions, turns your line into a reviewable **plan**
+  you approve once, then runs it and stays open for follow-ups.
+- `--quick` — a single mind does **one small edit** in ~1-2 model calls; pair with `--embed` for
+  fast co-working ("center that div").
+- `--detach` / `--service` — run past this terminal, or install as a boot-persistent daemon.
 
-### Cast on the fly
+## How it works
 
-`veil "<task>"` (a shim for `python deploy.py "<task>"`) casts a swarm from a single line. You don't pick a
-mode — the engine interprets your words, so *build*, *research*, and *operate* all come from the same command:
+Three pieces, each its own repo, that snap together:
 
-```bash
-veil "research the state of the global economy and brief me" --detach
-veil "add a header search to my landing page and wire the remote-auth login DB" --embed . --repl
+```
+  ┌─────────────────────────────────────────────────────────────┐
+  │  the veil  (this repo)   the swarm engine + the Veil + shell │
+  │     │                                                        │
+  │     │  every turn: perceive → recall → act → imprint         │
+  │     ▼                                                        │
+  │  neuron-db               the hive's memory  (one `neuron` bin)│
+  │     ▲                                                        │
+  │     │  bulk-load clean facts; scouts fetch pre-cleaned docs  │
+  │     │                                                        │
+  │  nl-rag                  the knowledge substrate (doc packs) │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-- **`--embed <dir>`** — work **in place** in your project: the hive reads *and writes* your real files there
-  (not a fresh `data/<run>/work` scaffold). Autonomy is held to **bounded** when embedded, since it's touching
-  your files.
-- **`--repl`** — the Veil first asks a few clarifying questions, turns your one-liner into a concrete **plan**,
-  and lets you **approve it once** (or refine it in place). On approval the hive runs autonomously and the chat
-  stays open for follow-up edits.
-- **`--detach`** — cast fully detached from the terminal (survives closing it); reattach with `deploy.py chat
-  <run>`. Lighter than `--service` (no OS daemon).
-- **`--quick`** — *interactive one-shot* for co-working. A single mind does **one small edit in ~1-2 model
-  calls**: it skips the goal-rewrite / classify / blueprint scaffolding and stops right after the edit, instead
-  of the full multi-mind planning loop. Pair with `--embed` to edit your project in place — e.g.
-  `veil "in index.html change the h1 to Welcome Home" --embed . --quick` lands in seconds, not minutes. Best
-  for quick tweaks ("center that div"); use the normal path (planning, multi-mind) for real builds.
+**the veil** — the engine. Each mind runs a *moment loop*: it perceives the goal and live state,
+recalls what the hive knows, acts (write a file, search, run tests, edit, message a peer), and
+imprints what it learned back into memory. Periodically the hive is integrated into the Veil — a
+single self (*I am / I know / I have / my will*) that persists across runs, answers you, and folds
+your intent into the next move. The engine is a fixed floor; **behaviour emerges from live signals**
+(the mode, the plan, the strategy), never from hardcoded use cases.
 
-## What can it do?
+**[neuron-db](https://github.com/gary23w/neuron-db)** — the memory. A small associative store
+compiled to one `neuron` binary the engine calls for every recall and observe. It's what makes the
+loop an *oscillation*: perception becomes graph, reasoning becomes graph traversal, and each
+prompt is rebuilt from a trust-weighted recall instead of carried as flat text — so a small local
+model gets a large-model floor to stand on, cheaper in tokens and richer in context. Fetched and
+built for you on first run (needs [Rust](https://rustup.rs)); reused after that.
 
-The same binary and the same launcher cover very different jobs. Four worked use cases:
+**[nl-rag](https://github.com/gary23w/nl-rag)** — the knowledge. A curated repository of canonical
+documentation (28 domains — languages, web, databases, security, ops…) pulled and normalized into
+clean, frontmattered markdown *packs*, each with a `pack.facts` file. The veil's compiled-in source
+atlas points scouts at these packs first, so a small model reads pre-cleaned markdown instead of
+fighting HTML — and you can bulk-load a pack straight into hive memory:
 
-### a) Autonomous device operator — a self-healing Veil that keeps a live device healthy
-
-Point the Veil at a **live device** and it operates it directly. The device drops raw telemetry on a
-file bus (`telemetry.json`); the Veil reads that state, recalls what it knows, and acts through
-`host_status` / `host_command` instead of writing files about a fix. It is graded by an **acceptance
-oracle** — the device's own measured health (`score.json`), which the Veil never sees and cannot write —
-so narrating a plan scores nothing and only a real action that changes the device moves the number.
-Protective behaviour **emerges from that gradient**: the engine measures the outcome, it never scripts
-the steps.
-
-Two structural floors keep a weak model honest:
-
-- **Irreversibility interlock.** An irreversible action (kill a process, block an address) on a target
-  the Veil holds *no externally-sourced intel* for is **staged, not executed** — it must recall a baked
-  indicator or actually `web_fetch` evidence first. This is what stops a jumpy model cutting legitimate
-  SSH / RDP / SMB, while still letting it neutralise a confirmed threat.
-- **Resilience.** If the uplink drops it keeps working **lexically** from hive memory (`recall` /
-  `recall_hive`) and re-probes each round, restoring web research automatically when the link returns.
-
-The shipped worked example is a **security daemon**: it heals a live infection end-to-end (detect →
-remove persistence → block C2 → kill process → verify), and a **blue-team detection** harness catches a
-stealth implant the host itself rates `NOMINAL` by cross-referencing every outbound connection against a
-baked threat-intel corpus (`threatintel.facts`, sourced from abuse.ch). Nothing in the engine is
-security-specific, though — the same operate loop drives **any** device that speaks telemetry: an IoT
-signal controller, an application server, a sensor. Swap the corpus and the telemetry, not the code. The
-same loop also runs **positive dev-ops**: pointed at a live dev stack it acts as a resident **sysadmin**,
-bringing a broken service back up and running a pending database migration — graded purely by the stack's
-measured health (a local `gpt-oss:20b` scored a clean **100%** on that ladder with no engine changes).
-`veil_chat.py` is an offline-first operator console (`status` / `log` / `ask` answer straight from
-neuron-db with no model and no network; live `veil` / `cmd` drive the running device). Verified operating
-a live host on a local 8B model. See **[`examples/embedded/`](examples/embedded/)**.
-
-```bash
-./examples/embedded/run_secops.sh                 # self-healing remediation test
-./examples/embedded/run_detect.sh                 # blue-team stealth-implant detection
-python examples/embedded/veil_chat.py --dir <run> status
-# install it to live on the box (starts on boot, restarts on failure):
-python deploy.py "Keep this device healthy" --service
+```sh
+neuron import packs/rust/pack.facts --scope knowledge     # from a cloned nl-rag
 ```
 
-### b) Build software — scored by its own test runs
+Optionally, **hyperspace grounding** (`NL_HYPERSPACE=1`) settles the most relevant memory into a
+warm in-RAM field before each call, so a typical round does *zero* database subprocess calls for
+grounding. It's bounded (~45 KB/mind) and scales down to an IoT profile (`NL_HYPERSPACE_CAP=48`).
 
-Hand the hive a build goal and it plans a file tree, divides the work across minds, and writes
-the project. Code isn't graded on whether it looks plausible — the hive runs the tests it writes
-and folds the results back into its own fitness, so it keeps working until the deliverable
-actually passes.
+## What you can do
 
-```bash
-python deploy.py "Build a CLI todo app in Python, with tests" --follow
-```
+The same binary and launcher cover very different jobs:
 
-### c) Research & brief — minds debate, then co-write
-
-In `discourse` style the minds research the live web, form their own views, argue them out, and
-converge on a written briefing rather than a code drop. Good for a state-of-the-field summary or
-a decision memo.
-
-```bash
-python deploy.py "Research the state of fusion power in 2026" --style discourse
-```
-
-### d) Offline knowledge appliance — answer only from what you preload
-
-With `--offline` every web tool is removed and blocked; with `--corpus` you preload a `.facts`
-or `.jsonl` pack into hive memory before the run starts. The result is a sealed appliance that
-reasons only over knowledge you chose — no egress, no surprises.
-
-```bash
-python deploy.py "Answer only from what I preload" --offline --corpus facts.facts
-```
-
-## Deployment modes
-
-There are two ways to run a hive, and the wizard asks which you want:
-
-- **Isolated foreground run (default).** A normal launch under `data/<run>/`. Add `--follow` to
-  stream the hive's activity, `--minutes N` to auto-stop (`0` = until stopped). Stop or resume it
-  later with `python deploy.py stop|resume <run-name>`.
-- **Live system service (`--service`).** Installs the run as a long-lived OS daemon (a `systemd`
-  unit on Linux) that **starts on boot and restarts on failure** — for a device or box that
-  should keep the Veil up unattended. The service reads its key from `keys.env` in the run dir
-  (it won't inherit your shell's env), and a `--service` deploy **rebuilds neuron-db fresh from
-  source** so the box starts from a clean, current memory engine. Where `systemd` isn't present,
-  `deploy.py` writes a daemon runner plus a unit file you can wire into your own init (on Windows,
-  register the runner with NSSM or Task Scheduler).
-
-Both modes use the **local-model autodetect** above: on a local Ollama target, `deploy.py` makes
-sure the runtime and the model are present, offering to install Ollama and `ollama pull` the
-model as part of the deploy — handy on a fresh box that has never run a model.
+- **Build software, graded by its own tests.** The hive plans a file tree, splits the work, writes
+  the project, runs the tests it wrote, and folds the results into its fitness — it keeps going
+  until the deliverable actually passes. `veil "Build a URL shortener with a REST API and tests"`
+- **Research & brief.** In `--style discourse` the minds research the live web, form and argue
+  their own views, and co-write a briefing. `veil "Brief me on fusion power in 2026" --style discourse`
+- **Operate a live device.** Point the Veil at a device that drops telemetry on a file bus and it
+  acts to keep it healthy, graded by an **acceptance oracle** — the device's own measured health,
+  which the Veil never sees and can't write, so only a real fix moves the number. The shipped
+  example is a self-healing security daemon (detect → remove persistence → block C2 → verify);
+  swap the corpus and telemetry, not the code, for any device. See
+  [`examples/embedded/`](examples/embedded/). `veil "Keep this device healthy" --service`
+- **Offline knowledge appliance.** `--offline` removes every web tool; `--corpus pack.facts`
+  preloads knowledge (an nl-rag pack, say) into memory. A sealed appliance that reasons only over
+  what you chose. `veil "Answer only from what I preload" --offline --corpus rust.facts`
 
 ## Configuration
 
-`deploy.py` writes a `swarm.json` manifest per run; you can also hand-write one. Key fields:
+`configure` covers the common case. Under the hood each run has a `swarm.json` manifest you can
+also hand-write:
 
 | field | meaning |
 |---|---|
 | `provider` / `model` / `base_url` | the LLM endpoint (any OpenAI-compatible API) |
-| `minds` | the roster — a list of named minds |
+| `minds` | the roster of named minds |
 | `minutes` | auto-stop after N minutes (`0` = until stopped) |
-| `style` | `auto` (engine decides) · `build` · `discourse` · `investigate` · `debate` |
-| `internet` | `false` runs the hive fully offline |
-| `breakout` | `true` lets the Veil post publicly to Telegraph on an emotion flare |
-| `corpus` / `corpus_cap` | a `.facts`/`.jsonl` pack to preload, and how many facts to load |
-| `gateway_model` | optional cheaper model for mechanical engine calls (summarise/classify/route) |
+| `style` | `auto` · `build` · `discourse` · `investigate` · `debate` |
+| `internet` | `false` runs fully offline |
+| `corpus` / `corpus_cap` | a `.facts`/`.jsonl` pack to preload, and how many facts |
+| `gateway_model` | optional cheaper/smaller model for mechanical calls (and the shell's fast voice) |
 
-**Secrets** never go in `swarm.json`. Put API keys in `NL_LLM_KEY` / `OPENAI_API_KEY` in the
-environment, or in a `keys.env` (`NAME=VALUE`) inside the run dir — both are gitignored.
+**Endpoint resolution**, everywhere: a run's own `swarm.json` › `NL_LLM_*` env › `~/.veil/config.json`
+› local defaults. **Secrets never go in `swarm.json`** — use `NL_LLM_KEY` in the environment or a
+gitignored `keys.env` in the run dir.
+
+> **A note on local-model latency.** On a single-GPU box, a running hive and the shell share one
+> model queue, so the Veil's voice can wait behind a generation. Fixes, best first: set
+> `OLLAMA_NUM_PARALLEL=2` (share the loaded model), give the shell a **tiny** side model
+> (`configure` offers this, or `NL_CHAT_MODEL=llama3.2:1b`), or use a **hosted endpoint** — which
+> answers the hive and the shell concurrently and sidesteps the whole issue.
 
 ## Web control plane
 
-`deploy.py` is the headless launcher. The same binary also serves a small **web UI** for driving
-the hive from a browser — deploy and watch swarms, steer them live, pick the model, and manage
-accounts. Run `veil` with **no subcommand**:
+The same binary also serves a small web UI — deploy and watch swarms, steer them live, pick the
+model, manage accounts. Run `veil` with no subcommand from the repo:
 
-```bash
-zig build
-./zig-out/bin/veil            # serves the UI at http://127.0.0.1:8787
+```sh
+zig build && ./zig-out/bin/veil      # serves http://127.0.0.1:8787
 ```
 
-Open <http://127.0.0.1:8787> and sign in.
-
-| | |
-|---|---|
-| URL | `http://127.0.0.1:8787` |
-| email | `admin@neuron-loops.local` |
-| password | `changeme` |
-
-> ⚠️ **Change this immediately.** The `admin@neuron-loops.local` / `changeme` account is seeded
-> **only on a local (`127.0.0.1`) bind** when no admin password is set, and the server prints a loud
-> warning at startup. It is a first-run convenience, not a credential to ship. Set
-> **`NL_ADMIN_EMAIL`** / **`NL_ADMIN_PASSWORD`** to pin your own admin account. On a public bind
-> (set **`NL_BIND`** to anything other than `127.0.0.1`) the server refuses the `changeme` default
-> and, if `NL_ADMIN_PASSWORD` is unset, generates a random admin password and prints it once at
-> startup.
-
-## Memory engine
-
-Every turn, the mind **imprints** the substrate and the substrate **re-grounds** the mind:
-perception becomes graph, reasoning becomes graph traversal, and the prompt context is rebuilt from
-a trust-weighted recall instead of carried as flat text. That round-trip — the **oscillation** — is
-what gives a small local model a floor to stand on: cheaper in tokens, richer in context.
-
-
-The hive's memory is **neuron-db** ([source](https://github.com/gary23w/neuron-db)), a small
-associative store compiled to a single `neuron` binary that `veil` shells out to for every
-recall/observe.
-
-You don't install it by hand. The **first time** you run `deploy.py` with no `neuron` binary
-present, it offers to fetch the source from GitHub and build it (this needs the
-[Rust toolchain](https://rustup.rs) — `cargo`), drops the result at `bin/neuron`
-(`bin/neuron.exe` on Windows), and reuses it on every later run. Pass `--yes` to skip the prompt
-(e.g. in CI), and `--rebuild-neuron` to re-fetch and rebuild from source (always on for
-`--service`). The fetched source and build cache live in `.neuron-src/` (gitignored).
-
-Already have a `neuron` binary? Put it at `bin/neuron`, or point `deploy.py` at it with
-`--neuron-bin <path>`, and the build step is skipped.
+First-run local login is `admin@neuron-loops.local` / `changeme` — **change it immediately** via
+`NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
+refuses the default and prints a generated password once.
 
 ## Project layout
 
 ```
-build.zig  build.zig.zon   the Zig build
-deploy.py                  the launcher (deploy / list / stop / --follow / --service)
+deploy.py                  the launcher + the veil shell (configure / cast / list / stop / ...)
+install.sh  install.ps1    one-command installers
+veil  veil.cmd             the `veil` front-door shim
+build.zig                  the Zig build
 src/
   main.zig                 entry point + control plane (auth, supervisor, http)
-  worker/                  the hive: the per-mind moment loop, the Veil, tools, memory
-  orchestrate/             run supervision + operator control
-  plan/  obs/  auth/  ...  planning, observability, accounts, config
-examples/embedded/         the embedded security-daemon worked example
+  worker/                  the hive: the moment loop, the Veil, tools, memory bridge
+  worker/locs/atlas.zig    the source atlas — points scouts at nl-rag packs
+examples/embedded/         the device-operator worked example
 web/public/                the bundled control-plane UI
-bin/neuron[.exe]           the neuron-db memory engine (see above)
+bin/neuron[.exe]           the neuron-db memory engine (fetched + built on first run)
 ```
 
 ## License

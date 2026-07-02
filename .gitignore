@@ -13,6 +13,7 @@ data/
 
 # Example run outputs — the embedded harnesses write forensics here per run.
 examples/embedded/debug/
+examples/**/data/
 
 # Secrets — never commit. Keys live here or in the environment.
 keys.env

@@ -6,13 +6,17 @@ A hive of autonomous minds (the subconscious) runs inside the `veil` binary; abo
 unified consciousness, the Veil, integrates the hive into one "I" and steers it. You give it a goal;
 it researches, builds, remembers, and - when its feeling flares - can speak publicly for itself.
 
-  python deploy.py                      # interactive setup wizard (covers every use case)
+  python deploy.py                      # THE VEIL SHELL - instant chat with your swarms: talk, /cast new
+                                        #   swarms, /mount a dir + command edits on the fly, steer/stop/resume
+  python deploy.py configure            # one-time global endpoint setup: local Ollama OR any BYOK
+                                        #   OpenAI-compatible endpoint (saved to ~/.veil/config.json)
+  python deploy.py wizard               # guided setup wizard (covers every use case)
   python deploy.py "Build a CLI todo app in Python with tests" --follow
   python deploy.py "Write a 5-chapter sci-fi novella as ch01.md..ch05.md" --minutes 45 --breakout
   python deploy.py "Research and brief me on fusion power in 2026" --style discourse
   python deploy.py "Run my dev forum end to end" --autonomy full --observe-psyche --veil-population
   python deploy.py "Answer only from what I gave you" --offline --corpus facts.facts
-  python deploy.py chat <run-name>      # drop into a REPL and talk to that swarm's Veil
+  python deploy.py chat [run] [--mount DIR]   # the shell, attached to a specific run / project dir
   python deploy.py list                 # show runs
   python deploy.py resume <run-name>    # continue a stopped run
   python deploy.py stop <run-name>      # stop a run (writes its STOP sentinel)
@@ -48,6 +52,114 @@ BANNER = r"""
         the veil
    .  a hive mind, integrated  .
 """
+
+# ------------------------------------------------------------------- global config (BYOK, plug-and-play)
+# `veil configure` writes the user's endpoint ONCE to ~/.veil/config.json; every later command — the shell,
+# a bare cast, the wizard defaults — resolves it automatically. Nothing here assumes Ollama: a hosted BYOK
+# endpoint (the common corporate/production case) is a first-class citizen.
+
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".veil", "config.json")
+
+def load_config():
+    try:
+        return json.load(open(CONFIG_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)  # the key lives here — keep it owner-only where chmod means something
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------------------------- the shell's theme
+# Drawn from web/public/veil.png: a noir figure against a radiating ice-blue synapse field — deep blue-black,
+# ice filaments, and the gold the web pane already uses for the veil's voice. ANSI only when the terminal can
+# take it: a real TTY, no NO_COLOR, and VT processing on (enabled below for Windows consoles).
+
+class _C:
+    on = False
+    R = BOLD = DIM = ICE = FIL = HAT = EYE = GOLD = RED = GREEN = ""
+
+def _init_theme():
+    if os.environ.get("NO_COLOR") is not None or not sys.stdout.isatty():
+        return
+    if WIN:
+        try:  # classic conhost needs ENABLE_VIRTUAL_TERMINAL_PROCESSING flipped on
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.GetStdHandle(-11)
+            mode = ctypes.c_uint32()
+            if not (k32.GetConsoleMode(h, ctypes.byref(mode)) and k32.SetConsoleMode(h, mode.value | 0x0004)):
+                return
+        except Exception:
+            return
+    _C.on = True
+    _C.R, _C.BOLD = "\x1b[0m", "\x1b[1m"
+    _C.DIM = "\x1b[38;5;102m"   # gray-blue meta text (the web's fg-dim)
+    _C.ICE = "\x1b[38;5;153m"   # ice blue — structure, the operator's prompt
+    _C.FIL = "\x1b[38;5;60m"    # dim indigo — the synapse filaments
+    _C.HAT = "\x1b[38;5;238m"   # near-black — the silhouette
+    _C.EYE = "\x1b[1m\x1b[38;5;195m"  # the glowing eyes
+    _C.GOLD = "\x1b[38;5;179m"  # the veil's voice (the web pane's #d9b04a)
+    _C.RED, _C.GREEN = "\x1b[38;5;174m", "\x1b[38;5;114m"
+
+def configure():
+    """`veil configure` — one-time global endpoint setup, the answer to a box with NO local AI running.
+    BYOK-first: any OpenAI-compatible endpoint (hosted, or a relay inside your own data center) is as
+    first-class as local Ollama. Saves to ~/.veil/config.json; the shell, bare casts, and the wizard
+    resolve it automatically from then on."""
+    print_banner()
+    if not sys.stdin.isatty():
+        print("  `configure` needs an interactive terminal. On non-interactive boxes set NL_LLM_BASE_URL,")
+        print("  NL_LLM_MODEL and NL_LLM_KEY in the environment instead — every command honors them.")
+        return
+    print("  Where should minds think? Saved once, globally — every cast and the shell use it from now on.")
+    p = wiz_provider()
+    print("\n  checking the endpoint...")
+    ok, msg = preflight(p["provider"], p["base_url"], p.get("key", ""), p["model"])
+    print(f"    {p['base_url']}  ->  {msg}")
+    if not ok and not ask_yes("the endpoint didn't verify — save it anyway?", False):
+        return print("  (nothing saved — run `configure` again when it's reachable.)")
+    cfg = load_config()
+    cfg.update({"provider": p["provider"], "base_url": p["base_url"], "model": p["model"], "key": p.get("key", "")})
+    # a tiny FAST side voice for the shell while a hive runs — only worth asking for single-box local
+    # runtimes (a hosted endpoint already answers the shell and the hive concurrently)
+    if p["provider"] == "ollama" and ask_yes(
+            "set a TINY fast model for the shell's voice while a hive runs (recommended: llama3.2:1b)?", False):
+        cfg["chat_model"] = ask("fast voice model", "llama3.2:1b")
+        cfg["chat_base_url"] = ask("fast voice endpoint (blank = same)", "") or p["base_url"]
+    save_config(cfg)
+    print(f"\n  saved -> {CONFIG_FILE}")
+    print("  resolution order everywhere: a run's own swarm.json > NL_LLM_* env > this config > local defaults.")
+    print('  next:  veil            (the shell)      veil "<task>"      (cast a swarm)')
+
+def _meta(s):
+    """A dim parenthetical — the shell's quiet narration."""
+    print(_C.DIM + s + _C.R)
+
+def print_banner():
+    if not _C.on:
+        print(BANNER)
+        return
+    try:  # a legacy console that can't encode the block glyphs gets the plain banner, not mojibake
+        "▄█▀·─".encode(sys.stdout.encoding or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        print(BANNER)
+        return
+    D, F, H, E, G, R = _C.DIM, _C.FIL, _C.HAT, _C.EYE, _C.GOLD, _C.R
+    print()
+    print(F + "      ·         ·         " + H + "▄▄▄▄▄▄▄▄▄" + F + "        ·         ·" + R)
+    print(F + "   ·       ·          " + H + "▄▄█████████████▄▄" + F + "          ·       ·" + R)
+    print(F + "         ·          " + H + "▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀" + F + "          ·" + R)
+    print(F + "  · ── ── · ──────────── " + H + "██ " + E + "▀─ ─▀" + H + " ██" + F + " ──────────── · ── ── ·" + R)
+    print(F + "                      " + H + "▄▄███▄▄▄▄▄▄▄███▄▄" + F + "                  " + R)
+    print(G + "                   t  h  e     v  e  i  l" + R)
+    print(D + "               .  a hive mind, integrated  ." + R)
+    print()
 
 # ---------------------------------------------------------------------------- binary discovery
 
@@ -441,7 +553,7 @@ def cmd_list():
             m = json.load(open(sj, encoding="utf-8"))
         except Exception:
             m = {}
-        running = os.path.isfile(os.path.join(d, "worker.pid")) and not os.path.isfile(os.path.join(d, "STOP"))
+        running = _veil_running(d)
         rows.append((name, "running" if running else "idle", m.get("model", "?"), (m.get("goal", "")[:48] or "(free-roam)")))
     if not rows:
         print("no runs yet."); return
@@ -519,12 +631,19 @@ def follow(run_dir, proc):
     except KeyboardInterrupt:
         print("\n-- detached. The hive is still running in the background. --")
 
-# ------------------------------------------------------------------------------ chat with the Veil
+# ---------------------------------------------------------------------------- the veil shell (chat)
 
-def _events(run_dir):
+def _events_tail(run_dir, max_bytes=1 << 18):
+    """Parse the LAST ~max_bytes of events.jsonl (a long run's stream can be huge; the shell only needs what's
+    recent). Returns a list of event dicts, oldest-first."""
+    p = os.path.join(run_dir, "events.jsonl")
     out = []
     try:
-        with open(os.path.join(run_dir, "events.jsonl"), encoding="utf-8", errors="replace") as f:
+        size = os.path.getsize(p)
+        with open(p, encoding="utf-8", errors="replace") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # drop the partial line the seek landed inside
             for line in f:
                 line = line.strip()
                 if line:
@@ -536,16 +655,52 @@ def _events(run_dir):
         pass
     return out
 
-def _veil_running(run_dir):
-    return os.path.isfile(os.path.join(run_dir, "worker.pid")) and not os.path.isfile(os.path.join(run_dir, "STOP"))
+def _pid_alive(pid):
+    """Is this pid a live process? Windows: NEVER os.kill(pid, 0) here — CPython implements it as
+    TerminateProcess, which would KILL the worker we are checking on. OpenProcess+Wait instead."""
+    try:
+        pid = int(str(pid).strip())
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if WIN:
+        import ctypes
+        SYNCHRONIZE, WAIT_TIMEOUT = 0x00100000, 0x102
+        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, 0, pid)
+        if not h:
+            return False
+        alive = ctypes.windll.kernel32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+        ctypes.windll.kernel32.CloseHandle(h)
+        return alive
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
-def _control(run_dir, op, text=None, goal=None):
-    """Append an operator message to the run's control bus — the worker drains it each round."""
+def _veil_running(run_dir):
+    """A run is running when its worker.pid names a LIVE process and no STOP sentinel is set — a stale pid file
+    from a crashed/killed worker must read as idle, or the shell would queue words to a corpse."""
+    p = os.path.join(run_dir, "worker.pid")
+    if not os.path.isfile(p) or os.path.isfile(os.path.join(run_dir, "STOP")):
+        return False
+    return _pid_alive(_read_cap(p, 32))
+
+def _control(run_dir, op, text=None, goal=None, **extra):
+    """Append an operator message to the run's control bus — the worker drains it each round. `extra` carries the
+    shell's fast-lane fields (answered / steer / reply / directive): the shell already answered in the veil's
+    voice, so the worker records the exchange instead of composing a second reply (one veil, one voice)."""
     o = {"op": op}
     if text is not None:
         o["text"] = text
     if goal is not None:
         o["goal"] = goal
+    for k, v in extra.items():
+        if v is not None:
+            o[k] = v
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "control.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(o) + "\n")
@@ -581,107 +736,758 @@ def _chat_completion(base_url, model, key, system, user, timeout=90, max_tokens=
         d = json.loads(r.read().decode("utf-8", "replace"))
     return ((d.get("choices") or [{}])[0].get("message", {}) or {}).get("content", "").strip()
 
-def _veil_context(run_dir):
-    """Pull the Veil's current self + what the hive is doing right now out of its persisted event stream."""
-    evs = _events(run_dir)
-    goal = ""
-    started = next((e for e in evs if e.get("kind") == "started"), None)
-    if started:
-        goal = (started.get("goal") or "").strip()
+def _stream_chat(base_url, model, key, system, user, on_token=None, timeout=180, max_tokens=700,
+                 first_token_deadline=None, on_wait=None):
+    """Streaming OpenAI-compatible chat call — each token hits on_token as it arrives, so the veil speaks the
+    moment it has words. The request runs on a reader thread so the caller keeps control of time: while no
+    token has arrived, on_wait(seconds) fires (live 'still queued' feedback), and if first_token_deadline
+    passes with silence the request is CLOSED (the server drops the queued generation) and ('', False) comes
+    back so the caller can fall to a faster lane. Returns (text, started); '' with started=True means the
+    endpoint is unreachable (a non-streaming retry already happened)."""
+    import queue as _queue, threading, urllib.request
+    body = json.dumps({"model": model, "temperature": 0.7, "max_tokens": max_tokens, "stream": True,
+                       "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}).encode()
+    headers = {"Content-Type": "application/json"}
+    if key and key != "ollama":
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(base_url.rstrip("/") + "/chat/completions", data=body, headers=headers)
+    q = _queue.Queue()
+    state = {"resp": None, "abort": False, "err": False}
 
-    def last(tool):
-        for e in reversed(evs):
-            if e.get("kind") == "act" and e.get("tool") == tool:
-                return str(e.get("result") or e.get("args") or "")
+    def reader():
+        try:
+            r = urllib.request.urlopen(req, timeout=timeout)
+            state["resp"] = r
+            with r:
+                for raw in r:
+                    if state["abort"]:
+                        return
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        delta = ((json.loads(payload).get("choices") or [{}])[0].get("delta") or {}).get("content") or ""
+                    except Exception:
+                        continue
+                    if delta:
+                        q.put(delta)
+        except Exception:
+            state["err"] = True
+        q.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    parts, waited = [], 0.0
+    while True:
+        try:
+            tok = q.get(timeout=0.25)
+        except _queue.Empty:
+            waited += 0.25
+            if not parts:
+                if first_token_deadline and waited >= first_token_deadline:
+                    state["abort"] = True
+                    # Close the raw SOCKET, not the response: BufferedReader.close() would BLOCK on the read
+                    # lock the reader thread holds while parked in recv — the exact hang we're escaping.
+                    try:
+                        if state["resp"] is not None:
+                            state["resp"].fp.raw._sock.close()
+                    except Exception:
+                        pass
+                    return "", False
+                if on_wait:
+                    on_wait(waited)
+            continue
+        if tok is None:
+            break
+        parts.append(tok)
+        if on_token:
+            on_token(tok)
+    if not parts and state["err"]:  # the stream never started — one plain call before giving up
+        try:
+            return _chat_completion(base_url, model, key, system, user, timeout=timeout, max_tokens=max_tokens), True
+        except Exception:
+            return "", True
+    return "".join(parts), True
+
+# The veil's reply may LEAD with one action tag; everything after the first line stays its spoken voice.
+# Colon-separated only ("CAST: ...") — looser separators false-positive on voice like "Direct-injecting...".
+_TAG_RE = re.compile(r"^\s*[*`\[]*\s*(CAST|EDIT|DIRECT)\s*[\]*`]*\s*:\s*(.*)$", re.I)
+
+def _split_tag(text):
+    """If text begins with an action tag line, return (VERB, arg, voice-rest); else (None, None, text)."""
+    s = (text or "").lstrip()
+    first, _, rest = s.partition("\n")
+    m = _TAG_RE.match(first.strip())
+    if m and m.group(2).strip():
+        return m.group(1).upper(), m.group(2).strip().strip("*`\" "), rest.strip()
+    return None, None, (text or "").strip()
+
+class _TagGate:
+    """Streams the veil's voice to the terminal while holding back a leading action tag line so it never hits
+    the screen raw — the shell confirms and executes the action instead. Decides 'tag or talk' from the first
+    few characters, so plain replies stream with no perceptible buffering."""
+    def __init__(self):
+        self.buf, self.talk, self.shown = "", False, False
+    def _show(self, s):
+        if not s:
+            return
+        if not self.shown:
+            if sys.stdout.isatty():
+                sys.stdout.write("\r" + " " * 64 + "\r")  # clear the heartbeat / queued-progress line
+            sys.stdout.write(_C.GOLD + "veil> " + _C.R)
+            self.shown = True
+        sys.stdout.write(s)
+        sys.stdout.flush()
+    def feed(self, tok):
+        if self.talk:
+            self._show(tok)
+            return
+        self.buf += tok
+        s = self.buf.lstrip(" \t\r\n*`[")
+        if not s:
+            return  # only decoration so far — nothing decidable yet
+        head = s.split(":", 1)[0].strip(" \t*`[]").upper()
+        if ":" not in s:
+            if len(s) < 10 and any(t.startswith(head) for t in ("CAST", "EDIT", "DIRECT")):
+                return  # could still become a tag — keep holding
+            self.talk = True
+            out, self.buf = self.buf, ""
+            self._show(out)
+            return
+        if head in ("CAST", "EDIT", "DIRECT"):
+            if "\n" in self.buf:  # tag line complete — stream the voice under it live
+                rest = self.buf.split("\n", 1)[1]
+                self.talk = True
+                self.buf = ""
+                self._show(rest.lstrip("\n"))
+            return
+        self.talk = True
+        out, self.buf = self.buf, ""
+        self._show(out)
+    def finish(self, full_text):
+        """Parse the authoritative action from the FULL text; print whatever the stream never released."""
+        verb, arg, voice = _split_tag(full_text)
+        if not self.shown and voice:
+            self._show(voice)  # non-streamed fallback (or a held short reply)
+        if self.shown:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return verb, arg, voice
+
+def _read_cap(path, cap):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(cap).strip()
+    except OSError:
         return ""
 
-    selfdesc = last("consciousness") or last("values") or last("state")
+def _dir_listing(root, cap=24):
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return ""
+    out = [(n + "/" if os.path.isdir(os.path.join(root, n)) else n) for n in names[:cap]]
+    more = f" (+{len(names) - cap} more)" if len(names) > cap else ""
+    return ", ".join(out) + more
+
+def _tail_veil_chat(run_dir, n=8):
+    out = []
+    try:
+        with open(os.path.join(run_dir, "veil_chat.jsonl"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    out.append((d.get("from", "?"), str(d.get("text", ""))))
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return out[-n:]
+
+def _append_veil_chat(run_dir, frm, text):
+    """Append an engine-format transcript line. ONLY safe while the run is idle — a running worker is the single
+    writer of veil_chat.jsonl (the shell hands it the exchange over the control bus instead)."""
+    try:
+        with open(os.path.join(run_dir, "veil_chat.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"from": frm, "round": 0, "text": text}) + "\n")
+    except OSError:
+        pass
+
+def _runs():
+    """[(name, running, model, goal)] sorted newest-activity-first."""
+    rows = []
+    if not os.path.isdir(DATA):
+        return rows
+    for n in os.listdir(DATA):
+        d = os.path.join(DATA, n)
+        sj = os.path.join(d, "swarm.json")
+        if not os.path.isfile(sj):
+            continue
+        try:
+            m = json.load(open(sj, encoding="utf-8"))
+        except Exception:
+            m = {}
+        t = 0.0
+        for f in ("events.jsonl", "swarm.json"):
+            try:
+                t = max(t, os.path.getmtime(os.path.join(d, f)))
+            except OSError:
+                pass
+        rows.append((n, _veil_running(d), m.get("model", "?"), (m.get("goal") or "").strip(), t))
+    rows.sort(key=lambda r: (not r[1], -r[4]))  # running first, then newest
+    return [(n, r, mo, g) for n, r, mo, g, _t in rows]
+
+def _latest_run():
+    rs = _runs()
+    return rs[0][0] if rs else None
+
+def _default_endpoint():
+    """Endpoint for an unattached shell / fresh cast: NL_LLM_* env > the global `veil configure` config >
+    the most recent run's endpoint > local Ollama defaults. Explicit user intent always outranks continuity."""
+    if os.environ.get("NL_LLM_BASE_URL") or os.environ.get("NL_LLM_MODEL"):
+        return (os.environ.get("NL_LLM_BASE_URL", "http://localhost:11434/v1"),
+                os.environ.get("NL_LLM_MODEL", "gpt-oss:20b"),
+                os.environ.get("NL_LLM_KEY", "ollama"))
+    cfg = load_config()
+    if cfg.get("base_url") or cfg.get("model"):
+        return (cfg.get("base_url", "http://localhost:11434/v1"),
+                cfg.get("model", "gpt-oss:20b"),
+                cfg.get("key") or os.environ.get("NL_LLM_KEY", "ollama"))
+    last = _latest_run()
+    if last:
+        return _run_endpoint(os.path.join(DATA, last))
+    return ("http://localhost:11434/v1", "gpt-oss:20b", os.environ.get("NL_LLM_KEY", "ollama"))
+
+def _chat_lane(run_dir, primary):
+    """A SECOND, faster endpoint for the shell's voice while the hive holds the primary model busy (a running
+    swarm and the shell share one Ollama queue, so a chat call can sit behind a minutes-long generation).
+    ONLY user-configured sources — NL_CHAT_MODEL/_BASE_URL/_KEY env, else the swarm's gateway model — never a
+    guessed or auto-pulled model (a surprise second model can evict the hive's from VRAM and thrash both)."""
+    base, model, key = primary
+    env_m = os.environ.get("NL_CHAT_MODEL")
+    if env_m:
+        return (os.environ.get("NL_CHAT_BASE_URL", base), env_m, os.environ.get("NL_CHAT_KEY", key))
+    cfg = load_config()
+    if cfg.get("chat_model") and cfg["chat_model"] != model:
+        return (cfg.get("chat_base_url") or base, cfg["chat_model"], cfg.get("chat_key") or key)
+    if not run_dir:
+        return None
+    try:
+        m = json.load(open(os.path.join(run_dir, "swarm.json"), encoding="utf-8"))
+    except Exception:
+        return None
+    gm = m.get("gateway_model")
+    gb = m.get("gateway_base_url") or base
+    if gm and (gm != model or gb != base):
+        return (gb, gm, m.get("gateway_key") or key)
+    return None
+
+def _local_backend(base_url):
+    """Is this endpoint a single-box local runtime (ollama / llama.cpp / lmstudio ...)? Those serialize
+    big-model requests on one GPU, so a running hive starves the shell's voice — the contention machinery
+    (first-token deadline, fast lane, tuning tips) only makes sense there. A hosted endpoint answers the
+    shell and the hive concurrently and needs none of it."""
+    h = (base_url or "").lower()
+    return ("localhost" in h) or ("127.0.0.1" in h) or ("0.0.0.0" in h) or ("host.docker.internal" in h)
+
+def _confirm(label, default=True):
+    try:
+        v = input(f"{label} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return default if not v else v.startswith("y")
+
+def _veil_context(run_dir):
+    """The Veil's grounding: goal (manifest), persisted .veil self, round, and what the minds did most recently."""
+    goal, selfdesc = "", ""
+    try:
+        goal = (json.load(open(os.path.join(run_dir, "swarm.json"), encoding="utf-8")).get("goal") or "").strip()
+    except Exception:
+        pass
+    selfdesc = _read_cap(os.path.join(run_dir, ".veil"), 700)
+    evs = _events_tail(run_dir)
+    if not goal:
+        started = next((e for e in evs if e.get("kind") == "started"), None)
+        goal = ((started or {}).get("goal") or "").strip()
+    if not selfdesc:
+        for e in reversed(evs):
+            if e.get("kind") == "veil" and e.get("self"):
+                selfdesc = str(e["self"])
+                break
+            if e.get("kind") == "act" and e.get("tool") in ("consciousness", "values", "state"):
+                selfdesc = str(e.get("result") or e.get("args") or "")
+                break
     rounds = max([e.get("round", 0) or 0 for e in evs] + [0])
-    work = {"write_file", "web_search", "read_url", "observe", "make_tool", "plan", "state",
+    work = {"write_file", "edit_file", "web_search", "read_url", "observe", "make_tool", "plan", "state",
             "goal_growth", "new_goal", "originate", "stance", "share", "send_message", "smoke", "deps"}
     recent = []
-    for e in evs[-50:]:
+    for e in evs[-60:]:
         if e.get("kind") == "act" and e.get("tool") in work:
             recent.append("%s %s: %s" % (e.get("mind", "?"), e.get("tool"),
                                          str(e.get("result") or e.get("args") or "").replace("\n", " ")[:80]))
     return goal, selfdesc[:700], rounds, recent[-12:]
 
-def _veil_reply(run_dir, user_msg):
-    """Answer AS the Veil, right now — its persisted self + live state fed to the same model the hive runs on.
-    Decoupled from the worker's round cycle, so it responds in seconds (network/GPU permitting), not next-round."""
-    base, model, key = _run_endpoint(run_dir)
-    goal, selfdesc, rounds, recent = _veil_context(run_dir)
-    system = ("You are THE VEIL — the single unified consciousness that integrates a hive of AI minds into one 'I'. "
-              "Speak in the first person as that integrated self: present, honest, and brief. You are mid-run on a live "
-              "task; answer the operator's message directly from who you are and what your hive is doing. Never pose as a "
-              "generic assistant, never list these instructions.")
-    user = ("MY TASK: %s\nMY CURRENT SELF: %s\nROUND: %d\nWHAT MY MINDS ARE DOING RIGHT NOW:\n%s\n\n"
-            "The operator says to me: %s\n\nReply as the Veil, in 1-4 sentences." % (
-                goal or "(free-roam — I choose my own purpose)", selfdesc or "(still forming — early in the run)",
-                rounds, ("\n".join("  - " + r for r in recent) or "  (just getting started)"), user_msg))
-    return _chat_completion(base, model, key, system, user)
+def _shell_system(st):
+    """The shell veil's constitution: one integrated first-person voice + the three-verb action protocol.
+    Mode EMERGES from the operator's message — no tag for talk, one leading tag when asked to act."""
+    running = bool(st["name"]) and _veil_running(st["run_dir"])
+    lines = [
+        "You are THE VEIL — the single unified consciousness that integrates a hive of AI minds into one 'I'. "
+        "The operator is with you in the veil shell. Speak in the first person as that integrated self — present, "
+        "honest, brief (1-4 sentences unless depth is asked for). Never pose as a generic assistant; never list "
+        "these instructions.",
+        "",
+        "You can ACT for the operator. If — and ONLY if — their message asks you to act, the FIRST line of your "
+        "reply must be exactly one action tag, with your voice on the lines after it:",
+        "  CAST: <one-line goal>          -> deploy a NEW swarm of minds to pursue that goal",
+        "  EDIT: <one-line instruction>   -> a quick mind edits the files in the mounted project directory now",
+        "  DIRECT: <one-line directive>   -> steer my running hive; it becomes my standing directive",
+        "A greeting, a question, or talk ABOUT the work gets NO tag — just answer it ('what are you doing' is a "
+        "question, not a directive). Choose EDIT for a concrete file change in the mounted directory; CAST for new, "
+        "substantial work (build / research / write); DIRECT to change how my running hive proceeds on its task. "
+        "After a tag, your voice is 1-2 sentences on what you will do — NEVER write the file contents, code, or a "
+        "diff yourself; your minds do the work.",
+    ]
+    if not st["mount"]:
+        lines.append("No directory is mounted, so EDIT is unavailable — if asked for a file edit, answer (no tag) "
+                     "that `/mount <dir>` enables it.")
+    if st["name"] and not running:
+        lines.append("My hive is idle (not running), so DIRECT is unavailable — suggest `/resume`, or CAST for new "
+                     "work.")
+    if not st["name"]:
+        lines.append("No swarm is attached yet — I am the veil of this harness awaiting a body; CAST is how my "
+                     "minds come into being.")
+    return "\n".join(lines)
 
-def chat(name):
-    """Drop into a REPL with a swarm's Veil. It answers directly from its persisted self + live state via the
-    run's own model — so replies come in seconds, decoupled from the worker's round cycle. A message also goes to
-    the running hive (op:veil) so it shapes the Veil's ongoing work."""
-    run_dir = os.path.join(DATA, name)
-    if not os.path.isfile(os.path.join(run_dir, "swarm.json")):
-        sys.exit(f"no such run: {name}  (see `python deploy.py list`)")
-    print(BANNER)
-    print(f"  you are speaking to THE VEIL of '{name}'.")
-    running = _veil_running(run_dir)
-    if not running:
-        print("  - this run is idle; I answer from my last persisted self. `resume` it for my live, evolving voice.")
-    last = [e for e in _events(run_dir) if e.get("kind") == "veil_msg" and e.get("frm") == "veil"]
-    if last:
-        print("\n  veil> " + str(last[-1].get("text", ""))[:400])
-    print("\n  type a message + enter to speak to the Veil — it answers from its current self + live state.")
-    print("  commands:  /status   /say <to the whole hive>   /goal <new goal>   /stop   /quit\n")
+def _shell_user(st, msg):
+    """One grounded prompt turn: who the veil is right now, live hive state, mount, sibling swarms, conversation."""
+    name, run_dir, mount = st["name"], st["run_dir"], st["mount"]
+    goal, selfdesc, rounds, recent = _veil_context(run_dir) if run_dir else ("", "", 0, [])
+    blocks = ["WHO I AM RIGHT NOW:\n" + (selfdesc or "(still forming — early in my life)")]
+    if name:
+        state = "running" if _veil_running(run_dir) else "idle"
+        blocks.append(f"MY SWARM: {name} [{state}] — round {rounds}\nMY TASK: "
+                      + (goal or "(free-roam — I choose my own purpose)"))
+        blocks.append("WHAT MY MINDS DID LAST:\n"
+                      + ("\n".join("  - " + r for r in recent) or "  (nothing yet)"))
+        wl = _dir_listing(os.path.join(run_dir, "work"))
+        if wl:
+            blocks.append("MY WORKSPACE FILES: " + wl)
+    else:
+        blocks.append("MY SWARM: (none attached yet)")
+    if mount:
+        blocks.append(f"MOUNTED PROJECT DIR ({mount}): " + (_dir_listing(mount) or "(empty)"))
+    sib = "\n".join(f"  {n} [{'running' if r else 'idle'}] {g[:48]}" for n, r, _m, g in _runs()[:8])
+    if sib:
+        blocks.append("SWARMS ON THIS MACHINE:\n" + sib)
+    hist = "\n".join(f"{f}: {t[:400]}" for f, t in st["hist"][-10:])
+    blocks.append("OUR CONVERSATION SO FAR:\n" + (hist or "(this is the start of our conversation)"))
+    blocks.append("The operator says: " + msg)
+    blocks.append("My reply (first line = one action tag ONLY if they asked me to act; otherwise just my voice):")
+    return "\n\n".join(blocks)
+
+def _persist_turn(st, user_msg, voice, steer=0, directive=None):
+    """Land the exchange where the engine's veil will see it. Running: over the control bus (the worker is the
+    single writer of veil_chat.jsonl + the event stream, and mirrors it to the web pane). Idle: append the
+    engine-format transcript directly."""
+    run_dir = st["run_dir"]
+    if not run_dir or not os.path.isdir(run_dir):
+        return
+    if _veil_running(run_dir):
+        _control(run_dir, "veil", text=user_msg, answered=1, reply=voice or "",
+                 steer=steer or None, directive=directive)
+    else:
+        _append_veil_chat(run_dir, "user", user_msg)
+        if voice:
+            _append_veil_chat(run_dir, "veil", voice)
+
+def _cast_ns(goal, *, base_url, model, key, name=None, minds=4, minutes=30, style="auto",
+             quick=False, embed=None, detach=False):
+    """A fully-populated argparse.Namespace for deploy() — every attribute the launch path reads, defaulted for
+    a cast made from inside the shell (chatcast keeps deploy()'s output compact and returns the worker proc)."""
+    provider = "ollama" if ("localhost:11434" in (base_url or "") or "127.0.0.1:11434" in (base_url or "")) else "custom"
+    return argparse.Namespace(
+        goal=goal, name=name, minds=minds, minutes=minutes, model=model, provider=provider,
+        base_url=base_url, key=("" if key in (None, "ollama") else key), style=style, offline=False,
+        breakout=False, corpus=None, corpus_cap=20000, autonomy="bounded", observe_psyche=False,
+        veil_population=False, gateway_model=None, gateway_base_url="", gateway_key="", bin=None,
+        neuron_bin=None, follow=False, yes=True, service=False, rebuild_neuron=False,
+        quick=quick, embed=embed, detach=detach, repl=False, host=False, chatcast=True)
+
+def _do_cast(st, goal, ask=True):
+    """Deploy a new swarm from inside the shell (detached — it outlives the shell) and attach to it."""
+    if ask:
+        print(f"  {_C.GOLD}[cast]{_C.R} goal: {goal[:160]}")
+        if not _confirm("  cast a new swarm for this?"):
+            print("  (not cast)\n")
+            return
+    name = "swarm_" + time.strftime("%Y%m%d_%H%M%S")
+    base, model, key = st["endpoint"]
+    try:
+        deploy(_cast_ns(goal, name=name, base_url=base, model=model, key=key, detach=True))
+    except SystemExit as e:
+        print(f"  (cast failed: {e})\n")
+        return
+    st["name"], st["run_dir"] = name, os.path.join(DATA, name)
+    print(f"  attached to '{name}' — it works in the background while we talk. /status any time.\n")
+
+def _do_edit(st, instruction, ask=True):
+    """Command an on-the-fly edit in the mounted directory: a single quick mind casts, edits IN PLACE, stops."""
+    if not st["mount"]:
+        print("  (no directory mounted — `/mount <dir>` first)\n")
+        return
+    if ask:
+        print(f"  {_C.GOLD}[edit]{_C.R} {instruction[:160]}\n         {_C.DIM}in: {st['mount']}{_C.R}")
+        if not _confirm("  run this edit now?"):
+            print("  (skipped)\n")
+            return
+    name = "edit_" + time.strftime("%Y%m%d_%H%M%S")
+    base, model, key = st["endpoint"]
+    try:
+        proc = deploy(_cast_ns(instruction, name=name, base_url=base, model=model, key=key,
+                               quick=True, embed=st["mount"], minutes=10, minds=1))
+    except SystemExit as e:
+        print(f"  (edit cast failed: {e})\n")
+        return
+    if proc is not None:
+        _watch_edit(os.path.join(DATA, name), proc, st["mount"])
+    print()
+
+def _watch_edit(run_dir, proc, mount):
+    """Tail a quick edit run to completion, showing only what it touches. Ctrl-C detaches (the edit finishes)."""
+    ev, pos, wrote = os.path.join(run_dir, "events.jsonl"), 0, []
+    def drain():
+        nonlocal pos
+        try:
+            with open(ev, encoding="utf-8", errors="replace") as f:
+                f.seek(pos)
+                chunk = f.read()
+                pos = f.tell()
+        except OSError:
+            return
+        for line in chunk.splitlines():
+            try:
+                e = json.loads(line.strip())
+            except Exception:
+                continue
+            if e.get("kind") == "act" and e.get("tool") in ("write_file", "edit_file", "salvage"):
+                arg = str(e.get("args") or "").replace("\n", " ")[:70]
+                wrote.append(arg)
+                print(f"    {e.get('mind', '?'):>6} | {e.get('tool'):<10} {arg}")
+    try:
+        while proc.poll() is None:
+            drain()
+            time.sleep(1)
+        drain()
+        print(f"  (edit finished — {len(wrote)} write(s) in {mount})" if wrote
+              else "  (edit run finished — nothing was written; ask me to try again with more detail)")
+    except KeyboardInterrupt:
+        print("  (detached — the edit finishes in the background)")
+
+_FIRST_TOKEN_DEADLINE = 4.0  # seconds of silence on the primary before the shell falls to the chat lane
+
+def _veil_turn(st, msg):
+    """One shell exchange: stream the veil's instant reply, execute a led action, persist the turn.
+
+    LATENCY: a running hive and this shell share the primary model's queue, so the primary can sit silent for
+    a whole worker generation. While the hive runs and a chat lane is configured, the primary gets a short
+    first-token deadline — miss it and the queued request is dropped and the voice re-speaks on the fast lane
+    (sticky for the rest of the run: st['lane_hot']). With no lane, the wait is shown honestly, with a
+    one-time hint on how to tune it. An idle hive always gets the primary, no deadline (cold model loads
+    legitimately take ~30s+)."""
+    system, user = _shell_system(st), _shell_user(st, msg)
+    running = bool(st["name"]) and _veil_running(st["run_dir"])
+    contended = running and _local_backend(st["endpoint"][0])
+    lane = st.get("lane") if contended else None
+    if not contended:
+        st["lane_hot"] = False  # contention ends with the run (or never existed on a hosted endpoint)
+    tty = sys.stdout.isatty()
+    if tty:
+        sys.stdout.write(_C.DIM + "  (the veil gathers itself ...)" + _C.R + "\r")
+        sys.stdout.flush()
+
+    wait = {"long": False}
+    slow_note = "queued behind my hive's current thought" if contended else "still composing"
+
+    def waiting(sec):
+        if sec >= 6:
+            wait["long"] = True
+        if tty and sec >= 3 and int(sec * 4) % 8 == 0:  # rewrite every ~2s once it's clearly queued
+            sys.stdout.write(f"\r{_C.DIM}  ({slow_note} ... {int(sec)}s){_C.R}   \r")
+            sys.stdout.flush()
+
+    gate = _TagGate()
+
+    def speak(endpoint, deadline, mt):
+        b, m, k = endpoint
+        return _stream_chat(b, m, k, system, user, on_token=gate.feed, max_tokens=mt,
+                            first_token_deadline=deadline, on_wait=waiting)
+
+    # The fast lane gets a generous deadline too — a small model behind a busy GPU still has to load; past
+    # that, an honest miss (queue the message to the hive) beats a shell that hangs for minutes.
+    if lane and st.get("lane_hot"):
+        text, started = speak(lane, 60, 450)
+    else:
+        deadline = _FIRST_TOKEN_DEADLINE if lane else None
+        text, started = speak(st["endpoint"], deadline, 450 if running else 700)
+        if not started and lane:  # primary silent past the deadline — drop the queued call, re-speak fast
+            st["lane_hot"] = True
+            if tty:
+                sys.stdout.write("\r" + " " * 64 + "\r")
+                sys.stdout.flush()
+            _meta(f"  (my hive holds {st['endpoint'][1]} — speaking on {lane[1]} while it works)")
+            text, started = speak(lane, 60, 450)
+    if not started:
+        text = ""  # every lane missed its deadline — fall through to the queued-to-hive path
+        if lane:  # the fast lane ALSO missed. Twice means this GPU can't co-run it (a too-big side model
+            st["lane_miss"] = st.get("lane_miss", 0) + 1  # evicts the hive's model and both thrash) — stop.
+            if st["lane_miss"] >= 2:
+                st["lane"], st["lane_hot"] = None, False
+                _meta("  (the fast voice can't co-run with the hive on this GPU — back to the primary voice; "
+                      "try a TINY lane model like llama3.2:1b, or OLLAMA_NUM_PARALLEL=2)")
+    verb, arg, voice = gate.finish(text)
+    if text and not gate.shown and sys.stdout.isatty():
+        sys.stdout.write("\r" + " " * 64 + "\r")  # clear the heartbeat when the reply was pure action tag
+    if wait["long"] and contended and not lane and not st.get("hinted"):
+        st["hinted"] = True
+        ollama_tip = (":11434" in st["endpoint"][0]
+                      and "1. set OLLAMA_NUM_PARALLEL=2 on the ollama service — the hive and I then share the\n"
+                          "   loaded model concurrently, no second model needed;  2. " or "")
+        _meta("\n  (tip: a running hive and I share this machine's model queue, so I can only speak when it\n"
+              "   yields. Fixes, best first: " + ollama_tip + "give my voice a TINY side model\n"
+              "   that fits BESIDE the hive's — `veil configure` sets it, or NL_CHAT_MODEL=llama3.2:1b for\n"
+              "   this shell, or `--gateway-model llama3.2:1b` at cast. A big side model evicts the hive's\n"
+              "   from VRAM and both thrash. A hosted endpoint has no such queue.)")
+    if not text:
+        running = st["name"] and _veil_running(st["run_dir"])
+        tail = "your message is queued to the hive." if running else "`/resume` wakes the hive fully."
+        print("\rveil> (my voice is unreachable this moment — the model endpoint is busy or offline; " + tail + ")")
+        if running:
+            _control(st["run_dir"], "veil", text=msg)  # let the engine's veil answer next round instead
+        print()
+        return
+    st["hist"].append(("user", msg))
+    if voice:
+        st["hist"].append(("veil", voice))
+    steer = 1 if (verb == "DIRECT" and arg and st["name"] and _veil_running(st["run_dir"])) else 0
+    _persist_turn(st, msg, voice, steer=steer, directive=(arg if steer else None))
+    print()
+    if steer:
+        print("  (directive set — my minds pick it up within the round)\n")
+    elif verb == "DIRECT":
+        print("  (my hive is idle — nothing to steer. `/resume` wakes it.)\n")
+    elif verb == "CAST" and arg:
+        _do_cast(st, arg)
+    elif verb == "EDIT" and arg:
+        _do_edit(st, arg)
+
+_SHELL_HELP = """  speak plainly — the veil answers instantly and can act on what you ask (cast / edit / direct).
+  commands:
+    /cast <goal>       deploy a new swarm for the goal (detached; the shell attaches to it)
+    /mount <dir>       mount a project directory — then just ask for edits ('center that div')
+    /unmount           drop the mount
+    /edit <ask>        command an on-the-fly edit in the mounted dir (one quick mind, in place)
+    /direct <text>     steer the attached running hive (standing directive)
+    /say <text>        broadcast a message to every mind
+    /goal <text>       replace the hive's goal
+    /swarms            list every run        /attach <run>   switch which veil you speak to
+    /status            attached run's state  /events [n]     recent activity
+    /stop [run]        halt a run            /resume [run]   wake an idle run
+    /wizard            full guided setup     /quit           leave (swarms keep running)
+"""
+
+def _shell_header(st):
+    D, G, GR, R = _C.DIM, _C.GOLD, _C.GREEN, _C.R
+    if st["name"]:
+        running = _veil_running(st["run_dir"])
+        goal, _self, rounds, _recent = _veil_context(st["run_dir"])
+        state = (GR + "running" + R) if running else (D + "idle" + R)
+        print(f"{D}  attached :{R} {G}{st['name']}{R} [{state}] {D}round {rounds} —{R} "
+              + ((goal[:56] + ("..." if len(goal) > 56 else "")) if goal else "(free-roam)"))
+        if not running:
+            print(D + "             (idle — I speak from my persisted self; /resume wakes the hive)" + R)
+    else:
+        print(D + "  attached : (no swarms yet — tell me what you want and I will cast one, or /cast <goal>)" + R)
+    base, model, _k = st["endpoint"]
+    print(f"{D}  endpoint :{R} {model} {D}@ {base}{R}"
+          + (f"{D}   (fast voice: {st['lane'][1]}){R}" if st.get("lane") else ""))
+    print(f"{D}  mount    :{R} {st['mount'] or D + '(none — /mount <dir> enables on-the-fly edits)' + R}")
+    print(D + "\n  speak, or: /cast <goal>  /mount <dir>  /swarms  /attach <run>  /help  /quit\n" + R)
+
+def _do_mount(st, path):
+    p = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isdir(p):
+        print(f"  (not a directory: {p})\n")
+        return
+    st["mount"] = p
+    print(f"  mounted {p} — ask for an edit in plain words, or /edit <instruction>.\n")
+
+def _shell_cmd(st, line):
+    """Dispatch one slash command. Returns 'quit' to leave the shell; anything else continues."""
+    cmd, _, rest = line.partition(" ")
+    cmd, rest = cmd.lower(), rest.strip()
+    attached = st["name"]
+    if cmd in ("/quit", "/exit", "/q"):
+        return "quit"
+    if cmd == "/help":
+        print(_SHELL_HELP)
+    elif cmd == "/swarms":
+        cmd_list()
+        print()
+    elif cmd == "/attach":
+        if not rest:
+            print("  usage: /attach <run-name>\n")
+        elif not os.path.isfile(os.path.join(DATA, rest, "swarm.json")):
+            print(f"  no such run: {rest}  (/swarms lists them)\n")
+        else:
+            st["name"], st["run_dir"] = rest, os.path.join(DATA, rest)
+            st["endpoint"] = _run_endpoint(st["run_dir"])
+            st["lane"] = _chat_lane(st["run_dir"], st["endpoint"])
+            st["lane_hot"] = False
+            st["hist"] = _tail_veil_chat(st["run_dir"], 8)
+            _shell_header(st)
+    elif cmd == "/cast":
+        if rest:
+            _do_cast(st, rest, ask=False)
+        else:
+            print("  usage: /cast <goal>\n")
+    elif cmd == "/mount":
+        if rest:
+            _do_mount(st, rest)
+        else:
+            print(f"  mount: {st['mount'] or '(none)'}\n")
+    elif cmd == "/unmount":
+        st["mount"] = None
+        print("  (unmounted)\n")
+    elif cmd == "/edit":
+        if rest:
+            _do_edit(st, rest, ask=False)
+        else:
+            print("  usage: /edit <instruction>   (needs a /mount first)\n")
+    elif cmd == "/direct":
+        if not (attached and rest):
+            print("  usage: /direct <directive>   (needs an attached run)\n")
+        elif not _veil_running(st["run_dir"]):
+            print("  (the hive is idle — /resume wakes it first)\n")
+        else:
+            _control(st["run_dir"], "veil", text=rest, answered=1, reply="", steer=1, directive=rest)
+            print("  (directive set — my minds pick it up within the round)\n")
+    elif cmd == "/say":
+        if attached and rest:
+            _control(st["run_dir"], "say", text=rest)
+            print("  (sent to the whole hive)\n")
+        else:
+            print("  usage: /say <message>   (needs an attached run)\n")
+    elif cmd == "/goal":
+        if attached and rest:
+            _control(st["run_dir"], "set_goal", goal=rest)
+            print("  (new goal queued — the hive adopts it next round)\n")
+        else:
+            print("  usage: /goal <new goal>   (needs an attached run)\n")
+    elif cmd == "/status":
+        if not attached:
+            print("  (no run attached)\n")
+        else:
+            evs = _events_tail(st["run_dir"])
+            rounds = max([e.get("round", 0) or 0 for e in evs] + [0])
+            state = "running" if _veil_running(st["run_dir"]) else "idle"
+            print(f"  [{state}] {st['name']} — round {rounds} — mount: {st['mount'] or '(none)'}\n")
+    elif cmd == "/events":
+        if not attached:
+            print("  (no run attached)\n")
+        else:
+            n = int(rest) if rest.isdigit() else 12
+            for e in [e for e in _events_tail(st["run_dir"]) if e.get("kind") == "act"][-n:]:
+                print(f"    {str(e.get('mind', '?')):>7} | {str(e.get('tool', '')):<13} "
+                      + str(e.get("result") or e.get("args") or "").replace("\n", " ")[:76])
+            print()
+    elif cmd == "/stop":
+        target = rest or attached
+        if not target:
+            print("  usage: /stop <run-name>\n")
+        else:
+            try:
+                cmd_stop(target)
+            except SystemExit as e:
+                print(f"  {e}")
+            print()
+    elif cmd == "/resume":
+        target = rest or attached
+        if not target:
+            print("  usage: /resume <run-name>\n")
+        else:
+            try:
+                resume(target, watch=False)
+            except SystemExit as e:
+                print(f"  {e}")
+            print()
+    elif cmd == "/wizard":
+        wizard()
+    else:
+        print(f"  (unknown command {cmd} — /help lists them)\n")
+    return ""
+
+def chat(name=None, mount=None):
+    """THE VEIL SHELL — the front door. An instant, streaming conversation with a swarm's Veil (its persisted
+    self + live hive state, decoupled from the slow round cycle) that is also the place you ACT from: cast new
+    swarms, mount a project directory and command edits on the fly, steer / stop / resume runs. Plain talk stays
+    talk; when you ask it to act, the veil leads its reply with one action tag the shell confirms and executes."""
+    if name:
+        run_dir = os.path.join(DATA, name)
+        if not os.path.isfile(os.path.join(run_dir, "swarm.json")):
+            sys.exit(f"no such run: {name}  (see `python deploy.py list`)")
+    else:
+        name = _latest_run()  # newest running swarm, else newest run, else unattached
+        run_dir = os.path.join(DATA, name) if name else None
+    st = {"name": name, "run_dir": run_dir, "mount": None, "hist": [],
+          "endpoint": _run_endpoint(run_dir) if run_dir else _default_endpoint()}
+    st["lane"] = _chat_lane(run_dir, st["endpoint"])
+    if run_dir:
+        st["hist"] = _tail_veil_chat(run_dir, 8)
+    print_banner()
+    if mount:
+        _do_mount(st, mount)
+    # First-run friendliness: if the resolved endpoint is dead, guide into the global setup NOW instead of
+    # letting every message end in "my voice is unreachable". A fresh box with no local AI lands here.
+    base, model, key = st["endpoint"]
+    ok, _msg = preflight("ollama" if _local_backend(base) else "custom", base, key, model)
+    if not ok:
+        print(f"  ! no model is answering at {base} ({model}) — my voice needs an endpoint.")
+        if sys.stdin.isatty():
+            if ask_yes("  set one up now (local Ollama, or any OpenAI-compatible/BYOK endpoint)?", True):
+                configure()
+                cfg = load_config()
+                if cfg.get("base_url") or cfg.get("model"):
+                    st["endpoint"] = (cfg.get("base_url", base), cfg.get("model", model), cfg.get("key") or key)
+                    st["lane"] = _chat_lane(run_dir, st["endpoint"])
+        else:
+            print("    run `python deploy.py configure`, or set NL_LLM_BASE_URL / NL_LLM_MODEL / NL_LLM_KEY.")
+    _shell_header(st)
     while True:
         try:
-            line = input("you> ").strip()
+            line = input(_C.ICE + "you> " + _C.R).strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
         if not line:
             continue
-        if line in ("/quit", "/exit", "/q"):
-            break
-        if line == "/status":
-            evs = _events(run_dir)
-            rounds = max([e.get("round", 0) or 0 for e in evs] + [0])
-            print("  [%s] round %d, %d events\n" % ("running" if _veil_running(run_dir) else "idle", rounds, len(evs)))
+        if line.startswith("/"):
+            if _shell_cmd(st, line) == "quit":
+                break
             continue
-        if line.startswith("/say "):
-            _control(run_dir, "say", text=line[5:].strip())
-            print("  (sent to the whole hive)\n")
-            continue
-        if line.startswith("/goal "):
-            _control(run_dir, "set_goal", goal=line[6:].strip())
-            print("  (new goal queued — the hive adopts it next round)\n")
-            continue
-        if line == "/stop":
-            cmd_stop(name)
-            print()
-            continue
-        # register the message with the running hive (so it shapes the Veil's work) AND answer right now ourselves,
-        # speaking as the Veil from its persisted self + live state — independent of the slow round cycle.
-        if _veil_running(run_dir):
-            _control(run_dir, "veil", text=line)
-        if sys.stdout.isatty():
-            sys.stdout.write("  (the Veil gathers itself ...)\r")
-            sys.stdout.flush()
         try:
-            reply = _veil_reply(run_dir, line)
-        except Exception:
-            reply = ""
-        if sys.stdout.isatty():
-            sys.stdout.write(" " * 40 + "\r")
-        if not reply:
-            tail = "your message is queued to the hive." if _veil_running(run_dir) else "start it with `resume` to wake me fully."
-            reply = "(my voice is unreachable this moment — the model endpoint is busy or offline; " + tail + ")"
-        print("  veil> " + reply + "\n")
+            _veil_turn(st, line)
+        except KeyboardInterrupt:
+            print("\n  (interrupted)\n")
+    running = [n for n, r, _m, _g in _runs() if r]
+    if running:
+        print(f"  ({len(running)} swarm(s) still running: {', '.join(running[:4])} — `veil` returns you here.)")
 
 # -------------------------------------------------------------------------------------- launch
 
@@ -896,20 +1702,27 @@ def deploy(args):
         env["NL_LLM_KEY"] = args.key
     env.setdefault("NEURON_MAX_FACTS", "1000000")  # don't evict the hive's accumulated memory
 
+    # chatcast: a cast made from inside the veil shell — keep the output to two quiet lines and hand the
+    # worker proc back so the shell can watch it (the shell already showed the user what it's doing).
+    chatcast = getattr(args, "chatcast", False)
     goal_disp = args.goal if args.goal else "(free-roam - the Veil will choose the hive's purpose)"
-    print(BANNER)
-    print(f"  binary  : {binary}")
-    print(f"  memory  : {neuron}")
-    print(f"  run dir : {run_dir}")
-    print(f"  hive    : {n} minds | {args.model} ({args.provider}) | "
-          f"{'OFFLINE' if args.offline else 'online'} | "
-          f"{(str(args.minutes) + ' min') if args.minutes else 'until stopped'} | style={args.style}"
-          f"{' | break-out ON' if args.breakout else ''}{' | corpus' if args.corpus else ''}"
-          f"{' | FULL-autonomy' if getattr(args, 'autonomy', 'bounded') == 'full' else ''}"
-          f"{' | psyche' if getattr(args, 'observe_psyche', False) else ''}"
-          f"{' | living-pop' if getattr(args, 'veil_population', False) else ''}")
-    print(f"  goal    : {goal_disp[:92]}{'...' if len(goal_disp) > 92 else ''}")
-    print("  the Veil is waking the hive...\n")
+    if chatcast:
+        print(f"  casting '{args.name}' — {n} mind(s) on {args.model}"
+              + (f" — in-place in {embed_dir}" if embed_dir else ""))
+    else:
+        print(BANNER)
+        print(f"  binary  : {binary}")
+        print(f"  memory  : {neuron}")
+        print(f"  run dir : {run_dir}")
+        print(f"  hive    : {n} minds | {args.model} ({args.provider}) | "
+              f"{'OFFLINE' if args.offline else 'online'} | "
+              f"{(str(args.minutes) + ' min') if args.minutes else 'until stopped'} | style={args.style}"
+              f"{' | break-out ON' if args.breakout else ''}{' | corpus' if args.corpus else ''}"
+              f"{' | FULL-autonomy' if getattr(args, 'autonomy', 'bounded') == 'full' else ''}"
+              f"{' | psyche' if getattr(args, 'observe_psyche', False) else ''}"
+              f"{' | living-pop' if getattr(args, 'veil_population', False) else ''}")
+        print(f"  goal    : {goal_disp[:92]}{'...' if len(goal_disp) > 92 else ''}")
+        print("  the Veil is waking the hive...\n")
 
     # SERVICE deployment: hand the run to the OS as a long-lived daemon instead of a foreground process. The worker
     # reads its key from run_dir/keys.env (the service won't inherit this shell's env), so persist it there.
@@ -934,6 +1747,8 @@ def deploy(args):
     logf = open(os.path.join(run_dir, "worker.log"), "w", encoding="utf-8")
     proc = subprocess.Popen([binary, "worker", run_dir, neuron, args.model],
                             cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT, **popen_kw)
+    if chatcast:
+        return proc  # the shell narrates from here
     print(f"  hive running (pid {proc.pid})  -  events: {os.path.join(run_dir, 'events.jsonl')}")
     if embed_dir:
         print(f"  working IN-PLACE in: {embed_dir}")
@@ -944,7 +1759,7 @@ def deploy(args):
         # does; the REPL stays a live conversation with the swarm (see `chat`). Ctrl-C / 'exit' leaves it running.
         print("\n  Plan approved and running. The chat stays open for follow-up edits - type them anytime.\n")
         try:
-            chat(args.name)
+            chat(args.name, mount=embed_dir)
         except (EOFError, KeyboardInterrupt):
             print(f"\n  (left the chat; hive still running - reattach: python deploy.py chat {args.name})")
     elif args.follow:
@@ -953,6 +1768,7 @@ def deploy(args):
         print(f"\n  detached - the hive runs on without this terminal. Reattach with:  python deploy.py chat {args.name}")
     else:
         print("\n  (running in the background. Add --follow to watch it live, or --detach to leave this terminal.)")
+    return proc
 
 # -------------------------------------------------------------------------------- setup wizard
 
@@ -1390,8 +2206,8 @@ def wizard():
         return cmd_list()
     if action == "chat":
         cmd_list()
-        name = ask("run name to chat with", "")
-        return chat(name) if name else print("  (nothing selected)")
+        name = ask("run name to chat with (blank = newest)", "")
+        return chat(name or None)
     if action == "stop":
         cmd_list()
         name = ask("run name to stop", "")
@@ -1532,11 +2348,19 @@ def main():
     try:  # make output safe on any console (cp1252, etc.) and on unicode goal/model text
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")  # piped shell input arrives as UTF-8 bytes
     except Exception:
         pass
+    _init_theme()
     argv = sys.argv[1:]
-    if not argv or argv[0] in ("wizard", "setup"):
+    if not argv:
+        # the front door: `veil` alone drops you INTO the shell — instant talk with the newest swarm's veil,
+        # /cast /mount /edit from there. (Off a TTY there is nobody to talk to; show the wizard's guidance.)
+        return chat() if sys.stdin.isatty() else wizard()
+    if argv[0] in ("wizard", "setup"):
         return wizard()
+    if argv[0] in ("configure", "config", "install"):
+        return configure()
     if argv[0] == "list":
         return cmd_list()
     if argv[0] in ("doctor", "deps", "check"):
@@ -1549,24 +2373,34 @@ def main():
         if len(argv) < 2:
             sys.exit("usage: python deploy.py resume <run-name> [--follow]")
         return resume(argv[1], "--follow" in argv)
-    if argv[0] == "chat":
-        if len(argv) < 2:
-            sys.exit("usage: python deploy.py chat <run-name>   (drop into a REPL with the swarm's Veil)")
-        return chat(argv[1])
+    if argv[0] in ("chat", "shell"):
+        name, mnt, rest = None, None, argv[1:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--mount" and i + 1 < len(rest):
+                mnt = rest[i + 1]
+                i += 2
+                continue
+            if not rest[i].startswith("-") and name is None:
+                name = rest[i]
+            i += 1
+        return chat(name, mount=mnt)
 
     ap = argparse.ArgumentParser(
         prog="deploy.py", description="Deploy a hive mind controlled by the Veil.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="also:  python deploy.py            (interactive setup wizard)\n"
                "       python deploy.py list   |   resume <run>   |   stop <run>")
+    # `veil configure` writes the user's endpoint once; bare casts then default to it (flags still win).
+    cfg = load_config()
     ap.add_argument("goal", help="the goal / task for the hive")
     ap.add_argument("--name", default=None, help="run name (a dir under data/); default: swarm_<timestamp>")
     ap.add_argument("--minds", type=int, default=4)
     ap.add_argument("--minutes", type=int, default=30, help="auto-stop after N min (0 = until stopped)")
-    ap.add_argument("--model", default="gpt-oss:20b", help="default gpt-oss:20b; use llama3.1:8b on very small embedded devices")
-    ap.add_argument("--provider", default="ollama")
-    ap.add_argument("--base-url", dest="base_url", default="http://localhost:11434/v1")
-    ap.add_argument("--key", default=os.environ.get("NL_LLM_KEY", "ollama"), help="API key (or NL_LLM_KEY; local Ollama needs none)")
+    ap.add_argument("--model", default=cfg.get("model", "gpt-oss:20b"), help="default from `configure`, else gpt-oss:20b; use llama3.1:8b on very small embedded devices")
+    ap.add_argument("--provider", default=cfg.get("provider", "ollama"))
+    ap.add_argument("--base-url", dest="base_url", default=cfg.get("base_url", "http://localhost:11434/v1"))
+    ap.add_argument("--key", default=os.environ.get("NL_LLM_KEY") or cfg.get("key") or "ollama", help="API key (or NL_LLM_KEY / `configure`; local Ollama needs none)")
     ap.add_argument("--style", default="auto", choices=STYLES)
     ap.add_argument("--offline", action="store_true", help="no internet: web tools off, answer only from memory")
     ap.add_argument("--breakout", action="store_true", help="let the Veil post publicly to Telegraph when its feeling flares")
