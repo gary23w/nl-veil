@@ -3305,7 +3305,12 @@ fn isFrontierFile(ctx: *ToolCtx, path: []const u8) bool {
         while (end < s.len and s[end] != ' ' and s[end] != '\t' and s[end] != ':' and s[end] != '`') : (end += 1) {}
         if (end == 0) continue;
         const bp = s[0..end];
-        if (std.mem.indexOfScalar(u8, std.fs.path.basename(bp), '.') == null) continue;
+        // File-shape mirrors run.zig's fileShapedToken / bpPath accept rule: an extension OR a
+        // path-shaped token ('/') marks a real deliverable, so a dotless file under a directory
+        // (app/Makefile, api/Dockerfile) can BE the frontier and reach the ordered-guard rescue,
+        // while bare prose words still can't become a permanent phantom frontier.
+        if (std.mem.indexOfScalar(u8, std.fs.path.basename(bp), '.') == null and
+            std.mem.indexOfScalar(u8, bp, '/') == null) continue;
         if (builtAlready(ctx, bp)) continue;
         return pathKeyMatch(bp, path);
     }
