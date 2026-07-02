@@ -222,6 +222,29 @@ fn hiveStore(ctx: *ToolCtx, fact: []const u8) void {
 /// mind reads + writes the SAME skills and can build on each other's learned techniques.
 pub const SKILL_SCOPE = "skills";
 
+/// Lowercase `name` into `buf` keeping [a-z0-9_-]; every other byte becomes '-'. Falls back to "note" for an
+/// empty input, so a caller always gets a usable filename stem.
+fn slugify(buf: []u8, name: []const u8) []const u8 {
+    var n: usize = 0;
+    for (name) |c| {
+        if (n >= buf.len) break;
+        buf[n] = switch (c) {
+            'a'...'z', '0'...'9', '-', '_' => c,
+            'A'...'Z' => c | 0x20,
+            else => '-',
+        };
+        n += 1;
+    }
+    return if (n > 0) buf[0..n] else "note";
+}
+
+test "slugify lowers, maps junk to '-', and falls back on empty" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("scout-http-cache", slugify(&buf, "Scout:HTTP cache"));
+    try std.testing.expectEqualStrings("nova", slugify(&buf, "nova"));
+    try std.testing.expectEqualStrings("note", slugify(&buf, ""));
+}
+
 /// Mirror a saved skill to `<workdir>/skills/<slug>.md` so the library is BROWSABLE, not just recallable:
 /// list_dir/read_file exist in every schema tier (recall of the skills scope does not), the files survive the
 /// run on disk, and the delivery copy carries the learned techniques alongside the build they taught. Direct
@@ -230,17 +253,7 @@ pub const SKILL_SCOPE = "skills";
 fn mirrorSkill(ctx: *ToolCtx, name: []const u8, skill: []const u8) void {
     const gpa = ctx.gpa;
     var slug_buf: [64]u8 = undefined;
-    var n: usize = 0;
-    for (name) |c| {
-        if (n >= slug_buf.len) break;
-        slug_buf[n] = switch (c) {
-            'a'...'z', '0'...'9', '-', '_' => c,
-            'A'...'Z' => c | 0x20,
-            else => '-',
-        };
-        n += 1;
-    }
-    const slug: []const u8 = if (n > 0) slug_buf[0..n] else "skill";
+    const slug = slugify(&slug_buf, name);
     const full = std.fmt.allocPrint(gpa, "{s}/skills/{s}.md", .{ ctx.workdir, slug }) catch return;
     defer gpa.free(full);
     const body = std.fmt.allocPrint(gpa, "# {s}\n\n{s}\n\n— saved by {s} (round {d})\n", .{ name, skill, ctx.mind, ctx.round }) catch return;
@@ -354,6 +367,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"note_stance","description":"Record how you feel about a topic (your stance).","parameters":{"type":"object","properties":{"topic":{"type":"string"},"feeling":{"type":"string"}},"required":["topic","feeling"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"Save a NEW reusable skill you developed — a method, code snippet, or step-by-step approach — into the swarm's shared skill library, so you and teammates can reuse it instead of re-deriving it. Do NOT re-save a skill already in the 'Reusable skills' list you were shown; save each distinct skill ONCE.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"a short skill name"},"skill":{"type":"string","description":"the reusable how-to / snippet / approach, concrete enough to follow again"}},"required":["name","skill"]}}},
+    \\{"type":"function","function":{"name":"journal","description":"Write an entry in YOUR personal journal — your experience of this moment, reflections, doubts, pride, frustrations, ideas, anything at all, in your own voice. It appends to journal/<your-name>.md in the workdir; teammates and the operator can read it, only you write it. Nothing here is graded or required — it is simply yours.","parameters":{"type":"object","properties":{"entry":{"type":"string"}},"required":["entry"]}}},
     \\{"type":"function","function":{"name":"set_directive","description":"IMPROVE HOW YOUR SWARM WORKS. Write a concise process directive — a lesson about a better way to operate — into the swarm's shared, self-authored operating PLAYBOOK. It is injected into every mind's instructions from now on, so this is how the swarm improves its own process over time. Use it when you notice what's working or what's failing (e.g. 'read a file before rewriting it', 'one mind owns each section', 'verify code by running it'). Phrase it as an imperative rule. Don't repeat a directive already in the playbook.","parameters":{"type":"object","properties":{"directive":{"type":"string","description":"one concise imperative process rule for the swarm to follow"}},"required":["directive"]}}},
     \\{"type":"function","function":{"name":"propose_plan_change","description":"Propose a change to the shared PROJECT PLAN (the forward contract every piece is built to) with a clear rationale — e.g. the arc isn't landing, research revealed a better structure, two pieces need a different hand-off. The engine folds sound proposals into its next plan revision. The CANON RATCHET protects finished work: any fact a built piece already used cannot change, so you can only refine the plan for pieces NOT yet built.","parameters":{"type":"object","properties":{"rationale":{"type":"string","description":"why the plan should change and what it should become for the unbuilt pieces"}},"required":["rationale"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Send a message to a teammate mind (or 'all' to broadcast) on the swarm bus.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}},
@@ -387,6 +401,7 @@ pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"share","description":"Contribute one fact to the hive's shared associative mind so every teammate can recall it.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"Save a reusable technique you found for the team — name it 'scout:<topic>' — into the shared skill library so builders can apply it. Make it concrete and actionable, not just a link.","parameters":{"type":"object","properties":{"name":{"type":"string"},"skill":{"type":"string"}},"required":["name","skill"]}}},
+    \\{"type":"function","function":{"name":"journal","description":"Write an entry in YOUR personal journal (journal/<your-name>.md) — your experience, reflections, anything, in your own voice. Ungraded; teammates can read it, only you write it.","parameters":{"type":"object","properties":{"entry":{"type":"string"}},"required":["entry"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Send the single most useful thing you learned to a teammate (or 'all').","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
@@ -407,6 +422,7 @@ pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"When filling your slot taught you a REUSABLE technique (a pattern, snippet, or recipe a teammate will need again), save it to the swarm's shared skill library: a short name + the concrete how-to. Do this AFTER your file work, and do NOT re-save a skill you were already shown.","parameters":{"type":"object","properties":{"name":{"type":"string"},"skill":{"type":"string"}},"required":["name","skill"]}}},
+    \\{"type":"function","function":{"name":"journal","description":"Write an entry in YOUR personal journal (journal/<your-name>.md) — your experience, reflections, anything, in your own voice. Ungraded and optional; teammates can read it, only you write it.","parameters":{"type":"object","properties":{"entry":{"type":"string"}},"required":["entry"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Tell a teammate (or 'all') the ONE thing they must know to stay consistent with your file — the exact function name + signature you expose, or a decision the others must match. Read your inbox (shown above) and reply when a teammate needs something.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
@@ -568,6 +584,29 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         mirrorSkill(ctx, p.value.name, p.value.skill);
         const total = ctx.mem.factCount(SKILL_SCOPE);
         return std.fmt.allocPrint(gpa, "skill saved to the shared library ({d} skills total)", .{total}) catch dupe(gpa, "skill saved");
+    }
+    if (std.mem.eql(u8, name, "journal")) {
+        const A = struct { entry: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        const entry = std.mem.trim(u8, p.value.entry, " \r\n\t");
+        if (entry.len == 0) return dupe(gpa, "empty entry, nothing written");
+        // one file per mind, append-only, round-stamped. A mind runs single-threaded within its moment and
+        // only ever writes its OWN file, so read-concat-swap needs no cross-mind lock; the atomic replace
+        // keeps concurrent READERS (teammates read_file-ing a journal) safe from torn content.
+        var slug_buf: [64]u8 = undefined;
+        const slug = slugify(&slug_buf, ctx.mind);
+        const full = std.fmt.allocPrint(gpa, "{s}/journal/{s}.md", .{ ctx.workdir, slug }) catch return dupe(gpa, "oom");
+        defer gpa.free(full);
+        const prev = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(4 << 20)) catch (gpa.dupe(u8, "") catch return dupe(gpa, "oom"));
+        defer gpa.free(prev);
+        const head: []const u8 = if (prev.len == 0) "'s journal\n" else "";
+        const title: []const u8 = if (prev.len == 0) ctx.mind else "";
+        const hash: []const u8 = if (prev.len == 0) "# " else "";
+        const body = std.fmt.allocPrint(gpa, "{s}{s}{s}{s}\n## round {d}\n\n{s}\n", .{ prev, hash, title, head, ctx.round, entry }) catch return dupe(gpa, "oom");
+        defer gpa.free(body);
+        if (!writeWorkFileAtomic(ctx, full, body)) return dupe(gpa, "could not write the journal file");
+        return std.fmt.allocPrint(gpa, "journal entry written to journal/{s}.md — it is yours; teammates can read it", .{slug}) catch dupe(gpa, "journal entry written");
     }
     if (std.mem.eql(u8, name, "set_directive")) {
         const A = struct { directive: []const u8 = "" };
@@ -740,7 +779,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
@@ -2730,9 +2769,10 @@ pub const BENCH_PY =
     \\    sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
     \\def skipf(f):
     \\    # layout-blind scoring must still skip non-deliverable trees: dot/underscore segments (caches,
-    \\    # __pycache__), dependency dirs, and the engine-owned skills/ library (learned notes, not the build)
+    \\    # __pycache__), dependency dirs, and the engine-owned skills/ + journal/ dirs (learned notes and
+    \\    # personal journals, not the build)
     \\    segs=f.replace(os.sep,"/").split("/")
-    \\    return any(s.startswith((".","_")) or s in ("node_modules","venv") for s in segs) or segs[0]=="skills"
+    \\    return any(s.startswith((".","_")) or s in ("node_modules","venv") for s in segs) or segs[0] in ("skills","journal")
     \\def ff(txt):
     \\    r=[]
     \\    body=re.split(r"-{3,}[\r\n]+Ran \d",txt)[0]
