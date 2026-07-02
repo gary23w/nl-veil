@@ -2162,21 +2162,31 @@ def _mcp_tools():
         tool("hive_research",
              "Cast a hive-mind swarm of research agents at a question and BLOCK until it returns "
              "structured findings (recommendation + key findings, each backed by provenance-gated web "
-             "evidence). Pass context_path to ground the research inside YOUR application's own files. "
-             "Budget with minutes (default 6). For long jobs prefer hive_cast + hive_collect.",
+             "evidence). WHEN TO CAST: the question needs grounding in a specific codebase/application "
+             "(pass context_path), live web research you cannot verify yourself, or multi-source "
+             "synthesis — do NOT cast for anything you can answer directly from your own knowledge. "
+             "EXPECT MINUTES, not seconds: this runs a real multi-agent swarm (default 6 minutes; the "
+             "engine self-crunches to fit the budget). If your turn should not stall that long, use "
+             "hive_cast + hive_collect instead.",
              {"question": S,
               "context_path": {"type": "string", "description": "file or directory that grounds the research (your app's code, an issue text, a spec)"},
               "minutes": I, "minds": I}, ["question"]),
         tool("hive_task",
              "Cast a hive to BUILD or FIX something and block until done; returns findings + the built "
              "file list (full output under the run's data dir / DELIVERY). Pass dir to work IN-PLACE on "
-             "real files (bounded autonomy, engine-verified edits).",
+             "real files (bounded autonomy, engine-verified edits). WHEN TO CAST: real build/fix work "
+             "that benefits from test-verified multi-agent construction — not one-line edits you can "
+             "make yourself. EXPECT MINUTES (default 10); for longer builds prefer hive_cast so your "
+             "turn is not blocked.",
              {"goal": S,
               "dir": {"type": "string", "description": "project directory to edit in-place (omit for a fresh scaffold)"},
               "minutes": I, "minds": I}, ["goal"]),
         tool("hive_cast",
-             "Start a hive ASYNCHRONOUSLY and return its run name immediately. Poll hive_status; fetch "
-             "findings any time with hive_collect (stop=true to halt it first).",
+             "Start a hive ASYNCHRONOUSLY and return its run name immediately — the PREFERRED door for "
+             "any research or build job: your turn never blocks; do other work, then poll hive_status "
+             "and fetch findings any time with hive_collect (stop=true to halt it first). Use the "
+             "blocking hive_research/hive_task only when you genuinely need the answer before you can "
+             "proceed.",
              {"goal": S, "context_path": S, "dir": S, "minutes": I, "minds": I}, ["goal"]),
         tool("hive_status", "Live status of a cast: running?, round, fitness, recent activity.",
              {"run": S}, ["run"]),
