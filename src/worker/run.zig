@@ -179,6 +179,12 @@ pub const Worker = struct {
     demanded_str: []const u8 = "", // "module: nameA, nameB | ..." — names callers import from a module that it
     // does NOT define yet; injected into that module's builder as a required-exports checklist (the demand side)
     bench_fixed: []const u8 = "",
+    checks_str: []const u8 = "", // the goal's DECLARED acceptance interface: newline-joined `VERIFY:` shell
+    // commands ("" = none declared). When present they ARE the benchmark — any toolchain enters through the
+    // build description; the engine executes each row verbatim and scores exit codes, never inspecting
+    // project shape or language. BENCH_PY stays the fallback default for goals that declare nothing.
+    smoke_cmd: []const u8 = "", // the goal's declared `SMOKE:` boot command ("" => SMOKE_PY heuristics)
+    probes_str: []const u8 = "", // newline-joined `PROBE:` urls the declared smoke must answer 2xx/3xx
     corpus_facts: u32 = 0,
     internet: bool = true,
     want_net: bool = true,
@@ -702,6 +708,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     w.open_ended = isOpenEnded(goal, w.goal_brief);
     w.never_stops = isNeverStops(goal, w.goal_brief);
+    {
+        // the goal may DECLARE its own acceptance interface (VERIFY/SMOKE/PROBE rows) — adopt it verbatim.
+        // This is the general (language-blind) floor: the criterion lives in the build description, the
+        // engine only executes and scores it. Minds read the goal, so the criteria are in-band by design.
+        const dc = parseDeclaredChecks(gpa, goal);
+        w.checks_str = dc.checks;
+        w.smoke_cmd = dc.smoke;
+        w.probes_str = dc.probes;
+    }
+    defer if (w.checks_str.len > 0) gpa.free(@constCast(w.checks_str));
+    defer if (w.smoke_cmd.len > 0) gpa.free(@constCast(w.smoke_cmd));
+    defer if (w.probes_str.len > 0) gpa.free(@constCast(w.probes_str));
+    if (live and (w.checks_str.len > 0 or w.smoke_cmd.len > 0)) {
+        const acc = std.fmt.allocPrint(gpa, "checks:\n{s}\nsmoke: {s}\nprobes:\n{s}", .{ w.checks_str, w.smoke_cmd, w.probes_str }) catch "";
+        defer if (acc.len > 0) gpa.free(acc);
+        w.act("engine", 0, "acceptance", "goal DECLARES its own acceptance interface (VERIFY/SMOKE/PROBE) — adopted verbatim; engine-run, language-blind", acc);
+    }
     if (m.benchmark.len > 0) w.bench_fixed = gpa.dupe(u8, m.benchmark) catch "";
     defer if (w.bench_fixed.len > 0) gpa.free(@constCast(w.bench_fixed));
     if (w.bench_fixed.len > 0) {
@@ -897,7 +920,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
             const cov = goalCoverage(&w, goal);
             defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.doc_target, prev_pct, cov);
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov);
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
                 _ = w.mem.observe(tools.PLAYBOOK_SCOPE, "Write an objective test suite (test_*.py with real assertions about intended behavior) for the deliverable before adding more features — the swarm is scored by its pass rate.");
@@ -3811,6 +3834,7 @@ fn deliverableGate(w: *Worker, run_dir: []const u8) void {
 }
 
 fn smokeTest(w: *Worker, run_dir: []const u8) void {
+    if (w.smoke_cmd.len > 0) return declaredSmoke(w, run_dir); // the goal declared its own runtime gate
     const gpa = w.gpa;
     if (w.smoke_str.len > 0) gpa.free(@constCast(w.smoke_str));
     w.smoke_str = "";
@@ -3959,12 +3983,302 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
     if (w.iface_str.len > 0) w.act("engine", 0, "interfaces", std.fmt.allocPrint(w.a(), "{d} cross-file mismatch(es)", .{parsed.value.count}) catch "mismatches", w.iface_str);
 }
 
+/// The goal's DECLARED ACCEPTANCE INTERFACE. A build description may carry its own verification contract:
+///   `VERIFY: <shell command>` — one acceptance check row (any toolchain: cargo test, go vet, make lint, …)
+///   `SMOKE: <shell command>`  — how to boot the deliverable (first declaration wins)
+///   `PROBE: [GET ]<http url>` — a url the booted deliverable must answer 2xx/3xx (one full-url token; GET only)
+/// A VERIFY/SMOKE body runs to the next marker, a `;;`, or end-of-text, so declarations compose inside a
+/// one-line goal; a PROBE takes exactly one whitespace-delimited url token. This is how ANY language or
+/// framework enters the engine without a hardcoded lane: the operator states the criterion in the build
+/// description, the engine executes it verbatim and scores exit codes — it never inspects project shape.
+const DeclaredChecks = struct { checks: []const u8 = "", smoke: []const u8 = "", probes: []const u8 = "" };
+fn parseDeclaredChecks(gpa: std.mem.Allocator, goal: []const u8) DeclaredChecks {
+    var checks: std.ArrayListUnmanaged(u8) = .empty;
+    var probes: std.ArrayListUnmanaged(u8) = .empty;
+    var smoke: []const u8 = "";
+    var i: usize = 0;
+    while (i < goal.len) {
+        const rest = goal[i..];
+        var kind: u8 = 0;
+        var body_off: usize = 0;
+        if (std.mem.startsWith(u8, rest, "VERIFY:")) {
+            kind = 'v';
+            body_off = 7;
+        } else if (std.mem.startsWith(u8, rest, "SMOKE:")) {
+            kind = 's';
+            body_off = 6;
+        } else if (std.mem.startsWith(u8, rest, "PROBE:")) {
+            kind = 'p';
+            body_off = 6;
+        }
+        if (kind == 0) {
+            i += 1;
+            continue;
+        }
+        const body_start = i + body_off;
+        var end = goal.len;
+        var j = body_start;
+        while (j < goal.len) : (j += 1) {
+            const r2 = goal[j..];
+            if (std.mem.startsWith(u8, r2, ";;") or std.mem.startsWith(u8, r2, "VERIFY:") or std.mem.startsWith(u8, r2, "SMOKE:") or std.mem.startsWith(u8, r2, "PROBE:")) {
+                end = j;
+                break;
+            }
+        }
+        const body = std.mem.trim(u8, goal[body_start..end], " \t\r\n");
+        if (body.len > 0) switch (kind) {
+            'v' => {
+                if (checks.items.len > 0) checks.append(gpa, '\n') catch {};
+                checks.appendSlice(gpa, body) catch {};
+            },
+            's' => {
+                if (smoke.len == 0) smoke = body;
+            },
+            'p' => {
+                var u = body;
+                if (std.mem.startsWith(u8, u, "GET ")) u = std.mem.trimStart(u8, u[4..], " \t");
+                if (std.mem.indexOfAny(u8, u, " \t")) |sp| u = u[0..sp];
+                if (std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://")) {
+                    if (probes.items.len > 0) probes.append(gpa, '\n') catch {};
+                    probes.appendSlice(gpa, u) catch {};
+                }
+            },
+            else => {},
+        };
+        i = end;
+        if (std.mem.startsWith(u8, goal[i..], ";;")) i += 2;
+    }
+    const smoke_d = if (smoke.len > 0) (gpa.dupe(u8, smoke) catch "") else "";
+    return .{ .checks = checks.toOwnedSlice(gpa) catch "", .smoke = smoke_d, .probes = probes.toOwnedSlice(gpa) catch "" };
+}
+
+test "parseDeclaredChecks: a one-line goal composes VERIFY rows, one SMOKE, and single-token PROBEs" {
+    const gpa = std.testing.allocator;
+    const goal = "Build synapse in Rust. VERIFY: cargo build VERIFY: cargo test -- --test-threads=1 ;; SMOKE: cargo run PROBE: GET http://127.0.0.1:8047/api/stats PROBE: http://127.0.0.1:8047/ then trailing prose.";
+    const dc = parseDeclaredChecks(gpa, goal);
+    defer if (dc.checks.len > 0) gpa.free(@constCast(dc.checks));
+    defer if (dc.smoke.len > 0) gpa.free(@constCast(dc.smoke));
+    defer if (dc.probes.len > 0) gpa.free(@constCast(dc.probes));
+    try std.testing.expectEqualStrings("cargo build\ncargo test -- --test-threads=1", dc.checks);
+    try std.testing.expectEqualStrings("cargo run", dc.smoke);
+    try std.testing.expectEqualStrings("http://127.0.0.1:8047/api/stats\nhttp://127.0.0.1:8047/", dc.probes);
+}
+
+test "parseDeclaredChecks: goals without markers declare nothing; non-http probes and empty bodies drop" {
+    const gpa = std.testing.allocator;
+    const plain = parseDeclaredChecks(gpa, "Build agora, a forum in Python with pytest tests. No inline contract here.");
+    try std.testing.expectEqual(@as(usize, 0), plain.checks.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.smoke.len);
+    try std.testing.expectEqual(@as(usize, 0), plain.probes.len);
+    const odd = parseDeclaredChecks(gpa, "VERIFY: ;; PROBE: /api/health SMOKE:   ");
+    try std.testing.expectEqual(@as(usize, 0), odd.checks.len);
+    try std.testing.expectEqual(@as(usize, 0), odd.smoke.len);
+    try std.testing.expectEqual(@as(usize, 0), odd.probes.len);
+}
+
+test "parseDeclaredChecks: `;;` ends a row so trailing prose never rides into the command" {
+    const gpa = std.testing.allocator;
+    const dc = parseDeclaredChecks(gpa, "VERIFY: make test ;; and the app must feel fast.");
+    defer if (dc.checks.len > 0) gpa.free(@constCast(dc.checks));
+    try std.testing.expectEqualStrings("make test", dc.checks);
+}
+
+/// The ACTIONABLE slice of a failing check's output: from the first line containing "error" (any case —
+/// rustc, go, tsc, gcc, pytest, java all mark real diagnostics with it) to the end; otherwise the tail.
+/// Toolchain-blind by design — a locating heuristic, not a format parser; the minds read the raw text.
+fn checkDiag(out: []const u8) []const u8 {
+    const t = std.mem.trim(u8, out, " \r\n\t");
+    var off: usize = 0;
+    var it = std.mem.splitScalar(u8, t, '\n');
+    while (it.next()) |ln| {
+        if (std.ascii.indexOfIgnoreCase(ln, "error") != null) return t[off..];
+        off += ln.len + 1;
+    }
+    return if (t.len > 700) t[t.len - 700 ..] else t;
+}
+
+test "checkDiag: slices from the first error line; falls back to the tail when nothing says error" {
+    const rustc = "Compiling synapse v0.1.0\nerror[E0433]: failed to resolve: use of undeclared crate\n --> src/main.rs:2:5";
+    try std.testing.expect(std.mem.startsWith(u8, checkDiag(rustc), "error[E0433]"));
+    const quiet = "test result: FAILED. 3 passed; 1 failed";
+    try std.testing.expectEqualStrings(quiet, checkDiag(quiet));
+    const big = "x" ** 900;
+    try std.testing.expectEqual(@as(usize, 700), checkDiag(big).len);
+}
+
+/// DECLARED CHECKS are the benchmark when the goal carries them: each `VERIFY:` row runs verbatim as a
+/// shell command in the build workdir (exit 0 = pass), pct = passed/total, tier 1 (they are the operator's
+/// own acceptance criteria — the strongest signal class). The failing rows' raw toolchain output IS the
+/// failure feedback — no per-format extractor; the minds interpret their own toolchain. Runs out-of-band
+/// and engine-owned, so the swarm cannot edit or fake it — and completely language-blind: any stack enters
+/// via the goal, and keep-or-revert (trackConvergence/rewardFloor) fires unchanged for all of them.
+fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
+    const gpa = w.gpa;
+    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return .{ .status = .err };
+    defer gpa.free(workdir);
+    const pe = w.mem.environ orelse return .{ .status = .err };
+    var env = pe.clone(gpa) catch return .{ .status = .err };
+    defer env.deinit();
+    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+    var passed: u32 = 0;
+    var total: u32 = 0;
+    var fl: std.ArrayListUnmanaged(u8) = .empty;
+    var it = std.mem.splitScalar(u8, w.checks_str, '\n');
+    while (it.next()) |raw| {
+        const cmd = std.mem.trim(u8, raw, " \r\t");
+        if (cmd.len == 0) continue;
+        total += 1;
+        const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", cmd } else .{ "/bin/sh", "-c", cmd };
+        // The timeout guards a HUNG toolchain only — deliberately generous, because a cold `cargo build` or
+        // first `go build` legitimately takes minutes; per-test speed budgets belong in the declared command.
+        const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(48 << 10), .stderr_limit = .limited(48 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(240), .clock = .awake } } }) catch {
+            if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
+            fl.appendSlice(gpa, "`") catch {};
+            fl.appendSlice(gpa, cmd) catch {};
+            fl.appendSlice(gpa, "` did not finish (spawn failed or exceeded 240s)") catch {};
+            continue;
+        };
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        const code: u32 = switch (r.term) {
+            .exited => |c| c,
+            else => 999,
+        };
+        if (code == 0) {
+            passed += 1;
+            continue;
+        }
+        const diag_src = if (std.mem.trim(u8, r.stderr, " \r\n\t").len > 0) r.stderr else r.stdout;
+        if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
+        const entry = std.fmt.allocPrint(gpa, "`{s}` exit {d} — {s}", .{ cmd, code, clip(checkDiag(diag_src), 650) }) catch {
+            fl.appendSlice(gpa, cmd) catch {};
+            continue;
+        };
+        defer gpa.free(entry);
+        fl.appendSlice(gpa, entry) catch {};
+    }
+    if (total == 0) return .{ .status = .no_tests };
+    var res: BenchResult = .{ .status = .ok, .passed = passed, .total = total, .tier = 1 };
+    res.pct = (passed * 100) / total;
+    res.failures = fl.toOwnedSlice(gpa) catch &.{};
+    return res;
+}
+
+/// GET `url` via curl, returning just the HTTP status code (0 = nothing answered). Local-probe shaped:
+/// tight per-request timeouts; the retry cadence lives in the caller's boot window.
+fn curlCode(w: *Worker, url: []const u8) u32 {
+    const gpa = w.gpa;
+    const nul = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
+    const argv = [_][]const u8{ "curl", "-s", "-o", nul, "-w", "%{http_code}", "--max-time", "3", url };
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(64), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(8), .clock = .awake } } }) catch return 0;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return std.fmt.parseInt(u32, std.mem.trim(u8, r.stdout, " \r\n\t"), 10) catch 0;
+}
+
+/// DECLARED SMOKE — when the goal declares `SMOKE:` (+ `PROBE:` urls) the runtime gate is the goal's own:
+/// boot the declared command in the workdir, curl every declared probe until each answers 2xx/3xx or the
+/// boot window closes, then ALWAYS reap the process tree (`cargo run`/`npm start` put the real server in a
+/// grandchild — Windows gets `taskkill /T` on the resolved pid, POSIX a direct kill of the exec'd command).
+/// Framework-blind: the goal states how to boot and what must answer; the engine never guesses entrypoints
+/// or route shapes. Feeds the same smoke_ok completion gate SMOKE_PY does.
+fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
+    const gpa = w.gpa;
+    if (w.smoke_str.len > 0) gpa.free(@constCast(w.smoke_str));
+    w.smoke_str = "";
+    w.smoke_ok = true;
+    if (w.probes_str.len == 0) return; // nothing declared to answer — vacuously ok; the VERIFY rows carry the gradient
+    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return;
+    defer gpa.free(workdir);
+    const boot = if (builtin.os.tag == .windows)
+        std.fmt.allocPrint(gpa, "cd /d \"{s}\" && {s}", .{ workdir, w.smoke_cmd }) catch return
+    else
+        std.fmt.allocPrint(gpa, "cd \"{s}\" && exec {s}", .{ workdir, w.smoke_cmd }) catch return;
+    defer gpa.free(boot);
+    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", boot } else .{ "/bin/sh", "-c", boot };
+    var child = std.process.spawn(w.io, .{ .argv = &argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
+        w.smoke_ok = false;
+        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the declared smoke `{s}` could not be spawned at all.", .{clip(w.smoke_cmd, 120)}) catch "";
+        if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", "runtime fail", w.smoke_str);
+        return;
+    };
+    var okf = [_]bool{false} ** 16; // probe cap 16: a smoke is a liveness gate, not a test suite
+    var codes = [_]u32{0} ** 16;
+    var all_ok = false;
+    var waited: u32 = 0;
+    while (waited < 50) : (waited += 1) { // ~50s boot window: the declared boot may compile first (cargo run)
+        all_ok = true;
+        var idx: usize = 0;
+        var pit = std.mem.splitScalar(u8, w.probes_str, '\n');
+        while (pit.next()) |praw| {
+            const url = std.mem.trim(u8, praw, " \r\t");
+            if (url.len == 0) continue;
+            if (idx >= okf.len) break;
+            const my = idx;
+            idx += 1;
+            if (okf[my]) continue;
+            const c = curlCode(w, url);
+            codes[my] = c;
+            if (c >= 200 and c < 400) {
+                okf[my] = true;
+            } else {
+                all_ok = false;
+            }
+        }
+        if (all_ok) break;
+        w.io.sleep(.{ .nanoseconds = 1000 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    // ALWAYS reap the tree — a leaked server keeps the port and the workdir's build locks hostage
+    if (child.id) |h| {
+        if (builtin.os.tag == .windows) {
+            var pb: [16]u8 = undefined;
+            const pid = GetProcessId(@ptrCast(h)); // Child.Id is a HANDLE on Windows; taskkill wants the pid
+            if (std.fmt.bufPrint(&pb, "{d}", .{pid})) |ps| {
+                const ka = [_][]const u8{ "taskkill", "/F", "/T", "/PID", ps };
+                if (std.process.run(gpa, w.io, .{ .argv = &ka, .stdout_limit = .limited(512), .stderr_limit = .limited(512), .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } })) |kr| {
+                    gpa.free(kr.stdout);
+                    gpa.free(kr.stderr);
+                } else |_| {}
+            } else |_| {}
+            _ = TerminateProcess(@ptrCast(h), 1); // belt-and-braces for the direct child
+        } else {
+            std.posix.kill(h, .KILL) catch {};
+        }
+    }
+    _ = child.wait(w.io) catch {};
+    if (all_ok) {
+        w.smoke_ok = true;
+        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME OK: the declared smoke `{s}` boots and every declared probe answers 2xx/3xx — keep it bootable as you change it.", .{clip(w.smoke_cmd, 100)}) catch "";
+    } else {
+        w.smoke_ok = false;
+        var fb: std.ArrayListUnmanaged(u8) = .empty;
+        defer fb.deinit(gpa);
+        var idx: usize = 0;
+        var pit = std.mem.splitScalar(u8, w.probes_str, '\n');
+        while (pit.next()) |praw| {
+            const url = std.mem.trim(u8, praw, " \r\t");
+            if (url.len == 0) continue;
+            if (idx >= okf.len) break;
+            const my = idx;
+            idx += 1;
+            if (okf[my]) continue;
+            if (fb.items.len > 0) fb.appendSlice(gpa, ", ") catch {};
+            const e = std.fmt.allocPrint(gpa, "{s} -> {d}", .{ url, codes[my] }) catch continue;
+            defer gpa.free(e);
+            fb.appendSlice(gpa, e) catch {};
+        }
+        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: booted the DECLARED smoke `{s}` but these declared probes never answered 2xx/3xx inside the boot window (status 0 = nothing listening at all): {s}. The deliverable must boot from exactly that command and serve every declared probe — if VERIFY checks are failing, fix those first (a non-compiling server cannot serve).", .{ clip(w.smoke_cmd, 100), clip(fb.items, 400) }) catch "";
+    }
+    if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
+}
+
 /// Run the engine-owned BENCHMARK once for the round (cwd = the build workdir) via `python -c BENCH_PY`, and
 /// parse its single JSON line into a score. Best-effort: every failure path returns .err, so a missing python,
 /// a crashing test, or unparseable output can NEVER crash or hang the round (BENCH_PY itself caps each test run
 /// with a subprocess timeout). The score is engine truth the model cannot fake — it runs out-of-band, not as a
 /// tool the swarm controls.
 fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
+    if (w.checks_str.len > 0) return runDeclaredChecks(w, run_dir);
     const gpa = w.gpa;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return .{ .status = .err };
     defer gpa.free(workdir);
@@ -4054,7 +4368,7 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
 
 /// The FITNESS block injected into every mind's user prompt — the score turned into a concrete "raise this"
 /// instruction. gpa-owned (caller frees on replace + teardown).
-fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, doc_target: u32, prev_pct: u32, cov: Coverage) []const u8 {
+fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage) []const u8 {
     const fails = if (b.failures.len > 0) clip(b.failures, 900) else "(none — all green)";
     const cover_lead = if (cov.total > 0 and cov.present < cov.total)
         std.fmt.allocPrint(gpa, "COVERAGE {d}/{d} required files present. CREATE the MISSING required files FIRST (write_file, full substantive content — not stubs): {s}. ", .{ cov.present, cov.total, clip(cov.missing, 400) }) catch ""
@@ -4067,7 +4381,13 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, do
         else if (b.pct >= 95) " The device is healthy — keep watching; do not take irreversible actions without cause." else "";
         return std.fmt.allocPrint(gpa, "HOST FITNESS (raise this — your device's MEASURED health, 0-100): {d}/100 (last round it was {d}). State: {s}. Computed from the host ITSELF, not from your words — only an actual host_command that changes the host moves it; describing a plan leaves it unchanged, and a false_positive (killing/blocking something legitimate) drops it HARD.{s}", .{ b.pct, prev_pct, fails, nudge }) catch (gpa.dupe(u8, "HOST FITNESS: raise the host's measured health.") catch @constCast(""));
     }
-    const base: []const u8 = if (doc_target > 0)
+    // DECLARED checks outrank every inferred build-shape heuristic (doc-target included): when the goal
+    // states its own acceptance interface, that score IS the fitness — nothing the engine guessed may
+    // re-narrate it (observed live: an all-.txt LLM blueprint doc-classified a run whose goal declared
+    // VERIFY rows, and the prose nudge buried the real gradient).
+    const base: []const u8 = if (declared and b.status == .ok)
+        std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, fails }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
+    else if (doc_target > 0)
         switch (b.status) {
             .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Once every required file exists, your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
             else => gpa.dupe(u8, "LENGTH FITNESS: grow each file toward its word target by APPENDING scenes — this is prose, no tests or tools are needed.") catch @constCast(""),
@@ -5125,6 +5445,8 @@ const HANG_CHECK_S: u32 = 30;
 const HANG_STALE_CHECKS: u32 = 10;
 
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+extern "kernel32" fn GetProcessId(hProcess: *anyopaque) callconv(.winapi) u32;
+extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
 fn rawSleep1s() void {
     if (@import("builtin").os.tag == .windows) {
         Sleep(1000);
