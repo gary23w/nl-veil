@@ -122,9 +122,17 @@ pub fn commitEdit(
     defer fmtx.unlock(io);
 
     // HEAD = the file on disk, read IN-LOCK (authoritative; also catches an external --embed edit). Cap matches
-    // editFile's own read cap so nothing over 1 MiB reaches this path.
-    const cur = std.Io.Dir.cwd().readFileAlloc(io, full_workpath, gpa, .limited(1 << 20)) catch @constCast("");
+    // editFile's own read cap so nothing over 1 MiB reaches this path. A FAILED read is not an empty file:
+    // the caller proved the file exists (its own unlocked read succeeded), so treating a transient
+    // sharing-violation as "" would merge the ops against nothing and REPLACE the whole file with a fragment.
+    var head_unreadable = false;
+    const cur = std.Io.Dir.cwd().readFileAlloc(io, full_workpath, gpa, .limited(1 << 20)) catch blk: {
+        head_unreadable = true;
+        break :blk @constCast("");
+    };
     defer if (cur.len > 0) gpa.free(cur);
+    if (head_unreadable and base.len > 0)
+        return .{ .failed = dupe(gpa, "could not read the file's current state (transient lock?) — re-issue the edit") };
 
     const dec = mergeDecision(gpa, cur, base, ops);
     switch (dec) {

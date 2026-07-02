@@ -461,24 +461,23 @@ pub fn matchArchetype(role: []const u8) ?Archetype {
 /// the planner only overrides from round 2+, caps churn at half the swarm (anti-thrash), and never strips the
 /// learning floor (>=1 scout at n>=4; an omitted mind keeps its prior role, so the seed reviewer persists).
 /// Best-effort: on any failure roles are left untouched. Single-threaded (between rounds) — moments read fresh.
-/// TRUE when `focus` names a blueprint file already claimed by an earlier assignment THIS round (the caller
-/// then skips the duplicate assignment); otherwise registers every blueprint basename the focus names into
-/// `claimed` and returns false. Word-bounded matching, so `store.py` in prose never claims test_store.py.
-fn focusClaimsTaken(blueprint: []const u8, focus: []const u8, claimed: *std.ArrayListUnmanaged([]const u8), gpa: std.mem.Allocator) bool {
-    if (blueprint.len == 0) return false;
-    var pending: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer pending.deinit(gpa);
+/// The ONE blueprint basename `focus` names, or null when it names zero or several. Exactly-one is the
+/// ownership signal: "fix users.py" targets a file; "write test_users.py covering users.py" is coordination
+/// prose spanning two, and treating a mere MENTION as a claim let an early assignment steal a file from the
+/// mind the plan explicitly sent to it (audit finding). Word-bounded, so `store.py` never claims test_store.py.
+fn focusClaimFile(blueprint: []const u8, focus: []const u8) ?[]const u8 {
+    if (blueprint.len == 0) return null;
+    var match: ?[]const u8 = null;
     var bit = std.mem.splitScalar(u8, blueprint, '\n');
     while (bit.next()) |bl| {
         const bp = bpPath(bl) orelse continue;
         const base = std.fs.path.basename(bp);
         if (base.len < 4) continue;
         if (!run.containsWordBounded(focus, base)) continue;
-        for (claimed.items) |c| if (std.mem.eql(u8, c, base)) return true;
-        pending.append(gpa, base) catch {};
+        if (match != null) return null; // second distinct file — prose, not ownership
+        match = base;
     }
-    for (pending.items) |b| claimed.append(gpa, b) catch {};
-    return false;
+    return match;
 }
 
 pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, bench: BenchResult, stalled: bool) void {
@@ -588,10 +587,12 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
     var plan_ev: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_ev.deinit(gpa);
     // PER-FILE EXCLUSIVITY: at most ONE mind may hold a task naming a given blueprint file. Within this plan
-    // the first claim wins; after the plan lands, a STALE lane (a mind not reassigned this round) that names a
-    // file claimed this round is RELEASED. Without this, tasks piled up — observed live (sim_forum4): round 7
-    // held two minds' tasks on users.py, round 8 three; the collision spliced a second copy of the module into
-    // the file. Claims are blueprint basenames word-bounded in the task text (a real file, not a prose word).
+    // the first LANDED claim wins; after the plan lands, a STALE lane (a mind not reassigned this round) that
+    // names a file claimed this round is RELEASED. Without this, tasks piled up — observed live (sim_forum4):
+    // round 7 held two minds' tasks on users.py, round 8 three; the collision spliced a second copy of the
+    // module into the file. A claim = an assignment that (a) resolves to a REAL mind (a hallucinated name
+    // must not evict anybody), (b) is not research-only (a scout cannot write, so it cannot own a file), and
+    // (c) names exactly ONE blueprint file (a multi-file mention is prose, not ownership).
     var claimed: std.ArrayListUnmanaged([]const u8) = .empty; // slices into w.blueprint — stable this round
     defer claimed.deinit(gpa);
     const reassigned = gpa.alloc(bool, minds.len) catch null;
@@ -602,30 +603,46 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
     for (parsed.value.assignments) |a| {
         const focus = std.mem.trim(u8, a.focus, " \r\n\t");
         if (focus.len < 4) continue;
-        if (focusClaimsTaken(w.blueprint, focus, &claimed, gpa)) continue; // a teammate claimed this file first
+        const amind = std.mem.trim(u8, a.mind, " \r\n\t");
+        var tix: ?usize = null;
         for (minds, 0..) |*mi, mx| {
-            if (!std.ascii.eqlIgnoreCase(mi.name, a.mind)) continue;
-            if (reassigned) |ra| ra[mx] = true;
-            if (std.mem.eql(u8, mi.lane, focus)) {
-                mi.scout = a.research and w.internet;
+            if (std.ascii.eqlIgnoreCase(mi.name, amind)) {
+                tix = mx;
                 break;
             }
-            const newlane = gpa.dupe(u8, clip(focus, 300)) catch break;
-            if (mi.lane_owned and mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
-            mi.lane = newlane;
-            mi.lane_owned = true;
-            mi.scout = a.research and w.internet;
-            changed += 1;
-            if (plan_ev.items.len > 0) plan_ev.appendSlice(gpa, " | ") catch {};
-            plan_ev.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}: {s}", .{ a.mind, clip(newlane, 60) }) catch "") catch {};
-            break;
         }
+        const mx = tix orelse continue; // assignment to nobody — no claim, no eviction
+        const mi = &minds[mx];
+        if (focusClaimFile(w.blueprint, focus)) |base| {
+            var taken = false;
+            for (claimed.items) |c| if (std.mem.eql(u8, c, base)) {
+                taken = true;
+                break;
+            };
+            if (taken) continue; // a teammate's landed assignment claimed this file first — drop the duplicate
+            if (!a.research) claimed.append(gpa, base) catch {};
+        }
+        if (reassigned) |ra| ra[mx] = true;
+        if (std.mem.eql(u8, mi.lane, focus)) {
+            mi.scout = a.research and w.internet;
+            continue;
+        }
+        const newlane = gpa.dupe(u8, clip(focus, 300)) catch continue;
+        if (mi.lane_owned and mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
+        mi.lane = newlane;
+        mi.lane_owned = true;
+        mi.scout = a.research and w.internet;
+        changed += 1;
+        if (plan_ev.items.len > 0) plan_ev.appendSlice(gpa, " | ") catch {};
+        const pev = std.fmt.allocPrint(gpa, "{s}: {s}", .{ amind, clip(newlane, 60) }) catch "";
+        plan_ev.appendSlice(gpa, pev) catch {};
+        if (pev.len > 0) gpa.free(@constCast(pev));
     }
     // release stale colliding lanes: a mind NOT in this round's plan whose old task names a file a teammate
-    // just claimed would otherwise keep "owning" it and edit in parallel (the pile-up above).
-    if (claimed.items.len > 0) for (minds, 0..) |*mi, mx| {
-        const was_reassigned = if (reassigned) |ra| ra[mx] else false;
-        if (was_reassigned or !mi.lane_owned or mi.lane.len == 0) continue;
+    // just claimed would otherwise keep "owning" it and edit in parallel (the pile-up above). Requires the
+    // reassignment bookkeeping — if its allocation failed, do nothing (never clear a lane the plan just set).
+    if (claimed.items.len > 0) if (reassigned) |ra| for (minds, 0..) |*mi, mx| {
+        if (ra[mx] or !mi.lane_owned or mi.lane.len == 0) continue;
         var hit: []const u8 = "";
         for (claimed.items) |base| {
             if (run.containsWordBounded(mi.lane, base)) {

@@ -383,6 +383,27 @@ pub fn veilConverse(w: *Worker, goal: []const u8, user_text: []const u8) void {
     commons.sendMessage(gpa, w.io, w.run_dir, "veil", "all", clip(user_text, 600), w.cur_round);
 }
 
+/// THE VEIL SHELL FAST LANE. The shell (deploy.py chat) already answered the operator OUT-OF-BAND in the veil's
+/// voice — seconds, not round boundaries. `op:"veil","answered":1` lands here: record the exchange as lived
+/// conversation (veil_chat.jsonl + veil_msg events, so the web pane and every reconnect replay it) and, when the
+/// shell flagged steer, adopt the distilled directive — WITHOUT composing a second reply (one veil, one voice).
+pub fn veilShellNote(w: *Worker, user_text: []const u8, veil_reply: []const u8, directive: []const u8, steer: bool) void {
+    const gpa = w.gpa;
+    appendVeilChat(w, "user", user_text);
+    w.emit("veil_msg", std.fmt.allocPrint(w.a(), ",\"frm\":\"user\",\"text\":\"{s}\",\"round\":{d}", .{ w.esc(clip(user_text, 2000)), w.cur_round }) catch ",\"frm\":\"user\"");
+    if (veil_reply.len > 0) {
+        appendVeilChat(w, "veil", veil_reply);
+        w.emit("veil_msg", std.fmt.allocPrint(w.a(), ",\"frm\":\"veil\",\"text\":\"{s}\",\"round\":{d}", .{ w.esc(clip(veil_reply, 2000)), w.cur_round }) catch ",\"frm\":\"veil\"");
+    }
+    if (steer) {
+        const dir = if (directive.len > 0) directive else user_text;
+        w.act("veil", w.cur_round, "directive", "the operator steered the veil from the shell", clip(dir, 400));
+        if (w.veil_directive.len > 0) gpa.free(@constCast(w.veil_directive));
+        w.veil_directive = gpa.dupe(u8, clip(dir, 600)) catch "";
+        commons.sendMessage(gpa, w.io, w.run_dir, "veil", "all", clip(dir, 600), w.cur_round);
+    }
+}
+
 /// The veil is asked for four identity lines (I AM / I KNOW / I HAVE / MY WILL) and a trailing AROUSAL line, but a
 /// weak relay model reliably prepends chatter ("Here is the updated self:") and bolds the labels. Return the clean
 /// self — from the first "I AM" up to (but not including) the AROUSAL line — so the preamble never pollutes the .veil
