@@ -23,6 +23,7 @@ const hyperspace = @import("hyperspace.zig");
 const bufedit = @import("bufedit.zig");
 const rsi = @import("rsi.zig");
 const agi = @import("agi.zig");
+const crawl = @import("crawl.zig");
 const writer = @import("writer.zig");
 const locs = @import("locs/atlas.zig");
 
@@ -5984,7 +5985,18 @@ fn firstBalancedObject(s: []const u8) ?[]const u8 {
 fn screenDistill(w: *Worker, goal: []const u8, gap: []const u8, dom: []const u8, page: []const u8) ?Distilled {
     const gpa = w.gpa;
     const sys = "You are a strict extractor. Output ONLY one JSON object: {\"applicable\":true|false,\"evidence_span\":\"...\",\"note\":\"...\",\"code\":\"...\"}. evidence_span = copied VERBATIM from the page: the exact sentence or code line (at least 40 chars) that states the concrete technique/API/config/value; it MUST appear in the page character-for-character. note = at most 3 lines a builder can act on, derived ONLY from evidence_span, quoting the exact API/signature/value. code = OPTIONAL: when the page shows actual CODE (a signature, call, or config line), copy the single most reusable code line(s) VERBATIM from the page (max ~200 chars); otherwise an empty string — builders paste this directly, so never invent or paraphrase it. If the page has no concrete span, set applicable=false with empty strings. No preamble, no markdown, no phrases like 'see above'.";
-    const user = std.fmt.allocPrint(gpa, "GOAL: {s}\nGAP: {s}\nPAGE (source {s}):\n{s}\n", .{ clip(goal, 300), clip(gap, 200), dom, clip(page, 4000) }) catch return null;
+    // Show the judge the MOST GAP-RELEVANT ~4KB, not the raw first 4KB. On long reference/research pages the
+    // concrete technique sits below the fold, so a head-clip made the judge truthfully report applicable=false
+    // on pages that DID answer the gap (freeroam1 r1-r4: four straight frontiersin/scispace rejects, and the
+    // hive posted a public "knowledge trapped behind doors that stay shut" meditation — its frustration WAS
+    // this window). fitToQuery BM25-ranks the page's chunks against goal+gap and re-joins the top ones in
+    // document order; the provenance gate still verifies every span against the WHOLE page, so a tighter
+    // window only changes what the judge SEES, never what can be admitted. Empty query → doc head (old behavior).
+    const query = std.fmt.allocPrint(gpa, "{s} {s}", .{ clip(goal, 300), clip(gap, 200) }) catch "";
+    defer if (query.len > 0) gpa.free(query);
+    const window = crawl.fitToQuery(gpa, page, query, 4000);
+    defer gpa.free(window);
+    const user = std.fmt.allocPrint(gpa, "GOAL: {s}\nGAP: {s}\nPAGE (source {s}):\n{s}\n", .{ clip(goal, 300), clip(gap, 200), dom, window }) catch return null;
     defer gpa.free(user);
     const r = llm.chat(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, sys, user, 320);
     defer gpa.free(r.content);
