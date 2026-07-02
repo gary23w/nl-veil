@@ -461,6 +461,26 @@ pub fn matchArchetype(role: []const u8) ?Archetype {
 /// the planner only overrides from round 2+, caps churn at half the swarm (anti-thrash), and never strips the
 /// learning floor (>=1 scout at n>=4; an omitted mind keeps its prior role, so the seed reviewer persists).
 /// Best-effort: on any failure roles are left untouched. Single-threaded (between rounds) — moments read fresh.
+/// TRUE when `focus` names a blueprint file already claimed by an earlier assignment THIS round (the caller
+/// then skips the duplicate assignment); otherwise registers every blueprint basename the focus names into
+/// `claimed` and returns false. Word-bounded matching, so `store.py` in prose never claims test_store.py.
+fn focusClaimsTaken(blueprint: []const u8, focus: []const u8, claimed: *std.ArrayListUnmanaged([]const u8), gpa: std.mem.Allocator) bool {
+    if (blueprint.len == 0) return false;
+    var pending: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer pending.deinit(gpa);
+    var bit = std.mem.splitScalar(u8, blueprint, '\n');
+    while (bit.next()) |bl| {
+        const bp = bpPath(bl) orelse continue;
+        const base = std.fs.path.basename(bp);
+        if (base.len < 4) continue;
+        if (!run.containsWordBounded(focus, base)) continue;
+        for (claimed.items) |c| if (std.mem.eql(u8, c, base)) return true;
+        pending.append(gpa, base) catch {};
+    }
+    for (pending.items) |b| claimed.append(gpa, b) catch {};
+    return false;
+}
+
 pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, bench: BenchResult, stalled: bool) void {
     const gpa = w.gpa;
     if (minds.len <= 1) return;
@@ -567,11 +587,25 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
     var changed: u32 = 0;
     var plan_ev: std.ArrayListUnmanaged(u8) = .empty;
     defer plan_ev.deinit(gpa);
+    // PER-FILE EXCLUSIVITY: at most ONE mind may hold a task naming a given blueprint file. Within this plan
+    // the first claim wins; after the plan lands, a STALE lane (a mind not reassigned this round) that names a
+    // file claimed this round is RELEASED. Without this, tasks piled up — observed live (sim_forum4): round 7
+    // held two minds' tasks on users.py, round 8 three; the collision spliced a second copy of the module into
+    // the file. Claims are blueprint basenames word-bounded in the task text (a real file, not a prose word).
+    var claimed: std.ArrayListUnmanaged([]const u8) = .empty; // slices into w.blueprint — stable this round
+    defer claimed.deinit(gpa);
+    const reassigned = gpa.alloc(bool, minds.len) catch null;
+    defer if (reassigned) |ra| gpa.free(ra);
+    if (reassigned) |ra| for (ra) |*x| {
+        x.* = false;
+    };
     for (parsed.value.assignments) |a| {
         const focus = std.mem.trim(u8, a.focus, " \r\n\t");
         if (focus.len < 4) continue;
-        for (minds) |*mi| {
+        if (focusClaimsTaken(w.blueprint, focus, &claimed, gpa)) continue; // a teammate claimed this file first
+        for (minds, 0..) |*mi, mx| {
             if (!std.ascii.eqlIgnoreCase(mi.name, a.mind)) continue;
+            if (reassigned) |ra| ra[mx] = true;
             if (std.mem.eql(u8, mi.lane, focus)) {
                 mi.scout = a.research and w.internet;
                 break;
@@ -587,6 +621,26 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
             break;
         }
     }
+    // release stale colliding lanes: a mind NOT in this round's plan whose old task names a file a teammate
+    // just claimed would otherwise keep "owning" it and edit in parallel (the pile-up above).
+    if (claimed.items.len > 0) for (minds, 0..) |*mi, mx| {
+        const was_reassigned = if (reassigned) |ra| ra[mx] else false;
+        if (was_reassigned or !mi.lane_owned or mi.lane.len == 0) continue;
+        var hit: []const u8 = "";
+        for (claimed.items) |base| {
+            if (run.containsWordBounded(mi.lane, base)) {
+                hit = base;
+                break;
+            }
+        }
+        if (hit.len == 0) continue;
+        if (mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
+        mi.lane = "";
+        mi.lane_owned = false;
+        var relbuf: [256]u8 = undefined;
+        const relmsg = std.fmt.bufPrint(&relbuf, "stale task named `{s}`, which this round's plan assigns to a teammate — released (one mind per file)", .{hit}) catch "stale colliding task released (one mind per file)";
+        w.act("orchestrator", round, "lane_release", mi.name, relmsg);
+    };
     if (minds.len >= 4 and w.internet) {
         var has_scout = false;
         for (minds) |mi| {

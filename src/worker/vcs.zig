@@ -94,6 +94,16 @@ fn appendLine(io: std.Io, gpa: std.mem.Allocator, path: []const u8, line: []cons
     _ = writeAtomic(io, path, buf.items);
 }
 
+/// Optional pre-commit content gate, called IN-LOCK with (HEAD, candidate) right before the write. A non-null
+/// return is an owned reject message: the commit is abandoned and the file stays untouched. This is how the
+/// language gates (py-compile, duplicate-definition) reach the CONCURRENT path — without it every team>1 run
+/// bypassed edit_file's own gate entirely (the VCS branch returned before the gate ran), which is how a
+/// SEARCH/REPLACE spliced a full second copy of users.py into the file with no rejection.
+pub const Validator = struct {
+    ctx: *anyopaque,
+    check: *const fn (vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8,
+};
+
 /// Commit a mind's edit ops to `full_workpath` under `fmtx`. See file header for the correctness argument. Caller
 /// owns any returned message; on `committed` the caller builds its own success string.
 pub fn commitEdit(
@@ -106,6 +116,7 @@ pub fn commitEdit(
     ops: []const bufedit.EditOp,
     base: []const u8,
     mind: []const u8,
+    validator: ?Validator,
 ) Result {
     fmtx.lockUncancelable(io);
     defer fmtx.unlock(io);
@@ -120,6 +131,7 @@ pub fn commitEdit(
         .conflict => |m| return .{ .conflict = m },
         .write => |w| {
             defer gpa.free(w.bytes);
+            if (validator) |v| if (v.check(v.ctx, cur, w.bytes)) |msg| return .{ .failed = msg };
             if (!writeAtomic(io, full_workpath, w.bytes))
                 return .{ .failed = dupe(gpa, "could not write the edited file (locked by another process?)") };
 
@@ -222,12 +234,12 @@ test "commitEdit: two minds merge disjoint edits, a third with a stale base conf
 
     // mind A edits fn a (base == HEAD -> fast-forward)
     {
-        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn a() 1", .text = "fn a() 11" }}, base, "A");
+        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn a() 1", .text = "fn a() 11" }}, base, "A", null);
         try std.testing.expect(r == .committed);
     }
     // mind B edits fn b with a STALE base (never saw A's commit) -> must rebase onto A and merge
     {
-        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn b() 2", .text = "fn b() 22" }}, base, "B");
+        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn b() 2", .text = "fn b() 22" }}, base, "B", null);
         switch (r) {
             .committed => |c| try std.testing.expect(c.rebased),
             .conflict => |m| {
@@ -247,7 +259,7 @@ test "commitEdit: two minds merge disjoint edits, a third with a stale base conf
     }
     // mind C edits fn a's ORIGINAL line (A already changed it) with a stale base -> conflict, file untouched
     {
-        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn a() 1", .text = "fn a() 999" }}, base, "C");
+        const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn a() 1", .text = "fn a() 999" }}, base, "C", null);
         switch (r) {
             .conflict => |m| gpa.free(m),
             .committed => return error.CExpectedConflict,
@@ -266,4 +278,54 @@ test "commitEdit: two minds merge disjoint edits, a third with a stale base conf
     const vcs_dir = root ++ "/.vcs";
     const rk = hex32(hash16(npath));
     try std.testing.expect(readSeq(io, gpa, vcs_dir, &rk) == 2);
+}
+
+test "commitEdit: the pre-commit validator rejects IN-LOCK and HEAD stays untouched (the gate the VCS path used to bypass)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-vcs-gate-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    var fmtx: std.Io.Mutex = .init;
+    const full = root ++ "/work/mod.py";
+    const base = "def a():\n    return 1\n";
+    try std.testing.expect(writeAtomic(io, full, base));
+
+    const G = struct {
+        var saw_head: bool = false;
+        fn reject(vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8 {
+            _ = vctx;
+            saw_head = std.mem.indexOf(u8, head, "def a()") != null and std.mem.indexOf(u8, candidate, "# edited") != null;
+            return std.testing.allocator.dupe(u8, "edit REJECTED — gate says no") catch null;
+        }
+        fn accept(vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8 {
+            _ = vctx;
+            _ = head;
+            _ = candidate;
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    {
+        const r = commitEdit(io, gpa, &fmtx, root, "mod.py", full, &.{.{ .kind = .replace, .anchor = "def a():", .text = "def a():  # edited" }}, base, "A", .{ .ctx = @ptrCast(&dummy), .check = &G.reject });
+        switch (r) {
+            .failed => |m| {
+                try std.testing.expect(std.mem.startsWith(u8, m, "edit REJECTED"));
+                gpa.free(m);
+            },
+            else => return error.ExpectedGateReject,
+        }
+        try std.testing.expect(G.saw_head); // the gate really saw (HEAD, candidate)
+        const after = try std.Io.Dir.cwd().readFileAlloc(io, full, gpa, .limited(1 << 20));
+        defer gpa.free(after);
+        try std.testing.expectEqualStrings(base, after); // untouched
+    }
+    {
+        const r = commitEdit(io, gpa, &fmtx, root, "mod.py", full, &.{.{ .kind = .replace, .anchor = "def a():", .text = "def a():  # edited" }}, base, "A", .{ .ctx = @ptrCast(&dummy), .check = &G.accept });
+        try std.testing.expect(r == .committed);
+    }
 }

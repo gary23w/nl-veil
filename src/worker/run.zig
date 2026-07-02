@@ -2250,7 +2250,11 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     ctx.my_files = my_files;
     ctx.owned_by_others = others_files;
     ctx.one_slot = w.cap.one_slot;
-    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
+    // STRATEGY-FIX OVERRIDE: the orchestrator's task for THIS mind naming one BUILT blueprint file outranks
+    // the coverage frontier — one mind carries the deliberated bottleneck fix while teammates keep covering.
+    const lane_slot = if (!w.quick and w.cap.one_slot and mi.lane.len > 0) laneSlotOverride(w, mi.lane) else "";
+    defer if (lane_slot.len > 0) gpa.free(@constCast(lane_slot));
+    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else if (w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
     defer if (w.quick and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
     const dg_block = if (w.depgraph_str.len > 0)
@@ -2338,6 +2342,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const chunk_clause = " If this file would run more than ~40 lines, do NOT try to emit it all in one call — THIS round write a strong FIRST PART (imports/setup + the first function or section, correct as far as it goes) with write_file, then GROW it using write_file mode:\"append\" over the next rounds. A partial runnable file is real progress; producing nothing is a wasted round.";
     const slot = if (assembler) blk_slot: {
         if (assembler_slot.len > 0) {
+            if (lane_slot.len > 0)
+                break :blk_slot std.fmt.allocPrint(gpa, "FIX the ONE file `{s}` — the orchestrator's bottleneck task for YOU this round: {s}. Change it surgically (edit_file / SEARCH-REPLACE on its exact current lines — NEVER paste a whole second copy of the file); a corrected FULL rewrite is accepted only when the file's structure is wrong.", .{ assembler_slot, clip(mi.lane, 280) }) catch (gpa.dupe(u8, "") catch @constCast(""));
             if (inSpaceList(w.incomplete_str, std.fs.path.basename(assembler_slot))) {
                 // fence mode has NO write_file — telling a fenced mind to use mode:"append" makes obedience
                 // impossible; the fenced continuation is a SEARCH/REPLACE that extends the file's tail.
@@ -2921,7 +2927,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         // SLOTLESS RESCUE: a surplus-rank mind sometimes narrates a COMPLETE missing blueprint file (observed
         // live: a correct test_store.py, dropped with zero trace because it had no slot). If the reply's head
         // names exactly ONE unbuilt blueprint file and carries a fenced body, salvage into that file.
-        const derived = if (salvage_slot0.len == 0) deriveSlotFromReply(w, monologue) else "";
+        const derived = if (salvage_slot0.len == 0) deriveSlotFromReply(w, monologue, others_files) else "";
         const salvage_slot = if (salvage_slot0.len > 0) salvage_slot0 else derived;
         if (derived.len > 0) w.act(mi.name, round, "salvage_derive", derived, "slotless reply names exactly one unbuilt blueprint file — salvaging into it");
         // SURGICAL EDIT first: if the reply carries narrated SEARCH/REPLACE blocks, apply them through the SAME
@@ -3159,7 +3165,11 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     if (body.len < 80) return "too short (<80 chars)";
     if (salvageLeadConversational(body)) return "conversational lead-in (chatter, not a file body)";
     if (salvageHasToolFragment(body)) return "contains a raw tool-call fragment";
-    if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py") and !pyCompileOk(w, body)) return "fails py_compile (syntax error)";
+    if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py")) switch (pySalvageCheck(w, body)) {
+        7 => return "fails py_compile (syntax error)",
+        8 => return "defines the same top-level name TWICE — the body glues two copies of the module together; emit ONE clean copy of the file",
+        else => {},
+    };
     const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch return null;
     defer gpa.free(full);
     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
@@ -3172,8 +3182,11 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
 
 /// A slotless mind's narrated file, matched to the ONE unbuilt blueprint file its reply names near the head.
 /// Conservative: requires a fenced body, and exactly one distinct unbuilt basename match — ambiguity means no
-/// derivation (better to drop one rescue than to write the wrong file). Returned slice is gpa-owned ("" = none).
-fn deriveSlotFromReply(w: *Worker, monologue: []const u8) []const u8 {
+/// derivation (better to drop one rescue than to write the wrong file). A file ASSIGNED to a teammate this
+/// round is never derived into — the slot owner is building it in parallel and last-writer-wins would eat one
+/// side's work (observed live, sim_forum4 r2: a slotless mind salvaged users.py over the owner's in-flight
+/// build). Returned slice is gpa-owned ("" = none).
+fn deriveSlotFromReply(w: *Worker, monologue: []const u8, others_files: []const u8) []const u8 {
     const gpa = w.gpa;
     if (w.blueprint.len == 0) return "";
     if (std.mem.indexOf(u8, monologue, "```") == null) return "";
@@ -3190,6 +3203,7 @@ fn deriveSlotFromReply(w: *Worker, monologue: []const u8) []const u8 {
         const base = std.fs.path.basename(bp);
         if (base.len < 4) continue;
         if (builtInManifest(manifest, base)) continue;
+        if (tools.fileOwnedBy(others_files, bp)) continue;
         if (std.mem.indexOf(u8, head, base) == null) continue;
         matches += 1;
         match = bp;
@@ -3223,8 +3237,9 @@ fn slotImplicatedInFailure(w: *Worker, salvage_slot: []const u8) bool {
 }
 
 /// `needle` occurs in `s` with non-word characters (or edges) on both sides — `_`, letters, and digits count
-/// as word characters, so "store.py" does NOT match inside "test_store.py".
-fn containsWordBounded(s: []const u8, needle: []const u8) bool {
+/// as word characters, so "store.py" does NOT match inside "test_store.py". Pub: rsi.zig's planRoles uses it
+/// to enforce one-mind-per-file exclusivity over strategy task text.
+pub fn containsWordBounded(s: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return false;
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, s, from, needle)) |p| {
@@ -3242,6 +3257,64 @@ test "slot implication: failure text implicates, success text and substring cous
     try std.testing.expect(!containsWordBounded("ERROR in test_store.py collection", "store.py")); // substring cousin
     try std.testing.expect(containsWordBounded("cli.py: SYNTAX ERROR line 25", "cli.py"));
     try std.testing.expect(!containsWordBounded("", "store.py"));
+}
+
+test "extractGoalPaths adopts data files (config.json) and expands a bare __init__.py into the package dirs, never the root" {
+    const gpa = std.testing.allocator;
+    // the sim_forum4 goal shape: nested src tree + slashless config.json + a bare __init__.py token
+    const goal = "Build agora. Structure: src/main/app.py (reads config.json), src/db/store.py, static/style.css, config.json, test_db.py (pytest), README.md. Every package dir under src/ needs __init__.py; do NOT put __init__.py at the project root.";
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer if (tree.len > 0) gpa.free(@constCast(tree));
+    try std.testing.expect(std.mem.indexOf(u8, tree, "config.json") != null); // .json is a deliverable format
+    try std.testing.expect(std.mem.indexOf(u8, tree, "src/main/__init__.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree, "src/db/__init__.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree, "src/__init__.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree, "static/__init__.py") == null); // no .py under static/
+    // the bare root token is GONE (expanded into the package dirs above)
+    var has_bare = false;
+    var it = std.mem.splitScalar(u8, tree, '\n');
+    while (it.next()) |ln| if (std.mem.eql(u8, std.mem.trim(u8, ln, " \r\t"), "__init__.py")) {
+        has_bare = true;
+    };
+    try std.testing.expect(!has_bare);
+    // a FLAT goal keeps its bare __init__.py untouched (no dirs to expand into)
+    var n2: u32 = 0;
+    const flat = extractGoalPaths(gpa, "Build a lib: core.py, __init__.py, test_core.py", &n2);
+    defer if (flat.len > 0) gpa.free(@constCast(flat));
+    try std.testing.expect(std.mem.indexOf(u8, flat, "__init__.py") != null);
+}
+
+/// STRATEGY-FIX SLOT OVERRIDE — when the orchestrator's task for this mind names exactly ONE blueprint file
+/// that is already BUILT (and not mid-chunk), that file becomes the mind's slot this round: the deliberated
+/// bottleneck fix outranks frontier order. Observed live (sim_forum4): the strategy named the exact one-function
+/// fix in round 4, but coverage-first pinning kept every mind on missing files until round 6, and the fix
+/// finally landed in round 8 — two rounds starved, then corrupted. Unbuilt/incomplete files stay with the
+/// frontier assigner (someone gets them by rank), and planRoles' per-file exclusivity guarantees at most one
+/// mind holds a task naming any file. Returned slice is gpa-owned ("" = none).
+fn laneSlotOverride(w: *Worker, lane: []const u8) []const u8 {
+    const gpa = w.gpa;
+    if (w.blueprint.len == 0 or lane.len == 0) return "";
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return "";
+    defer gpa.free(mpath);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch "";
+    defer if (manifest.len > 0) gpa.free(manifest);
+    if (manifest.len == 0) return "";
+    var match: []const u8 = "";
+    var matches: u32 = 0;
+    var it = std.mem.splitScalar(u8, w.blueprint, '\n');
+    while (it.next()) |ln| {
+        const bp = bpPath(ln) orelse continue;
+        const base = std.fs.path.basename(bp);
+        if (base.len < 4) continue;
+        if (!containsWordBounded(lane, base)) continue;
+        if (!builtInManifest(manifest, base)) continue; // unbuilt => coverage frontier handles it
+        if (inSpaceList(w.incomplete_str, base)) continue; // mid-chunk => its owner is still growing it
+        matches += 1;
+        match = bp;
+    }
+    if (matches != 1) return "";
+    return gpa.dupe(u8, match) catch "";
 }
 
 fn salvageLeadConversational(body: []const u8) bool {
@@ -3328,21 +3401,24 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
     return gpa.dupe(u8, t) catch "";
 }
 
-fn pyCompileOk(w: *Worker, source: []const u8) bool {
+/// Gate a salvaged full-file .py body: 0 = ok (or the check can't run — fail-open), 7 = SyntaxError, 8 = the
+/// body defines the same top-level name twice (two glued copies of the module — valid Python, so compile()
+/// alone passed it; observed live as users.py doubled end to end).
+fn pySalvageCheck(w: *Worker, source: []const u8) u8 {
     const gpa = w.gpa;
-    const pe = w.mem.environ orelse return true;
-    var env = pe.clone(gpa) catch return true;
+    const pe = w.mem.environ orelse return 0;
+    var env = pe.clone(gpa) catch return 0;
     defer env.deinit();
-    env.put("NL_SALVAGE_SRC", source) catch return true;
+    env.put("NL_SALVAGE_SRC", source) catch return 0;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const code = "import os,sys\ntry:\n compile(os.environ.get('NL_SALVAGE_SRC',''),'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\n";
+    const code = "import os,sys,ast\nsrc=os.environ.get('NL_SALVAGE_SRC','')\ntry:\n compile(src,'<salvage>','exec')\nexcept SyntaxError:\n sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n seen=set()\n for n in ast.parse(src).body:\n  if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):\n   if n.name in seen: sys.exit(8)\n   seen.add(n.name)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return true;
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return 0;
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     return switch (r.term) {
-        .exited => |c| c != 7,
-        else => true,
+        .exited => |c| if (c == 7 or c == 8) @intCast(c) else 0,
+        else => 0,
     };
 }
 
@@ -3774,7 +3850,7 @@ fn interfaceScan(w: *Worker, run_dir: []const u8) void {
     defer env.deinit();
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", tools.INTERFACES_PY };
-    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(16 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const line = std.mem.trim(u8, r.stdout, " \r\n\t");
@@ -4321,11 +4397,12 @@ fn markIncomplete(w: *Worker, round: u32) void {
         defer gpa.free(fp);
         const fdata = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch continue;
         defer gpa.free(fdata);
-        const broken_py = std.mem.endsWith(u8, base, ".py") and std.mem.trim(u8, fdata, " \r\n\t").len > 40 and !pyCompileOk(w, fdata);
-        if (fileNeedsMore(fdata) or broken_py) {
+        const pycheck: u8 = if (std.mem.endsWith(u8, base, ".py") and std.mem.trim(u8, fdata, " \r\n\t").len > 40) pySalvageCheck(w, fdata) else 0;
+        if (fileNeedsMore(fdata) or pycheck != 0) {
             out.appendSlice(gpa, base) catch {};
             out.append(gpa, ' ') catch {};
-            if (broken_py) w.act("engine", round, "compile_fail", base, "a built .py file does not compile — re-queued to its owner to FIX");
+            if (pycheck == 7) w.act("engine", round, "compile_fail", base, "a built .py file does not compile — re-queued to its owner to FIX");
+            if (pycheck == 8) w.act("engine", round, "compile_fail", base, "a built .py file defines the same top-level name TWICE (two glued copies) — re-queued to its owner to collapse it into ONE clean copy");
         }
     }
     if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
@@ -4678,6 +4755,16 @@ fn isDocExt(base: []const u8) bool {
         std.mem.endsWith(u8, base, ".markdown") or std.mem.endsWith(u8, base, ".rst");
 }
 
+/// Config/data formats a goal legitimately names as DELIVERABLES (the bench already scores these by their own
+/// parsers) — without this list the extractor silently dropped them (observed live, sim_forum4: the goal listed
+/// `config.json` explicitly; it never entered the blueprint, so app.py's FileNotFoundError on boot was a failure
+/// no amount of coverage could fix). Runtime artifacts (.db/.sqlite/.log/.pid) stay excluded on purpose.
+fn isDataExt(base: []const u8) bool {
+    const ext = [_][]const u8{ ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".csv", ".tsv", ".svg" };
+    for (ext) |e| if (std.mem.endsWith(u8, base, e)) return true;
+    return false;
+}
+
 fn stripPathPunct(tok: []const u8) []const u8 {
     return std.mem.trim(u8, tok, " \t\r\n`'\"()[]{}<>,;.:*");
 }
@@ -4687,16 +4774,14 @@ fn looksLikeNamedFile(tok: []const u8) bool {
     if (std.mem.indexOf(u8, tok, "..") != null or tok[0] == '/' or tok[0] == '\\') return false;
     const base = if (std.mem.lastIndexOfScalar(u8, tok, '/')) |i| tok[i + 1 ..] else tok;
     if (base.len == 0) return false;
-    return isDocExt(base) or isCodeExt(base);
+    return isDocExt(base) or isCodeExt(base) or isDataExt(base);
 }
 
 fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []const u8 {
-    var bp: std.ArrayListUnmanaged(u8) = .empty;
     var seen: std.ArrayListUnmanaged([]const u8) = .empty;
     defer seen.deinit(gpa);
-    var n: u32 = 0;
     var it = std.mem.splitScalar(u8, goal, '\n');
-    while (it.next()) |raw| {
+    outer: while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0 or line.len > 2000) continue;
         var tit = std.mem.tokenizeAny(u8, line, " \t");
@@ -4710,12 +4795,57 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
             };
             if (dup) continue;
             seen.append(gpa, p) catch {};
-            if (n > 0) bp.append(gpa, '\n') catch {};
-            bp.appendSlice(gpa, clip(p, 160)) catch {};
-            n += 1;
-            if (n >= 40) break;
+            if (seen.items.len >= 40) break :outer;
         }
+    }
+    // PACKAGE-INIT PLACEMENT: a bare `__init__.py` token in a goal whose tree nests .py files in directories
+    // means "the packages need inits" — the project ROOT is the working dir, not a package, so a root init is
+    // (nearly) always wrong. Expand the bare token into `<dir>/__init__.py` for EVERY directory on the adopted
+    // .py paths and drop the root copy (observed live, sim_forum4: the goal said "every package dir under src/
+    // needs __init__.py; do NOT put it at the project root" and the adopted tree did exactly the opposite).
+    var inits: std.ArrayListUnmanaged([]const u8) = .empty; // gpa-owned "<dir>/__init__.py" strings
+    defer {
+        for (inits.items) |s| gpa.free(@constCast(s));
+        inits.deinit(gpa);
+    }
+    var bare_init: ?usize = null;
+    for (seen.items, 0..) |e, i| if (std.mem.eql(u8, e, "__init__.py")) {
+        bare_init = i;
+    };
+    if (bare_init) |bi| {
+        for (seen.items) |e| {
+            if (!std.mem.endsWith(u8, e, ".py")) continue;
+            var rest = e;
+            while (std.mem.lastIndexOfScalar(u8, rest, '/')) |sl| {
+                rest = rest[0..sl];
+                const ip = std.fmt.allocPrint(gpa, "{s}/__init__.py", .{rest}) catch break;
+                var have = false;
+                for (seen.items) |s| if (std.mem.eql(u8, s, ip)) {
+                    have = true;
+                    break;
+                };
+                if (!have) for (inits.items) |s| if (std.mem.eql(u8, s, ip)) {
+                    have = true;
+                    break;
+                };
+                if (have) gpa.free(@constCast(ip)) else inits.append(gpa, ip) catch gpa.free(@constCast(ip));
+            }
+        }
+        if (inits.items.len > 0) _ = seen.orderedRemove(bi);
+    }
+    var bp: std.ArrayListUnmanaged(u8) = .empty;
+    var n: u32 = 0;
+    for (seen.items) |e| {
         if (n >= 40) break;
+        if (n > 0) bp.append(gpa, '\n') catch {};
+        bp.appendSlice(gpa, clip(e, 160)) catch {};
+        n += 1;
+    }
+    for (inits.items) |e| {
+        if (n >= 40) break;
+        if (n > 0) bp.append(gpa, '\n') catch {};
+        bp.appendSlice(gpa, clip(e, 160)) catch {};
+        n += 1;
     }
     out_n.* = n;
     if (n == 0) {

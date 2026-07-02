@@ -768,9 +768,17 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (is_append) {
         const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch &[_]u8{};
         defer if (prior.len > 0) gpa.free(prior);
-        if (appendRestartsFile(prior, clean)) {
+        // A .py append that RE-DEFINES a top-level name the file already has is a fresh attempt at the same
+        // module, whatever its first line is — the first-line restart guard misses a re-attempt that opens with
+        // a different import, and gluing it on doubles every definition (observed live: users.py doubled end to
+        // end). Big enough to be the whole file => it IS the rewrite; a small redefining fragment is rejected
+        // outright (gluing corrupts, replacing 200 lines with 15 is silent data loss).
+        const redef: ?[]const u8 = if (std.mem.endsWith(u8, wpath, ".py")) pyAppendRedefines(prior, clean) else null;
+        if (appendRestartsFile(prior, clean) or (redef != null and clean.len * 2 >= prior.len)) {
             restarted = true;
             if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
+        } else if (redef) |nm| {
+            return std.fmt.allocPrint(gpa, "append REJECTED — your body RE-DEFINES `{s}`, which {s} already defines at top level; gluing it on would leave two copies of the same definition. To CHANGE an existing definition use edit_file (SEARCH its exact current lines, REPLACE with the fix); to truly append, send only NEW code that does not re-define existing names.", .{ nm, wpath }) catch dupe(gpa, "append rejected: body re-defines existing top-level names — use edit_file instead");
         } else {
             var joined: std.ArrayListUnmanaged(u8) = .empty;
             defer joined.deinit(gpa);
@@ -829,24 +837,65 @@ fn firstMeaningfulLine(s: []const u8) []const u8 {
     return "";
 }
 
-/// Compile-check a Python source string via the workdir python. Returns null when it compiles (or the check
-/// can't run — fail-open), else an owned "line N: message" (caller frees). The source rides an env var so no
-/// scratch file is needed and the model's code can't collide with a path.
-fn pyCompileError(ctx: *ToolCtx, source: []const u8) ?[]u8 {
+/// The name on a COLUMN-0 Python `def`/`async def`/`class` line (nested definitions are indented, so an
+/// unstripped scan sees only module-level ones). null for anything else.
+fn pyTopDefName(line: []const u8) ?[]const u8 {
+    var s = line;
+    if (std.mem.startsWith(u8, s, "async ")) s = s[6..];
+    const kw: usize = if (std.mem.startsWith(u8, s, "def ")) 4 else if (std.mem.startsWith(u8, s, "class ")) 6 else return null;
+    var end = kw;
+    while (end < s.len and (std.ascii.isAlphanumeric(s[end]) or s[end] == '_')) : (end += 1) {}
+    if (end == kw) return null;
+    return s[kw..end];
+}
+
+/// First top-level def/class name the append `body` shares with the existing `prior` — a genuine continuation
+/// never re-defines a module-level name the file already has. null = no overlap (safe to glue).
+fn pyAppendRedefines(prior: []const u8, body: []const u8) ?[]const u8 {
+    var bit = std.mem.splitScalar(u8, body, '\n');
+    while (bit.next()) |bl| {
+        const name = pyTopDefName(bl) orelse continue;
+        var pit = std.mem.splitScalar(u8, prior, '\n');
+        while (pit.next()) |pl| {
+            const pn = pyTopDefName(pl) orelse continue;
+            if (std.mem.eql(u8, name, pn)) return name;
+        }
+    }
+    return null;
+}
+
+/// Compile-check a Python source string via the workdir python. Returns null when it passes (or the check
+/// can't run — fail-open), else an owned "line N: message" / "duplicate top-level definition(s): ..." string
+/// (caller frees). Beyond the SyntaxError gate, it AST-checks that the edit did not paste a SECOND copy of a
+/// top-level def/class the file already had — valid Python, so compile() passes it, but it is the signature
+/// corruption of a REPLACE whose text re-emits the whole module (observed live: users.py doubled end to end).
+/// The pre-edit source rides NL_CHK_ORIG so a file that ALREADY carries duplicates stays editable — only
+/// NEWLY-introduced duplicates reject. Sources ride env vars so no scratch file is needed.
+fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
     var env = ctx.environ.clone(gpa) catch return null;
     defer env.deinit();
     env.put("NL_CHK_SRC", source) catch return null;
+    env.put("NL_CHK_ORIG", orig) catch return null;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
-    const code = "import os,sys\ntry:\n compile(os.environ.get('NL_CHK_SRC',''),'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\n";
+    const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)):\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
     const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(4096), .stderr_limit = .limited(4096) }) catch return null;
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     return switch (r.term) {
-        .exited => |c| if (c == 7) (gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \r\n\t")) catch null) else null,
+        .exited => |c| if (c == 7 or c == 8) (gpa.dupe(u8, std.mem.trim(u8, r.stdout, " \r\n\t")) catch null) else null,
         else => null,
     };
+}
+
+/// One reject message for BOTH edit paths (direct and VCS), so a gate rejection reads identically wherever it
+/// fires. `perr` is pyCompileError's output; a "duplicate ..." verdict gets the paste-a-second-copy guidance,
+/// anything else the parse-break guidance. Owned; null only on OOM (caller falls back to a static string).
+fn editRejectMsg(gpa: std.mem.Allocator, npath: []const u8, perr: []const u8) ?[]u8 {
+    if (std.mem.startsWith(u8, perr, "duplicate"))
+        return std.fmt.allocPrint(gpa, "edit REJECTED — applying your ops would paste a SECOND copy of code `{s}` already defines ({s}); the file was NOT changed. Never re-emit the whole module inside a REPLACE: SEARCH the exact current lines of the ONE definition you are changing and replace only those lines.", .{ npath, perr }) catch null;
+    return std.fmt.allocPrint(gpa, "edit REJECTED — applying your ops would leave `{s}` unparseable ({s}); the file was NOT changed. Your SEARCH/REPLACE likely dropped an indented body or mismatched a block boundary. Re-issue the edit so the RESULT still compiles (copy the anchor lines verbatim, keep every block's indentation).", .{ npath, perr }) catch null;
 }
 
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
@@ -878,8 +927,22 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     // When minds run concurrently, route through the micro-VCS: it reads HEAD in-lock and re-applies these ops
     // against it, so two minds editing one file merge instead of clobbering. `original` is this mind's base.
+    // The validator runs the SAME .py gate (compile + duplicate-definition) on the rebased result, in-lock,
+    // BEFORE the commit — the VCS branch returns from here, so without it team>1 runs had NO edit gate at all.
     if (ctx.vcs_enabled) if (ctx.fmtx) |m| {
-        const outcome = vcs.commitEdit(ctx.io, gpa, m, ctx.run_dir, npath, full, ops.items, original, ctx.mind);
+        const Gate = struct {
+            tc: *ToolCtx,
+            path: []const u8,
+            fn check(vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8 {
+                const g: *@This() = @ptrCast(@alignCast(vctx));
+                if (!std.mem.endsWith(u8, g.path, ".py")) return null;
+                const perr = pyCompileError(g.tc, candidate, head) orelse return null;
+                defer g.tc.gpa.free(perr);
+                return editRejectMsg(g.tc.gpa, g.path, perr) orelse (dupe(g.tc.gpa, "edit rejected: result does not compile"));
+            }
+        };
+        var gate = Gate{ .tc = ctx, .path = npath };
+        const outcome = vcs.commitEdit(ctx.io, gpa, m, ctx.run_dir, npath, full, ops.items, original, ctx.mind, .{ .ctx = @ptrCast(&gate), .check = &Gate.check });
         switch (outcome) {
             .committed => |c| {
                 ctx.files_written.* += 1;
@@ -898,9 +961,9 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // "edited" so the mind only learned two rounds later via the global scan. Reject a parse-breaking edit and
     // name the error NOW, in the same turn, keeping the last good file. Fail-open (a broken python env = no gate).
     if (std.mem.endsWith(u8, npath, ".py")) {
-        if (pyCompileError(ctx, res.bytes)) |perr| {
+        if (pyCompileError(ctx, res.bytes, original)) |perr| {
             defer gpa.free(perr);
-            return std.fmt.allocPrint(gpa, "edit REJECTED — applying your ops would leave `{s}` unparseable ({s}); the file was NOT changed. Your SEARCH/REPLACE likely dropped an indented body or mismatched a block boundary. Re-issue the edit so the RESULT still compiles (copy the anchor lines verbatim, keep every block's indentation).", .{ npath, perr }) catch dupe(gpa, "edit rejected: result does not compile");
+            return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
         }
     }
     if (!writeWorkFileAtomic(ctx, full, res.bytes)) return dupe(gpa, "could not write the edited file");
@@ -2788,13 +2851,33 @@ pub const SMOKE_PY =
 /// Parses each module with ast, collects the top-level def/class names it DEFINES, then flags every `module.attr`
 /// reference whose `module` is a local file but whose `attr` is NOT defined there (with a difflib "did you mean"),
 /// plus any file that fails to parse (a syntax error breaks the whole build). Prints ONE JSON line; never throws.
+///
+/// The contract is SIGNATURE-level, not just name-level: exports publish each function as `name(a, b=?, *args)`
+/// so builders see the real parameter list, and every cross-module CALL is checked against the def's arity and
+/// keyword names (observed live, sim_forum4 endgame: every remaining failure was a call-shape mismatch on a name
+/// that exists — start_server(host=..) vs def start_server(), init_db() vs def init_db(db_path)). The def stays
+/// canonical; a call with extra positionals, an unknown keyword, or a missing required argument is reported.
 pub const INTERFACES_PY =
     \\import ast,os,glob,json,sys,difflib
     \\def out(d): sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
     \\def modbase(mod):
     \\    return (mod or "").strip(".").split(".")[-1]
+    \\def siginfo(fn):
+    \\    a=fn.args
+    \\    pos=[x.arg for x in a.posonlyargs+a.args]
+    \\    req=pos[:len(pos)-len(a.defaults)] if a.defaults else pos[:]
+    \\    kwonly=[x.arg for x in a.kwonlyargs]
+    \\    kwreq=[x.arg for x,d in zip(a.kwonlyargs,a.kw_defaults) if d is None]
+    \\    if pos and pos[0] in ("self","cls"): pos=pos[1:]; req=[r for r in req if r not in ("self","cls")]
+    \\    return {"pos":pos,"req":req,"kwonly":kwonly,"kwreq":kwreq,"var":a.vararg is not None,"kw":a.kwarg is not None}
+    \\def sigstr(name,si):
+    \\    ps=[p if i<len(si["req"]) else p+"=?" for i,p in enumerate(si["pos"])]
+    \\    if si["var"]: ps.append("*args")
+    \\    ps+= [k if k in si["kwreq"] else k+"=?" for k in si["kwonly"]]
+    \\    if si["kw"]: ps.append("**kw")
+    \\    return name+"("+", ".join(ps)+")"
     \\try:
-    \\    defs={}; srcs={}
+    \\    defs={}; srcs={}; sigs={}
     \\    for p in glob.glob("**/*.py",recursive=True):
     \\        if "__pycache__" in p: continue
     \\        try: s=open(p,encoding="utf-8",errors="replace").read()
@@ -2805,7 +2888,9 @@ pub const INTERFACES_PY =
     \\        except SyntaxError: continue
     \\        ns=set()
     \\        for n in t.body:
-    \\            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): ns.add(n.name)
+    \\            if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)):
+    \\                ns.add(n.name); sigs.setdefault(base,{})[n.name]=siginfo(n)
+    \\            elif isinstance(n,ast.ClassDef): ns.add(n.name)
     \\            elif isinstance(n,ast.Assign):
     \\                for tg in n.targets:
     \\                    if isinstance(tg,ast.Name): ns.add(tg.id)
@@ -2814,11 +2899,26 @@ pub const INTERFACES_PY =
     \\    issues=[]; missing={}
     \\    def demand(mb,name):
     \\        missing.setdefault(mb,set()).add(name)
+    \\    def argcheck(caller,mb,fname,call):
+    \\        si=sigs.get(mb,{}).get(fname)
+    \\        if not si: return
+    \\        if any(isinstance(x,ast.Starred) for x in call.args): return
+    \\        kwn=[k.arg for k in call.keywords]
+    \\        if None in kwn: return
+    \\        probs=[]
+    \\        npos=len(call.args); maxpos=len(si["pos"])
+    \\        if npos>maxpos and not si["var"]: probs.append("takes at most "+str(maxpos)+" positional argument(s), got "+str(npos))
+    \\        for k in kwn:
+    \\            if k not in si["pos"] and k not in si["kwonly"] and not si["kw"]: probs.append("unexpected keyword '"+k+"'")
+    \\        covered=set(si["pos"][:min(npos,maxpos)])|set(kwn)
+    \\        miss=[r for r in si["req"] if r not in covered]+[r for r in si["kwreq"] if r not in kwn]
+    \\        if miss: probs.append("missing required argument(s): "+", ".join(miss))
+    \\        if probs: issues.append(caller+" calls "+mb+"."+fname+" — "+"; ".join(probs)+". The def is canonical: call it as "+sigstr(fname,si))
     \\    for p,s in srcs.items():
     \\        b=os.path.basename(p)
     \\        try: t=ast.parse(s)
     \\        except SyntaxError as e: issues.append(b+": SYNTAX ERROR line "+str(getattr(e,"lineno","?"))+" — the file does not parse, so every importer of it breaks"); continue
-    \\        alias2mod={}
+    \\        alias2mod={}; name2modfn={}
     \\        for n in ast.walk(t):
     \\            if isinstance(n,ast.ImportFrom):
     \\                mb=modbase(n.module)
@@ -2827,6 +2927,7 @@ pub const INTERFACES_PY =
     \\                        if a.name=="*": continue
     \\                        if a.name in defs:  # `from pkg import submodule`
     \\                            alias2mod[a.asname or a.name]=a.name; continue
+    \\                        if a.name in defs[mb]: name2modfn[a.asname or a.name]=(mb,a.name)
     \\                        if a.name not in defs[mb] and not a.name.startswith("_"):
     \\                            demand(mb,a.name)
     \\                            sug=difflib.get_close_matches(a.name,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
@@ -2843,8 +2944,19 @@ pub const INTERFACES_PY =
     \\                    demand(mb,n.attr)
     \\                    sug=difflib.get_close_matches(n.attr,[d for d in defs[mb] if not d.startswith("_")],1,0.4)
     \\                    issues.append(b+" uses "+m+"."+n.attr+"() but "+mb+".py defines no such name"+((" (did you mean "+sug[0]+"?)") if sug else ""))
+    \\        for n in ast.walk(t):
+    \\            if not isinstance(n,ast.Call): continue
+    \\            f=n.func
+    \\            if isinstance(f,ast.Attribute) and isinstance(f.value,ast.Name):
+    \\                mb=alias2mod.get(f.value.id)
+    \\                if mb and mb!=b[:-3]: argcheck(b,mb,f.attr,n)
+    \\            elif isinstance(f,ast.Name) and f.id in name2modfn:
+    \\                mb,orig=name2modfn[f.id]; argcheck(b,mb,orig,n)
     \\    issues=sorted(set(issues))[:12]
-    \\    exports={b:sorted(n for n in ns if not n.startswith("_")) for b,ns in defs.items() if any(not n.startswith("_") for n in ns)}
+    \\    exports={}
+    \\    for base,ns in defs.items():
+    \\        pub=[(sigstr(n,sigs[base][n]) if n in sigs.get(base,{}) else n) for n in sorted(ns) if not n.startswith("_")]
+    \\        if pub: exports[base]=pub
     \\    demanded={m:sorted(v) for m,v in missing.items()}
     \\    out({"mismatches":issues,"count":len(issues),"exports":exports,"demanded":demanded})
     \\except Exception as e:
@@ -3016,8 +3128,8 @@ fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
 /// True if `path` matches a comma+space entry of `list` (the format mindFiles emits) by BASENAME — because the
 /// system prompt makes minds write bare filenames (e.g. 'errors.py') while the slices carry full blueprint paths
 /// (e.g. 'src/todolib/errors.py'). Whole-basename equality (not substring), so 'errors.py' never matches
-/// 'myerrors.py'. Used by writeFile's file-partition guard.
-fn fileOwnedBy(list: []const u8, path: []const u8) bool {
+/// 'myerrors.py'. Used by writeFile's file-partition guard and run.zig's slotless-salvage derivation.
+pub fn fileOwnedBy(list: []const u8, path: []const u8) bool {
     if (list.len == 0) return false;
     const pb = std.fs.path.basename(path);
     if (pb.len == 0) return false;
@@ -3092,6 +3204,22 @@ test "appendRestartsFile: a restarted attempt is caught; a real continuation app
     const big_prior = "import json\n" ++ ("def f():\n    return 1\n\n" ** 12);
     try std.testing.expect(!appendRestartsFile(big_prior, "import json\n\ndef save_tasks(t):\n    pass\n"));
     try std.testing.expect(appendRestartsFile(big_prior, big_prior)); // a full same-size re-attempt still rewrites
+}
+
+test "pyAppendRedefines: a re-attempt that re-defines existing top-level names is caught even with a different opening line" {
+    // the sim_forum4 users.py corruption: a second full copy of the module, opening with a DIFFERENT first
+    // line (a comment), glued below the first — the first-line restart guard missed it.
+    const prior = "\"\"\"User auth.\"\"\"\nimport hashlib\n\ndef register(u, p):\n    pass\n\ndef verify(u, p):\n    pass\n";
+    const reattempt = "# src/auth/users.py\nimport os\nimport hashlib\n\ndef register(u, p):\n    pass\n\ndef verify(u, p):\n    return True\n";
+    try std.testing.expectEqualStrings("register", pyAppendRedefines(prior, reattempt).?);
+    // a genuine continuation adds NEW names only
+    try std.testing.expect(pyAppendRedefines(prior, "def get_user(u):\n    pass\n") == null);
+    // nested (indented) defs never count as top-level
+    try std.testing.expect(pyAppendRedefines(prior, "def wrap():\n    def verify(u, p):\n        pass\n") == null);
+    // async + class forms match at column 0
+    try std.testing.expectEqualStrings("verify", pyAppendRedefines("async def verify(t):\n    pass\n", "async def verify(t):\n    return 1\n").?);
+    try std.testing.expectEqualStrings("Store", pyAppendRedefines("class Store:\n    pass\n", "class Store:\n    x = 1\n").?);
+    try std.testing.expect(pyAppendRedefines("", "def a():\n    pass\n") == null);
 }
 
 test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {
