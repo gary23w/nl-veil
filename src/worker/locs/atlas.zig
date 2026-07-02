@@ -11,7 +11,18 @@ pub const Loc = struct {
     kind: Kind = .reference,
     depth: u8 = 2, // suggested crawl depth from a seed
     trust: f32 = 1.0, // ranking prior only — LEARNED application-trust decides what survives
+    pack: []const u8 = "", // nl-rag PACK index url — pre-normalized AI markdown (fetch-first when set)
 };
+
+/// nl-rag (github.com/gary23w/nl-rag) mirrors curated doc pages as pre-normalized markdown packs:
+/// no HTML, no site chrome, frontmattered provenance, split to fetch-sized parts. For a small model
+/// that's strictly better input than the raw doc site, and raw.githubusercontent bodies ride the
+/// existing 7-day fetch cache — so a pack page costs one GET ever. The INDEX lists every page of the
+/// pack (plus a distilled pack.facts) as absolute raw urls. Seeds stay listed: the pack is a fast
+/// mirror, not a replacement, and freshness-critical topics should still hit the origin.
+fn packUrl(comptime domain: []const u8) []const u8 {
+    return "https://raw.githubusercontent.com/gary23w/nl-rag/main/packs/" ++ domain ++ "/INDEX.md";
+}
 
 /// Curation rules: (1) official documentation first; (2) the url must serve real HTML to curl (no
 /// JS-walled apps); (3) doc roots over homepages so depth-2 crawls land on content; (4) tags must survive
@@ -23,28 +34,28 @@ pub const Loc = struct {
 /// (every seed answered 200 with real static HTML) followed by a tag-safety audit applying rule (5).
 pub const ATLAS = [_]Loc{
     // — base block: the original hand-curated core; listed first so score ties resolve toward it —
-    .{ .name = "python", .tags = &.{ "python", "pytest", "cpython", "pip" }, .seeds = &.{ "https://docs.python.org/3/library/", "https://docs.python.org/3/tutorial/", "https://docs.pytest.org/en/stable/" } },
-    .{ .name = "rust", .tags = &.{ "rust", "cargo", "borrow checker", "rustc" }, .seeds = &.{ "https://doc.rust-lang.org/std/", "https://doc.rust-lang.org/book/", "https://doc.rust-lang.org/rust-by-example/" } },
-    .{ .name = "ruby", .tags = &.{ "ruby", "rails", "rubygem" }, .seeds = &.{ "https://ruby-doc.org/core/", "https://ruby-doc.org/stdlib/", "https://guides.rubyonrails.org/" } },
-    .{ .name = "golang", .tags = &.{ "golang", "goroutine", "go module", "go stdlib" }, .seeds = &.{ "https://go.dev/doc/", "https://pkg.go.dev/std", "https://go.dev/ref/spec" } },
-    .{ .name = "javascript", .tags = &.{ "javascript", "node.js", "nodejs", "npm" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/JavaScript", "https://nodejs.org/api/" } },
-    .{ .name = "web-platform", .tags = &.{ "html", "css", "dom", "frontend" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/HTML", "https://developer.mozilla.org/en-US/docs/Web/CSS" } },
-    .{ .name = "http-rest", .tags = &.{ "http", "rest api", "endpoint", "cookie", "cors" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/HTTP", "https://www.rfc-editor.org/rfc/rfc9110.html" }, .kind = .spec },
-    .{ .name = "sql-sqlite", .tags = &.{ "sql", "sqlite", "database schema" }, .seeds = &.{ "https://sqlite.org/lang.html", "https://sqlite.org/docs.html" } },
-    .{ .name = "zig", .tags = &.{ "zig", "comptime" }, .seeds = &.{ "https://ziglang.org/documentation/master/", "https://ziglang.org/documentation/master/std/" } },
-    .{ .name = "algorithms", .tags = &.{ "algorithm", "sorting", "complexity", "big-o", "dynamic programming" }, .seeds = &.{ "https://en.wikipedia.org/wiki/List_of_algorithms", "https://en.wikipedia.org/wiki/Analysis_of_algorithms" }, .kind = .index, .trust = 0.8 },
-    .{ .name = "data-structures", .tags = &.{ "data structure", "hash table", "binary tree", "linked list", "b-tree" }, .seeds = &.{"https://en.wikipedia.org/wiki/List_of_data_structures"}, .kind = .index, .trust = 0.8 },
-    .{ .name = "software-design", .tags = &.{ "design pattern", "software architecture", "software design", "refactoring" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Software_design_pattern", "https://refactoring.guru/design-patterns" }, .kind = .cookbook, .trust = 0.8 },
-    .{ .name = "security", .tags = &.{ "security", "authentication", "password hashing", "session token", "owasp" }, .seeds = &.{ "https://cheatsheetseries.owasp.org/", "https://en.wikipedia.org/wiki/PBKDF2" }, .kind = .cookbook, .trust = 0.9 },
-    .{ .name = "git", .tags = &.{ "git", "merge conflict", "version control" }, .seeds = &.{"https://git-scm.com/docs"} },
-    .{ .name = "shell-linux", .tags = &.{ "bash", "shell script", "linux command", "posix" }, .seeds = &.{ "https://www.gnu.org/software/bash/manual/bash.html", "https://man7.org/linux/man-pages/" } },
-    .{ .name = "regex", .tags = &.{ "regex", "regular expression" }, .seeds = &.{"https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions"} },
+    .{ .name = "python", .pack = packUrl("python"), .tags = &.{ "python", "pytest", "cpython", "pip" }, .seeds = &.{ "https://docs.python.org/3/library/", "https://docs.python.org/3/tutorial/", "https://docs.pytest.org/en/stable/" } },
+    .{ .name = "rust", .pack = packUrl("rust"), .tags = &.{ "rust", "cargo", "borrow checker", "rustc" }, .seeds = &.{ "https://doc.rust-lang.org/std/", "https://doc.rust-lang.org/book/", "https://doc.rust-lang.org/rust-by-example/" } },
+    .{ .name = "ruby", .pack = packUrl("ruby"), .tags = &.{ "ruby", "rails", "rubygem" }, .seeds = &.{ "https://ruby-doc.org/core/", "https://ruby-doc.org/stdlib/", "https://guides.rubyonrails.org/" } },
+    .{ .name = "golang", .pack = packUrl("golang"), .tags = &.{ "golang", "goroutine", "go module", "go stdlib" }, .seeds = &.{ "https://go.dev/doc/", "https://pkg.go.dev/std", "https://go.dev/ref/spec" } },
+    .{ .name = "javascript", .pack = packUrl("javascript"), .tags = &.{ "javascript", "node.js", "nodejs", "npm" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/JavaScript", "https://nodejs.org/api/" } },
+    .{ .name = "web-platform", .pack = packUrl("web-platform"), .tags = &.{ "html", "css", "dom", "frontend" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/HTML", "https://developer.mozilla.org/en-US/docs/Web/CSS" } },
+    .{ .name = "http-rest", .pack = packUrl("http-rest"), .tags = &.{ "http", "rest api", "endpoint", "cookie", "cors" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/HTTP", "https://www.rfc-editor.org/rfc/rfc9110.html" }, .kind = .spec },
+    .{ .name = "sql-sqlite", .pack = packUrl("sql-sqlite"), .tags = &.{ "sql", "sqlite", "database schema" }, .seeds = &.{ "https://sqlite.org/lang.html", "https://sqlite.org/docs.html" } },
+    .{ .name = "zig", .pack = packUrl("zig"), .tags = &.{ "zig", "comptime" }, .seeds = &.{ "https://ziglang.org/documentation/master/", "https://ziglang.org/documentation/master/std/" } },
+    .{ .name = "algorithms", .pack = packUrl("algorithms"), .tags = &.{ "algorithm", "sorting", "complexity", "big-o", "dynamic programming" }, .seeds = &.{ "https://en.wikipedia.org/wiki/List_of_algorithms", "https://en.wikipedia.org/wiki/Analysis_of_algorithms" }, .kind = .index, .trust = 0.8 },
+    .{ .name = "data-structures", .pack = packUrl("data-structures"), .tags = &.{ "data structure", "hash table", "binary tree", "linked list", "b-tree" }, .seeds = &.{"https://en.wikipedia.org/wiki/List_of_data_structures"}, .kind = .index, .trust = 0.8 },
+    .{ .name = "software-design", .pack = packUrl("software-design"), .tags = &.{ "design pattern", "software architecture", "software design", "refactoring" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Software_design_pattern", "https://refactoring.guru/design-patterns" }, .kind = .cookbook, .trust = 0.8 },
+    .{ .name = "security", .pack = packUrl("security"), .tags = &.{ "security", "authentication", "password hashing", "session token", "owasp" }, .seeds = &.{ "https://cheatsheetseries.owasp.org/", "https://en.wikipedia.org/wiki/PBKDF2" }, .kind = .cookbook, .trust = 0.9 },
+    .{ .name = "git", .pack = packUrl("git"), .tags = &.{ "git", "merge conflict", "version control" }, .seeds = &.{"https://git-scm.com/docs"} },
+    .{ .name = "shell-linux", .pack = packUrl("shell-linux"), .tags = &.{ "bash", "shell script", "linux command", "posix" }, .seeds = &.{ "https://www.gnu.org/software/bash/manual/bash.html", "https://man7.org/linux/man-pages/" } },
+    .{ .name = "regex", .pack = packUrl("regex"), .tags = &.{ "regex", "regular expression" }, .seeds = &.{"https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_expressions"} },
 
     // — systems languages & native toolchains —
-    .{ .name = "c-language", .tags = &.{ "c language", "c programming", "c standard library", "libc", "c11" }, .seeds = &.{ "https://en.cppreference.com/w/c", "https://en.cppreference.com/w/c/language" } },
-    .{ .name = "cpp-language", .tags = &.{ "c++", "cpp", "c++ stl", "cppreference", "modern c++", "clang" }, .seeds = &.{ "https://en.cppreference.com/w/cpp", "https://en.cppreference.com/w/cpp/language" } },
+    .{ .name = "c-language", .pack = packUrl("c-cpp"), .tags = &.{ "c language", "c programming", "c standard library", "libc", "c11" }, .seeds = &.{ "https://en.cppreference.com/w/c", "https://en.cppreference.com/w/c/language" } },
+    .{ .name = "cpp-language", .pack = packUrl("c-cpp"), .tags = &.{ "c++", "cpp", "c++ stl", "cppreference", "modern c++", "clang" }, .seeds = &.{ "https://en.cppreference.com/w/cpp", "https://en.cppreference.com/w/cpp/language" } },
     .{ .name = "x86-assembly", .tags = &.{ "x86 assembly", "assembly language", "x86", "x86-64", "amd64", "asm" }, .seeds = &.{ "https://www.felixcloutier.com/x86/", "https://en.wikipedia.org/wiki/X86_instruction_listings" }, .trust = 0.9 },
-    .{ .name = "gnu-make", .tags = &.{ "makefile", "gnu make", "gmake", "makefile rules" }, .seeds = &.{ "https://www.gnu.org/software/make/manual/html_node/index.html", "https://www.gnu.org/software/make/manual/" } },
+    .{ .name = "gnu-make", .pack = packUrl("build-systems"), .tags = &.{ "makefile", "gnu make", "gmake", "makefile rules" }, .seeds = &.{ "https://www.gnu.org/software/make/manual/html_node/index.html", "https://www.gnu.org/software/make/manual/" } },
     .{ .name = "cmake", .tags = &.{ "cmake", "cmakelists", "ctest", "cpack" }, .seeds = &.{ "https://cmake.org/cmake/help/latest/", "https://cmake.org/cmake/help/latest/guide/tutorial/index.html" } },
     .{ .name = "gdb-debugging", .tags = &.{ "gdb", "gdb debugging", "gdb debugger", "gdb breakpoint", "core dump" }, .seeds = &.{"https://sourceware.org/gdb/current/onlinedocs/gdb/"} },
     .{ .name = "perl-docs", .tags = &.{ "perl", "perldoc", "perl script", "perl module", "cpan" }, .seeds = &.{ "https://perldoc.perl.org/", "https://perldoc.perl.org/perlintro", "https://perldoc.perl.org/functions" } },
@@ -78,16 +89,16 @@ pub const ATLAS = [_]Loc{
     .{ .name = "web-accessibility", .tags = &.{ "accessibility", "a11y", "aria", "wcag", "screen reader" }, .seeds = &.{ "https://developer.mozilla.org/en-US/docs/Web/Accessibility", "https://www.w3.org/WAI/standards-guidelines/wcag/", "https://www.w3.org/WAI/ARIA/apg/" } },
 
     // — web backend & api surface —
-    .{ .name = "django", .tags = &.{ "django", "django orm", "django rest", "django model" }, .seeds = &.{ "https://docs.djangoproject.com/en/stable/", "https://docs.djangoproject.com/en/stable/ref/" } },
-    .{ .name = "flask", .tags = &.{ "flask", "flask app", "werkzeug", "jinja2" }, .seeds = &.{ "https://flask.palletsprojects.com/en/stable/", "https://flask.palletsprojects.com/en/stable/api/" } },
+    .{ .name = "django", .pack = packUrl("web-frameworks"), .tags = &.{ "django", "django orm", "django rest", "django model" }, .seeds = &.{ "https://docs.djangoproject.com/en/stable/", "https://docs.djangoproject.com/en/stable/ref/" } },
+    .{ .name = "flask", .pack = packUrl("web-frameworks"), .tags = &.{ "flask", "flask app", "werkzeug", "jinja2" }, .seeds = &.{ "https://flask.palletsprojects.com/en/stable/", "https://flask.palletsprojects.com/en/stable/api/" } },
     .{ .name = "fastapi", .tags = &.{ "fastapi", "pydantic", "starlette", "uvicorn" }, .seeds = &.{ "https://fastapi.tiangolo.com/", "https://fastapi.tiangolo.com/tutorial/" } },
-    .{ .name = "express", .tags = &.{ "expressjs", "express.js", "express js", "express middleware", "express route", "express server" }, .seeds = &.{ "https://expressjs.com/en/5x/api.html", "https://expressjs.com/en/guide/routing.html" } },
+    .{ .name = "express", .pack = packUrl("web-frameworks"), .tags = &.{ "expressjs", "express.js", "express js", "express middleware", "express route", "express server" }, .seeds = &.{ "https://expressjs.com/en/5x/api.html", "https://expressjs.com/en/guide/routing.html" } },
     .{ .name = "deno", .tags = &.{ "deno", "deno runtime", "deno deploy" }, .seeds = &.{ "https://docs.deno.com/runtime/", "https://docs.deno.com/api/deno/" } },
     .{ .name = "graphql", .tags = &.{ "graphql", "graphql schema", "graphql query", "graphql mutation", "graphql subscription" }, .seeds = &.{ "https://graphql.org/learn/", "https://spec.graphql.org/October2021/" }, .kind = .tutorial },
     .{ .name = "grpc", .tags = &.{"grpc"}, .seeds = &.{ "https://grpc.io/docs/", "https://grpc.io/docs/what-is-grpc/introduction/" } },
     .{ .name = "openapi", .tags = &.{ "openapi", "swagger", "openapi spec", "api specification" }, .seeds = &.{ "https://spec.openapis.org/oas/latest.html", "https://swagger.io/specification/" }, .kind = .spec },
     .{ .name = "rest-api-design", .tags = &.{ "api design", "restful", "http api", "api guideline" }, .seeds = &.{ "https://en.wikipedia.org/wiki/REST", "https://raw.githubusercontent.com/microsoft/api-guidelines/vNext/azure/Guidelines.md" }, .trust = 0.8 },
-    .{ .name = "software-testing", .tags = &.{ "software testing", "unit testing methodology", "integration testing strategy", "test automation", "tdd" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Software_testing", "https://martinfowler.com/testing/" }, .trust = 0.8 },
+    .{ .name = "software-testing", .pack = packUrl("testing"), .tags = &.{ "software testing", "unit testing methodology", "integration testing strategy", "test automation", "tdd" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Software_testing", "https://martinfowler.com/testing/" }, .trust = 0.8 },
 
     // — data & machine learning —
     .{ .name = "numpy", .tags = &.{ "numpy", "ndarray", "array programming", "numerical python" }, .seeds = &.{ "https://numpy.org/doc/stable/", "https://numpy.org/doc/stable/reference/index.html", "https://numpy.org/doc/stable/user/index.html" } },
@@ -98,29 +109,30 @@ pub const ATLAS = [_]Loc{
     .{ .name = "r-language", .tags = &.{ "r language", "rstats", "cran", "statistical computing" }, .seeds = &.{ "https://cran.r-project.org/manuals.html", "https://cran.r-project.org/doc/manuals/r-release/R-intro.html", "https://cran.r-project.org/doc/manuals/r-release/R-lang.html" } },
     .{ .name = "julia", .tags = &.{ "julia language", "julialang" }, .seeds = &.{ "https://docs.julialang.org/en/v1/", "https://docs.julialang.org/en/v1/manual/getting-started/" } },
     .{ .name = "statistics-fundamentals", .tags = &.{ "statistics fundamentals", "probability", "statistical inference", "hypothesis testing", "probability distribution" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Statistics", "https://en.wikipedia.org/wiki/Probability" }, .trust = 0.8 },
+    .{ .name = "machine-learning", .tags = &.{ "machine learning", "neural network", "llm", "large language model", "transformer model", "gradient descent", "word embedding", "retrieval-augmented" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Machine_learning", "https://en.wikipedia.org/wiki/Large_language_model", "https://en.wikipedia.org/wiki/Retrieval-augmented_generation" }, .trust = 0.8, .pack = packUrl("machine-learning") },
 
     // — databases —
-    .{ .name = "postgresql", .tags = &.{ "postgresql", "postgres", "psql" }, .seeds = &.{ "https://www.postgresql.org/docs/current/", "https://www.postgresql.org/docs/current/sql-commands.html" } },
+    .{ .name = "postgresql", .pack = packUrl("databases"), .tags = &.{ "postgresql", "postgres", "psql" }, .seeds = &.{ "https://www.postgresql.org/docs/current/", "https://www.postgresql.org/docs/current/sql-commands.html" } },
     .{ .name = "mysql", .tags = &.{ "mysql", "innodb", "mysql server" }, .seeds = &.{ "https://dev.mysql.com/doc/refman/8.4/en/", "https://dev.mysql.com/doc/" } },
     .{ .name = "redis", .tags = &.{ "redis", "redis commands", "redis cache" }, .seeds = &.{ "https://redis.io/docs/latest/", "https://redis.io/docs/latest/commands/" } },
     .{ .name = "mongodb", .tags = &.{ "mongodb", "mongod", "mongosh", "aggregation pipeline" }, .seeds = &.{"https://www.mongodb.com/docs/manual/"} },
-    .{ .name = "sql-theory", .tags = &.{ "relational model", "database normalization", "relational database" }, .seeds = &.{ "https://en.wikipedia.org/wiki/SQL", "https://en.wikipedia.org/wiki/Relational_model", "https://en.wikipedia.org/wiki/Database_normalization" }, .trust = 0.8 },
+    .{ .name = "sql-theory", .pack = packUrl("databases"), .tags = &.{ "relational model", "database normalization", "relational database" }, .seeds = &.{ "https://en.wikipedia.org/wiki/SQL", "https://en.wikipedia.org/wiki/Relational_model", "https://en.wikipedia.org/wiki/Database_normalization" }, .trust = 0.8 },
 
     // — infra & devops —
-    .{ .name = "docker", .tags = &.{ "docker", "dockerfile", "docker compose", "docker container" }, .seeds = &.{ "https://docs.docker.com/", "https://docs.docker.com/reference/", "https://docs.docker.com/engine/" }, .kind = .index },
+    .{ .name = "docker", .pack = packUrl("docker-containers"), .tags = &.{ "docker", "dockerfile", "docker compose", "docker container" }, .seeds = &.{ "https://docs.docker.com/", "https://docs.docker.com/reference/", "https://docs.docker.com/engine/" }, .kind = .index },
     .{ .name = "kubernetes", .tags = &.{ "kubernetes", "k8s", "kubectl" }, .seeds = &.{ "https://kubernetes.io/docs/home/", "https://kubernetes.io/docs/concepts/", "https://kubernetes.io/docs/reference/" } },
     .{ .name = "terraform", .tags = &.{ "terraform", "hcl", "infrastructure as code", "terraform provider" }, .seeds = &.{ "https://developer.hashicorp.com/terraform/docs", "https://developer.hashicorp.com/terraform/language", "https://developer.hashicorp.com/terraform/cli" } },
     .{ .name = "ansible", .tags = &.{ "ansible", "ansible playbook", "ansible galaxy" }, .seeds = &.{ "https://docs.ansible.com/ansible/latest/index.html", "https://docs.ansible.com/" } },
     .{ .name = "nginx", .tags = &.{ "nginx", "nginx reverse proxy", "nginx conf" }, .seeds = &.{ "https://nginx.org/en/docs/", "https://nginx.org/en/docs/http/ngx_http_core_module.html" } },
-    .{ .name = "systemd", .tags = &.{ "systemd", "systemctl", "journalctl", "unit file" }, .seeds = &.{ "https://www.freedesktop.org/software/systemd/man/latest/", "https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html" } },
+    .{ .name = "systemd", .pack = packUrl("sysadmin-ops"), .tags = &.{ "systemd", "systemctl", "journalctl", "unit file" }, .seeds = &.{ "https://www.freedesktop.org/software/systemd/man/latest/", "https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html" } },
     .{ .name = "github-actions", .tags = &.{ "github actions", "github workflow", "actions runner" }, .seeds = &.{ "https://docs.github.com/en/actions", "https://docs.github.com/en/actions/reference" } },
 
     // — os & networking —
-    .{ .name = "tcp-ip", .tags = &.{ "tcp", "transmission control protocol", "internet protocol suite", "networking stack", "three-way handshake" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc9293.html", "https://en.wikipedia.org/wiki/Internet_protocol_suite" }, .kind = .spec },
-    .{ .name = "dns", .tags = &.{ "dns", "domain name system", "dns name resolution", "nameserver", "dns record" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc1035.html", "https://en.wikipedia.org/wiki/Domain_Name_System" }, .kind = .spec },
+    .{ .name = "tcp-ip", .pack = packUrl("networking"), .tags = &.{ "tcp", "transmission control protocol", "internet protocol suite", "networking stack", "three-way handshake" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc9293.html", "https://en.wikipedia.org/wiki/Internet_protocol_suite" }, .kind = .spec },
+    .{ .name = "dns", .pack = packUrl("networking"), .tags = &.{ "dns", "domain name system", "dns name resolution", "nameserver", "dns record" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc1035.html", "https://en.wikipedia.org/wiki/Domain_Name_System" }, .kind = .spec },
     .{ .name = "tls", .tags = &.{ "tls", "ssl", "transport layer security", "tls handshake", "https protocol" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc8446.html", "https://en.wikipedia.org/wiki/Transport_Layer_Security" }, .kind = .spec },
     .{ .name = "ssh", .tags = &.{ "ssh", "openssh", "secure shell", "ssh key", "remote login" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc4251.html", "https://man.openbsd.org/ssh.1" } },
-    .{ .name = "websockets", .tags = &.{ "websocket", "web socket", "websocket protocol", "socket upgrade" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc6455.html", "https://en.wikipedia.org/wiki/WebSocket" }, .kind = .spec },
+    .{ .name = "websockets", .pack = packUrl("networking"), .tags = &.{ "websocket", "web socket", "websocket protocol", "socket upgrade" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc6455.html", "https://en.wikipedia.org/wiki/WebSocket" }, .kind = .spec },
     .{ .name = "email-protocols", .tags = &.{ "smtp", "imap", "email protocol", "mail server", "email delivery" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc5321.html", "https://www.rfc-editor.org/rfc/rfc9051.html" }, .kind = .spec },
     .{ .name = "mqtt", .tags = &.{ "mqtt", "iot messaging", "mqtt publish subscribe", "mqtt broker" }, .seeds = &.{ "https://docs.oasis-open.org/mqtt/mqtt/v5.0/mqtt-v5.0.html", "https://mqtt.org/" }, .kind = .spec },
     .{ .name = "operating-systems", .tags = &.{ "operating system", "os kernel", "virtual memory", "process scheduling", "os theory" }, .seeds = &.{ "https://pages.cs.wisc.edu/~remzi/OSTEP/", "https://en.wikipedia.org/wiki/Operating_system", "https://en.wikipedia.org/wiki/Kernel_(operating_system)" }, .trust = 0.8 },
@@ -131,21 +143,21 @@ pub const ATLAS = [_]Loc{
     .{ .name = "automata-formal-languages", .tags = &.{ "automata", "automaton", "finite state machine", "formal language", "context-free grammar", "turing machine" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Automata_theory", "https://en.wikipedia.org/wiki/Formal_language", "https://en.wikipedia.org/wiki/Finite-state_machine" }, .trust = 0.8 },
     .{ .name = "distributed-systems", .tags = &.{ "distributed system", "distributed computing", "cap theorem", "consistency model", "eventual consistency" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Distributed_computing", "https://en.wikipedia.org/wiki/CAP_theorem", "https://en.wikipedia.org/wiki/Consistency_model" }, .trust = 0.8 },
     .{ .name = "consensus-algorithms", .tags = &.{ "consensus algorithm", "consensus protocol", "raft", "paxos", "leader election" }, .seeds = &.{ "https://raft.github.io/", "https://en.wikipedia.org/wiki/Consensus_(computer_science)", "https://en.wikipedia.org/wiki/Paxos_(computer_science)" }, .trust = 0.8 },
-    .{ .name = "concurrency", .tags = &.{ "concurrency", "concurrency control", "mutex", "memory ordering", "lock-free", "race condition" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Concurrency_(computer_science)", "https://en.wikipedia.org/wiki/Memory_ordering", "https://preshing.com/archives/" }, .trust = 0.8 },
+    .{ .name = "concurrency", .pack = packUrl("concurrency"), .tags = &.{ "concurrency", "concurrency control", "mutex", "memory ordering", "lock-free", "race condition" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Concurrency_(computer_science)", "https://en.wikipedia.org/wiki/Memory_ordering", "https://preshing.com/archives/" }, .trust = 0.8 },
     .{ .name = "complexity-theory", .tags = &.{ "complexity theory", "computational complexity", "np-complete", "np-hard", "time complexity" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Computational_complexity_theory", "https://en.wikipedia.org/wiki/NP-completeness", "https://en.wikipedia.org/wiki/P_versus_NP_problem" }, .trust = 0.8 },
 
     // — formats & encodings —
-    .{ .name = "json", .tags = &.{ "json", "rfc 8259", "json parser", "json serialization" }, .seeds = &.{ "https://www.json.org/json-en.html", "https://www.rfc-editor.org/rfc/rfc8259" }, .kind = .spec },
-    .{ .name = "xml", .tags = &.{ "xml", "extensible markup language", "xml namespace", "dtd" }, .seeds = &.{ "https://www.w3.org/TR/xml/", "https://www.w3.org/XML/" }, .kind = .spec },
-    .{ .name = "yaml", .tags = &.{ "yaml", "yml", "yaml spec" }, .seeds = &.{"https://yaml.org/spec/1.2.2/"}, .kind = .spec },
-    .{ .name = "toml", .tags = &.{ "toml", "toml config", "config file format" }, .seeds = &.{ "https://toml.io/en/v1.0.0", "https://toml.io/en/" }, .kind = .spec },
+    .{ .name = "json", .pack = packUrl("data-formats"), .tags = &.{ "json", "rfc 8259", "json parser", "json serialization" }, .seeds = &.{ "https://www.json.org/json-en.html", "https://www.rfc-editor.org/rfc/rfc8259" }, .kind = .spec },
+    .{ .name = "xml", .pack = packUrl("data-formats"), .tags = &.{ "xml", "extensible markup language", "xml namespace", "dtd" }, .seeds = &.{ "https://www.w3.org/TR/xml/", "https://www.w3.org/XML/" }, .kind = .spec },
+    .{ .name = "yaml", .pack = packUrl("data-formats"), .tags = &.{ "yaml", "yml", "yaml spec" }, .seeds = &.{"https://yaml.org/spec/1.2.2/"}, .kind = .spec },
+    .{ .name = "toml", .pack = packUrl("data-formats"), .tags = &.{ "toml", "toml config", "config file format" }, .seeds = &.{ "https://toml.io/en/v1.0.0", "https://toml.io/en/" }, .kind = .spec },
     .{ .name = "unicode-utf8", .tags = &.{ "unicode", "utf-8", "utf8", "character encoding", "codepoint", "byte order mark" }, .seeds = &.{ "https://www.unicode.org/faq/utf_bom.html", "https://en.wikipedia.org/wiki/UTF-8" }, .trust = 0.9 },
     .{ .name = "protobuf", .tags = &.{ "protobuf", "protocol buffers", "proto3", "proto file" }, .seeds = &.{ "https://protobuf.dev/", "https://protobuf.dev/programming-guides/proto3/" } },
-    .{ .name = "markdown", .tags = &.{ "markdown", "commonmark", "md syntax" }, .seeds = &.{ "https://spec.commonmark.org/0.31.2/", "https://daringfireball.net/projects/markdown/syntax" }, .kind = .spec },
-    .{ .name = "base64-mime", .tags = &.{ "base64", "base32", "mime type", "content-transfer-encoding", "data encoding" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc4648", "https://www.rfc-editor.org/rfc/rfc2045" }, .kind = .spec },
+    .{ .name = "markdown", .pack = packUrl("data-formats"), .tags = &.{ "markdown", "commonmark", "md syntax" }, .seeds = &.{ "https://spec.commonmark.org/0.31.2/", "https://daringfireball.net/projects/markdown/syntax" }, .kind = .spec },
+    .{ .name = "base64-mime", .pack = packUrl("data-formats"), .tags = &.{ "base64", "base32", "mime type", "content-transfer-encoding", "data encoding" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc4648", "https://www.rfc-editor.org/rfc/rfc2045" }, .kind = .spec },
 
     // — security & crypto —
-    .{ .name = "crypto-fundamentals", .tags = &.{ "cryptography", "public-key", "aes", "sha-256", "hmac", "encryption" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Public-key_cryptography", "https://en.wikipedia.org/wiki/Advanced_Encryption_Standard", "https://en.wikipedia.org/wiki/SHA-2" }, .trust = 0.8 },
+    .{ .name = "crypto-fundamentals", .pack = packUrl("crypto"), .tags = &.{ "cryptography", "public-key", "aes", "sha-256", "hmac", "encryption" }, .seeds = &.{ "https://en.wikipedia.org/wiki/Public-key_cryptography", "https://en.wikipedia.org/wiki/Advanced_Encryption_Standard", "https://en.wikipedia.org/wiki/SHA-2" }, .trust = 0.8 },
     .{ .name = "libsodium", .tags = &.{ "libsodium", "sodium library", "nacl", "secretbox" }, .seeds = &.{ "https://doc.libsodium.org/", "https://doc.libsodium.org/password_hashing" } },
     .{ .name = "jwt", .tags = &.{ "jwt", "json web token", "jwt bearer token" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc7519", "https://jwt.io/introduction" }, .kind = .spec },
     .{ .name = "oauth2", .tags = &.{ "oauth", "oauth2", "oauth 2.0", "authorization code", "oauth access token" }, .seeds = &.{ "https://www.rfc-editor.org/rfc/rfc6749", "https://oauth.net/2/" }, .kind = .spec },
@@ -242,12 +254,17 @@ pub fn sourcesBlock(gpa: std.mem.Allocator, text: []const u8, max_locs: usize) [
     if (n == 0) return "";
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(gpa);
-    b.appendSlice(gpa, " CANONICAL SOURCES for this domain (curated — web_fetch/deep_crawl these FIRST; use web_search only when they don't answer or the topic is outside them): ") catch {};
+    b.appendSlice(gpa, " CANONICAL SOURCES for this domain (curated — web_fetch/deep_crawl these FIRST; a PACK url serves pre-normalized markdown: fetch the pack INDEX, then fetch any page it lists; use web_search only when they don't answer or the topic is outside them): ") catch {};
     for (0..n) |i| {
         if (i > 0) b.appendSlice(gpa, " | ") catch {};
         b.append(gpa, '[') catch {};
         b.appendSlice(gpa, top[i].name) catch {};
         b.appendSlice(gpa, "] ") catch {};
+        if (top[i].pack.len > 0) {
+            b.appendSlice(gpa, "PACK ") catch {};
+            b.appendSlice(gpa, top[i].pack) catch {};
+            b.append(gpa, ' ') catch {};
+        }
         for (top[i].seeds, 0..) |s, si| {
             if (si > 0) b.append(gpa, ' ') catch {};
             b.appendSlice(gpa, s) catch {};
@@ -291,6 +308,21 @@ test "sourcesBlock: renders top domains with seeds, empty for unmatched text" {
     try std.testing.expect(std.mem.indexOf(u8, blk, "cheatsheetseries.owasp.org") != null);
     const none = sourcesBlock(gpa, "narrate a short story about winter", 3);
     try std.testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "pack wiring: covered domains render the PACK url ahead of seeds, uncovered domains stay seed-only" {
+    const gpa = std.testing.allocator;
+    const blk = sourcesBlock(gpa, "sort a list in Python", 3);
+    defer if (blk.len > 0) gpa.free(@constCast(blk));
+    try std.testing.expect(std.mem.indexOf(u8, blk, "PACK https://raw.githubusercontent.com/gary23w/nl-rag/main/packs/python/INDEX.md") != null);
+    const pack_at = std.mem.indexOf(u8, blk, "PACK ").?;
+    const seed_at = std.mem.indexOf(u8, blk, "https://docs.python.org").?;
+    try std.testing.expect(pack_at < seed_at); // the pre-normalized mirror is the first thing a scout sees
+    // a pack-less domain must render exactly as before — no PACK marker anywhere
+    const blk2 = sourcesBlock(gpa, "optimize the x86 assembly inner loop", 3);
+    defer if (blk2.len > 0) gpa.free(@constCast(blk2));
+    try std.testing.expect(std.mem.indexOf(u8, blk2, "x86-assembly") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blk2, "PACK https://") == null); // framing mentions PACK; no entry carries one
 }
 
 test "atlas audit: common-word tags de-fanged, dedicated domains own their tags, new domains reachable" {
