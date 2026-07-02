@@ -222,6 +222,32 @@ fn hiveStore(ctx: *ToolCtx, fact: []const u8) void {
 /// mind reads + writes the SAME skills and can build on each other's learned techniques.
 pub const SKILL_SCOPE = "skills";
 
+/// Mirror a saved skill to `<workdir>/skills/<slug>.md` so the library is BROWSABLE, not just recallable:
+/// list_dir/read_file exist in every schema tier (recall of the skills scope does not), the files survive the
+/// run on disk, and the delivery copy carries the learned techniques alongside the build they taught. Direct
+/// atomic write — NOT the write_file executor — so a skill never enters the build manifest, the blueprint
+/// frontier, or file-ownership accounting. Best-effort: a failed mirror never fails the save (memory is canon).
+fn mirrorSkill(ctx: *ToolCtx, name: []const u8, skill: []const u8) void {
+    const gpa = ctx.gpa;
+    var slug_buf: [64]u8 = undefined;
+    var n: usize = 0;
+    for (name) |c| {
+        if (n >= slug_buf.len) break;
+        slug_buf[n] = switch (c) {
+            'a'...'z', '0'...'9', '-', '_' => c,
+            'A'...'Z' => c | 0x20,
+            else => '-',
+        };
+        n += 1;
+    }
+    const slug: []const u8 = if (n > 0) slug_buf[0..n] else "skill";
+    const full = std.fmt.allocPrint(gpa, "{s}/skills/{s}.md", .{ ctx.workdir, slug }) catch return;
+    defer gpa.free(full);
+    const body = std.fmt.allocPrint(gpa, "# {s}\n\n{s}\n\n— saved by {s} (round {d})\n", .{ name, skill, ctx.mind, ctx.round }) catch return;
+    defer gpa.free(body);
+    _ = writeWorkFileAtomic(ctx, full, body);
+}
+
 /// The swarm's self-authored OPERATING PLAYBOOK — process directives the minds write for THEMSELVES (e.g.
 /// "read a file before improving it", "one mind owns each section"). It is injected into every mind's system
 /// prompt, so the minds effectively edit their own operating instructions and improve their PROCESS over time
@@ -243,7 +269,8 @@ pub const KNOWLEDGE_SCOPE = "knowledge";
 /// The EXTERNAL / runtime-LEARNED cache: facts the swarm acquired from the live web at runtime (scout/web tools)
 /// while OPERATING — kept separate from KNOWLEDGE_SCOPE (the protected core: baked playbook, tools, skills,
 /// directives, the daemon's own identity). Only this scope is evictable, so a service deployment can cap + FIFO it
-/// (stale threat-intel decays) WITHOUT ever touching the core. recall_hive spans BOTH, so the agent recalls all of it.
+/// (stale threat-intel decays) WITHOUT ever touching the core. recall_hive spans knowledge + intel + skills,
+/// so the agent recalls all of it.
 pub const INTEL_SCOPE = "intel";
 
 /// The VERIFIED-WORK corpus — heads of build files the swarm has already gotten RIGHT (promoted by the engine
@@ -368,13 +395,18 @@ pub const SCOUT_SCHEMA =
 /// assembler is given ONLY what it needs: read what exists, write the fill, record a fact, recall_hive — so it can
 /// PULL the exact concept/pattern the hive already learned before it builds (without recall, learned knowledge is
 /// stored-and-forgotten) — AND send_message, so parallel minds building separate files can agree on the interfaces
-/// between them. No web/search (the scout's job), no run_python/run_tests. Keep defs in sync with SCHEMA.
+/// between them. save_skill is here too: the lean tier is where techniques are actually WORKED OUT (every local
+/// model lands in this regime), and without a save path the skill-development RSI loop is structurally dead for
+/// exactly the minds doing the developing. No web/search (the scout's job), no run_python/run_tests, and no
+/// make_tool (authoring+invoking dynamic tools needs the full schema a lean model can't carry). Keep defs in
+/// sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"save_skill","description":"When filling your slot taught you a REUSABLE technique (a pattern, snippet, or recipe a teammate will need again), save it to the swarm's shared skill library: a short name + the concrete how-to. Do this AFTER your file work, and do NOT re-save a skill you were already shown.","parameters":{"type":"object","properties":{"name":{"type":"string"},"skill":{"type":"string"}},"required":["name","skill"]}}},
     \\{"type":"function","function":{"name":"send_message","description":"Tell a teammate (or 'all') the ONE thing they must know to stay consistent with your file — the exact function name + signature you expose, or a decision the others must match. Read your inbox (shown above) and reply when a teammate needs something.","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
@@ -473,10 +505,19 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer gpa.free(core);
         const learned = ctx.mem.assoc(INTEL_SCOPE, p.value.query, 1, 12);
         defer gpa.free(learned);
-        if (core.len == 0 and learned.len == 0) return dupe(gpa, "(the hive knows nothing relevant yet — be the first to share something)");
-        if (learned.len == 0) return dupe(gpa, core);
-        if (core.len == 0) return dupe(gpa, learned);
-        return std.fmt.allocPrint(gpa, "{s}\n{s}", .{ core, learned }) catch dupe(gpa, core);
+        // skills ride the same recall: a saved technique nobody can recall is stored-and-forgotten —
+        // the exact failure mode this tool exists to prevent for knowledge.
+        const skills = ctx.mem.assoc(SKILL_SCOPE, p.value.query, 1, 6);
+        defer gpa.free(skills);
+        if (core.len == 0 and learned.len == 0 and skills.len == 0) return dupe(gpa, "(the hive knows nothing relevant yet — be the first to share something)");
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(gpa);
+        for ([_][]const u8{ core, learned, skills }) |part| {
+            if (part.len == 0) continue;
+            if (out.items.len > 0) out.append(gpa, '\n') catch {};
+            out.appendSlice(gpa, part) catch {};
+        }
+        return dupe(gpa, out.items);
     }
     if (std.mem.eql(u8, name, "probe")) {
         if (ctx.space.len == 0) return dupe(gpa, "this swarm has no spatial grid (the task isn't spatial) — there is nothing to probe");
@@ -524,6 +565,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer gpa.free(text);
         _ = ctx.mem.observe(SKILL_SCOPE, text);
         ctx.skills_saved.* += 1;
+        mirrorSkill(ctx, p.value.name, p.value.skill);
         const total = ctx.mem.factCount(SKILL_SCOPE);
         return std.fmt.allocPrint(gpa, "skill saved to the shared library ({d} skills total)", .{total}) catch dupe(gpa, "skill saved");
     }
@@ -2686,6 +2728,11 @@ pub const BENCH_PY =
     \\import sys,json,os,glob,subprocess,re,py_compile
     \\def out(d):
     \\    sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
+    \\def skipf(f):
+    \\    # layout-blind scoring must still skip non-deliverable trees: dot/underscore segments (caches,
+    \\    # __pycache__), dependency dirs, and the engine-owned skills/ library (learned notes, not the build)
+    \\    segs=f.replace(os.sep,"/").split("/")
+    \\    return any(s.startswith((".","_")) or s in ("node_modules","venv") for s in segs) or segs[0]=="skills"
     \\def ff(txt):
     \\    r=[]
     \\    body=re.split(r"-{3,}[\r\n]+Ran \d",txt)[0]
@@ -2711,8 +2758,8 @@ pub const BENCH_PY =
     \\    return u[:6]
     \\def wf():
     \\    fails=[]; ok=0; tot=0
-    \\    for f in sorted(glob.glob("*")+glob.glob("*/*")):
-    \\        if not os.path.isfile(f) or os.path.basename(f).startswith((".","_")): continue
+    \\    for f in sorted(glob.glob("**/*",recursive=True)):
+    \\        if not os.path.isfile(f) or skipf(f): continue
     \\        lf=f.lower()
     \\        if lf.endswith((".py",".pyc")): continue
     \\        tot+=1
@@ -2746,7 +2793,7 @@ pub const BENCH_PY =
     \\            fails=ff(txt)
     \\            out({"status":"ok","passed":p,"total":tot,"failures":fails,"tier":1})
     \\        out({"status":"error","msg":("protected spec did not run: "+(txt.strip().splitlines() or ["?"])[-1])[:120]})
-    \\    pys=[f for f in glob.glob("*.py")+glob.glob("*/*.py") if not os.path.basename(f).startswith("_")]
+    \\    pys=[f for f in glob.glob("**/*.py",recursive=True) if not skipf(f)]
     \\    tests=[f for f in pys if os.path.basename(f).startswith("test_") or os.path.basename(f).endswith("_test.py")]
     \\    if os.path.isdir("tests"): tests+=glob.glob("tests/**/*.py",recursive=True)
     \\    aux=wf()[2]
@@ -2780,7 +2827,7 @@ pub const BENCH_PY =
     \\            except Exception as e: fails.append((f+": "+str(e).splitlines()[0])[:90])
     \\        out({"status":"ok","passed":ok,"total":tot,"failures":(fails+aux)[:5],"tier":2})
     \\    tw=int(os.environ.get("NL_DOC_TARGET_WORDS","0") or 0)
-    \\    docs=[f for f in glob.glob("*")+glob.glob("*/*") if os.path.isfile(f) and not os.path.basename(f).startswith((".","_"))]
+    \\    docs=[f for f in glob.glob("**/*",recursive=True) if os.path.isfile(f) and not skipf(f)]
     \\    if docs and tw>0:
     \\        sc=0.0
     \\        for f in docs:
