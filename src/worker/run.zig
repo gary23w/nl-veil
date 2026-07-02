@@ -1361,8 +1361,19 @@ fn builtInManifest(data: []const u8, key: []const u8) bool {
         const fp = ln[0..bar];
         const hit = if (want_full) pathEq(fp, key) else std.mem.eql(u8, std.fs.path.basename(fp), key);
         if (hit) {
-            const sz = std.fmt.parseInt(u64, std.mem.trim(u8, ln[bar + 1 ..], " \r\t"), 10) catch 0;
-            if (sz >= 40) return true;
+            var tail = std.mem.trim(u8, ln[bar + 1 ..], " \r\t");
+            var flag: []const u8 = "";
+            if (std.mem.indexOfScalar(u8, tail, '|')) |b2| {
+                flag = std.mem.trim(u8, tail[b2 + 1 ..], " \r\t");
+                tail = std.mem.trim(u8, tail[0..b2], " \r\t");
+            }
+            const sz = std.fmt.parseInt(u64, tail, 10) catch 0;
+            // A "valve"-flagged entry is credited at ANY size: the length-floor valve only commits after
+            // the slot was floor-rejected twice with the file still missing — the engine's own evidence
+            // that this file is INTENTIONALLY tiny. Without the credit, a complete 2-byte deliverable
+            // re-pins its slot every round (kotlin4 r3/r7, collider1 r3: wasted attempts, no deadlock).
+            // The >=40 floor still guards every ordinary write against stub-retiring a slot.
+            if (sz >= 40 or std.mem.eql(u8, flag, "valve")) return true;
         }
     }
     return false;
@@ -3154,10 +3165,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer gpa.free(wres);
                 const landed = std.mem.startsWith(u8, wres, "wrote") or std.mem.startsWith(u8, wres, "rewrote") or std.mem.startsWith(u8, wres, "appended");
                 if (landed) {
-                    w.act(mi.name, round, "salvage", salvage_slot, if (body.len < 80)
-                        "rescued a SHORT narrated file body via the length-floor valve (slot floor-rejected twice, file still missing)"
-                    else
-                        "rescued a narrated file body from the reply into the assigned slot");
+                    if (body.len < 80) {
+                        markValveBuilt(w, salvage_slot, body.len);
+                        w.act(mi.name, round, "salvage", salvage_slot, "rescued a SHORT narrated file body via the length-floor valve (slot floor-rejected twice, file still missing)");
+                    } else {
+                        w.act(mi.name, round, "salvage", salvage_slot, "rescued a narrated file body from the reply into the assigned slot");
+                    }
                 } else {
                     // the write path itself refused (ownership/marker/append guard) — record the truth, not a
                     // phantom rescue, and put the refusal in the round ledger the lead reads
@@ -3313,6 +3326,27 @@ fn noteReject(w: *Worker, path: []const u8, why: []const u8) void {
     w.reject_notes.appendSlice(w.gpa, " — ") catch return;
     w.reject_notes.appendSlice(w.gpa, clip(why, 90)) catch return;
     w.reject_notes.appendSlice(w.gpa, "; ") catch return;
+}
+
+/// Append a "path|bytes|valve" line to .build_manifest after a length-floor-valve landing, so
+/// builtInManifest credits the intentionally-tiny file and its slot ADVANCES instead of re-pinning
+/// every round. Same locked read-append-write shape as the tool layer's manifest appends; the third
+/// field is invisible to every reader that only parses the path segment.
+fn markValveBuilt(w: *Worker, slot: []const u8, n: usize) void {
+    const gpa = w.gpa;
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return;
+    defer gpa.free(mpath);
+    const existing = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(64 << 10)) catch &[_]u8{};
+    defer if (existing.len > 0) gpa.free(existing);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    buf.appendSlice(gpa, existing) catch return;
+    const line = std.fmt.allocPrint(gpa, "{s}|{d}|valve\n", .{ slot, n }) catch return;
+    defer gpa.free(line);
+    buf.appendSlice(gpa, line) catch return;
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
 }
 
 /// True only when the slot file genuinely does NOT exist on disk (read error). An existing (even empty)
@@ -7021,6 +7055,16 @@ test "builtInManifest matches by basename + non-trivial size (the slot-advance s
     try std.testing.expect(!builtInManifest(m, "routes.rs"));
     try std.testing.expect(!builtInManifest("", "anything"));
     try std.testing.expect(builtInManifest("PROJECT_TREE/main.rs|600\n", "main.rs"));
+}
+
+test "builtInManifest: a valve-flagged entry credits at ANY size (collider1 r3: complete 2-byte seed.json re-pinned its slot); unflagged tiny and junk flags still don't" {
+    const m = "pulse/data/seed.json|2|valve\npulse/version.txt|5|valve\nnotes.md|12\nstub.py|3|wip\n";
+    try std.testing.expect(builtInManifest(m, "pulse/data/seed.json"));
+    try std.testing.expect(builtInManifest(m, "pulse/version.txt"));
+    try std.testing.expect(builtInManifest(m, "seed.json")); // bare key: same credit
+    try std.testing.expect(!builtInManifest(m, "notes.md")); // tiny + no flag: still a stub
+    try std.testing.expect(!builtInManifest(m, "stub.py")); // unknown flag is not a credit
+    try std.testing.expect(!builtInManifest(m, "pulse/core/seed.json")); // sibling stays distinct
 }
 
 test "builtInManifest: a path key distinguishes same-basename siblings (sim_forum6 __init__.py stall / Rust mod.rs)" {
