@@ -3621,16 +3621,32 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
         gpa.free(c);
     }
     {
+        // DEPTH-AWARE fence pairing: a ``` carrying an info string (```python, ```bash) always OPENS a
+        // block; a bare ``` closes the innermost open block (or opens an anonymous one at depth 0). A
+        // markdown FILE with embedded code examples therefore stays ONE top-level block — the old
+        // first-close scan paired the outer ```markdown with the first INNER example fence and cut
+        // every README at its first code sample (kotlin2/3/4 + collider1 all ended mid-document at
+        // "### add" / "prints a table:" / "## Installation"; only example-free READMEs survived).
         var best: []const u8 = "";
         var scan: usize = 0;
-        while (std.mem.indexOfPos(u8, monologue, scan, "```")) |open| {
-            var bodystart = open + 3;
-            while (bodystart < monologue.len and monologue[bodystart] != '\n') bodystart += 1;
-            if (bodystart < monologue.len) bodystart += 1;
-            const close = std.mem.indexOfPos(u8, monologue, bodystart, "```") orelse break;
-            const body = std.mem.trim(u8, monologue[bodystart..close], " \r\n\t");
-            if (body.len > best.len) best = body;
-            scan = close + 3;
+        var depth: u32 = 0;
+        var top_start: usize = 0;
+        while (std.mem.indexOfPos(u8, monologue, scan, "```")) |mark| {
+            var eol = mark + 3;
+            while (eol < monologue.len and monologue[eol] != '\n') eol += 1;
+            const info = std.mem.trim(u8, monologue[mark + 3 .. eol], " \t\r");
+            const body_start = if (eol < monologue.len) eol + 1 else eol;
+            if (info.len > 0 or depth == 0) {
+                depth += 1;
+                if (depth == 1) top_start = body_start;
+            } else {
+                depth -= 1;
+                if (depth == 0) {
+                    const body = std.mem.trim(u8, monologue[top_start..mark], " \r\n\t");
+                    if (body.len > best.len) best = body;
+                }
+            }
+            scan = eol;
         }
         // A fenced block is the mind's EXPLICIT file-body signal — return it whatever its size and let
         // salvageRejectReason's floor+valve own the length policy. A pre-floor here starved the valve of
@@ -7479,6 +7495,38 @@ test "salvageFileBody returns a TINY fenced body whole — length policy belongs
     const b2 = salvageFileBody(gpa, mixed);
     defer if (b2.len > 0) gpa.free(b2);
     try std.testing.expectEqualStrings("[]", b2);
+}
+
+test "salvageFileBody: a markdown file's EMBEDDED example fences don't cut it — depth-aware pairing keeps the whole doc (four straight sims truncated every README at its first code sample)" {
+    const gpa = std.testing.allocator;
+    const monologue =
+        \\README.md
+        \\```markdown
+        \\# Expense Tracker
+        \\
+        \\## Commands
+        \\
+        \\### add
+        \\```bash
+        \\expense add --amount 23.50 --category food
+        \\```
+        \\
+        \\### list
+        \\```bash
+        \\expense list --month 7
+        \\```
+        \\
+        \\## Notes
+        \\All data persists to expenses.json.
+        \\```
+    ;
+    const body = salvageFileBody(gpa, monologue);
+    defer if (body.len > 0) gpa.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "# Expense Tracker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "expense add --amount") != null); // first example survives
+    try std.testing.expect(std.mem.indexOf(u8, body, "expense list --month") != null); // second example survives
+    try std.testing.expect(std.mem.indexOf(u8, body, "All data persists") != null); // the tail after both examples survives
+    try std.testing.expect(!std.mem.startsWith(u8, body, "README.md")); // path line stays outside the body
 }
 
 test "fileShapedToken: extension or path-shape marks a real slot (app/Makefile salvageable); bare prose words and root dotless stay excluded, matching bpPath" {
