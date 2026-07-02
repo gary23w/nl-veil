@@ -194,10 +194,53 @@ First-run local login is `admin@neuron-loops.local` / `changeme` — **change it
 `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
 refuses the default and prints a generated password once.
 
+## The fleet hub — many veils, one console
+
+The web control plane watches *one* box. When you've installed veils across a fleet of machines,
+`hub.py` gives you *one place* to see and steer all of them. Three roles, one file, standard library
+only — and enrollment is **just a URL + a shared secret**:
+
+```sh
+export NL_HUB_SECRET=$(openssl rand -hex 24)      # the same secret on all three
+
+python hub.py serve                                # THE RECEIVER — host this once (a box / container)
+python hub.py agent   --hub https://hub.example    # THE CALLBACK — once per veil host; meshes them all
+python hub.py console --hub https://hub.example    # THE OPERATOR — a live fleet REPL
+```
+
+You only ever host one thing: the receiver at some URL. Every veil host runs the tiny **callback**
+(`hub.py agent`) — it finds *every* local run and reports them on a heartbeat, then applies whatever
+the operator sends back. Set `NL_HUB_URL` and a normal `veil "…"` cast auto-starts the callback for
+you, so meshing a new host is genuinely nothing but a URL.
+
+The wire is **encrypted end to end** with the shared secret — every request and reply is sealed with
+an authenticated cipher built from the standard library (HKDF key-derivation, an HMAC-SHA256
+keystream, encrypt-then-MAC, replay window). No secret, no read and no write; possession of the secret
+*is* authentication. It's already sealed over plain HTTP, so a bare container is enough — front it with
+TLS too if you like.
+
+From the operator console you drive the whole swarm at once:
+
+```
+fleet> fleet                     # the roster: every host, its veils, liveness, round, score
+fleet> all keep the build green  # one standing directive → EVERY running veil, this round
+fleet> ask what are you stuck on?# scatter-gather: each Veil answers in its own voice, gathered back
+fleet> @edge-07 focus on auth    # steer one host — or a #tagged cohort
+fleet> stream                    # the merged, fleet-wide event feed
+fleet> alerts                    # stalled / offline / fitness-regressed veils
+fleet> killall                   # fleet-wide kill switch (a safety stop for autonomous minds)
+```
+
+`cast`, `stop`, `resume`, `goal`, `tag`, and `audit` round it out. Across a swarm of ~100 hives it's a
+mission control: broadcast one intent to all, poll the fleet for what each hive has learned, tag
+cohorts by role, watch health, and pull the plug on everything with one word. Nothing about the fleet
+is hardcoded — the hub is transport + console; the behaviour still lives in each veil.
+
 ## Project layout
 
 ```
 deploy.py                  the launcher + the veil shell (configure / cast / list / stop / ...)
+hub.py                     the fleet hub: serve (receiver) / agent (callback) / console (operator)
 install.sh  install.ps1    one-command installers
 veil  veil.cmd             the `veil` front-door shim
 build.zig                  the Zig build

@@ -1632,6 +1632,32 @@ def embed_workdir(run_dir, embed_dir):
     return embed_dir
 
 
+def _ensure_hub_beacon():
+    """Fleet callback, kept to 'just a URL': if NL_HUB_URL (+ NL_HUB_SECRET) is set, make sure ONE
+    background hub agent is running on this host — it reports every local run to the hub and applies the
+    operator's commands. A pidfile guard means repeated casts never stack up beacons. Best-effort only: a
+    hub misconfiguration must never block or crash a cast."""
+    url = os.environ.get("NL_HUB_URL")
+    if not url or not os.environ.get("NL_HUB_SECRET"):
+        return
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        lock = os.path.join(DATA, ".hub_beacon.pid")
+        if os.path.isfile(lock) and _pid_alive(_read_cap(lock, 32)):
+            return  # a beacon already meshes this host into the fleet
+        hub_py = os.path.join(ROOT, "hub.py")
+        if not os.path.isfile(hub_py):
+            return
+        kw = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+        logf = open(os.path.join(DATA, "hub_beacon.log"), "a", encoding="utf-8")
+        p = subprocess.Popen([sys.executable, hub_py, "agent"], cwd=ROOT, env=dict(os.environ),
+                             stdout=logf, stderr=subprocess.STDOUT, **kw)
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write(str(p.pid))
+        print(f"  hub: this host meshed to {url} (callback pid {p.pid})")
+    except Exception:
+        pass
+
 def deploy(args):
     args.name = args.name or ("swarm_" + time.strftime("%Y%m%d_%H%M%S"))
     # --quick: interactive one-shot small-edit mode. Single mind, no plan/clarify scaffolding, edit-and-stop in
@@ -1747,6 +1773,8 @@ def deploy(args):
     logf = open(os.path.join(run_dir, "worker.log"), "w", encoding="utf-8")
     proc = subprocess.Popen([binary, "worker", run_dir, neuron, args.model],
                             cwd=ROOT, env=env, stdout=logf, stderr=subprocess.STDOUT, **popen_kw)
+    if args.style != "quick":
+        _ensure_hub_beacon()  # if a hub URL is configured, mesh this host into the fleet (no-op otherwise)
     if chatcast:
         return proc  # the shell narrates from here
     print(f"  hive running (pid {proc.pid})  -  events: {os.path.join(run_dir, 'events.jsonl')}")
@@ -2373,6 +2401,10 @@ def main():
         if len(argv) < 2:
             sys.exit("usage: python deploy.py resume <run-name> [--follow]")
         return resume(argv[1], "--follow" in argv)
+    if argv[0] == "hub":
+        # the fleet hub: connect + monitor + steer many veils at once. `veil hub serve|agent|console`.
+        import hub as _hub
+        return _hub.main(argv[1:])
     if argv[0] in ("chat", "shell"):
         name, mnt, rest = None, None, argv[1:]
         i = 0
