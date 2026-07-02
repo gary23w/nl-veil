@@ -4,7 +4,11 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    // ReleaseFast by DEFAULT: this binary is what every user runs (deploy.py builds it with a bare
+    // `zig build`), and the engine's hot paths — BM25 page fitting, salvage scans over long replies,
+    // VCS merges, atlas matching on every fetch — run 5-20x slower in Debug. Developers still get a
+    // debug build explicitly with `zig build -Doptimize=Debug`.
+    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     const httpz = b.dependency("httpz", .{
         .target = target,

@@ -205,6 +205,9 @@ pub const Worker = struct {
     solved_rounds: u32 = 0,
     flat_rounds: u32 = 0,
     regress_rounds: u32 = 0,
+    ema_mind_s: f32 = 0, // measured wall-seconds of the minds' moments phase (the BUILDING), EMA across rounds
+    ema_meta_s: f32 = 0, // measured wall-seconds of the between-rounds meta phase, EMA across rounds
+    gov_lvl: u8 = 0, // metabolic governor level this round: 0 full / 1 trim reflective / 2 crunch (see govLevelFrom)
     open_ended: bool = false,
     never_stops: bool = false,
     discourse: bool = false,
@@ -821,6 +824,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 w.act("engine", round, "arousal", if (rest) "resting" else "focused", std.fmt.allocPrint(w.a(), "the hive shifted to {s} — this round's moments {s}", .{ if (rest) "RESTING (default-mode)" else "FOCUSED", if (rest) "hover on the gateway model and escalate to the primary only when a moment needs real compute" else "run on the primary model" }) catch "arousal");
             }
         }
+        const t_mind0 = w.nowSecs();
         if (minds.items.len <= 1) {
             for (minds.items) |*mi| results[0] = doMoment(&w, mi, goal, round, live, environ);
         } else {
@@ -831,6 +835,27 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 };
             }
             grp.await(io) catch {};
+        }
+        // METABOLIC GOVERNOR: measure the building phase, then set this round's meta level from
+        // last round's measured split + the remaining budget + the plateau (all live signals).
+        const t_meta0 = w.nowSecs();
+        {
+            const mind_s: f32 = @floatFromInt(@max(0, t_meta0 - t_mind0));
+            w.ema_mind_s = if (w.ema_mind_s <= 0) mind_s else 0.6 * w.ema_mind_s + 0.4 * mind_s;
+        }
+        const gov_prev = w.gov_lvl;
+        const budget_left_s: f32 = if (m.minutes > 0)
+            @floatFromInt(@max(0, @as(i64, m.minutes) * 60 - (w.nowSecs() - start)))
+        else
+            -1;
+        w.gov_lvl = govLevelFrom(w.ema_mind_s, w.ema_meta_s, budget_left_s, w.flat_rounds);
+        if (live and w.gov_lvl != gov_prev) {
+            const gname: []const u8 = switch (w.gov_lvl) {
+                0 => "full metabolism",
+                1 => "trim reflective",
+                else => "crunch — build only",
+            };
+            w.act("engine", round, "governor", gname, std.fmt.allocPrint(w.a(), "metabolism level {d} -> {d}: measured minds {d}s vs meta {d}s per round, budget left {d}s, plateau {d} round(s) — reflective meta (psyche/state/digest/dream) {s}, recovery meta (gap/retro/curriculum) {s}; building keeps its full budget", .{ gov_prev, w.gov_lvl, @as(i64, @intFromFloat(w.ema_mind_s)), @as(i64, @intFromFloat(w.ema_meta_s)), @as(i64, @intFromFloat(if (budget_left_s < 0) 0 else budget_left_s)), w.flat_rounds, if (w.gov_lvl == 0) "full" else if (w.gov_lvl == 1) "every 2nd round" else "off", if (w.gov_lvl < 2) "full" else "every 2nd round" }) catch "governor");
         }
 
         const round_posture = dominantPosture(results[0..minds.items.len]);
@@ -991,35 +1016,40 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         const stalled = (w.last_bench.status == .ok and prev_status == .ok and w.last_bench.pct <= prev_pct);
         if (live and !w.quick) applyScoutRewards(&w, round); // grounded APPLICATION anchor: a scouted token in a built file -> +0.40 source trust
-        if (live and m.gap_assess and !w.quick) assessGap(&w, goal, round, stalled);
+        if (live and m.gap_assess and !w.quick and govRecovery(w.gov_lvl, round)) assessGap(&w, goal, round, stalled);
         if (live and minds.items.len > 1 and !w.operating and !w.discourse) {
             rsi.planRoles(&w, minds.items, goal, round, w.last_bench, stalled or w.last_gap_str.len > 0);
         }
 
-        if (live and !w.operating and !w.quick) {
+        if (live and !w.operating and !w.quick and govRecovery(w.gov_lvl, round)) {
             rsi.rsiGovernance(&w, round, prev_pct, tok0_in, tok0_out, tok0_calls);
             rsi.distillRsiMemory(&w, goal, round);
             rsi.updateRsiCurriculum(&w, goal, round, stalled);
         }
 
-        if (live and !w.quick) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
-        if (live and w.breakout_on and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items);
-        if (live and w.psyche_on) emitPsyche(&w, minds.items, round, retro_in.items);
-        if (live and !w.quick and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
+        if (live and !w.quick and govRecovery(w.gov_lvl, round)) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
+        if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items);
+        if (live and w.psyche_on and govReflective(w.gov_lvl, round)) emitPsyche(&w, minds.items, round, retro_in.items);
+        if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
             if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
         }
         if (live and !w.discourse and w.blueprint.len > 0) markIncomplete(&w, round);
-        if (live and !w.discourse and w.blueprint.len > 0) consolidateState(&w, goal, round);
-        if (live and !w.discourse and (w.blueprint.len > 0 or w.operating) and round > 1 and @mod(round, PLAN_EVERY) == 0) capabilityGrowth(&w, goal, round);
-        if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0) or w.stop_now)) revisePlan(&w, goal, round);
+        if (live and !w.discourse and w.blueprint.len > 0 and govReflective(w.gov_lvl, round)) consolidateState(&w, goal, round);
+        if (live and !w.discourse and (w.blueprint.len > 0 or w.operating) and round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) capabilityGrowth(&w, goal, round);
+        if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
 
-        if (live and !w.quick and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
+        if (live and !w.quick and (w.gov_lvl < 2 or w.stop_now) and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
 
-        if (live and w.resting and !w.stop_now) agi.dream(&w, goal, round);
+        if (live and w.resting and !w.stop_now and w.gov_lvl == 0) agi.dream(&w, goal, round);
 
         if (live and w.pop_on and !w.stop_now and @mod(round, POP_EVERY) == 0 and round > w.last_pop_round + POP_COOLDOWN) agi.veilPopulation(&w, &minds, goal, round);
 
+        {
+            // close the governor's measurement window: everything since the minds finished was meta
+            const meta_s: f32 = @floatFromInt(@max(0, w.nowSecs() - t_meta0));
+            w.ema_meta_s = if (w.ema_meta_s <= 0) meta_s else 0.6 * w.ema_meta_s + 0.4 * meta_s;
+        }
         if (live) {
             const din = llm.tokens_in.load(.monotonic) - tok0_in;
             const dout = llm.tokens_out.load(.monotonic) - tok0_out;
@@ -1117,6 +1147,45 @@ pub fn fitnessSource(b: BenchResult, operating: bool, doc_target: u32, discourse
 }
 
 pub const Schema = enum { full, assembler, scout, operate };
+/// THE METABOLIC GOVERNOR — how a round's wall-clock gets spent is a MEASURED signal, not a hope.
+/// Each round the loop times its two phases: the minds' moments (the building — the actual work)
+/// and the between-rounds meta (gap probes, retrospectives, psyche, state digests, veil reflection —
+/// each a gateway LLM call that QUEUES behind the minds on a single local backend, so on a small box
+/// meta can silently eat a third or more of every round). From those measurements plus the remaining
+/// minutes budget and the fitness plateau, pick a level:
+///   0 = full metabolism;
+///   1 = REFLECTIVE meta (psyche/flare-compose/state/digest/dream) every 2nd round;
+///   2 = crunch — reflective off, RECOVERY meta (gap assess, retro, curriculum) every 2nd round.
+/// Building is NEVER trimmed: a swarm short on time builds; it does not narrate. Purely
+/// signal-driven (measured seconds, budget, plateau) — no model-name or task-shape branches.
+pub fn govLevelFrom(ema_mind_s: f32, ema_meta_s: f32, budget_left_s: f32, flat_rounds: u32) u8 {
+    var lvl: u8 = 0;
+    const total = ema_mind_s + ema_meta_s;
+    if (total > 30 and ema_meta_s > total * 0.35) lvl = 1; // measured: meta eats over a third of the round
+    if (flat_rounds >= 3) lvl = @max(lvl, 1); // plateau: reflect less, keep recovering (the freeroam2 12-stalled-rounds lesson)
+    if (budget_left_s >= 0) {
+        const round_cost: f32 = if (total > 30) total else 240; // pre-measurement estimate for round 1
+        if (budget_left_s < round_cost * 2.5) {
+            lvl = 2; // ~two rounds of budget left: every remaining second goes to building
+        } else if (budget_left_s < round_cost * 5) {
+            lvl = @max(lvl, 1); // small budget (a short cast): reflective meta at half cadence from the start
+        }
+    }
+    return lvl;
+}
+/// Reflective meta = self-narration/observability. Full at level 0, every 2nd round at 1, off at 2.
+pub fn govReflective(gov_lvl: u8, round: u32) bool {
+    return switch (gov_lvl) {
+        0 => true,
+        1 => round == 1 or @mod(round, 2) == 0,
+        else => false,
+    };
+}
+/// Recovery meta = how a stuck swarm self-corrects. Full at levels 0-1, every 2nd round at 2.
+pub fn govRecovery(gov_lvl: u8, round: u32) bool {
+    return gov_lvl < 2 or round == 1 or @mod(round, 2) == 0;
+}
+
 pub const ModeGate = struct { schema: Schema, fence: bool };
 pub fn modeGate(operating: bool, lean_schema: bool, fence_writes: bool, scout: bool, discourse: bool) ModeGate {
     if (scout) return .{ .schema = .scout, .fence = false };
@@ -3488,6 +3557,21 @@ test "slot implication: failure text implicates, success text and substring cous
     try std.testing.expect(!containsWordBounded("", "store.py"));
 }
 
+test "extractGoalPaths: a tool-attributed name (with/using X.js) is never a required file" {
+    const gpa = std.testing.allocator;
+    // the sim_freeroam2 goal-2 shape: a library named after "with" + real deliverable paths
+    const goal = "Extend the app by adding an interactive world-map layer with Leaflet.js that renders sites; write static/js/map.js and tests/test_map.py, and document it in README.md using pytest.ini conventions.";
+    var n: u32 = 0;
+    const tree = extractGoalPaths(gpa, goal, &n);
+    defer if (tree.len > 0) gpa.free(@constCast(tree));
+    try std.testing.expect(std.mem.indexOf(u8, tree, "Leaflet.js") == null); // the tool, not a deliverable
+    try std.testing.expect(std.mem.indexOf(u8, tree, "pytest.ini") == null); // "using X" = the tool
+    try std.testing.expect(std.mem.indexOf(u8, tree, "static/js/map.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree, "tests/test_map.py") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tree, "README.md") != null);
+    try std.testing.expectEqual(@as(u32, 3), n);
+}
+
 test "extractGoalPaths adopts data files (config.json) and expands a bare __init__.py into the package dirs, never the root" {
     const gpa = std.testing.allocator;
     // the sim_forum4 goal shape: nested src tree + slashless config.json + a bare __init__.py token
@@ -5436,6 +5520,18 @@ fn stripPathPunct(tok: []const u8) []const u8 {
     return std.mem.trim(u8, tok, " \t\r\n`'\"()[]{}<>,;.:*");
 }
 
+/// True when `prev` is a tool-attribution word: "add a map layer WITH Leaflet.js" names the LIBRARY
+/// the work is done with, not a file to create. Observed live (sim_freeroam2 goal #2): the library
+/// name became a required file and pinned COVERAGE at 0/1 for 12 straight rounds — a swarm can never
+/// satisfy a "file" that is actually a technology's name, so it burned ~90 minutes at a floor. The
+/// error costs are asymmetric: a falsely-SKIPPED real file only loses one coverage line (the
+/// architect's blueprint still carries the whole goal), while a false REQUIRED file wedges the run.
+fn toolAttributed(prev: []const u8) bool {
+    const words = [_][]const u8{ "with", "using", "use", "via", "through", "like", "leveraging", "leverage", "powered", "atop" };
+    for (words) |w| if (std.ascii.eqlIgnoreCase(prev, w)) return true;
+    return false;
+}
+
 fn looksLikeNamedFile(tok: []const u8) bool {
     if (tok.len == 0 or tok.len > 120) return false;
     if (std.mem.indexOf(u8, tok, "..") != null or tok[0] == '/' or tok[0] == '\\') return false;
@@ -5456,9 +5552,13 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0 or line.len > 2000) continue;
         var tit = std.mem.tokenizeAny(u8, line, " \t");
+        var prev_word: []const u8 = "";
         while (tit.next()) |rawtok| {
             const p = stripPathPunct(rawtok);
+            const attributed = toolAttributed(prev_word);
+            prev_word = p;
             if (!looksLikeNamedFile(p)) continue;
+            if (attributed) continue; // "with X.js" / "using Y.json" = the tool, never the deliverable
             var dup = false;
             for (seen.items) |e| if (std.mem.eql(u8, e, p)) {
                 dup = true;
@@ -7274,6 +7374,33 @@ test "fitnessSource follows the dominant LIVE fitness the situation provides (FI
     try std.testing.expect(fitnessSource(tests_ok, false, 0, true, false) == .doc);
     try std.testing.expect(fitnessSource(tests_ok, false, 0, false, true) == .doc);
     try std.testing.expect(fitnessSource(no_score, false, 0, false, false) == .none);
+}
+
+test "govLevelFrom: overload, plateau, and budget crunch each raise the level; a healthy funded round stays full" {
+    // healthy: meta is a sixth of the round, no plateau, no budget pressure
+    try std.testing.expectEqual(@as(u8, 0), govLevelFrom(300, 60, -1, 0));
+    // measured overload: meta is half the round
+    try std.testing.expectEqual(@as(u8, 1), govLevelFrom(200, 200, -1, 0));
+    // plateau alone trims reflective even when the split is healthy
+    try std.testing.expectEqual(@as(u8, 1), govLevelFrom(300, 60, -1, 3));
+    // ~1.5 rounds of budget left: crunch — build only
+    try std.testing.expectEqual(@as(u8, 2), govLevelFrom(300, 100, 600, 0));
+    // small-but-workable budget: half-cadence reflective
+    try std.testing.expectEqual(@as(u8, 1), govLevelFrom(300, 60, 1500, 0));
+    // unmeasured round 1 of a 6-minute cast (the MCP hive_research shape): crunch from the start
+    try std.testing.expectEqual(@as(u8, 2), govLevelFrom(0, 0, 360, 0));
+    // unmeasured round 1 of a 30-minute run: full metabolism
+    try std.testing.expectEqual(@as(u8, 0), govLevelFrom(0, 0, 1800, 0));
+    // unlimited run with tiny measured times: below the noise floor, stays full
+    try std.testing.expectEqual(@as(u8, 0), govLevelFrom(10, 8, -1, 0));
+}
+
+test "govReflective/govRecovery cadences per level" {
+    try std.testing.expect(govReflective(0, 3) and govReflective(0, 4));
+    try std.testing.expect(!govReflective(1, 3) and govReflective(1, 4) and govReflective(1, 1));
+    try std.testing.expect(!govReflective(2, 4));
+    try std.testing.expect(govRecovery(0, 3) and govRecovery(1, 3));
+    try std.testing.expect(!govRecovery(2, 3) and govRecovery(2, 4) and govRecovery(2, 1));
 }
 
 test "modeGate routes build-vs-operate on the SITUATION (operate → lean OPERATE schema + fence OFF; build unchanged)" {
