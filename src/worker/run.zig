@@ -194,6 +194,7 @@ pub const Worker = struct {
     scout_ledger: [24]ScoutNote = [_]ScoutNote{.{}} ** 24, // admitted notes awaiting the round-end application check
     scout_ledger_n: u32 = 0,
     last_gap_str: []const u8 = "",
+    last_src_str: []const u8 = "", // the atlas CANONICAL SOURCES block for the current gaps — held SEPARATE from last_gap_str so no consumer's clip() can silently drop the tail
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
     best_tier: u8 = 0,
@@ -653,6 +654,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     defer if (w.goal_brief.len > 0) gpa.free(@constCast(w.goal_brief));
     defer if (w.last_gap_str.len > 0) gpa.free(@constCast(w.last_gap_str));
+    defer if (w.last_src_str.len > 0) gpa.free(@constCast(w.last_src_str));
     defer if (w.phase_str.len > 0) gpa.free(@constCast(w.phase_str));
     defer if (w.strategy_str.len > 0) gpa.free(@constCast(w.strategy_str));
     defer if (w.depgraph_str.len > 0) gpa.free(@constCast(w.depgraph_str));
@@ -1386,7 +1388,7 @@ fn quickTargetFromGoal(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
         for (exts) |e| {
             if (t.len > e.len and endsWithIC(t, e)) {
                 var rel = t;
-                if (std.mem.startsWith(u8, rel, "./")) rel = rel[2 .. rel.len]; // normalize a leading ./
+                if (std.mem.startsWith(u8, rel, "./")) rel = rel[2..rel.len]; // normalize a leading ./
                 // keep the RELATIVE path (so subdir files like assets/css/style.scss land correctly); fall back to
                 // the basename only if the token is unsafe (absolute, or a .. path-escape).
                 if (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\' or std.mem.indexOf(u8, rel, "..") != null)) rel = std.fs.path.basename(rel);
@@ -2340,7 +2342,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(lane_clause);
     const scout_clause = if (mi.scout and w.last_gap_str.len > 0)
-        std.fmt.allocPrint(gpa, " YOU ARE THE SCOUT THIS MOMENT: the hive may have a preloaded corpus, but it is NOT complete. Research THESE KNOWN GAPS specifically (web_search then read_url/fetch_json), do NOT re-derive what's already in hive knowledge — {s} — then share/observe what you find back to the hive and save_skill the technique. Do NOT write_file or run_python.", .{clip(w.last_gap_str, 400)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, " YOU ARE THE SCOUT THIS MOMENT: the hive may have a preloaded corpus, but it is NOT complete. Research THESE KNOWN GAPS specifically (web_search then read_url/fetch_json), do NOT re-derive what's already in hive knowledge — {s}{s} — then share/observe what you find back to the hive and save_skill the technique. Do NOT write_file or run_python.", .{ clip(w.last_gap_str, 400), w.last_src_str }) catch (gpa.dupe(u8, "") catch @constCast(""))
     else if (mi.scout)
         gpa.dupe(u8, " YOU ARE THE SCOUT THIS MOMENT: you MUST call web_search and then read_url/fetch_json to learn something the team does NOT yet know for this goal, then save_skill it (name it 'scout:<topic>') AND observe/share the key fact. Do NOT write_file or run_python — building is your teammates' job; if you write a file you have failed your role.") catch @constCast("")
     else
@@ -2419,6 +2421,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             if (bpl.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write the ONE file `{s}` — its blueprint entry is: \"{s}\". Produce EXACTLY that piece (match its number/title/scope), continuing coherently from the CURRENT STATE above; do NOT jump ahead to a later piece.{s}", .{ assembler_slot, clip(bpl, 200), chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
             break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose, in order.{s}", .{ assembler_slot, chunk_clause }) catch (gpa.dupe(u8, "") catch @constCast(""));
         }
+        // the assembler scout's SLOT is its entire task spec — the lean prompt carries no gap_str, so
+        // the gap directive (and the atlas sources riding it) must arrive HERE or it reaches no model
+        // at all in this regime (found live: sim_atlas_kotlin r1 scout searched blind while the atlas
+        // block sat in the event log only).
+        if (mi.scout and w.last_gap_str.len > 0)
+            break :blk_slot std.fmt.allocPrint(gpa, "{s} THIS ROUND'S RESEARCH TARGET — the hive's gap audit found these SPECIFIC holes; close THESE, not generic reading: {s}{s}", .{ clip(mi.lane, 480), clip(w.last_gap_str, 700), w.last_src_str }) catch (gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast(""));
         if (mi.lane.len > 0) break :blk_slot gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast("");
         const ff = firstPath(my_files);
         if (ff.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose", .{ff}) catch (gpa.dupe(u8, "") catch @constCast(""));
@@ -2556,7 +2564,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const authored_names = authoredToolNames(gpa, w.mem);
     defer gpa.free(authored_names);
     const tools_str = if (authored_names.len > 0) authored_names else "(none yet — if you hit a capability gap, author one with make_tool instead of giving up)";
-    const gap_str = if (w.last_gap_str.len > 0) w.last_gap_str else "(no knowledge-gap probe yet — don't assume the hive already knows everything the goal needs)";
+    const gap_str = if (w.last_gap_str.len > 0 and w.last_src_str.len > 0)
+        std.fmt.allocPrint(gpa, "{s}{s}", .{ w.last_gap_str, w.last_src_str }) catch (gpa.dupe(u8, w.last_gap_str) catch @constCast(""))
+    else if (w.last_gap_str.len > 0)
+        gpa.dupe(u8, w.last_gap_str) catch @constCast("")
+    else
+        gpa.dupe(u8, "(no knowledge-gap probe yet — don't assume the hive already knows everything the goal needs)") catch @constCast("");
+    defer gpa.free(@constCast(gap_str));
     const phase_inject = if (w.phase_str.len > 0) w.phase_str else "(assessing progress — build toward the goal and protect what already works)";
     const strategy_inject = if (w.strategy_str.len > 0)
         std.fmt.allocPrint(gpa, "SWARM STRATEGY (the lead's current read — the top bottleneck; align your work to clearing it): {s}", .{w.strategy_str}) catch (gpa.dupe(u8, "") catch @constCast(""))
@@ -2661,7 +2675,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     if (playbook.len > 0) w.act(mi.name, round, "playbook", "operating directives", playbook);
     if (build.len > 0) w.act(mi.name, round, "build_state", "files so far", build);
     if (w.last_bench_str.len > 0) w.act(mi.name, round, "score", "fitness", w.last_bench_str);
-    if (w.last_gap_str.len > 0) w.act(mi.name, round, "gap", "knowledge gaps", w.last_gap_str);
+    // capture fidelity: only the FULL prompt carries gap_str — an assembler mind's directive (scout
+    // slot) is already captured by its own `slot` act above; emitting gap here for lean minds would
+    // log a directive their prompt never contained.
+    if (!assembler and w.last_gap_str.len > 0) w.act(mi.name, round, "gap", "knowledge gaps", gap_str);
     if (w.space.len > 0 and spacemap.len > 0) w.act(mi.name, round, "map", "shared spatial map", spacemap);
 
     var trace: std.ArrayListUnmanaged(u8) = .empty;
@@ -3772,22 +3789,26 @@ fn assessGap(w: *Worker, goal: []const u8, round: u32, stalled: bool) void {
     // DDG search often can't rank the right page; the atlas removes the WHERE problem. A prior, not a
     // switch: matching is a general word-scan over live signals, admission still requires a verbatim
     // quote, and only APPLIED sources earn lasting trust. No match or offline ⇒ byte-identical directive.
+    if (w.last_src_str.len > 0) {
+        gpa.free(@constCast(w.last_src_str));
+        w.last_src_str = "";
+    }
     if (w.internet and w.last_gap_str.len > 0) {
         const probe_txt = std.fmt.allocPrint(gpa, "{s} {s}", .{ gaps, goal }) catch "";
         defer if (probe_txt.len > 0) gpa.free(@constCast(probe_txt));
         const srcs = locs.sourcesBlock(gpa, if (probe_txt.len > 0) probe_txt else goal, 3);
-        if (srcs.len > 0) {
-            defer gpa.free(@constCast(srcs));
-            const joined = std.fmt.allocPrint(gpa, "{s}{s}", .{ w.last_gap_str, srcs }) catch "";
-            if (joined.len > 0) {
-                gpa.free(@constCast(w.last_gap_str));
-                w.last_gap_str = joined;
-            }
-        }
+        // held apart from the gaps text, NOT joined: every consumer clips the gaps to its own prompt
+        // budget, and a joined string put the sources at the clipped-off tail — the directive LOGGED
+        // the atlas block while no model prompt ever contained it (found live, sim_atlas_kotlin r1).
+        if (srcs.len > 0) w.last_src_str = srcs;
     }
     _ = w.mem.observe(tools.GAP_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: coverage {d}% gaps {s}", .{ round, @as(u32, @intFromFloat(cov * 100)), clip(gaps, 200) }) catch "round");
     w.emit("gap", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"coverage\":{d},\"gaps\":\"{s}\"", .{ round, @as(u32, @intFromFloat(cov * 100)), w.esc(clip(gaps, 200)) }) catch ",\"round\":0");
-    if (w.last_gap_str.len > 0) w.act("gap-auditor", round, "gap", goal, w.last_gap_str);
+    if (w.last_gap_str.len > 0) {
+        const dir_full = std.fmt.allocPrint(gpa, "{s}{s}", .{ w.last_gap_str, w.last_src_str }) catch null;
+        defer if (dir_full) |d| gpa.free(d);
+        w.act("gap-auditor", round, "gap", goal, if (dir_full) |d| d else w.last_gap_str);
+    }
 }
 
 /// Recompute the project IMPORT GRAPH each round (cwd = workdir) via DEPGRAPH_PY — structural RAG context so a
