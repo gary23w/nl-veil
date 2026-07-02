@@ -1,18 +1,5 @@
 //! The SOURCE ATLAS — curated, compiled-in seed locations for knowledge domains.
-//!
-//! WHY THIS EXISTS: a small-parameter model has no reliable "coding weights" — it cannot recall the Python
-//! stdlib or Rust's module rules from its own parameters, so its knowledge floor is whatever the hive can
-//! ACQUIRE. Acquisition through a bare DDG search is the weak link (ranking is poor and the right page is
-//! often not in the first screen — measured in crawl.zig's search lane). The atlas removes the WHERE
-//! problem for the domains that recur: canonical, curl-friendly documentation roots, compiled into the
-//! binary so an offline-built device still knows exactly where to go the moment it has a link.
-//!
-//! WHAT THIS IS NOT: not a routing switch and not a replacement for search. The engine's control flow is
-//! unchanged — the gap-auditor names what's missing, scouts research it, admission still requires a
-//! verbatim page-span quote, and a source only EARNS trust when its note lands in a builder's file. The
-//! atlas is a PRIOR: it seeds where to look first, ranked by a general word-match over the live gap/goal
-//! text; web_search remains first-class for everything the atlas doesn't cover (and for tasks — books,
-//! automation, live events — where curated references are the wrong tool entirely).
+
 const std = @import("std");
 
 pub const Kind = enum { reference, tutorial, spec, cookbook, index };

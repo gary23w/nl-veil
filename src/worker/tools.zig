@@ -56,8 +56,45 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
 
 /// Fetch a URL via curl into a per-mind temp file, guarded by spawnGuarded (so a WAF hang is killed, not fatal), then
 /// read back whatever body arrived. Caller frees. `json` adds the Accept header; `limit` caps the read.
+///
+/// FETCH CACHE: successful bodies persist to data/_fetch_cache (7-day TTL, keyed by url+accept, timestamp
+/// header line + body) so a documentation page is fetched ONCE across all minds, rounds, and runs — the
+/// raw-latency lever behind the source atlas: the atlas tells scouts WHERE, the cache makes going there
+/// again ~free. Deliberately NOT on the search path (crawlSearch has its own fetch — search freshness is
+/// load-bearing for automation/live-event tasks) and BYPASSED under an active egress allowlist (cached
+/// off-allowlist content must never leak into a gated run). A torn concurrent write self-heals: the header
+/// parse fails, we refetch, we rewrite.
 fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limit: usize) []u8 {
     const gpa = ctx.gpa;
+    const cache_ttl_s: i64 = 7 * 24 * 3600;
+    var cpath: []const u8 = "";
+    defer if (cpath.len > 0) gpa.free(@constCast(cpath));
+    if (ctx.egress_allow.len == 0) blk_cache: {
+        const cdir = std.fmt.allocPrint(gpa, "{s}/../_fetch_cache", .{ctx.run_dir}) catch break :blk_cache;
+        defer gpa.free(cdir);
+        _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, cdir, .default_dir) catch {};
+        const h = std.hash.Wyhash.hash(if (json) 1 else 0, url);
+        cpath = std.fmt.allocPrint(gpa, "{s}/{x}.txt", .{ cdir, h }) catch "";
+        if (cpath.len == 0) break :blk_cache;
+        const cached = std.Io.Dir.cwd().readFileAlloc(ctx.io, cpath, gpa, .limited(limit + 64)) catch break :blk_cache;
+        const nl = std.mem.indexOfScalar(u8, cached, '\n') orelse {
+            gpa.free(cached);
+            break :blk_cache;
+        };
+        const ts = std.fmt.parseInt(i64, std.mem.trim(u8, cached[0..nl], " \r"), 10) catch {
+            gpa.free(cached);
+            break :blk_cache;
+        };
+        if (std.Io.Timestamp.now(ctx.io, .real).toSeconds() - ts <= cache_ttl_s and cached.len > nl + 1) {
+            const body = gpa.dupe(u8, cached[nl + 1 ..]) catch {
+                gpa.free(cached);
+                break :blk_cache;
+            };
+            gpa.free(cached);
+            return body;
+        }
+        gpa.free(cached); // expired — fall through to a live fetch that overwrites it
+    }
     const tmp = std.fmt.allocPrint(gpa, "{s}/.fetch-{s}.tmp", .{ ctx.run_dir, ctx.mind }) catch return dupe(gpa, "oom");
     defer gpa.free(tmp);
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -71,6 +108,15 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
     spawnGuarded(ctx.io, av.items, deadline_ms);
     const raw = std.Io.Dir.cwd().readFileAlloc(ctx.io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
     std.Io.Dir.cwd().deleteFile(ctx.io, tmp) catch {};
+    // Persist a substantial body for reuse (>=600 bytes filters most error/empty pages; a cached WAF page
+    // costs one stale week at worst and the TTL ages it out).
+    if (cpath.len > 0 and raw.len >= 600) {
+        const stamped = std.fmt.allocPrint(gpa, "{d}\n{s}", .{ std.Io.Timestamp.now(ctx.io, .real).toSeconds(), raw }) catch null;
+        if (stamped) |st| {
+            defer gpa.free(st);
+            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cpath, .data = st }) catch {};
+        }
+    }
     return raw;
 }
 
