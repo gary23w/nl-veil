@@ -35,6 +35,13 @@ pub const Tray = struct {
     pub fn takeRestoreRequest(t: *Tray) bool {
         return if (t.inited) t.impl.takeRestoreRequest() else false;
     }
+    pub const Diag = struct { reg: u16, hwnd: bool, add: bool, err: u32 };
+    pub fn diag(_: *Tray) Diag {
+        return if (builtin.os.tag == .windows)
+            .{ .reg = WindowsTray.g_reg, .hwnd = WindowsTray.g_hwnd_ok, .add = WindowsTray.g_add_ok, .err = WindowsTray.g_err }
+        else
+            .{ .reg = 0, .hwnd = false, .add = false, .err = 0 };
+    }
 };
 
 const Impl = if (builtin.os.tag == .windows) WindowsTray else PosixTray;
@@ -115,6 +122,12 @@ const WindowsTray = struct {
 
     // module-level state read by the WndProc (runs on the main thread inside pump()).
     var g_restore: bool = false;
+    // diagnostics captured during init (read by Tray.diag for troubleshooting)
+    var g_reg: u16 = 0;
+    var g_hwnd_ok: bool = false;
+    var g_add_ok: bool = false;
+    var g_err: u32 = 0;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VeilDeskTrayWnd");
 
@@ -143,10 +156,14 @@ const WindowsTray = struct {
         wc.lpfnWndProc = &wndProc;
         wc.hInstance = hinst;
         wc.lpszClassName = class_name;
-        _ = RegisterClassExW(&wc); // idempotent-ish; ignore "already registered"
+        g_reg = RegisterClassExW(&wc); // idempotent-ish; ignore "already registered"
         // A normal but never-shown window owns the tray icon (message-only windows are flakier hosts).
         self.hwnd = CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, null, null, hinst, null);
-        if (self.hwnd == null) return false;
+        g_hwnd_ok = self.hwnd != null;
+        if (self.hwnd == null) {
+            g_err = GetLastError();
+            return false;
+        }
         self.nid = std.mem.zeroes(NOTIFYICONDATAW);
         self.nid.cbSize = @sizeOf(NOTIFYICONDATAW);
         self.nid.hWnd = self.hwnd;
@@ -156,6 +173,8 @@ const WindowsTray = struct {
         self.nid.hIcon = LoadIconW(null, IDI_APPLICATION);
         utf16z(&self.nid.szTip, title);
         self.live = Shell_NotifyIconW(NIM_ADD, &self.nid) != 0;
+        g_add_ok = self.live;
+        if (!self.live) g_err = GetLastError();
         if (self.live) {
             // Adopt the modern (v4) behavior contract — without SETVERSION the callback + balloon
             // semantics vary by shell and the icon can misbehave on Win10/11.

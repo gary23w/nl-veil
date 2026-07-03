@@ -174,8 +174,36 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});
 
     std.debug.print("neuron-loops {s} on http://127.0.0.1:{d}  home={s}  ({d} users, {d} swarms re-adopted)\n", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+    // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
+    // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
+    if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
     launchDesktop(gpa, io, paths.home, init.environ_map);
     try server.listen();
+}
+
+const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
+
+/// Ensure a valid admin API key sits at <data>/.desktop_key so the desktop auto-connects. Reuses the
+/// existing key if it still verifies; otherwise logs in as the admin, mints one, and writes it. Best-effort.
+fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8) void {
+    // Written on any localhost bind (harmless, same-user) so the desktop connects whether it's auto-hosted
+    // or the user launches it later — NOT gated on NL_NO_DESKTOP.
+    const path = std.fmt.allocPrint(gpa, "{s}/.desktop_key", .{data}) catch return;
+    defer gpa.free(path);
+    // reuse an existing valid key
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256))) |old| {
+        defer gpa.free(old);
+        if (keys.verify(std.mem.trim(u8, old, " \r\n\t")) != null) return;
+    } else |_| {}
+    const email = environ.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
+    const pw = environ.get("NL_ADMIN_PASSWORD") orelse "changeme";
+    const tok = auth.login(email, pw) catch return;
+    defer gpa.free(tok);
+    const u = auth.whoami(tok) orelse return;
+    const key = keys.create(u.id, "veil-desk") catch return;
+    defer gpa.free(key);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = key }) catch return;
+    std.debug.print("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)\n", .{});
 }
 
 const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";

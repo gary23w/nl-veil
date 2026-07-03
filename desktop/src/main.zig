@@ -125,7 +125,7 @@ pub fn main() !void {
     const io = threaded.io();
 
     var store = Store{};
-    seedSettings(&store, io);
+    seedSettings(&store, gpa, io);
     ui.d_name.len = seedName(&ui.d_name.buf);
 
     var poller = poller_mod.Poller{ .io = io, .gpa = gpa, .store = &store };
@@ -316,12 +316,11 @@ const glyph_set = blk: {
     break :blk arr;
 };
 
+// The web theme (styles.css) is monospace EVERYWHERE — --mono: JetBrains Mono → Cascadia Code → Consolas.
+// To carry that across, the desktop UI uses the same monospace family (Consolas on Windows, where the web
+// actually falls back to since JetBrains Mono/Cascadia aren't installed). Logs use it too (already mono).
 fn uiCandidates() []const [:0]const u8 {
-    return switch (builtin.os.tag) {
-        .windows => &.{ "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/tahoma.ttf", "C:/Windows/Fonts/arial.ttf" },
-        .macos => &.{ "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf" },
-        else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf" },
-    };
+    return monoCandidates();
 }
 fn monoCandidates() []const [:0]const u8 {
     return switch (builtin.os.tag) {
@@ -354,15 +353,33 @@ fn seedName(buf: []u8) usize {
     return s.len;
 }
 
-fn seedSettings(store: *Store, io: std.Io) void {
+fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io) void {
     const candidates = [_][]const u8{ "data", "../data", "../../data", "../nl-veil/data" };
     for (candidates) |c| {
         if (dirExists(io, c)) {
             setDataDir(store, c);
+            loadDesktopKey(store, gpa, io, c);
             return;
         }
     }
     setDataDir(store, "data");
+    loadDesktopKey(store, gpa, io, "data");
+}
+
+/// Auto-load the admin API key the server dropped at <data>/.desktop_key so Deploy works with no manual
+/// paste. The desktop is a same-machine companion; the key is the server's own local admin key.
+fn loadDesktopKey(store: *Store, gpa: std.mem.Allocator, io: std.Io, dd: []const u8) void {
+    const path = std.fmt.allocPrint(gpa, "{s}/.desktop_key", .{dd}) catch return;
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256)) catch return;
+    defer gpa.free(data);
+    const key = std.mem.trim(u8, data, " \r\n\t");
+    if (key.len == 0) return;
+    store.lock();
+    defer store.unlock();
+    const n = @min(key.len, store.settings.token.len);
+    @memcpy(store.settings.token[0..n], key[0..n]);
+    store.settings.token_len = @intCast(n);
 }
 
 fn dirExists(io: std.Io, path: []const u8) bool {
@@ -447,6 +464,17 @@ fn handleKeys() void {
 }
 
 fn editField(f: *Ui.Field) void {
+    // Ctrl+V paste — the fields ignored the clipboard before, so keys/goals couldn't be pasted.
+    const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+    if (ctrl and rl.isKeyPressed(.v)) {
+        const clip = rl.getClipboardText();
+        for (clip) |ch| {
+            if (ch >= 32 and ch < 127 and f.len < f.buf.len - 1) {
+                f.buf[f.len] = ch;
+                f.len += 1;
+            }
+        }
+    }
     var c = rl.getCharPressed();
     while (c > 0) : (c = rl.getCharPressed()) {
         if (c >= 32 and c < 127 and f.len < f.buf.len - 1) {
