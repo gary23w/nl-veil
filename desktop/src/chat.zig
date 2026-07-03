@@ -77,6 +77,7 @@ pub const Chat = struct {
         self.loadSettings(dd0);
         self.loadKey(dd0);
         self.refreshConvs(dd0, true);
+        self.fetchOllamaModels();
 
         var tick: u32 = 0;
         while (!self.stop.load(.monotonic)) {
@@ -86,6 +87,7 @@ pub const Chat = struct {
             self.pumpStream(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
+            if (tick % 300 == 299) self.fetchOllamaModels(); // ~30s: catch newly-pulled models
             tick +%= 1;
             self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
         }
@@ -106,6 +108,58 @@ pub const Chat = struct {
 
     fn nowS(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+    }
+
+    /// Ask the local Ollama which models are installed (GET /api/tags) and publish their names so the
+    /// Settings model dropdown shows the user's REAL models instead of a guessed catalog list. Best-effort:
+    /// on any failure the dropdown falls back to the catalog. Uses the configured local base, else the
+    /// default; the root is derived by trimming a trailing /v1.
+    fn fetchOllamaModels(self: *Chat) void {
+        var rootbuf: [200]u8 = undefined;
+        var root: []const u8 = "http://127.0.0.1:11434";
+        {
+            self.store.lock();
+            const s = &self.store.settings;
+            const base = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1";
+            self.store.unlock();
+            var r = std.mem.trimEnd(u8, base, "/");
+            if (std.mem.endsWith(u8, r, "/v1")) r = r[0 .. r.len - 3];
+            // only probe a LOCAL ollama (loopback); a remote/BYOK base has no /api/tags for us to list
+            if ((std.mem.indexOf(u8, r, "127.0.0.1") != null or std.mem.indexOf(u8, r, "localhost") != null) and std.mem.indexOf(u8, r, "11434") != null) {
+                const n = @min(r.len, rootbuf.len);
+                @memcpy(rootbuf[0..n], r[0..n]);
+                root = rootbuf[0..n];
+            }
+        }
+        const url = std.fmt.allocPrint(self.gpa, "{s}/api/tags", .{root}) catch return;
+        defer self.gpa.free(url);
+        const res = std.process.run(self.gpa, self.io, .{
+            .argv = &.{ "curl", "-sS", "--max-time", "5", url },
+            .stdout_limit = .limited(256 << 10),
+        }) catch return;
+        defer self.gpa.free(res.stdout);
+        defer self.gpa.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0) return;
+        // parse the "name":"..." fields (one per installed model)
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.ollama_model_count = 0;
+        var i: usize = 0;
+        const needle = "\"name\":\"";
+        while (std.mem.indexOfPos(u8, res.stdout, i, needle)) |at| {
+            if (self.store.ollama_model_count >= store_mod.MAX_OLLAMA_MODELS) break;
+            const from = at + needle.len;
+            const end = std.mem.indexOfScalarPos(u8, res.stdout, from, '"') orelse break;
+            const name = res.stdout[from..end];
+            i = end + 1;
+            if (name.len == 0 or name.len > 96) continue;
+            var m: store_mod.OllamaModel = .{};
+            @memcpy(m.name[0..name.len], name);
+            m.name_len = @intCast(name.len);
+            self.store.ollama_models[self.store.ollama_model_count] = m;
+            self.store.ollama_model_count += 1;
+        }
+        log.info("chat: {d} local ollama models listed", .{self.store.ollama_model_count});
     }
 
     /// Is the chat model the local Ollama backend (where NUM_PARALLEL contention applies)?
@@ -143,6 +197,7 @@ pub const Chat = struct {
         self.store.chat_busy = v;
         if (!v) {
             self.store.stream_len = 0;
+            self.store.stream_reason_len = 0;
             self.store.chat_status_len = 0;
         }
     }
@@ -658,7 +713,7 @@ pub const Chat = struct {
         // While a cast runs, the chat call shares the local backend with the whole swarm — long silence
         // is queueing. The stream gets a longer first-byte leash and the status line says so honestly.
         llm.poll(&self.stream, self.io, self.gpa, now, self.cast_active);
-        // publish the partial + a live status with elapsed time
+        // publish the partial reply AND the partial reasoning (so thinking shows live, line-by-line)
         {
             self.store.lock();
             defer self.store.unlock();
@@ -666,6 +721,11 @@ pub const Chat = struct {
             const n = @min(src.len, self.store.stream_text.len);
             @memcpy(self.store.stream_text[0..n], src[0..n]);
             self.store.stream_len = n;
+            // show the TAIL of the reasoning if it exceeds the buffer (the newest thinking matters most)
+            const rsrc = self.stream.reasoning.items;
+            const rn = @min(rsrc.len, self.store.stream_reason.len);
+            @memcpy(self.store.stream_reason[0..rn], rsrc[rsrc.len - rn ..]);
+            self.store.stream_reason_len = rn;
         }
         if (!self.stream.done) {
             const el = now - self.stream.started_s;
@@ -801,10 +861,15 @@ pub const Chat = struct {
         wesc(&w, goal);
         w.writeAll("\"}") catch return;
 
+        // Show a "deploying" row in the activity panel the INSTANT casting starts — so the user sees the
+        // cast even while the POST is in flight, and sees it flip to failed if the server is down (rather
+        // than the panel just saying "no casts yet").
+        self.pushCastRow(goal);
         self.setStatus("casting the hive...");
         const resp = netcli.cast(self.io, self.gpa, port, tokb[0..tok_n], w.buffered()) orelse {
-            self.appendMsg(dd, .cast_note, "[cast] failed — the veil server is unreachable (start it, then ask again)");
-            self.store.pushNotif("Cast failed", "server unreachable", 2);
+            self.appendMsg(dd, .cast_note, "[cast] failed — the veil server isn't running on :8787. Start it (run the veil server / `python deploy.py`), then ask again.");
+            self.updateCastRow(.failed, 0, -1, "veil server unreachable on :8787", "");
+            self.store.pushNotif("Cast failed", "veil server not running on :8787", 2);
             self.setStatus("");
             return;
         };
@@ -813,6 +878,7 @@ pub const Chat = struct {
             var nb: [200]u8 = undefined;
             const msg = std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d})", .{resp.status}) catch "[cast] rejected";
             self.appendMsg(dd, .cast_note, msg);
+            self.updateCastRow(.failed, 0, -1, if (resp.status == 401 or resp.status == 403) "unauthorized - set an API token" else "server rejected the cast", "");
             self.store.pushNotif("Cast rejected", if (resp.status == 401 or resp.status == 403) "set an API token in Settings" else "server error", 2);
             self.setStatus("");
             return;
@@ -821,6 +887,7 @@ pub const Chat = struct {
         const hex = jStr(resp.body, "id", &idb) orelse "";
         if (hex.len == 0) {
             self.appendMsg(dd, .cast_note, "[cast] deploy answered without an id — check the server log");
+            self.updateCastRow(.failed, 0, -1, "no run id in the server response", "");
             self.setStatus("");
             return;
         }
@@ -833,26 +900,25 @@ pub const Chat = struct {
         var gb: [200]u8 = undefined;
         const note = std.fmt.bufPrint(&gb, "[cast] hive deployed ({s}) — watching", .{hex}) catch "[cast] hive deployed";
         self.appendMsg(dd, .cast_note, note);
-        // right-pane row
-        {
-            self.store.lock();
-            defer self.store.unlock();
-            if (self.store.cast_count >= store_mod.MAX_CASTS) {
-                std.mem.copyForwards(store_mod.CastRow, self.store.casts[0 .. store_mod.MAX_CASTS - 1], self.store.casts[1..store_mod.MAX_CASTS]);
-                self.store.cast_count = store_mod.MAX_CASTS - 1;
-            }
-            var row: store_mod.CastRow = .{ .status = .deploying };
-            const rn = @min(hex.len, row.run.len);
-            @memcpy(row.run[0..rn], hex[0..rn]);
-            row.run_len = @intCast(rn);
-            const gn = @min(goal.len, row.goal.len);
-            @memcpy(row.goal[0..gn], goal[0..gn]);
-            row.goal_len = @intCast(gn);
-            self.store.casts[self.store.cast_count] = row;
-            self.store.cast_count += 1;
-        }
+        self.updateCastRow(.deploying, 0, -1, "worker starting...", hex); // stamp the row with the real id
         self.store.pushNotif("Hive cast", goal, 1);
         log.info("chat cast: id={s} goal={s}", .{ hex, goal[0..@min(goal.len, 80)] });
+    }
+
+    /// Add a fresh "deploying" cast row (newest) to the activity panel; evicts the oldest when full.
+    fn pushCastRow(self: *Chat, goal: []const u8) void {
+        self.store.lock();
+        defer self.store.unlock();
+        if (self.store.cast_count >= store_mod.MAX_CASTS) {
+            std.mem.copyForwards(store_mod.CastRow, self.store.casts[0 .. store_mod.MAX_CASTS - 1], self.store.casts[1..store_mod.MAX_CASTS]);
+            self.store.cast_count = store_mod.MAX_CASTS - 1;
+        }
+        var row: store_mod.CastRow = .{ .status = .deploying };
+        const gn = @min(goal.len, row.goal.len);
+        @memcpy(row.goal[0..gn], goal[0..gn]);
+        row.goal_len = @intCast(gn);
+        self.store.casts[self.store.cast_count] = row;
+        self.store.cast_count += 1;
     }
 
     pub fn watchCast(self: *Chat, dd: []const u8) void {

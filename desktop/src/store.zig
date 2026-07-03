@@ -103,6 +103,16 @@ pub const MAX_CHAT_MSGS = 64;
 pub const MAX_CONVS = 32;
 pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
+pub const MAX_OLLAMA_MODELS = 48;
+
+/// One locally-installed Ollama model name (from GET /api/tags), for the Settings model dropdown.
+pub const OllamaModel = struct {
+    name: [96]u8 = [_]u8{0} ** 96,
+    name_len: u8 = 0,
+    pub fn nameStr(m: *const OllamaModel) []const u8 {
+        return m.name[0..m.name_len];
+    }
+};
 
 pub const ChatRole = enum(u8) { user, veil, cast_note };
 
@@ -216,6 +226,10 @@ pub const Store = struct {
     // --- settings (UI writes, poller reads) ---
     settings: Settings = .{},
 
+    // --- locally-installed Ollama models (chat thread writes from /api/tags; Settings reads) ---
+    ollama_models: [MAX_OLLAMA_MODELS]OllamaModel = undefined,
+    ollama_model_count: usize = 0,
+
     // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
     convs: [MAX_CONVS]ConvRow = undefined,
     conv_count: usize = 0,
@@ -225,6 +239,8 @@ pub const Store = struct {
     msg_count: usize = 0,
     stream_text: [8192]u8 = undefined, // the in-flight assistant reply, grown as deltas land
     stream_len: usize = 0,
+    stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
+    stream_reason_len: usize = 0,
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,

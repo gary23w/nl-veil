@@ -31,7 +31,7 @@ const TITLE_H = 30;
 const TAB_H = 34;
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model };
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -75,6 +75,7 @@ const Ui = struct {
     // deploy dropdowns
     open_dd: DdKind = .none,
     dd_rect: t.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    dd_scroll: f32 = 0, // scroll offset (rows) for a long dropdown list
     // window chrome
     dragging: bool = false,
     resizing: bool = false,
@@ -616,6 +617,7 @@ fn drawTabbar(store: *Store) void {
         if (t.tab(r, lb, ui.tab == tabv)) {
             ui.tab = tabv;
             ui.focus = .none;
+            ui.open_dd = .none; // don't let a dropdown opened on one tab bleed onto another
         }
         x += w + 4;
     }
@@ -752,6 +754,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var stream_buf: [8192]u8 = undefined;
     const stream_n = store.stream_len;
     @memcpy(stream_buf[0..stream_n], store.stream_text[0..stream_n]);
+    var sreason_buf: [4096]u8 = undefined;
+    const sreason_n = store.stream_reason_len;
+    @memcpy(sreason_buf[0..sreason_n], store.stream_reason[0..sreason_n]);
     const busy = store.chat_busy;
     var status: [96]u8 = undefined;
     const status_n: usize = store.chat_status_len;
@@ -773,9 +778,42 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph };
     const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = right.x - (left.x + left_w) - pad * 2, .height = ph };
 
+    // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
+    var inflight_buf: [13312]u8 = undefined;
+    const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n]);
+
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
-    drawChatCenter(store, center, msgs[0..msg_n], stream_buf[0..stream_n], busy, status[0..status_n]);
+    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n]);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
+}
+
+/// Compose the streaming display: reasoning as a `> ` blockquote, a blank line, then the answer. Matches
+/// how a finished veil message is stored (Chat.appendVeil), so the live view and the settled view agree.
+fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8) []const u8 {
+    var w: usize = 0;
+    if (reasoning.len > 0) {
+        var it = std.mem.splitScalar(u8, reasoning, '\n');
+        while (it.next()) |line| {
+            const ln = std.mem.trim(u8, line, " \r\t");
+            if (ln.len == 0) continue;
+            if (w + ln.len + 3 > buf.len) break;
+            buf[w] = '>';
+            buf[w + 1] = ' ';
+            w += 2;
+            @memcpy(buf[w .. w + ln.len], ln);
+            w += ln.len;
+            buf[w] = '\n';
+            w += 1;
+        }
+        if (w + 1 < buf.len) {
+            buf[w] = '\n';
+            w += 1;
+        }
+    }
+    const cn = @min(content.len, buf.len - w);
+    @memcpy(buf[w .. w + cn], content[0..cn]);
+    w += cn;
+    return buf[0..w];
 }
 
 fn togglePane(store: *Store, left: bool) void {
@@ -1392,12 +1430,17 @@ fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) voi
     if (t.hovering(r) and rl.isMouseButtonPressed(.left)) {
         ui.open_dd = if (open) .none else kind;
         ui.dd_rect = r;
+        ui.dd_scroll = 0;
     }
 }
 
 /// Render the currently-open dropdown's option list on top of the form and apply a selection.
 fn flushDropdown() void {
     if (ui.open_dd == .none) return;
+    switch (ui.open_dd) {
+        .chat_provider, .chat_byok, .chat_model => return, // owned by flushChatDropdown (Settings tab)
+        else => {},
+    }
     // Build the option labels + current index for the open kind.
     var labels: [16][]const u8 = undefined;
     var count: usize = 0;
@@ -1446,7 +1489,7 @@ fn flushDropdown() void {
             }
             current = ui.d_mode;
         },
-        .none => return,
+        .none, .chat_provider, .chat_byok, .chat_model => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -1460,28 +1503,49 @@ fn flushDropdown() void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none => {},
+            .none, .chat_provider, .chat_byok, .chat_model => {},
         }
         ui.open_dd = .none;
     }
 }
 
-/// Draw a dropdown option list under `anchor`; returns the clicked index, or null. Clicking outside closes.
+/// Draw a dropdown option list under `anchor`; returns the clicked ABSOLUTE index, or null. Wheel-scrolls
+/// when there are more options than fit (so e.g. all installed Ollama models are reachable, not just 9).
 fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
     const ih: f32 = 30;
-    const shown = @min(labels.len, 9);
-    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 2, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(shown)) + 8 };
+    const max_vis: usize = 9;
+    const total = labels.len;
+    const vis = @min(total, max_vis);
+    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 2, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(vis)) + 8 };
     t.panelBordered(lr, t.bg_dark, t.blue);
+
+    var start: usize = 0;
+    if (total > max_vis) {
+        const wheel = rl.getMouseWheelMove();
+        if (wheel != 0 and t.hovering(lr)) ui.dd_scroll -= wheel;
+        const maxoff: f32 = @floatFromInt(total - max_vis);
+        if (ui.dd_scroll < 0) ui.dd_scroll = 0;
+        if (ui.dd_scroll > maxoff) ui.dd_scroll = maxoff;
+        start = @intFromFloat(ui.dd_scroll);
+    }
+
     var yy = lr.y + 4;
     var clicked: ?usize = null;
-    for (labels, 0..) |lbl, i| {
-        if (i >= shown) break;
+    var i: usize = start;
+    while (i < total and i < start + vis) : (i += 1) {
         const ir = t.Rect{ .x = lr.x + 4, .y = yy, .width = lr.width - 8, .height = ih };
         const hot = t.hovering(ir);
         if (i == current) t.panel(ir, t.bg_sel) else if (hot) t.panel(ir, t.bg_hl);
-        t.textClip(lbl, @intFromFloat(ir.x + 10), @intFromFloat(ir.y + 8), 13, t.fg, @intFromFloat(ir.width - 16));
+        t.textClip(labels[i], @intFromFloat(ir.x + 10), @intFromFloat(ir.y + 8), 13, t.fg, @intFromFloat(ir.width - 22));
         if (hot and rl.isMouseButtonPressed(.left)) clicked = i;
         yy += ih;
+    }
+    // a subtle scrollbar thumb + count when the list overflows
+    if (total > max_vis) {
+        const track_h = lr.height - 8;
+        const thumb_h = @max(12.0, track_h * @as(f32, @floatFromInt(vis)) / @as(f32, @floatFromInt(total)));
+        const thumb_y = lr.y + 4 + (track_h - thumb_h) * (ui.dd_scroll / @as(f32, @floatFromInt(total - max_vis)));
+        t.fillRect(@intFromFloat(lr.x + lr.width - 5), @intFromFloat(thumb_y), 3, @intFromFloat(thumb_h), t.comment);
     }
     // click outside the list AND its anchor button closes it
     if (rl.isMouseButtonPressed(.left) and !t.hovering(lr) and !t.hovering(anchor)) ui.open_dd = .none;
@@ -1873,6 +1937,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
     const chat_key_n = store.settings.chat_key_len;
+    const ol_n = store.ollama_model_count;
     var cmb: [96]u8 = undefined;
     const cmn: usize = store.settings.chat_model_len;
     @memcpy(cmb[0..cmn], store.settings.chat_model[0..cmn]);
@@ -1918,8 +1983,8 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 44;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
-    // Seed the editable fields from the store once, after the chat thread has loaded persisted settings.
-    if (!ui.s_seeded and cmn > 0) {
+    // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
+    if (!ui.s_seeded and (cmn > 0 or cbn > 0)) {
         setField(&ui.s_model, cmb[0..cmn]);
         setField(&ui.s_url, cbb[0..cbn]);
         ui.s_seeded = true;
@@ -1928,36 +1993,57 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 12;
     t.text(t.z("CHAT MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
     t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x + 100), @intFromFloat(y), 11, t.comment);
-    y += 20;
+    y += 22;
     const half = (colw - 10) / 2;
+
+    // PROVIDER dropdown: Local / BYOK / Custom URL
     const kind_lbl = switch (chat_kind) {
-        1 => t.z("BYOK - {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label}),
+        1 => t.z("BYOK (cloud key)", .{}),
         2 => t.z("Custom URL", .{}),
         else => t.z("Local (Ollama)", .{}),
     };
-    const kd = t.cycle(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("PROVIDER", .{}), kind_lbl, false);
-    if (kd != 0) {
-        store.lock();
-        store.settings.chat_kind = @intCast(@mod(@as(i32, chat_kind) + kd + 3, 3));
-        store.unlock();
-    }
+    selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
+    // BYOK cloud-provider dropdown
     if (chat_kind == 1) {
         const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
-        const bd = t.cycle(.{ .x = x + half + 10, .y = y, .width = half, .height = 46 }, t.z("BYOK PROVIDER", .{}), t.zs(p.label), false);
-        if (bd != 0) {
-            store.lock();
-            store.settings.chat_byok = byokStep(chat_byok, bd);
-            store.unlock();
-        }
+        selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 46 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
     }
     y += 56;
-    flabel(x, y, "MODEL");
-    textField(.{ .x = x, .y = y + 14, .width = half, .height = 32 }, &ui.s_model, ui.focus == .s_model, "gpt-oss:20b", .s_model);
+
+    // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
     if (chat_kind == 2) {
+        flabel(x, y, "MODEL");
+        textField(.{ .x = x, .y = y + 14, .width = half, .height = 32 }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
         flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
         textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = 32 }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+        y += 56;
+        if (t.button(.{ .x = x, .y = y, .width = 180, .height = 34 }, t.z("Save endpoint + model", .{}), t.blue, true)) {
+            store.lock();
+            const s = &store.settings;
+            const mn = @min(ui.s_model.len, s.chat_model.len);
+            @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
+            s.chat_model_len = @intCast(mn);
+            const bn2 = @min(ui.s_url.len, s.chat_base.len);
+            @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+            s.chat_base_len = @intCast(bn2);
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif("Chat endpoint saved", "custom model config persisted", 1);
+            ui.focus = .none;
+        }
+        y += 42;
+    } else {
+        const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+        selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("MODEL", .{}), model_disp, .chat_model);
+        const hint = if (chat_kind == 0)
+            (if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{}))
+        else
+            t.z("models available on {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label});
+        t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 16), 11, t.comment);
+        y += 56;
     }
-    y += 56;
+
+    // API key (BYOK only — local needs none, custom uses this too)
     if (chat_kind != 0) {
         flabel(x, y, "API KEY (stored in the OS-protected local store, never plaintext)");
         y += 14;
@@ -1970,37 +2056,135 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 116), @intFromFloat(y + 9), 12, t.green);
         y += 44;
     }
-    if (t.button(.{ .x = x, .y = y, .width = 180, .height = 34 }, t.z("Save chat settings", .{}), t.blue, true)) {
-        store.lock();
-        const s = &store.settings;
-        const mn = @min(ui.s_model.len, s.chat_model.len);
-        @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
-        s.chat_model_len = @intCast(mn);
-        const bn2 = @min(ui.s_url.len, s.chat_base.len);
-        @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
-        s.chat_base_len = @intCast(bn2);
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-        store.pushNotif("Chat settings saved", "provider config persisted", 1);
-        ui.focus = .none;
-    }
-    y += 48;
-
+    y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+
+    // draw the open chat dropdown LAST so its option list sits on top of the fields below it.
+    flushChatDropdown(store);
 }
 
-/// Step the BYOK provider index over the catalog entries a chat client can use directly: needs a key and
-/// has a real https base (skips ollama/local, cloudflare-resolved, and mock entries).
-fn byokStep(cur: u8, delta: i32) u8 {
-    const n: i32 = @intCast(catalog.providers.len);
-    var i: i32 = cur;
-    var guard: usize = 0;
-    while (guard < catalog.providers.len * 2) : (guard += 1) {
-        i = @mod(i + delta + n, n);
-        const p = &catalog.providers[@intCast(i)];
-        if (p.needs_key and std.mem.startsWith(u8, p.base_url, "http")) return @intCast(i);
+/// The catalog provider indices usable as a BYOK cloud chat provider: needs a key AND a real https base
+/// (skips ollama/local, cloudflare-resolved, and mock). Fills `out`, returns the count.
+fn byokProviderList(out: *[16]usize) usize {
+    var n: usize = 0;
+    for (catalog.providers, 0..) |p, i| {
+        if (n >= out.len) break;
+        if (p.needs_key and std.mem.startsWith(u8, p.base_url, "http")) {
+            out[n] = i;
+            n += 1;
+        }
     }
-    return cur;
+    return n;
+}
+
+fn setChatModel(store: *Store, model: []const u8) void {
+    store.lock();
+    setChatModelLocked(store, model);
+    store.unlock();
+}
+
+/// Caller MUST hold store.lock(). Copies `model` into settings.chat_model.
+fn setChatModelLocked(store: *Store, model: []const u8) void {
+    const n = @min(model.len, store.settings.chat_model.len);
+    @memcpy(store.settings.chat_model[0..n], model[0..n]);
+    store.settings.chat_model_len = @intCast(n);
+}
+
+/// Render + apply the open chat dropdown (PROVIDER / CLOUD PROVIDER / MODEL) on top of the Settings form.
+/// Selections apply live AND persist, and switching provider re-selects a valid model — so the chat can
+/// never be left pointing a cloud provider at a local model (the "BYOK breaks" trap).
+fn flushChatDropdown(store: *Store) void {
+    switch (ui.open_dd) {
+        .chat_provider, .chat_byok, .chat_model => {},
+        else => return,
+    }
+    // snapshot the state the list needs
+    store.lock();
+    const kind = store.settings.chat_kind;
+    const byok = store.settings.chat_byok;
+    var models: [store_mod.MAX_OLLAMA_MODELS]store_mod.OllamaModel = undefined;
+    const ol_n = store.ollama_model_count;
+    @memcpy(models[0..ol_n], store.ollama_models[0..ol_n]);
+    var cur_model: [96]u8 = undefined;
+    const cur_model_n = store.settings.chat_model_len;
+    @memcpy(cur_model[0..cur_model_n], store.settings.chat_model[0..cur_model_n]);
+    store.unlock();
+
+    var labels: [64][]const u8 = undefined;
+    var count: usize = 0;
+    var current: usize = 0;
+    var byok_idx: [16]usize = undefined;
+    var byok_n: usize = 0;
+
+    switch (ui.open_dd) {
+        .chat_provider => {
+            labels[0] = "Local (Ollama)";
+            labels[1] = "BYOK (cloud key)";
+            labels[2] = "Custom URL";
+            count = 3;
+            current = @min(kind, 2);
+        },
+        .chat_byok => {
+            byok_n = byokProviderList(&byok_idx);
+            for (0..byok_n) |i| {
+                labels[i] = catalog.providers[byok_idx[i]].label;
+                if (byok_idx[i] == byok) current = i;
+            }
+            count = byok_n;
+        },
+        .chat_model => {
+            if (kind == 0 and ol_n > 0) {
+                for (0..ol_n) |i| {
+                    labels[i] = models[i].nameStr();
+                    if (std.mem.eql(u8, labels[i], cur_model[0..cur_model_n])) current = i;
+                }
+                count = ol_n;
+            } else {
+                const prov = if (kind == 1) &catalog.providers[@min(byok, catalog.providers.len - 1)] else &catalog.providers[2]; // 2 = ollama
+                for (prov.models, 0..) |m, i| {
+                    if (i >= labels.len) break;
+                    labels[i] = m.id;
+                    if (std.mem.eql(u8, m.id, cur_model[0..cur_model_n])) current = i;
+                    count += 1;
+                }
+            }
+        },
+        else => return,
+    }
+
+    const chosen = drawList(ui.dd_rect, labels[0..count], current) orelse return;
+    // Switching provider re-selects a valid default model so the chat can never point a cloud provider at
+    // a local model (the "BYOK breaks" trap). All model strings below are either catalog-static or slices
+    // into the STACK-local `models` snapshot — never a slice into the shared Store held past an unlock.
+    // Provider+model must change ATOMICALLY (one lock): otherwise the chat thread could drain a queued
+    // send/cast between the two writes and read the new provider with the old (mismatched) model — the
+    // exact "cloud provider pointed at a local model" trap this feature exists to prevent.
+    switch (ui.open_dd) {
+        .chat_provider => {
+            const newkind: u8 = @intCast(chosen);
+            store.lock();
+            store.settings.chat_kind = newkind;
+            if (newkind == 0) {
+                setChatModelLocked(store, if (ol_n > 0) models[0].nameStr() else "gpt-oss:20b");
+            } else if (newkind == 1) {
+                const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
+                if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+            } // custom (2) keeps its typed model
+            store.unlock();
+        },
+        .chat_byok => {
+            const newbyok: u8 = @intCast(byok_idx[chosen]);
+            store.lock();
+            store.settings.chat_byok = newbyok;
+            const p = &catalog.providers[newbyok];
+            if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+            store.unlock();
+        },
+        .chat_model => setChatModel(store, labels[chosen]),
+        else => {},
+    }
+    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // apply live + persist
+    ui.open_dd = .none;
 }
 
 // -------------------------------------------------------------------------------- shared widgets
