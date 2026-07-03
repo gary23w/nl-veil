@@ -174,7 +174,26 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});
 
     std.debug.print("neuron-loops {s} on http://127.0.0.1:{d}  home={s}  ({d} users, {d} swarms re-adopted)\n", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+    launchDesktop(gpa, io, paths.home, init.environ_map);
     try server.listen();
+}
+
+const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
+
+/// "Host the desktop": when the control plane comes up, launch the veil-desk dashboard if it was built
+/// (desktop/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached and
+/// best-effort — a headless box either has no binary (built with -Ddesktop=false) or no display, and the
+/// spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
+fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) void {
+    if (environ.get("NL_NO_DESKTOP")) |v| {
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;
+    }
+    const bin = std.fmt.allocPrint(gpa, "{s}/desktop/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
+    defer gpa.free(bin);
+    std.Io.Dir.cwd().access(io, bin, .{}) catch return; // not built → nothing to host
+    // Spawn and forget — it's an independent same-machine companion, not a child we manage.
+    _ = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+    std.debug.print("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)\n", .{});
 }
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {

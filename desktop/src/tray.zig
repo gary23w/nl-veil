@@ -1,8 +1,8 @@
-//! tray.zig — the OS system-tray presence + native notifications. Windows gets a real Shell_NotifyIcon
-//! icon with balloon toasts (the app "sits in the system tray when online"); Linux/macOS degrade to a
-//! best-effort notifier (notify-send / osascript) and otherwise no-op, so the SAME app binary builds and
-//! runs on all three. The in-app toast (drawn by the UI) is the always-present fallback; this layer adds
-//! the native surface where the platform offers one cheaply.
+//! tray.zig — the OS system-tray presence + native notifications. On Windows it owns a real
+//! Shell_NotifyIcon icon anchored to a HIDDEN message window we create (v1 anchored to GetConsoleWindow,
+//! which is null under the Windows GUI subsystem — so no icon ever appeared). A per-frame `pump()` drains
+//! that window's message queue so tray clicks reach us (double-click → restore the app). Linux/macOS
+//! degrade to no-op stubs; the always-present in-app toast (drawn by the UI) is the cross-platform floor.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,17 +19,19 @@ pub const Tray = struct {
         if (t.inited) t.impl.deinit();
         t.inited = false;
     }
-    /// Reflect server-online state in the tray tooltip/icon (no-op where unsupported).
     pub fn setOnline(t: *Tray, online: bool) void {
         if (t.online == online) return;
         t.online = online;
         if (t.inited) t.impl.setOnline(online);
     }
-    /// Raise a native notification. `accent`: 0 info / 1 good / 2 warn.
     pub fn notify(t: *Tray, gpa: std.mem.Allocator, title: []const u8, body: []const u8, accent: u8) void {
-        t.impl.notify(gpa, title, body, accent);
+        if (t.inited) t.impl.notify(gpa, title, body, accent);
     }
-    /// True if the user activated the tray icon and wants the window restored (Windows only).
+    /// Drain the tray window's message queue (Windows). Call once per UI frame.
+    pub fn pump(t: *Tray) void {
+        if (t.inited) t.impl.pump();
+    }
+    /// True (once) if the user double-clicked the tray icon and wants the window restored.
     pub fn takeRestoreRequest(t: *Tray) bool {
         return if (t.inited) t.impl.takeRestoreRequest() else false;
     }
@@ -39,9 +41,12 @@ const Impl = if (builtin.os.tag == .windows) WindowsTray else PosixTray;
 
 // ------------------------------------------------------------------------------------- Windows
 const WindowsTray = struct {
-    const w = std.os.windows;
+    const HWND = std.os.windows.HWND;
     const WM_APP: u32 = 0x8000;
     const CALLBACK_MSG: u32 = WM_APP + 1;
+    const WM_LBUTTONDBLCLK: u32 = 0x0203;
+    const WM_LBUTTONUP: u32 = 0x0202;
+    const PM_REMOVE: u32 = 0x0001;
     const NIM_ADD: u32 = 0;
     const NIM_MODIFY: u32 = 1;
     const NIM_DELETE: u32 = 2;
@@ -51,10 +56,35 @@ const WindowsTray = struct {
     const NIF_INFO: u32 = 0x10;
     const NIIF_INFO: u32 = 0x1;
     const NIIF_WARNING: u32 = 0x2;
+    const IDI_APPLICATION: usize = 32512;
 
+    const POINT = extern struct { x: i32, y: i32 };
+    const MSG = extern struct {
+        hwnd: ?HWND,
+        message: u32,
+        wParam: usize,
+        lParam: isize,
+        time: u32,
+        pt: POINT,
+    };
+    const WNDPROC = *const fn (?HWND, u32, usize, isize) callconv(.winapi) isize;
+    const WNDCLASSEXW = extern struct {
+        cbSize: u32,
+        style: u32,
+        lpfnWndProc: WNDPROC,
+        cbClsExtra: i32,
+        cbWndExtra: i32,
+        hInstance: ?*anyopaque,
+        hIcon: ?*anyopaque,
+        hCursor: ?*anyopaque,
+        hbrBackground: ?*anyopaque,
+        lpszMenuName: ?[*:0]const u16,
+        lpszClassName: ?[*:0]const u16,
+        hIconSm: ?*anyopaque,
+    };
     const NOTIFYICONDATAW = extern struct {
         cbSize: u32,
-        hWnd: ?*anyopaque,
+        hWnd: ?HWND,
         uID: u32,
         uFlags: u32,
         uCallbackMessage: u32,
@@ -72,11 +102,31 @@ const WindowsTray = struct {
 
     extern "shell32" fn Shell_NotifyIconW(dwMessage: u32, lpData: *NOTIFYICONDATAW) callconv(.winapi) c_int;
     extern "user32" fn LoadIconW(hInstance: ?*anyopaque, lpIconName: usize) callconv(.winapi) ?*anyopaque;
-    extern "kernel32" fn GetConsoleWindow() callconv(.winapi) ?*anyopaque;
+    extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(.winapi) u16;
+    extern "user32" fn CreateWindowExW(dwExStyle: u32, lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16, dwStyle: u32, x: i32, y: i32, w: i32, h: i32, parent: ?HWND, menu: ?*anyopaque, inst: ?*anyopaque, param: ?*anyopaque) callconv(.winapi) ?HWND;
+    extern "user32" fn DefWindowProcW(hwnd: ?HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;
+    extern "user32" fn DestroyWindow(hwnd: ?HWND) callconv(.winapi) i32;
+    extern "user32" fn PeekMessageW(msg: *MSG, hwnd: ?HWND, min: u32, max: u32, remove: u32) callconv(.winapi) i32;
+    extern "user32" fn TranslateMessage(msg: *const MSG) callconv(.winapi) i32;
+    extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) isize;
+    extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
 
-    const IDI_APPLICATION: usize = 32512;
+    // module-level state read by the WndProc (runs on the main thread inside pump()).
+    var g_restore: bool = false;
+
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("VeilDeskTrayWnd");
+
+    fn wndProc(hwnd: ?HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize {
+        if (msg == CALLBACK_MSG) {
+            const ev: u32 = @intCast(@as(usize, @bitCast(lParam)) & 0xFFFF);
+            if (ev == WM_LBUTTONDBLCLK or ev == WM_LBUTTONUP) g_restore = true;
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
 
     nid: NOTIFYICONDATAW = undefined,
+    hwnd: ?HWND = null,
     live: bool = false,
 
     fn utf16z(dst: []u16, s: []const u8) void {
@@ -85,12 +135,19 @@ const WindowsTray = struct {
     }
 
     fn init(self: *WindowsTray, title: []const u8) bool {
-        // Attach to a window so balloons route somewhere; the console/message window is enough for a v1
-        // tray presence. A dedicated hidden message window is the next step for click-to-restore.
-        const hwnd = GetConsoleWindow();
+        const hinst = GetModuleHandleW(null);
+        var wc = std.mem.zeroes(WNDCLASSEXW);
+        wc.cbSize = @sizeOf(WNDCLASSEXW);
+        wc.lpfnWndProc = &wndProc;
+        wc.hInstance = hinst;
+        wc.lpszClassName = class_name;
+        _ = RegisterClassExW(&wc); // idempotent-ish; ignore "already registered"
+        // A normal but never-shown window owns the tray icon (message-only windows are flakier hosts).
+        self.hwnd = CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, null, null, hinst, null);
+        if (self.hwnd == null) return false;
         self.nid = std.mem.zeroes(NOTIFYICONDATAW);
         self.nid.cbSize = @sizeOf(NOTIFYICONDATAW);
-        self.nid.hWnd = hwnd;
+        self.nid.hWnd = self.hwnd;
         self.nid.uID = 1;
         self.nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
         self.nid.uCallbackMessage = CALLBACK_MSG;
@@ -101,6 +158,7 @@ const WindowsTray = struct {
     }
     fn deinit(self: *WindowsTray) void {
         if (self.live) _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+        if (self.hwnd) |h| _ = DestroyWindow(h);
         self.live = false;
     }
     fn setOnline(self: *WindowsTray, online: bool) void {
@@ -118,9 +176,20 @@ const WindowsTray = struct {
         utf16z(&self.nid.szInfo, body);
         _ = Shell_NotifyIconW(NIM_MODIFY, &self.nid);
     }
+    fn pump(self: *WindowsTray) void {
+        var msg: MSG = undefined;
+        while (PeekMessageW(&msg, self.hwnd, 0, 0, PM_REMOVE) != 0) {
+            _ = TranslateMessage(&msg);
+            _ = DispatchMessageW(&msg);
+        }
+    }
     fn takeRestoreRequest(self: *WindowsTray) bool {
         _ = self;
-        return false; // needs a real message pump; the window stays visible in v1
+        if (g_restore) {
+            g_restore = false;
+            return true;
+        }
+        return false;
     }
 };
 
@@ -129,7 +198,7 @@ const PosixTray = struct {
     fn init(self: *PosixTray, title: []const u8) bool {
         _ = self;
         _ = title;
-        return true; // no persistent icon, but notify() still works via the desktop notifier
+        return true;
     }
     fn deinit(self: *PosixTray) void {
         _ = self;
@@ -138,15 +207,15 @@ const PosixTray = struct {
         _ = self;
         _ = online;
     }
-    /// v1: no native toast on POSIX — the always-present in-app toast (drawn by the UI) covers it, and
-    /// keeping this a pure no-op guarantees the Linux/macOS build has zero process-spawn surface. A
-    /// notify-send / osascript path (needs the poller's io handle threaded in) is the next increment.
     fn notify(self: *PosixTray, gpa: std.mem.Allocator, title: []const u8, body: []const u8, accent: u8) void {
         _ = self;
         _ = gpa;
         _ = title;
         _ = body;
         _ = accent;
+    }
+    fn pump(self: *PosixTray) void {
+        _ = self;
     }
     fn takeRestoreRequest(self: *PosixTray) bool {
         _ = self;
