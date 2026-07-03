@@ -123,18 +123,27 @@ fn firstNonEmpty(lines: []const []const u8) []const u8 {
     return "";
 }
 
-/// A weak model's anchor usually misses by a FEW characters (retyped, wrong indent, curly quote). Show it the
-/// closest real file line (by shared-character prefix/token overlap) with its line number, so the corrective
-/// turn can copy the true text instead of guessing again. Returns a borrowed slice of `lines` content in a
-/// caller-provided buffer ("" when the file is empty or nothing is remotely close).
-fn nearestLineHint(lines: []const []const u8, anchor_first: []const u8, buf: []u8) []const u8 {
+/// A stale anchor is usually a TEAMMATE'S rewrite, not a typo: under concurrency a mind reads, a teammate
+/// commits, and the mind's SEARCH lines no longer exist verbatim (observed live, openai_splash_test_4 r4-6:
+/// several repair attempts per round lost on digest/__init__.py and digest/rank.py, each costing a full
+/// re-read turn). So on anchor-not-found we hand back the CURRENT file's closest region — exact trimmed match
+/// on the anchor's first line first, else longest shared prefix of trimmed text — so the mind can re-anchor in
+/// the SAME turn. Returns gpa-owned bytes (folded into the reject string and freed by the caller); when nothing
+/// scores above a trivial threshold the region is gone and the hint says to read_file instead.
+fn regionHint(gpa: std.mem.Allocator, lines: []const []const u8, anchor_first: []const u8) []u8 {
+    const removed = "The anchored region appears to have been removed from the current file entirely — read_file it before retrying.";
     const want = trimBoth(anchor_first);
-    if (want.len == 0 or lines.len == 0) return "";
+    if (want.len == 0 or lines.len == 0) return gpa.dupe(u8, removed) catch @constCast("");
     var best_i: usize = 0;
     var best_score: usize = 0;
     for (lines, 0..) |ln, i| {
         const have = trimBoth(ln);
         if (have.len == 0) continue;
+        if (std.mem.eql(u8, want, have)) { // exact (trimmed) hit — take the first one and stop scanning
+            best_i = i;
+            best_score = std.math.maxInt(usize);
+            break;
+        }
         var score: usize = 0;
         const n = @min(want.len, have.len);
         while (score < n and want[score] == have[score]) score += 1; // shared prefix
@@ -144,8 +153,25 @@ fn nearestLineHint(lines: []const []const u8, anchor_first: []const u8, buf: []u
             best_i = i;
         }
     }
-    if (best_score < 4) return "";
-    return std.fmt.bufPrint(buf, " Closest file line is {d}: `{s}`", .{ best_i + 1, lines[best_i][0..@min(lines[best_i].len, 120)] }) catch "";
+    if (best_score < 4) return gpa.dupe(u8, removed) catch @constCast("");
+    // up to 7 lines centered on the match, shrunk (wider side first, never below the match line itself) until
+    // the region fits ~400 chars — the hint must help the retry, not blow up the tool-result budget.
+    var lo = best_i -| 3;
+    var hi = @min(lines.len, best_i + 4);
+    while (lo < best_i or hi > best_i + 1) {
+        var total: usize = 0;
+        for (lines[lo..hi]) |ln| total += @min(ln.len, 200) + 1;
+        if (total <= 400) break;
+        if (best_i - lo >= hi - best_i - 1) lo += 1 else hi -= 1;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    // verbatim, no line numbers: the mind copies these lines straight into its next SEARCH block.
+    out.appendSlice(gpa, "The file NOW reads (re-anchor on these exact lines):\n") catch {};
+    for (lines[lo..hi]) |ln| {
+        out.appendSlice(gpa, ln[0..@min(ln.len, 200)]) catch {};
+        out.append(gpa, '\n') catch {};
+    }
+    return out.toOwnedSlice(gpa) catch @constCast("");
 }
 
 /// Apply all ops to `original`. Pure (no I/O). Returns owned rewritten bytes, or an owned reject reason.
@@ -189,9 +215,12 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
         var start: usize = 0;
         var loose: bool = false;
         if (matchAnchor(lines.items, anc_lines.items, &start, &loose)) |err| {
-            var hbuf: [180]u8 = undefined;
             return switch (err) {
-                .not_found => rejectMsg(gpa, "op{d}: anchor not found — copy an exact snippet (leading spaces included) from the current file.{s}", .{ i + 1, nearestLineHint(lines.items, firstNonEmpty(anc_lines.items), &hbuf) }),
+                .not_found => blk: {
+                    const hint = regionHint(gpa, lines.items, firstNonEmpty(anc_lines.items));
+                    defer gpa.free(hint);
+                    break :blk rejectMsg(gpa, "op{d}: anchor not found — copy an exact snippet (leading spaces included) from the current file. {s}", .{ i + 1, hint });
+                },
                 .ambiguous => rejectMsg(gpa, "op{d}: anchor matches more than one place — add surrounding lines so it appears exactly once", .{i + 1}),
             };
         }
@@ -484,6 +513,41 @@ test "anchor not found and ambiguous both reject with no bytes" {
     const am = apply(gpa, "dup\nmid\ndup\n", &.{.{ .kind = .replace, .anchor = "dup", .text = "x" }});
     defer gpa.free(am.reject);
     try std.testing.expect(!am.ok and std.mem.indexOf(u8, am.reject, "more than one") != null);
+}
+
+test "stale anchor reject carries the CURRENT region (exact first-line match)" {
+    const gpa = std.testing.allocator;
+    // the live failure shape: a teammate rewrote rank()'s body between this mind's read and its edit, so the
+    // anchor's tail is stale — but its def line still exists verbatim and the reject must show what's there NOW.
+    const src = "import math\n\ndef rank(items):\n    scored = []\n    for it in items:\n        scored.append(it)\n    return scored\n";
+    const r = apply(gpa, src, &.{.{ .kind = .replace, .anchor = "def rank(items):\n    return sorted(items)", .text = "def rank(items):\n    return sorted(items, reverse=True)" }});
+    defer gpa.free(r.reject);
+    try std.testing.expect(!r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "anchor not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "The file NOW reads (re-anchor on these exact lines):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "def rank(items):") != null); // the matched line, verbatim
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "    scored = []") != null); // real neighbors, indentation intact
+}
+
+test "stale anchor reject falls back to a shared-prefix fuzzy match" {
+    const gpa = std.testing.allocator;
+    // the mind retyped the signature (item_list vs items): no exact line, but the def line shares a long prefix
+    const src = "a\nb\ndef rank(items):\n    return 1\nz\n";
+    const r = apply(gpa, src, &.{.{ .kind = .replace, .anchor = "def rank(item_list):", .text = "def rank(xs):" }});
+    defer gpa.free(r.reject);
+    try std.testing.expect(!r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "The file NOW reads") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "def rank(items):") != null); // the closest real line
+}
+
+test "anchor region removed entirely: reject says read_file, offers no bogus region" {
+    const gpa = std.testing.allocator;
+    const r = apply(gpa, "alpha\nbeta\n", &.{.{ .kind = .replace, .anchor = "zzzz qqqq wwww", .text = "x" }});
+    defer gpa.free(r.reject);
+    try std.testing.expect(!r.ok);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "removed from the current file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "read_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.reject, "NOW reads") == null); // never a made-up region
 }
 
 test "all-or-nothing: one bad op in a batch yields no bytes" {

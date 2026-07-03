@@ -346,6 +346,8 @@ pub fn updateRsiCurriculum(w: *Worker, goal: []const u8, round: u32, stalled: bo
 /// operating rule to the self-authored playbook (or decline). Those rules are injected into every mind's system
 /// prompt next round, so the swarm's PROCESS compounds over time exactly like its artifact does — without the
 /// engine hard-wiring any particular behaviour. Best-effort: any failure just skips this round's reflection.
+/// Runs inside the CONCURRENT meta group (run.zig): gpa-only, no w.a()/w.esc(); its writes (playbook scope via
+/// the locked mem, act/emit via the locked emitter) are disjoint from every other grouped faculty.
 pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: []const u8, bench: BenchResult) void {
     const gpa = w.gpa;
     const playbook = w.mem.list(tools.PLAYBOOK_SCOPE);
@@ -418,7 +420,9 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     }
     _ = w.mem.observe(tools.PLAYBOOK_SCOPE, rule);
     w.act("retro", round, "set_directive", "retrospective", rule);
-    w.emit("growth", std.fmt.allocPrint(w.a(), ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
+    // stack buffer, not w.a(): this faculty now runs inside the concurrent meta group and the round arena is not thread-safe
+    var gbuf: [160]u8 = undefined;
+    w.emit("growth", std.fmt.bufPrint(&gbuf, ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
 }
 
 /// The string value of `"<key>": "<value>"` inside possibly-malformed JSON text — a last-resort extractor for
