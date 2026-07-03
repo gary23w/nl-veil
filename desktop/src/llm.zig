@@ -126,13 +126,13 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
         s.out_path_len = @intCast(n);
     }
 
-    // Local Ollama uses the NATIVE /api/chat with stream:FALSE — the engine's proven path. Reasoning
-    // models (gpt-oss) stream their harmony channels token-by-token, and Ollama's incremental tool-call
-    // parser trips on plain text like a leading "CAST:" ("error parsing tool call: invalid character
-    // 'C'"), breaking the reply. The non-streaming path returns ONE object with content + thinking
-    // cleanly parsed. num_ctx matches the engine so chat + swarm share one runner (no reload thrash).
+    // Local Ollama uses the NATIVE /api/chat, STREAMING (NDJSON) so the reply types out token-by-token
+    // and the reasoning shows line-by-line. Reasoning models (gpt-oss) sometimes route a reply through
+    // Ollama's harmony "commentary" channel, which its incremental tool-call parser then chokes on
+    // ("error parsing tool call: ... 'C'"); handleStreamLine RECOVERS the raw text from that error rather
+    // than failing. num_ctx matches the engine so chat + swarm share one runner (no reload thrash).
     const body = if (native)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"max_tokens\":{d}}}", .{ prov.model, messages_json, max_tokens }) catch return false;
     defer gpa.free(body);
@@ -206,24 +206,11 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
         }
     }
 
-    // Native (local Ollama) is non-streaming: the whole JSON object lands only when generation finishes.
-    // Nothing to parse incrementally — wait for the STAT sentinel (curl exit), then parse content +
-    // thinking (+ tool-call-error recovery) from the complete body.
-    if (s.native) {
-        if (std.mem.trim(u8, body, " \r\n\t").len > 0) s.saw_any = true; // suppress the first-byte timeout
-        if (stat) |code| {
-            finishNativeWhole(s, io, gpa, code, body);
-            return;
-        }
-        checkTimeouts(s, io, now_s, patient);
-        return;
-    }
-
     if (body.len > s.offset) {
         consume(s, gpa, body[s.offset..]);
         s.offset = body.len;
         s.last_growth_s = now_s;
-    } else if (stat == null and s.saw_any and !s.saw_sse) {
+    } else if (stat == null and s.saw_any and !s.saw_sse and !s.native) {
         // plain-JSON body (backend ignored stream:true): complete once the object closes + carries a
         // terminal key — brace-end alone can be a partial write.
         tryWholeJson(s, gpa, body);
@@ -234,9 +221,9 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
 
     // curl has EXITED — resolve from the HTTP code now instead of waiting out the first-byte ceiling.
     // This is what turns a typo'd endpoint / dead port / HTML 502 from a 5–15 minute blind wait into an
-    // immediate, accurate error.
+    // immediate, accurate error. Native uses the ollama-aware finish (content+thinking+recovery backstop).
     if (stat) |code| {
-        finishBySentinel(s, io, gpa, code, body);
+        if (s.native) finishNativeWhole(s, io, gpa, code, body) else finishBySentinel(s, io, gpa, code, body);
         return;
     }
     checkTimeouts(s, io, now_s, patient);
@@ -262,14 +249,18 @@ fn finishNativeWhole(s: *Stream, io: Io, gpa: std.mem.Allocator, code: []const u
         setErr(s, eb[0..n]);
         return;
     }
-    // reasoning (thinking channel) + the answer (content)
-    if (jsonUnescape(gpa, body, "thinking")) |th| {
-        defer gpa.free(th);
-        s.reasoning.appendSlice(gpa, th) catch {};
-    }
-    if (jsonUnescape(gpa, body, "content")) |c| {
-        defer gpa.free(c);
-        s.content.appendSlice(gpa, c) catch {};
+    // Backstop only — streaming already accumulated content/thinking via handleStreamLine. Extract from
+    // the whole body ONLY if nothing streamed (e.g. done:true never arrived), so we never duplicate a
+    // delta already in the buffer. On a normal stream, s.content is non-empty here and we just complete.
+    if (s.content.items.len == 0 and s.reasoning.items.len == 0) {
+        if (jsonUnescape(gpa, body, "thinking")) |th| {
+            defer gpa.free(th);
+            s.reasoning.appendSlice(gpa, th) catch {};
+        }
+        if (jsonUnescape(gpa, body, "content")) |c| {
+            defer gpa.free(c);
+            s.content.appendSlice(gpa, c) catch {};
+        }
     }
     if (s.content.items.len > 0 or s.reasoning.items.len > 0) {
         s.done = true;
@@ -415,12 +406,35 @@ fn handleStreamLine(s: *Stream, gpa: std.mem.Allocator, line: []const u8) void {
         if (payload.len == 0 or payload[0] != '{') return;
     } else return;
 
+    // A gpt-oss harmony tool-call parse error ({"error":"error parsing tool call: raw='...'"}) carries the
+    // model's real text — recover it (from the FULL, un-capped error string) instead of failing the turn.
+    if (jsonUnescape(gpa, payload, "error")) |emsg| {
+        defer gpa.free(emsg);
+        if (recoverToolCallRaw(emsg)) |raw| {
+            s.content.appendSlice(gpa, raw) catch {};
+            s.done = true;
+            return;
+        }
+        if (emsg.len > 0) {
+            var mb: [200]u8 = undefined;
+            const n = @min(emsg.len, mb.len);
+            @memcpy(mb[0..n], emsg[0..n]);
+            setErr(s, mb[0..n]);
+            return;
+        }
+    }
+    // nested error object (OpenAI-style {"error":{"message":...}})
     if (extractErr(payload)) |msg| {
         var mb: [200]u8 = undefined;
         const n = @min(msg.len, mb.len);
         @memcpy(mb[0..n], msg[0..n]);
         setErr(s, mb[0..n]);
         return;
+    }
+    // NDJSON reasoning deltas: {"message":{"thinking":"..."},...} while the model reasons (content empty).
+    if (jsonUnescape(gpa, payload, "thinking")) |th| {
+        defer gpa.free(th);
+        s.reasoning.appendSlice(gpa, th) catch {};
     }
     // SSE: {"choices":[{"delta":{"content":"..."}}]} — role-only/finish chunks carry no content key.
     // NDJSON: {"message":{"role":"assistant","content":"..."},"done":false} … {"done":true,...} last.
@@ -688,6 +702,31 @@ test "finishBySentinel maps HTTP codes: 000 unreachable, 4xx error, 200 graceful
         try std.testing.expect(s.done and !s.failed);
         try std.testing.expectEqualStrings("final", s.content.items);
     }
+}
+
+test "native STREAMING NDJSON accumulates thinking then content, done:true completes" {
+    const gpa = std.testing.allocator;
+    var s: Stream = .{ .native = true };
+    defer s.deinit(gpa);
+    // reasoning deltas first (content empty), then the answer deltas, then the terminal line
+    consume(&s, gpa, "{\"message\":{\"role\":\"assistant\",\"thinking\":\"Let me \",\"content\":\"\"},\"done\":false}\n");
+    consume(&s, gpa, "{\"message\":{\"thinking\":\"think.\",\"content\":\"\"},\"done\":false}\n");
+    try std.testing.expectEqualStrings("Let me think.", s.reasoningStr());
+    try std.testing.expectEqualStrings("", s.content.items);
+    consume(&s, gpa, "{\"message\":{\"thinking\":\"\",\"content\":\"Hi \"},\"done\":false}\n{\"message\":{\"content\":\"there\"},\"done\":true}\n");
+    try std.testing.expect(s.done and !s.failed);
+    try std.testing.expectEqualStrings("Hi there", s.content.items);
+    try std.testing.expectEqualStrings("Let me think.", s.reasoningStr());
+}
+
+test "native STREAMING recovers a mid-stream tool-call error into content (uncapped)" {
+    const gpa = std.testing.allocator;
+    var s: Stream = .{ .native = true };
+    defer s.deinit(gpa);
+    // Ollama emits the harmony parse error as one NDJSON line; the raw is the model's real reply
+    consume(&s, gpa, "{\"error\":\"error parsing tool call: raw='CAST: Search the web for the most recent global news stories and summarize the top items', err=invalid character 'C' looking for beginning of value\"}\n");
+    try std.testing.expect(s.done and !s.failed);
+    try std.testing.expectEqualStrings("CAST: Search the web for the most recent global news stories and summarize the top items", s.content.items);
 }
 
 test "native whole-object parse: content + thinking (reasoning)" {
