@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, deploy, swarm, hub, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, refresh_now };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -64,6 +64,7 @@ pub const Settings = struct {
     port: u16 = 8787,
     token: [128]u8 = [_]u8{0} ** 128,
     token_len: u8 = 0,
+    token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
     notify: bool = true,
 
     pub fn dataDir(s: *const Settings) []const u8 {

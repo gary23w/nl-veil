@@ -115,6 +115,7 @@ const WindowsTray = struct {
     extern "user32" fn CreateWindowExW(dwExStyle: u32, lpClassName: ?[*:0]const u16, lpWindowName: ?[*:0]const u16, dwStyle: u32, x: i32, y: i32, w: i32, h: i32, parent: ?HWND, menu: ?*anyopaque, inst: ?*anyopaque, param: ?*anyopaque) callconv(.winapi) ?HWND;
     extern "user32" fn DefWindowProcW(hwnd: ?HWND, msg: u32, wParam: usize, lParam: isize) callconv(.winapi) isize;
     extern "user32" fn DestroyWindow(hwnd: ?HWND) callconv(.winapi) i32;
+    extern "user32" fn ShowWindow(hwnd: ?HWND, cmd: i32) callconv(.winapi) i32;
     extern "user32" fn PeekMessageW(msg: *MSG, hwnd: ?HWND, min: u32, max: u32, remove: u32) callconv(.winapi) i32;
     extern "user32" fn TranslateMessage(msg: *const MSG) callconv(.winapi) i32;
     extern "user32" fn DispatchMessageW(msg: *const MSG) callconv(.winapi) isize;
@@ -157,13 +158,18 @@ const WindowsTray = struct {
         wc.hInstance = hinst;
         wc.lpszClassName = class_name;
         g_reg = RegisterClassExW(&wc); // idempotent-ish; ignore "already registered"
-        // A normal but never-shown window owns the tray icon (message-only windows are flakier hosts).
-        self.hwnd = CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, null, null, hinst, null);
+        // Match the canonical Win32 tray recipe: a REAL overlapped window created then hidden (SW_HIDE) —
+        // a proper window is a more reliable icon host than a zero-size style-0 one.
+        const WS_OVERLAPPEDWINDOW: u32 = 0x00CF0000;
+        const CW_USEDEFAULT: i32 = @bitCast(@as(u32, 0x80000000));
+        const SW_HIDE: i32 = 0;
+        self.hwnd = CreateWindowExW(0, class_name, class_name, WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, null, null, hinst, null);
         g_hwnd_ok = self.hwnd != null;
         if (self.hwnd == null) {
             g_err = GetLastError();
             return false;
         }
+        _ = ShowWindow(self.hwnd, SW_HIDE);
         self.nid = std.mem.zeroes(NOTIFYICONDATAW);
         self.nid.cbSize = @sizeOf(NOTIFYICONDATAW);
         self.nid.hWnd = self.hwnd;
