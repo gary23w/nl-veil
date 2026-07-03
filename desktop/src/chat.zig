@@ -703,25 +703,65 @@ pub const Chat = struct {
             self.setBusy(false);
             return;
         }
-        log.info("chat turn done in {d}s ({d} chars)", .{ now - self.stream.started_s, self.stream.content.items.len });
+        log.info("chat turn done in {d}s ({d} chars, {d} reasoning)", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len });
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
+        const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         if (kind == .collect) {
-            self.appendMsg(dd, .veil, full);
+            self.appendVeil(dd, reason, full);
         } else if (castGoal(full)) |goal| {
             var nb: [3072]u8 = undefined;
             const note = noteWithoutCast(full, &nb);
             if (self.cast_active) {
-                if (note.len > 0) self.appendMsg(dd, .veil, note) else self.appendMsg(dd, .veil, full);
+                self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
             } else {
-                if (note.len > 0) self.appendMsg(dd, .veil, note);
+                if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, goal);
             }
         } else {
-            self.appendMsg(dd, .veil, full);
+            self.appendVeil(dd, reason, full);
         }
         self.stream.deinit(self.gpa);
         self.setBusy(false);
+    }
+
+    /// Append a veil message, prepending the model's reasoning (if any) as a capped markdown blockquote so
+    /// the user can see how it thought. Reasoning is trimmed to leave room for the answer in the message.
+    fn appendVeil(self: *Chat, dd: []const u8, reasoning: []const u8, text: []const u8) void {
+        if (reasoning.len == 0) {
+            self.appendMsg(dd, .veil, text);
+            return;
+        }
+        var buf: [3072]u8 = undefined;
+        var w: usize = 0;
+        const cap = @min(reasoning.len, 700);
+        // blockquote each reasoning line
+        var it = std.mem.splitScalar(u8, reasoning[0..cap], '\n');
+        while (it.next()) |line| {
+            const ln = std.mem.trim(u8, line, " \r\t");
+            if (ln.len == 0) continue;
+            if (w + ln.len + 3 > buf.len) break;
+            buf[w] = '>';
+            buf[w + 1] = ' ';
+            w += 2;
+            @memcpy(buf[w .. w + ln.len], ln);
+            w += ln.len;
+            buf[w] = '\n';
+            w += 1;
+        }
+        if (reasoning.len > cap and w + 6 < buf.len) {
+            @memcpy(buf[w .. w + 6], "> ...\n");
+            w += 6;
+        }
+        // blank line then the answer
+        if (w + 1 < buf.len) {
+            buf[w] = '\n';
+            w += 1;
+        }
+        const tn = @min(text.len, buf.len - w);
+        @memcpy(buf[w .. w + tn], text[0..tn]);
+        w += tn;
+        self.appendMsg(dd, .veil, buf[0..w]);
     }
 
     // ------------------------------------------------------------------------------ casting (the existing door)
