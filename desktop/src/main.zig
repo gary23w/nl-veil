@@ -11,6 +11,8 @@ const t = @import("theme.zig");
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const poller_mod = @import("poller.zig");
+const chat_mod = @import("chat.zig");
+const llm = @import("llm.zig");
 const tray_mod = @import("tray.zig");
 const catalog = @import("catalog.zig");
 const log = @import("log.zig");
@@ -36,6 +38,17 @@ const Ui = struct {
     inner: InnerTab = .console,
     focus: Focus = .none,
     chat: Field = .{},
+    // Chat tab
+    c_input: Field = .{},
+    c_rename: Field = .{},
+    c_renaming: bool = false, // the active conversation's title is being edited in the left pane
+    chat_scroll: f32 = 0,
+    chat_follow: bool = true,
+    // Settings: chat model provider fields
+    s_model: Field = .{},
+    s_url: Field = .{},
+    s_ckey: Field = .{},
+    s_seeded: bool = false, // provider fields copied from the store once (after the chat thread loads)
     // deploy form
     d_name: Field = .{},
     d_key: Field = .{},
@@ -71,7 +84,7 @@ const Ui = struct {
     log_scroll: f32 = 0,
     log_follow: bool = true,
 
-    const Focus = enum { none, chat, d_name, d_key, d_goal, d_gateway };
+    const Focus = enum { none, chat, d_name, d_key, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -130,7 +143,8 @@ fn pruneDeleting(rows: []const scan.SwarmSummary) void {
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
 
-    var threaded = std.Io.Threaded.init(gpa, .{});
+    // carry the real process environ so spawned children (curl, explorer) get a working environment
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -143,6 +157,17 @@ pub fn main() !void {
     defer {
         poller.stop.store(true, .monotonic);
         th.join();
+    }
+
+    // The chat worker is the third thread (model turns + swarm casting); it owns its own Io instance so
+    // the poller's cadence and the chat's long-running streams never contend.
+    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
+    defer chat_threaded.deinit();
+    var chat_worker = chat_mod.Chat{ .io = chat_threaded.io(), .gpa = gpa, .store = &store };
+    const cth = try std.Thread.spawn(.{}, chat_mod.Chat.run, .{&chat_worker});
+    defer {
+        chat_worker.stop.store(true, .monotonic);
+        cth.join();
     }
 
     // Borderless: we draw our own title bar (drag / File / minimize / close). Resizable stays on so the
@@ -207,6 +232,7 @@ pub fn main() !void {
         const body = t.Rect{ .x = 0, .y = top, .width = @floatFromInt(rl.getScreenWidth()), .height = @floatFromInt(rl.getScreenHeight() - top) };
         switch (ui.tab) {
             .dashboard => drawDashboard(&store, body),
+            .chat => drawChat(&store, body),
             .deploy => drawDeploy(&store, body),
             .swarm => drawSwarm(&store, body),
             .hub => drawHub(body),
@@ -416,6 +442,7 @@ fn seedName(buf: []u8) usize {
 }
 
 fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io) void {
+    seedChatDefaults(store);
     const candidates = [_][]const u8{ "data", "../data", "../../data", "../nl-veil/data" };
     for (candidates) |c| {
         if (dirExists(io, c)) {
@@ -426,6 +453,18 @@ fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io) void {
     }
     setDataDir(store, "data");
     loadDesktopKey(store, gpa, io, "data");
+}
+
+/// Chat provider defaults: local Ollama + the catalog's local default model. The chat thread overwrites
+/// these with the persisted .veil-desk/settings.json right after it starts.
+fn seedChatDefaults(store: *Store) void {
+    store.lock();
+    defer store.unlock();
+    const s = &store.settings;
+    s.chat_kind = 0;
+    const model = "gpt-oss:20b";
+    @memcpy(s.chat_model[0..model.len], model);
+    s.chat_model_len = model.len;
 }
 
 /// Auto-load the admin API key the server dropped at <data>/.desktop_key so Deploy works with no manual
@@ -507,10 +546,11 @@ fn handleKeys() void {
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) ui.tab = .dashboard;
-        if (rl.isKeyPressed(.two)) ui.tab = .deploy;
-        if (rl.isKeyPressed(.three)) ui.tab = .swarm;
-        if (rl.isKeyPressed(.four)) ui.tab = .hub;
-        if (rl.isKeyPressed(.five)) ui.tab = .settings;
+        if (rl.isKeyPressed(.two)) ui.tab = .chat;
+        if (rl.isKeyPressed(.three)) ui.tab = .deploy;
+        if (rl.isKeyPressed(.four)) ui.tab = .swarm;
+        if (rl.isKeyPressed(.five)) ui.tab = .hub;
+        if (rl.isKeyPressed(.six)) ui.tab = .settings;
     }
     switch (ui.focus) {
         .none => {},
@@ -519,10 +559,16 @@ fn handleKeys() void {
         .d_key => editField(&ui.d_key),
         .d_goal => editField(&ui.d_goal),
         .d_gateway => editField(&ui.d_gateway),
+        .c_input => editField(&ui.c_input),
+        .c_rename => editField(&ui.c_rename),
+        .s_model => editField(&ui.s_model),
+        .s_url => editField(&ui.s_url),
+        .s_ckey => editField(&ui.s_ckey),
     }
     if (rl.isKeyPressed(.escape)) {
         ui.focus = .none;
         ui.file_menu = false;
+        ui.c_renaming = false;
     }
 }
 
@@ -555,8 +601,8 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
-    const tabs = [_]Tab{ .dashboard, .deploy, .swarm, .hub, .settings };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .settings };
     var x: f32 = 12;
     for (labels, tabs) |lb, tabv| {
         const w: f32 = @floatFromInt(t.measure(lb, 13) + 26);
@@ -671,6 +717,329 @@ fn drawRoster(store: *Store, r: t.Rect) void {
     if (n == 0) {
         const msg = if (scanned) t.z("no swarms yet - Deploy one", .{}) else t.z("scanning run directories...", .{});
         t.text(msg, @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+    }
+}
+
+// -------------------------------------------------------------------------------- chat
+
+const CHAT_LEFT_W: f32 = 230;
+const CHAT_RIGHT_W: f32 = 320;
+const CHAT_STRIP_W: f32 = 24;
+
+/// The Chat tab: three panes. Left = conversations (create/select/rename/delete, collapsible), center =
+/// the message stream + input, right = live swarm-cast activity (collapsible). Pane open state persists
+/// via the chat settings file.
+fn drawChat(store: *Store, body: t.Rect) void {
+    const pad: f32 = 12;
+
+    // copy everything the frame needs under one short lock
+    store.lock();
+    var convs: [store_mod.MAX_CONVS]store_mod.ConvRow = undefined;
+    const conv_n = store.conv_count;
+    @memcpy(convs[0..conv_n], store.convs[0..conv_n]);
+    var active: [32]u8 = undefined;
+    const active_n: usize = store.conv_active_len;
+    @memcpy(active[0..active_n], store.conv_active[0..active_n]);
+    var msgs: [store_mod.MAX_CHAT_MSGS]store_mod.ChatMsg = undefined;
+    const msg_n = store.msg_count;
+    @memcpy(msgs[0..msg_n], store.msgs[0..msg_n]);
+    var stream_buf: [8192]u8 = undefined;
+    const stream_n = store.stream_len;
+    @memcpy(stream_buf[0..stream_n], store.stream_text[0..stream_n]);
+    const busy = store.chat_busy;
+    var status: [96]u8 = undefined;
+    const status_n: usize = store.chat_status_len;
+    @memcpy(status[0..status_n], store.chat_status[0..status_n]);
+    var casts: [store_mod.MAX_CASTS]store_mod.CastRow = undefined;
+    const cast_n = store.cast_count;
+    @memcpy(casts[0..cast_n], store.casts[0..cast_n]);
+    var tail: [store_mod.CAST_TAIL]scan.Ev = undefined;
+    const tail_n = store.cast_tail_count;
+    @memcpy(tail[0..tail_n], store.cast_tail[0..tail_n]);
+    const left_open = store.settings.chat_left_open;
+    const right_open = store.settings.chat_right_open;
+    store.unlock();
+
+    const left_w: f32 = if (left_open) CHAT_LEFT_W else CHAT_STRIP_W;
+    const right_w: f32 = if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W;
+    const ph = body.height - pad * 2;
+    const left = t.Rect{ .x = pad, .y = body.y + pad, .width = left_w, .height = ph };
+    const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph };
+    const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = right.x - (left.x + left_w) - pad * 2, .height = ph };
+
+    drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
+    drawChatCenter(store, center, msgs[0..msg_n], stream_buf[0..stream_n], busy, status[0..status_n]);
+    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
+}
+
+fn togglePane(store: *Store, left: bool) void {
+    store.lock();
+    if (left) store.settings.chat_left_open = !store.settings.chat_left_open else store.settings.chat_right_open = !store.settings.chat_right_open;
+    store.unlock();
+    store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // persist the pane state
+}
+
+fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    if (!open) {
+        if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z(">", .{}), false)) togglePane(store, true);
+        return;
+    }
+    t.text(t.z("Chats", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 10), 14, t.fg);
+    if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z("<", .{}), false)) togglePane(store, true);
+    if (t.winButton(.{ .x = r.x + r.width - 56, .y = r.y + 6, .width = 24, .height = 22 }, t.z("+", .{}), false)) {
+        store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
+        ui.c_renaming = false;
+    }
+
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 34), @intFromFloat(r.width - 2), @intFromFloat(r.height - 38));
+    defer rl.endScissorMode();
+    var yy: f32 = r.y + 38;
+    const row_h: f32 = 40;
+    for (convs) |*cv| {
+        if (yy > r.y + r.height - 8) break;
+        const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 5 };
+        const is_active = std.mem.eql(u8, cv.idStr(), active);
+        const hot = t.hovering(rr);
+        if (is_active) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+
+        if (is_active and ui.c_renaming) {
+            textField(.{ .x = rr.x + 4, .y = rr.y + 4, .width = rr.width - 8, .height = rr.height - 8 }, &ui.c_rename, ui.focus == .c_rename, "new title - Enter", .c_rename);
+            if (ui.focus == .c_rename and rl.isKeyPressed(.enter) and ui.c_rename.len > 0) {
+                store.pushChatCmd(store_mod.mkChatCmd(.rename_conv, cv.idStr(), ui.c_rename.str()));
+                ui.c_renaming = false;
+                ui.focus = .none;
+            }
+        } else {
+            const title = if (cv.title_len > 0) cv.titleStr() else cv.idStr();
+            t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + 9), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
+            const xb = t.Rect{ .x = rr.x + rr.width - 26, .y = rr.y + (rr.height - 20) / 2, .width = 20, .height = 20 };
+            if (hot and t.winButton(xb, t.z("x", .{}), true)) {
+                store.pushChatCmd(store_mod.mkChatCmd(.delete_conv, cv.idStr(), ""));
+            } else if (hot and rl.isMouseButtonPressed(.left)) {
+                if (is_active) {
+                    // clicking the active row again edits its title in place
+                    ui.c_renaming = true;
+                    setField(&ui.c_rename, title);
+                    ui.focus = .c_rename;
+                } else {
+                    store.pushChatCmd(store_mod.mkChatCmd(.select_conv, cv.idStr(), ""));
+                    ui.chat_follow = true;
+                    ui.c_renaming = false;
+                }
+            }
+        }
+        yy += row_h;
+    }
+    if (convs.len == 0) {
+        t.text(t.z("no chats yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 42), 12, t.comment);
+        t.text(t.z("type below to start one", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 60), 12, t.comment);
+    }
+}
+
+/// Fixed mono columns for wrapping: the chat body renders in the console font, so wrap width is exact.
+fn monoCols(w: f32, size: i32) usize {
+    const ten = t.measureMono(t.z("MMMMMMMMMM", .{}), size);
+    const per = @as(f32, @floatFromInt(ten)) / 10.0;
+    if (per <= 0.1) return 80;
+    return @max(10, @as(usize, @intFromFloat(w / per)));
+}
+
+fn wrappedLines(text_: []const u8, cols: usize) usize {
+    var lines: usize = 0;
+    var it = std.mem.splitScalar(u8, text_, '\n');
+    while (it.next()) |seg| {
+        lines += if (seg.len == 0) 1 else (seg.len + cols - 1) / cols;
+    }
+    return lines;
+}
+
+fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
+    return switch (role) {
+        .user => t.z("you", .{}),
+        .veil => t.z("veil", .{}),
+        .cast_note => t.z("cast", .{}),
+    };
+}
+
+fn roleColor(role: store_mod.ChatRole) t.Color {
+    return switch (role) {
+        .user => t.cyan,
+        .veil => t.magenta,
+        .cast_note => t.yellow,
+    };
+}
+
+fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8) void {
+    const input_h: f32 = 38;
+    const status_h: f32 = 20;
+    const view = t.Rect{ .x = r.x, .y = r.y, .width = r.width, .height = r.height - input_h - status_h - 10 };
+    t.panelBordered(view, t.bg_dark, t.border);
+
+    const fsz: i32 = 14;
+    const line_h: f32 = 19;
+    const head_h: f32 = 17;
+    const gap_h: f32 = 9;
+    const cols = monoCols(view.width - 28, fsz);
+
+    // total content height (streaming reply rendered as one more message)
+    var total: f32 = 8;
+    for (msgs) |*m| total += head_h + @as(f32, @floatFromInt(wrappedLines(m.textStr(), cols))) * line_h + gap_h;
+    if (busy or stream.len > 0) total += head_h + @as(f32, @floatFromInt(wrappedLines(stream, cols) + 1)) * line_h + gap_h;
+
+    const max_scroll = if (total > view.height) total - view.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) {
+        ui.chat_scroll -= wheel * 3 * line_h;
+        ui.chat_follow = false;
+    }
+    if (ui.chat_follow) ui.chat_scroll = max_scroll;
+    if (ui.chat_scroll < 0) ui.chat_scroll = 0;
+    if (ui.chat_scroll > max_scroll) ui.chat_scroll = max_scroll;
+    if (ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
+
+    rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
+    var yy: f32 = view.y + 8 - ui.chat_scroll;
+    for (msgs) |*m| {
+        yy = drawChatMsg(view, yy, m.role, m.textStr(), cols, fsz, line_h, head_h, gap_h, false);
+        if (yy > view.y + view.height) break;
+    }
+    if (busy or stream.len > 0) {
+        yy = drawChatMsg(view, yy, .veil, stream, cols, fsz, line_h, head_h, gap_h, true);
+    }
+    if (msgs.len == 0 and !busy and stream.len == 0) {
+        t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
+    }
+    rl.endScissorMode();
+
+    // status line
+    var sy = view.y + view.height + 4;
+    if (busy) {
+        const dots: usize = @intFromFloat(@mod(rl.getTime() * 2.5, 4.0));
+        const dstr = [_][]const u8{ "", ".", "..", "..." };
+        t.text(t.z("{s}{s}", .{ if (status.len > 0) status else "working", dstr[dots] }), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.cyan);
+    } else if (status.len > 0) {
+        t.text(t.zs(status), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment);
+    }
+    sy += status_h;
+
+    // input row
+    const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
+    textField(cf, &ui.c_input, ui.focus == .c_input, "message the veil - Enter to send", .c_input);
+    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
+    const can_send = ui.c_input.len > 0 and !busy;
+    const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
+    if (can_send and (clicked or (ui.focus == .c_input and rl.isKeyPressed(.enter)))) {
+        store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
+        ui.c_input.len = 0;
+        ui.chat_follow = true;
+    }
+}
+
+/// Draw one message (role header + mono-wrapped body); returns the next y. `cursor` appends the streaming
+/// caret to the last line.
+fn drawChatMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, line_h: f32, head_h: f32, gap_h: f32, cursor: bool) f32 {
+    var yy = y0;
+    const h = head_h + @as(f32, @floatFromInt(wrappedLines(text_, cols))) * line_h + gap_h;
+    if (yy + h < view.y) return yy + h; // fully above the fold — just advance
+    const dim = role == .cast_note;
+    t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
+    yy += head_h;
+    var it = std.mem.splitScalar(u8, text_, '\n');
+    while (it.next()) |seg| {
+        var i: usize = 0;
+        while (true) {
+            const end = @min(seg.len, i + cols);
+            if (yy > view.y + view.height) return yy; // below the fold — stop drawing (height already counted)
+            if (yy + line_h >= view.y) {
+                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (dim) t.fg_dim else t.fg, @intFromFloat(view.width - 26));
+            }
+            i = end;
+            if (i >= seg.len) break;
+            yy += line_h;
+        }
+        yy += line_h;
+    }
+    if (cursor and @mod(rl.getTime(), 1.0) < 0.6) {
+        t.textMono(t.z("|", .{}), @intFromFloat(view.x + 14), @intFromFloat(yy - line_h + 2), fsz, t.magenta);
+    }
+    return y0 + h;
+}
+
+fn castStatusColor(st: store_mod.CastStatus) t.Color {
+    return switch (st) {
+        .deploying => t.yellow,
+        .running => t.green,
+        .collecting => t.cyan,
+        .done => t.comment,
+        .failed => t.red,
+    };
+}
+
+fn castStatusWord(st: store_mod.CastStatus) [:0]const u8 {
+    return switch (st) {
+        .deploying => t.z("deploying", .{}),
+        .running => t.z("running", .{}),
+        .collecting => t.z("stopping", .{}),
+        .done => t.z("done", .{}),
+        .failed => t.z("failed", .{}),
+    };
+}
+
+fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    if (!open) {
+        if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z("<", .{}), false)) togglePane(store, false);
+        return;
+    }
+    t.text(t.z("Swarm activity", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 10), 14, t.fg);
+    if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z(">", .{}), false)) togglePane(store, false);
+
+    var yy: f32 = r.y + 38;
+    const row_h: f32 = 68;
+    // newest first
+    var i: usize = casts.len;
+    while (i > 0) {
+        i -= 1;
+        if (yy > r.y + r.height * 0.55) break;
+        const c = &casts[i];
+        const rr = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = row_h - 6 };
+        t.panelBordered(rr, t.bg, t.border);
+        t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + 13), castStatusColor(c.status));
+        t.textClip(c.goalStr(), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 6), 13, t.fg, @intFromFloat(rr.width - 96));
+        const rt = if (c.pct >= 0) t.z("r{d} {d}%", .{ c.round, c.pct }) else t.z("r{d}", .{c.round});
+        t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(rt, 12))) - 8), @intFromFloat(rr.y + 6), 12, t.cyan);
+        t.text(castStatusWord(c.status), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 24), 11, castStatusColor(c.status));
+        t.textClip(c.lastStr(), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 40), 11, t.comment, @intFromFloat(rr.width - 84));
+        if (c.status == .running or c.status == .collecting) {
+            const sb = t.Rect{ .x = rr.x + rr.width - 52, .y = rr.y + rr.height - 26, .width = 46, .height = 20 };
+            if (t.button(sb, t.z("Stop", .{}), t.red, true)) {
+                store.pushChatCmd(store_mod.mkChatCmd(.stop_cast, c.runStr(), ""));
+            }
+        }
+        yy += row_h;
+    }
+    if (casts.len == 0) {
+        t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 4), 12, t.comment);
+        t.text(t.z("the veil casts the hive when", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 24), 11, t.comment);
+        t.text(t.z("a task needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 40), 11, t.comment);
+        yy += 62;
+    }
+
+    // live tail of the newest cast
+    t.hline(@intFromFloat(r.x + 8), @intFromFloat(yy + 2), @intFromFloat(r.width - 16), t.border);
+    t.text(t.z("live cast tail", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 8), 11, t.comment);
+    yy += 26;
+    const line_h: f32 = 17;
+    const avail: usize = if (r.y + r.height - 8 > yy) @intFromFloat((r.y + r.height - 8 - yy) / line_h) else 0;
+    const start = if (tail.len > avail) tail.len - avail else 0;
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(yy), @intFromFloat(r.width - 2), @intFromFloat(r.height - (yy - r.y) - 4));
+    defer rl.endScissorMode();
+    var k = start;
+    while (k < tail.len) : (k += 1) {
+        const e = &tail[k];
+        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 12), @intFromFloat(yy), 12, kindColor(e.kindStr()), @intFromFloat(r.width - 22));
+        yy += line_h;
     }
 }
 
@@ -1260,6 +1629,15 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const tok_n = store.settings.token_len;
     const notify_on = store.settings.notify;
     const online = store.server_online;
+    const chat_kind = store.settings.chat_kind;
+    const chat_byok = store.settings.chat_byok;
+    const chat_key_n = store.settings.chat_key_len;
+    var cmb: [96]u8 = undefined;
+    const cmn: usize = store.settings.chat_model_len;
+    @memcpy(cmb[0..cmn], store.settings.chat_model[0..cmn]);
+    var cbb: [192]u8 = undefined;
+    const cbn: usize = store.settings.chat_base_len;
+    @memcpy(cbb[0..cbn], store.settings.chat_base[0..cbn]);
     store.unlock();
 
     flabel(x, y, "DATA DIRECTORY (read live)");
@@ -1297,7 +1675,91 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.unlock();
     }
     y += 44;
+
+    // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
+    // Seed the editable fields from the store once, after the chat thread has loaded persisted settings.
+    if (!ui.s_seeded and cmn > 0) {
+        setField(&ui.s_model, cmb[0..cmn]);
+        setField(&ui.s_url, cbb[0..cbn]);
+        ui.s_seeded = true;
+    }
+    t.hline(@intFromFloat(x), @intFromFloat(y), @intFromFloat(colw), t.border);
+    y += 12;
+    t.text(t.z("CHAT MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x + 100), @intFromFloat(y), 11, t.comment);
+    y += 20;
+    const half = (colw - 10) / 2;
+    const kind_lbl = switch (chat_kind) {
+        1 => t.z("BYOK - {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label}),
+        2 => t.z("Custom URL", .{}),
+        else => t.z("Local (Ollama)", .{}),
+    };
+    const kd = t.cycle(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("PROVIDER", .{}), kind_lbl, false);
+    if (kd != 0) {
+        store.lock();
+        store.settings.chat_kind = @intCast(@mod(@as(i32, chat_kind) + kd + 3, 3));
+        store.unlock();
+    }
+    if (chat_kind == 1) {
+        const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
+        const bd = t.cycle(.{ .x = x + half + 10, .y = y, .width = half, .height = 46 }, t.z("BYOK PROVIDER", .{}), t.zs(p.label), false);
+        if (bd != 0) {
+            store.lock();
+            store.settings.chat_byok = byokStep(chat_byok, bd);
+            store.unlock();
+        }
+    }
+    y += 56;
+    flabel(x, y, "MODEL");
+    textField(.{ .x = x, .y = y + 14, .width = half, .height = 32 }, &ui.s_model, ui.focus == .s_model, "gpt-oss:20b", .s_model);
+    if (chat_kind == 2) {
+        flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
+        textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = 32 }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+    }
+    y += 56;
+    if (chat_kind != 0) {
+        flabel(x, y, "API KEY (stored in the OS-protected local store, never plaintext)");
+        y += 14;
+        textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
+        if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save key", .{}), t.blue, ui.s_ckey.len > 0)) {
+            store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
+            ui.s_ckey.len = 0;
+            ui.focus = .none;
+        }
+        if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 116), @intFromFloat(y + 9), 12, t.green);
+        y += 44;
+    }
+    if (t.button(.{ .x = x, .y = y, .width = 180, .height = 34 }, t.z("Save chat settings", .{}), t.blue, true)) {
+        store.lock();
+        const s = &store.settings;
+        const mn = @min(ui.s_model.len, s.chat_model.len);
+        @memcpy(s.chat_model[0..mn], ui.s_model.buf[0..mn]);
+        s.chat_model_len = @intCast(mn);
+        const bn2 = @min(ui.s_url.len, s.chat_base.len);
+        @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+        s.chat_base_len = @intCast(bn2);
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        store.pushNotif("Chat settings saved", "provider config persisted", 1);
+        ui.focus = .none;
+    }
+    y += 48;
+
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+}
+
+/// Step the BYOK provider index over the catalog entries a chat client can use directly: needs a key and
+/// has a real https base (skips ollama/local, cloudflare-resolved, and mock entries).
+fn byokStep(cur: u8, delta: i32) u8 {
+    const n: i32 = @intCast(catalog.providers.len);
+    var i: i32 = cur;
+    var guard: usize = 0;
+    while (guard < catalog.providers.len * 2) : (guard += 1) {
+        i = @mod(i + delta + n, n);
+        const p = &catalog.providers[@intCast(i)];
+        if (p.needs_key and std.mem.startsWith(u8, p.base_url, "http")) return @intCast(i);
+    }
+    return cur;
 }
 
 // -------------------------------------------------------------------------------- shared widgets

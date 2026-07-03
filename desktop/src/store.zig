@@ -20,7 +20,7 @@ const SpinLock = struct {
     }
 };
 
-pub const Tab = enum { dashboard, deploy, swarm, hub, settings };
+pub const Tab = enum { dashboard, chat, deploy, swarm, hub, settings };
 
 pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file };
 
@@ -67,16 +67,118 @@ pub const Settings = struct {
     token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
     notify: bool = true,
 
+    // --- chat model provider (Settings tab writes, chat thread reads; persisted to .veil-desk) ---
+    chat_kind: u8 = 0, // 0 local (Ollama) / 1 BYOK (catalog provider) / 2 custom URL
+    chat_byok: u8 = 0, // catalog.providers index when chat_kind==1
+    chat_base: [192]u8 = [_]u8{0} ** 192, // custom endpoint (OpenAI-compatible /v1 root)
+    chat_base_len: u8 = 0,
+    chat_model: [96]u8 = [_]u8{0} ** 96,
+    chat_model_len: u8 = 0,
+    chat_key: [192]u8 = [_]u8{0} ** 192, // in-memory only; persisted via secrets.zig, never plaintext
+    chat_key_len: u8 = 0,
+    // chat pane collapse state (persisted with the chat settings)
+    chat_left_open: bool = true,
+    chat_right_open: bool = true,
+
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
     }
     pub fn tokenStr(s: *const Settings) []const u8 {
         return s.token[0..s.token_len];
     }
+    pub fn chatBase(s: *const Settings) []const u8 {
+        return s.chat_base[0..s.chat_base_len];
+    }
+    pub fn chatModel(s: *const Settings) []const u8 {
+        return s.chat_model[0..s.chat_model_len];
+    }
+    pub fn chatKey(s: *const Settings) []const u8 {
+        return s.chat_key[0..s.chat_key_len];
+    }
+};
+
+// ------------------------------------------------------------------------------------ chat state
+
+pub const MAX_CHAT_MSGS = 64;
+pub const MAX_CONVS = 32;
+pub const MAX_CASTS = 6;
+pub const CAST_TAIL = 40;
+
+pub const ChatRole = enum(u8) { user, veil, cast_note };
+
+/// One chat message of the ACTIVE conversation. Fixed-size like everything else in the Store; the chat
+/// thread owns the full history on disk, this is the render copy.
+pub const ChatMsg = struct {
+    role: ChatRole = .user,
+    text: [3072]u8 = [_]u8{0} ** 3072,
+    text_len: u16 = 0,
+
+    pub fn textStr(m: *const ChatMsg) []const u8 {
+        return m.text[0..m.text_len];
+    }
+};
+
+pub const ConvRow = struct {
+    id: [32]u8 = [_]u8{0} ** 32, // file basename under .veil-desk/chats (no extension)
+    id_len: u8 = 0,
+    title: [64]u8 = [_]u8{0} ** 64,
+    title_len: u8 = 0,
+    mtime_s: i64 = 0,
+
+    pub fn idStr(c: *const ConvRow) []const u8 {
+        return c.id[0..c.id_len];
+    }
+    pub fn titleStr(c: *const ConvRow) []const u8 {
+        return c.title[0..c.title_len];
+    }
+};
+
+pub const CastStatus = enum(u8) { deploying, running, collecting, done, failed };
+
+/// One swarm cast fired from the chat, for the right-hand activity pane.
+pub const CastRow = struct {
+    run: [96]u8 = [_]u8{0} ** 96, // rel path under data ("u1/<hex>") once resolved; hex id before that
+    run_len: u8 = 0,
+    goal: [120]u8 = [_]u8{0} ** 120,
+    goal_len: u8 = 0,
+    status: CastStatus = .deploying,
+    round: i64 = 0,
+    pct: i32 = -1,
+    last: [180]u8 = [_]u8{0} ** 180, // most recent act line
+    last_len: u8 = 0,
+
+    pub fn runStr(c: *const CastRow) []const u8 {
+        return c.run[0..c.run_len];
+    }
+    pub fn goalStr(c: *const CastRow) []const u8 {
+        return c.goal[0..c.goal_len];
+    }
+    pub fn lastStr(c: *const CastRow) []const u8 {
+        return c.last[0..c.last_len];
+    }
+};
+
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key };
+
+/// A UI→chat-thread command; same copy-by-value ring discipline as Command.
+pub const ChatCommand = struct {
+    kind: ChatCmdKind = .none,
+    id: [96]u8 = [_]u8{0} ** 96, // conversation id or cast run rel-path
+    id_len: u8 = 0,
+    text: [1600]u8 = [_]u8{0} ** 1600, // message text / new title / api key
+    text_len: u16 = 0,
+
+    pub fn idStr(c: *const ChatCommand) []const u8 {
+        return c.id[0..c.id_len];
+    }
+    pub fn textStr(c: *const ChatCommand) []const u8 {
+        return c.text[0..c.text_len];
+    }
 };
 
 const CMD_RING = 32;
 const NOTIF_RING = 8;
+const CHAT_CMD_RING = 8;
 
 pub const Store = struct {
     mu: SpinLock = .{},
@@ -114,10 +216,32 @@ pub const Store = struct {
     // --- settings (UI writes, poller reads) ---
     settings: Settings = .{},
 
+    // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
+    convs: [MAX_CONVS]ConvRow = undefined,
+    conv_count: usize = 0,
+    conv_active: [32]u8 = [_]u8{0} ** 32,
+    conv_active_len: u8 = 0,
+    msgs: [MAX_CHAT_MSGS]ChatMsg = undefined,
+    msg_count: usize = 0,
+    stream_text: [8192]u8 = undefined, // the in-flight assistant reply, grown as deltas land
+    stream_len: usize = 0,
+    chat_busy: bool = false, // a model turn is in flight (Send disabled)
+    chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
+    chat_status_len: u8 = 0,
+    casts: [MAX_CASTS]CastRow = undefined,
+    cast_count: usize = 0,
+    cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast
+    cast_tail_count: usize = 0,
+
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,
     cmd_head: usize = 0,
     cmd_tail: usize = 0,
+
+    // --- chat command ring (UI writes head, chat thread reads tail) ---
+    chat_cmds: [CHAT_CMD_RING]ChatCommand = undefined,
+    chat_cmd_head: usize = 0,
+    chat_cmd_tail: usize = 0,
 
     // --- notification ring (poller writes, UI reads/renders + tray-delivers) ---
     notifs: [NOTIF_RING]Notif = undefined,
@@ -151,6 +275,25 @@ pub const Store = struct {
         return c;
     }
 
+    /// UI thread: enqueue a command for the chat thread. Same drop-when-full discipline as pushCmd.
+    pub fn pushChatCmd(s: *Store, c: ChatCommand) void {
+        s.lock();
+        defer s.unlock();
+        if ((s.chat_cmd_head + 1) % CHAT_CMD_RING == s.chat_cmd_tail) return;
+        s.chat_cmds[s.chat_cmd_head] = c;
+        s.chat_cmd_head = (s.chat_cmd_head + 1) % CHAT_CMD_RING;
+    }
+
+    /// Chat thread: pop the next chat command, or null.
+    pub fn popChatCmd(s: *Store) ?ChatCommand {
+        s.lock();
+        defer s.unlock();
+        if (s.chat_cmd_tail == s.chat_cmd_head) return null;
+        const c = s.chat_cmds[s.chat_cmd_tail];
+        s.chat_cmd_tail = (s.chat_cmd_tail + 1) % CHAT_CMD_RING;
+        return c;
+    }
+
     /// Poller thread: raise a notification. Overwrites the oldest when full.
     pub fn pushNotif(s: *Store, title: []const u8, body: []const u8, accent: u8) void {
         s.lock();
@@ -175,6 +318,17 @@ pub const Store = struct {
 
 pub fn mkCmd(kind: CmdKind, id: []const u8, text: []const u8) Command {
     var c: Command = .{ .kind = kind };
+    const il = @min(id.len, c.id.len);
+    @memcpy(c.id[0..il], id[0..il]);
+    c.id_len = @intCast(il);
+    const tl = @min(text.len, c.text.len);
+    @memcpy(c.text[0..tl], text[0..tl]);
+    c.text_len = @intCast(tl);
+    return c;
+}
+
+pub fn mkChatCmd(kind: ChatCmdKind, id: []const u8, text: []const u8) ChatCommand {
+    var c: ChatCommand = .{ .kind = kind };
     const il = @min(id.len, c.id.len);
     @memcpy(c.id[0..il], id[0..il]);
     c.id_len = @intCast(il);

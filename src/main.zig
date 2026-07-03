@@ -148,6 +148,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/apikeys", auth_api.keyList, .{});
     router.delete("/api/v1/apikeys/:id", auth_api.keyRevoke, .{});
     router.post("/api/v1/run", deploy_service.run, .{});
+    router.post("/api/v1/cast", deploy_service.cast, .{});
     router.post("/api/v1/swarms", deploy_service.deploy, .{});
     router.post("/api/v1/swarms/resolve", deploy_service.resolve, .{});
     router.get("/api/v1/swarms", deploy_service.listSwarms, .{});
