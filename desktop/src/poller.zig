@@ -117,13 +117,9 @@ pub const Poller = struct {
         if (!ok) self.store.pushNotif("Control failed", id, 2);
     }
 
-    fn doDeploy(self: *Poller, goal: []const u8) void {
-        if (goal.len == 0) return;
-        var jb: std.ArrayListUnmanaged(u8) = .empty;
-        defer jb.deinit(self.gpa);
-        jb.appendSlice(self.gpa, "{\"goal\":\"") catch return;
-        appendEsc(&jb, self.gpa, goal);
-        jb.appendSlice(self.gpa, "\"}") catch return;
+    fn doDeploy(self: *Poller, body: []const u8) void {
+        // `body` is the complete DeployReq JSON built by the UI (Deploy form). Post it verbatim.
+        if (body.len == 0) return;
         var tbuf: [128]u8 = undefined;
         var tlen: usize = 0;
         {
@@ -133,13 +129,13 @@ pub const Poller = struct {
             @memcpy(tbuf[0..tlen], t[0..tlen]);
             self.store.unlock();
         }
-        const resp = netcli.deploy(self.io, self.gpa, self.port(), tbuf[0..tlen], jb.items) orelse {
+        const resp = netcli.deploy(self.io, self.gpa, self.port(), tbuf[0..tlen], body) orelse {
             self.store.pushNotif("Deploy failed", "server unreachable — is it running?", 2);
             return;
         };
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status == 200 or resp.status == 201) {
-            self.store.pushNotif("Swarm deploying", goal, 1);
+            self.store.pushNotif("Swarm deploying", "the server accepted the deploy", 1);
         } else if (resp.status == 401 or resp.status == 403) {
             self.store.pushNotif("Deploy unauthorized", "set an API token in Settings", 2);
         } else {

@@ -20,7 +20,7 @@ const SpinLock = struct {
     }
 };
 
-pub const Tab = enum { dashboard, swarm, hub, settings };
+pub const Tab = enum { dashboard, deploy, swarm, hub, settings };
 
 pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, refresh_now };
 
@@ -29,7 +29,7 @@ pub const Command = struct {
     kind: CmdKind = .none,
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: u8 = 0,
-    text: [1024]u8 = [_]u8{0} ** 1024,
+    text: [3200]u8 = [_]u8{0} ** 3200, // holds the full deploy-body JSON, not just a goal line
     text_len: u16 = 0,
 
     pub fn idStr(c: *const Command) []const u8 {

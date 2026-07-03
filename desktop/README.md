@@ -7,16 +7,22 @@ Night palette as the web UI, and cross-platform (Windows / Linux / macOS).
 
 ## What it does
 
-- **Dashboard** — server-online status, fleet counters (live swarms / minds / headroom), a one-line
-  **Deploy** box, and a live roster of every swarm under your `data/` dir.
-- **Swarm** — open any swarm to get the live **event console** (narrated, color-coded by kind), a
-  **metrics strip** (score, pct, round, tokens, smoke gate, zero-gradient sentinel), a **chat** row that
-  messages the hive (`say`), plus **Set goal** and **Stop**.
+- **Borderless own-chrome window** — the OS title bar is hidden; veil-desk draws its own with the **veil**
+  mark, a **File** menu (New swarm / Refresh / Quit), minimize + close, drag-to-move, and a corner resize
+  grip. A real system TTF (Segoe UI / SF / DejaVu) replaces raylib's default font.
+- **Dashboard** — server-online status, fleet counters (live swarms / minds / headroom), a **New swarm**
+  button, and a live roster of every swarm under your `data/` dir.
+- **Deploy** — a full configuration form mirroring the web console: name, provider + model (cycle
+  selectors), API key, minds (stepper), style, runtime, stack, mode, gateway model, living-hive and
+  encrypt toggles, and the goal. Posts the exact `DeployReq` the server's `POST /api/v1/swarms` expects.
+- **Swarm** — open any swarm to get inner tabs: **Console** (the live event log, color-coded by mind) and
+  **Details** (score / pct / best / round / files / smoke gate / tokens in-out-cached / the zero-gradient
+  sentinel). A **chat** row messages the hive (`say`), plus **Set goal** and **Stop**.
 - **Hub** — the fleet hub (`hub.py`) commands for meshing many hosts into one console.
-- **Settings** — data directory, server port + reachability, an API token for Deploy, notification toggle.
-- **System tray + notifications** — on Windows it sits in the tray and raises native toasts on state
-  changes (server up/down, a swarm finishing, a zero-gradient warning on the open swarm). In-app toasts
-  always show as the cross-platform fallback.
+- **Settings** — data directory, server port + reachability, an API token (`nlk_…`) for Deploy, notifications.
+- **System tray + notifications** — on Windows it owns a tray icon (anchored to a hidden message window)
+  and raises native toasts on state changes (server up/down, a swarm finishing, a zero-gradient warning);
+  double-click the tray icon to restore. In-app toasts are the cross-platform fallback.
 
 ## Architecture
 
@@ -35,7 +41,9 @@ online signal, and only reaches the HTTP API for the two actions that genuinely 
 | `src/store.zig` | the mutex-guarded shared state + command/notification rings |
 | `src/netcli.zig` | tiny HTTP/1.1 client (fleet GET, deploy POST) |
 | `src/poller.zig` | the background worker thread |
-| `src/tray.zig` | native tray + toasts (Windows), graceful stubs elsewhere |
+| `src/tray.zig` | native tray + toasts (Windows hidden-window host), graceful stubs elsewhere |
+| `src/catalog.zig` | embedded provider/model catalog + deploy option sets (mirrors models.json) |
+| `assets/veil-mark.svg` | the shadow-figure mark (the app draws it procedurally; this is the source art) |
 
 ## Build & run
 
@@ -55,6 +63,12 @@ zig test src/scan.zig   # data-layer tests (parses real run dirs under ../data)
 ```
 
 The dependency (`raylib-zig`) is fetched and pinned via `build.zig.zon` — no vendoring needed.
+
+**The server builds and hosts it for you.** A plain `zig build` at the repo root also builds veil-desk
+(best-effort — a headless box that can't link GL/X11 just skips it without failing the server build; pass
+`-Ddesktop=false` to skip explicitly), and the running server launches the dashboard on startup so it sits
+in the tray and lights up when the control plane is up. Set `NL_NO_DESKTOP=1` to stop the server launching
+it. `python deploy.py desktop [--install] [--launch]` builds it and can register a login autostart entry.
 
 ## How it finds your swarms
 
