@@ -316,11 +316,15 @@ const glyph_set = blk: {
     break :blk arr;
 };
 
-// The web theme (styles.css) is monospace EVERYWHERE — --mono: JetBrains Mono → Cascadia Code → Consolas.
-// To carry that across, the desktop UI uses the same monospace family (Consolas on Windows, where the web
-// actually falls back to since JetBrains Mono/Cascadia aren't installed). Logs use it too (already mono).
+// Two fonts, matching the ask: a clean proportional SANS for the UI (Calibri on Windows — modern +
+// rounded, deliberately NOT Segoe UI) and a MONOSPACE for the log console so its columns align. Per-OS
+// fallbacks pick the nearest clean sans / mono.
 fn uiCandidates() []const [:0]const u8 {
-    return monoCandidates();
+    return switch (builtin.os.tag) {
+        .windows => &.{ "C:/Windows/Fonts/calibri.ttf", "C:/Windows/Fonts/corbel.ttf", "C:/Windows/Fonts/candara.ttf", "C:/Windows/Fonts/segoeui.ttf" },
+        .macos => &.{ "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/HelveticaNeue.ttc", "/Library/Fonts/Arial.ttf" },
+        else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/liberation/LiberationSans-Regular.ttf" },
+    };
 }
 fn monoCandidates() []const [:0]const u8 {
     return switch (builtin.os.tag) {
