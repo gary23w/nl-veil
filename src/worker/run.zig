@@ -175,6 +175,7 @@ pub const Worker = struct {
     depgraph_str: []const u8 = "",
     smoke_ok: bool = true,
     smoke_str: []const u8 = "",
+    gov_calm: u8 = 0, // consecutive rounds the governor measured a LOWER level than current — relax needs 2 (hysteresis; observed live: 0->1->0->1 flap on a meta-share hovering at the boundary)
     build_str: []const u8 = "",
     iface_str: []const u8 = "",
     exports_str: []const u8 = "", // per-module public export contract (from the live import graph) — the shared
@@ -872,7 +873,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             @floatFromInt(@max(0, @as(i64, m.minutes) * 60 - (w.nowSecs() - start)))
         else
             -1;
-        w.gov_lvl = govLevelFrom(w.ema_mind_s, w.ema_meta_s, budget_left_s, w.flat_rounds);
+        const gov_want = govLevelFrom(w.ema_mind_s, w.ema_meta_s, budget_left_s, w.flat_rounds);
+        if (gov_want >= w.gov_lvl) {
+            w.gov_lvl = gov_want; // escalation (and holding steady) is immediate
+            w.gov_calm = 0;
+        } else {
+            w.gov_calm += 1; // relaxing back needs 2 consecutive calm rounds, else a boundary-hovering meta share flaps every round
+            if (w.gov_calm >= 2) {
+                w.gov_lvl = gov_want;
+                w.gov_calm = 0;
+            }
+        }
         if (live and w.gov_lvl != gov_prev) {
             const gname: []const u8 = switch (w.gov_lvl) {
                 0 => "full metabolism",
@@ -965,7 +976,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.deliverable_missing = false;
             if (bench.status == .ok and !bench.host and !w.operating) {
                 var gn: u32 = 0;
-                const gtree = extractGoalPaths(gpa, goal, &gn);
+                var gtree = extractGoalPaths(gpa, goal, &gn);
+                if (gn == 0 and w.goal_brief.len > 0) {
+                    // originated goals carry their REQUIRED DELIVERABLES in the brief, not the prose
+                    gpa.free(@constCast(gtree));
+                    gtree = extractGoalPaths(gpa, w.goal_brief, &gn);
+                }
                 defer gpa.free(@constCast(gtree));
                 if (gn > 0) {
                     var any_missing = false;
@@ -990,7 +1006,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
             const cov = goalCoverage(&w, goal);
             defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov, w.reject_notes.items);
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov, w.reject_notes.items, if (w.smoke_ok) "" else w.smoke_str);
             w.reject_notes.clearRetainingCapacity(); // folded into this round's fitness — start the next round's ledger clean
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
@@ -1079,8 +1095,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             const dout = llm.tokens_out.load(.monotonic) - tok0_out;
             const dcalls = llm.calls_made.load(.monotonic) - tok0_calls;
             const dfree = (llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic)) - tok0_free;
-            w.emit("cost", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"in\":{d},\"out\":{d},\"calls\":{d},\"free\":{d},\"total_in\":{d},\"total_out\":{d},\"total_free\":{d}", .{ round, din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic) }) catch ",\"round\":0");
-            w.act("engine", round, "cost", std.fmt.allocPrint(w.a(), "round {d}", .{round}) catch "round", std.fmt.allocPrint(w.a(), "PAID {d} in + {d} out over {d} calls this round; FREE (local relay) {d} tokens. run total PAID {d} in / {d} out, FREE {d}", .{ din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic) }) catch "cost");
+            const tcached = llm.tokens_cached.load(.monotonic);
+            w.emit("cost", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"in\":{d},\"out\":{d},\"calls\":{d},\"free\":{d},\"total_in\":{d},\"total_out\":{d},\"total_free\":{d},\"total_cached\":{d}", .{ round, din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic), tcached }) catch ",\"round\":0");
+            w.act("engine", round, "cost", std.fmt.allocPrint(w.a(), "round {d}", .{round}) catch "round", std.fmt.allocPrint(w.a(), "PAID {d} in + {d} out over {d} calls this round; FREE (local relay) {d} tokens. run total PAID {d} in / {d} out ({d} of the in served from the provider's prompt cache), FREE {d}", .{ din, dout, dcalls, dfree, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic), tcached, llm.tokens_in_free.load(.monotonic) + llm.tokens_out_free.load(.monotonic) }) catch "cost");
             if (std.mem.indexOf(u8, w.base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, w.base_url, "/ai") != null) {
                 const used_neurons = neuronsForCfModel(w.model, llm.tokens_in.load(.monotonic), llm.tokens_out.load(.monotonic));
                 var nbuf: [24]u8 = undefined;
@@ -4754,7 +4771,15 @@ const Coverage = struct { present: u32 = 0, total: u32 = 0, missing: []const u8 
 fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
     const gpa = w.gpa;
     var n: u32 = 0;
-    const tree = extractGoalPaths(gpa, goal, &n);
+    var tree = extractGoalPaths(gpa, goal, &n);
+    // An ORIGINATED goal states its purpose in prose; the REQUIRED DELIVERABLES the intent
+    // interpreter minted live in the brief. Without this fallback a free-roam run has no
+    // deliverable floor at all (observed live, open_ai_test_3: 1 of 7 required files existed
+    // at a 100% fitness that never mentioned coverage).
+    if (n == 0 and w.goal_brief.len > 0) {
+        gpa.free(@constCast(tree));
+        tree = extractGoalPaths(gpa, w.goal_brief, &n);
+    }
     defer gpa.free(@constCast(tree));
     if (n == 0) return .{};
     var present: u32 = 0;
@@ -4782,8 +4807,18 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
 
 /// The FITNESS block injected into every mind's user prompt — the score turned into a concrete "raise this"
 /// instruction. gpa-owned (caller frees on replace + teardown).
-fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage, rejects: []const u8) []const u8 {
-    const fails = if (b.failures.len > 0) clip(b.failures, 900) else "(none — all green)";
+fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage, rejects: []const u8, runtime_fail: []const u8) []const u8 {
+    // A green score line must never read "all green" while the runtime smoke gate is red. The minds
+    // optimize THIS line and will trust it over a separate contradicting RUNTIME FAIL block (observed
+    // live, open_ai_test_3: swarm-declared checks held 100% "all green" for 30+ rounds while pytest
+    // errored every one of them — no mind ever prioritized the fix). Fold the red gate into FAILING so
+    // the per-mind "fix the one in YOUR file" routing applies to the real failure.
+    const green_note: ?[]const u8 = if (runtime_fail.len > 0)
+        std.fmt.allocPrint(gpa, "(the declared checks pass, BUT the runtime gate is RED — treat THIS as the failing check and fix it first: {s})", .{clip(runtime_fail, 700)}) catch null
+    else
+        null;
+    defer if (green_note) |g| gpa.free(@constCast(g));
+    const fails = if (b.failures.len > 0) clip(b.failures, 900) else (green_note orelse "(none — all green)");
     // the write-path refusal ledger rides the coverage lead: "CREATE the missing file" is useless advice
     // when the engine itself refused every attempt — the lead needs the WHY to route around the block
     const reject_lead = if (rejects.len > 0)
@@ -4811,7 +4846,7 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, de
     const base: []const u8 = if (declared and b.status == .ok)
         // wider failure budget than the legacy 900: the multi-error header list is the parallelism lever —
         // each mind takes a DIFFERENT failing point instead of the whole team serializing on the first
-        std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — when it lists SEVERAL failing points, fix the one in YOUR file (each mind a different one); read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, if (b.failures.len > 0) clip(b.failures, 1700) else "(none — all green)" }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
+        std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — when it lists SEVERAL failing points, fix the one in YOUR file (each mind a different one); read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, if (b.failures.len > 0) clip(b.failures, 1700) else (green_note orelse "(none — all green)") }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
     else if (doc_target > 0)
         switch (b.status) {
             .ok => std.fmt.allocPrint(gpa, "LENGTH FITNESS (raise this number): the document is at {d}% of its word target ({d} words/file). Once every required file exists, your single most valuable move is to APPEND a 600-900 word NEW scene to the SHORTEST under-target file you own. This is PROSE — do NOT write tests, run_python, make_tool, or web_search; just write more story.", .{ b.pct, doc_target }) catch (gpa.dupe(u8, "LENGTH FITNESS: deepen the shortest chapter.") catch @constCast("")),
@@ -6520,7 +6555,11 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.stop_now = true;
             w.stop_why = "completed";
         }
-        if (!w.stop_now and w.autonomous and !w.open_ended and w.best_pct >= GRADUATE_PCT and w.flat_rounds >= GRADUATE_FLAT) {
+        // Graduation holds the SAME floor as completion: a red smoke gate or missing declared
+        // deliverables must block the chain, not just the "completed" stop. (Observed live,
+        // open_ai_test_3: the swarm's self-written checks pinned 100%, flat_rounds accrued, and
+        // the hive graduated goal after goal on a build whose pytest had been red for 30 rounds.)
+        if (!w.stop_now and w.autonomous and !w.open_ended and w.best_pct >= GRADUATE_PCT and w.flat_rounds >= GRADUATE_FLAT and w.smoke_ok and !w.deliverable_missing) {
             w.stop_now = true;
             w.stop_why = "graduated";
         }
@@ -6553,7 +6592,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             prog_now = ov;
             prog_best = w.best_oracle;
             prog_flat = w.stale_rounds;
-            if (w.autonomous and w.best_oracle >= GRADUATE_PCT and w.stale_rounds >= GRADUATE_FLAT and !w.deliverable_missing) {
+            if (w.autonomous and w.best_oracle >= GRADUATE_PCT and w.stale_rounds >= GRADUATE_FLAT and !w.deliverable_missing and w.smoke_ok) {
                 w.stop_now = true;
                 w.stop_why = "graduated";
             }
@@ -6571,7 +6610,7 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.stale_rounds += 1;
             phase = if (w.stale_rounds >= SATURATE_ROUNDS) "saturated" else "learning";
         }
-        if (w.autonomous and w.best_knowledge > 0 and w.stale_rounds >= SATURATE_ROUNDS and !w.deliverable_missing) {
+        if (w.autonomous and w.best_knowledge > 0 and w.stale_rounds >= SATURATE_ROUNDS and !w.deliverable_missing and w.smoke_ok) {
             w.stop_now = true;
             w.stop_why = "graduated";
         }

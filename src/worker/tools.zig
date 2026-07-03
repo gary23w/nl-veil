@@ -576,6 +576,20 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer p.deinit();
         if (std.mem.trim(u8, p.value.skill, " \r\n\t").len == 0) return dupe(gpa, "empty skill, nothing saved");
         if (p.value.name.len >= 3) {
+            // Exact-name dedup FIRST, via the mirrored skills/<slug>.md — deterministic where semantic
+            // recall is not: the recall guard alone let 7 parallel minds re-save the same skill every
+            // round (recall abstains on path-shaped names like 'veil/data/links.json', and concurrent
+            // minds race the observe). 39 saves → ~10 distinct skills, observed live (open_ai_test_3).
+            var slug_buf: [64]u8 = undefined;
+            const slug = slugify(&slug_buf, p.value.name);
+            const mirrored = std.fmt.allocPrint(gpa, "{s}/skills/{s}.md", .{ ctx.workdir, slug }) catch "";
+            defer if (mirrored.len > 0) gpa.free(mirrored);
+            if (mirrored.len > 0) {
+                const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, mirrored, gpa, .limited(1 << 20)) catch &[_]u8{};
+                defer if (prior.len > 0) gpa.free(prior);
+                if (prior.len > 0)
+                    return std.fmt.allocPrint(gpa, "skill '{s}' is already in the shared library (skills/{s}.md) — not re-saved; read_file it to reuse it", .{ p.value.name, slug }) catch dupe(gpa, "already saved");
+            }
             const existing = ctx.mem.recall(SKILL_SCOPE, p.value.name);
             defer gpa.free(existing);
             if (std.mem.indexOf(u8, existing, p.value.name) != null)
