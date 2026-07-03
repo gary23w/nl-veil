@@ -85,9 +85,10 @@ fn theFont() rl.Font {
 fn theMono() rl.Font {
     return mono_font orelse theFont();
 }
-// Minimal extra tracking — a real TTF already carries its own advances; too much spacing hurts readability.
+// A real TTF carries its own advances; extra tracking made the UI text look spaced-out/"broken". Keep it
+// near zero for the proportional font (the mono path uses its own fixed 0.5 in textMono).
 fn spacingFor(size: i32) f32 {
-    return @max(0.3, @as(f32, @floatFromInt(size)) / 28.0);
+    return @max(0.0, @as(f32, @floatFromInt(size)) / 64.0);
 }
 
 pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {

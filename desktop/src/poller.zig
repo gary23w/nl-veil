@@ -4,6 +4,7 @@
 //! the Store at 60fps and never blocks. This is the only thread that may call io — the UI only calls raylib.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
@@ -82,6 +83,7 @@ pub const Poller = struct {
                 .stop => self.doControl(dd, c.idStr(), "stop", "", ""),
                 .deploy => self.doDeploy(c.textStr()),
                 .delete => self.doDelete(dd, c.idStr()),
+                .open_folder => self.doOpenFolder(dd),
             }
         }
     }
@@ -187,11 +189,49 @@ pub const Poller = struct {
         }
     }
 
+    /// Keep the API token in sync with <data>/.desktop_key each poll — the server may (re)write it AFTER
+    /// the desktop started or rotate it, and a stale token was silently rejecting deploy + delete (fixed by
+    /// a restart before). Skips if the user manually saved their own token.
+    fn syncDesktopKey(self: *Poller, dd: []const u8) void {
+        {
+            self.store.lock();
+            const manual = self.store.settings.token_manual;
+            self.store.unlock();
+            if (manual) return;
+        }
+        const path = std.fmt.allocPrint(self.gpa, "{s}/.desktop_key", .{dd}) catch return;
+        defer self.gpa.free(path);
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256)) catch return;
+        defer self.gpa.free(data);
+        const key = std.mem.trim(u8, data, " \r\n\t");
+        if (key.len == 0) return;
+        self.store.lock();
+        defer self.store.unlock();
+        if (!std.mem.eql(u8, self.store.settings.tokenStr(), key)) {
+            const n = @min(key.len, self.store.settings.token.len);
+            @memcpy(self.store.settings.token[0..n], key[0..n]);
+            self.store.settings.token_len = @intCast(n);
+        }
+    }
+
+    /// Open the data dir in the OS file browser (best-effort). Set the child's cwd to the data dir and
+    /// open "." — sidesteps resolving `dd` to an absolute path (getCwd is gone in this Zig).
+    fn doOpenFolder(self: *Poller, dd: []const u8) void {
+        const argv: []const []const u8 = switch (builtin.os.tag) {
+            .windows => &.{ "explorer.exe", "." },
+            .macos => &.{ "open", "." },
+            else => &.{ "xdg-open", "." },
+        };
+        _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = dd }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+    }
+
     fn refresh(self: *Poller) void {
         var dbuf: [512]u8 = undefined;
         const dd = self.dataDir(&dbuf);
         const now_ns = Io.Timestamp.now(self.io, .real).nanoseconds;
         const now_s: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
+
+        self.syncDesktopKey(dd);
 
         // 1) server liveness + fleet counters
         const online = scan.serverOnline(self.io, self.port());

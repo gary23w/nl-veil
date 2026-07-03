@@ -145,12 +145,13 @@ pub fn main() !void {
     rl.setTargetFPS(30);
 
     // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
-    // at a crisp base size and bilinear-filter so they scale smoothly.
-    if (loadFontAt(uiCandidates(), 32)) |f| {
+    // at a HIGH base size (48) so the atlas is high-res and downscaling to 11-22px stays crisp (loading
+    // near the render size left small text blurry — the "broken" look); bilinear smooths the scale.
+    if (loadFontAt(uiCandidates(), 48)) |f| {
         rl.setTextureFilter(f.texture, .bilinear);
         t.setFont(f);
     }
-    if (loadFontAt(monoCandidates(), 30)) |f| {
+    if (loadFontAt(monoCandidates(), 44)) |f| {
         rl.setTextureFilter(f.texture, .bilinear);
         t.setMono(f);
     }
@@ -271,19 +272,13 @@ fn drawFileMenu(store: *Store) void {
             switch (i) {
                 0 => ui.tab = .deploy,
                 1 => store.pushCmd(store_mod.mkCmd(.refresh_now, "", "")),
-                2 => openDataFolder(store),
+                2 => store.pushCmd(store_mod.mkCmd(.open_folder, "", "")),
                 3 => ui.close_req = true,
                 else => {},
             }
         }
         yy += ih;
     }
-}
-
-fn openDataFolder(store: *Store) void {
-    // v2 stub: opening a file browser needs a process spawn (explorer/open/xdg-open) which belongs on the
-    // poller's io thread; wire a command for it next. For now the path is visible in Settings.
-    _ = store;
 }
 
 fn drawResizeGrip() void {
@@ -1093,13 +1088,14 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         const n = @min(ui.d_key.len, store.settings.token.len);
         @memcpy(store.settings.token[0..n], ui.d_key.buf[0..n]);
         store.settings.token_len = @intCast(n);
+        store.settings.token_manual = true; // stop the poller auto-syncing over the user's own key
         store.unlock();
         store.pushNotif("Token saved", "Deploy is authorized", 1);
         ui.focus = .none;
     }
-    y += 30;
-    if (tok_n > 0) t.text(t.z("a token is set ({d} chars)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
-    y += 40;
+    y += 42; // clear the 34px field + gap (was 30 → the subtitle overlapped the input)
+    if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
+    y += 34;
     const tr = t.Rect{ .x = x, .y = y, .width = 220, .height = 30 };
     if (t.button(tr, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), if (notify_on) t.green else t.comment, true)) {
         store.lock();
