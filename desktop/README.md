@@ -70,6 +70,14 @@ The dependency (`raylib-zig`) is fetched and pinned via `build.zig.zon` — no v
 in the tray and lights up when the control plane is up. Set `NL_NO_DESKTOP=1` to stop the server launching
 it. `python deploy.py desktop [--install] [--launch]` builds it and can register a login autostart entry.
 
+**Connects with no key pasting.** On a localhost bind the server mints an admin API key and drops it at
+`<data>/.desktop_key`; the desktop reads it on launch, so **Deploy works out of the box** — no need to
+create or paste an `nlk_` key. (Text fields also support Ctrl+V now if you ever do paste one.)
+
+**Tray on Windows 11:** the icon is created successfully, but Win11 hides *new* tray icons in the overflow
+flyout (the `^` chevron by the clock) by default. Click the `^` and drag veil-desk onto the taskbar, or
+pin it via Settings → Personalization → Taskbar → Other system tray icons.
+
 ## How it finds your swarms
 
 On launch it probes `data`, `../data`, `../../data`, `../nl-veil/data` (first existing wins) so it Just
