@@ -56,6 +56,8 @@ pub const Chat = struct {
     turn: Turn = .idle,
     first_byte_logged: bool = false, // one timing line per turn
     parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
+    last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
+    last_user_len: usize = 0,
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -88,7 +90,7 @@ pub const Chat = struct {
             self.pumpStream(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
-            if (tick % 300 == 299) self.fetchOllamaModels(); // ~30s: catch newly-pulled models
+            if (tick % 300 == 299) self.fetchOllamaModels();
             tick +%= 1;
             self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
         }
@@ -246,6 +248,10 @@ pub const Chat = struct {
             }
             self.renameActive(dd, tb[0..n]);
         }
+        // remember the request so an explicit cast still fires if the model flakes (gpt-oss sometimes
+        // puts its whole reply in the hidden reasoning channel and emits no CAST line in the content).
+        self.last_user_len = @min(text.len, self.last_user.len);
+        @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -764,9 +770,9 @@ pub const Chat = struct {
             self.setBusy(false);
             return;
         }
-        log.info("chat turn done in {d}s ({d} chars, {d} reasoning)", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len });
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
+        log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
         if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (castGoal(full)) |goal| {
@@ -779,8 +785,22 @@ pub const Chat = struct {
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, goal);
             }
-        } else {
+        } else if (!self.cast_active and userWantsCast(self.last_user[0..self.last_user_len])) {
+            // The user EXPLICITLY asked to cast but the model didn't emit a CAST line (gpt-oss commonly
+            // leaves `content` empty, putting everything in its hidden reasoning). Honor the request:
+            // cast using the user's own words as the goal so an explicit "cast a swarm to X" always fires.
+            var gb: [1600]u8 = undefined;
+            const goal = castGoalFromUser(self.last_user[0..self.last_user_len], &gb);
+            log.info("cast recovery: model emitted no CAST line; casting from the user request", .{});
+            if (full.len > 0 or reason.len > 0) self.appendVeil(dd, reason, full);
+            self.fireCast(dd, goal);
+        } else if (full.len > 0) {
             self.appendVeil(dd, reason, full);
+        } else if (reason.len > 0) {
+            // content empty but the model reasoned — show the reasoning AS the reply so it's never blank.
+            self.appendMsg(dd, .veil, reason);
+        } else {
+            self.appendMsg(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)");
         }
         self.stream.deinit(self.gpa);
         self.setBusy(false);
@@ -854,20 +874,32 @@ pub const Chat = struct {
             else => "ollama",
         };
 
-        var body: [2048]u8 = undefined;
-        var w = Io.Writer.fixed(&body);
-        w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"api_key\":\"", .{ prov_key, prov.model, prov.base_url, CAST_MINUTES }) catch return;
-        wesc(&w, prov.key);
-        w.writeAll("\",\"goal\":\"") catch return;
-        wesc(&w, goal);
-        w.writeAll("\"}") catch return;
-
-        // Show a "deploying" row in the activity panel the INSTANT casting starts — so the user sees the
-        // cast even while the POST is in flight, and sees it flip to failed if the server is down (rather
-        // than the panel just saying "no casts yet").
+        // Show a "deploying" row + status the INSTANT casting starts, BEFORE building the body — so even a
+        // body-build failure is visible (a stuck row) rather than a silent nothing.
         self.pushCastRow(goal);
         self.setStatus("casting the hive...");
+        log.info("cast: start provider={s} model={s} base={s} port={d} token={d}b goal={s}", .{ prov_key, prov.model, prov.base_url, port, tok_n, goal[0..@min(goal.len, 60)] });
+
+        var body: [3072]u8 = undefined;
+        var w = Io.Writer.fixed(&body);
+        const bok = blk: {
+            w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"api_key\":\"", .{ prov_key, prov.model, prov.base_url, CAST_MINUTES }) catch break :blk false;
+            wesc(&w, prov.key);
+            w.writeAll("\",\"goal\":\"") catch break :blk false;
+            wesc(&w, goal);
+            w.writeAll("\"}") catch break :blk false;
+            break :blk true;
+        };
+        if (!bok) {
+            log.err("cast: body build overflow (goal/key too long)", .{});
+            self.appendMsg(dd, .cast_note, "[cast] failed — the request was too large to build");
+            self.updateCastRow(.failed, 0, -1, "request too large", "");
+            self.setStatus("");
+            return;
+        }
+
         const resp = netcli.cast(self.io, self.gpa, port, tokb[0..tok_n], w.buffered()) orelse {
+            log.err("cast: netcli returned NULL (connect/read failed) — server on :{d}?", .{port});
             self.appendMsg(dd, .cast_note, "[cast] failed — the veil server isn't running on :8787. Start it (run the veil server / `python deploy.py`), then ask again.");
             self.updateCastRow(.failed, 0, -1, "veil server unreachable on :8787", "");
             self.store.pushNotif("Cast failed", "veil server not running on :8787", 2);
@@ -875,9 +907,10 @@ pub const Chat = struct {
             return;
         };
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        log.info("cast: POST -> status={d} body={s}", .{ resp.status, resp.body[0..@min(resp.body.len, 160)] });
         if (resp.status != 200 and resp.status != 201) {
             var nb: [200]u8 = undefined;
-            const msg = std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d})", .{resp.status}) catch "[cast] rejected";
+            const msg = std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d}): {s}", .{ resp.status, resp.body[0..@min(resp.body.len, 120)] }) catch "[cast] rejected";
             self.appendMsg(dd, .cast_note, msg);
             self.updateCastRow(.failed, 0, -1, if (resp.status == 401 or resp.status == 403) "unauthorized - set an API token" else "server rejected the cast", "");
             self.store.pushNotif("Cast rejected", if (resp.status == 401 or resp.status == 403) "set an API token in Settings" else "server error", 2);
@@ -887,6 +920,7 @@ pub const Chat = struct {
         var idb: [64]u8 = undefined;
         const hex = jStr(resp.body, "id", &idb) orelse "";
         if (hex.len == 0) {
+            log.err("cast: 2xx but no id in body: {s}", .{resp.body[0..@min(resp.body.len, 160)]});
             self.appendMsg(dd, .cast_note, "[cast] deploy answered without an id — check the server log");
             self.updateCastRow(.failed, 0, -1, "no run id in the server response", "");
             self.setStatus("");
@@ -1082,6 +1116,50 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
         if (seen >= 5) return null; // a CAST mention deep in prose is narration, not an action
     }
     return null;
+}
+
+/// Did the user's message explicitly ask to cast a swarm? Case-insensitive: a cast verb
+/// (cast/run/spin/deploy/launch/summon) together with "swarm" or "hive". Used to honor an explicit
+/// request even when the model flakes and emits no CAST line.
+pub fn userWantsCast(msg: []const u8) bool {
+    if (msg.len == 0 or msg.len > 4000) return false;
+    var lower: [4000]u8 = undefined;
+    const n = @min(msg.len, lower.len);
+    for (0..n) |i| lower[i] = std.ascii.toLower(msg[i]);
+    const lo = lower[0..n];
+    const has_target = std.mem.indexOf(u8, lo, "swarm") != null or std.mem.indexOf(u8, lo, "hive") != null;
+    if (!has_target) return false;
+    const verbs = [_][]const u8{ "cast", "run ", "spin", "deploy", "launch", "summon", "dispatch" };
+    for (verbs) |v| {
+        if (std.mem.indexOf(u8, lo, v) != null) return true;
+    }
+    return false;
+}
+
+/// Strip a leading cast-request preamble ("cast a swarm to ", "have the hive ", "run a swarm that ")
+/// from the user's message to get a clean one-line goal. Returns a slice into `buf`.
+pub fn castGoalFromUser(msg: []const u8, buf: []u8) []const u8 {
+    var g = std.mem.trim(u8, msg, " \r\n\t");
+    // find " to " / " that " / " for " after a cast verb and take what follows, else use the message
+    const seps = [_][]const u8{ " to ", " that ", " which ", " for " };
+    var lower: [1600]u8 = undefined;
+    const ln = @min(g.len, lower.len);
+    for (0..ln) |i| lower[i] = std.ascii.toLower(g[i]);
+    // only strip if the message clearly starts with a cast request
+    if (std.mem.indexOf(u8, lower[0..ln], "swarm") != null or std.mem.indexOf(u8, lower[0..ln], "hive") != null) {
+        for (seps) |sep| {
+            if (std.mem.indexOf(u8, lower[0..ln], sep)) |at| {
+                const rest = std.mem.trim(u8, g[at + sep.len ..], " \r\n\t");
+                if (rest.len > 3) {
+                    g = rest;
+                    break;
+                }
+            }
+        }
+    }
+    const n = @min(g.len, buf.len);
+    @memcpy(buf[0..n], g[0..n]);
+    return buf[0..n];
 }
 
 /// The reply minus its CAST line — the note shown to the user beside the cast.
@@ -1354,6 +1432,24 @@ test "castGoal fires on a CAST line within the first few lines" {
     try std.testing.expect(castGoal("CAST:") == null);
     // a CAST buried deep in prose is narration
     try std.testing.expect(castGoal("a\nb\nc\nd\ne\nf\nCAST: too deep") == null);
+}
+
+test "userWantsCast detects explicit cast requests" {
+    try std.testing.expect(userWantsCast("cast a swarm to research AI regulation"));
+    try std.testing.expect(userWantsCast("Run the hive on this problem"));
+    try std.testing.expect(userWantsCast("spin up a swarm that builds a CLI"));
+    try std.testing.expect(userWantsCast("deploy a swarm for the news"));
+    try std.testing.expect(!userWantsCast("what is the capital of France?"));
+    try std.testing.expect(!userWantsCast("tell me about swarms of bees")); // target but no cast verb
+    try std.testing.expect(!userWantsCast("run to the store")); // verb but no swarm/hive
+}
+
+test "castGoalFromUser strips the cast preamble" {
+    var b: [1600]u8 = undefined;
+    try std.testing.expectEqualStrings("research AI regulation news", castGoalFromUser("cast a swarm to research AI regulation news", &b));
+    try std.testing.expectEqualStrings("build a REST API", castGoalFromUser("spin up a swarm that build a REST API", &b));
+    // no clear separator → keep the whole message
+    try std.testing.expectEqualStrings("run the hive", castGoalFromUser("run the hive", &b));
 }
 
 test "noteWithoutCast drops exactly the tag line" {
