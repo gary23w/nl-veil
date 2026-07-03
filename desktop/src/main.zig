@@ -577,13 +577,18 @@ fn editField(f: *Ui.Field) void {
     const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
     if (ctrl and rl.isKeyPressed(.v)) {
         const clip = rl.getClipboardText();
-        for (clip) |ch| {
+        for (clip) |raw_ch| {
+            // multi-line pastes flatten to spaces instead of being silently dropped
+            const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
             if (ch >= 32 and ch < 127 and f.len < f.buf.len - 1) {
+                if (ch == ' ' and f.len > 0 and f.buf[f.len - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
                 f.buf[f.len] = ch;
                 f.len += 1;
             }
         }
     }
+    // Ctrl+C — copy the field's current text out (there is no selection model; whole-field copy)
+    if (ctrl and rl.isKeyPressed(.c) and f.len > 0) copyToClipboard(f.str());
     var c = rl.getCharPressed();
     while (c > 0) : (c = rl.getCharPressed()) {
         if (c >= 32 and c < 127 and f.len < f.buf.len - 1) {
@@ -845,13 +850,138 @@ fn monoCols(w: f32, size: i32) usize {
     return @max(10, @as(usize, @intFromFloat(w / per)));
 }
 
-fn wrappedLines(text_: []const u8, cols: usize) usize {
-    var lines: usize = 0;
-    var it = std.mem.splitScalar(u8, text_, '\n');
-    while (it.next()) |seg| {
-        lines += if (seg.len == 0) 1 else (seg.len + cols - 1) / cols;
+// ---- chat markdown: a small block renderer. ONE function does both measuring and drawing (draw flag)
+// so the scroll math and the pixels can never disagree. Structure honored: fenced code blocks (panel +
+// copy chip), headings, bullets, **bold** markers stripped; body text stays mono so wrap math is exact.
+
+var clip_buf: [8192]u8 = undefined;
+fn copyToClipboard(s: []const u8) void {
+    const n = @min(s.len, clip_buf.len - 1);
+    @memcpy(clip_buf[0..n], s[0..n]);
+    clip_buf[n] = 0;
+    rl.setClipboardText(clip_buf[0..n :0]);
+}
+
+/// A tiny "copy" chip; returns true on click.
+fn copyChip(x: f32, y: f32) bool {
+    const r = t.Rect{ .x = x, .y = y, .width = 46, .height = 17 };
+    const hot = t.hovering(r);
+    t.panelBordered(r, if (hot) t.bg_sel else t.bg_hl, if (hot) t.blue else t.border);
+    t.text(t.z("copy", .{}), @intFromFloat(x + 9), @intFromFloat(y + 2), 11, if (hot) t.fg else t.comment);
+    return hot and rl.isMouseButtonPressed(.left);
+}
+
+/// The code block's raw content, from just after the opening fence line to the closing fence.
+fn codeBlockSlice(text_: []const u8, from: usize) []const u8 {
+    var i = from;
+    while (i < text_.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text_, i, '\n') orelse text_.len;
+        const ln = std.mem.trimStart(u8, text_[i..nl], " ");
+        if (std.mem.startsWith(u8, ln, "```")) return text_[from..i];
+        i = if (nl == text_.len) text_.len else nl + 1;
     }
-    return lines;
+    return text_[from..];
+}
+
+const MSG_LINE_H: f32 = 19;
+const MSG_HEAD_H: f32 = 17;
+const MSG_GAP_H: f32 = 9;
+const MSG_HEADING_H: f32 = 24;
+const MSG_FENCE_H: f32 = 6;
+
+/// Render (or just measure, draw=false) one message. Returns the y after the message.
+fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, draw: bool, cursor: bool) f32 {
+    var yy = y0;
+    const in_view = struct {
+        fn f(v: t.Rect, y: f32, h: f32) bool {
+            return y + h >= v.y and y <= v.y + v.height;
+        }
+    }.f;
+    if (draw and in_view(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
+    yy += MSG_HEAD_H;
+    const dim = role == .cast_note;
+    var in_code = false;
+    var it = std.mem.splitScalar(u8, text_, '\n');
+    while (it.next()) |raw| {
+        const off = @intFromPtr(raw.ptr) - @intFromPtr(text_.ptr);
+        const tl = std.mem.trimStart(u8, std.mem.trimEnd(u8, raw, " \r"), " ");
+        if (std.mem.startsWith(u8, tl, "```")) {
+            if (!in_code and draw and in_view(view, yy, MSG_FENCE_H + 17)) {
+                const from = @min(off + raw.len + 1, text_.len);
+                if (copyChip(view.x + view.width - 60, yy - 2)) copyToClipboard(codeBlockSlice(text_, from));
+            }
+            in_code = !in_code;
+            yy += MSG_FENCE_H;
+            continue;
+        }
+        if (in_code) {
+            yy = renderWrapped(view, yy, raw, cols, fsz, draw, .code, dim);
+            continue;
+        }
+        if (std.mem.startsWith(u8, tl, "#")) {
+            var h = tl;
+            while (h.len > 0 and h[0] == '#') h = h[1..];
+            h = std.mem.trimStart(u8, h, " ");
+            if (draw and in_view(view, yy, MSG_HEADING_H)) t.textClip(h, @intFromFloat(view.x + 14), @intFromFloat(yy + 3), 15, t.fg, @intFromFloat(view.width - 28));
+            yy += MSG_HEADING_H;
+            continue;
+        }
+        // bullets + bold-marker stripping into a scratch line
+        var lb: [1024]u8 = undefined;
+        var w: usize = 0;
+        var src = raw;
+        if (std.mem.startsWith(u8, tl, "- ") or std.mem.startsWith(u8, tl, "* ")) {
+            const indent = raw.len - tl.len;
+            const n = @min(indent, 8);
+            @memset(lb[0..n], ' ');
+            w = n;
+            lb[w] = 0xE2; // "•" utf-8
+            lb[w + 1] = 0x80;
+            lb[w + 2] = 0xA2;
+            w += 3;
+            lb[w] = ' ';
+            w += 1;
+            src = tl[2..];
+        }
+        var i: usize = 0;
+        while (i < src.len and w < lb.len - 1) {
+            if (i + 1 < src.len and src[i] == '*' and src[i + 1] == '*') {
+                i += 2; // strip ** markers
+                continue;
+            }
+            lb[w] = src[i];
+            w += 1;
+            i += 1;
+        }
+        yy = renderWrapped(view, yy, lb[0..w], cols, fsz, draw, .prose, dim);
+    }
+    if (cursor and draw and @mod(rl.getTime(), 1.0) < 0.6) {
+        t.textMono(t.z("|", .{}), @intFromFloat(view.x + 14), @intFromFloat(yy - MSG_LINE_H + 2), fsz, t.magenta);
+    }
+    return yy + MSG_GAP_H;
+}
+
+const LineStyle = enum { prose, code };
+
+/// One logical line, wrapped into `cols`-char rows. Code rows get a filled backdrop.
+fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, draw: bool, style: LineStyle, dim: bool) f32 {
+    var yy = y0;
+    var i: usize = 0;
+    while (true) {
+        const end = @min(seg.len, i + cols);
+        if (draw and yy + MSG_LINE_H >= view.y and yy <= view.y + view.height) {
+            if (style == .code) {
+                t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
+                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
+            } else {
+                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (dim) t.fg_dim else t.fg, @intFromFloat(view.width - 26));
+            }
+        }
+        i = end;
+        if (i >= seg.len) break;
+        yy += MSG_LINE_H;
+    }
+    return yy + MSG_LINE_H;
 }
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
@@ -877,20 +1007,17 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     t.panelBordered(view, t.bg_dark, t.border);
 
     const fsz: i32 = 14;
-    const line_h: f32 = 19;
-    const head_h: f32 = 17;
-    const gap_h: f32 = 9;
     const cols = monoCols(view.width - 28, fsz);
 
-    // total content height (streaming reply rendered as one more message)
+    // total content height via the SAME renderer that draws (streaming reply is one more message)
     var total: f32 = 8;
-    for (msgs) |*m| total += head_h + @as(f32, @floatFromInt(wrappedLines(m.textStr(), cols))) * line_h + gap_h;
-    if (busy or stream.len > 0) total += head_h + @as(f32, @floatFromInt(wrappedLines(stream, cols) + 1)) * line_h + gap_h;
+    for (msgs) |*m| total += renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+    if (busy or stream.len > 0) total += renderMsg(view, 0, .veil, stream, cols, fsz, false, false) + MSG_LINE_H;
 
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(view)) {
-        ui.chat_scroll -= wheel * 3 * line_h;
+        ui.chat_scroll -= wheel * 3 * MSG_LINE_H;
         ui.chat_follow = false;
     }
     if (ui.chat_follow) ui.chat_scroll = max_scroll;
@@ -901,11 +1028,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
     var yy: f32 = view.y + 8 - ui.chat_scroll;
     for (msgs) |*m| {
-        yy = drawChatMsg(view, yy, m.role, m.textStr(), cols, fsz, line_h, head_h, gap_h, false);
-        if (yy > view.y + view.height) break;
+        const y0 = yy;
+        yy = renderMsg(view, yy, m.role, m.textStr(), cols, fsz, true, false);
+        // whole-message copy chip on hover (beside the role label)
+        const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
+        if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
+            if (copyChip(view.x + view.width - 60, y0)) copyToClipboard(m.textStr());
+        }
     }
     if (busy or stream.len > 0) {
-        yy = drawChatMsg(view, yy, .veil, stream, cols, fsz, line_h, head_h, gap_h, true);
+        yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
     }
     if (msgs.len == 0 and !busy and stream.len == 0) {
         t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
@@ -934,36 +1066,6 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         ui.c_input.len = 0;
         ui.chat_follow = true;
     }
-}
-
-/// Draw one message (role header + mono-wrapped body); returns the next y. `cursor` appends the streaming
-/// caret to the last line.
-fn drawChatMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, line_h: f32, head_h: f32, gap_h: f32, cursor: bool) f32 {
-    var yy = y0;
-    const h = head_h + @as(f32, @floatFromInt(wrappedLines(text_, cols))) * line_h + gap_h;
-    if (yy + h < view.y) return yy + h; // fully above the fold — just advance
-    const dim = role == .cast_note;
-    t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
-    yy += head_h;
-    var it = std.mem.splitScalar(u8, text_, '\n');
-    while (it.next()) |seg| {
-        var i: usize = 0;
-        while (true) {
-            const end = @min(seg.len, i + cols);
-            if (yy > view.y + view.height) return yy; // below the fold — stop drawing (height already counted)
-            if (yy + line_h >= view.y) {
-                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (dim) t.fg_dim else t.fg, @intFromFloat(view.width - 26));
-            }
-            i = end;
-            if (i >= seg.len) break;
-            yy += line_h;
-        }
-        yy += line_h;
-    }
-    if (cursor and @mod(rl.getTime(), 1.0) < 0.6) {
-        t.textMono(t.z("|", .{}), @intFromFloat(view.x + 14), @intFromFloat(yy - line_h + 2), fsz, t.magenta);
-    }
-    return y0 + h;
 }
 
 fn castStatusColor(st: store_mod.CastStatus) t.Color {
