@@ -210,21 +210,16 @@ pub fn winButton(r: Rect, glyph: [:0]const u8, danger: bool) bool {
     return hot and rl.isMouseButtonPressed(.left);
 }
 
-/// The nl-veil mark: a hooded shadow-figure in a rounded tile — the same silhouette the CLI uses, drawn
-/// with primitives (no asset needed). cx,cy is the tile center; `s` the tile half-size.
+/// The nl-veil mark: a shadow-agent bust (head + broad shoulders — the universal "person/agent"
+/// silhouette), NOT a keyhole/padlock. Drawn from primitives, no asset. cx,cy is the center; `s` the
+/// half-size.
 pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
     if (tile) rl.drawRectangleRounded(.{ .x = cx - s, .y = cy - s, .width = s * 2, .height = s * 2 }, 0.32, 8, bg_hl);
     const fig = magenta;
-    // hood/head: a circle
-    rl.drawCircle(@intFromFloat(cx), @intFromFloat(cy - s * 0.34), s * 0.36, fig);
-    // shoulders/cloak: a downward triangle-ish body via a rounded rect tapering — approximate with a
-    // trapezoid drawn as a triangle fan of two triangles.
-    const bw = s * 0.98;
-    const top = cy - s * 0.02;
-    const bot = cy + s * 0.62;
-    rl.drawTriangle(.{ .x = cx, .y = top - s * 0.3 }, .{ .x = cx - bw, .y = bot }, .{ .x = cx + bw, .y = bot }, fig);
-    // a darker inner void for the face, giving the "shadowy" read
-    rl.drawCircle(@intFromFloat(cx), @intFromFloat(cy - s * 0.34), s * 0.20, bg_dark);
+    // shoulders / cloak: a broad rounded mound, clearly wider than the head (the "person" read)
+    rl.drawRectangleRounded(.{ .x = cx - s * 0.92, .y = cy + s * 0.06, .width = s * 1.84, .height = s * 0.98 }, 0.75, 10, fig);
+    // head
+    rl.drawCircle(@intFromFloat(cx), @intFromFloat(cy - s * 0.44), s * 0.38, fig);
 }
 
 /// Click-to-cycle selector (immediate-mode, no popup z-order): shows the current value; left-click →

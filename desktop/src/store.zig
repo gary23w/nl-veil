@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, deploy, swarm, hub, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, refresh_now };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, refresh_now };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {

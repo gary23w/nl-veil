@@ -81,6 +81,7 @@ pub const Poller = struct {
                 .set_goal => self.doControl(dd, c.idStr(), "set_goal", "", c.textStr()),
                 .stop => self.doControl(dd, c.idStr(), "stop", "", ""),
                 .deploy => self.doDeploy(c.textStr()),
+                .delete => self.doDelete(dd, c.idStr()),
             }
         }
     }
@@ -140,6 +141,49 @@ pub const Poller = struct {
             self.store.pushNotif("Deploy unauthorized", "set an API token in Settings", 2);
         } else {
             self.store.pushNotif("Deploy rejected", "server returned an error", 2);
+        }
+    }
+
+    /// Delete a swarm. `rel` is the path relative to data ("name" or "u1/<hexid>"). Server-managed swarms
+    /// (rel has a '/') go through DELETE /api/v1/swarms/<hexid> so the worker is stopped + removed; a flat
+    /// CLI run is removed by deleting exactly its own dir. Only ever the one dir the user picked — never a
+    /// sweep.
+    fn doDelete(self: *Poller, dd: []const u8, rel: []const u8) void {
+        if (rel.len == 0) return;
+        const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
+        if (std.mem.indexOfScalar(u8, rel, '/') != null) {
+            // server swarm → API delete (stops + removes)
+            var tbuf: [128]u8 = undefined;
+            var tlen: usize = 0;
+            {
+                self.store.lock();
+                const t = self.store.settings.tokenStr();
+                tlen = @min(t.len, tbuf.len);
+                @memcpy(tbuf[0..tlen], t[0..tlen]);
+                self.store.unlock();
+            }
+            const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], base);
+            if (resp) |r| {
+                defer if (r.body.len > 0) self.gpa.free(r.body);
+                if (r.status == 200 or r.status == 204) {
+                    self.store.pushNotif("Deleted", rel, 1);
+                    return;
+                }
+                if (r.status == 401 or r.status == 403) {
+                    self.store.pushNotif("Delete unauthorized", "set an API token in Settings", 2);
+                    return;
+                }
+            }
+            self.store.pushNotif("Delete failed", rel, 2);
+        } else {
+            // flat CLI run → remove exactly this dir
+            const path = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ dd, rel }) catch return;
+            defer self.gpa.free(path);
+            Io.Dir.cwd().deleteTree(self.io, path) catch {
+                self.store.pushNotif("Delete failed", rel, 2);
+                return;
+            };
+            self.store.pushNotif("Deleted", rel, 1);
         }
     }
 
