@@ -40,3 +40,6 @@ Thumbs.db
 .vscode/
 .idea/
 SWARM_VCS_BLUEPRINT.md
+
+# raylib F12 default screenshots (veil-desk uses F12 for the log overlay)
+screenshot*.png

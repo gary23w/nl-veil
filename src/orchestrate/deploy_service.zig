@@ -33,6 +33,13 @@ const DeployReq = struct {
     gateway_base_url: []const u8 = "",
     gateway_key: []const u8 = "",
     veil_population: bool = false,
+    // RSI dials — the same knobs the deploy wizard writes into swarm.json. Defaults match the worker's
+    // Manifest defaults, so an old client that omits them behaves exactly as before.
+    autonomy: []const u8 = "full", // "full" | "bounded"
+    internet: bool = true,
+    gap_assess: bool = true,
+    breakout: bool = false,
+    observe_psyche: bool = false,
     minds: []MindSpec,
 };
 
@@ -153,6 +160,14 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq) !?
         try jstr(app.gpa, &mani, body.gateway_key);
     }
     if (body.veil_population) try mani.appendSlice(app.gpa, ",\"veil_population\":true");
+    // RSI dials — write them explicitly so the manifest carries the same knobs the wizard sets (and the
+    // desktop Deploy form can toggle). Autonomy is a string; the rest are bools the worker reads verbatim.
+    try mani.appendSlice(app.gpa, ",\"autonomy\":");
+    try jstr(app.gpa, &mani, if (std.mem.eql(u8, body.autonomy, "bounded")) "bounded" else "full");
+    try mani.appendSlice(app.gpa, if (body.internet) ",\"internet\":true" else ",\"internet\":false");
+    try mani.appendSlice(app.gpa, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
+    if (body.breakout) try mani.appendSlice(app.gpa, ",\"breakout\":true");
+    if (body.observe_psyche) try mani.appendSlice(app.gpa, ",\"observe_psyche\":true");
     if (body.encrypt and e.encrypted) try mani.appendSlice(app.gpa, ",\"encrypted\":true");
     try mani.appendSlice(app.gpa, ",\"minds\":[");
     for (body.minds, 0..) |m, i| {

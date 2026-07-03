@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, deploy, swarm, hub, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -101,6 +101,15 @@ pub const Store = struct {
     events: [scan.MAX_LOG]scan.Ev = undefined,
     event_count: usize = 0,
     metrics: scan.Metrics = .{},
+
+    // --- selected swarm's built files (poller writes; Files tab reads) ---
+    files: [scan.MAX_FILES]scan.FileRow = undefined,
+    file_count: usize = 0,
+    sel_file: [128]u8 = [_]u8{0} ** 128, // which file the Files viewer is showing (rel to work/)
+    sel_file_len: u8 = 0,
+    file_content: [1 << 14]u8 = undefined, // up to 16KB of the selected file, for the viewer
+    file_content_len: usize = 0,
+    file_content_trunc: bool = false,
 
     // --- settings (UI writes, poller reads) ---
     settings: Settings = .{},
