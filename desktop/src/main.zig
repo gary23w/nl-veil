@@ -15,6 +15,7 @@ const chat_mod = @import("chat.zig");
 const llm = @import("llm.zig");
 const tray_mod = @import("tray.zig");
 const catalog = @import("catalog.zig");
+const md = @import("mdutil.zig");
 const log = @import("log.zig");
 
 const Store = store_mod.Store;
@@ -888,25 +889,44 @@ const MSG_HEAD_H: f32 = 17;
 const MSG_GAP_H: f32 = 9;
 const MSG_HEADING_H: f32 = 24;
 const MSG_FENCE_H: f32 = 6;
+const MSG_HR_H: f32 = 12;
+const MSG_MAX_LINES = 512;
 
-/// Render (or just measure, draw=false) one message. Returns the y after the message.
+fn inView(v: t.Rect, y: f32, h: f32) bool {
+    return y + h >= v.y and y <= v.y + v.height;
+}
+
+/// Render (or just measure, draw=false) one message with lightweight markdown: fenced code blocks
+/// (backdrop + copy chip), GFM tables (aligned columns), headings, horizontal rules, bullets, and inline
+/// **bold** / `code` / <br> handled. ONE function measures AND draws (draw flag) so scroll math and pixels
+/// can never disagree. Returns the y after the message.
 fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, draw: bool, cursor: bool) f32 {
     var yy = y0;
-    const in_view = struct {
-        fn f(v: t.Rect, y: f32, h: f32) bool {
-            return y + h >= v.y and y <= v.y + v.height;
-        }
-    }.f;
-    if (draw and in_view(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
+    if (draw and inView(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
     yy += MSG_HEAD_H;
     const dim = role == .cast_note;
+
+    // split into a line array so multi-line constructs (tables, code) can be grouped with lookahead
+    var lines: [MSG_MAX_LINES][]const u8 = undefined;
+    var n: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, text_, '\n');
+        while (it.next()) |l| {
+            if (n >= MSG_MAX_LINES) break;
+            lines[n] = l;
+            n += 1;
+        }
+    }
+
+    var i: usize = 0;
     var in_code = false;
-    var it = std.mem.splitScalar(u8, text_, '\n');
-    while (it.next()) |raw| {
-        const off = @intFromPtr(raw.ptr) - @intFromPtr(text_.ptr);
-        const tl = std.mem.trimStart(u8, std.mem.trimEnd(u8, raw, " \r"), " ");
+    while (i < n) : (i += 1) {
+        const raw = lines[i];
+        const tl = std.mem.trim(u8, raw, " \r\t");
+        // fenced code
         if (std.mem.startsWith(u8, tl, "```")) {
-            if (!in_code and draw and in_view(view, yy, MSG_FENCE_H + 17)) {
+            if (!in_code and draw and inView(view, yy, MSG_FENCE_H + 17)) {
+                const off = @intFromPtr(raw.ptr) - @intFromPtr(text_.ptr);
                 const from = @min(off + raw.len + 1, text_.len);
                 if (copyChip(view.x + view.width - 60, yy - 2)) copyToClipboard(codeBlockSlice(text_, from));
             }
@@ -918,24 +938,42 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             yy = renderWrapped(view, yy, raw, cols, fsz, draw, .code, dim);
             continue;
         }
+        // horizontal rule
+        if (md.isHr(tl)) {
+            if (draw and inView(view, yy, MSG_HR_H)) t.fillRect(@intFromFloat(view.x + 14), @intFromFloat(yy + MSG_HR_H / 2), @intFromFloat(view.width - 28), 1, t.border);
+            yy += MSG_HR_H;
+            continue;
+        }
+        // GFM table: a pipe row whose NEXT line is the |---|---| separator
+        if (md.hasPipe(tl) and i + 1 < n and md.isTableSep(std.mem.trim(u8, lines[i + 1], " \r\t"))) {
+            var j = i;
+            while (j < n and md.hasPipe(std.mem.trim(u8, lines[j], " \r\t"))) : (j += 1) {}
+            yy = renderTable(view, yy, lines[i..j], fsz, draw);
+            i = j - 1; // for-loop adds 1
+            continue;
+        }
+        // heading
         if (std.mem.startsWith(u8, tl, "#")) {
             var h = tl;
             while (h.len > 0 and h[0] == '#') h = h[1..];
             h = std.mem.trimStart(u8, h, " ");
-            if (draw and in_view(view, yy, MSG_HEADING_H)) t.textClip(h, @intFromFloat(view.x + 14), @intFromFloat(yy + 3), 15, t.fg, @intFromFloat(view.width - 28));
+            var hb: [512]u8 = undefined;
+            const hn = md.cleanInline(&hb, h);
+            if (draw and inView(view, yy, MSG_HEADING_H)) t.textClip(hb[0..hn], @intFromFloat(view.x + 14), @intFromFloat(yy + 4), 16, t.fg, @intFromFloat(view.width - 28));
             yy += MSG_HEADING_H;
             continue;
         }
-        // bullets + bold-marker stripping into a scratch line
-        var lb: [1024]u8 = undefined;
+        // bullet / prose with inline cleanup
+        var lb: [2048]u8 = undefined;
         var w: usize = 0;
         var src = raw;
-        if (std.mem.startsWith(u8, tl, "- ") or std.mem.startsWith(u8, tl, "* ")) {
-            const indent = raw.len - tl.len;
-            const n = @min(indent, 8);
-            @memset(lb[0..n], ' ');
-            w = n;
-            lb[w] = 0xE2; // "•" utf-8
+        const is_bullet = std.mem.startsWith(u8, tl, "- ") or std.mem.startsWith(u8, tl, "* ") or std.mem.startsWith(u8, tl, "+ ");
+        if (is_bullet) {
+            const indent = raw.len - std.mem.trimStart(u8, raw, " \t").len;
+            const pad = @min(indent + 1, 6);
+            @memset(lb[0..pad], ' ');
+            w = pad;
+            lb[w] = 0xE2; // "•"
             lb[w + 1] = 0x80;
             lb[w + 2] = 0xA2;
             w += 3;
@@ -943,15 +981,10 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             w += 1;
             src = tl[2..];
         }
-        var i: usize = 0;
-        while (i < src.len and w < lb.len - 1) {
-            if (i + 1 < src.len and src[i] == '*' and src[i + 1] == '*') {
-                i += 2; // strip ** markers
-                continue;
-            }
-            lb[w] = src[i];
-            w += 1;
-            i += 1;
+        w += md.cleanInline(lb[w..], src);
+        if (w == 0) {
+            yy += MSG_LINE_H; // blank line = paragraph spacing
+            continue;
         }
         yy = renderWrapped(view, yy, lb[0..w], cols, fsz, draw, .prose, dim);
     }
@@ -959,6 +992,64 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
         t.textMono(t.z("|", .{}), @intFromFloat(view.x + 14), @intFromFloat(yy - MSG_LINE_H + 2), fsz, t.magenta);
     }
     return yy + MSG_GAP_H;
+}
+
+/// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns.
+fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: bool) f32 {
+    var yy = y0;
+    const MAXC = 10;
+    var colw: [MAXC]usize = [_]usize{0} ** MAXC;
+    // pass 1: column widths (in bytes ~ mono chars)
+    for (rows) |row| {
+        const tl = std.mem.trim(u8, row, " \r\t");
+        if (md.isTableSep(tl)) continue;
+        var it = std.mem.splitScalar(u8, md.tableInner(tl), '|');
+        var ci_: usize = 0;
+        while (it.next()) |cell| {
+            if (ci_ >= MAXC) break;
+            var cb: [256]u8 = undefined;
+            const cl = md.cleanInline(&cb, cell);
+            if (cl > colw[ci_]) colw[ci_] = cl;
+            ci_ += 1;
+        }
+    }
+    // pass 2: draw each non-separator row as padded, joined cells
+    var header = true;
+    for (rows) |row| {
+        const tl = std.mem.trim(u8, row, " \r\t");
+        if (md.isTableSep(tl)) continue;
+        var lb: [1024]u8 = undefined;
+        var w: usize = 0;
+        var it = std.mem.splitScalar(u8, md.tableInner(tl), '|');
+        var ci_: usize = 0;
+        while (it.next()) |cell| {
+            if (ci_ >= MAXC or w >= lb.len - 4) break;
+            if (ci_ > 0) {
+                const sep = " | ";
+                @memcpy(lb[w .. w + sep.len], sep);
+                w += sep.len;
+            }
+            var cb: [256]u8 = undefined;
+            const cl = md.cleanInline(&cb, cell);
+            const take = @min(cl, lb.len - w);
+            @memcpy(lb[w .. w + take], cb[0..take]);
+            w += take;
+            // pad to the column width (skip padding the final column)
+            if (ci_ + 1 < MAXC and colw[ci_] > cl) {
+                const pad = @min(colw[ci_] - cl, lb.len - w);
+                @memset(lb[w .. w + pad], ' ');
+                w += pad;
+            }
+            ci_ += 1;
+        }
+        if (draw and inView(view, yy, MSG_LINE_H)) {
+            if (header) t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 130));
+            t.textMonoClip(lb[0..w], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (header) t.fg else t.fg_dim, @intFromFloat(view.width - 26));
+        }
+        yy += MSG_LINE_H;
+        header = false;
+    }
+    return yy + 4;
 }
 
 const LineStyle = enum { prose, code };
@@ -1091,56 +1182,92 @@ fn castStatusWord(st: store_mod.CastStatus) [:0]const u8 {
 fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
+        // collapsed rail: a status dot when a cast is live so the user knows to expand it
+        const live = casts.len > 0 and (casts[casts.len - 1].status == .deploying or casts[casts.len - 1].status == .running or casts[casts.len - 1].status == .collecting);
+        if (live) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 40), t.green);
         if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z("<", .{}), false)) togglePane(store, false);
         return;
     }
     t.text(t.z("Swarm activity", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 10), 14, t.fg);
     if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z(">", .{}), false)) togglePane(store, false);
 
-    var yy: f32 = r.y + 38;
-    const row_h: f32 = 68;
-    // newest first
-    var i: usize = casts.len;
-    while (i > 0) {
-        i -= 1;
-        if (yy > r.y + r.height * 0.55) break;
-        const c = &casts[i];
-        const rr = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = row_h - 6 };
-        t.panelBordered(rr, t.bg, t.border);
-        t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + 13), castStatusColor(c.status));
-        t.textClip(c.goalStr(), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 6), 13, t.fg, @intFromFloat(rr.width - 96));
-        const rt = if (c.pct >= 0) t.z("r{d} {d}%", .{ c.round, c.pct }) else t.z("r{d}", .{c.round});
-        t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(rt, 12))) - 8), @intFromFloat(rr.y + 6), 12, t.cyan);
-        t.text(castStatusWord(c.status), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 24), 11, castStatusColor(c.status));
-        t.textClip(c.lastStr(), @intFromFloat(rr.x + 22), @intFromFloat(rr.y + 40), 11, t.comment, @intFromFloat(rr.width - 84));
-        if (c.status == .running or c.status == .collecting) {
-            const sb = t.Rect{ .x = rr.x + rr.width - 52, .y = rr.y + rr.height - 26, .width = 46, .height = 20 };
-            if (t.button(sb, t.z("Stop", .{}), t.red, true)) {
-                store.pushChatCmd(store_mod.mkChatCmd(.stop_cast, c.runStr(), ""));
-            }
-        }
-        yy += row_h;
-    }
+    var yy: f32 = r.y + 36;
+
     if (casts.len == 0) {
-        t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 4), 12, t.comment);
-        t.text(t.z("the veil casts the hive when", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 24), 11, t.comment);
-        t.text(t.z("a task needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 40), 11, t.comment);
-        yy += 62;
+        t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
+        t.text(t.z("when a message needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment);
+        t.text(t.z("- research, current facts, web", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment);
+        t.text(t.z("- building or fixing code", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment);
+        t.text(t.z("the veil casts the hive and its", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment);
+        t.text(t.z("live progress appears here.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment);
+        return;
     }
 
-    // live tail of the newest cast
-    t.hline(@intFromFloat(r.x + 8), @intFromFloat(yy + 2), @intFromFloat(r.width - 16), t.border);
-    t.text(t.z("live cast tail", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 8), 11, t.comment);
-    yy += 26;
+    // ---- the newest cast gets a prominent DETAIL card (goal + phase + metrics + Stop) ----
+    const c = &casts[casts.len - 1];
+    const live = c.status == .deploying or c.status == .running or c.status == .collecting;
+    const card = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = 92 };
+    t.panelBordered(card, t.bg, if (live) castStatusColor(c.status) else t.border);
+    t.statusDot(@intFromFloat(card.x + 12), @intFromFloat(card.y + 14), castStatusColor(c.status));
+    t.text(castStatusWord(c.status), @intFromFloat(card.x + 24), @intFromFloat(card.y + 8), 12, castStatusColor(c.status));
+    if (c.run_len > 0) t.textClip(c.runStr(), @intFromFloat(card.x + 92), @intFromFloat(card.y + 9), 10, t.comment, @intFromFloat(card.width - 150));
+    if (live) {
+        const sb = t.Rect{ .x = card.x + card.width - 54, .y = card.y + 6, .width = 48, .height = 20 };
+        if (t.button(sb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_cast, c.runStr(), ""));
+    }
+    // goal, up to two clipped lines
+    t.textClip(c.goalStr(), @intFromFloat(card.x + 12), @intFromFloat(card.y + 30), 13, t.fg, @intFromFloat(card.width - 24));
+    // metrics row
+    const mrt = if (c.pct >= 0) t.z("round {d}   {d}%", .{ c.round, c.pct }) else t.z("round {d}", .{c.round});
+    t.text(mrt, @intFromFloat(card.x + 12), @intFromFloat(card.y + 52), 13, if (c.pct >= 100) t.green else if (c.pct >= 50) t.cyan else if (c.pct >= 0) t.yellow else t.comment);
+    // open in the full Swarm tab for the complete console/metrics/files
+    const ob = t.Rect{ .x = card.x + card.width - 96, .y = card.y + card.height - 26, .width = 90, .height = 20 };
+    if (c.run_len > 0 and t.button(ob, t.z("open swarm", .{}), t.blue, true)) {
+        store.pushCmd(store_mod.mkCmd(.select, c.runStr(), ""));
+        ui.tab = .swarm;
+    }
+    yy += 100;
+
+    // older casts, one compact line each (up to 2)
+    var shown_old: usize = 0;
+    var i: usize = casts.len - 1;
+    while (i > 0 and shown_old < 2) {
+        i -= 1;
+        const oc = &casts[i];
+        t.statusDot(@intFromFloat(r.x + 14), @intFromFloat(yy + 8), castStatusColor(oc.status));
+        t.textClip(oc.goalStr(), @intFromFloat(r.x + 24), @intFromFloat(yy + 2), 11, t.fg_dim, @intFromFloat(r.width - 70));
+        t.text(t.z("r{d}", .{oc.round}), @intFromFloat(r.x + r.width - 40), @intFromFloat(yy + 2), 11, t.comment);
+        yy += 18;
+        shown_old += 1;
+    }
+
+    // ---- live console: the swarm's own event stream (this is what "shows its progress") ----
+    t.hline(@intFromFloat(r.x + 8), @intFromFloat(yy + 4), @intFromFloat(r.width - 16), t.border);
+    t.text(t.z("live hive console", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 10), 11, t.comment);
+    yy += 28;
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(yy), @intFromFloat(r.width - 2), @intFromFloat(r.y + r.height - yy - 4));
+    defer rl.endScissorMode();
+    if (tail.len == 0) {
+        // the "while it loads" state — a cold local model can take a minute before the first event
+        if (live) {
+            t.text(t.z("starting the hive...", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 2), 12, t.cyan);
+            t.textClip(t.z("a local model may be loading;", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 22), 11, t.comment, @intFromFloat(r.width - 20));
+            t.textClip(t.z("cold starts can take a minute", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 38), 11, t.comment, @intFromFloat(r.width - 20));
+        } else {
+            t.text(t.z("(no console output)", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 2), 11, t.comment);
+        }
+        return;
+    }
     const line_h: f32 = 17;
     const avail: usize = if (r.y + r.height - 8 > yy) @intFromFloat((r.y + r.height - 8 - yy) / line_h) else 0;
     const start = if (tail.len > avail) tail.len - avail else 0;
-    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(yy), @intFromFloat(r.width - 2), @intFromFloat(r.height - (yy - r.y) - 4));
-    defer rl.endScissorMode();
     var k = start;
     while (k < tail.len) : (k += 1) {
         const e = &tail[k];
-        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 12), @intFromFloat(yy), 12, kindColor(e.kindStr()), @intFromFloat(r.width - 22));
+        if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), 11, t.comment);
+        const mind = e.mindStr();
+        if (mind.len > 0) t.textMonoClip(mind, @intFromFloat(r.x + 40), @intFromFloat(yy), 11, kindColor(e.kindStr()), 54);
+        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 96), @intFromFloat(yy), 11, t.fg_dim, @intFromFloat(r.width - 106));
         yy += line_h;
     }
 }
