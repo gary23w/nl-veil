@@ -2745,14 +2745,17 @@ def wizard():
     print("  Welcome. This sets up a hive run end to end - Ctrl-C any time to bail.\n")
 
     action = ask_menu("What would you like to do?", [
-        ("new",    "Start a new hive run"),
-        ("chat",   "Chat with a running swarm's Veil"),
-        ("resume", "Resume a stopped run"),
-        ("list",   "List existing runs"),
-        ("stop",   "Stop a running hive"),
+        ("new",     "Start a new hive run"),
+        ("chat",    "Chat with a running swarm's Veil"),
+        ("resume",  "Resume a stopped run"),
+        ("list",    "List existing runs"),
+        ("stop",    "Stop a running hive"),
+        ("desktop", "Install the veil-desk desktop dashboard"),
     ], 1)
     if action == "list":
         return cmd_list()
+    if action == "desktop":
+        return cmd_desktop([])
     if action == "chat":
         cmd_list()
         name = ask("run name to chat with (blank = newest)", "")
@@ -2891,6 +2894,118 @@ def wizard():
         return print("  not launched. The line above is the command to run when you're ready.")
     deploy(args)
 
+# ------------------------------------------------------------------ veil-desk (desktop dashboard)
+
+DESKTOP_DIR = os.path.join(ROOT, "desktop")
+DESKTOP_EXE = "veil-desk.exe" if WIN else "veil-desk"
+
+def desktop_binary():
+    return os.path.join(DESKTOP_DIR, "zig-out", "bin", DESKTOP_EXE)
+
+def build_desktop(assume_yes=False):
+    """Build desktop/ with `zig build`. Returns the binary path, or None on failure."""
+    if not os.path.isdir(DESKTOP_DIR):
+        print("  desktop/ is not present in this checkout — nothing to build.")
+        return None
+    zig = ensure_zig(assume_yes)
+    if not zig:
+        return None
+    print("  building veil-desk (`zig build` in desktop/) — the first build fetches raylib, ~1 min...")
+    r = subprocess.run([zig, "build"], cwd=DESKTOP_DIR)
+    b = desktop_binary()
+    if r.returncode == 0 and os.path.exists(b):
+        print(f"  built -> {b}")
+        return b
+    print("  ! veil-desk build failed.")
+    if platform.system() == "Linux":
+        print("    Linux needs raylib's dev libraries present to link. On Debian/Ubuntu:")
+        print("      sudo apt install libgl1-mesa-dev libx11-dev libxrandr-dev \\")
+        print("                       libxinerama-dev libxi-dev libxcursor-dev")
+    return None
+
+def _spawn_detached(binary):
+    """Launch veil-desk with cwd=ROOT (so it finds data/) and fully detached from this process."""
+    try:
+        if WIN:
+            DETACHED = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            subprocess.Popen([binary], cwd=ROOT, creationflags=DETACHED, close_fds=True)
+        else:
+            subprocess.Popen([binary], cwd=ROOT, start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print(f"  ! could not launch veil-desk: {e}")
+        return False
+
+def install_desktop_autostart(binary):
+    """Register veil-desk to start on login so it sits in the tray and lights up when the server runs.
+    Cross-platform: a Startup .cmd on Windows, an XDG autostart .desktop on Linux, a LaunchAgent on macOS.
+    Every launcher sets the working directory to the repo root so the app resolves data/ the same way."""
+    sysname = platform.system()
+    try:
+        if sysname == "Windows":
+            startup = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows",
+                                   "Start Menu", "Programs", "Startup")
+            os.makedirs(startup, exist_ok=True)
+            path = os.path.join(startup, "veil-desk.cmd")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f'@start "" /D "{ROOT}" "{binary}"\r\n')
+            print(f"  autostart installed -> {path}")
+        elif sysname == "Linux":
+            d = os.path.join(os.path.expanduser("~"), ".config", "autostart")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "veil-desk.desktop")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("[Desktop Entry]\nType=Application\nName=veil-desk\n"
+                        f"Exec={binary}\nPath={ROOT}\nX-GNOME-Autostart-enabled=true\n"
+                        "Comment=nl-veil desktop dashboard\n")
+            print(f"  autostart installed -> {path}")
+        elif sysname == "Darwin":
+            d = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "com.nlveil.veildesk.plist")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+                        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                        '<plist version="1.0"><dict>\n'
+                        '  <key>Label</key><string>com.nlveil.veildesk</string>\n'
+                        f'  <key>ProgramArguments</key><array><string>{binary}</string></array>\n'
+                        f'  <key>WorkingDirectory</key><string>{ROOT}</string>\n'
+                        '  <key>RunAtLoad</key><true/>\n'
+                        '</dict></plist>\n')
+            print(f"  autostart installed -> {path}")
+        else:
+            print(f"  autostart not supported on {sysname}; launch veil-desk manually.")
+            return
+        print("    it will start on your next login, sit in the tray, and light up when the server runs.")
+    except Exception as e:
+        print(f"  ! could not install autostart: {e}")
+
+def cmd_desktop(argv):
+    """Build / install / launch the veil-desk desktop dashboard."""
+    assume_yes = "--yes" in argv or "-y" in argv
+    do_install = "--install" in argv
+    do_launch = "--launch" in argv
+    do_rebuild = "--rebuild" in argv
+    interactive = sys.stdin.isatty() and not (assume_yes or do_install or do_launch)
+
+    b = desktop_binary()
+    if do_rebuild or not os.path.exists(b):
+        b = build_desktop(assume_yes)
+        if not b:
+            return
+    else:
+        print(f"  veil-desk already built -> {b}   (--rebuild to rebuild)")
+
+    if do_install or (interactive and ask_yes(
+            "auto-start veil-desk on login (sits in the tray, lights up when the server runs)?", False)):
+        install_desktop_autostart(b)
+
+    if do_launch or assume_yes or (interactive and ask_yes("launch veil-desk now?", True)):
+        if _spawn_detached(b):
+            print("  veil-desk launched — it reads your run dirs live and finds the server on :8787.")
+
 # --------------------------------------------------------------------------------------- entry
 
 def main():
@@ -2914,6 +3029,8 @@ def main():
         return cmd_list()
     if argv[0] in ("doctor", "deps", "check"):
         return deps_doctor()
+    if argv[0] in ("desktop", "ui", "dashboard"):
+        return cmd_desktop(argv[1:])
     if argv[0] == "stop":
         if len(argv) < 2:
             sys.exit("usage: python deploy.py stop <run-name>")
@@ -2950,6 +3067,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="also:  python deploy.py            (interactive setup wizard)\n"
                "       python deploy.py list   |   resume <run>   |   stop <run>\n"
+               "       python deploy.py desktop [--install] [--launch]   (veil-desk dashboard)\n"
                "agent: python deploy.py cast \"<goal>\" --json     (hive as a sub-agent: one findings JSON back)\n"
                "       python deploy.py report <run> [--json]   |   python deploy.py mcp   (stdio MCP server)")
     # `veil configure` writes the user's endpoint once; bare casts then default to it (flags still win).
