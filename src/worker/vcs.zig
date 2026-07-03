@@ -20,8 +20,12 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("out of memory");
 }
 
+// guidance FIRST, bufedit's reject LAST: on a stale anchor the reject now ends with the current file's
+// closest region ("The file NOW reads ..."), and the copyable lines must be the final thing the mind sees —
+// the old shape buried them mid-sentence and cost a whole read_file turn per lost repair attempt (observed
+// live, openai_splash_test_4 r4-6 on digest/__init__.py and digest/rank.py).
 fn conflictMsg(gpa: std.mem.Allocator, reject: []const u8) []u8 {
-    return std.fmt.allocPrint(gpa, "edit conflict: {s}. The file changed since you read it (a teammate edited the same region) — read_file it again and re-emit your SEARCH/REPLACE against the CURRENT lines.", .{reject}) catch dupe(gpa, "edit conflict — read_file the file again and re-emit against the current lines.");
+    return std.fmt.allocPrint(gpa, "edit conflict: the file changed since you read it (a teammate edited the same region) — re-emit your SEARCH/REPLACE against the CURRENT lines. {s}", .{reject}) catch dupe(gpa, "edit conflict — read_file the file again and re-emit against the current lines.");
 }
 
 pub const Decision = union(enum) {
@@ -216,6 +220,8 @@ test "mergeDecision: conflict when a teammate changed the same region (anchor go
         .conflict => |m| {
             defer gpa.free(m);
             try std.testing.expect(std.mem.indexOf(u8, m, "conflict") != null);
+            try std.testing.expect(std.mem.indexOf(u8, m, "re-emit") != null); // guidance leads ...
+            try std.testing.expect(std.mem.indexOf(u8, m, "read_file") != null); // ... bufedit's hint (region gone) ends the message
         },
         .write => |w| {
             defer gpa.free(w.bytes);
@@ -269,7 +275,11 @@ test "commitEdit: two minds merge disjoint edits, a third with a stale base conf
     {
         const r = commitEdit(io, gpa, &fmtx, root, npath, full, &.{.{ .kind = .replace, .anchor = "fn a() 1", .text = "fn a() 999" }}, base, "C", null);
         switch (r) {
-            .conflict => |m| gpa.free(m),
+            .conflict => |m| {
+                defer gpa.free(m);
+                // the stale-anchor reject must carry the CURRENT line so C can re-anchor in the SAME turn
+                try std.testing.expect(std.mem.indexOf(u8, m, "fn a() 11") != null);
+            },
             .committed => return error.CExpectedConflict,
             .failed => |m| {
                 gpa.free(m);

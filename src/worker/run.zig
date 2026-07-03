@@ -263,6 +263,10 @@ pub const Worker = struct {
     emit_mtx: std.Io.Mutex = .init,
     db_mtx: std.Io.Mutex = .init,
     files_mtx: std.Io.Mutex = .init,
+    // telegraphPublish lazily CREATES the account token into w.tg_token on first use; with the flare
+    // break-out and the briefing's publishArtifact now in the concurrent meta group, two first-publishes
+    // could race the token slot (double createAccount + a torn slice). Both call sites take this lock.
+    tg_mtx: std.Io.Mutex = .init,
 
     pub fn a(self: *Worker) std.mem.Allocator {
         return self.scratch.allocator();
@@ -1102,14 +1106,39 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             rsi.updateRsiCurriculum(&w, goal, round, stalled);
         }
 
-        if (live and !w.quick and govRecovery(w.gov_lvl, round)) rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
-        if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0)) agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items, prev_pct);
-        if (live and w.psyche_on and govReflective(w.gov_lvl, round)) emitPsyche(&w, minds.items, round, retro_in.items);
-        if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
-            if (w.discourse) consolidateBriefing(&w, goal, round, retro_in.items) else gatewayDigest(&w, goal, round);
+        // CONCURRENT META GROUP — measured live (open_ai_advanced_test / splash_test_4): the minds phase runs
+        // parallel at 24-38s/round while these between-round faculties ran back-to-back at 251-285s/round —
+        // 85-90% of wall-clock was one LLM call waiting on the next for no reason. The five below are
+        // independent: every read is frozen before the group starts (retro_in, last_bench, blueprint, now_str,
+        // minds' names/personas), every write lands in a DISJOINT place (playbook scope / breakouts /
+        // digest_str / state_str — digest vs briefing are mutually exclusive on w.discourse, state runs only
+        // !discourse so it can never race the briefing), act/emit are emit_mtx-locked and mem writes are
+        // db_mtx-locked (the exact same path the parallel moments already exercise), and none of them touches
+        // the round scratch arena anymore (their emit bodies moved to stack buffers / local arenas —
+        // w.a()/w.esc() are NOT thread-safe). The plan/goal/mind mutators (planRoles, rsiGovernance,
+        // capabilityGrowth, revisePlan, veilReflect, dream, veilPopulation) stay SERIAL around the group.
+        // Gates are byte-identical to the serial version; the governor's t_meta0..ema_meta_s window is
+        // untouched, so it now measures the (shorter) parallel meta wall — exactly what it should steer on.
+        {
+            var mgrp: std.Io.Group = .init;
+            if (live and !w.quick and govRecovery(w.gov_lvl, round))
+                mgrp.concurrent(io, rsi.roundRetrospective, .{ &w, goal, round, retro_in.items, w.last_bench }) catch rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
+            if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0))
+                mgrp.concurrent(io, agi.detectEmotionalFlare, .{ &w, minds.items, goal, round, retro_in.items, prev_pct }) catch agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items, prev_pct);
+            if (live and w.psyche_on and govReflective(w.gov_lvl, round))
+                mgrp.concurrent(io, emitPsyche, .{ &w, minds.items, round, retro_in.items }) catch emitPsyche(&w, minds.items, round, retro_in.items);
+            if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
+                if (w.discourse) {
+                    mgrp.concurrent(io, consolidateBriefing, .{ &w, goal, round, retro_in.items }) catch consolidateBriefing(&w, goal, round, retro_in.items);
+                } else {
+                    mgrp.concurrent(io, gatewayDigest, .{ &w, goal, round }) catch gatewayDigest(&w, goal, round);
+                }
+            }
+            if (live and !w.discourse and w.blueprint.len > 0 and govReflective(w.gov_lvl, round))
+                mgrp.concurrent(io, consolidateState, .{ &w, goal, round }) catch consolidateState(&w, goal, round);
+            mgrp.await(io) catch {};
         }
         if (live and !w.discourse and w.blueprint.len > 0) markIncomplete(&w, round);
-        if (live and !w.discourse and w.blueprint.len > 0 and govReflective(w.gov_lvl, round)) consolidateState(&w, goal, round);
         if (live and !w.discourse and (w.blueprint.len > 0 or w.operating) and round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) capabilityGrowth(&w, goal, round);
         if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
@@ -5025,7 +5054,9 @@ fn flagUncitedSources(w: *Worker, md: []const u8, round: u32) void {
     }
     if (n == 0) return;
     w.act("engine", round, "citation_flag", "these cited domains were NOT fetched by the hive this run — verify or remove (possible hallucinated citations)", flagged.items);
-    w.emit("citation_flag", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"uncited\":{d}", .{ round, n }) catch ",\"round\":0");
+    // stack buffer, not w.a(): reached from consolidateBriefing inside the concurrent meta group
+    var cbuf: [48]u8 = undefined;
+    w.emit("citation_flag", std.fmt.bufPrint(&cbuf, ",\"round\":{d},\"uncited\":{d}", .{ round, n }) catch ",\"round\":0");
 }
 
 /// DELIVERABLE CONSOLIDATION (discourse) — composes the round's shared document via writer.compose (general grounding
@@ -5085,7 +5116,9 @@ fn consolidateBriefing(w: *Worker, goal: []const u8, round: u32, discussion: []c
     }
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = md }) catch {};
     w.act("engine", round, "briefing", "consolidated the hive's findings + debate", clip(md, 600));
-    w.emit("briefing", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"bytes\":{d}", .{ round, md.len }) catch ",\"round\":0");
+    // stack buffer, not w.a(): this runs inside the concurrent meta group and the round arena is not thread-safe
+    var bbuf: [64]u8 = undefined;
+    w.emit("briefing", std.fmt.bufPrint(&bbuf, ",\"round\":{d},\"bytes\":{d}", .{ round, md.len }) catch ",\"round\":0");
     flagUncitedSources(w, md, round);
     if (w.digest_str.len > 0) gpa.free(@constCast(w.digest_str));
     w.digest_str = gpa.dupe(u8, clip(md, 1400)) catch "";
@@ -5099,13 +5132,18 @@ fn consolidateBriefing(w: *Worker, goal: []const u8, round: u32, discussion: []c
 fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited: u32) void {
     const gpa = w.gpa;
     if (md.len < 120) return;
+    // local arena, not w.a()/w.esc(): reached from consolidateBriefing inside the concurrent meta group,
+    // and the round scratch arena is not thread-safe
+    var pa = std.heap.ArenaAllocator.init(gpa);
+    defer pa.deinit();
+    const paa = pa.allocator();
     const enough_grounded = grounded >= PUBLISH_MIN_SOURCES;
     const enough_independent = w.round_independent_sources >= PUBLISH_MIN_INDEPENDENT;
     const seed_ok = w.round_seed_dependency_pct <= PUBLISH_MAX_SEED_DEP_PCT;
     if (!(enough_grounded and enough_independent and seed_ok)) {
         const reason = if (!enough_grounded) "ungrounded" else if (!enough_independent) "seed_only" else "seed_dependency";
-        w.act("engine", round, "edition", "held", std.fmt.allocPrint(w.a(), "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, w.round_seed_dependency_pct, PUBLISH_MAX_SEED_DEP_PCT }) catch "held");
-        w.emit("edition", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"{s}\",\"grounded\":{d},\"cited\":{d},\"independent_sources\":{d},\"seed_sources\":{d},\"seed_dependency_pct\":{d},\"source_diversity\":{d}", .{ round, reason, grounded, cited, w.round_independent_sources, w.round_seed_sources, w.round_seed_dependency_pct, w.round_source_diversity }) catch ",\"round\":0");
+        w.act("engine", round, "edition", "held", std.fmt.allocPrint(paa, "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, w.round_seed_dependency_pct, PUBLISH_MAX_SEED_DEP_PCT }) catch "held");
+        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"{s}\",\"grounded\":{d},\"cited\":{d},\"independent_sources\":{d},\"seed_sources\":{d},\"seed_dependency_pct\":{d},\"source_diversity\":{d}", .{ round, reason, grounded, cited, w.round_independent_sources, w.round_seed_sources, w.round_seed_dependency_pct, w.round_source_diversity }) catch ",\"round\":0");
         return;
     }
     const suser = std.fmt.allocPrint(gpa, "Review this PUBLIC post for publication:\n\n{s}", .{clip(md, 3500)}) catch return;
@@ -5113,17 +5151,19 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
     var passed = screenPass(w, CONSTITUTION_SCREEN, suser, round);
     if (passed) passed = screenPass(w, CONSTITUTION_SCREEN2, suser, round);
     if (!passed) {
-        w.emit("edition", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"screen\"", .{round}) catch ",\"round\":0");
+        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"screen\"", .{round}) catch ",\"round\":0");
         return;
     }
     const title = std.fmt.allocPrint(gpa, "Briefing — {s}", .{if (w.now_str.len > 0) w.now_str else "today"}) catch return;
     defer gpa.free(title);
+    w.tg_mtx.lockUncancelable(w.io);
     const url = tools.telegraphPublish(w.io, gpa, &w.tg_token, title, md);
+    w.tg_mtx.unlock(w.io);
     defer if (url.len > 0) gpa.free(@constCast(url));
     if (url.len > 0) {
         w.editions += 1;
         w.act("engine", round, "edition", "published a briefing", url);
-        w.emit("edition", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"published\":true,\"n\":{d},\"url\":\"{s}\"", .{ round, w.editions, w.esc(url) }) catch ",\"round\":0");
+        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":true,\"n\":{d},\"url\":\"{s}\"", .{ round, w.editions, escA(paa, url) }) catch ",\"round\":0");
         const pp = std.fmt.allocPrint(gpa, "{s}/edition-{d}.md", .{ w.run_dir, round }) catch "";
         defer if (pp.len > 0) gpa.free(pp);
         if (pp.len > 0) {
@@ -5133,7 +5173,7 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
         }
     } else {
         w.act("engine", round, "edition", "screened OK but the Telegraph publish failed (network)", "no URL");
-        w.emit("edition", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"published\":false,\"held\":false,\"reason\":\"network\"", .{round}) catch ",\"round\":0");
+        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":false,\"reason\":\"network\"", .{round}) catch ",\"round\":0");
     }
 }
 
@@ -5180,7 +5220,9 @@ fn gatewayDigest(w: *Worker, goal: []const u8, round: u32) void {
     if (w.digest_str.len > 0) gpa.free(@constCast(w.digest_str));
     w.digest_str = gpa.dupe(u8, clip(d, 1200)) catch "";
     w.act("engine", round, "digest", "compact working memory", clip(d, 400));
-    w.emit("digest", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"bytes\":{d}", .{ round, d.len }) catch ",\"round\":0");
+    // stack buffer, not w.a(): this runs inside the concurrent meta group and the round arena is not thread-safe
+    var dbuf: [64]u8 = undefined;
+    w.emit("digest", std.fmt.bufPrint(&dbuf, ",\"round\":{d},\"bytes\":{d}", .{ round, d.len }) catch ",\"round\":0");
 }
 
 fn establishPlan(w: *Worker, goal: []const u8) void {
@@ -7240,7 +7282,9 @@ fn authoredToolNames(gpa: std.mem.Allocator, mem: Mem) []u8 {
 }
 
 /// JSON-escape `s` using `alloc` (returns a slice owned by `alloc`). Falls back to the raw input on OOM.
-fn escA(alloc: std.mem.Allocator, s: []const u8) []const u8 {
+/// pub: the concurrent meta faculties (agi flare/break-out) escape into their own local arenas with this —
+/// w.esc() is round-arena-backed and therefore main-thread-only.
+pub fn escA(alloc: std.mem.Allocator, s: []const u8) []const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     for (s) |c| switch (c) {
         '"' => out.appendSlice(alloc, "\\\"") catch return s,
