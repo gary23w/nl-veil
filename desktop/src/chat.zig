@@ -26,7 +26,8 @@ const SYSTEM_PROMPT =
     "To cast, make the FIRST line of your reply exactly:\n" ++
     "CAST: <one-line goal for the hive>\n" ++
     "After that line you may add a short note to the user. Only one cast runs at a time.\n" ++
-    "WHEN TO CAST (cast — do NOT answer from memory):\n" ++
+    "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'have the hive research/build X', 'spin up a swarm'. An explicit request is a command: emit the CAST line, never answer it from memory instead.\n" ++
+    "OTHERWISE, cast whenever real work would help (do NOT answer from memory):\n" ++
     "- ANY question about current events, news, or the state of the world (you have NO live knowledge and " ++
     "would otherwise hallucinate — cast so the hive researches it on the web).\n" ++
     "- Anything time-sensitive or that could have changed since your training, or that asks 'latest', " ++
@@ -1008,16 +1009,32 @@ pub const Chat = struct {
                 jb.print(self.gpa, " {s}({d}b)", .{ self.file_scratch[i].pathStr(), self.file_scratch[i].size }) catch {};
             }
         }
-        // the tail of what the hive said/did
+        // the tail of what the hive said/did (for a research cast, scout_learn notes carry the findings)
         if (ev_n > 0) {
             jb.appendSlice(self.gpa, "\nrecent hive activity:") catch {};
-            const start = if (ev_n > 14) ev_n - 14 else 0;
+            const start = if (ev_n > 12) ev_n - 12 else 0;
             var i = start;
             while (i < ev_n) : (i += 1) {
                 const e = &self.ev_scratch[i];
                 jb.print(self.gpa, "\n- {s} {s}: {s}", .{ e.kindStr(), e.mindStr(), e.textStr() }) catch {};
             }
         }
+        // RAG the swarm's actual OUTPUT into the chat: the content of the top built file, so the model
+        // answers FROM the work product, not just its name. The full run (all files, events, memory) stays
+        // saved under <data>/<rel> and can be reopened from the Swarm tab.
+        if (fn_ > 0) {
+            var fi: usize = 0;
+            var shown: usize = 0;
+            while (fi < fn_ and shown < 2) : (fi += 1) {
+                var cbuf: [1400]u8 = undefined;
+                var trunc = false;
+                const cn = scan.readWorkFile(self.io, self.gpa, dd, rel, self.file_scratch[fi].pathStr(), &cbuf, &trunc);
+                if (cn == 0) continue;
+                jb.print(self.gpa, "\n\n--- {s} ---\n{s}{s}", .{ self.file_scratch[fi].pathStr(), cbuf[0..cn], if (trunc) "\n[...truncated; full file saved in the run dir]" else "" }) catch {};
+                shown += 1;
+            }
+        }
+        jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab)", .{rel}) catch {};
         const digest = jb.items[0..@min(jb.items.len, 3000)];
         self.appendMsg(dd, .cast_note, digest);
         self.setStatus("composing the answer...");
