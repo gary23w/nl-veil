@@ -47,17 +47,22 @@ pub const Stream = struct {
     err: [200]u8 = [_]u8{0} ** 200,
     err_len: u8 = 0,
     content: std.ArrayListUnmanaged(u8) = .empty, // accumulated assistant text (gpa-owned)
+    reasoning: std.ArrayListUnmanaged(u8) = .empty, // the model's thinking channel (reasoning models)
     started_s: i64 = 0,
     last_growth_s: i64 = 0,
 
     pub fn errStr(s: *const Stream) []const u8 {
         return s.err[0..s.err_len];
     }
+    pub fn reasoningStr(s: *const Stream) []const u8 {
+        return s.reasoning.items;
+    }
     pub fn outPath(s: *const Stream) []const u8 {
         return s.out_path[0..s.out_path_len];
     }
     pub fn deinit(s: *Stream, gpa: std.mem.Allocator) void {
         s.content.deinit(gpa);
+        s.reasoning.deinit(gpa);
         s.carry.deinit(gpa);
         s.* = .{};
     }
@@ -121,10 +126,13 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
         s.out_path_len = @intCast(n);
     }
 
+    // Local Ollama uses the NATIVE /api/chat with stream:FALSE — the engine's proven path. Reasoning
+    // models (gpt-oss) stream their harmony channels token-by-token, and Ollama's incremental tool-call
+    // parser trips on plain text like a leading "CAST:" ("error parsing tool call: invalid character
+    // 'C'"), breaking the reply. The non-streaming path returns ONE object with content + thinking
+    // cleanly parsed. num_ctx matches the engine so chat + swarm share one runner (no reload thrash).
     const body = if (native)
-        // native /api/chat with the ENGINE's num_ctx so chat + swarm share one Ollama runner (no reload
-        // thrash while a cast runs); NDJSON stream, one object per line.
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"max_tokens\":{d}}}", .{ prov.model, messages_json, max_tokens }) catch return false;
     defer gpa.free(body);
@@ -198,11 +206,24 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
         }
     }
 
+    // Native (local Ollama) is non-streaming: the whole JSON object lands only when generation finishes.
+    // Nothing to parse incrementally — wait for the STAT sentinel (curl exit), then parse content +
+    // thinking (+ tool-call-error recovery) from the complete body.
+    if (s.native) {
+        if (std.mem.trim(u8, body, " \r\n\t").len > 0) s.saw_any = true; // suppress the first-byte timeout
+        if (stat) |code| {
+            finishNativeWhole(s, io, gpa, code, body);
+            return;
+        }
+        checkTimeouts(s, io, now_s, patient);
+        return;
+    }
+
     if (body.len > s.offset) {
         consume(s, gpa, body[s.offset..]);
         s.offset = body.len;
         s.last_growth_s = now_s;
-    } else if (stat == null and s.saw_any and !s.saw_sse and !s.native) {
+    } else if (stat == null and s.saw_any and !s.saw_sse) {
         // plain-JSON body (backend ignored stream:true): complete once the object closes + carries a
         // terminal key — brace-end alone can be a partial write.
         tryWholeJson(s, gpa, body);
@@ -219,6 +240,64 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
         return;
     }
     checkTimeouts(s, io, now_s, patient);
+}
+
+/// Ollama non-streaming: parse the one complete response object. Extracts message.content (the answer)
+/// and message.thinking (the reasoning), and RECOVERS the model's text when Ollama's gpt-oss harmony
+/// parser fails with "error parsing tool call: raw='...'" — that raw IS the intended reply.
+fn finishNativeWhole(s: *Stream, io: Io, gpa: std.mem.Allocator, code: []const u8, body: []const u8) void {
+    abort(s, io); // reap the (already-exited) child
+    if (s.done) return;
+    // Ollama surfaces server-side failures as a top-level {"error":"..."}.
+    if (jsonUnescape(gpa, body, "error")) |emsg| {
+        defer gpa.free(emsg);
+        if (recoverToolCallRaw(emsg)) |raw| {
+            s.content.appendSlice(gpa, raw) catch {};
+            s.done = true;
+            return;
+        }
+        var eb: [200]u8 = undefined;
+        const n = @min(emsg.len, eb.len);
+        @memcpy(eb[0..n], emsg[0..n]);
+        setErr(s, eb[0..n]);
+        return;
+    }
+    // reasoning (thinking channel) + the answer (content)
+    if (jsonUnescape(gpa, body, "thinking")) |th| {
+        defer gpa.free(th);
+        s.reasoning.appendSlice(gpa, th) catch {};
+    }
+    if (jsonUnescape(gpa, body, "content")) |c| {
+        defer gpa.free(c);
+        s.content.appendSlice(gpa, c) catch {};
+    }
+    if (s.content.items.len > 0 or s.reasoning.items.len > 0) {
+        s.done = true;
+        return;
+    }
+    // no content, no thinking, no error — fall back to the HTTP code
+    if (std.mem.eql(u8, code, "000")) {
+        setErr(s, "could not reach the model endpoint — is Ollama running?");
+    } else if (code.len > 0 and code[0] != '2') {
+        var eb: [200]u8 = undefined;
+        setErr(s, std.fmt.bufPrint(&eb, "Ollama returned HTTP {s}: {s}", .{ code, errBodyHead(body) }) catch "Ollama error");
+    } else {
+        setErr(s, "the model returned an empty response");
+    }
+}
+
+/// From an Ollama "error parsing tool call: raw='<text>', err=..." message, recover the `<text>` — that is
+/// the model's actual output that the harmony tool-call parser choked on. Returns null if not that error.
+fn recoverToolCallRaw(emsg: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, emsg, "parsing tool call") == null) return null;
+    const key = "raw='";
+    const at = std.mem.indexOf(u8, emsg, key) orelse return null;
+    const from = at + key.len;
+    if (from > emsg.len) return null;
+    const tail = emsg[from..];
+    // the raw is terminated by "', err=" (preferred) or the last single-quote
+    const end = std.mem.indexOf(u8, tail, "', err=") orelse (std.mem.lastIndexOfScalar(u8, tail, '\'') orelse tail.len);
+    return tail[0..end];
 }
 
 var body_head_buf: [160]u8 = undefined;
@@ -611,16 +690,32 @@ test "finishBySentinel maps HTTP codes: 000 unreachable, 4xx error, 200 graceful
     }
 }
 
-test "ollama-native NDJSON deltas accumulate and done:true completes" {
+test "native whole-object parse: content + thinking (reasoning)" {
     const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var s: Stream = .{ .native = true };
     defer s.deinit(gpa);
-    consume(&s, gpa, "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"done\":false}\n{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"con");
-    try std.testing.expectEqualStrings("Hel", s.content.items);
-    consume(&s, gpa, "tent\":\"lo\"},\"done\":false}\n{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"total_duration\":1}\n");
-    try std.testing.expect(s.done);
-    try std.testing.expect(!s.failed);
-    try std.testing.expectEqualStrings("Hello", s.content.items);
+    finishNativeWhole(&s, io, gpa, "200", "{\"model\":\"gpt-oss:20b\",\"message\":{\"role\":\"assistant\",\"content\":\"The answer is 42.\",\"thinking\":\"User asks a question; compute it.\"},\"done\":true}");
+    try std.testing.expect(s.done and !s.failed);
+    try std.testing.expectEqualStrings("The answer is 42.", s.content.items);
+    try std.testing.expectEqualStrings("User asks a question; compute it.", s.reasoningStr());
+}
+
+test "native recovers the raw text from a gpt-oss tool-call parse error" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var s: Stream = .{ .native = true };
+    defer s.deinit(gpa);
+    // Ollama's exact failure shape (with JSON-escaped newlines in the raw)
+    finishNativeWhole(&s, io, gpa, "200", "{\"error\":\"error parsing tool call: raw='CAST: Gather current global news\\n\\nWant a summary?', err=invalid character 'C' looking for beginning of value\"}");
+    try std.testing.expect(s.done and !s.failed);
+    try std.testing.expectEqualStrings("CAST: Gather current global news\n\nWant a summary?", s.content.items);
+    // recoverToolCallRaw only fires on that error, not arbitrary ones
+    try std.testing.expect(recoverToolCallRaw("some other error") == null);
 }
 
 test "ollama root + local detection for native routing" {

@@ -963,6 +963,15 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             yy += MSG_HEADING_H;
             continue;
         }
+        // blockquote (used for the model's reasoning): dim text with a left accent bar
+        if (std.mem.startsWith(u8, tl, ">")) {
+            var qb: [2048]u8 = undefined;
+            const qn = md.cleanInline(&qb, std.mem.trimStart(u8, tl[1..], " "));
+            const y_before = yy;
+            yy = renderWrapped(view, yy, qb[0..qn], cols, fsz, draw, .quote, dim);
+            if (draw and inView(view, y_before, yy - y_before)) t.fillRect(@intFromFloat(view.x + 10), @intFromFloat(y_before - 1), 2, @intFromFloat(yy - y_before - MSG_LINE_H + 2), t.comment);
+            continue;
+        }
         // bullet / prose with inline cleanup
         var lb: [2048]u8 = undefined;
         var w: usize = 0;
@@ -1052,9 +1061,10 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
     return yy + 4;
 }
 
-const LineStyle = enum { prose, code };
+const LineStyle = enum { prose, code, quote };
 
-/// One logical line, wrapped into `cols`-char rows. Code rows get a filled backdrop.
+/// One logical line, wrapped into `cols`-char rows. Code rows get a filled backdrop; quote rows (the
+/// model's reasoning) are indented and dimmed.
 fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, draw: bool, style: LineStyle, dim: bool) f32 {
     var yy = y0;
     var i: usize = 0;
@@ -1064,6 +1074,8 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
             if (style == .code) {
                 t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
                 t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
+            } else if (style == .quote) {
+                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 18), @intFromFloat(yy), fsz, t.comment, @intFromFloat(view.width - 30));
             } else {
                 t.textMonoClip(seg[i..end], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (dim) t.fg_dim else t.fg, @intFromFloat(view.width - 26));
             }
