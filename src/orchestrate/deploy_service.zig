@@ -284,6 +284,66 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }, .{});
 }
 
+/// CAST — the hive as a sub-agent, over HTTP. One small body casts a bounded swarm at a goal and returns
+/// the run id at once; the caller (veil-desk chat, another AI, a script) then watches events/control like
+/// any swarm. This is the server-side twin of the CLI's `veil cast`: the SERVER owns the cast defaults
+/// (short time budget, 3 minds, full-autonomy research/build dials) so every client casts the same way.
+const CastReq = struct {
+    goal: []const u8 = "",
+    minutes: u32 = 8, // a cast is time-budgeted by default, not until-stopped
+    minds: u32 = 3,
+    provider: []const u8 = "",
+    model: []const u8 = "",
+    api_key: []const u8 = "",
+    base_url: []const u8 = "",
+    gateway_model: []const u8 = "",
+    style: []const u8 = "auto",
+    name: []const u8 = "",
+};
+
+pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const rq = (try req.json(CastReq)) orelse return badReq(res, "bad body");
+    if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0) return badReq(res, "a goal is required, e.g. {\"goal\":\"research X and report findings\"}");
+    const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
+    var n: usize = if (rq.minds == 0) 3 else rq.minds;
+    if (n > e.per_swarm_minds) n = e.per_swarm_minds;
+    if (n == 0) n = 1;
+    const names = [_][]const u8{ "nova", "ada", "rex", "lux", "sol" };
+    const minds = try res.arena.alloc(MindSpec, n);
+    for (minds, 0..) |*m, i| m.* = .{ .name = names[i % names.len], .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
+    var sfx: [3]u8 = undefined;
+    app.io.random(&sfx);
+    const name = if (rq.name.len > 0) rq.name else try std.fmt.allocPrint(res.arena, "cast-{s}", .{std.fmt.bytesToHex(sfx, .lower)});
+    const body = DeployReq{
+        .name = name,
+        .provider = if (rq.provider.len > 0) rq.provider else "workers-ai",
+        .model = rq.model,
+        .stack = "general",
+        .style = rq.style,
+        .mode = "continuous",
+        .goal = rq.goal,
+        .api_key = rq.api_key,
+        .base_url = rq.base_url,
+        .minutes = if (rq.minutes == 0) 8 else rq.minutes,
+        .gateway_model = rq.gateway_model,
+        // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
+        // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
+        .minds = minds,
+    };
+    const sp = (try deployCore(app, res, u, body)) orelse return;
+    res.status = 201;
+    try res.json(.{
+        .ok = true,
+        .id = sp.id,
+        .state = sp.state,
+        .minds = sp.minds,
+        .events_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/events", .{sp.id}),
+        .control_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/control", .{sp.id}),
+        .files_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/files", .{sp.id}),
+    }, .{});
+}
+
 const ResolveReq = struct { provider: []const u8 = "mock", model: []const u8 = "mock", minds: u32 = 1 };
 
 pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {

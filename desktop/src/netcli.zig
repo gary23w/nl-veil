@@ -109,6 +109,20 @@ test "netcli.deploy exercises the REAL desktop HTTP client against a running ser
     } else std.debug.print("[netcli test] DEPLOY: NO RESPONSE (client failed)\n", .{});
 }
 
+/// POST /api/v1/cast — the server-side cast door: a small {goal, provider, model, ...} body deploys a
+/// bounded swarm with the SERVER's cast defaults and returns {ok,id,...} at once. The chat thread uses
+/// this instead of composing a full DeployReq — cast semantics live in one place, the server.
+pub fn cast(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    const auth = if (token.len > 0)
+        std.fmt.allocPrint(gpa, "Authorization: Bearer {s}\r\n", .{token}) catch return null
+    else
+        gpa.dupe(u8, "") catch return null;
+    defer gpa.free(auth);
+    const req = std.fmt.allocPrint(gpa, "POST /api/v1/cast HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\n\r\n{s}", .{ auth, body_json.len, body_json }) catch return null;
+    defer gpa.free(req);
+    return sendRecv(io, gpa, port, req);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     const auth = if (token.len > 0)
