@@ -65,3 +65,15 @@ pub fn deploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body
     defer gpa.free(req);
     return sendRecv(io, gpa, port, req);
 }
+
+/// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
+pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
+    const auth = if (token.len > 0)
+        std.fmt.allocPrint(gpa, "Authorization: Bearer {s}\r\n", .{token}) catch return null
+    else
+        gpa.dupe(u8, "") catch return null;
+    defer gpa.free(auth);
+    const req = std.fmt.allocPrint(gpa, "DELETE /api/v1/swarms/{s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{s}\r\n", .{ id, auth }) catch return null;
+    defer gpa.free(req);
+    return sendRecv(io, gpa, port, req);
+}

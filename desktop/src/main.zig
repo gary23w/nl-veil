@@ -27,6 +27,7 @@ const TITLE_H = 30;
 const TAB_H = 34;
 
 const InnerTab = enum { console, details };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode };
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -48,6 +49,9 @@ const Ui = struct {
     d_mode: usize = 0,
     d_population: bool = false,
     d_encrypt: bool = false,
+    // deploy dropdowns
+    open_dd: DdKind = .none,
+    dd_rect: t.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     // window chrome
     dragging: bool = false,
     resizing: bool = false,
@@ -68,6 +72,50 @@ const Ui = struct {
 };
 
 var ui: Ui = .{};
+
+// UI-thread-only optimistic "deleting…" set: when the user clicks ✕ the row shows "deleting…" until the
+// poller's delete lands and the swarm drops out of the roster.
+var del_ids: [16][96]u8 = undefined;
+var del_lens: [16]u8 = [_]u8{0} ** 16;
+var del_n: usize = 0;
+fn markDeleting(id: []const u8) void {
+    if (isDeleting(id) or del_n >= del_ids.len) return;
+    const nn = @min(id.len, del_ids[del_n].len);
+    @memcpy(del_ids[del_n][0..nn], id[0..nn]);
+    del_lens[del_n] = @intCast(nn);
+    del_n += 1;
+}
+fn isDeleting(id: []const u8) bool {
+    var i: usize = 0;
+    while (i < del_n) : (i += 1) {
+        if (std.mem.eql(u8, del_ids[i][0..del_lens[i]], id)) return true;
+    }
+    return false;
+}
+/// Drop del-set entries whose swarm no longer appears in the roster — the delete finished.
+fn pruneDeleting(rows: []const scan.SwarmSummary) void {
+    var i: usize = 0;
+    while (i < del_n) {
+        const id = del_ids[i][0..del_lens[i]];
+        var present = false;
+        for (rows) |*sw| {
+            if (std.mem.eql(u8, sw.idStr(), id)) {
+                present = true;
+                break;
+            }
+        }
+        if (present) {
+            i += 1;
+        } else {
+            // swap-remove
+            del_n -= 1;
+            if (i != del_n) {
+                del_ids[i] = del_ids[del_n];
+                del_lens[i] = del_lens[del_n];
+            }
+        }
+    }
+}
 
 pub fn main() !void {
     const gpa = std.heap.c_allocator;
@@ -293,10 +341,10 @@ fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
 
 fn makeIcon() rl.Image {
     var img = rl.genImageColor(64, 64, .{ .r = 0x1a, .g = 0x1b, .b = 0x26, .a = 255 });
-    // hooded head + cloak in magenta, a dark face void — the shadow-figure mark.
-    rl.imageDrawCircle(&img, 32, 22, 12, .{ .r = 0xbb, .g = 0x9a, .b = 0xf7, .a = 255 });
-    rl.imageDrawRectangle(&img, 14, 30, 36, 28, .{ .r = 0xbb, .g = 0x9a, .b = 0xf7, .a = 255 });
-    rl.imageDrawCircle(&img, 32, 22, 6, .{ .r = 0x16, .g = 0x16, .b = 0x1e, .a = 255 });
+    const mag = rl.Color{ .r = 0xbb, .g = 0x9a, .b = 0xf7, .a = 255 };
+    // agent bust: broad shoulders (wider than head) + head — the person silhouette, not a padlock.
+    rl.imageDrawRectangle(&img, 12, 36, 40, 22, mag);
+    rl.imageDrawCircle(&img, 32, 26, 13, mag);
     return img;
 }
 
@@ -478,11 +526,14 @@ fn drawRoster(store: *Store, r: t.Rect) void {
     const n = store.swarm_count;
     var rows: [scan.MAX_SWARMS]scan.SwarmSummary = undefined;
     @memcpy(rows[0..n], store.swarms[0..n]);
-    var sel: [64]u8 = undefined;
+    var sel: [96]u8 = undefined;
     const sel_n = store.selected_len;
     @memcpy(sel[0..sel_n], store.selected[0..sel_n]);
     const scanned = store.last_refresh_s > 0; // has the poller completed its first pass?
     store.unlock();
+
+    // drop any "deleting…" ids that are no longer in the roster (the delete landed)
+    pruneDeleting(rows[0..n]);
 
     const row_h: f32 = 46;
     var yy: f32 = r.y + 6;
@@ -491,19 +542,31 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         const sw = &rows[idx];
         const rr = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = row_h - 6 };
         const is_sel = std.mem.eql(u8, sw.idStr(), sel[0..sel_n]);
-        const hot = t.hovering(rr);
+        const deleting = isDeleting(sw.idStr());
+        const hot = t.hovering(rr) and !deleting;
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
-        t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + rr.height / 2), if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
-        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 13, t.fg, @intFromFloat(rr.width - 220));
-        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 23), 11, t.comment, @intFromFloat(rr.width - 220));
-        const pct = sw.pct;
-        const rt = if (pct >= 0) t.z("r{d}  {d}%", .{ sw.round, pct }) else t.z("r{d}", .{sw.round});
-        const rtw = t.measure(rt, 12);
-        const pc = if (pct >= 100) t.green else if (pct >= 50) t.cyan else if (pct >= 0) t.yellow else t.comment;
-        t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(rtw)) - 12), @intFromFloat(rr.y + 6), 12, pc);
-        const stt = if (sw.stopped) t.z("done", .{}) else if (sw.live) t.z("live", .{}) else t.z("idle", .{});
-        t.text(stt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(stt, 11))) - 12), @intFromFloat(rr.y + 24), 11, if (sw.live) t.green else t.comment);
-        if (hot and rl.isMouseButtonPressed(.left)) {
+        t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
+        const name_c = if (deleting) t.comment else t.fg;
+        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 13, name_c, @intFromFloat(rr.width - 236));
+        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 23), 12, t.comment, @intFromFloat(rr.width - 236));
+        // ✕ delete button (right edge, on row hover)
+        const xb = t.Rect{ .x = rr.x + rr.width - 26, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
+        if (deleting) {
+            t.text(t.z("deleting...", .{}), @intFromFloat(rr.x + rr.width - 88), @intFromFloat(rr.y + 24), 11, t.red);
+        } else {
+            if (hot and t.winButton(xb, t.z("x", .{}), true)) {
+                markDeleting(sw.idStr());
+                store.pushCmd(store_mod.mkCmd(.delete, sw.idStr(), ""));
+            }
+            const pct = sw.pct;
+            const rt = if (pct >= 0) t.z("r{d}  {d}%", .{ sw.round, pct }) else t.z("r{d}", .{sw.round});
+            const rtw = t.measure(rt, 12);
+            const pc = if (pct >= 100) t.green else if (pct >= 50) t.cyan else if (pct >= 0) t.yellow else t.comment;
+            t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(rtw)) - 36), @intFromFloat(rr.y + 6), 12, pc);
+            const stt = if (sw.stopped) t.z("done", .{}) else if (sw.live) t.z("LIVE", .{}) else t.z("idle", .{});
+            t.text(stt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(stt, 11))) - 36), @intFromFloat(rr.y + 24), 11, if (sw.live) t.green else t.comment);
+        }
+        if (hot and !t.hovering(xb) and rl.isMouseButtonPressed(.left)) {
             store.pushCmd(store_mod.mkCmd(.select, sw.idStr(), ""));
             ui.tab = .swarm;
         }
@@ -543,15 +606,9 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
     ly += fh + 14 + gap - 14;
 
-    const pv = t.cycle(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), t.zs(prov.label), false);
-    if (pv != 0) {
-        ui.d_provider = wrap(ui.d_provider, pv, catalog.providers.len);
-        ui.d_model = 0;
-    }
+    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), prov.label, .provider);
     ly += fh + gap;
-
-    const mv = t.cycle(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), t.zs(prov.models[ui.d_model].label), false);
-    if (mv != 0) ui.d_model = wrap(ui.d_model, mv, prov.models.len);
+    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), prov.models[ui.d_model].label, .model);
     ly += fh + gap;
 
     if (prov.needs_key) {
@@ -563,16 +620,12 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     // right column: knobs
     ui.d_minds = t.stepper(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("MINDS", .{}), ui.d_minds, 1, 5);
     ry += fh + gap;
-    const sv = t.cycle(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("STYLE", .{}), t.zs(catalog.styles[ui.d_style]), false);
-    if (sv != 0) ui.d_style = wrap(ui.d_style, sv, catalog.styles.len);
+    selector(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("STYLE", .{}), catalog.styles[ui.d_style], .style);
     ry += fh + gap;
-    const tv = t.cycle(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("RUNTIME (min, 0=until stopped)", .{}), t.zs(catalog.minutes_lbl[ui.d_minutes]), false);
-    if (tv != 0) ui.d_minutes = wrap(ui.d_minutes, tv, catalog.minutes.len);
+    selector(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("RUNTIME (min, 0=until stopped)", .{}), catalog.minutes_lbl[ui.d_minutes], .minutes);
     ry += fh + gap;
-    const kv = t.cycle(.{ .x = rx, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("STACK", .{}), t.zs(catalog.stacks[ui.d_stack]), false);
-    if (kv != 0) ui.d_stack = wrap(ui.d_stack, kv, catalog.stacks.len);
-    const ov = t.cycle(.{ .x = rx + cw / 2 + 5, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("MODE", .{}), t.zs(catalog.modes[ui.d_mode]), false);
-    if (ov != 0) ui.d_mode = wrap(ui.d_mode, ov, catalog.modes.len);
+    selector(.{ .x = rx, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("STACK", .{}), catalog.stacks[ui.d_stack], .stack);
+    selector(.{ .x = rx + cw / 2 + 5, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("MODE", .{}), catalog.modes[ui.d_mode], .mode);
     ry += fh + gap;
 
     // goal spans full width below the columns
@@ -601,6 +654,116 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     }
     const hint = if (!online) t.z("server offline - start it to deploy", .{}) else if (ui.d_goal.len == 0) t.z("enter a goal", .{}) else t.z("posts to /api/v1/swarms on :{d}", .{portOf(store)});
     t.text(hint, @intFromFloat(x + 214), @intFromFloat(gy + 13), 12, if (ready) t.comment else t.orange);
+
+    // draw the open dropdown LAST so its list sits on top of the fields below it.
+    flushDropdown();
+}
+
+/// A closed dropdown button (label + current value + chevron). Clicking toggles its option list, which is
+/// drawn on top by flushDropdown() after the whole form. `value` is the current selection's display text.
+fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) void {
+    const open = ui.open_dd == kind;
+    t.panelBordered(r, t.bg, if (open) t.blue else t.border);
+    t.text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 6), 11, t.comment);
+    t.textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 20), 14, t.fg, @intFromFloat(r.width - 30));
+    t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 20), @intFromFloat(r.y + 18), 13, if (open) t.blue else t.comment);
+    if (t.hovering(r) and rl.isMouseButtonPressed(.left)) {
+        ui.open_dd = if (open) .none else kind;
+        ui.dd_rect = r;
+    }
+}
+
+/// Render the currently-open dropdown's option list on top of the form and apply a selection.
+fn flushDropdown() void {
+    if (ui.open_dd == .none) return;
+    // Build the option labels + current index for the open kind.
+    var labels: [16][]const u8 = undefined;
+    var count: usize = 0;
+    var current: usize = 0;
+    const prov = &catalog.providers[ui.d_provider];
+    switch (ui.open_dd) {
+        .provider => {
+            for (catalog.providers, 0..) |p, i| {
+                labels[i] = p.label;
+                count += 1;
+            }
+            current = ui.d_provider;
+        },
+        .model => {
+            for (prov.models, 0..) |m, i| {
+                labels[i] = m.label;
+                count += 1;
+            }
+            current = ui.d_model;
+        },
+        .style => {
+            for (catalog.styles, 0..) |s, i| {
+                labels[i] = s;
+                count += 1;
+            }
+            current = ui.d_style;
+        },
+        .minutes => {
+            for (catalog.minutes_lbl, 0..) |s, i| {
+                labels[i] = s;
+                count += 1;
+            }
+            current = ui.d_minutes;
+        },
+        .stack => {
+            for (catalog.stacks, 0..) |s, i| {
+                labels[i] = s;
+                count += 1;
+            }
+            current = ui.d_stack;
+        },
+        .mode => {
+            for (catalog.modes, 0..) |s, i| {
+                labels[i] = s;
+                count += 1;
+            }
+            current = ui.d_mode;
+        },
+        .none => return,
+    }
+    const chosen = drawList(ui.dd_rect, labels[0..count], current);
+    if (chosen) |ci| {
+        switch (ui.open_dd) {
+            .provider => {
+                ui.d_provider = ci;
+                ui.d_model = 0;
+            },
+            .model => ui.d_model = ci,
+            .style => ui.d_style = ci,
+            .minutes => ui.d_minutes = ci,
+            .stack => ui.d_stack = ci,
+            .mode => ui.d_mode = ci,
+            .none => {},
+        }
+        ui.open_dd = .none;
+    }
+}
+
+/// Draw a dropdown option list under `anchor`; returns the clicked index, or null. Clicking outside closes.
+fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
+    const ih: f32 = 30;
+    const shown = @min(labels.len, 9);
+    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 2, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(shown)) + 8 };
+    t.panelBordered(lr, t.bg_dark, t.blue);
+    var yy = lr.y + 4;
+    var clicked: ?usize = null;
+    for (labels, 0..) |lbl, i| {
+        if (i >= shown) break;
+        const ir = t.Rect{ .x = lr.x + 4, .y = yy, .width = lr.width - 8, .height = ih };
+        const hot = t.hovering(ir);
+        if (i == current) t.panel(ir, t.bg_sel) else if (hot) t.panel(ir, t.bg_hl);
+        t.textClip(lbl, @intFromFloat(ir.x + 10), @intFromFloat(ir.y + 8), 13, t.fg, @intFromFloat(ir.width - 16));
+        if (hot and rl.isMouseButtonPressed(.left)) clicked = i;
+        yy += ih;
+    }
+    // click outside the list AND its anchor button closes it
+    if (rl.isMouseButtonPressed(.left) and !t.hovering(lr) and !t.hovering(anchor)) ui.open_dd = .none;
+    return clicked;
 }
 
 fn flabel(x: f32, y: f32, s: [:0]const u8) void {

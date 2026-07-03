@@ -50,6 +50,8 @@ const WindowsTray = struct {
     const NIM_ADD: u32 = 0;
     const NIM_MODIFY: u32 = 1;
     const NIM_DELETE: u32 = 2;
+    const NIM_SETVERSION: u32 = 4;
+    const NOTIFYICON_VERSION_4: u32 = 4;
     const NIF_MESSAGE: u32 = 0x01;
     const NIF_ICON: u32 = 0x02;
     const NIF_TIP: u32 = 0x04;
@@ -154,6 +156,12 @@ const WindowsTray = struct {
         self.nid.hIcon = LoadIconW(null, IDI_APPLICATION);
         utf16z(&self.nid.szTip, title);
         self.live = Shell_NotifyIconW(NIM_ADD, &self.nid) != 0;
+        if (self.live) {
+            // Adopt the modern (v4) behavior contract — without SETVERSION the callback + balloon
+            // semantics vary by shell and the icon can misbehave on Win10/11.
+            self.nid.uVersionOrTimeout = NOTIFYICON_VERSION_4;
+            _ = Shell_NotifyIconW(NIM_SETVERSION, &self.nid);
+        }
         return self.live;
     }
     fn deinit(self: *WindowsTray) void {

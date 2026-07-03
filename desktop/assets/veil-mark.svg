@@ -1,17 +1,15 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="veil mark">
-  <!-- nl-veil mark: a hooded shadow-figure on a Tokyo Night tile. Matches the procedural mark drawn in
-       the app title bar (theme.drawMark) and the CLI's shadow-figure. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="veil agent mark">
+  <!-- nl-veil mark: a shadow-agent bust (head + broad shoulders) — the "person/agent" silhouette, matched
+       to theme.drawMark. NOT a padlock. -->
   <defs>
-    <linearGradient id="cloak" x1="0" y1="0" x2="0" y2="1">
+    <linearGradient id="fig" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#bb9af7"/>
       <stop offset="1" stop-color="#7aa2f7"/>
     </linearGradient>
   </defs>
   <rect x="4" y="4" width="120" height="120" rx="28" fill="#1f2335" stroke="#292e42" stroke-width="2"/>
-  <!-- cloak/shoulders -->
-  <path d="M64 40 L104 108 Q64 96 24 108 Z" fill="url(#cloak)"/>
-  <!-- hooded head -->
-  <circle cx="64" cy="46" r="20" fill="url(#cloak)"/>
-  <!-- shadowed face void -->
-  <circle cx="64" cy="46" r="11" fill="#16161e"/>
+  <!-- shoulders / cloak: broad rounded mound -->
+  <rect x="24" y="70" width="80" height="42" rx="20" fill="url(#fig)"/>
+  <!-- head -->
+  <circle cx="64" cy="52" r="24" fill="url(#fig)"/>
 </svg>
