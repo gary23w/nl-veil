@@ -27,7 +27,7 @@ const WIN_H = 820;
 const TITLE_H = 30;
 const TAB_H = 34;
 
-const InnerTab = enum { console, details };
+const InnerTab = enum { console, details, files };
 const DdKind = enum { none, provider, model, style, minutes, stack, mode };
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
@@ -50,6 +50,14 @@ const Ui = struct {
     d_mode: usize = 0,
     d_population: bool = false,
     d_encrypt: bool = false,
+    // RSI dials (mirror the deploy wizard's swarm.json knobs)
+    d_autonomy_full: bool = true,
+    d_internet: bool = true,
+    d_gap: bool = true,
+    d_breakout: bool = false,
+    d_psyche: bool = false,
+    // Files tab view state
+    file_scroll: f32 = 0,
     // deploy dropdowns
     open_dd: DdKind = .none,
     dd_rect: t.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
@@ -340,14 +348,22 @@ fn drawResizeGrip() void {
 
 // -------------------------------------------------------------------------------- setup
 
-// ASCII (32..126) plus the punctuation that shows up in swarm GOAL text (en/em dash, curly quotes,
-// ellipsis, arrow, bullet, middle dot). Without these, non-ASCII bytes in the run data render as tofu.
+// ASCII 32..126, PLUS the full Latin-1 supplement (0xA0..0xFF) and the General-Punctuation dashes/quotes.
+// The run data (LLM-authored goals) is littered with these and they were rendering as '?': "World?Bank"
+// was a non-breaking space (0xA0), "per?capita" a non-breaking hyphen (0x2011). Requesting the real
+// codepoints from the TTF makes them render as the proper space/dash instead of tofu.
 const glyph_set = blk: {
-    const extra = [_]i32{ 0x00B7, 0x2013, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026, 0x2192, 0x25CF, 0x25CB, 0x2022 };
-    var arr: [95 + extra.len]i32 = undefined;
+    const extra = [_]i32{ 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x2192, 0x25CF, 0x25CB };
+    const latin1 = 0xFF - 0xA0 + 1; // 0xA0..0xFF inclusive
+    var arr: [95 + latin1 + extra.len]i32 = undefined;
     var i: usize = 0;
     var c: i32 = 32;
     while (c <= 126) : (c += 1) {
+        arr[i] = c;
+        i += 1;
+    }
+    c = 0xA0;
+    while (c <= 0xFF) : (c += 1) {
         arr[i] = c;
         i += 1;
     }
@@ -622,8 +638,12 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
         t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
         const name_c = if (deleting) t.comment else t.fg;
-        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 13, name_c, @intFromFloat(rr.width - 236));
-        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 23), 12, t.comment, @intFromFloat(rr.width - 236));
+        // Reserve only ~124px on the right for the round/status columns. The old 236 reserve left the
+        // name ~22px in the narrow (270px) swarm-tab panel → "sw.." — unreadable. This keeps the name
+        // wide in both the wide dashboard row and the narrow side panel while clearing the right block.
+        const name_w: f32 = @max(48, rr.width - 124);
+        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 14, name_c, @intFromFloat(name_w));
+        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 24), 12, t.comment, @intFromFloat(name_w));
         // ✕ delete button (right edge, on row hover)
         const xb = t.Rect{ .x = rr.x + rr.width - 26, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
         if (deleting) {
@@ -709,12 +729,29 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 54 }, &ui.d_goal, ui.focus == .d_goal, "one line: what should the hive build or research?", .d_goal);
     gy += 78;
 
-    // gateway + toggles row
+    // gateway
     flabel(x, gy, "GATEWAY MODEL (optional - cheap model for mechanical calls)");
-    textField(.{ .x = x, .y = gy + 14, .width = cw, .height = 32 }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
-    if (t.checkbox(.{ .x = rx, .y = gy + 14, .width = cw / 2, .height = 32 }, t.z("living hive", .{}), ui.d_population)) ui.d_population = !ui.d_population;
-    if (t.checkbox(.{ .x = rx + cw / 2, .y = gy + 14, .width = cw / 2, .height = 32 }, t.z("encrypt memory", .{}), ui.d_encrypt)) ui.d_encrypt = !ui.d_encrypt;
-    gy += 58;
+    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 32 }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
+    gy += 56;
+
+    // RSI DIALS — the same knobs the deploy wizard writes into swarm.json. Omitting these is what made a
+    // desktop-deployed swarm behave differently from a wizard one (breakout / psyche / living-hive OFF).
+    flabel(x, gy, "RSI DIALS");
+    gy += 18;
+    const tcw = (colw - 3 * 8) / 4;
+    const c0 = x;
+    const c1 = x + (tcw + 8);
+    const c2 = x + 2 * (tcw + 8);
+    const c3 = x + 3 * (tcw + 8);
+    if (t.checkbox(.{ .x = c0, .y = gy, .width = tcw, .height = 30 }, t.z("full autonomy", .{}), ui.d_autonomy_full)) ui.d_autonomy_full = !ui.d_autonomy_full;
+    if (t.checkbox(.{ .x = c1, .y = gy, .width = tcw, .height = 30 }, t.z("internet research", .{}), ui.d_internet)) ui.d_internet = !ui.d_internet;
+    if (t.checkbox(.{ .x = c2, .y = gy, .width = tcw, .height = 30 }, t.z("gap audit", .{}), ui.d_gap)) ui.d_gap = !ui.d_gap;
+    if (t.checkbox(.{ .x = c3, .y = gy, .width = tcw, .height = 30 }, t.z("breakout", .{}), ui.d_breakout)) ui.d_breakout = !ui.d_breakout;
+    gy += 34;
+    if (t.checkbox(.{ .x = c0, .y = gy, .width = tcw, .height = 30 }, t.z("living hive", .{}), ui.d_population)) ui.d_population = !ui.d_population;
+    if (t.checkbox(.{ .x = c1, .y = gy, .width = tcw, .height = 30 }, t.z("observe psyche", .{}), ui.d_psyche)) ui.d_psyche = !ui.d_psyche;
+    if (t.checkbox(.{ .x = c2, .y = gy, .width = tcw, .height = 30 }, t.z("encrypt memory", .{}), ui.d_encrypt)) ui.d_encrypt = !ui.d_encrypt;
+    gy += 42;
 
     // deploy button
     const online = blk: {
@@ -865,8 +902,10 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     var w = std.Io.Writer.fixed(&b);
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
-    w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"api_key\":\"", .{
-        prov.key, prov.models[ui.d_model].id, catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode], prov.base_url, catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt), boolStr(ui.d_population),
+    w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
+        prov.key,                    prov.models[ui.d_model].id, catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
+        prov.base_url,               catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),   boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
+        boolStr(ui.d_internet),      boolStr(ui.d_gap),          boolStr(ui.d_breakout),    boolStr(ui.d_psyche),
     }) catch return;
     jesc(&w, ui.d_key.str());
     w.writeAll("\",\"gateway_model\":\"") catch return;
@@ -924,6 +963,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     // friendly name for the header (look up the selected swarm in the roster)
     var title: [64]u8 = undefined;
     var title_n: usize = 0;
+    var sel_live = false;
     {
         var i: usize = 0;
         while (i < store.swarm_count) : (i += 1) {
@@ -931,6 +971,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
                 const nm = store.swarms[i].nameStr();
                 title_n = @min(nm.len, title.len);
                 @memcpy(title[0..title_n], nm[0..title_n]);
+                sel_live = store.swarms[i].live;
                 break;
             }
         }
@@ -949,10 +990,12 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     }
 
     var y = body.y + pad;
-    t.textClip(title[0..title_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - 200));
-    // inner tabs (Console / Details)
-    const it_console = t.Rect{ .x = rx + rw - 190, .y = y - 2, .width = 92, .height = 24 };
-    const it_details = t.Rect{ .x = rx + rw - 94, .y = y - 2, .width = 92, .height = 24 };
+    t.textClip(title[0..title_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - 296));
+    // inner tabs (Files / Console / Details) — right-aligned in the header row
+    const it_files = t.Rect{ .x = rx + rw - 288, .y = y - 2, .width = 92, .height = 24 };
+    const it_console = t.Rect{ .x = rx + rw - 192, .y = y - 2, .width = 92, .height = 24 };
+    const it_details = t.Rect{ .x = rx + rw - 96, .y = y - 2, .width = 92, .height = 24 };
+    if (t.tab(it_files, t.z("Files", .{}), ui.inner == .files)) ui.inner = .files;
     if (t.tab(it_console, t.z("Console", .{}), ui.inner == .console)) ui.inner = .console;
     if (t.tab(it_details, t.z("Details", .{}), ui.inner == .details)) ui.inner = .details;
     y += 30;
@@ -963,8 +1006,9 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     const panel_bottom = body.y + body.height - pad - chat_h - 8 - ctrl_h - 8;
     const panel = t.Rect{ .x = rx, .y = y, .width = rw, .height = panel_bottom - y };
     switch (ui.inner) {
-        .console => drawConsole(panel, evs[0..ev_n]),
+        .console => drawConsole(panel, evs[0..ev_n], sel_live),
         .details => drawDetails(panel, m),
+        .files => drawFiles(store, panel),
     }
 
     var cy = panel.y + panel.height + 8;
@@ -1024,11 +1068,11 @@ fn scoreColor(pct: i32) t.Color {
     return if (pct >= 100) t.green else if (pct >= 50) t.cyan else if (pct >= 0) t.yellow else t.comment;
 }
 
-fn drawConsole(r: t.Rect, evs: []const scan.Ev) void {
+fn drawConsole(r: t.Rect, evs: []const scan.Ev, live: bool) void {
     t.panelBordered(r, t.bg_dark, t.border);
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
     defer rl.endScissorMode();
-    const line_h: f32 = 19;
+    const line_h: f32 = 21;
     const visible: usize = @intFromFloat((r.height - 12) / line_h);
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(r)) {
@@ -1048,18 +1092,120 @@ fn drawConsole(r: t.Rect, evs: []const scan.Ev) void {
     }
     var yy: f32 = r.y + 8;
     var i: usize = start;
-    // Monospace + fixed pixel columns so round / mind / text line up like a real log. Sizes bumped for
-    // readability (13px mono).
+    // Monospace + fixed pixel columns so round / mind / text line up like a real log. 14px + brighter
+    // body color (fg vs fg_dim) — the console read as "very hard to read" at 13px dim.
     while (i < evs.len and yy < r.y + r.height - 4) : (i += 1) {
         const e = &evs[i];
         const kc = kindColor(e.kindStr());
-        if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), 13, t.comment);
+        if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), 14, t.comment);
         const mind = e.mindStr();
-        if (mind.len > 0) t.textMonoClip(mind, @intFromFloat(r.x + 52), @intFromFloat(yy), 13, kc, 72);
-        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 134), @intFromFloat(yy), 13, t.fg_dim, @intFromFloat(r.width - 144));
+        if (mind.len > 0) t.textMonoClip(mind, @intFromFloat(r.x + 54), @intFromFloat(yy), 14, kc, 78);
+        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 142), @intFromFloat(yy), 14, t.fg, @intFromFloat(r.width - 152));
         yy += line_h;
     }
-    if (evs.len == 0) t.text(t.z("no events yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 12), 13, t.comment);
+    if (evs.len == 0) {
+        // Distinguish "just launched, worker still booting" from "idle/empty". A local model cold-starts
+        // slowly (the 20B has to load), so the setup phase can show nothing for a minute — say so.
+        if (live) {
+            t.text(t.z("starting worker...", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 14, t.cyan);
+            t.text(t.z("waiting for the first events - a local model may be loading (cold-starts are slow); this can take a minute", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 38), 12, t.comment);
+        } else {
+            t.text(t.z("no events yet", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------- files (swarm outputs)
+
+/// The Files inner tab: a two-pane viewer over the swarm's build workdir — the file list on the left
+/// (from .build_manifest), the selected file's content on the right (mono, scrollable). This is where the
+/// user sees + inspects what the hive is actually producing. Clicking a file asks the poller to load it.
+fn drawFiles(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const list_w: f32 = @min(280, r.width * 0.38);
+    t.fillRect(@intFromFloat(r.x + list_w), @intFromFloat(r.y + 1), 1, @intFromFloat(r.height - 2), t.border);
+
+    store.lock();
+    const nfiles = store.file_count;
+    var files: [scan.MAX_FILES]scan.FileRow = undefined;
+    @memcpy(files[0..nfiles], store.files[0..nfiles]);
+    var selfile: [128]u8 = undefined;
+    const sfl = store.sel_file_len;
+    @memcpy(selfile[0..sfl], store.sel_file[0..sfl]);
+    const cl = store.file_content_len;
+    var content: [1 << 14]u8 = undefined;
+    @memcpy(content[0..cl], store.file_content[0..cl]);
+    const trunc = store.file_content_trunc;
+    store.unlock();
+
+    // ---- left: file list ----
+    {
+        rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(list_w - 2), @intFromFloat(r.height - 2));
+        defer rl.endScissorMode();
+        if (nfiles == 0) {
+            t.text(t.z("no files yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 12), 13, t.comment);
+        }
+        var yy: f32 = r.y + 6;
+        const row_h: f32 = 30;
+        var i: usize = 0;
+        while (i < nfiles and yy < r.y + r.height - 4) : (i += 1) {
+            const f = &files[i];
+            const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = list_w - 10, .height = row_h - 4 };
+            const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
+            const hot = t.hovering(rr);
+            if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+            t.textClip(f.pathStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 3), 13, if (is_sel) t.fg else t.fg_dim, @intFromFloat(rr.width - 62));
+            t.textMono(fmtSize(f.size), @intFromFloat(rr.x + rr.width - 50), @intFromFloat(rr.y + 4), 11, t.comment);
+            if (hot and rl.isMouseButtonPressed(.left)) {
+                store.pushCmd(store_mod.mkCmd(.open_file, "", f.pathStr()));
+                ui.file_scroll = 0;
+            }
+            yy += row_h;
+        }
+    }
+
+    // ---- right: content ----
+    const cx = r.x + list_w + 12;
+    const cw = r.width - list_w - 20;
+    if (sfl == 0) {
+        t.text(t.z("select a file to view its contents", .{}), @intFromFloat(cx), @intFromFloat(r.y + 14), 13, t.comment);
+        return;
+    }
+    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(r.y + 10), 13, t.cyan, @intFromFloat(cw - 120));
+    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(r.y + 11), 11, t.orange);
+    const view = t.Rect{ .x = cx, .y = r.y + 30, .width = cw, .height = r.height - 40 };
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    const line_h: f32 = 17;
+    const visible: usize = @intFromFloat(view.height / line_h);
+    // count lines for scroll clamp
+    var total_lines: usize = 1;
+    for (content[0..cl]) |ch| {
+        if (ch == '\n') total_lines += 1;
+    }
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.file_scroll -= wheel * 3;
+    if (ui.file_scroll < 0) ui.file_scroll = 0;
+    const maxs: f32 = if (total_lines > visible) @floatFromInt(total_lines - visible) else 0;
+    if (ui.file_scroll > maxs) ui.file_scroll = maxs;
+    const skip: usize = @intFromFloat(ui.file_scroll);
+    var yy: f32 = view.y;
+    var it = std.mem.splitScalar(u8, content[0..cl], '\n');
+    var ln: usize = 0;
+    while (it.next()) |line| : (ln += 1) {
+        if (ln < skip) continue;
+        if (yy > view.y + view.height - line_h) break;
+        t.textMonoClip(line, @intFromFloat(view.x + 2), @intFromFloat(yy), 13, t.fg_dim, @intFromFloat(view.width - 6));
+        yy += line_h;
+    }
+    if (cl == 0) t.text(t.z("(empty or still being written)", .{}), @intFromFloat(view.x + 2), @intFromFloat(view.y), 12, t.comment);
+}
+
+/// Compact human byte size for the file list ("824b" / "12k" / "3.4M").
+fn fmtSize(sz: u64) [:0]const u8 {
+    if (sz < 1024) return t.z("{d}b", .{sz});
+    if (sz < 1024 * 1024) return t.z("{d}k", .{sz / 1024});
+    return t.z("{d}.{d}M", .{ sz / (1024 * 1024), (sz % (1024 * 1024)) / (105 * 1024) });
 }
 
 fn kindColor(kind: []const u8) t.Color {

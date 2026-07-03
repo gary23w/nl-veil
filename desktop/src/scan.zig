@@ -9,6 +9,17 @@ const Io = std.Io;
 
 pub const MAX_LOG = 400; // ring of the most-recent event lines held for the log console
 pub const MAX_SWARMS = 64;
+pub const MAX_FILES = 64; // built files listed in the Files tab
+
+/// One file a swarm has built, for the Files tab. Path is relative to the swarm's work/ dir.
+pub const FileRow = struct {
+    path: [128]u8 = [_]u8{0} ** 128,
+    path_len: u8 = 0,
+    size: u64 = 0,
+    pub fn pathStr(f: *const FileRow) []const u8 {
+        return f.path[0..f.path_len];
+    }
+};
 
 /// One parsed line of a swarm's events.jsonl, reduced to what the console + metrics need.
 pub const Ev = struct {
@@ -375,6 +386,80 @@ fn readGoalBrief(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, name: []c
     setBuf(&s.goal, &s.goal_len, t);
 }
 
+/// List the files a swarm has built — the Files tab's data. Reads <data>/<rel>/.build_manifest, whose
+/// lines are "path|bytes|valve" (the same file the server's swarmFiles handler reads); de-dups repeated
+/// paths keeping the latest size. Falls back to walking work/ (one level) when there's no manifest yet
+/// (early in a run). `rel` is the swarm path relative to data_dir. Returns count written into `out`.
+pub fn listWorkFiles(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, out: []FileRow) usize {
+    var n: usize = 0;
+    const mp = std.fmt.allocPrint(gpa, "{s}/{s}/.build_manifest", .{ data_dir, rel }) catch return 0;
+    defer gpa.free(mp);
+    if (Io.Dir.cwd().readFileAlloc(io, mp, gpa, .limited(256 << 10))) |data| {
+        defer gpa.free(data);
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |raw| {
+            if (n >= out.len) break;
+            const ln = std.mem.trim(u8, raw, " \r\t");
+            if (ln.len == 0) continue;
+            const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
+            const path = ln[0..bar];
+            if (path.len == 0) continue;
+            const rest = ln[bar + 1 ..];
+            const bar2 = std.mem.indexOfScalar(u8, rest, '|') orelse rest.len;
+            const size = std.fmt.parseInt(u64, std.mem.trim(u8, rest[0..bar2], " \r\t"), 10) catch 0;
+            var found = false;
+            var k: usize = 0;
+            while (k < n) : (k += 1) {
+                if (std.mem.eql(u8, out[k].path[0..out[k].path_len], path)) {
+                    out[k].size = size;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+            var f: FileRow = .{ .size = size };
+            const pn = @min(path.len, f.path.len);
+            @memcpy(f.path[0..pn], path[0..pn]);
+            f.path_len = @intCast(pn);
+            out[n] = f;
+            n += 1;
+        }
+        if (n > 0) return n;
+    } else |_| {}
+    // fallback: walk work/ names (flat) when the manifest isn't written yet
+    const wp = std.fmt.allocPrint(gpa, "{s}/{s}/work", .{ data_dir, rel }) catch return n;
+    defer gpa.free(wp);
+    var wd = Io.Dir.cwd().openDir(io, wp, .{ .iterate = true }) catch return n;
+    defer wd.close(io);
+    var wit = wd.iterate();
+    while (n < out.len) {
+        const e = (wit.next(io) catch break) orelse break;
+        if (e.kind != .file or e.name.len == 0 or e.name[0] == '.') continue;
+        var f: FileRow = .{};
+        const pn = @min(e.name.len, f.path.len);
+        @memcpy(f.path[0..pn], e.name[0..pn]);
+        f.path_len = @intCast(pn);
+        out[n] = f;
+        n += 1;
+    }
+    return n;
+}
+
+/// Read a built file's content for the Files viewer, from <data>/<rel>/work/<sub>. Copies up to out.len
+/// bytes; sets trunc if the file was larger. Rejects absolute/escape paths. Returns bytes copied.
+pub fn readWorkFile(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, sub: []const u8, out: []u8, trunc: *bool) usize {
+    trunc.* = false;
+    if (sub.len == 0 or sub[0] == '/' or sub[0] == '\\' or std.mem.indexOf(u8, sub, "..") != null) return 0;
+    const fp = std.fmt.allocPrint(gpa, "{s}/{s}/work/{s}", .{ data_dir, rel, sub }) catch return 0;
+    defer gpa.free(fp);
+    const data = Io.Dir.cwd().readFileAlloc(io, fp, gpa, .limited(2 << 20)) catch return 0;
+    defer gpa.free(data);
+    const n = @min(data.len, out.len);
+    @memcpy(out[0..n], data[0..n]);
+    if (data.len > out.len) trunc.* = true;
+    return n;
+}
+
 /// TCP-probe 127.0.0.1:port — the "server online" signal for the tray + dashboard. Connect-and-close; a
 /// dead local port refuses immediately, so no timeout is needed (and this Zig's Windows connect panics on
 /// a timeout option — .none is the only portable choice).
@@ -421,6 +506,29 @@ test "parseEv composes readable lines and foldMetrics accumulates" {
     try std.testing.expect(m.gradient_warn);
     try std.testing.expect(m.stopped);
     try std.testing.expectEqualStrings("done", m.stop_reason[0..m.stop_reason_len]);
+}
+
+test "listWorkFiles parses a .build_manifest and de-dups to latest size" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const rel = "zig-scan-tmp"; // under the desktop project dir (test cwd), not the user's data
+    _ = Io.Dir.cwd().createDirPathStatus(io, rel, .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, rel) catch {};
+    // "path|bytes|valve" lines; app.py appears twice — the later (bigger) size must win, one row only.
+    const mani = "app.py|1024|valve\nutils/helpers.py|512|\napp.py|2048|edit\n";
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-scan-tmp/.build_manifest", .data = mani }) catch {};
+    var out: [MAX_FILES]FileRow = undefined;
+    const n = listWorkFiles(io, std.testing.allocator, ".", rel, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    var app_sz: u64 = 0;
+    var saw_helpers = false;
+    for (out[0..n]) |*f| {
+        if (std.mem.eql(u8, f.pathStr(), "app.py")) app_sz = f.size;
+        if (std.mem.eql(u8, f.pathStr(), "utils/helpers.py")) saw_helpers = true;
+    }
+    try std.testing.expectEqual(@as(u64, 2048), app_sz);
+    try std.testing.expect(saw_helpers);
 }
 
 test "jsonStr unescapes and jsonInt reads negatives" {

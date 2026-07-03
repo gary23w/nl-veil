@@ -44,7 +44,7 @@ pub const providers = [_]Provider{
     } },
 };
 
-pub const styles = [_][]const u8{ "build", "build_use", "investigate", "debate" };
+pub const styles = [_][]const u8{ "auto", "build", "build_use", "investigate", "debate" };
 pub const stacks = [_][]const u8{ "general", "static", "node" };
 pub const modes = [_][]const u8{ "continuous", "checkpoint", "refine" };
 pub const minutes = [_]u32{ 0, 5, 15, 30, 60 };

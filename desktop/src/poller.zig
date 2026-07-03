@@ -32,6 +32,8 @@ pub const Poller = struct {
     // scratch (poller-owned)
     swarm_scratch: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
     ev_scratch: [scan.MAX_LOG]scan.Ev = undefined,
+    file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
+    fc_scratch: [1 << 14]u8 = undefined, // selected-file content read buffer
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -86,6 +88,7 @@ pub const Poller = struct {
                 .deploy => self.doDeploy(c.textStr()),
                 .delete => self.doDelete(dd, c.idStr()),
                 .open_folder => self.doOpenFolder(dd),
+                .open_file => self.setSelFile(c.textStr()),
             }
         }
     }
@@ -97,6 +100,21 @@ pub const Poller = struct {
         @memcpy(self.store.selected[0..n], id[0..n]);
         self.store.selected_len = @intCast(n);
         self.store.event_count = 0; // force a fresh tail on next refresh
+        // clear the previous swarm's file view so it doesn't bleed across selections
+        self.store.file_count = 0;
+        self.store.sel_file_len = 0;
+        self.store.file_content_len = 0;
+    }
+
+    /// Files tab: remember which file the viewer is showing; refresh() re-reads it each pass so a live
+    /// build's file updates as it grows.
+    fn setSelFile(self: *Poller, sub: []const u8) void {
+        self.store.lock();
+        defer self.store.unlock();
+        const n = @min(sub.len, self.store.sel_file.len);
+        @memcpy(self.store.sel_file[0..n], sub[0..n]);
+        self.store.sel_file_len = @intCast(n);
+        self.store.file_content_len = 0; // force a re-read next refresh
     }
 
     fn doControl(self: *Poller, dd: []const u8, id: []const u8, op: []const u8, text: []const u8, goal: []const u8) void {
@@ -307,12 +325,27 @@ pub const Poller = struct {
         }
         var ev_n: usize = 0;
         var metrics: scan.Metrics = .{};
+        var file_n: usize = 0;
+        var fc_len: usize = 0;
+        var fc_trunc = false;
         if (sel_len > 0) {
             const ep = std.fmt.allocPrint(self.gpa, "{s}/{s}/events.jsonl", .{ dd, selbuf[0..sel_len] }) catch "";
             if (ep.len > 0) {
                 defer self.gpa.free(ep);
                 ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &metrics);
             }
+            // Files tab: list built files, and (if one is open) re-read its content.
+            file_n = scan.listWorkFiles(self.io, self.gpa, dd, selbuf[0..sel_len], &self.file_scratch);
+            var selfile: [128]u8 = undefined;
+            var selfile_len: usize = 0;
+            {
+                self.store.lock();
+                selfile_len = self.store.sel_file_len;
+                @memcpy(selfile[0..selfile_len], self.store.sel_file[0..selfile_len]);
+                self.store.unlock();
+            }
+            if (selfile_len > 0)
+                fc_len = scan.readWorkFile(self.io, self.gpa, dd, selbuf[0..sel_len], selfile[0..selfile_len], &self.fc_scratch, &fc_trunc);
         }
 
         // 4) publish under lock
@@ -333,6 +366,11 @@ pub const Poller = struct {
                 @memcpy(self.store.events[0..ev_n], self.ev_scratch[0..ev_n]);
                 self.store.event_count = ev_n;
                 self.store.metrics = metrics;
+                @memcpy(self.store.files[0..file_n], self.file_scratch[0..file_n]);
+                self.store.file_count = file_n;
+                @memcpy(self.store.file_content[0..fc_len], self.fc_scratch[0..fc_len]);
+                self.store.file_content_len = fc_len;
+                self.store.file_content_trunc = fc_trunc;
             }
             self.store.last_refresh_s = now_s;
             self.store.unlock();
