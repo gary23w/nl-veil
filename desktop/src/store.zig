@@ -27,7 +27,7 @@ pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, refresh_no
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
     kind: CmdKind = .none,
-    id: [64]u8 = [_]u8{0} ** 64,
+    id: [96]u8 = [_]u8{0} ** 96, // swarm path relative to data dir ("name" or "u1/<hexid>")
     id_len: u8 = 0,
     text: [3200]u8 = [_]u8{0} ** 3200, // holds the full deploy-body JSON, not just a goal line
     text_len: u16 = 0,
@@ -95,7 +95,7 @@ pub const Store = struct {
     swarm_count: usize = 0,
 
     // --- selected swarm detail (poller writes when selection set) ---
-    selected: [64]u8 = [_]u8{0} ** 64,
+    selected: [96]u8 = [_]u8{0} ** 96,
     selected_len: u8 = 0,
     events: [scan.MAX_LOG]scan.Ev = undefined,
     event_count: usize = 0,

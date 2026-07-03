@@ -68,19 +68,26 @@ pub fn zs(s: []const u8) [:0]const u8 {
     return b[0..n :0];
 }
 
-// The loaded UI font (a real TTF, loaded at startup). Until then, fall back to raylib's default so early
-// frames still render. Drawing goes through drawTextEx so it uses the TTF's kerning + antialiasing.
+// The loaded fonts (real TTFs, loaded at startup). `ui_font` is proportional (labels, buttons, headers);
+// `mono_font` is fixed-width for the log console so its columns line up. Until set, fall back to raylib's
+// default. Drawing goes through drawTextEx for kerning + antialiasing.
 var ui_font: ?rl.Font = null;
-var loaded = false;
+var mono_font: ?rl.Font = null;
 pub fn setFont(f: rl.Font) void {
     ui_font = f;
-    loaded = true;
+}
+pub fn setMono(f: rl.Font) void {
+    mono_font = f;
 }
 fn theFont() rl.Font {
     return ui_font orelse (rl.getFontDefault() catch unreachable);
 }
+fn theMono() rl.Font {
+    return mono_font orelse theFont();
+}
+// Minimal extra tracking — a real TTF already carries its own advances; too much spacing hurts readability.
 fn spacingFor(size: i32) f32 {
-    return @max(0.5, @as(f32, @floatFromInt(size)) / 18.0);
+    return @max(0.3, @as(f32, @floatFromInt(size)) / 28.0);
 }
 
 pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
@@ -89,6 +96,26 @@ pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
 
 pub fn measure(s: [:0]const u8, size: i32) i32 {
     return @intFromFloat(rl.measureTextEx(theFont(), s, @floatFromInt(size), spacingFor(size)).x);
+}
+
+/// Monospace draw (log console) — fixed advances so aligned columns actually align.
+pub fn textMono(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
+    rl.drawTextEx(theMono(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, @floatFromInt(size), 0.5, c);
+}
+pub fn measureMono(s: [:0]const u8, size: i32) i32 {
+    return @intFromFloat(rl.measureTextEx(theMono(), s, @floatFromInt(size), 0.5).x);
+}
+/// Monospace clip helper for the console.
+pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {
+    const b = nextBuf();
+    var n = @min(s.len, b.len - 1);
+    @memcpy(b[0..n], s[0..n]);
+    b[n] = 0;
+    while (n > 1 and measureMono(b[0..n :0], size) > max_w) {
+        n -= 1;
+        b[n] = 0;
+    }
+    textMono(b[0..n :0], x, y, size, c);
 }
 
 /// Left-aligned label, clipped to max_w px with an ellipsis — the workhorse for rows that must not overflow.
@@ -153,8 +180,8 @@ pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
     rl.drawRectangleRounded(r, 0.14, 6, fill);
     if (hot) rl.drawRectangleRoundedLinesEx(r, 0.14, 6, 1.0, accent);
     const tc = if (!enabled) comment else if (hot) accent else fg;
-    const tw = rl.measureText(label, 13);
-    rl.drawText(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 13) / 2), 13, tc);
+    const tw = measure(label, 14); // the loaded TTF — NOT raylib's blocky default (the "ugly button font")
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 14) / 2), 14, tc);
     return enabled and mouse.over(r) and rl.isMouseButtonPressed(.left);
 }
 
@@ -168,8 +195,8 @@ pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
         rl.drawRectangleRounded(r, 0.18, 6, withAlpha(bg_hl, 160));
     }
     const c = if (active) fg else if (hot) fg_dim else comment;
-    const tw = measure(label, 13);
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 13) / 2), 13, c);
+    const tw = measure(label, 14);
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 14) / 2), 14, c);
     return mouse.over(r) and rl.isMouseButtonPressed(.left);
 }
 
@@ -205,8 +232,8 @@ pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
 /// option sets (provider, style, minutes, mode) without a floating list.
 pub fn cycle(r: Rect, label: [:0]const u8, value: [:0]const u8, focused: bool) i32 {
     panelBordered(r, bg, if (focused) blue else border);
-    text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 5), 10, comment);
-    textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 18), 13, fg, @intFromFloat(r.width - 44));
+    text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 6), 11, comment);
+    textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 20), 14, fg, @intFromFloat(r.width - 44));
     // chevrons
     const hot = mouse.over(r);
     text(z("<", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(r.y + 13), 14, if (hot) blue else comment);
@@ -221,8 +248,8 @@ pub fn cycle(r: Rect, label: [:0]const u8, value: [:0]const u8, focused: bool) i
 pub fn checkbox(r: Rect, label: [:0]const u8, on: bool) bool {
     const box = Rect{ .x = r.x, .y = r.y + (r.height - 18) / 2, .width = 18, .height = 18 };
     panelBordered(box, if (on) withAlpha(green, 60) else bg, if (on) green else border);
-    if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 13, green);
-    text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 12) / 2), 12, fg_dim);
+    if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 14, green);
+    text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, fg_dim);
     return mouse.over(r) and rl.isMouseButtonPressed(.left);
 }
 
