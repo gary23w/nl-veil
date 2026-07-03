@@ -1,0 +1,19 @@
+.{
+    .name = .veil_desk,
+    .version = "0.1.0",
+    .fingerprint = 0x2ca6559e582613b,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // raylib-zig moved from Not-Nik/raylib-zig to its own org (the old repo's build banner says so);
+        // the org devel branch is the line that tracks current Zig (0.16).
+        .raylib_zig = .{
+            .url = "git+https://github.com/raylib-zig/raylib-zig#97be2c7ae646a2f09856604b138c427c0af1b952",
+            .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
