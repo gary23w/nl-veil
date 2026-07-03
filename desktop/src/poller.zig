@@ -9,6 +9,7 @@ const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const netcli = @import("netcli.zig");
+const log = @import("log.zig");
 
 const Store = store_mod.Store;
 
@@ -17,6 +18,7 @@ pub const Poller = struct {
     gpa: std.mem.Allocator,
     store: *Store,
     stop: std.atomic.Value(bool) = .init(false),
+    log_buf: std.ArrayListUnmanaged(u8) = .empty,
 
     // transition memory for notifications (poller-local, no lock needed)
     prev_online: bool = false,
@@ -122,7 +124,10 @@ pub const Poller = struct {
 
     fn doDeploy(self: *Poller, body: []const u8) void {
         // `body` is the complete DeployReq JSON built by the UI (Deploy form). Post it verbatim.
-        if (body.len == 0) return;
+        if (body.len == 0) {
+            log.err("deploy: EMPTY body (submitDeploy built nothing — buffer overflow or bad state)", .{});
+            return;
+        }
         var tbuf: [128]u8 = undefined;
         var tlen: usize = 0;
         {
@@ -132,11 +137,15 @@ pub const Poller = struct {
             @memcpy(tbuf[0..tlen], t[0..tlen]);
             self.store.unlock();
         }
+        log.info("deploy: POST body={d}b token={d}b port={d}", .{ body.len, tlen, self.port() });
+        log.dbg("deploy body: {s}", .{body[0..@min(body.len, 200)]});
         const resp = netcli.deploy(self.io, self.gpa, self.port(), tbuf[0..tlen], body) orelse {
+            log.err("deploy: netcli returned NO RESPONSE (client/connect failed)", .{});
             self.store.pushNotif("Deploy failed", "server unreachable — is it running?", 2);
             return;
         };
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        log.info("deploy: status={d} resp={s}", .{ resp.status, resp.body[0..@min(resp.body.len, 160)] });
         if (resp.status == 200 or resp.status == 201) {
             self.store.pushNotif("Swarm deploying", "the server accepted the deploy", 1);
         } else if (resp.status == 401 or resp.status == 403) {
@@ -165,6 +174,7 @@ pub const Poller = struct {
                 self.store.unlock();
             }
             const resp = netcli.delete(self.io, self.gpa, self.port(), tbuf[0..tlen], base);
+            log.info("delete {s} basename={s} status={d} token={d}b", .{ rel, base, if (resp) |r| r.status else 0, tlen });
             if (resp) |r| {
                 defer if (r.body.len > 0) self.gpa.free(r.body);
                 if (r.status == 200 or r.status == 204) {
@@ -211,6 +221,7 @@ pub const Poller = struct {
             const n = @min(key.len, self.store.settings.token.len);
             @memcpy(self.store.settings.token[0..n], key[0..n]);
             self.store.settings.token_len = @intCast(n);
+            log.info("token synced from .desktop_key ({d} chars, prefix {s})", .{ key.len, key[0..@min(key.len, 8)] });
         }
     }
 
@@ -225,13 +236,39 @@ pub const Poller = struct {
         _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = dd }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
+    /// Append any new log lines to <data>/veil-desk.log. Uses writeFile (whole-file rewrite of a bounded
+    /// in-memory copy) rather than an append API — simplest reliable path.
+    fn flushLog(self: *Poller, dd: []const u8) void {
+        var lb: [128]log.Line = undefined;
+        const n = log.drain(&lb);
+        if (n == 0) return;
+        for (lb[0..n]) |ln| {
+            const hh: u64 = @intCast(@mod(@divTrunc(ln.t_s, 3600), 24));
+            const mm: u64 = @intCast(@mod(@divTrunc(ln.t_s, 60), 60));
+            const ss: u64 = @intCast(@mod(ln.t_s, 60));
+            const s = std.fmt.allocPrint(self.gpa, "{d:0>2}:{d:0>2}:{d:0>2} {s} {s}\n", .{ hh, mm, ss, log.levelTag(ln.level), ln.str() }) catch continue;
+            defer self.gpa.free(s);
+            self.log_buf.appendSlice(self.gpa, s) catch {};
+        }
+        if (self.log_buf.items.len > 512 * 1024) {
+            const keep = self.log_buf.items[self.log_buf.items.len / 2 ..];
+            std.mem.copyForwards(u8, self.log_buf.items, keep);
+            self.log_buf.items.len = keep.len;
+        }
+        const p = std.fmt.allocPrint(self.gpa, "{s}/veil-desk.log", .{dd}) catch return;
+        defer self.gpa.free(p);
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = p, .data = self.log_buf.items }) catch {};
+    }
+
     fn refresh(self: *Poller) void {
         var dbuf: [512]u8 = undefined;
         const dd = self.dataDir(&dbuf);
         const now_ns = Io.Timestamp.now(self.io, .real).nanoseconds;
         const now_s: i64 = @intCast(@divTrunc(now_ns, std.time.ns_per_s));
+        log.setClock(now_s);
 
         self.syncDesktopKey(dd);
+        self.flushLog(dd);
 
         // 1) server liveness + fleet counters
         const online = scan.serverOnline(self.io, self.port());

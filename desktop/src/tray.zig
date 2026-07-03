@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const log = @import("log.zig");
 
 pub const Tray = struct {
     inited: bool = false,
@@ -187,6 +188,8 @@ const WindowsTray = struct {
             self.nid.uVersionOrTimeout = NOTIFYICON_VERSION_4;
             _ = Shell_NotifyIconW(NIM_SETVERSION, &self.nid);
         }
+        // ground truth for the tray: added or rejected, and the OS error if any.
+        log.info("tray: reg={d} hwnd={} add={} lastErr={d} (add=false OR add=true-but-invisible => Win11 hides new icons in the overflow flyout)", .{ g_reg, g_hwnd_ok, self.live, g_err });
         return self.live;
     }
     fn deinit(self: *WindowsTray) void {
