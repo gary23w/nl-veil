@@ -54,6 +54,7 @@ pub const Chat = struct {
     stream: llm.Stream = .{},
     turn: Turn = .idle,
     first_byte_logged: bool = false, // one timing line per turn
+    parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -105,6 +106,16 @@ pub const Chat = struct {
 
     fn nowS(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+    }
+
+    /// Is the chat model the local Ollama backend (where NUM_PARALLEL contention applies)?
+    fn isLocalChat(self: *Chat) bool {
+        self.store.lock();
+        defer self.store.unlock();
+        const s = &self.store.settings;
+        if (s.chat_kind == 0) return true; // local (Ollama) provider
+        if (s.chat_kind == 2) return std.mem.indexOf(u8, s.chatBase(), "11434") != null; // custom URL at Ollama
+        return false;
     }
 
     fn ensureDirs(self: *Chat, dd: []const u8) void {
@@ -666,6 +677,13 @@ pub const Chat = struct {
             else
                 std.fmt.bufPrint(&sb, "writing... {d}s", .{el}) catch "writing...";
             self.setStatus(st);
+            // Ollama serializes requests unless OLLAMA_NUM_PARALLEL is set, so a chat call waits out the
+            // swarm's whole generation. Once it's clearly queued behind a cast on the local backend, tip
+            // the user (once) — this is the real lever for concurrent chat + hive, not anything in-app.
+            if (self.cast_active and !self.stream.saw_any and el > 6 and !self.parallel_tip and self.isLocalChat()) {
+                self.parallel_tip = true;
+                self.store.pushNotif("Chat is waiting on Ollama", "set OLLAMA_NUM_PARALLEL=2 (then restart Ollama) so chat and the hive run at once", 0);
+            }
             if (self.stream.saw_any and !self.first_byte_logged) {
                 self.first_byte_logged = true;
                 log.info("chat turn: first byte after {d}s", .{el});
