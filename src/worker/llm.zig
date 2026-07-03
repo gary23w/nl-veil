@@ -20,6 +20,10 @@ pub var tokens_out: std.atomic.Value(u64) = .init(0);
 pub var tokens_in_free: std.atomic.Value(u64) = .init(0);
 pub var tokens_out_free: std.atomic.Value(u64) = .init(0);
 pub var calls_made: std.atomic.Value(u64) = .init(0);
+/// Of tokens_in, how many the provider served from its prompt cache (OpenAI usage.prompt_tokens_details.
+/// cached_tokens — billed at a steep discount). Measuring this is what makes prompt-prefix churn VISIBLE:
+/// a run whose cached share is ~0 is paying full price for re-sending the same doctrine every call.
+pub var tokens_cached: std.atomic.Value(u64) = .init(0);
 
 pub const Caps = struct {
     probed: bool = false,
@@ -565,7 +569,7 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
                 } = null,
             },
         } = &.{},
-        usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0 } = null,
+        usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0, prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
     };
     const parsed = std.json.parseFromSlice(Resp, gpa, r.content, .{ .ignore_unknown_fields = true }) catch
@@ -578,6 +582,7 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         } else {
             _ = tokens_in.fetchAdd(u.prompt_tokens, .monotonic);
             _ = tokens_out.fetchAdd(u.completion_tokens, .monotonic);
+            if (u.prompt_tokens_details) |d| _ = tokens_cached.fetchAdd(d.cached_tokens, .monotonic);
         }
         _ = calls_made.fetchAdd(1, .monotonic);
     }

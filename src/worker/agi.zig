@@ -10,6 +10,7 @@ const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
 const commons = @import("commons.zig");
+const rsi = @import("rsi.zig");
 const run = @import("run.zig");
 
 const Worker = run.Worker;
@@ -736,6 +737,16 @@ pub fn resetForNewGoal(w: *Worker, run_dir: []const u8, goal: []const u8) void {
     if (w.blueprint.len > 0) {
         std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
         w.act("engine", 0, "blueprint", "new project structure", w.blueprint);
+    }
+    // Re-interpret the CHAINED goal into a fresh brief. Without this the whole run steers by
+    // goal-0's brief: minds were shown the first goal's intent + REQUIRED DELIVERABLES while
+    // building goal-2 (observed live, open_ai_test_3), and the deliverable floor graded the
+    // wrong file list.
+    if (w.goal_brief.len > 0) gpa.free(@constCast(w.goal_brief));
+    w.goal_brief = rsi.interpretGoal(w, goal);
+    if (w.goal_brief.len > 0) {
+        w.emit("intent", std.fmt.allocPrint(w.a(), ",\"goal\":\"{s}\",\"brief\":\"{s}\"", .{ w.esc(clip(goal, 200)), w.esc(clip(w.goal_brief, 1200)) }) catch ",\"brief\":\"\"");
+        std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.goal_brief", .{run_dir}) catch "", .data = w.goal_brief }) catch {};
     }
     if (w.last_bench.failures.len > 0) gpa.free(w.last_bench.failures);
     w.last_bench = .{};
