@@ -189,6 +189,9 @@ pub const Worker = struct {
     // project shape or language. BENCH_PY stays the fallback default for goals that declare nothing.
     smoke_cmd: []const u8 = "", // the goal's declared `SMOKE:` boot command ("" => SMOKE_PY heuristics)
     probes_str: []const u8 = "", // newline-joined `PROBE:` urls the declared smoke must answer 2xx/3xx
+    prev_fail_fp: u64 = 0, // digit-stripped fingerprint of last round's check failures (zero-gradient sentinel)
+    prev_tree_fp: u64 = 0, // fingerprint of last round's per-file hash listing (did the code actually change?)
+    fail_invariant_n: u32 = 0, // consecutive rounds the failures stayed identical WHILE the tree changed
     corpus_facts: u32 = 0,
     internet: bool = true,
     want_net: bool = true,
@@ -704,6 +707,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.self_model_str.len > 0) gpa.free(@constCast(w.self_model_str));
     defer if (w.dream_str.len > 0) gpa.free(@constCast(w.dream_str));
     defer if (w.pending_will.len > 0) gpa.free(@constCast(w.pending_will));
+    { // the same-round write ledger is PROCESS-scoped: a resumed run in this dir restarts at round 1,
+        // and stale entries from the previous process would falsely refuse that round's writes.
+        const rwp = std.fmt.allocPrint(gpa, "{s}/.round_writes", .{run_dir}) catch "";
+        defer if (rwp.len > 0) gpa.free(rwp);
+        if (rwp.len > 0) std.Io.Dir.cwd().deleteFile(io, rwp) catch {};
+    }
     if (live) {
         if (w.quick) {
             w.discourse = false; // a direct edit — no research classify round-trip
@@ -1008,6 +1017,32 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
             w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov, w.reject_notes.items, if (w.smoke_ok) "" else w.smoke_str);
             w.reject_notes.clearRetainingCapacity(); // folded into this round's fitness — start the next round's ledger clean
+            // ZERO-GRADIENT SENTINEL — when the failing checks produce SHAPE-IDENTICAL failures for three
+            // straight rounds while the file tree changed every round, the minds' edits are not reaching the
+            // failure, and the diagnostic itself becomes poison: open_ai_advanced_test spent 8/8 rounds
+            // "fixing" a phantom SyntaxError that was really the check runner tearing a quoted row, and the
+            // round-8 retrospective wrote that false lesson into persistent directives. Signal-level and
+            // language-blind: failure-text hash constant (digits stripped, so timings/counts don't defeat
+            // equality) × tree hash changing. Purely advisory — scoring is untouched.
+            if (w.last_bench.status == .ok and w.last_bench.total > 0 and w.last_bench.passed < w.last_bench.total) {
+                var fpb: std.ArrayListUnmanaged(u8) = .empty;
+                defer fpb.deinit(gpa);
+                for (w.last_bench.failures) |fc| if (!std.ascii.isDigit(fc)) fpb.append(gpa, fc) catch {};
+                const fail_fp = std.hash.Wyhash.hash(w.last_bench.total, fpb.items);
+                const tree_fp = std.hash.Wyhash.hash(0, fv.json);
+                if (fail_fp == w.prev_fail_fp and tree_fp != w.prev_tree_fp) w.fail_invariant_n += 1 else w.fail_invariant_n = 0;
+                w.prev_fail_fp = fail_fp;
+                w.prev_tree_fp = tree_fp;
+                if (w.fail_invariant_n >= 2) {
+                    if (std.fmt.allocPrint(gpa, "{s}\n\nZERO-GRADIENT WARNING: the failing checks above have failed IDENTICALLY for {d} consecutive rounds while the project files changed every round — your edits are NOT reaching this failure. STOP re-editing the file the diagnostic names. Either the true cause lives in a DIFFERENT file (follow the interface/import reports), or the check command itself cannot execute in this environment: reproduce it yourself (run_python: subprocess.run the exact command inside the workdir, capture stdout+stderr) and record the RAW output in your journal, so the difference between a code failure and a harness failure becomes visible.", .{ w.last_bench_str, w.fail_invariant_n + 1 })) |warned| {
+                        gpa.free(@constCast(w.last_bench_str));
+                        w.last_bench_str = warned;
+                    } else |_| {}
+                    w.act("engine", round, "gradient", "invariant failure", "the failing checks produced identical failures for 3+ rounds while the files changed every round — the minds' edits do not influence this failure; suspect a wrong-file diagnosis or a check that cannot run on this platform");
+                }
+            } else {
+                w.fail_invariant_n = 0;
+            }
             _ = w.mem.observe(tools.SCORE_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: {d}/{d} ({d}%) tier{d}", .{ round, bench.passed, bench.total, bench.pct, bench.tier }) catch "round");
             if (bench.status == .no_tests and !w.tests_seeded and w.doc_target == 0) {
                 _ = w.mem.observe(tools.PLAYBOOK_SCOPE, "Write an objective test suite (test_*.py with real assertions about intended behavior) for the deliverable before adding more features — the swarm is scored by its pass rate.");
@@ -4525,6 +4560,29 @@ test "checkDiag: slices from the first error line; falls back to the tail when n
     try std.testing.expectEqual(@as(usize, 700), checkDiag(big).len);
 }
 
+/// Windows: a shell row that CONTAINS double quotes cannot ride through `cmd /C <row>` as one argv
+/// element — the argv encoder backslash-escapes the embedded quotes for CreateProcess, but cmd.exe does
+/// not read backslash escapes, so the row reaches the toolchain torn. Observed live (open_ai_advanced_test,
+/// gpt-4.1-mini): both `python -c "..."` VERIFY rows failed EVERY round with `SyntaxError: unterminated
+/// string literal (detected at line 1)` while the same rows ran fine typed at a prompt — the swarm spent
+/// all 8 rounds "fixing" phantom syntax errors in its own files and the retrospective wrote the false
+/// lesson into its persistent directives. Fix: materialize such a row VERBATIM into a one-shot .cmd script
+/// in run_dir and hand cmd the script path instead — expressed relative to the row's workdir (run_dir/work),
+/// so `..\<name>`. Quote-free rows keep the direct argv path, which is proven fine (`python -m pytest -q`
+/// ran verbatim all run). Batch semantics caveat: inside a .cmd a literal `%` is a metachar — strictly
+/// better than every quoted row failing. Returns the gpa-owned argv replacement, or "" for the direct path.
+fn winRowViaScript(w: *Worker, run_dir: []const u8, row: []const u8, name: []const u8) []const u8 {
+    if (builtin.os.tag != .windows) return "";
+    if (std.mem.indexOfScalar(u8, row, '"') == null) return "";
+    const gpa = w.gpa;
+    const sp = std.fmt.allocPrint(gpa, "{s}/{s}", .{ run_dir, name }) catch return "";
+    defer gpa.free(sp);
+    const body = std.fmt.allocPrint(gpa, "@echo off\r\n{s}\r\n", .{row}) catch return "";
+    defer gpa.free(body);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = sp, .data = body }) catch return "";
+    return std.fmt.allocPrint(gpa, "..\\{s}", .{name}) catch "";
+}
+
 /// DECLARED CHECKS are the benchmark when the goal carries them: each `VERIFY:` row runs verbatim as a
 /// shell command in the build workdir (exit 0 = pass), pct = passed/total, tier 1 (they are the operator's
 /// own acceptance criteria — the strongest signal class). The failing rows' raw toolchain output IS the
@@ -4547,7 +4605,12 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
         const cmd = std.mem.trim(u8, raw, " \r\t");
         if (cmd.len == 0) continue;
         total += 1;
-        const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", cmd } else .{ "/bin/sh", "-c", cmd };
+        // Rows run sequentially, so one script slot is safely reused; the file is fully read by cmd
+        // before std.process.run returns (run waits for exit).
+        const via = winRowViaScript(w, run_dir, cmd, ".chk_row.cmd");
+        defer if (via.len > 0) gpa.free(@constCast(via));
+        const row_arg: []const u8 = if (via.len > 0) via else cmd;
+        const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", row_arg } else .{ "/bin/sh", "-c", cmd };
         // The timeout guards a HUNG toolchain only — deliberately generous, because a cold `cargo build` or
         // first `go build` legitimately takes minutes; per-test speed budgets belong in the declared command.
         const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(48 << 10), .stderr_limit = .limited(48 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(240), .clock = .awake } } }) catch {
@@ -4624,7 +4687,14 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
     // probe silently saw status 0 forever when the wrapper ate the boot command).
     const posix_boot = if (builtin.os.tag != .windows) std.fmt.allocPrint(gpa, "exec {s}", .{w.smoke_cmd}) catch return else "";
     defer if (posix_boot.len > 0) gpa.free(@constCast(posix_boot));
-    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", w.smoke_cmd } else .{ "/bin/sh", "-c", posix_boot };
+    // A quoted smoke row tears under cmd /C argv quoting exactly like a quoted VERIFY row — same
+    // script-file detour (see winRowViaScript). One declaredSmoke runs at a time and the process is
+    // reaped before this function returns, so the single script slot cannot be rewritten under a
+    // still-running boot.
+    const via = winRowViaScript(w, run_dir, w.smoke_cmd, ".smoke_boot.cmd");
+    defer if (via.len > 0) gpa.free(@constCast(via));
+    const boot_arg: []const u8 = if (via.len > 0) via else w.smoke_cmd;
+    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", boot_arg } else .{ "/bin/sh", "-c", posix_boot };
     var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch {
         w.smoke_ok = false;
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the declared smoke `{s}` could not be spawned at all.", .{clip(w.smoke_cmd, 120)}) catch "";

@@ -934,6 +934,23 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             return std.fmt.allocPrint(gpa, "{s} is a teammate's file this round — they own it in the blueprint and are building it in parallel, so writing it would collide (last-writer-wins) and waste the work. YOUR files: {s}. Write or DEEPEN one of yours that isn't done, or create a genuinely NEW file in nobody's slice. To change a file you don't own, read_file it and send_message its owner — don't rewrite it.", .{ wpath, if (ctx.my_files.len > 0) ctx.my_files else "(none assigned — take an unbuilt blueprint file or a new one)" }) catch dupe(gpa, "that file is a teammate's this round — write one of yours instead");
         }
     }
+    // SAME-ROUND SERIALIZATION — ownership decides who MAY write, this checks who already DID: a full
+    // overwrite of a file a teammate LANDED this round throws their finished repair away wholesale
+    // (observed live, open_ai_advanced_test: repeated pairs of legitimate same-round writes on one hot
+    // file — a rescue plus an owner, or two minds sharing an incomplete file — each pair costing one
+    // mind-round of work). First landed write wins the round; a latecomer is routed to read + edit_file
+    // (the VCS merge path, anchor-guarded against staleness) or to a different failing point. Appends
+    // stay open (additive), and the ledger is round-scoped so the file is freely rewritable next round.
+    if (!std.mem.eql(u8, p.value.mode, "append")) {
+        lockFiles(ctx);
+        const landed = sameRoundWriter(ctx, wpath);
+        unlockFiles(ctx);
+        if (landed) |who| {
+            defer gpa.free(who);
+            noteWriteReject(ctx, wpath, " — write refused: a teammate already rebuilt it this round; ");
+            return std.fmt.allocPrint(gpa, "{s} was already rebuilt by {s} THIS round — overwriting it now would throw their landed work away (last-writer-wins). read_file it first: if something in it is still wrong, fix JUST those lines with edit_file (which merges concurrent changes); otherwise take a DIFFERENT failing point or file this round.", .{ wpath, who }) catch dupe(gpa, "a teammate already rebuilt that file this round — read it and edit_file the exact lines, or take a different failing point");
+        }
+    }
     if (std.fs.path.dirname(full)) |dir| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, dir, .default_dir) catch {};
     const clean = sanitizeModelText(gpa, p.value.content);
     defer gpa.free(clean);
@@ -986,6 +1003,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ wpath, final_bytes }) catch "") catch {};
             std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
         }
+        recordRoundWrite(ctx, wpath);
     }
     if (redirected)
         return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.", .{ wpath, final_bytes, p.value.path }) catch dupe(gpa, "wrote");
@@ -1157,6 +1175,9 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         switch (outcome) {
             .committed => |c| {
                 ctx.files_written.* += 1;
+                lockFiles(ctx);
+                recordRoundWrite(ctx, npath);
+                unlockFiles(ctx);
                 return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied{s}, file is now {d} bytes", .{ npath, ops.items.len, if (c.rebased) " and merged with a teammate's concurrent change (unverified — re-check the file still builds)" else "", c.len }) catch dupe(gpa, "edited");
             },
             .conflict => |msg| return msg,
@@ -1197,6 +1218,7 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, res.bytes.len }) catch "") catch {};
             std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
         }
+        recordRoundWrite(ctx, npath);
     }
     if (res.reindented > 0)
         return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes. NOTE: {d} op(s) matched only after auto-reindenting your text to the file's indentation — your SEARCH lines had the wrong leading whitespace; copy them exactly next time.", .{ npath, ops.items.len, res.bytes.len, res.reindented }) catch dupe(gpa, "edited");
@@ -3389,6 +3411,49 @@ fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
         if (fp.len > 0 and pathKeyMatch(fp, path)) return true;
     }
     return false;
+}
+
+/// The teammate (not this mind) whose write already LANDED on `path` THIS round, per the
+/// run_dir/.round_writes ledger ("round|mind|path" lines, appended on every successful write/edit).
+/// null when nobody has. This is the same-round serialization record: ownership guards decide who MAY
+/// write, this records who DID — observed live (open_ai_advanced_test r1-r8), two minds with an equally
+/// legitimate claim on one hot file kept landing full rewrites seconds apart, and every such pair threw
+/// one mind's whole repair away (r8: sol's 1909-byte index.py fix clobbered by nova's parallel 1753-byte
+/// rewrite). gpa-owned name when non-null; caller frees.
+fn sameRoundWriter(ctx: *ToolCtx, path: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    const rp = std.fmt.allocPrint(gpa, "{s}/.round_writes", .{ctx.run_dir}) catch return null;
+    defer gpa.free(rp);
+    const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, rp, gpa, .limited(256 << 10)) catch return null;
+    defer gpa.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |ln| {
+        var f = std.mem.splitScalar(u8, ln, '|');
+        const r = f.next() orelse continue;
+        const m = std.mem.trim(u8, f.next() orelse continue, " \r");
+        const p2 = std.mem.trim(u8, f.rest(), " \r");
+        const rn = std.fmt.parseInt(u32, std.mem.trim(u8, r, " \r"), 10) catch continue;
+        if (rn != ctx.round or m.len == 0 or p2.len == 0) continue;
+        if (std.mem.eql(u8, m, ctx.mind)) continue;
+        if (pathKeyMatch(p2, path)) return gpa.dupe(u8, m) catch null;
+    }
+    return null;
+}
+
+/// Append one "round|mind|path" line to the same-round write ledger. Caller holds the files lock
+/// (writeFile/editFile call this inside their existing manifest-update critical sections). Best-effort:
+/// a failed append never fails the write it records.
+fn recordRoundWrite(ctx: *ToolCtx, path: []const u8) void {
+    const gpa = ctx.gpa;
+    const rp = std.fmt.allocPrint(gpa, "{s}/.round_writes", .{ctx.run_dir}) catch return;
+    defer gpa.free(rp);
+    const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, rp, gpa, .limited(256 << 10)) catch &[_]u8{};
+    defer if (existing.len > 0) gpa.free(existing);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    buf.appendSlice(gpa, existing) catch {};
+    buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{d}|{s}|{s}\n", .{ ctx.round, ctx.mind, path }) catch "") catch {};
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = rp, .data = buf.items }) catch {};
 }
 
 /// True if `path` matches a comma+space entry of `list` (the format mindFiles emits) under pathKeyMatch:
