@@ -13,6 +13,7 @@ const scan = @import("scan.zig");
 const poller_mod = @import("poller.zig");
 const tray_mod = @import("tray.zig");
 const catalog = @import("catalog.zig");
+const log = @import("log.zig");
 
 const Store = store_mod.Store;
 const Tab = store_mod.Tab;
@@ -57,6 +58,7 @@ const Ui = struct {
     resizing: bool = false,
     file_menu: bool = false,
     close_req: bool = false,
+    show_log: bool = false, // F12 debug overlay
     // log console
     log_scroll: f32 = 0,
     log_follow: bool = true,
@@ -147,13 +149,17 @@ pub fn main() !void {
     // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
     // at a HIGH base size (48) so the atlas is high-res and downscaling to 11-22px stays crisp (loading
     // near the render size left small text blurry — the "broken" look); bilinear smooths the scale.
+    var ui_loaded = false;
+    var mono_loaded = false;
     if (loadFontAt(uiCandidates(), 48)) |f| {
         rl.setTextureFilter(f.texture, .bilinear);
         t.setFont(f);
+        ui_loaded = true;
     }
     if (loadFontAt(monoCandidates(), 44)) |f| {
         rl.setTextureFilter(f.texture, .bilinear);
         t.setMono(f);
+        mono_loaded = true;
     }
     // Window + taskbar icon: the shadow-figure mark rendered into an image.
     const icon = makeIcon();
@@ -162,6 +168,15 @@ pub fn main() !void {
     var tray: tray_mod.Tray = .{};
     tray.init("veil-desk");
     defer tray.deinit();
+
+    {
+        store.lock();
+        const dd = store.settings.dataDir();
+        const tk = store.settings.token_len;
+        const pt = store.settings.port;
+        log.info("veil-desk start; data={s} port={d} token={d}b fonts(ui={} mono={})", .{ dd, pt, tk, ui_loaded, mono_loaded });
+        store.unlock();
+    }
 
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
@@ -192,6 +207,38 @@ pub fn main() !void {
         drawResizeGrip();
         if (ui.file_menu) drawFileMenu(&store);
         drawToasts(&store);
+        if (ui.show_log) drawLogOverlay();
+    }
+}
+
+fn setField(f: *Ui.Field, s: []const u8) void {
+    const n = @min(s.len, f.buf.len);
+    @memcpy(f.buf[0..n], s[0..n]);
+    f.len = n;
+}
+
+fn drawLogOverlay() void {
+    const sw: f32 = @floatFromInt(rl.getScreenWidth());
+    const sh: f32 = @floatFromInt(rl.getScreenHeight());
+    const r = t.Rect{ .x = 8, .y = TITLE_H + TAB_H + 8, .width = sw - 16, .height = sh - TITLE_H - TAB_H - 16 };
+    rl.drawRectangleRounded(r, 0.02, 6, t.withAlpha(t.bg_dark, 245));
+    t.panelBordered(r, t.withAlpha(t.bg_dark, 0), t.blue);
+    t.text(t.z("debug log  (F12 to close)  -  also written to <data>/veil-desk.log", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 8), 13, t.comment);
+    var lines: [200]log.Line = undefined;
+    const n = log.snapshot(&lines);
+    const rows: usize = @intFromFloat((r.height - 40) / 16);
+    const start = if (n > rows) n - rows else 0;
+    var yy: f32 = r.y + 30;
+    var i: usize = start;
+    while (i < n) : (i += 1) {
+        const c = switch (lines[i].level) {
+            .err => t.red,
+            .warn => t.yellow,
+            .dbg => t.comment,
+            else => t.fg_dim,
+        };
+        t.textMonoClip(lines[i].str(), @intFromFloat(r.x + 12), @intFromFloat(yy), 13, c, @intFromFloat(r.width - 24));
+        yy += 16;
     }
 }
 
@@ -441,6 +488,7 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
 // -------------------------------------------------------------------------------- input
 
 fn handleKeys() void {
+    if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) ui.tab = .dashboard;
         if (rl.isKeyPressed(.two)) ui.tab = .deploy;

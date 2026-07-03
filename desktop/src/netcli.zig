@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const log = @import("log.zig");
 
 pub const Resp = struct {
     status: u16 = 0,
@@ -16,20 +17,34 @@ fn sendRecv(io: Io, gpa: std.mem.Allocator, port: u16, req: []const u8) ?Resp {
     const addr = Io.net.IpAddress{ .ip4 = Io.net.Ip4Address.loopback(port) };
     // No timeout: localhost connects/refuses immediately, and this Zig's Windows connect panics if a
     // timeout option is set (netConnectIpWindows TODO). The read side is bounded by the 1MiB guard.
-    var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return null;
+    var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |e| {
+        log.err("http: connect :{d} failed: {t}", .{ port, e });
+        return null;
+    };
     defer stream.close(io);
 
     var wbuf: [4096]u8 = undefined;
     var w = stream.writer(io, &wbuf);
-    w.interface.writeAll(req) catch return null;
-    w.interface.flush() catch return null;
+    w.interface.writeAll(req) catch |e| {
+        log.err("http: write failed: {t}", .{e});
+        return null;
+    };
+    w.interface.flush() catch |e| {
+        log.err("http: flush failed: {t}", .{e});
+        return null;
+    };
 
     // Connection: close means the server ends the body with EOF, so read to end-of-stream in one shot.
     var rbuf: [8192]u8 = undefined;
     var r = stream.reader(io, &rbuf);
-    const raw = r.interface.allocRemaining(gpa, .limited(1 << 20)) catch return null;
+    const raw = r.interface.allocRemaining(gpa, .limited(1 << 20)) catch |e| {
+        log.err("http: read failed: {t}", .{e});
+        return null;
+    };
     defer gpa.free(raw);
-    return parse(gpa, raw);
+    const resp = parse(gpa, raw);
+    if (resp) |rr| log.dbg("http: -> {d} ({d}b)", .{ rr.status, rr.body.len }) else log.warn("http: unparseable response ({d}b)", .{raw.len});
+    return resp;
 }
 
 fn parse(gpa: std.mem.Allocator, raw: []const u8) ?Resp {
@@ -64,6 +79,34 @@ pub fn deploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body
     const req = std.fmt.allocPrint(gpa, "POST /api/v1/swarms HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\n{s}Content-Length: {d}\r\n\r\n{s}", .{ auth, body_json.len, body_json }) catch return null;
     defer gpa.free(req);
     return sendRecv(io, gpa, port, req);
+}
+
+test "netcli.deploy exercises the REAL desktop HTTP client against a running server (best-effort)" {
+    // Requires: a veil server on :8787 + a valid key at ../data/.desktop_key. If either is missing this
+    // returns early (harmless). Point: prove the hand-rolled std.Io.net client works where curl does.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const raw = Io.Dir.cwd().readFileAlloc(io, "../data/.desktop_key", std.testing.allocator, .limited(256)) catch {
+        std.debug.print("\n[netcli test] no ../data/.desktop_key — start a server first; skipping\n", .{});
+        return;
+    };
+    defer std.testing.allocator.free(raw);
+    const key = std.mem.trim(u8, raw, " \r\n\t");
+    std.debug.print("\n[netcli test] key {d} chars prefix={s}\n", .{ key.len, key[0..@min(key.len, 8)] });
+
+    // 1) unauth GET /fleet — proves the client can talk at all
+    if (fleet(io, std.testing.allocator, 8787)) |fr| {
+        defer if (fr.body.len > 0) std.testing.allocator.free(fr.body);
+        std.debug.print("[netcli test] fleet status={d} body={s}\n", .{ fr.status, fr.body[0..@min(fr.body.len, 120)] });
+    } else std.debug.print("[netcli test] fleet: NO RESPONSE\n", .{});
+
+    // 2) the actual deploy the button fires
+    const body = "{\"name\":\"nettest\",\"provider\":\"mock\",\"model\":\"mock\",\"style\":\"build\",\"stack\":\"general\",\"mode\":\"continuous\",\"base_url\":\"\",\"minutes\":1,\"encrypt\":false,\"veil_population\":false,\"api_key\":\"\",\"gateway_model\":\"\",\"goal\":\"nettest\",\"minds\":[{\"name\":\"nova\",\"role\":\"Lead\",\"duty\":\"build\",\"lead\":true}]}";
+    if (deploy(io, std.testing.allocator, 8787, key, body)) |dr| {
+        defer if (dr.body.len > 0) std.testing.allocator.free(dr.body);
+        std.debug.print("[netcli test] DEPLOY status={d} body={s}\n", .{ dr.status, dr.body[0..@min(dr.body.len, 200)] });
+    } else std.debug.print("[netcli test] DEPLOY: NO RESPONSE (client failed)\n", .{});
 }
 
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
