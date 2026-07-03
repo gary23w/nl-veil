@@ -46,6 +46,7 @@ pub const Chat = struct {
 
     stream: llm.Stream = .{},
     turn: Turn = .idle,
+    first_byte_logged: bool = false, // one timing line per turn
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -148,16 +149,28 @@ pub const Chat = struct {
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
         if (text.len == 0 or self.turn != .idle) return;
-        // no conversation yet → create one named from the message
+        // a conversation's FIRST message names it — whether the user typed straight away (auto-create)
+        // or clicked + first (the "new chat" placeholder title gets replaced here).
         var have_conv = false;
+        var fresh = false;
         {
             self.store.lock();
             have_conv = self.store.conv_active_len > 0;
+            fresh = self.store.msg_count == 0;
             self.store.unlock();
         }
         if (!have_conv) {
             self.cmdNewConv(dd);
-            self.renameActive(dd, text[0..@min(text.len, 42)]);
+            fresh = true;
+        }
+        if (fresh) {
+            var tb: [42]u8 = undefined;
+            const n = @min(text.len, tb.len);
+            @memcpy(tb[0..n], text[0..n]);
+            for (tb[0..n]) |*c| {
+                if (c.* == '\n' or c.* == '\r' or c.* == '\t') c.* = ' ';
+            }
+            self.renameActive(dd, tb[0..n]);
         }
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
@@ -223,6 +236,23 @@ pub const Chat = struct {
 
     fn cmdDeleteConv(self: *Chat, dd: []const u8, id: []const u8) void {
         if (id.len == 0) return;
+        // Refuse to delete the conversation whose turn is streaming: cmdSend/cmdSelectConv already guard
+        // on turn==idle, but without this guard deleting the ACTIVE chat mid-turn clears conv_active, the
+        // fallback select silently no-ops (its own guard), and the in-flight reply lands with no active
+        // conversation — appendMsg writes it to a stranded Store slot and never persists it (lost). A
+        // background conversation is always safe to delete.
+        if (self.turn != .idle) {
+            var active = false;
+            {
+                self.store.lock();
+                active = std.mem.eql(u8, self.store.conv_active[0..self.store.conv_active_len], id);
+                self.store.unlock();
+            }
+            if (active) {
+                self.store.pushNotif("Busy", "let the reply finish before deleting this chat", 2);
+                return;
+            }
+        }
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
@@ -534,11 +564,27 @@ pub const Chat = struct {
         return .{ .base_url = base_buf[0..bn], .key = key_buf[0..kn], .model = model_buf[0..mn] };
     }
 
+    /// "Sunday 2026-07-05 14:03 UTC" — the model gets a real clock every turn (it has no other one).
+    fn dateLine(self: *Chat, buf: []u8) []const u8 {
+        const now = self.nowS();
+        if (now <= 0) return "";
+        const es = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
+        const ed = es.getEpochDay();
+        const yd = ed.calculateYearDay();
+        const md = yd.calculateMonthDay();
+        const ds = es.getDaySeconds();
+        const weekdays = [_][]const u8{ "Thursday", "Friday", "Saturday", "Sunday", "Monday", "Tuesday", "Wednesday" }; // epoch day 0 = Thu 1970-01-01
+        const wd = weekdays[@intCast(@mod(ed.day, 7))];
+        return std.fmt.bufPrint(buf, "\nCurrent date and time: {s} {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC.", .{ wd, yd.year, md.month.numeric(), md.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour() }) catch "";
+    }
+
     fn startTurn(self: *Chat, dd: []const u8, kind: Turn) void {
         var msgs: std.ArrayListUnmanaged(u8) = .empty;
         defer msgs.deinit(self.gpa);
+        var dbuf: [96]u8 = undefined;
         msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
         escJson(&msgs, self.gpa, SYSTEM_PROMPT);
+        escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
         {
             self.store.lock();
@@ -582,14 +628,19 @@ pub const Chat = struct {
             return;
         }
         self.turn = kind;
+        self.first_byte_logged = false;
         self.setBusy(true);
         self.setStatus("thinking...");
+        log.info("chat turn start: kind={t} prompt={d}b model_msgs history", .{ kind, msgs.items.len });
     }
 
     pub fn pumpStream(self: *Chat, dd: []const u8) void {
         if (self.turn == .idle) return;
-        llm.poll(&self.stream, self.io, self.gpa, self.nowS());
-        // publish the partial
+        const now = self.nowS();
+        // While a cast runs, the chat call shares the local backend with the whole swarm — long silence
+        // is queueing. The stream gets a longer first-byte leash and the status line says so honestly.
+        llm.poll(&self.stream, self.io, self.gpa, now, self.cast_active);
+        // publish the partial + a live status with elapsed time
         {
             self.store.lock();
             defer self.store.unlock();
@@ -598,24 +649,42 @@ pub const Chat = struct {
             @memcpy(self.store.stream_text[0..n], src[0..n]);
             self.store.stream_len = n;
         }
-        if (!self.stream.done) return;
+        if (!self.stream.done) {
+            const el = now - self.stream.started_s;
+            var sb: [96]u8 = undefined;
+            const st = if (!self.stream.saw_any and self.cast_active)
+                std.fmt.bufPrint(&sb, "queued behind the hive... {d}s", .{el}) catch "queued behind the hive..."
+            else if (!self.stream.saw_any)
+                std.fmt.bufPrint(&sb, "thinking... {d}s", .{el}) catch "thinking..."
+            else
+                std.fmt.bufPrint(&sb, "writing... {d}s", .{el}) catch "writing...";
+            self.setStatus(st);
+            if (self.stream.saw_any and !self.first_byte_logged) {
+                self.first_byte_logged = true;
+                log.info("chat turn: first byte after {d}s", .{el});
+            }
+            return;
+        }
         llm.finish(&self.stream, self.io);
         const kind = self.turn;
         self.turn = .idle;
         if (self.stream.failed) {
             var eb: [260]u8 = undefined;
             const emsg = std.fmt.bufPrint(&eb, "(model error: {s})", .{self.stream.errStr()}) catch "(model error)";
+            log.err("chat turn FAILED after {d}s: {s}", .{ now - self.stream.started_s, self.stream.errStr() });
             self.appendMsg(dd, .veil, emsg);
             self.store.pushNotif("Chat model error", self.stream.errStr(), 2);
             self.stream.deinit(self.gpa);
             self.setBusy(false);
             return;
         }
+        log.info("chat turn done in {d}s ({d} chars)", .{ now - self.stream.started_s, self.stream.content.items.len });
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
         if (kind == .collect) {
             self.appendMsg(dd, .veil, full);
         } else if (castGoal(full)) |goal| {
-            const note = afterFirstLine(full);
+            var nb: [3072]u8 = undefined;
+            const note = noteWithoutCast(full, &nb);
             if (self.cast_active) {
                 if (note.len > 0) self.appendMsg(dd, .veil, note) else self.appendMsg(dd, .veil, full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
@@ -848,9 +917,12 @@ pub const Chat = struct {
 
 // ------------------------------------------------------------------------------ pure helpers (tested)
 
-/// If the reply's first non-empty line is "CAST: goal", return the goal.
+/// If a "CAST: goal" line appears within the reply's first few substantive lines, return the goal.
+/// Tolerant on purpose: reasoning models often put a short preamble ("Sure — this needs the hive.")
+/// above the tag even when told to lead with it.
 pub fn castGoal(full: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, full, '\n');
+    var seen: usize = 0;
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0) continue;
@@ -858,22 +930,32 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
             const g = std.mem.trim(u8, line[5..], " \r\t");
             return if (g.len > 0) g else null;
         }
-        return null; // first substantive line is not a cast
+        seen += 1;
+        if (seen >= 5) return null; // a CAST mention deep in prose is narration, not an action
     }
     return null;
 }
 
-/// Everything after the first non-empty line (the note the model added under its CAST line).
-pub fn afterFirstLine(full: []const u8) []const u8 {
-    var i: usize = 0;
-    // skip leading blank lines
-    while (i < full.len) {
-        const nl = std.mem.indexOfScalarPos(u8, full, i, '\n') orelse full.len;
-        const line = std.mem.trim(u8, full[i..nl], " \r\t");
-        i = if (nl == full.len) full.len else nl + 1;
-        if (line.len > 0) break;
+/// The reply minus its CAST line — the note shown to the user beside the cast.
+pub fn noteWithoutCast(full: []const u8, buf: []u8) []const u8 {
+    var w: usize = 0;
+    var removed = false;
+    var it = std.mem.splitScalar(u8, full, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (!removed and std.mem.startsWith(u8, line, "CAST:")) {
+            removed = true;
+            continue;
+        }
+        if (w + raw.len + 1 > buf.len) break;
+        if (w > 0) {
+            buf[w] = '\n';
+            w += 1;
+        }
+        @memcpy(buf[w .. w + raw.len], raw);
+        w += raw.len;
     }
-    return std.mem.trim(u8, full[i..], " \r\n\t");
+    return std.mem.trim(u8, buf[0..w], " \r\n\t");
 }
 
 fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) void {
@@ -956,6 +1038,60 @@ fn jStr(body: []const u8, key: []const u8, out: []u8) ?[]const u8 {
 }
 
 // ------------------------------------------------------------------------------ tests
+
+test "first message auto-titles the conversation (both the type-first and +-first flows)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-title-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    // dead endpoint so startTurn's curl goes nowhere — the title path is what's under test
+    const base = "http://127.0.0.1:1/v1";
+    @memcpy(store.settings.chat_base[0..base.len], base);
+    store.settings.chat_base_len = base.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    // flow 1: user types first (no conversation yet)
+    chat.cmdSend(dd, "hello there veil, how are you?");
+    llm.abort(&chat.stream, io);
+    chat.stream.deinit(std.testing.allocator);
+    chat.turn = .idle;
+    var found_title = false;
+    {
+        store.lock();
+        defer store.unlock();
+        var i: usize = 0;
+        while (i < store.conv_count) : (i += 1) {
+            if (std.mem.startsWith(u8, store.convs[i].titleStr(), "hello there veil")) found_title = true;
+        }
+    }
+    try std.testing.expect(found_title);
+
+    // flow 2: user clicks + first, then sends
+    chat.cmdNewConv(dd);
+    chat.cmdSend(dd, "second conversation opener");
+    llm.abort(&chat.stream, io);
+    chat.stream.deinit(std.testing.allocator);
+    chat.turn = .idle;
+    var found2 = false;
+    {
+        store.lock();
+        defer store.unlock();
+        var i: usize = 0;
+        while (i < store.conv_count) : (i += 1) {
+            if (std.mem.startsWith(u8, store.convs[i].titleStr(), "second conversation")) found2 = true;
+        }
+    }
+    try std.testing.expect(found2);
+}
 
 test "cast watch resolves the run dir, tails it, and collects on stop (no server needed)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
@@ -1061,17 +1197,22 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     try std.testing.expect(std.mem.indexOf(u8, data, "capital of France") != null);
 }
 
-test "castGoal fires only on a leading CAST line" {
+test "castGoal fires on a CAST line within the first few lines" {
     try std.testing.expectEqualStrings("map the auth flow", castGoal("CAST: map the auth flow\nOn it.").?);
     try std.testing.expectEqualStrings("x", castGoal("\n  CAST: x").?);
-    try std.testing.expect(castGoal("I think CAST: is a keyword") == null);
+    // tolerant: a short preamble above the tag still casts
+    try std.testing.expectEqualStrings("dig into the repo", castGoal("This needs real work.\nCAST: dig into the repo").?);
     try std.testing.expect(castGoal("hello there") == null);
     try std.testing.expect(castGoal("CAST:") == null);
+    // a CAST buried deep in prose is narration
+    try std.testing.expect(castGoal("a\nb\nc\nd\ne\nf\nCAST: too deep") == null);
 }
 
-test "afterFirstLine returns the note under the tag" {
-    try std.testing.expectEqualStrings("On it - casting the hive.", afterFirstLine("CAST: goal\nOn it - casting the hive."));
-    try std.testing.expectEqualStrings("", afterFirstLine("CAST: goal"));
+test "noteWithoutCast drops exactly the tag line" {
+    var b: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("On it - casting the hive.", noteWithoutCast("CAST: goal\nOn it - casting the hive.", &b));
+    try std.testing.expectEqualStrings("", noteWithoutCast("CAST: goal", &b));
+    try std.testing.expectEqualStrings("Preamble.\nAfter.", noteWithoutCast("Preamble.\nCAST: goal\nAfter.", &b));
 }
 
 test "jStr and jInt read the deploy response" {
