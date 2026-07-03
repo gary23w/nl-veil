@@ -88,17 +88,23 @@ pub fn main() !void {
     }
 
     // Borderless: we draw our own title bar (drag / File / minimize / close). Resizable stays on so the
-    // grip in the corner can drive setWindowSize.
-    rl.setConfigFlags(.{ .window_resizable = true, .vsync_hint = true, .msaa_4x_hint = true, .window_undecorated = true });
+    // grip in the corner can drive setWindowSize. No MSAA/vsync — this is a 2D UI, and MSAA + a pinned
+    // 60fps kept the GPU hot with nothing happening; we cap FPS ourselves (30 focused / 8 idle) below.
+    rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true });
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     defer rl.closeWindow();
-    rl.setTargetFPS(60);
+    rl.setTargetFPS(30);
 
-    // A real TTF replaces raylib's blocky default; bilinear filter keeps it smooth when scaled.
-    if (loadUiFont(gpa)) |f| {
+    // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
+    // at a crisp base size and bilinear-filter so they scale smoothly.
+    if (loadFontAt(uiCandidates(), 32)) |f| {
         rl.setTextureFilter(f.texture, .bilinear);
         t.setFont(f);
+    }
+    if (loadFontAt(monoCandidates(), 30)) |f| {
+        rl.setTextureFilter(f.texture, .bilinear);
+        t.setMono(f);
     }
     // Window + taskbar icon: the shadow-figure mark rendered into an image.
     const icon = makeIcon();
@@ -110,6 +116,9 @@ pub fn main() !void {
 
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
+        // Heat control: 30fps when focused, 8fps when the window is in the background. A 2D dashboard has
+        // no reason to redraw 60x/sec, and a pinned high FPS is what warmed the machine with no swarms.
+        rl.setTargetFPS(if (rl.isWindowFocused()) 30 else 8);
         tray.pump();
         pumpTray(&store, &tray, gpa);
         if (!auto_selected) auto_selected = autoSelect(&store);
@@ -259,16 +268,23 @@ const glyph_set = blk: {
     break :blk arr;
 };
 
-fn loadUiFont(gpa: std.mem.Allocator) ?rl.Font {
-    _ = gpa;
-    const candidates: []const [:0]const u8 = switch (builtin.os.tag) {
-        .windows => &.{ "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/tahoma.ttf", "C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/consola.ttf" },
+fn uiCandidates() []const [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => &.{ "C:/Windows/Fonts/segoeui.ttf", "C:/Windows/Fonts/tahoma.ttf", "C:/Windows/Fonts/arial.ttf" },
         .macos => &.{ "/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Helvetica.ttc", "/Library/Fonts/Arial.ttf" },
         else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/liberation/LiberationSans-Regular.ttf", "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf" },
     };
+}
+fn monoCandidates() []const [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => &.{ "C:/Windows/Fonts/consola.ttf", "C:/Windows/Fonts/lucon.ttf", "C:/Windows/Fonts/cour.ttf" },
+        .macos => &.{ "/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/Courier.ttc" },
+        else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/TTF/DejaVuSansMono.ttf", "/usr/share/fonts/liberation/LiberationMono-Regular.ttf" },
+    };
+}
+fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
     for (candidates) |path| {
-        // load a crisp base size (scaled per draw) with the extended glyph set.
-        if (rl.loadFontEx(path, 34, glyph_set[0..])) |f| {
+        if (rl.loadFontEx(path, size, glyph_set[0..])) |f| {
             if (f.glyphCount > 0) return f;
         } else |_| {}
     }
@@ -450,7 +466,7 @@ fn drawDashboard(store: *Store, body: t.Rect) void {
 fn statCard(x: f32, y: f32, w: f32, label: [:0]const u8, value: [:0]const u8, accent: t.Color) void {
     const r = t.Rect{ .x = x, .y = y, .width = w, .height = 88 };
     t.panelBordered(r, t.bg_dark, t.border);
-    t.text(label, @intFromFloat(x + 14), @intFromFloat(y + 14), 11, t.comment);
+    t.text(label, @intFromFloat(x + 14), @intFromFloat(y + 14), 12, t.comment);
     t.text(value, @intFromFloat(x + 14), @intFromFloat(y + 40), 26, accent);
 }
 
@@ -478,7 +494,7 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         const hot = t.hovering(rr);
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
         t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + rr.height / 2), if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
-        t.textClip(sw.idStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 13, t.fg, @intFromFloat(rr.width - 220));
+        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 13, t.fg, @intFromFloat(rr.width - 220));
         if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 23), 11, t.comment, @intFromFloat(rr.width - 220));
         const pct = sw.pct;
         const rt = if (pct >= 0) t.z("r{d}  {d}%", .{ sw.round, pct }) else t.z("r{d}", .{sw.round});
@@ -588,7 +604,7 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 }
 
 fn flabel(x: f32, y: f32, s: [:0]const u8) void {
-    t.text(s, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+    t.text(s, @intFromFloat(x), @intFromFloat(y), 12, t.comment);
 }
 
 fn wrap(cur: usize, delta: i32, n: usize) usize {
@@ -661,13 +677,31 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
 
     store.lock();
     const sel_n = store.selected_len;
-    var sel: [64]u8 = undefined;
+    var sel: [96]u8 = undefined;
     @memcpy(sel[0..sel_n], store.selected[0..sel_n]);
     const m = store.metrics;
     const ev_n = store.event_count;
     var evs: [scan.MAX_LOG]scan.Ev = undefined;
     @memcpy(evs[0..ev_n], store.events[0..ev_n]);
+    // friendly name for the header (look up the selected swarm in the roster)
+    var title: [64]u8 = undefined;
+    var title_n: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < store.swarm_count) : (i += 1) {
+            if (std.mem.eql(u8, store.swarms[i].idStr(), sel[0..sel_n])) {
+                const nm = store.swarms[i].nameStr();
+                title_n = @min(nm.len, title.len);
+                @memcpy(title[0..title_n], nm[0..title_n]);
+                break;
+            }
+        }
+    }
     store.unlock();
+    if (title_n == 0) {
+        title_n = @min(sel_n, title.len);
+        @memcpy(title[0..title_n], sel[0..title_n]);
+    }
 
     const rx = pad * 2 + left_w;
     const rw = body.width - rx - pad;
@@ -677,7 +711,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     }
 
     var y = body.y + pad;
-    t.textClip(sel[0..sel_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - 200));
+    t.textClip(title[0..title_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - 200));
     // inner tabs (Console / Details)
     const it_console = t.Rect{ .x = rx + rw - 190, .y = y - 2, .width = 92, .height = 24 };
     const it_details = t.Rect{ .x = rx + rw - 94, .y = y - 2, .width = 92, .height = 24 };
@@ -744,7 +778,7 @@ fn drawDetails(r: t.Rect, m: scan.Metrics) void {
 }
 
 fn metricCell(x: f32, y: f32, lbl: [:0]const u8, value: [:0]const u8, accent: t.Color) void {
-    t.text(lbl, @intFromFloat(x), @intFromFloat(y), 10, t.comment);
+    t.text(lbl, @intFromFloat(x), @intFromFloat(y), 12, t.comment);
     t.text(value, @intFromFloat(x), @intFromFloat(y + 16), 22, accent);
 }
 
@@ -756,7 +790,7 @@ fn drawConsole(r: t.Rect, evs: []const scan.Ev) void {
     t.panelBordered(r, t.bg_dark, t.border);
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
     defer rl.endScissorMode();
-    const line_h: f32 = 17;
+    const line_h: f32 = 19;
     const visible: usize = @intFromFloat((r.height - 12) / line_h);
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(r)) {
@@ -776,16 +810,18 @@ fn drawConsole(r: t.Rect, evs: []const scan.Ev) void {
     }
     var yy: f32 = r.y + 8;
     var i: usize = start;
+    // Monospace + fixed pixel columns so round / mind / text line up like a real log. Sizes bumped for
+    // readability (13px mono).
     while (i < evs.len and yy < r.y + r.height - 4) : (i += 1) {
         const e = &evs[i];
         const kc = kindColor(e.kindStr());
-        if (e.round >= 0) t.text(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.comment);
+        if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), 13, t.comment);
         const mind = e.mindStr();
-        if (mind.len > 0) t.textClip(mind, @intFromFloat(r.x + 46), @intFromFloat(yy), 12, kc, 68);
-        t.textClip(e.textStr(), @intFromFloat(r.x + 120), @intFromFloat(yy), 12, t.fg_dim, @intFromFloat(r.width - 128));
+        if (mind.len > 0) t.textMonoClip(mind, @intFromFloat(r.x + 52), @intFromFloat(yy), 13, kc, 72);
+        t.textMonoClip(e.textStr(), @intFromFloat(r.x + 134), @intFromFloat(yy), 13, t.fg_dim, @intFromFloat(r.width - 144));
         yy += line_h;
     }
-    if (evs.len == 0) t.text(t.z("no events yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 12), 12, t.comment);
+    if (evs.len == 0) t.text(t.z("no events yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 12), 13, t.comment);
 }
 
 fn kindColor(kind: []const u8) t.Color {
@@ -819,7 +855,7 @@ fn drawHub(body: t.Rect) void {
     t.text(t.z("Fleet console", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 14, t.fg);
     t.text(t.z("python hub.py console --hub URL", .{}), @intFromFloat(x + 14), @intFromFloat(y + 40), 13, t.cyan);
     t.text(t.z("Live roster, broadcast a directive to every veil, target one, stop all.", .{}), @intFromFloat(x + 14), @intFromFloat(y + 66), 12, t.comment);
-    t.text(t.z("Wire NL_HUB_URL + NL_HUB_SECRET in Settings to embed this here (next).", .{}), @intFromFloat(x + 14), @intFromFloat(y + 88), 11, t.comment);
+    t.text(t.z("Wire NL_HUB_URL + NL_HUB_SECRET in Settings to embed this here (next).", .{}), @intFromFloat(x + 14), @intFromFloat(y + 88), 12, t.comment);
 }
 
 // -------------------------------------------------------------------------------- settings
@@ -846,7 +882,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 20;
     const dr = t.Rect{ .x = x, .y = y, .width = colw, .height = 32 };
     t.panelBordered(dr, t.bg, t.border);
-    t.textClip(ddb[0..ddn], @intFromFloat(x + 10), @intFromFloat(y + 9), 12, t.fg, @intFromFloat(colw - 20));
+    t.textClip(ddb[0..ddn], @intFromFloat(x + 10), @intFromFloat(y + 9), 13, t.fg, @intFromFloat(colw - 20));
     y += 48;
     flabel(x, y, "SERVER PORT");
     y += 20;
@@ -867,7 +903,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         ui.focus = .none;
     }
     y += 30;
-    if (tok_n > 0) t.text(t.z("a token is set ({d} chars)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 11, t.green);
+    if (tok_n > 0) t.text(t.z("a token is set ({d} chars)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
     y += 40;
     const tr = t.Rect{ .x = x, .y = y, .width = 220, .height = 30 };
     if (t.button(tr, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), if (notify_on) t.green else t.comment, true)) {
@@ -876,7 +912,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.unlock();
     }
     y += 44;
-    t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+    t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
 }
 
 // -------------------------------------------------------------------------------- shared widgets

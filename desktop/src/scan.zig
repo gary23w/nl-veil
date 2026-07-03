@@ -54,8 +54,10 @@ pub const Metrics = struct {
 };
 
 pub const SwarmSummary = struct {
-    id: [64]u8 = [_]u8{0} ** 64,
+    id: [96]u8 = [_]u8{0} ** 96, // path RELATIVE to data dir: "name" (CLI run) or "u1/<hexid>" (server deploy)
     id_len: u8 = 0,
+    name: [64]u8 = [_]u8{0} ** 64, // friendly display name (swarm.json "swarm", else the dir basename)
+    name_len: u8 = 0,
     round: i64 = 0,
     pct: i32 = -1,
     live: bool = false, // events.jsonl touched recently AND no terminal 'stopped'
@@ -66,6 +68,9 @@ pub const SwarmSummary = struct {
 
     pub fn idStr(s: *const SwarmSummary) []const u8 {
         return s.id[0..s.id_len];
+    }
+    pub fn nameStr(s: *const SwarmSummary) []const u8 {
+        return if (s.name_len > 0) s.name[0..s.name_len] else s.id[0..s.id_len];
     }
     pub fn goalStr(s: *const SwarmSummary) []const u8 {
         return s.goal[0..s.goal_len];
@@ -270,8 +275,11 @@ fn composeText(ev: *Ev, a: []const u8, b: []const u8) void {
     setBuf16(&ev.text, &ev.text_len, s);
 }
 
-/// Enumerate swarm run dirs under `data_dir` (each with an events.jsonl). Fills `out`, returns the count.
-/// A run is `live` when its events.jsonl was modified within `live_window_s` and carries no 'stopped'.
+/// Enumerate swarm run dirs under `data_dir`. A swarm is any dir with an events.jsonl — and crucially the
+/// server writes deploys ONE LEVEL DOWN under per-user accounts (data/u<uid>/<hexid>/), while the CLI
+/// writes flat (data/<name>/). So: if data/X has events.jsonl it's a swarm; otherwise if X is a plain
+/// container dir, descend one level and take each data/X/child that has events.jsonl. The stored `id` is
+/// the path RELATIVE to data_dir (so control/tail resolve correctly for both layouts); `name` is friendly.
 pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []SwarmSummary, now_s: i64, live_window_s: i64) usize {
     var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
@@ -282,18 +290,20 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
         if (entry.kind != .directory) continue;
         const name = entry.name;
         if (name.len == 0 or name[0] == '.' or name[0] == '_') continue; // skip dot/underscore sidecars
-        const ev_path = std.fmt.allocPrint(gpa, "{s}/{s}/events.jsonl", .{ data_dir, name }) catch continue;
-        defer gpa.free(ev_path);
-        const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch continue; // no events.jsonl → not a swarm
-        var s: SwarmSummary = .{};
-        setBuf(&s.id, &s.id_len, name);
-        const mtime_s: i64 = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-        s.mtime_s = mtime_s;
-        summarizeTail(io, gpa, ev_path, &s);
-        s.live = !s.stopped and (now_s - mtime_s) <= live_window_s;
-        readGoalBrief(io, gpa, data_dir, name, &s);
-        out[n] = s;
-        n += 1;
+        if (addSwarm(io, gpa, data_dir, name, out, &n, now_s, live_window_s)) continue;
+        // no events.jsonl here → treat as a container (e.g. u<uid>/) and descend exactly one level.
+        var nbuf: [512]u8 = undefined;
+        const sub = std.fmt.bufPrint(&nbuf, "{s}/{s}", .{ data_dir, name }) catch continue;
+        var sd = Io.Dir.cwd().openDir(io, sub, .{ .iterate = true }) catch continue;
+        defer sd.close(io);
+        var sit = sd.iterate();
+        while (n < out.len) {
+            const ce = (sit.next(io) catch break) orelse break;
+            if (ce.kind != .directory or ce.name.len == 0 or ce.name[0] == '.') continue;
+            var rbuf: [96]u8 = undefined;
+            const rel = std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ name, ce.name }) catch continue;
+            _ = addSwarm(io, gpa, data_dir, rel, out, &n, now_s, live_window_s);
+        }
     }
     // newest activity first
     std.mem.sort(SwarmSummary, out[0..n], {}, struct {
@@ -302,6 +312,37 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
         }
     }.lt);
     return n;
+}
+
+/// If data_dir/rel has an events.jsonl, append a summary for it and return true; else false.
+fn addSwarm(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, out: []SwarmSummary, n: *usize, now_s: i64, live_window_s: i64) bool {
+    const ev_path = std.fmt.allocPrint(gpa, "{s}/{s}/events.jsonl", .{ data_dir, rel }) catch return false;
+    defer gpa.free(ev_path);
+    const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return false;
+    var s: SwarmSummary = .{};
+    setBuf(&s.id, &s.id_len, rel);
+    // friendly name: swarm.json "swarm", else the last path segment.
+    readSwarmName(io, gpa, data_dir, rel, &s);
+    if (s.name_len == 0) {
+        const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
+        setBuf(&s.name, &s.name_len, base);
+    }
+    s.mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+    summarizeTail(io, gpa, ev_path, &s);
+    s.live = !s.stopped and (now_s - s.mtime_s) <= live_window_s;
+    readGoalBrief(io, gpa, data_dir, rel, &s);
+    out[n.*] = s;
+    n.* += 1;
+    return true;
+}
+
+fn readSwarmName(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, s: *SwarmSummary) void {
+    const p = std.fmt.allocPrint(gpa, "{s}/{s}/swarm.json", .{ data_dir, rel }) catch return;
+    defer gpa.free(p);
+    const data = Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(8 << 10)) catch return;
+    defer gpa.free(data);
+    var nb: [256]u8 = undefined;
+    if (jsonStr(data, "swarm", &nb)) |nm| setBuf(&s.name, &s.name_len, nm);
 }
 
 /// Roster summary: the latest score + stopped marker. readFileAlloc with a limit ERRORS on a larger file
