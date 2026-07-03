@@ -1072,7 +1072,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
         }
 
-        if (live and !w.discourse) smokeTest(&w, run_dir);
+        if (live and !w.discourse) smokeTest(&w, run_dir, round);
         if (live and !w.discourse and w.doc_target == 0) deliverableGate(&w, run_dir);
         if (live and !w.discourse and w.doc_target == 0) interfaceScan(&w, run_dir);
         if (live and w.discourse) markDeliverableGaps(&w, goal, round);
@@ -4253,8 +4253,8 @@ fn deliverableGate(w: *Worker, run_dir: []const u8) void {
         w.emit("build", std.fmt.allocPrint(w.a(), ",\"lang\":\"{s}\",\"code\":{d},\"notes\":{d},\"focus\":{}", .{ lang, code, notes, notes > code }) catch ",\"code\":0");
 }
 
-fn smokeTest(w: *Worker, run_dir: []const u8) void {
-    if (w.smoke_cmd.len > 0) return declaredSmoke(w, run_dir); // the goal declared its own runtime gate
+fn smokeTest(w: *Worker, run_dir: []const u8, round: u32) void {
+    if (w.smoke_cmd.len > 0) return declaredSmoke(w, run_dir, round); // the goal declared its own runtime gate
     const gpa = w.gpa;
     if (w.smoke_str.len > 0) gpa.free(@constCast(w.smoke_str));
     w.smoke_str = "";
@@ -4674,7 +4674,7 @@ fn curlCode(w: *Worker, url: []const u8) u32 {
 /// grandchild — Windows gets `taskkill /T` on the resolved pid, POSIX a direct kill of the exec'd command).
 /// Framework-blind: the goal states how to boot and what must answer; the engine never guesses entrypoints
 /// or route shapes. Feeds the same smoke_ok completion gate SMOKE_PY does.
-fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
+fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
     const gpa = w.gpa;
     if (w.smoke_str.len > 0) gpa.free(@constCast(w.smoke_str));
     w.smoke_str = "";
@@ -4695,12 +4695,22 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
     defer if (via.len > 0) gpa.free(@constCast(via));
     const boot_arg: []const u8 = if (via.len > 0) via else w.smoke_cmd;
     const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", boot_arg } else .{ "/bin/sh", "-c", posix_boot };
-    var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch {
+    // BOOT STDERR CAPTURE — when the declared boot dies before binding, "status 0 = nothing listening"
+    // told the minds NOTHING about why (observed live, splash_test_4: the server crashed at startup on a
+    // cross-file TypeError for four straight rounds while the smoke reported only dead probes). The
+    // child's stderr lands in run_dir/.smoke_stderr and its tail rides the RUNTIME FAIL message — a
+    // crash traceback IS the actionable diagnostic. Best-effort: capture failure degrades to .ignore.
+    const sep = std.fmt.allocPrint(gpa, "{s}/.smoke_stderr", .{run_dir}) catch "";
+    defer if (sep.len > 0) gpa.free(sep);
+    const sef: ?std.Io.File = if (sep.len > 0) (std.Io.Dir.cwd().createFile(w.io, sep, .{}) catch null) else null;
+    var child = std.process.spawn(w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .stdin = .ignore, .stdout = .ignore, .stderr = if (sef) |f| .{ .file = f } else .ignore, .create_no_window = true }) catch {
+        if (sef) |f| f.close(w.io);
         w.smoke_ok = false;
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: the declared smoke `{s}` could not be spawned at all.", .{clip(w.smoke_cmd, 120)}) catch "";
-        if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", "runtime fail", w.smoke_str);
+        if (w.smoke_str.len > 0) w.act("engine", round, "smoke", "runtime fail", w.smoke_str);
         return;
     };
+    if (sef) |f| f.close(w.io); // the child holds its own duplicated handle; ours is done
     var okf = [_]bool{false} ** 16; // probe cap 16: a smoke is a liveness gate, not a test suite
     var codes = [_]u32{0} ** 16;
     var all_ok = false;
@@ -4766,9 +4776,19 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8) void {
             defer gpa.free(e);
             fb.appendSlice(gpa, e) catch {};
         }
-        w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: booted the DECLARED smoke `{s}` but these declared probes never answered 2xx/3xx inside the boot window (status 0 = nothing listening at all): {s}. The deliverable must boot from exactly that command and serve every declared probe — if VERIFY checks are failing, fix those first (a non-compiling server cannot serve).", .{ clip(w.smoke_cmd, 100), clip(fb.items, 400) }) catch "";
+        // The boot's own stderr tail: when the process crashed at startup this is the real diagnostic;
+        // when it's a healthy server's log noise the minds can see that too (capped, tail-only).
+        const crash: []const u8 = if (sep.len > 0) (std.Io.Dir.cwd().readFileAlloc(w.io, sep, gpa, .limited(32 << 10)) catch "") else "";
+        defer if (crash.len > 0) gpa.free(crash);
+        const ct = std.mem.trim(u8, crash, " \r\n\t");
+        const ctail = if (ct.len > 700) ct[ct.len - 700 ..] else ct;
+        if (ctail.len > 0) {
+            w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: booted the DECLARED smoke `{s}` but these declared probes never answered 2xx/3xx inside the boot window (status 0 = nothing listening at all): {s}. The boot's OWN stderr (tail) — if this is a crash traceback, THAT is the real failure to fix: {s}", .{ clip(w.smoke_cmd, 100), clip(fb.items, 400), ctail }) catch "";
+        } else {
+            w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: booted the DECLARED smoke `{s}` but these declared probes never answered 2xx/3xx inside the boot window (status 0 = nothing listening at all): {s}. The deliverable must boot from exactly that command and serve every declared probe — if VERIFY checks are failing, fix those first (a non-compiling server cannot serve).", .{ clip(w.smoke_cmd, 100), clip(fb.items, 400) }) catch "";
+        }
     }
-    if (w.smoke_str.len > 0) w.act("engine", 0, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
+    if (w.smoke_str.len > 0) w.act("engine", round, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
 }
 
 /// Run the engine-owned BENCHMARK once for the round (cwd = the build workdir) via `python -c BENCH_PY`, and
