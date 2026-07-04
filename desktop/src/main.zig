@@ -946,7 +946,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     }
 
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
-    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], tail[0..tail_n], cast_live);
+    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
 }
 
@@ -1409,30 +1409,20 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
     };
 }
 
-/// While the hive runs, stream its LIVE activity into the MAIN chat flow (the most recent events, refreshed
-/// every tick) so the user watches it work and reads findings AS THEY LAND — instead of dead air with only a
-/// side-pane and a % until the cast completes. Renders inside the same scrollable view as the messages.
-fn renderCastLive(view: t.Rect, y0: f32, tail: []const scan.Ev, status: []const u8, fsz: i32, draw: bool) f32 {
-    var yy = y0;
-    if (draw and inView(view, yy, MSG_LINE_H + 2)) {
-        t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H + 2), t.withAlpha(t.green, 34));
+/// A single clean 'the hive is working' status line in the chat flow while a cast runs, so the chat isn't dead
+/// air — but the DETAILED grounding/thinking/tool log stays in the Swarm activity pane (streaming the raw event
+/// dump into the chat was too noisy). One line only; the % + phase come from `status`.
+fn renderCastLive(view: t.Rect, y0: f32, status: []const u8, draw: bool) f32 {
+    if (draw and inView(view, y0, MSG_LINE_H + 2)) {
+        t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(y0 - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H + 2), t.withAlpha(t.green, 34));
         const spin = [_][]const u8{ "|", "/", "-", "\\" };
         const s = spin[@as(usize, @intFromFloat(@mod(rl.getTime() * 6.0, 4.0)))];
-        t.text(t.z("{s} the hive is working live — {s}", .{ s, if (status.len > 0) status else "casting" }), @intFromFloat(view.x + 14), @intFromFloat(yy), 12, t.green);
+        t.text(t.z("{s} the hive is working — {s}  (live detail in Swarm activity)", .{ s, if (status.len > 0) status else "casting" }), @intFromFloat(view.x + 14), @intFromFloat(y0), 12, t.green);
     }
-    yy += MSG_LINE_H + 6;
-    const n = tail.len;
-    const start = if (n > 14) n - 14 else 0; // the last ~14 events = the swarm's current work, streaming
-    for (tail[start..n]) |*ev| {
-        if (draw and inView(view, yy, MSG_LINE_H)) {
-            t.textMonoClip(ev.textStr(), @intFromFloat(view.x + 16), @intFromFloat(yy), fsz - 1, t.fg_dim, @intFromFloat(view.width - 28));
-        }
-        yy += MSG_LINE_H;
-    }
-    return yy + MSG_GAP_H;
+    return y0 + MSG_LINE_H + 6 + MSG_GAP_H;
 }
 
-fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, tail: []const scan.Ev, cast_live: bool) void {
+fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
     const input_h: f32 = 38;
     const status_h: f32 = 20;
     const view = t.Rect{ .x = r.x, .y = r.y, .width = r.width, .height = r.height - input_h - status_h - 10 };
@@ -1445,7 +1435,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     var total: f32 = 8;
     for (msgs) |*m| total += renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
     if (busy or stream.len > 0) total += renderMsg(view, 0, .veil, stream, cols, fsz, false, false) + MSG_LINE_H;
-    if (cast_live) total += renderCastLive(view, 0, tail, status, fsz, false);
+    if (cast_live) total += renderCastLive(view, 0, status, false);
 
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
@@ -1475,7 +1465,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (busy or stream.len > 0) {
         yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
     }
-    if (cast_live) yy = renderCastLive(view, yy, tail, status, fsz, true);
+    if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
         t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
     }
