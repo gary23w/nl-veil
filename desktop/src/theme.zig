@@ -10,30 +10,139 @@ pub const Color = rl.Color;
 pub const Rect = rl.Rectangle;
 pub const Vec2 = rl.Vector2;
 
-fn hex(comptime s: []const u8) Color {
-    const r = std.fmt.parseInt(u8, s[0..2], 16) catch 0;
-    const g = std.fmt.parseInt(u8, s[2..4], 16) catch 0;
-    const b = std.fmt.parseInt(u8, s[4..6], 16) catch 0;
-    return .{ .r = r, .g = g, .b = b, .a = 255 };
+fn hexNibble(c: u8) u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => 0,
+    };
 }
 
-// Tokyo Night — mirrors :root in styles.css.
-pub const bg = hex("1a1b26");
-pub const bg_dark = hex("16161e");
-pub const bg_hl = hex("1f2335");
-pub const bg_sel = hex("283457");
-pub const fg = hex("c0caf5");
-pub const fg_dim = hex("a9b1d6");
-pub const comment = hex("565f89");
-pub const border = hex("292e42");
-pub const blue = hex("7aa2f7");
-pub const cyan = hex("7dcfff");
-pub const green = hex("9ece6a");
-pub const magenta = hex("bb9af7");
-pub const orange = hex("ff9e64");
-pub const red = hex("f7768e");
-pub const yellow = hex("e0af68");
-pub const teal = hex("2ac3de");
+fn hexByte(hi: u8, lo: u8) u8 {
+    return (hexNibble(hi) << 4) | hexNibble(lo);
+}
+
+fn hex(comptime s: []const u8) Color {
+    return .{ .r = hexByte(s[0], s[1]), .g = hexByte(s[2], s[3]), .b = hexByte(s[4], s[5]), .a = 255 };
+}
+
+pub const Scheme = enum(u8) { dark = 0, light = 1 };
+
+const Palette = struct {
+    bg: Color,
+    bg_dark: Color,
+    bg_hl: Color,
+    bg_sel: Color,
+    fg: Color,
+    fg_dim: Color,
+    comment: Color,
+    border: Color,
+    blue: Color,
+    cyan: Color,
+    green: Color,
+    magenta: Color,
+    orange: Color,
+    red: Color,
+    yellow: Color,
+    teal: Color,
+};
+
+// Default dark palette (Tokyo Night, mirrors web/public/styles.css).
+const dark_palette = Palette{
+    .bg = hex("1a1b26"),
+    .bg_dark = hex("16161e"),
+    .bg_hl = hex("1f2335"),
+    .bg_sel = hex("283457"),
+    .fg = hex("ffffff"),
+    .fg_dim = hex("a9b1d6"),
+    .comment = hex("565f89"),
+    .border = hex("292e42"),
+    .blue = hex("7aa2f7"),
+    .cyan = hex("7dcfff"),
+    .green = hex("9ece6a"),
+    .magenta = hex("bb9af7"),
+    .orange = hex("ff9e64"),
+    .red = hex("f7768e"),
+    .yellow = hex("e0af68"),
+    .teal = hex("2ac3de"),
+};
+
+// Light palette tuned for readable contrast in the same visual language.
+const light_palette = Palette{
+    .bg = hex("f5f7fb"),
+    .bg_dark = hex("e9edf5"),
+    .bg_hl = hex("dfe7f4"),
+    .bg_sel = hex("cfdcf3"),
+    .fg = hex("000000"),
+    .fg_dim = hex("46557a"),
+    .comment = hex("6d7a99"),
+    .border = hex("c4cee2"),
+    .blue = hex("2f6feb"),
+    .cyan = hex("0b84a5"),
+    .green = hex("2f8f46"),
+    .magenta = hex("8a3ffc"),
+    .orange = hex("c27a00"),
+    .red = hex("c93a4a"),
+    .yellow = hex("a06a00"),
+    .teal = hex("0f8a83"),
+};
+
+var scheme: Scheme = .light;
+
+pub var bg: Color = light_palette.bg;
+pub var bg_dark: Color = light_palette.bg_dark;
+pub var bg_hl: Color = light_palette.bg_hl;
+pub var bg_sel: Color = light_palette.bg_sel;
+pub var fg: Color = light_palette.fg;
+pub var fg_dim: Color = light_palette.fg_dim;
+pub var comment: Color = light_palette.comment;
+pub var border: Color = light_palette.border;
+pub var blue: Color = light_palette.blue;
+pub var cyan: Color = light_palette.cyan;
+pub var green: Color = light_palette.green;
+pub var magenta: Color = light_palette.magenta;
+pub var orange: Color = light_palette.orange;
+pub var red: Color = light_palette.red;
+pub var yellow: Color = light_palette.yellow;
+pub var teal: Color = light_palette.teal;
+
+fn applyPalette(p: Palette) void {
+    bg = p.bg;
+    bg_dark = p.bg_dark;
+    bg_hl = p.bg_hl;
+    bg_sel = p.bg_sel;
+    fg = p.fg;
+    fg_dim = p.fg_dim;
+    comment = p.comment;
+    border = p.border;
+    blue = p.blue;
+    cyan = p.cyan;
+    green = p.green;
+    magenta = p.magenta;
+    orange = p.orange;
+    red = p.red;
+    yellow = p.yellow;
+    teal = p.teal;
+}
+
+pub fn setScheme(s: Scheme) void {
+    if (scheme == s) return;
+    scheme = s;
+    applyPalette(if (s == .light) light_palette else dark_palette);
+}
+
+pub fn setSchemeFromInt(v: u8) void {
+    setScheme(if (v == 1) .light else .dark);
+}
+
+pub fn getScheme() Scheme {
+    return scheme;
+}
+
+pub fn schemeInt() u8 {
+    return @intFromEnum(scheme);
+}
 
 pub fn withAlpha(c: Color, a: u8) Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
@@ -125,11 +234,60 @@ pub fn foldAscii(dst: []u8, src: []const u8) usize {
 // default. Drawing goes through drawTextEx for kerning + antialiasing.
 var ui_font: ?rl.Font = null;
 var mono_font: ?rl.Font = null;
+var mark_tex: ?rl.Texture = null;
+var mark_tex_attempted: bool = false;
+
+fn scrubTransparentRgb(img: *rl.Image) void {
+    if (img.width <= 0 or img.height <= 0) return;
+    img.setFormat(.uncompressed_r8g8b8a8);
+    const w: usize = @intCast(img.width);
+    const h: usize = @intCast(img.height);
+    const px_count: usize = w * h;
+    const data: [*]u8 = @ptrCast(img.data);
+    var i: usize = 0;
+    while (i < px_count) : (i += 1) {
+        const p = i * 4;
+        if (data[p + 3] == 0) {
+            data[p + 0] = 0;
+            data[p + 1] = 0;
+            data[p + 2] = 0;
+        }
+    }
+}
+
 pub fn setFont(f: rl.Font) void {
     ui_font = f;
 }
 pub fn setMono(f: rl.Font) void {
     mono_font = f;
+}
+pub fn deinit() void {
+    if (mark_tex) |tex| rl.unloadTexture(tex);
+    mark_tex = null;
+    mark_tex_attempted = false;
+}
+
+fn ensureMarkTexture() void {
+    if (mark_tex_attempted) return;
+    mark_tex_attempted = true;
+    const candidates = [_][:0]const u8{
+        "assets/icon.png",
+        "desktop/assets/icon.png",
+        "../assets/icon.png",
+        "../desktop/assets/icon.png",
+    };
+    for (candidates) |path| {
+        if (rl.loadImage(path)) |loaded| {
+            var img = loaded;
+            defer rl.unloadImage(img);
+            scrubTransparentRgb(&img);
+            if (rl.loadTextureFromImage(img)) |tex| {
+                rl.setTextureFilter(tex, .bilinear);
+                mark_tex = tex;
+                return;
+            } else |_| {}
+        } else |_| {}
+    }
 }
 fn theFont() rl.Font {
     return ui_font orelse (rl.getFontDefault() catch unreachable);
@@ -270,11 +428,19 @@ pub fn winButton(r: Rect, glyph: [:0]const u8, danger: bool) bool {
     return hot and rl.isMouseButtonPressed(.left);
 }
 
-/// The nl-veil mark: a shadow-agent bust (head + broad shoulders — the universal "person/agent"
-/// silhouette), NOT a keyhole/padlock. Drawn from primitives, no asset. cx,cy is the center; `s` the
-/// half-size.
+/// The nl-veil mark: use assets/icon.png when available; fall back to the procedural bust if loading fails.
+/// cx,cy is the center; `s` the half-size.
 pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
     if (tile) rl.drawRectangleRounded(.{ .x = cx - s, .y = cy - s, .width = s * 2, .height = s * 2 }, 0.32, 8, bg_hl);
+
+    ensureMarkTexture();
+    if (mark_tex) |tex| {
+        const src = Rect{ .x = 0, .y = 0, .width = @floatFromInt(tex.width), .height = @floatFromInt(tex.height) };
+        const dst = Rect{ .x = cx - s, .y = cy - s, .width = s * 2, .height = s * 2 };
+        rl.drawTexturePro(tex, src, dst, .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        return;
+    }
+
     const fig = magenta;
     // shoulders / cloak: a broad rounded mound, clearly wider than the head (the "person" read)
     rl.drawRectangleRounded(.{ .x = cx - s * 0.92, .y = cy + s * 0.06, .width = s * 1.84, .height = s * 0.98 }, 0.75, 10, fig);

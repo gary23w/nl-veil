@@ -56,6 +56,7 @@ fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    var desktop_mode = false;
     // A real threaded io instead of the default init.io. httpz runs a pool of ~32 worker threads that
     // correctly BLOCK on a condition variable when there is no work — but the default init.io busy-SPINS
     // those blocking waits on Windows, pinning ~10 CPU cores with the server completely idle (0 swarms, no
@@ -80,6 +81,10 @@ pub fn main(init: std.process.Init) !void {
                 const nbin = try gpa.dupe(u8, it.next() orelse "");
                 const model = try gpa.dupe(u8, it.next() orelse "mock");
                 return worker.run(gpa, io, init.environ_map, run_dir, nbin, model);
+            }
+            if (std.mem.eql(u8, sub, "--desktop")) desktop_mode = true;
+            while (it.next()) |arg| {
+                if (std.mem.eql(u8, arg, "--desktop")) desktop_mode = true;
             }
         }
     } else |_| {}
@@ -199,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
     // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
     // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
     if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
-    launchDesktop(gpa, io, paths.home, init.environ_map);
+    if (desktop_mode) launchDesktop(gpa, io, paths.home, init.environ_map);
     try server.listen();
 }
 
@@ -230,10 +235,10 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
 
 const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
 
-/// "Host the desktop": when the control plane comes up, launch the veil-desk dashboard if it was built
-/// (desktop/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached and
-/// best-effort — a headless box either has no binary (built with -Ddesktop=false) or no display, and the
-/// spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
+/// "Host the desktop": when desktop mode is requested (`--desktop`), launch the veil-desk dashboard if it
+/// was built (desktop/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached
+/// and best-effort — a headless box either has no binary (built with -Ddesktop=false) or no display, and
+/// the spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
 fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) void {
     if (environ.get("NL_NO_DESKTOP")) |v| {
         if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;

@@ -1,7 +1,6 @@
-//! Build script — produces the `veil` binary (the hive-mind engine). By default it ALSO builds the
-//! veil-desk desktop dashboard (desktop/) so a local `zig build` gives you both, and the running server
-//! launches the dashboard on startup. Headless/CI boxes that lack raylib's GL/X11 libs pass
-//! `-Ddesktop=false` (or the best-effort desktop build simply no-ops without failing the server build).
+//! Build script — produces the `veil` binary (the hive-mind engine). Desktop is opt-in: pass
+//! `-Ddesktop=true` to also build veil-desk (desktop/) and run the server in desktop-host mode.
+//! Headless/CI boxes can keep the default server-only build and never touch raylib's GL/X11 libs.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -51,11 +50,12 @@ pub fn build(b: *std.Build) void {
     const desktop_step = b.step("desktop", "Build the veil-desk desktop dashboard");
     desktop_step.dependOn(&desk_cmd.step);
 
-    const with_desktop = b.option(bool, "desktop", "also build veil-desk with the server (default true)") orelse true;
+    const with_desktop = b.option(bool, "desktop", "also build veil-desk + run server with --desktop (default false)") orelse false;
     if (with_desktop) b.getInstallStep().dependOn(&desk_cmd.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
+    if (with_desktop) run_cmd.addArg("--desktop");
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the veil hive-mind control plane");
     run_step.dependOn(&run_cmd.step);

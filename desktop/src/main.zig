@@ -180,6 +180,7 @@ pub fn main() !void {
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     defer rl.closeWindow();
+    defer t.deinit();
     rl.setTargetFPS(60);
 
     // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
@@ -204,9 +205,10 @@ pub fn main() !void {
         t.setMono(fm);
         mono_loaded = true;
     }
-    // Window + taskbar icon: the shadow-figure mark rendered into an image.
+    // Window + taskbar icon from assets/icon.png (with a procedural fallback).
     const icon = makeIcon();
     rl.setWindowIcon(icon);
+    rl.unloadImage(icon);
 
     var tray: tray_mod.Tray = .{};
     tray.init("veil-desk");
@@ -221,12 +223,15 @@ pub fn main() !void {
         store.unlock();
     }
 
+    syncThemeFromStore(&store);
+
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
         // 60fps focused = snappy scroll/type/hover; 10fps in the background for heat control.
         rl.setTargetFPS(if (rl.isWindowFocused()) 60 else 10);
         tray.pump();
         pumpTray(&store, &tray, gpa);
+        syncThemeFromStore(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
         handleWindowChrome();
         handleKeys();
@@ -301,8 +306,10 @@ fn handleWindowChrome() void {
             rl.setWindowSize(nw, nh);
         } else ui.resizing = false;
     }
-    // title-bar drag (empty zone only: not over the window buttons or the File hit-box)
-    const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 96 and !(mp.x > 40 and mp.x < 90);
+    // title-bar drag (empty zone only: not over window controls, File, or the theme selector)
+    const over_file = mp.x > 40 and mp.x < 90;
+    const over_theme = mp.x > 104 and mp.x < 236;
+    const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 96 and !(over_file or over_theme);
     if (rl.isMouseButtonPressed(.left) and in_title and !ui.resizing) ui.dragging = true;
     if (ui.dragging) {
         if (rl.isMouseButtonDown(.left)) {
@@ -325,6 +332,21 @@ fn drawTitlebar(store: *Store) void {
     if (t.hovering(fr) or ui.file_menu) t.panel(fr, t.bg_hl);
     t.text(t.z("File", .{}), 76, 8, 13, t.fg_dim);
     if (t.hovering(fr) and rl.isMouseButtonPressed(.left)) ui.file_menu = !ui.file_menu;
+
+    // Theme selector beside File
+    const tr = t.Rect{ .x = 114, .y = 3, .width = 118, .height = TITLE_H - 6 };
+    const scheme_now = t.getScheme();
+    const theme_hot = t.hovering(tr);
+    if (theme_hot) t.panel(tr, t.bg_hl);
+    t.text(if (scheme_now == .light) t.z("Theme: Light", .{}) else t.z("Theme: Dark", .{}), @intFromFloat(tr.x + 8), @intFromFloat(tr.y + 5), 12, if (theme_hot) t.fg else t.fg_dim);
+    if (theme_hot and rl.isMouseButtonPressed(.left)) {
+        const next: t.Scheme = if (scheme_now == .dark) .light else .dark;
+        t.setScheme(next);
+        store.lock();
+        store.settings.theme = @intFromEnum(next);
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
 
     // right: server status + minimize + close
     store.lock();
@@ -436,12 +458,29 @@ fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
 }
 
 fn makeIcon() rl.Image {
+    const candidates = [_][:0]const u8{
+        "assets/icon.png",
+        "desktop/assets/icon.png",
+        "../assets/icon.png",
+        "../desktop/assets/icon.png",
+    };
+    for (candidates) |path| {
+        if (rl.loadImage(path)) |img| return img else |_| {}
+    }
+
     var img = rl.genImageColor(64, 64, .{ .r = 0x1a, .g = 0x1b, .b = 0x26, .a = 255 });
     const mag = rl.Color{ .r = 0xbb, .g = 0x9a, .b = 0xf7, .a = 255 };
     // agent bust: broad shoulders (wider than head) + head — the person silhouette, not a padlock.
     rl.imageDrawRectangle(&img, 12, 36, 40, 22, mag);
     rl.imageDrawCircle(&img, 32, 26, 13, mag);
     return img;
+}
+
+fn syncThemeFromStore(store: *Store) void {
+    store.lock();
+    const theme = store.settings.theme;
+    store.unlock();
+    t.setSchemeFromInt(theme);
 }
 
 fn seedName(buf: []u8) usize {
@@ -528,7 +567,8 @@ fn autoSelect(store: *Store) bool {
 fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
     store.lock();
     tray.setOnline(store.server_online);
-    const notify_on = store.settings.notify;
+    var notify_on = store.settings.notify;
+    tray.setNotifyEnabled(notify_on);
     var to_send: [8]store_mod.Notif = undefined;
     var send_n: usize = 0;
     var i: usize = 0;
@@ -544,6 +584,29 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
     }
     store.unlock();
     if (tray.takeRestoreRequest()) rl.restoreWindow();
+
+    while (true) {
+        switch (tray.takeMenuAction()) {
+            .none => break,
+            .open_settings => {
+                rl.restoreWindow();
+                ui.tab = .settings;
+                ui.focus = .none;
+            },
+            .toggle_notifications => {
+                store.lock();
+                store.settings.notify = !store.settings.notify;
+                const now_on = store.settings.notify;
+                store.unlock();
+                tray.setNotifyEnabled(now_on);
+                notify_on = now_on;
+                if (now_on) tray.notify(gpa, "veil-desk", "Notifications enabled", 0);
+            },
+            .refresh_now => store.pushCmd(store_mod.mkCmd(.refresh_now, "", "")),
+            .quit => ui.close_req = true,
+        }
+    }
+
     if (!notify_on) return;
     var k: usize = 0;
     while (k < send_n) : (k += 1) tray.notify(gpa, to_send[k].titleStr(), to_send[k].bodyStr(), to_send[k].accent);
@@ -551,15 +614,29 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
 
 // -------------------------------------------------------------------------------- input
 
+/// Switch tabs from ANY input path (digit shortcut or tab click). Resetting open_dd here is what keeps a
+/// dropdown opened on one tab from bleeding onto — or silently blocking every text field of — the next tab:
+/// the keyboard path skipped this reset before, so a stray open dropdown could wedge focus (and thus Ctrl+V
+/// paste / Ctrl+C copy, which only run on the focused field). Landing focus in the chat input on the way into
+/// Chat means you can just start typing — and lets the whole app be driven from the keyboard. When the switch
+/// is triggered by a digit key, that same keypress also queued a character; swallow it so "2" doesn't type a
+/// literal '2' into the input it just focused.
+fn setTab(tabv: Tab) void {
+    ui.tab = tabv;
+    ui.open_dd = .none;
+    ui.focus = if (tabv == .chat) .c_input else .none;
+    if (tabv == .chat) while (rl.getCharPressed() > 0) {}; // drain the trigger digit; don't type it into the field
+}
+
 fn handleKeys() void {
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
-        if (rl.isKeyPressed(.one)) ui.tab = .dashboard;
-        if (rl.isKeyPressed(.two)) ui.tab = .chat;
-        if (rl.isKeyPressed(.three)) ui.tab = .deploy;
-        if (rl.isKeyPressed(.four)) ui.tab = .swarm;
-        if (rl.isKeyPressed(.five)) ui.tab = .hub;
-        if (rl.isKeyPressed(.six)) ui.tab = .settings;
+        if (rl.isKeyPressed(.one)) setTab(.dashboard);
+        if (rl.isKeyPressed(.two)) setTab(.chat);
+        if (rl.isKeyPressed(.three)) setTab(.deploy);
+        if (rl.isKeyPressed(.four)) setTab(.swarm);
+        if (rl.isKeyPressed(.five)) setTab(.hub);
+        if (rl.isKeyPressed(.six)) setTab(.settings);
     }
     switch (ui.focus) {
         .none => {},
@@ -589,7 +666,10 @@ fn editField(f: *Ui.Field) void {
         for (clip) |raw_ch| {
             // multi-line pastes flatten to spaces instead of being silently dropped
             const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
-            if (ch >= 32 and ch < 127 and f.len < f.buf.len - 1) {
+            // Accept UTF-8 (any byte >= 128) as well as printable ASCII — the old `< 127` cap silently dropped
+            // every non-ASCII byte, so pasting text with smart quotes, em-dashes, or accents lost characters.
+            // The renderer folds these to ASCII for display, but the field keeps the real bytes to send/copy.
+            if (ch >= 32 and ch != 127 and f.len < f.buf.len - 1) {
                 if (ch == ' ' and f.len > 0 and f.buf[f.len - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
                 f.buf[f.len] = ch;
                 f.len += 1;
@@ -621,11 +701,7 @@ fn drawTabbar(store: *Store) void {
     for (labels, tabs) |lb, tabv| {
         const w: f32 = @floatFromInt(t.measure(lb, 13) + 26);
         const r = t.Rect{ .x = x, .y = TITLE_H + 4, .width = w, .height = TAB_H - 6 };
-        if (t.tab(r, lb, ui.tab == tabv)) {
-            ui.tab = tabv;
-            ui.focus = .none;
-            ui.open_dd = .none; // don't let a dropdown opened on one tab bleed onto another
-        }
+        if (t.tab(r, lb, ui.tab == tabv)) setTab(tabv);
         x += w + 4;
     }
 }
@@ -1587,9 +1663,9 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
     w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
-        prov.key,                    prov.models[ui.d_model].id, catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
-        prov.base_url,               catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),   boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
-        boolStr(ui.d_internet),      boolStr(ui.d_gap),          boolStr(ui.d_breakout),    boolStr(ui.d_psyche),
+        prov.key,               prov.models[ui.d_model].id,    catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
+        prov.base_url,          catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),      boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
+        boolStr(ui.d_internet), boolStr(ui.d_gap),             boolStr(ui.d_breakout),     boolStr(ui.d_psyche),
     }) catch return;
     jesc(&w, ui.d_key.str());
     w.writeAll("\",\"gateway_model\":\"") catch return;

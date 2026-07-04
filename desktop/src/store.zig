@@ -66,6 +66,7 @@ pub const Settings = struct {
     token_len: u8 = 0,
     token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
     notify: bool = true,
+    theme: u8 = 1, // 0 dark / 1 light
 
     // --- chat model provider (Settings tab writes, chat thread reads; persisted to .veil-desk) ---
     chat_kind: u8 = 0, // 0 local (Ollama) / 1 BYOK (catalog provider) / 2 custom URL
