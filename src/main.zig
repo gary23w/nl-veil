@@ -19,6 +19,7 @@ const auth_api = @import("auth/auth_api.zig");
 const deploy_service = @import("orchestrate/deploy_service.zig");
 const tail_fanout = @import("orchestrate/tail_fanout.zig");
 const control_writer = @import("orchestrate/control_writer.zig");
+const chat_tools = @import("orchestrate/chat_tools.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
@@ -183,7 +184,10 @@ pub fn main(init: std.process.Init) !void {
     if (!open_reg) std.debug.print("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups\n", .{});
     if (cf_account.len > 0 and wai_token.len > 0) std.debug.print("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint\n", .{}) else std.debug.print("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)\n", .{});
 
-    const port: u16 = 8787;
+    const port: u16 = if (init.environ_map.get("NL_PORT")) |v|
+        (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
+    else
+        8787;
     // On Windows httpz runs the BLOCKING thread-per-connection worker (one pool thread per live socket),
     // and its ONLY idle/half-open reaping is SO_RCVTIMEO — which is never set unless we pass timeouts here.
     // Without these, a keep-alive connection that dies without a clean FIN (laptop sleep, tab crash, network
@@ -230,6 +234,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/swarms/:id/site/*", deploy_service.swarmSite, .{});
     router.post("/api/v1/swarms/:id/deploy/cloudflare", deploy_service.swarmDeployCf, .{});
     router.post("/api/v1/swarms/:id/control", control_writer.swarmControl, .{});
+    router.post("/api/v1/chat/tool", chat_tools.chatTool, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
