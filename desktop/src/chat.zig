@@ -67,6 +67,7 @@ pub const Chat = struct {
     cast_rel_len: usize = 0,
     cast_deadline_s: i64 = 0,
     cast_stop_sent: bool = false,
+    ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -173,6 +174,72 @@ pub const Chat = struct {
         if (s.chat_kind == 0) return true; // local (Ollama) provider
         if (s.chat_kind == 2) return std.mem.indexOf(u8, s.chatBase(), "11434") != null; // custom URL at Ollama
         return false;
+    }
+
+    /// Largest "context_length": value in an /api/ps body (0 if none/unparseable). Pure — unit-tested.
+    fn parseMaxCtx(body: []const u8) u32 {
+        var maxc: u32 = 0;
+        var i: usize = 0;
+        const needle = "\"context_length\":";
+        while (std.mem.indexOfPos(u8, body, i, needle)) |at| {
+            var j = at + needle.len;
+            while (j < body.len and body[j] == ' ') j += 1;
+            var v: u64 = 0;
+            var any = false;
+            while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {
+                v = v * 10 + (body[j] - '0');
+                any = true;
+                if (v > std.math.maxInt(u32)) break;
+            }
+            if (any and v > maxc) maxc = std.math.cast(u32, v) orelse std.math.maxInt(u32);
+            i = j;
+        }
+        return maxc;
+    }
+
+    /// Best-effort: the context window the LOCAL Ollama has actually loaded the model with (0 if not local /
+    /// nothing loaded / unreachable). Ollama IGNORES the per-request num_ctx and honors only the
+    /// OLLAMA_CONTEXT_LENGTH env var; when that is unset, gpt-oss loads at its full 131072 window whose KV
+    /// cache eats ~6GB of VRAM, starving the model onto the CPU (~1 tok/s) and making swarm casts crawl. A
+    /// value far above what we request (32768) is the tell that the env var is unset — see localSlowTip.
+    fn loadedLocalCtx(self: *Chat) u32 {
+        if (!self.isLocalChat()) return 0;
+        var rootbuf: [200]u8 = undefined;
+        var root: []const u8 = "http://127.0.0.1:11434";
+        {
+            self.store.lock();
+            const s = &self.store.settings;
+            const base = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1";
+            self.store.unlock();
+            var r = std.mem.trimEnd(u8, base, "/");
+            if (std.mem.endsWith(u8, r, "/v1")) r = r[0 .. r.len - 3];
+            if ((std.mem.indexOf(u8, r, "127.0.0.1") != null or std.mem.indexOf(u8, r, "localhost") != null) and std.mem.indexOf(u8, r, "11434") != null) {
+                const n = @min(r.len, rootbuf.len);
+                @memcpy(rootbuf[0..n], r[0..n]);
+                root = rootbuf[0..n];
+            }
+        }
+        const url = std.fmt.allocPrint(self.gpa, "{s}/api/ps", .{root}) catch return 0;
+        defer self.gpa.free(url);
+        const res = std.process.run(self.gpa, self.io, .{
+            .argv = &.{ "curl", "-sS", "--max-time", "4", url },
+            .stdout_limit = .limited(64 << 10),
+        }) catch return 0;
+        defer self.gpa.free(res.stdout);
+        defer self.gpa.free(res.stderr);
+        if (res.term != .exited or res.term.exited != 0) return 0;
+        return parseMaxCtx(res.stdout);
+    }
+
+    /// If a local model is loaded with a runaway context (env var unset), tell the user the one-line fix
+    /// ONCE — a slow cast otherwise looks like a broken cast. No-op when correctly configured.
+    fn localSlowTip(self: *Chat, dd: []const u8) void {
+        if (self.ctx_warned) return;
+        const ctx = self.loadedLocalCtx();
+        if (ctx <= 40000) return; // 0 (not local / nothing loaded) or a sane window → nothing to warn about
+        self.ctx_warned = true;
+        self.appendMsg(dd, .cast_note, "[cast] heads-up: your local model is loaded with a very large context window, so most of it is running on the CPU and this swarm will be slow. For ~16x faster local casts, set the Windows environment variable OLLAMA_CONTEXT_LENGTH=8192 and fully restart Ollama.");
+        log.info("cast: local model loaded at ctx={d} (>40k) — OLLAMA_CONTEXT_LENGTH likely unset; warned user", .{ctx});
     }
 
     fn ensureDirs(self: *Chat, dd: []const u8) void {
@@ -874,6 +941,10 @@ pub const Chat = struct {
             else => "ollama",
         };
 
+        // A local model loaded with a runaway context (OLLAMA_CONTEXT_LENGTH unset) casts ~16x slower and
+        // reads as "broken" — surface the one-line fix once, before the row, so the slowness is explained.
+        if (std.mem.eql(u8, prov_key, "ollama")) self.localSlowTip(dd);
+
         // Show a "deploying" row + status the INSTANT casting starts, BEFORE building the body — so even a
         // body-build failure is visible (a stuck row) rather than a silent nothing.
         self.pushCastRow(goal);
@@ -1450,6 +1521,17 @@ test "castGoalFromUser strips the cast preamble" {
     try std.testing.expectEqualStrings("build a REST API", castGoalFromUser("spin up a swarm that build a REST API", &b));
     // no clear separator → keep the whole message
     try std.testing.expectEqualStrings("run the hive", castGoalFromUser("run the hive", &b));
+}
+
+test "parseMaxCtx pulls the largest loaded context_length from an /api/ps body" {
+    const ps = "{\"models\":[{\"name\":\"gpt-oss:20b\",\"size_vram\":3812873994,\"context_length\":131072}]}";
+    try std.testing.expectEqual(@as(u32, 131072), Chat.parseMaxCtx(ps));
+    const ok = "{\"models\":[{\"name\":\"gpt-oss:20b\",\"context_length\":8192}]}";
+    try std.testing.expectEqual(@as(u32, 8192), Chat.parseMaxCtx(ok));
+    try std.testing.expectEqual(@as(u32, 0), Chat.parseMaxCtx("{\"models\":[]}")); // nothing loaded
+    // multiple models → the largest wins (the one that would dominate VRAM)
+    const two = "{\"models\":[{\"context_length\":4096},{\"context_length\":131072}]}";
+    try std.testing.expectEqual(@as(u32, 131072), Chat.parseMaxCtx(two));
 }
 
 test "noteWithoutCast drops exactly the tag line" {
