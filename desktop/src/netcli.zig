@@ -39,7 +39,10 @@ fn curlReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
 
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(gpa);
-    argv.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", timeout_s, "-X", method }) catch return null;
+    // `--no-keepalive` + `Connection: close`: the poller opens a fresh connection every few seconds, so we
+    // want the server to CLOSE each one right after replying rather than hold it half-open (keep-alive ->
+    // CLOSE_WAIT pile-up that exhausts a small local server). Restores what the old raw-socket client did.
+    argv.appendSlice(gpa, &.{ "curl", "-sS", "--no-keepalive", "--max-time", timeout_s, "-X", method, "-H", "Connection: close" }) catch return null;
     if (auth.len > 0) argv.appendSlice(gpa, &.{ "-H", auth }) catch return null;
     if (body_json) |b| argv.appendSlice(gpa, &.{ "-H", "Content-Type: application/json", "--data-binary", b }) catch return null;
     argv.appendSlice(gpa, &.{ "-w", STAT_FMT, url }) catch return null;
