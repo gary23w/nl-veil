@@ -114,9 +114,12 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
         text = c;
     } else |_| {
         const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{sw.run_dir}); // events.jsonl lives at the run_dir ROOT (synthesis.md is under work/)
-        if (std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(256 << 10))) |c| {
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(512 << 10))) |c| {
             scrubUtf8(c);
-            text = tailLines(c, 6000);
+            // No synthesis yet (a still-running cast): distill the readable research narrative from the events
+            // — the goal + each mind's per-round monologue — instead of dumping raw telemetry JSON at the model.
+            const digest = digestEvents(res.arena, c);
+            text = if (digest.len > 0) digest else tailLines(c, 6000);
         } else |_| {
             text = "(no findings yet — the swarm has not written a synthesis or events)";
         }
@@ -163,6 +166,84 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *ht
     scrubUtf8(result);
     defer if (result.len > 0) app.gpa.free(result);
     try res.json(.{ .ok = true, .tool = tool, .result = result }, .{});
+}
+
+/// Distill a still-running cast's events.jsonl into the readable research narrative a chat can summarize: the
+/// goal + each mind's per-round monologue (its own account of what it found), skipping pure telemetry (growth,
+/// cost, capacity, the giant tick trace/stored arrays). Returns "" if nothing useful was found (caller falls
+/// back to the raw tail). Output is UTF-8-scrubbed so it is always safe for res.json.
+fn digestEvents(arena: std.mem.Allocator, raw: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line| {
+        if (line.len < 8) continue;
+        const kind = jsonField(line, "kind");
+        if (std.mem.eql(u8, kind, "started")) {
+            if (jsonStrArena(arena, line, "goal")) |g| {
+                out.appendSlice(arena, "Goal: ") catch {};
+                out.appendSlice(arena, clip(g, 400)) catch {};
+                out.append(arena, '\n') catch {};
+            }
+        } else if (std.mem.eql(u8, kind, "tick")) {
+            const mono = jsonStrArena(arena, line, "monologue") orelse continue;
+            const t = std.mem.trim(u8, mono, " \r\n\t");
+            if (t.len < 8) continue;
+            out.appendSlice(arena, "\n• ") catch {};
+            out.appendSlice(arena, jsonField(line, "mind")) catch {};
+            out.appendSlice(arena, ": ") catch {};
+            out.appendSlice(arena, clip(t, 700)) catch {};
+            out.append(arena, '\n') catch {};
+        }
+        if (out.items.len > 8000) break; // enough for the model to summarize
+    }
+    scrubUtf8(out.items); // clips above may split a multibyte char
+    return out.items;
+}
+
+fn clip(s: []const u8, n: usize) []const u8 {
+    return if (s.len > n) s[0..n] else s;
+}
+
+/// Extract a JSON string value for `key`, UNESCAPING into a fresh arena allocation (\n \t \r \" \\ \/ and, best-
+/// effort, \uXXXX -> space). Unbounded + escape-aware, unlike jsonField. Returns null if the key is absent.
+fn jsonStrArena(arena: std.mem.Allocator, s: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [48]u8 = undefined;
+    if (key.len + 3 > kbuf.len) return null;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    kbuf[2 + key.len] = ':';
+    const needle = kbuf[0 .. 3 + key.len];
+    const at = std.mem.indexOf(u8, s, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < s.len and (s[i] == ' ' or s[i] == '\t')) i += 1;
+    if (i >= s.len or s[i] != '"') return null;
+    i += 1;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    while (i < s.len) {
+        const c = s[i];
+        if (c == '"') break;
+        if (c == '\\' and i + 1 < s.len) {
+            const e = s[i + 1];
+            i += 2;
+            out.append(arena, switch (e) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 8,
+                'f' => 12,
+                'u' => blk: {
+                    if (i + 4 <= s.len) i += 4;
+                    break :blk ' ';
+                },
+                else => e,
+            }) catch return out.items;
+            continue;
+        }
+        out.append(arena, c) catch return out.items;
+        i += 1;
+    }
+    return out.items;
 }
 
 /// Replace each byte that is not part of a valid UTF-8 sequence with '?' (in place, length-preserving), so
