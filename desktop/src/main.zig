@@ -1717,7 +1717,10 @@ fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) voi
     t.text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 6), 11, t.comment);
     t.textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 20), 14, t.fg, @intFromFloat(r.width - 30));
     t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 20), @intFromFloat(r.y + 18), 13, if (open) t.blue else t.comment);
-    if (t.hovering(r) and rl.isMouseButtonPressed(.left)) {
+    // While any dropdown list is open, only its own anchor may toggle; this prevents list clicks from
+    // leaking through to a selector drawn underneath the list in the same frame.
+    const can_toggle = ui.open_dd == .none or open;
+    if (can_toggle and t.hovering(r) and rl.isMouseButtonPressed(.left)) {
         ui.open_dd = if (open) .none else kind;
         ui.dd_rect = r;
         ui.dd_scroll = 0;
