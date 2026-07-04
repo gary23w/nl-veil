@@ -1332,6 +1332,8 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
 // -------------------------------------------------------------------------------- deploy form
 
 fn drawDeploy(store: *Store, body: t.Rect) void {
+    t.setBlockClicks(ui.open_dd != .none); // same dropdown-overlay guard as Settings (cleared before flushDropdown)
+    defer t.setBlockClicks(false);
     const pad: f32 = 16;
     const x: f32 = pad;
     const colw = @min(body.width - pad * 2, 900);
@@ -1422,7 +1424,8 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     const hint = if (!online) t.z("server offline - start it to deploy", .{}) else if (ui.d_goal.len == 0) t.z("enter a goal", .{}) else t.z("posts to /api/v1/swarms on :{d}", .{portOf(store)});
     t.text(hint, @intFromFloat(x + 214), @intFromFloat(gy + 13), 12, if (ready) t.comment else t.orange);
 
-    // draw the open dropdown LAST so its list sits on top of the fields below it.
+    // draw the open dropdown LAST so its list sits on top of the fields below it (unblock so options click).
+    t.setBlockClicks(false);
     flushDropdown();
 }
 
@@ -1926,6 +1929,10 @@ fn drawHub(body: t.Rect) void {
 // -------------------------------------------------------------------------------- settings
 
 fn drawSettings(store: *Store, body: t.Rect) void {
+    // While a dropdown is open, block the form's buttons/toggles from eating a click meant for the dropdown
+    // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
+    t.setBlockClicks(ui.open_dd != .none);
+    defer t.setBlockClicks(false); // never let it leak to the titlebar/tabbar of the next frame
     const pad: f32 = 16;
     var y: f32 = body.y + pad;
     const x: f32 = pad;
@@ -2066,7 +2073,9 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
 
-    // draw the open chat dropdown LAST so its option list sits on top of the fields below it.
+    // draw the open chat dropdown LAST so its option list sits on top of the fields below it. Unblock first
+    // so the option rows themselves are clickable (they were covered by the block during the form above).
+    t.setBlockClicks(false);
     flushChatDropdown(store);
 }
 
@@ -2198,7 +2207,10 @@ fn flushChatDropdown(store: *Store) void {
 
 fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
-    if (t.hovering(r) and rl.isMouseButtonPressed(.left)) ui.focus = which;
+    // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click
+    // meant for a dropdown item would otherwise fall through and focus the input underneath (the reported bug).
+    // The open dropdown owns the click; drawList closes it on an outside-click.
+    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
     if (f.len == 0 and !focused) {
