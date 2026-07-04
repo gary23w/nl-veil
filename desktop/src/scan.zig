@@ -214,6 +214,18 @@ fn foldMetrics(line: []const u8, m: *Metrics) void {
         }
         if (jsonInt(line, "passed")) |p| m.passed = @intCast(p);
         if (jsonInt(line, "total")) |t| m.total = @intCast(t);
+    } else if (std.mem.eql(u8, kind, "phase")) {
+        // RESEARCH/discourse casts never emit a "score" (no benchmark) — their per-round progress is a
+        // "phase" event carrying now/best. Reading it here is what makes the hive-running label move instead
+        // of sitting at 0% for the whole cast (the reported bug).
+        if (jsonInt(line, "round")) |r| m.round = r;
+        if (jsonInt(line, "now")) |p| {
+            m.pct = @intCast(p);
+            if (p > m.best_pct) m.best_pct = @intCast(p);
+        }
+        if (jsonInt(line, "best")) |b| {
+            if (b > m.best_pct) m.best_pct = @intCast(b);
+        }
     } else if (std.mem.eql(u8, kind, "cost")) {
         if (jsonInt(line, "total_in")) |v| m.tokens_in = @intCast(v);
         if (jsonInt(line, "total_out")) |v| m.tokens_out = @intCast(v);

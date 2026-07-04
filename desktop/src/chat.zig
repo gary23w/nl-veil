@@ -68,6 +68,7 @@ pub const Chat = struct {
     cast_deadline_s: i64 = 0,
     cast_stop_sent: bool = false,
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
+    ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -942,7 +943,10 @@ pub const Chat = struct {
 
         // A local model loaded with a runaway context (OLLAMA_CONTEXT_LENGTH unset) casts ~16x slower and
         // reads as "broken" — surface the one-line fix once, before the row, so the slowness is explained.
-        if (std.mem.eql(u8, prov_key, "ollama")) self.localSlowTip(dd);
+        if (std.mem.eql(u8, prov_key, "ollama")) {
+            self.localSlowTip(dd); // check now (model may already be loaded huge)
+            self.ctx_poll_budget = 12; // and re-check for the first ~12 ticks in case it loads huge mid-cast
+        }
 
         // Show a "deploying" row + status the INSTANT casting starts, BEFORE building the body — so even a
         // body-build failure is visible (a stuck row) rather than a silent nothing.
@@ -1063,9 +1067,23 @@ pub const Chat = struct {
         var last: []const u8 = "";
         if (ev_n > 0) last = self.ev_scratch[ev_n - 1].textStr();
         self.updateCastRow(if (m.stopped) .done else .running, m.round, m.pct, last, rel);
+        if (self.ctx_poll_budget > 0 and !self.ctx_warned) {
+            self.ctx_poll_budget -= 1;
+            self.localSlowTip(dd); // model may have loaded (huge) only after the cast fired — catch it early
+        }
         if (!m.stopped) {
             var sbuf: [96]u8 = undefined;
-            const st = std.fmt.bufPrint(&sbuf, "hive running - r{d} {d}%", .{ m.round, if (m.pct < 0) 0 else m.pct }) catch "hive running";
+            // Show the real metric once a score/phase event has landed; before that (common early in a slow
+            // local cast) fall back to an elapsed-vs-budget estimate capped at 90% so the label MOVES instead of
+            // sitting at 0 the whole time. cast_deadline_s = start + CAST_MINUTES*60 + 120, so start is derivable.
+            const shown_pct: i32 = if (m.pct >= 0) m.pct else blk: {
+                const start = self.cast_deadline_s - (@as(i64, CAST_MINUTES) * 60 + 120);
+                const elapsed = self.nowS() - start;
+                const budget: i64 = @as(i64, CAST_MINUTES) * 60;
+                if (elapsed <= 0 or budget <= 0) break :blk 0;
+                break :blk @intCast(@min(@divTrunc(elapsed * 100, budget), 90));
+            };
+            const st = std.fmt.bufPrint(&sbuf, "hive running - r{d} {d}%", .{ m.round, shown_pct }) catch "hive running";
             self.setStatus(st);
         }
 
