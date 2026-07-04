@@ -222,6 +222,19 @@ First-run local login is `admin@neuron-loops.local` / `changeme` — **change it
 `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
 refuses the default and prints a generated password once.
 
+## Desktop mode (veil-desk)
+
+The desktop dashboard is opt-in at the repo root. Default `zig build` and `zig build run` stay
+server-only.
+
+```sh
+zig build -Ddesktop=true            # also build veil-desk (best-effort)
+zig build run -Ddesktop=true        # run server in desktop mode (auto-launch dashboard)
+zig build run -- --desktop          # pass runtime flag directly
+```
+
+Set `NL_NO_DESKTOP=1` to force-disable desktop launch even when desktop mode is enabled.
+
 ## The fleet hub — many veils, one console
 
 The web control plane watches *one* box. When you've installed veils across a fleet of machines,

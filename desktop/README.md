@@ -43,7 +43,7 @@ online signal, and only reaches the HTTP API for the two actions that genuinely 
 | `src/poller.zig` | the background worker thread |
 | `src/tray.zig` | native tray + toasts (Windows hidden-window host), graceful stubs elsewhere |
 | `src/catalog.zig` | embedded provider/model catalog + deploy option sets (mirrors models.json) |
-| `assets/veil-mark.svg` | the shadow-figure mark (the app draws it procedurally; this is the source art) |
+| `assets/icon.png` | desktop app icon used for the window/taskbar icon |
 
 ## Build & run
 
@@ -64,11 +64,11 @@ zig test src/scan.zig   # data-layer tests (parses real run dirs under ../data)
 
 The dependency (`raylib-zig`) is fetched and pinned via `build.zig.zon` — no vendoring needed.
 
-**The server builds and hosts it for you.** A plain `zig build` at the repo root also builds veil-desk
-(best-effort — a headless box that can't link GL/X11 just skips it without failing the server build; pass
-`-Ddesktop=false` to skip explicitly), and the running server launches the dashboard on startup so it sits
-in the tray and lights up when the control plane is up. Set `NL_NO_DESKTOP=1` to stop the server launching
-it. `python deploy.py desktop [--install] [--launch]` builds it and can register a login autostart entry.
+**The server can build and host it for you.** A plain `zig build` at the repo root now does a server-only
+build. Pass `-Ddesktop=true` to also build veil-desk (best-effort), and run with `zig build run
+-Ddesktop=true` to start the server in desktop-host mode so the dashboard launches on startup. Set
+`NL_NO_DESKTOP=1` to force-disable launch even in desktop mode. `python deploy.py desktop [--install]
+[--launch]` builds it and can register a login autostart entry.
 
 **Connects with no key pasting.** On a localhost bind the server mints an admin API key and drops it at
 `<data>/.desktop_key`; the desktop reads it on launch, so **Deploy works out of the box** — no need to
