@@ -1120,10 +1120,18 @@ pub const Chat = struct {
                 jb.print(self.gpa, "\n- {s} {s}: {s}", .{ e.kindStr(), e.mindStr(), e.textStr() }) catch {};
             }
         }
-        // RAG the swarm's actual OUTPUT into the chat: the content of the top built file, so the model
-        // answers FROM the work product, not just its name. The full run (all files, events, memory) stays
-        // saved under <data>/<rel> and can be reopened from the Swarm tab.
-        if (fn_ > 0) {
+        // THE CAST'S ANSWER: the lead's synthesis.md is the composed result of the whole team's web research
+        // — surface it FIRST and nearly in full (a cast is judged by this, not by scraps of intermediate
+        // files). Only if there is no synthesis do we fall back to RAGing the top built files. The full run
+        // (every file, event, memory) stays saved under <data>/<rel> and reopens from the Swarm tab.
+        var sbuf: [2600]u8 = undefined;
+        var strunc = false;
+        const sn = scan.readWorkFile(self.io, self.gpa, dd, rel, "synthesis.md", &sbuf, &strunc);
+        if (sn > 0) {
+            jb.appendSlice(self.gpa, "\n\n=== THE CAST'S ANSWER (the lead composed this from the team's web research — cite its sources) ===\n") catch {};
+            jb.appendSlice(self.gpa, sbuf[0..sn]) catch {};
+            if (strunc) jb.appendSlice(self.gpa, "\n[...full report saved in the run dir]") catch {};
+        } else if (fn_ > 0) {
             var fi: usize = 0;
             var shown: usize = 0;
             while (fi < fn_ and shown < 2) : (fi += 1) {
@@ -1136,7 +1144,9 @@ pub const Chat = struct {
             }
         }
         jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab)", .{rel}) catch {};
-        const digest = jb.items[0..@min(jb.items.len, 3000)];
+        // Keep as much of the digest as the ChatMsg buffer (3072b) holds — the synthesis IS the answer, so
+        // we want it whole, not clipped to the old 3000b. appendMsg truncates to the buffer anyway.
+        const digest = jb.items[0..@min(jb.items.len, 3060)];
         self.appendMsg(dd, .cast_note, digest);
         self.setStatus("composing the answer...");
         self.startTurn(dd, .collect);
