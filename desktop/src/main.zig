@@ -173,27 +173,35 @@ pub fn main() !void {
     }
 
     // Borderless: we draw our own title bar (drag / File / minimize / close). Resizable stays on so the
-    // grip in the corner can drive setWindowSize. No MSAA/vsync — this is a 2D UI, and MSAA + a pinned
-    // 60fps kept the GPU hot with nothing happening; we cap FPS ourselves (30 focused / 8 idle) below.
+    // grip in the corner can drive setWindowSize. 60fps focused so scrolling/typing/hover feel instant (a
+    // 2D UI is trivial GPU load — the "machine got hot" was the swarm+poll load, not the UI); we drop to a
+    // low idle FPS when the window is in the background (heat control) below.
     rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true });
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     defer rl.closeWindow();
-    rl.setTargetFPS(30);
+    rl.setTargetFPS(60);
 
     // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
     // at a HIGH base size (48) so the atlas is high-res and downscaling to 11-22px stays crisp (loading
     // near the render size left small text blurry — the "broken" look); bilinear smooths the scale.
+    // Crisp at every render size (11..22px) from the one 48px atlas: generate mipmaps and use TRILINEAR so
+    // downscaling picks the right mip level instead of bilinear-minifying a 48px glyph to 12px (that soft,
+    // "unresponsive"-looking blur). Mipmaps + trilinear is the standard raylib recipe for multi-size fonts.
     var ui_loaded = false;
     var mono_loaded = false;
     if (loadFontAt(uiCandidates(), 48)) |f| {
-        rl.setTextureFilter(f.texture, .bilinear);
-        t.setFont(f);
+        var fm = f;
+        rl.genTextureMipmaps(&fm.texture);
+        rl.setTextureFilter(fm.texture, .trilinear);
+        t.setFont(fm);
         ui_loaded = true;
     }
     if (loadFontAt(monoCandidates(), 44)) |f| {
-        rl.setTextureFilter(f.texture, .bilinear);
-        t.setMono(f);
+        var fm = f;
+        rl.genTextureMipmaps(&fm.texture);
+        rl.setTextureFilter(fm.texture, .trilinear);
+        t.setMono(fm);
         mono_loaded = true;
     }
     // Window + taskbar icon: the shadow-figure mark rendered into an image.
@@ -215,9 +223,8 @@ pub fn main() !void {
 
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
-        // Heat control: 30fps when focused, 8fps when the window is in the background. A 2D dashboard has
-        // no reason to redraw 60x/sec, and a pinned high FPS is what warmed the machine with no swarms.
-        rl.setTargetFPS(if (rl.isWindowFocused()) 30 else 8);
+        // 60fps focused = snappy scroll/type/hover; 10fps in the background for heat control.
+        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else 10);
         tray.pump();
         pumpTray(&store, &tray, gpa);
         if (!auto_selected) auto_selected = autoSelect(&store);

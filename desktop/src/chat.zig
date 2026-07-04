@@ -935,11 +935,7 @@ pub const Chat = struct {
             tok_n = self.store.settings.token_len;
             @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
         }
-        const prov_key = switch (kind) {
-            1 => catalog.providers[@min(byok, catalog.providers.len - 1)].key,
-            2 => "openai", // custom endpoints are OpenAI-compatible; the URL carries the truth
-            else => "ollama",
-        };
+        const prov_key = castProviderId(kind, byok);
 
         // A local model loaded with a runaway context (OLLAMA_CONTEXT_LENGTH unset) casts ~16x slower and
         // reads as "broken" — surface the one-line fix once, before the row, so the slowness is explained.
@@ -1231,6 +1227,19 @@ pub fn castGoalFromUser(msg: []const u8, buf: []u8) []const u8 {
     const n = @min(g.len, buf.len);
     @memcpy(buf[0..n], g[0..n]);
     return buf[0..n];
+}
+
+/// The provider id a cast deploys under, derived from the CHAT's configured backend so a swarm always runs
+/// on whatever the user is chatting with: BYOK (kind=1) -> that catalog provider's id ("openai",
+/// "anthropic", "groq", ...); a custom OpenAI-compatible URL (kind=2) -> "openai" (the base_url carries the
+/// real endpoint); otherwise the local backend -> "ollama". Paired with resolveProvider (model/base_url/key
+/// come from the same chat settings), this is what makes "chatting with OpenAI casts an OpenAI swarm" true.
+pub fn castProviderId(kind: u8, byok: u8) []const u8 {
+    return switch (kind) {
+        1 => catalog.providers[@min(byok, catalog.providers.len - 1)].key,
+        2 => "openai",
+        else => "ollama",
+    };
 }
 
 /// The reply minus its CAST line — the note shown to the user beside the cast.
@@ -1634,6 +1643,58 @@ test "castGoalFromUser strips the cast preamble" {
     try std.testing.expectEqualStrings("build a REST API", castGoalFromUser("spin up a swarm that build a REST API", &b));
     // no clear separator → keep the whole message
     try std.testing.expectEqualStrings("run the hive", castGoalFromUser("run the hive", &b));
+}
+
+test "castProviderId routes a cast to the chat's configured backend (local vs BYOK vs custom)" {
+    try std.testing.expectEqualStrings("ollama", castProviderId(0, 0)); // local Ollama chat -> local swarm
+    try std.testing.expectEqualStrings("openai", castProviderId(2, 0)); // custom OpenAI-compatible URL
+    // BYOK: the exact catalog provider the user chats with flows straight to the swarm
+    try std.testing.expectEqualStrings("anthropic", castProviderId(1, 0));
+    try std.testing.expectEqualStrings("openai", castProviderId(1, 1));
+    try std.testing.expectEqualStrings("ollama", castProviderId(1, 2));
+    try std.testing.expectEqualStrings("groq", castProviderId(1, 4));
+}
+
+test "a BYOK-OpenAI chat resolves an OpenAI cast (base_url + chat model + key); a local chat resolves Ollama" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    // user chatting with OpenAI (BYOK): provider index 1 = "openai"
+    store.settings.chat_kind = 1;
+    store.settings.chat_byok = 1;
+    const model = "gpt-4.1";
+    @memcpy(store.settings.chat_model[0..model.len], model);
+    store.settings.chat_model_len = model.len;
+    const key = "sk-live-abc123";
+    @memcpy(store.settings.chat_key[0..key.len], key);
+    store.settings.chat_key_len = @intCast(key.len);
+
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+
+    var bb: [256]u8 = undefined;
+    var kb: [192]u8 = undefined;
+    var mb: [96]u8 = undefined;
+    const prov = chat.resolveProvider(&bb, &kb, &mb);
+    // the cast will carry EXACTLY the OpenAI endpoint + the chat's model + the chat's key
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", prov.base_url);
+    try std.testing.expectEqualStrings("gpt-4.1", prov.model);
+    try std.testing.expectEqualStrings("sk-live-abc123", prov.key);
+    try std.testing.expectEqualStrings("openai", castProviderId(store.settings.chat_kind, store.settings.chat_byok));
+
+    // flip to local Ollama: same code now routes to the local backend + local model, no key
+    store.settings.chat_kind = 0;
+    const local_model = "gpt-oss:20b";
+    @memcpy(store.settings.chat_model[0..local_model.len], local_model);
+    store.settings.chat_model_len = local_model.len;
+    const prov2 = chat.resolveProvider(&bb, &kb, &mb);
+    try std.testing.expect(std.mem.indexOf(u8, prov2.base_url, "11434") != null);
+    try std.testing.expectEqualStrings("gpt-oss:20b", prov2.model);
+    try std.testing.expectEqualStrings("ollama", castProviderId(store.settings.chat_kind, store.settings.chat_byok));
 }
 
 test "parseMaxCtx pulls the largest loaded context_length from an /api/ps body" {
