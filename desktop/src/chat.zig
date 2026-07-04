@@ -1516,9 +1516,12 @@ test "E2E cowork: explicit cast fires, chat replies in parallel, collect answers
         std.debug.print("\n[E2E] no veil server on :8787 — skipping\n", .{});
         return;
     }
-    const dd = "zig-e2e-tmp";
+    // dd is the LIVE server data dir (../data from desktop/): the veil server writes swarm run dirs under
+    // <dd>/u<uid>/<hex>, so watchCast must scan HERE to see the cast it fired — exactly as the shipped app
+    // does (its data_dir points at the server's data). NB: never deleteTree(dd) — it is real user data; the
+    // test removes only the single conversation file it creates (defer below).
+    const dd = "../data";
     _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
 
     var store = std.testing.allocator.create(Store) catch unreachable;
     defer std.testing.allocator.destroy(store);
@@ -1545,6 +1548,11 @@ test "E2E cowork: explicit cast fires, chat replies in parallel, collect answers
     // make sure any swarm we spawn gets stopped even if an assertion fails mid-test
     defer if (chat.cast_rel_len > 0) {
         _ = scan.writeControl(io, std.testing.allocator, dd, chat.cast_rel[0..chat.cast_rel_len], "{\"op\":\"stop\"}");
+    };
+    // dd is the LIVE data dir — clean up ONLY the one conversation file this test created (never the tree)
+    defer if (store.conv_active_len > 0) {
+        var pb: [700]u8 = undefined;
+        if (Chat.convPath(dd, store.conv_active[0..store.conv_active_len], &pb)) |cp| Io.Dir.cwd().deleteFile(io, cp) catch {};
     };
 
     const tick = struct {
