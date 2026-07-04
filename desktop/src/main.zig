@@ -225,14 +225,51 @@ pub fn main() !void {
 
     syncThemeFromStore(&store);
 
+    // AUTOMATION HOOK — if <data>/.veil-desk/SIM.txt exists, send its contents as a chat message once (a couple
+    // seconds after the server is reachable), then delete it. Drives the FULL desktop chat→cast→collect path for
+    // testing without any synthetic UI input, which a borderless window delivers unreliably — it pushes the exact
+    // same .send command the Send button would. No trigger file = normal run (no-op).
+    var sim_sent = false;
+    var sim_ticks: u32 = 0;
+
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
-        // 60fps focused = snappy scroll/type/hover; 10fps in the background for heat control.
-        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else 10);
+        // 60fps focused = snappy scroll/type/hover; 10fps backgrounded for heat control — but hold 30fps until a
+        // pending sim trigger has fired so its connect/poll stays responsive with the window unfocused.
+        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else if (!sim_sent) 30 else 10);
         tray.pump();
         pumpTray(&store, &tray, gpa);
         syncThemeFromStore(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
+        if (!sim_sent) {
+            store.lock();
+            const online = store.server_online;
+            store.unlock();
+            if (online) sim_ticks += 1; // count only once we're actually connected
+            if (sim_ticks > 45) { // ~1.5s after first-online: settle, then check for a trigger file exactly once
+                sim_sent = true;
+                var ddb: [512]u8 = undefined;
+                store.lock();
+                const dd = store.settings.dataDir();
+                const ddn = @min(dd.len, ddb.len);
+                @memcpy(ddb[0..ddn], dd[0..ddn]);
+                store.unlock();
+                var pathb: [640]u8 = undefined;
+                const path = std.fmt.bufPrint(&pathb, "{s}/.veil-desk/SIM.txt", .{ddb[0..ddn]}) catch "";
+                if (path.len > 0) {
+                    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8000))) |content| {
+                        defer gpa.free(content);
+                        const msg = std.mem.trim(u8, content, " \r\n\t");
+                        if (msg.len > 0) {
+                            setTab(.chat); // land on Chat so the run is visible
+                            store.pushChatCmd(store_mod.mkChatCmd(.send, "", msg));
+                            log.info("SIM.txt auto-sent chat message ({d} bytes)", .{msg.len});
+                        }
+                        std.Io.Dir.cwd().deleteFile(io, path) catch {};
+                    } else |_| {}
+                }
+            }
+        }
         handleWindowChrome();
         handleKeys(&store);
 
@@ -637,23 +674,30 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.four)) setTab(.swarm);
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
-        // Ctrl+C with nothing focused copies the LAST veil answer — a reliable keyboard copy for the response
-        // text (the per-message hover "copy" chip needs a precise mouse hover; this doesn't). Field-scoped
-        // Ctrl+C is handled in editField, so this only runs when no field owns the keyboard.
+        // Keyboard copy for chats (the per-message hover "copy" chip needs a precise mouse hover; these don't).
+        //   Ctrl+C        → the LAST veil answer
+        //   Ctrl+Shift+C  → the WHOLE conversation
+        // Field-scoped Ctrl+C (copy the focused input) is handled in editField, so these only run when no field
+        // owns the keyboard.
         const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         if (ctrl and rl.isKeyPressed(.c)) {
-            var last: ?store_mod.ChatMsg = null;
-            store.lock();
-            var i: usize = store.msg_count;
-            while (i > 0) {
-                i -= 1;
-                if (store.msgs[i].role == .veil) {
-                    last = store.msgs[i];
-                    break;
+            if (shift) {
+                copyConversation(store);
+            } else {
+                var last: ?store_mod.ChatMsg = null;
+                store.lock();
+                var i: usize = store.msg_count;
+                while (i > 0) {
+                    i -= 1;
+                    if (store.msgs[i].role == .veil) {
+                        last = store.msgs[i];
+                        break;
+                    }
                 }
+                store.unlock();
+                if (last) |m| if (m.textStr().len > 0) copyToClipboard(m.textStr());
             }
-            store.unlock();
-            if (last) |m| if (m.textStr().len > 0) copyToClipboard(m.textStr());
         }
     }
     switch (ui.focus) {
@@ -994,12 +1038,37 @@ fn monoCols(w: f32, size: i32) usize {
 // so the scroll math and the pixels can never disagree. Structure honored: fenced code blocks (panel +
 // copy chip), headings, bullets, **bold** markers stripped; body text stays mono so wrap math is exact.
 
-var clip_buf: [8192]u8 = undefined;
+var clip_buf: [65536]u8 = undefined; // 64K: long answers / whole-conversation copies shouldn't truncate
 fn copyToClipboard(s: []const u8) void {
     const n = @min(s.len, clip_buf.len - 1);
     @memcpy(clip_buf[0..n], s[0..n]);
     clip_buf[n] = 0;
     rl.setClipboardText(clip_buf[0..n :0]);
+}
+
+fn bufAppend(buf: []u8, n: *usize, s: []const u8) void {
+    const c = @min(s.len, buf.len - n.*);
+    @memcpy(buf[n.*..][0..c], s[0..c]);
+    n.* += c;
+}
+
+/// Copy the ENTIRE active conversation as plain text ("role: message" blocks) — the keyboard-reachable
+/// copy (Ctrl+Shift+C) for people who want the whole chat, not one message. Built under the store lock
+/// because the chat thread writes the message ring concurrently; roleLabel is copied immediately so its
+/// shared format buffer can't be clobbered before it lands.
+var conv_buf: [65536]u8 = undefined;
+fn copyConversation(store: *Store) void {
+    var n: usize = 0;
+    store.lock();
+    var i: usize = 0;
+    while (i < store.msg_count) : (i += 1) {
+        bufAppend(&conv_buf, &n, roleLabel(store.msgs[i].role));
+        bufAppend(&conv_buf, &n, ": ");
+        bufAppend(&conv_buf, &n, store.msgs[i].textStr());
+        bufAppend(&conv_buf, &n, "\n\n");
+    }
+    store.unlock();
+    if (n > 0) copyToClipboard(conv_buf[0..n]);
 }
 
 /// A tiny "copy" chip; returns true on click.
@@ -1303,7 +1372,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
     const can_send = ui.c_input.len > 0 and !busy;
     const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
-    if (can_send and (clicked or (ui.focus == .c_input and rl.isKeyPressed(.enter)))) {
+    const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter); // accept numpad Enter too
+    if (can_send and (clicked or (ui.focus == .c_input and enter))) {
         store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
         ui.c_input.len = 0;
         ui.chat_follow = true;
