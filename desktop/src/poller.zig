@@ -35,6 +35,11 @@ pub const Poller = struct {
     file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
     fc_scratch: [1 << 14]u8 = undefined, // selected-file content read buffer
 
+    // server-poll throttle: the roster/tail are read from the FILESYSTEM every ~1s (free), but the
+    // server-hitting checks (serverOnline + GET /fleet) only need to run every few seconds — a fresh
+    // connection every second is needless load on a small local server. Carry the last counters between.
+    last_fleet_s: i64 = 0,
+
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
     stopped_ids: [scan.MAX_SWARMS][64]u8 = undefined,
@@ -288,27 +293,42 @@ pub const Poller = struct {
         self.syncDesktopKey(dd);
         self.flushLog(dd);
 
-        // 1) server liveness + fleet counters
-        const online = scan.serverOnline(self.io, self.port());
+        // 1) server liveness + fleet counters — THROTTLED to every ~5s (see last_fleet_s). Between polls we
+        // carry the previous values so the dashboard counters stay put instead of flickering to 0/offline.
+        const FLEET_EVERY_S: i64 = 5;
+        var online: bool = undefined;
         var fs: i32 = 0;
         var fl: i32 = 0;
         var fm: i32 = 0;
         var fh: i32 = 0;
         var ver: [16]u8 = [_]u8{0} ** 16;
         var ver_len: u8 = 0;
-        if (online) {
-            if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
-                defer if (resp.body.len > 0) self.gpa.free(resp.body);
-                fs = jint(resp.body, "swarms");
-                fl = jint(resp.body, "live_swarms");
-                fm = jint(resp.body, "live_minds");
-                fh = jint(resp.body, "headroom");
-                if (jstr(resp.body, "version")) |v| {
-                    const n = @min(v.len, ver.len);
-                    @memcpy(ver[0..n], v[0..n]);
-                    ver_len = @intCast(n);
+        if (now_s - self.last_fleet_s >= FLEET_EVERY_S) {
+            self.last_fleet_s = now_s;
+            online = scan.serverOnline(self.io, self.port());
+            if (online) {
+                if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
+                    defer if (resp.body.len > 0) self.gpa.free(resp.body);
+                    fs = jint(resp.body, "swarms");
+                    fl = jint(resp.body, "live_swarms");
+                    fm = jint(resp.body, "live_minds");
+                    fh = jint(resp.body, "headroom");
+                    if (jstr(resp.body, "version")) |v| {
+                        const n = @min(v.len, ver.len);
+                        @memcpy(ver[0..n], v[0..n]);
+                        ver_len = @intCast(n);
+                    }
                 }
             }
+        } else {
+            // carry the last-known server state forward
+            self.store.lock();
+            online = self.store.server_online;
+            fs = self.store.fleet_swarms;
+            fl = self.store.fleet_live;
+            fm = self.store.fleet_minds;
+            fh = self.store.fleet_headroom;
+            self.store.unlock();
         }
 
         // 2) roster
