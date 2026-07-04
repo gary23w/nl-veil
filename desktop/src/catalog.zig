@@ -39,6 +39,19 @@ pub const providers = [_]Provider{
     .{ .key = "groq", .label = "Groq", .base_url = "https://api.groq.com/openai/v1", .needs_key = true, .models = &.{
         .{ .id = "llama-3.3-70b-versatile", .label = "Llama 3.3 70B versatile" },
     } },
+    // DeepSeek + Google Gemini — OpenAI-compatible endpoints (mirror web/public/models.json). Added AFTER the
+    // existing providers so saved chat_byok indices (anthropic=0, openai=1, ollama=2, workers-ai=3, groq=4) stay
+    // valid. Both flow through the standard {base_url}/chat/completions path, so no engine change is needed.
+    .{ .key = "deepseek", .label = "DeepSeek", .base_url = "https://api.deepseek.com/v1", .needs_key = true, .models = &.{
+        .{ .id = "deepseek-v4-flash", .label = "DeepSeek V4 Flash" },
+        .{ .id = "deepseek-v4-pro", .label = "DeepSeek V4 Pro" },
+        .{ .id = "deepseek-chat", .label = "DeepSeek Chat" },
+    } },
+    .{ .key = "google", .label = "Google Gemini", .base_url = "https://generativelanguage.googleapis.com/v1beta/openai", .needs_key = true, .models = &.{
+        .{ .id = "gemini-3.5-flash", .label = "Gemini 3.5 Flash" },
+        .{ .id = "gemini-3.1-pro-preview", .label = "Gemini 3.1 Pro (preview)" },
+        .{ .id = "gemini-2.5-flash", .label = "Gemini 2.5 Flash" },
+    } },
     .{ .key = "mock", .label = "Mock (dry run — no calls)", .base_url = "", .needs_key = false, .models = &.{
         .{ .id = "mock", .label = "mock" },
     } },
