@@ -54,6 +54,40 @@ fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
     };
 }
 
+fn runQuiet(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
+    const r = std.process.run(gpa, io, .{ .argv = argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(4 << 10) }) catch return;
+    gpa.free(r.stdout);
+    gpa.free(r.stderr);
+}
+
+/// AUTO-CONFIGURE local Ollama for effective agentic use. Two env vars decide whether local casts crawl:
+/// OLLAMA_NUM_PARALLEL (unset=1 → the cast's minds + the chat all serialize through ONE runner) and
+/// OLLAMA_CONTEXT_LENGTH (unset → gpt-oss loads its full 131072 window, spilling the KV cache to CPU at
+/// ~1 tok/s). Ollama reads BOTH only at serve-start, so we persist sane defaults with `setx` and restart the
+/// Ollama server (its tray app relaunches it with the fresh env). Runs only when a local Ollama is actually
+/// reachable, only touches vars that are unset/too-low, and no-ops thereafter. Opt out: NL_NO_OLLAMA_TUNE=1.
+fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) void {
+    if (builtin.os.tag != .windows) return; // setx/taskkill path is Windows-specific for now
+    if (environ.get("NL_NO_OLLAMA_TUNE")) |v| if (v.len > 0) return;
+    // only act if a local Ollama is actually up
+    {
+        const r = std.process.run(gpa, io, .{ .argv = &.{ "curl", "-sS", "--max-time", "3", "http://127.0.0.1:11434/api/version" }, .stdout_limit = .limited(4 << 10), .stderr_limit = .limited(2 << 10) }) catch return;
+        defer gpa.free(r.stdout);
+        defer gpa.free(r.stderr);
+        if (r.term != .exited or r.term.exited != 0 or r.stdout.len < 2) return;
+    }
+    const cur_par = std.mem.trim(u8, environ.get("OLLAMA_NUM_PARALLEL") orelse "", " \r\n\t");
+    const cur_ctx = std.mem.trim(u8, environ.get("OLLAMA_CONTEXT_LENGTH") orelse "", " \r\n\t");
+    const par_ok = (std.fmt.parseInt(u32, cur_par, 10) catch 0) >= 2;
+    const ctx_ok = cur_ctx.len > 0; // any explicit context = the user's choice, leave it
+    if (par_ok and ctx_ok) return; // already tuned — nothing to do
+    if (!par_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_NUM_PARALLEL", "4" });
+    if (!ctx_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_CONTEXT_LENGTH", "8192" });
+    std.debug.print("nl-veil: auto-tuned Ollama for local agentic use (OLLAMA_NUM_PARALLEL=4, OLLAMA_CONTEXT_LENGTH=8192) — restarting the Ollama server to apply\n", .{});
+    // Kill the Ollama server; its tray app (ollama app.exe) relaunches it with the now-updated user env.
+    runQuiet(gpa, io, &.{ "taskkill", "/F", "/IM", "ollama.exe" });
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     var desktop_mode = false;
@@ -94,6 +128,9 @@ pub fn main(init: std.process.Init) !void {
         if (d.len > 0) paths.data = try gpa.dupe(u8, d);
     }
     _ = std.Io.Dir.cwd().createDirPathStatus(io, paths.data, .default_dir) catch {};
+
+    // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
+    tuneOllama(gpa, io, init.environ_map);
 
     const auth_db = try std.fmt.allocPrint(gpa, "{s}/auth.sqlite", .{paths.data});
     const nb = Neuron.init(gpa, io, paths.neuron_bin, auth_db);
