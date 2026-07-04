@@ -5,6 +5,79 @@ const builtin = @import("builtin");
 const crypto = @import("../config/key_vault.zig");
 const NeuronLedger = @import("../plan/neurons.zig").NeuronLedger;
 
+// Native process liveness/termination — NO subprocess. tasklist/taskkill spawned a child process ON THE
+// httpz REQUEST THREAD for every reconcile-probe and every kill; under load those spawns starve the worker
+// pool and wedge (then a stale-pid recycle used to taskkill the server itself). These call the Win32 API
+// directly instead, so the checks are cheap and never touch the process table via a shell.
+const winproc = if (builtin.os.tag == .windows) struct {
+    const HANDLE = *anyopaque;
+    const BOOL = c_int; // Win32 BOOL is a 32-bit int at the ABI; plain c_int lets `0` coerce cleanly
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+    const STILL_ACTIVE: u32 = 259;
+    extern "kernel32" fn OpenProcess(access: u32, inherit: BOOL, pid: u32) callconv(.c) ?HANDLE;
+    extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *u32) callconv(.c) BOOL;
+    extern "kernel32" fn TerminateProcess(h: HANDLE, code: u32) callconv(.c) BOOL;
+    extern "kernel32" fn QueryFullProcessImageNameW(h: HANDLE, flags: u32, buf: [*]u16, size: *u32) callconv(.c) BOOL;
+    extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.c) BOOL;
+    extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
+} else struct {};
+
+/// Sleep `ms` from a RAW OS thread (the background loop is a std.Thread, NOT an Io-managed task — io.sleep
+/// throws there, and swallowing that error turned the loop into a 100%-CPU spin that starved the http pool).
+fn threadSleepMs(io: std.Io, ms: u64) void {
+    if (builtin.os.tag == .windows) {
+        winproc.Sleep(@intCast(ms));
+    } else {
+        io.sleep(.{ .nanoseconds = ms * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
+
+/// True only if `path16` (a UTF-16 full image path) has basename "veil.exe" (case-insensitive).
+fn imageIsVeil(path16: []const u16) bool {
+    var start: usize = 0;
+    for (path16, 0..) |c, i| if (c == '\\' or c == '/') {
+        start = i + 1;
+    };
+    const base = path16[start..];
+    const want = "veil.exe";
+    if (base.len != want.len) return false;
+    for (base, want) |c16, w| {
+        const c: u16 = if (c16 >= 'A' and c16 <= 'Z') c16 + 32 else c16;
+        if (c != w) return false;
+    }
+    return true;
+}
+
+/// Native, no-subprocess: is `pid` a live process whose image is veil.exe (i.e. an actual worker)? false on
+/// any failure — dead, access-denied, or a recycled pid now owned by some other app.
+fn liveVeilPid(pid: u32) bool {
+    if (builtin.os.tag != .windows or pid == 0) return false;
+    const h = winproc.OpenProcess(winproc.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return false;
+    defer _ = winproc.CloseHandle(h);
+    var code: u32 = 0;
+    if (winproc.GetExitCodeProcess(h, &code) == 0 or code != winproc.STILL_ACTIVE) return false;
+    var buf: [520]u16 = undefined;
+    var sz: u32 = buf.len;
+    if (winproc.QueryFullProcessImageNameW(h, 0, &buf, &sz) == 0) return false;
+    return imageIsVeil(buf[0..sz]);
+}
+
+/// Native force-kill, but ONLY if `pid` is still a live veil worker and not our own process. A recycled stale
+/// worker.pid can point at the server itself or an unrelated app — this refuses to touch either.
+fn terminateVeilPid(pid: u32) void {
+    if (builtin.os.tag != .windows or pid == 0) return;
+    if (pid == std.os.windows.GetCurrentProcessId()) return;
+    const h = winproc.OpenProcess(winproc.PROCESS_TERMINATE | winproc.PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return;
+    defer _ = winproc.CloseHandle(h);
+    var code: u32 = 0;
+    if (winproc.GetExitCodeProcess(h, &code) == 0 or code != winproc.STILL_ACTIVE) return;
+    var buf: [520]u16 = undefined;
+    var sz: u32 = buf.len;
+    if (winproc.QueryFullProcessImageNameW(h, 0, &buf, &sz) == 0 or !imageIsVeil(buf[0..sz])) return;
+    _ = winproc.TerminateProcess(h, 1);
+}
+
 pub const State = enum { starting, running, stopped, crashed };
 
 pub const Swarm = struct {
@@ -35,13 +108,29 @@ pub const Supervisor = struct {
     parent_env: ?*const std.process.Environ.Map = null,
     last_gc: i64 = 0,
     ledger: ?*NeuronLedger = null,
+    bg_stop: std.atomic.Value(bool) = .init(false),
+    gc_data_dir: []const u8 = "",
+    gc_days: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, neuron_bin: []const u8) Supervisor {
         return .{ .gpa = gpa, .io = io, .neuron_bin = neuron_bin };
     }
 
+    /// Background maintenance thread: reconcile swarm states + prune old runs every ~5s, OFF the httpz request
+    /// threads. reconcile() probes worker liveness and can respawn (spawn a worker subprocess) — doing that
+    /// inline in a /fleet or list handler starves the pool and wedges the server (esp. with a live swarm).
+    /// Request handlers now just read the in-memory map; this loop keeps it fresh. Fire-and-forget (detached).
+    pub fn bgLoop(self: *Supervisor) void {
+        while (!self.bg_stop.load(.monotonic)) {
+            self.reconcile();
+            if (self.gc_days > 0) self.maybeGc(self.gc_data_dir, self.gc_days);
+            // real sleep on a raw thread (see threadSleepMs) — 5s in 100ms slices so stop stays responsive
+            var slept: usize = 0;
+            while (slept < 50 and !self.bg_stop.load(.monotonic)) : (slept += 1) threadSleepMs(self.io, 100);
+        }
+    }
+
     pub fn liveMindsForUser(self: *Supervisor, uid: u64) usize {
-        self.reconcile();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var n: usize = 0;
@@ -54,7 +143,6 @@ pub const Supervisor = struct {
     }
 
     pub fn activeSwarmsForUser(self: *Supervisor, uid: u64) usize {
-        self.reconcile();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var n: usize = 0;
@@ -205,21 +293,11 @@ pub const Supervisor = struct {
     }
 
     fn rmTree(self: *Supervisor, path: []const u8) bool {
-        if (builtin.os.tag == .windows) {
-            const cmd = std.fmt.allocPrint(self.gpa, "Remove-Item -LiteralPath '{s}' -Recurse -Force -ErrorAction Stop", .{path}) catch return false;
-            defer self.gpa.free(cmd);
-            const argv = [_][]const u8{ "powershell", "-NoProfile", "-Command", cmd };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return false;
-            defer self.gpa.free(res.stdout);
-            defer self.gpa.free(res.stderr);
-            return res.term == .exited and res.term.exited == 0;
-        } else {
-            const argv = [_][]const u8{ "rm", "-rf", path };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return false;
-            defer self.gpa.free(res.stdout);
-            defer self.gpa.free(res.stderr);
-            return res.term == .exited and res.term.exited == 0;
-        }
+        // Native recursive delete — NO PowerShell/rm subprocess. Spawning a shell per delete on the httpz
+        // request thread starves the worker pool under load (the DELETE-flood wedge). deleteTree is idempotent
+        // (an already-absent tree is success); a locked file (a still-dying worker) errors -> caller retries.
+        std.Io.Dir.cwd().deleteTree(self.io, path) catch return false;
+        return true;
     }
 
     fn killByPidFile(self: *Supervisor, run_dir: []const u8) void {
@@ -228,15 +306,18 @@ pub const Supervisor = struct {
         const txt = std.Io.Dir.cwd().readFileAlloc(self.io, pidpath, self.gpa, .limited(64)) catch return;
         defer self.gpa.free(txt);
         const pid = std.fmt.parseInt(u32, std.mem.trim(u8, txt, " \r\n\t"), 10) catch return;
-        var nbuf: [16]u8 = undefined;
-        const pidstr = std.fmt.bufPrint(&nbuf, "{d}", .{pid}) catch return;
-        const argv = if (builtin.os.tag == .windows)
-            [_][]const u8{ "taskkill", "/F", "/T", "/PID", pidstr }
-        else
-            [_][]const u8{ "kill", "-9", pidstr };
-        const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return;
-        self.gpa.free(res.stdout);
-        self.gpa.free(res.stderr);
+        if (pid == 0) return;
+        if (builtin.os.tag == .windows) {
+            // Native, no subprocess: terminateVeilPid refuses to touch our own pid or any process that isn't a
+            // live veil worker (a recycled stale worker.pid could otherwise abort the server or a random app).
+            terminateVeilPid(pid);
+        } else {
+            var nbuf: [16]u8 = undefined;
+            const pidstr = std.fmt.bufPrint(&nbuf, "{d}", .{pid}) catch return;
+            const res = std.process.run(self.gpa, self.io, .{ .argv = &.{ "kill", "-9", pidstr } }) catch return;
+            self.gpa.free(res.stdout);
+            self.gpa.free(res.stderr);
+        }
     }
 
     pub fn reattach(self: *Supervisor, data_dir: []const u8) usize {
@@ -417,7 +498,12 @@ pub const Supervisor = struct {
     }
 
     fn inferState(self: *Supervisor, run_dir: []const u8) State {
-        return if (self.hasTerminalMarker(run_dir)) .stopped else .running;
+        if (self.hasTerminalMarker(run_dir)) return .stopped;
+        // Adopt as .running ONLY if the worker process is actually alive right now. An old run dir (dead pid,
+        // no terminal marker) must be adopted as .stopped — otherwise reconcile() "crash-detects" it and
+        // respawns a fresh worker for every stale swarm on startup, a mass-respawn that melts a single box.
+        const pid = self.workerPid(run_dir) orelse return .stopped;
+        return if (self.pidAlive(pid)) .running else .stopped;
     }
 
     const RECHECK_SECS: i64 = 10;
@@ -513,15 +599,9 @@ pub const Supervisor = struct {
 
     fn pidAlive(self: *Supervisor, pid: u32) bool {
         if (builtin.os.tag == .windows) {
-            const fil = std.fmt.allocPrint(self.gpa, "PID eq {d}", .{pid}) catch return true;
-            defer self.gpa.free(fil);
-            const argv = [_][]const u8{ "tasklist", "/FI", fil, "/NH", "/FO", "CSV" };
-            const res = std.process.run(self.gpa, self.io, .{ .argv = &argv }) catch return true;
-            defer self.gpa.free(res.stdout);
-            defer self.gpa.free(res.stderr);
-            const needle = std.fmt.allocPrint(self.gpa, "\"{d}\"", .{pid}) catch return true;
-            defer self.gpa.free(needle);
-            return std.mem.indexOf(u8, res.stdout, needle) != null;
+            // Native check (no tasklist spawn): "alive" == a live veil worker. A recycled pid on an unrelated
+            // app reads as NOT alive, so it can't become a phantom-running swarm or get force-killed.
+            return liveVeilPid(pid);
         } else {
             var nbuf: [16]u8 = undefined;
             const pidstr = std.fmt.bufPrint(&nbuf, "{d}", .{pid}) catch return true;
@@ -546,7 +626,6 @@ pub const Supervisor = struct {
     pub const Load = struct { swarms: usize = 0, live_swarms: usize = 0, live_minds: usize = 0 };
 
     pub fn load(self: *Supervisor) Load {
-        self.reconcile();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var l: Load = .{};
@@ -563,7 +642,6 @@ pub const Supervisor = struct {
     }
 
     pub fn listForUser(self: *Supervisor, uid: u64) ![]*Swarm {
-        self.reconcile();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var list: std.ArrayList(*Swarm) = .empty;
@@ -575,7 +653,6 @@ pub const Supervisor = struct {
     }
 
     pub fn listAll(self: *Supervisor) ![]*Swarm {
-        self.reconcile();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         var list: std.ArrayList(*Swarm) = .empty;
