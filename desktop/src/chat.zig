@@ -17,6 +17,7 @@ const llm = @import("llm.zig");
 const secrets = @import("secrets.zig");
 const catalog = @import("catalog.zig");
 const log = @import("log.zig");
+const neurondb = @import("neuron.zig");
 
 const Store = store_mod.Store;
 
@@ -70,6 +71,10 @@ pub const Chat = struct {
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
     ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
 
+    // HIPPOCAMPUS — the chat's own neuron-db (gpa-owned; "" = disabled → all memory ops no-op)
+    mind_bin: []const u8 = "",
+    mind_db: []const u8 = "",
+
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
     sw_scratch: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
@@ -79,6 +84,15 @@ pub const Chat = struct {
         var dbuf: [512]u8 = undefined;
         const dd0 = self.dataDir(&dbuf);
         self.ensureDirs(dd0);
+        // HIPPOCAMPUS: find the neuron binary + point at a chat-local sqlite so turns + cast findings persist as
+        // recallable neurons (neurondb.zig). Silently disabled (memory ops no-op) if the binary isn't found.
+        self.mind_bin = neurondb.findBin(self.gpa, self.io);
+        {
+            var mb: [600]u8 = undefined;
+            const p = std.fmt.bufPrint(&mb, "{s}/.veil-desk/chat.sqlite", .{dd0}) catch "";
+            if (p.len > 0) self.mind_db = self.gpa.dupe(u8, p) catch "";
+        }
+        log.info("chat hippocampus: {s}", .{if (self.mind_bin.len > 0) "enabled" else "disabled (neuron binary not found)"});
         self.loadSettings(dd0);
         self.loadKey(dd0);
         self.refreshConvs(dd0, true);
@@ -113,6 +127,22 @@ pub const Chat = struct {
 
     fn nowS(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+    }
+
+    /// The chat's hippocampus client (neuron-db). All ops no-op when the binary/db is unavailable.
+    fn mind(self: *Chat) neurondb.Db {
+        return .{ .gpa = self.gpa, .io = self.io, .bin = self.mind_bin, .db = self.mind_db };
+    }
+
+    /// The neuron-db scope for the ACTIVE conversation (its id) — memory is partitioned per conversation so
+    /// recall never bleeds an unrelated chat's facts. Caller must hold no store lock. Empty if no active conv.
+    fn convScope(self: *Chat, buf: []u8) []const u8 {
+        self.store.lock();
+        defer self.store.unlock();
+        const id = self.store.conv_active[0..self.store.conv_active_len];
+        const n = @min(id.len, buf.len);
+        @memcpy(buf[0..n], id[0..n]);
+        return buf[0..n];
     }
 
     /// Ask the local Ollama which models are installed (GET /api/tags) and publish their names so the
@@ -661,6 +691,10 @@ pub const Chat = struct {
             }
         }
         if (idn == 0) return;
+        // HIPPOCAMPUS: persist this turn as a neuron under the conversation's scope so it survives the 64-message
+        // ring eviction and can be relevance-recalled into future prompts (esp. a cast's synthesis digest, which
+        // otherwise ages out as one [cast] message). No-op when neuron-db is disabled.
+        self.mind().observe(idb[0..idn], text);
         // rewrite the file from the Store copy
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -737,6 +771,24 @@ pub const Chat = struct {
         escJson(&msgs, self.gpa, SYSTEM_PROMPT);
         escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
+        // HIPPOCAMPUS: draw the facts most relevant to THIS query in from the chat's own neuron-db — earlier
+        // turns and cast findings, including ones evicted from the 24KB visible history — and inject them as a
+        // grounded-context message. Additive + guarded: if recall is empty/disabled, the prompt is byte-identical
+        // to the token-tail-only version, so this can only help, never break the turn.
+        if (self.mind().enabled() and self.last_user_len > 0) {
+            var scope_buf: [40]u8 = undefined;
+            const scope = self.convScope(&scope_buf);
+            if (scope.len > 0) {
+                var rbuf: [4096]u8 = undefined;
+                const mem = self.mind().recall(scope, self.last_user[0..self.last_user_len], &rbuf);
+                if (mem.len > 0) {
+                    msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"RELEVANT MEMORY (recalled from this conversation's neuron-db — earlier turns + cast findings, some beyond the visible history). Treat as grounded context:\\n") catch return;
+                    escJson(&msgs, self.gpa, mem);
+                    msgs.appendSlice(self.gpa, "\"}") catch return;
+                    log.info("chat hippocampus: injected {d}b of recalled memory", .{mem.len});
+                }
+            }
+        }
         {
             self.store.lock();
             defer self.store.unlock();
