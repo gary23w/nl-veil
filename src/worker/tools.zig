@@ -68,18 +68,25 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
 /// off-allowlist content must never leak into a gated run). A torn concurrent write self-heals: the header
 /// parse fails, we refetch, we rewrite.
 fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limit: usize) []u8 {
-    const gpa = ctx.gpa;
+    return fetchCached(ctx.io, ctx.gpa, ctx.run_dir, ctx.mind, url, json, deadline_ms, limit, ctx.egress_allow);
+}
+
+/// The cache+curl core behind curlToText, callable WITHOUT a ToolCtx so the engine itself (run.zig's nl-rag
+/// pack prefetch) can pull a url through the SAME shared 7-day fetch cache — same hash key, same on-disk
+/// format, so a page the engine prefetches is free for a scout to web_fetch later and vice versa. `mind` only
+/// names the per-fetch temp file; `egress_allow` gates caching + forbids redirects exactly as before.
+pub fn fetchCached(io: std.Io, gpa: std.mem.Allocator, run_dir: []const u8, mind: []const u8, url: []const u8, json: bool, deadline_ms: u32, limit: usize, egress_allow: []const u8) []u8 {
     const cache_ttl_s: i64 = 7 * 24 * 3600;
     var cpath: []const u8 = "";
     defer if (cpath.len > 0) gpa.free(@constCast(cpath));
-    if (ctx.egress_allow.len == 0) blk_cache: {
-        const cdir = std.fmt.allocPrint(gpa, "{s}/../_fetch_cache", .{ctx.run_dir}) catch break :blk_cache;
+    if (egress_allow.len == 0) blk_cache: {
+        const cdir = std.fmt.allocPrint(gpa, "{s}/../_fetch_cache", .{run_dir}) catch break :blk_cache;
         defer gpa.free(cdir);
-        _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, cdir, .default_dir) catch {};
+        _ = std.Io.Dir.cwd().createDirPathStatus(io, cdir, .default_dir) catch {};
         const h = std.hash.Wyhash.hash(if (json) 1 else 0, url);
         cpath = std.fmt.allocPrint(gpa, "{s}/{x}.txt", .{ cdir, h }) catch "";
         if (cpath.len == 0) break :blk_cache;
-        const cached = std.Io.Dir.cwd().readFileAlloc(ctx.io, cpath, gpa, .limited(limit + 64)) catch break :blk_cache;
+        const cached = std.Io.Dir.cwd().readFileAlloc(io, cpath, gpa, .limited(limit + 64)) catch break :blk_cache;
         const nl = std.mem.indexOfScalar(u8, cached, '\n') orelse {
             gpa.free(cached);
             break :blk_cache;
@@ -88,7 +95,7 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
             gpa.free(cached);
             break :blk_cache;
         };
-        if (std.Io.Timestamp.now(ctx.io, .real).toSeconds() - ts <= cache_ttl_s and cached.len > nl + 1) {
+        if (std.Io.Timestamp.now(io, .real).toSeconds() - ts <= cache_ttl_s and cached.len > nl + 1) {
             const body = gpa.dupe(u8, cached[nl + 1 ..]) catch {
                 gpa.free(cached);
                 break :blk_cache;
@@ -98,26 +105,26 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
         }
         gpa.free(cached); // expired — fall through to a live fetch that overwrites it
     }
-    const tmp = std.fmt.allocPrint(gpa, "{s}/.fetch-{s}.tmp", .{ ctx.run_dir, ctx.mind }) catch return dupe(gpa, "oom");
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.fetch-{s}.tmp", .{ run_dir, mind }) catch return dupe(gpa, "oom");
     defer gpa.free(tmp);
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "--speed-limit", "1", "--speed-time", "15", "-o", tmp, "-A", "neuron-loops-mind/1.0" }) catch return dupe(gpa, "oom");
     // Under an active egress allowlist, a redirect could hop OFF the allowlist (the gate only sees the seed URL),
     // so forbid redirect-following entirely — the allowlisted host must answer directly.
-    if (ctx.egress_allow.len > 0) av.appendSlice(gpa, &.{ "--max-redirs", "0" }) catch {};
+    if (egress_allow.len > 0) av.appendSlice(gpa, &.{ "--max-redirs", "0" }) catch {};
     if (json) av.appendSlice(gpa, &.{ "-H", "Accept: application/json" }) catch {};
     av.append(gpa, url) catch {};
-    spawnGuarded(ctx.io, av.items, deadline_ms);
-    const raw = std.Io.Dir.cwd().readFileAlloc(ctx.io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
-    std.Io.Dir.cwd().deleteFile(ctx.io, tmp) catch {};
+    spawnGuarded(io, av.items, deadline_ms);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     // Persist a substantial body for reuse (>=600 bytes filters most error/empty pages; a cached WAF page
     // costs one stale week at worst and the TTL ages it out).
     if (cpath.len > 0 and raw.len >= 600) {
-        const stamped = std.fmt.allocPrint(gpa, "{d}\n{s}", .{ std.Io.Timestamp.now(ctx.io, .real).toSeconds(), raw }) catch null;
+        const stamped = std.fmt.allocPrint(gpa, "{d}\n{s}", .{ std.Io.Timestamp.now(io, .real).toSeconds(), raw }) catch null;
         if (stamped) |st| {
             defer gpa.free(st);
-            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = cpath, .data = st }) catch {};
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cpath, .data = st }) catch {};
         }
     }
     return raw;
