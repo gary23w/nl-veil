@@ -128,13 +128,14 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *httpz.Response) !void {
     const environ = app.sup.parent_env orelse return serverErr(res, "server env unavailable");
-    // Per-user scratch + memory db so observe/share/recall_hive on the chat surface never cross accounts
-    // (the endpoint is multi-tenant on the productized server; a shared db + fixed scope would leak facts).
+    // Per-user scratch + memory DB so observe/share/recall_hive on the chat surface never cross accounts
+    // (the endpoint is multi-tenant on the productized server). Isolation is by the per-uid DB FILE — NOT by
+    // scope: recall_hive reads the fixed KNOWLEDGE/INTEL/SKILL scopes, so overriding learn_scope would just
+    // make observe write somewhere recall_hive never looks (a stored-and-forgotten fact). Keep both default.
     const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, uid });
     const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
-    const scope = try std.fmt.allocPrint(res.arena, "chat-u{d}", .{uid});
 
     // The executor increments these; the chat surface ignores them (one shared sink is fine).
     var counters = [_]u32{0} ** 5;
@@ -144,8 +145,7 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *ht
         .environ = environ,
         .run_dir = base,
         .workdir = workdir,
-        .scope = scope,
-        .learn_scope = scope, // keep this user's facts out of the shared "knowledge" scope
+        .scope = "chat",
         .mind = "chat",
         .round = 0,
         .mem = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db),
