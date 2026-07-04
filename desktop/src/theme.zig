@@ -62,10 +62,62 @@ pub fn z(comptime fmt: []const u8, args: anytype) [:0]const u8 {
 }
 pub fn zs(s: []const u8) [:0]const u8 {
     const b = nextBuf();
-    const n = @min(s.len, b.len - 1);
-    @memcpy(b[0..n], s[0..n]);
+    const n = foldAscii(b[0 .. b.len - 1], s);
     b[n] = 0;
     return b[0..n :0];
+}
+
+/// Copy `src` into `dst`, folding it to renderable single-line ASCII. TWO jobs, both fixing real bugs seen
+/// in LLM-authored text (swarm goals/briefs, console events, chat):
+///   1) newlines/tabs/other control bytes -> a single space, so a multi-line string never renders as
+///      several OVERLAPPING lines (drawTextEx honours '\n'); one-line row labels stay one line.
+///   2) common Unicode punctuation the UI/mono fonts don't carry (em/en dashes, smart quotes, bullets,
+///      ellipsis, arrows, non-breaking space) -> its ASCII equivalent, so it never renders as tofu '?'.
+/// Printable Latin-1 (accents) is kept verbatim — the atlas covers 0xA0..0xFF. Anything else (emoji, CJK,
+/// rare symbols) is dropped rather than shown as '?'. Returns bytes written (never exceeds dst.len).
+pub fn foldAscii(dst: []u8, src: []const u8) usize {
+    var o: usize = 0;
+    var i: usize = 0;
+    while (i < src.len and o < dst.len) {
+        const b = src[i];
+        if (b < 0x80) {
+            dst[o] = if (b < 0x20 or b == 0x7F) ' ' else b; // controls (incl. \n \r \t) -> space
+            o += 1;
+            i += 1;
+            continue;
+        }
+        const seq = std.unicode.utf8ByteSequenceLength(b) catch {
+            i += 1; // invalid lead byte — skip it
+            continue;
+        };
+        if (i + seq > src.len) break;
+        const cp = std.unicode.utf8Decode(src[i .. i + seq]) catch {
+            i += 1;
+            continue;
+        };
+        const orig = src[i .. i + seq];
+        i += seq;
+        const rep: []const u8 = switch (cp) {
+            0xA0, 0x2000...0x200A, 0x202F, 0x205F, 0x3000 => " ",
+            0x200B...0x200D, 0xFEFF => "", // zero-width — drop
+            0xAD, 0x2010...0x2015, 0x2043, 0x2212 => "-",
+            0x2018, 0x2019, 0x201A, 0x201B, 0x2032 => "'",
+            0x201C, 0x201D, 0x201E, 0x201F, 0x2033 => "\"",
+            0x2022, 0x2023, 0x2027, 0x25AA, 0x25CB, 0x25CF => "*",
+            0x2026 => "...",
+            0x2192, 0x21D2 => "->",
+            0x2190, 0x21D0 => "<-",
+            0x2713, 0x2714 => "v",
+            0x00A1...0x00AC, 0x00AE...0x00FF => orig, // printable Latin-1 — atlas has it, keep verbatim
+            else => "", // emoji / CJK / rare symbol — drop, never tofu
+        };
+        for (rep) |rb| {
+            if (o >= dst.len) break;
+            dst[o] = rb;
+            o += 1;
+        }
+    }
+    return o;
 }
 
 // The loaded fonts (real TTFs, loaded at startup). `ui_font` is proportional (labels, buttons, headers);
@@ -109,8 +161,7 @@ pub fn measureMono(s: [:0]const u8, size: i32) i32 {
 /// Monospace clip helper for the console.
 pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {
     const b = nextBuf();
-    var n = @min(s.len, b.len - 1);
-    @memcpy(b[0..n], s[0..n]);
+    var n = foldAscii(b[0 .. b.len - 1], s);
     b[n] = 0;
     while (n > 1 and measureMono(b[0..n :0], size) > max_w) {
         n -= 1;
@@ -122,8 +173,7 @@ pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i
 /// Left-aligned label, clipped to max_w px with an ellipsis — the workhorse for rows that must not overflow.
 pub fn textClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {
     const b = nextBuf();
-    var n = @min(s.len, b.len - 1);
-    @memcpy(b[0..n], s[0..n]);
+    var n = foldAscii(b[0 .. b.len - 1], s);
     b[n] = 0;
     while (n > 1 and measure(b[0..n :0], size) > max_w) {
         n -= 1;
@@ -260,4 +310,23 @@ pub fn stepper(r: Rect, label: [:0]const u8, v: i32, lo: i32, hi: i32) i32 {
     if (button(minus, z("-", .{}), blue, v > lo)) nv = @max(lo, v - 1);
     if (button(plus, z("+", .{}), blue, v < hi)) nv = @min(hi, v + 1);
     return nv;
+}
+
+test "foldAscii collapses newlines and transliterates Unicode punctuation (fixes overlap + '?' tofu)" {
+    var buf: [256]u8 = undefined;
+    // newlines/tabs -> spaces so a multi-line goal never draws as overlapping lines
+    {
+        const n = foldAscii(&buf, "line one\nline two\tend");
+        try std.testing.expectEqualStrings("line one line two end", buf[0..n]);
+    }
+    // em/en dash + smart quotes + nbsp + bullet + ellipsis -> ASCII (no '?')
+    {
+        const n = foldAscii(&buf, "Clean\u{2011}Code \u{201c}Tips\u{201d}\u{a0}here\u{2014}now\u{2022}\u{2026}");
+        try std.testing.expectEqualStrings("Clean-Code \"Tips\" here-now*...", buf[0..n]);
+    }
+    // printable Latin-1 (accents) survive; emoji/other are dropped, never tofu
+    {
+        const n = foldAscii(&buf, "caf\u{e9} \u{1f600}ok");
+        try std.testing.expectEqualStrings("caf\u{e9} ok", buf[0..n]);
+    }
 }
