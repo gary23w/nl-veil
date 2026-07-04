@@ -406,7 +406,7 @@ fn enforceBudget(app: *App) void {
 
 pub fn listSwarms(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    app.sup.maybeGc(app.data, app.retention_days);
+    // (retention GC now runs on the supervisor's background thread, not on this request path)
     enforceBudget(app);
     const swarms = try app.sup.listForUser(u.id);
     defer app.gpa.free(swarms);

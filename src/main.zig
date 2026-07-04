@@ -167,6 +167,12 @@ pub fn main(init: std.process.Init) !void {
         const swept = sup.pruneOldRuns(paths.data, retention_days);
         if (swept > 0) std.debug.print("retention: pruned {d} stale run dir(s) at startup (>= {d}d inactive)\n", .{ swept, retention_days });
     }
+    // Swarm reconcile + retention GC run on a BACKGROUND thread, never on an httpz request thread — reconcile
+    // can spawn a worker subprocess (respawn) which, inline in a /fleet or list handler, starves the pool and
+    // wedges the server. Handlers now only read the in-memory roster.
+    sup.gc_data_dir = paths.data;
+    sup.gc_days = retention_days;
+    if (std.Thread.spawn(.{}, Supervisor.bgLoop, .{&sup})) |t| t.detach() else |_| {}
     var audit = AuditLog.init(gpa, io, paths.data);
     var login_guard = LoginGuard.init(gpa, io);
     var vault = KeyVault.init(gpa, io, nb, sup.server_key);
