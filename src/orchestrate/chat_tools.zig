@@ -66,7 +66,7 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
     // --- mind tools (the same executor the hive uses) --------------------------------------
     if (!mindAllowed(tool)) return badReq(res, "unknown or disallowed tool");
-    return runMindTool(app, tool, body.args, res);
+    return runMindTool(app, u.id, tool, body.args, res);
 }
 
 // ----- orchestration -------------------------------------------------------------------------
@@ -79,8 +79,15 @@ fn listSwarms(app: *App, uid: u64, res: *httpz.Response) !void {
     try arr.appendSlice(app.gpa, "{\"ok\":true,\"tool\":\"list_swarms\",\"swarms\":[");
     for (swarms, 0..) |s, i| {
         if (i > 0) try arr.append(app.gpa, ',');
-        const item = try std.fmt.allocPrint(res.arena, "{{\"id\":\"{s}\",\"name\":\"{s}\",\"model\":\"{s}\",\"minds\":{d},\"state\":\"{s}\"}}", .{ s.id, s.name, s.model, s.minds, @tagName(s.state) });
-        try arr.appendSlice(app.gpa, item);
+        // name/model are user/config-influenced — escape them, or a quote/backslash breaks the response.
+        try arr.appendSlice(app.gpa, "{\"id\":\"");
+        try appendEsc(app.gpa, &arr, s.id);
+        try arr.appendSlice(app.gpa, "\",\"name\":\"");
+        try appendEsc(app.gpa, &arr, s.name);
+        try arr.appendSlice(app.gpa, "\",\"model\":\"");
+        try appendEsc(app.gpa, &arr, s.model);
+        const tail = try std.fmt.allocPrint(res.arena, "\",\"minds\":{d},\"state\":\"{s}\"}}", .{ s.minds, @tagName(s.state) });
+        try arr.appendSlice(app.gpa, tail);
     }
     try arr.appendSlice(app.gpa, "]}");
     res.content_type = .JSON;
@@ -103,10 +110,12 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     const syn_path = try std.fmt.allocPrint(res.arena, "{s}/work/synthesis.md", .{sw.run_dir});
     var text: []const u8 = "";
     if (std.Io.Dir.cwd().readFileAlloc(app.io, syn_path, res.arena, .limited(256 << 10))) |c| {
+        scrubUtf8(c); // file content may not be valid UTF-8; res.json requires it
         text = c;
     } else |_| {
         const ev_path = try std.fmt.allocPrint(res.arena, "{s}/work/events.jsonl", .{sw.run_dir});
         if (std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(256 << 10))) |c| {
+            scrubUtf8(c);
             text = tailLines(c, 6000);
         } else |_| {
             text = "(no findings yet — the swarm has not written a synthesis or events)";
@@ -117,12 +126,15 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 // ----- mind tools ----------------------------------------------------------------------------
 
-fn runMindTool(app: *App, tool: []const u8, args: []const u8, res: *httpz.Response) !void {
+fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *httpz.Response) !void {
     const environ = app.sup.parent_env orelse return serverErr(res, "server env unavailable");
-    const base = try std.fmt.allocPrint(res.arena, "{s}/_chat", .{app.data});
+    // Per-user scratch + memory db so observe/share/recall_hive on the chat surface never cross accounts
+    // (the endpoint is multi-tenant on the productized server; a shared db + fixed scope would leak facts).
+    const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, uid });
     const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
+    const scope = try std.fmt.allocPrint(res.arena, "chat-u{d}", .{uid});
 
     // The executor increments these; the chat surface ignores them (one shared sink is fine).
     var counters = [_]u32{0} ** 5;
@@ -132,7 +144,8 @@ fn runMindTool(app: *App, tool: []const u8, args: []const u8, res: *httpz.Respon
         .environ = environ,
         .run_dir = base,
         .workdir = workdir,
-        .scope = "chat",
+        .scope = scope,
+        .learn_scope = scope, // keep this user's facts out of the shared "knowledge" scope
         .mind = "chat",
         .round = 0,
         .mem = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db),
@@ -144,11 +157,54 @@ fn runMindTool(app: *App, tool: []const u8, args: []const u8, res: *httpz.Respon
         .internet = true,
     };
     const result = tools.execute(&ctx, tool, args);
-    defer app.gpa.free(result);
+    // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid
+    // UTF-8, so scrub invalid sequences to U+FFFD-as-'?' in place before serializing. Guard the free: an OOM
+    // dupe() fallback in execute() can hand back a static "" (len 0) that must NOT be freed.
+    scrubUtf8(result);
+    defer if (result.len > 0) app.gpa.free(result);
     try res.json(.{ .ok = true, .tool = tool, .result = result }, .{});
 }
 
+/// Replace each byte that is not part of a valid UTF-8 sequence with '?' (in place, length-preserving), so
+/// arbitrary tool output always serializes as conformant JSON.
+fn scrubUtf8(buf: []u8) void {
+    var i: usize = 0;
+    while (i < buf.len) {
+        const n = std.unicode.utf8ByteSequenceLength(buf[i]) catch {
+            buf[i] = '?';
+            i += 1;
+            continue;
+        };
+        if (i + n > buf.len) {
+            buf[i] = '?';
+            i += 1;
+            continue;
+        }
+        if (std.unicode.utf8Decode(buf[i .. i + n])) |_| {
+            i += n;
+        } else |_| {
+            buf[i] = '?';
+            i += 1;
+        }
+    }
+}
+
 // ----- tiny helpers --------------------------------------------------------------------------
+
+/// Append `s` as the inside of a JSON string (no surrounding quotes), escaping ", \, and control chars.
+fn appendEsc(gpa: std.mem.Allocator, arr: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try arr.appendSlice(gpa, "\\\""),
+        '\\' => try arr.appendSlice(gpa, "\\\\"),
+        '\n' => try arr.appendSlice(gpa, "\\n"),
+        '\r' => try arr.appendSlice(gpa, "\\r"),
+        '\t' => try arr.appendSlice(gpa, "\\t"),
+        else => if (c < 0x20) {
+            var b: [8]u8 = undefined;
+            try arr.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch continue);
+        } else try arr.append(gpa, c),
+    };
+}
 
 /// String value of a top-level "key" in a flat JSON object — enough to pull an id out of a tool-call
 /// args blob without a full parse. Returns "" if absent.
