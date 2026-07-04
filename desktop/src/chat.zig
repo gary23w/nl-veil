@@ -851,6 +851,9 @@ pub const Chat = struct {
         const side = sideDir(dd, &sb);
         if (!llm.start(&self.stream, self.io, self.gpa, side, prov, msgs.items, MAX_TOKENS, self.nowS())) {
             self.store.pushNotif("Chat failed", "could not start the model call (is curl available?)", 2);
+            // A .tool_follow (or .collect) re-entry gets here with busy already true — clear it or the chat
+            // wedges "busy" forever. turn is already .idle (set by the caller before re-entry).
+            self.setBusy(false);
             return;
         }
         self.turn = kind;
@@ -922,7 +925,11 @@ pub const Chat = struct {
         // TOOL: <name> <args> — a single shared-tool call. Run it, fold the result back, continue the loop.
         // Not on a .collect turn (that turn's job is to compose the cast's final answer, not run tools).
         if (kind != .collect) {
-            if (toolCall(full)) |tc| {
+            // Primary: a strict TOOL line in content. Recovery: gpt-oss-style reasoning models sometimes leave
+            // content empty and narrate the call in the hidden reasoning ("...so we issue TOOL: web_search {..}")
+            // — pull the last TOOL: out of the reasoning so the tool still fires (mirrors the cast recovery).
+            const tc_opt = toolCall(full) orelse (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null);
+            if (tc_opt) |tc| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
                     self.stream.deinit(self.gpa);
@@ -946,7 +953,7 @@ pub const Chat = struct {
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, goal);
             }
-        } else if (!self.cast_active and userWantsCast(self.last_user[0..self.last_user_len])) {
+        } else if (kind == .user and !self.cast_active and userWantsCast(self.last_user[0..self.last_user_len])) {
             // The user EXPLICITLY asked to cast but the model didn't emit a CAST line (gpt-oss commonly
             // leaves `content` empty, putting everything in its hidden reasoning). Honor the request:
             // cast using the user's own words as the goal so an explicit "cast a swarm to X" always fires.
@@ -1130,6 +1137,20 @@ pub const Chat = struct {
         const orchestration = std.mem.eql(u8, name, "stop_swarm") or std.mem.eql(u8, name, "swarm_findings");
         if (orchestration and self.cast_active and self.cast_hex_len > 0 and !hasRealId(raw_args)) {
             args = std.fmt.bufPrint(&abuf, "{{\"id\":\"{s}\"}}", .{self.cast_hex[0..self.cast_hex_len]}) catch raw_args;
+        }
+        // web_search with a missing/placeholder query — common when the call is recovered from the reasoning
+        // channel, where a weak model writes {"query":"..."} as shorthand — searches for literal "...". Fall
+        // back to the user's own words so the search stays on-topic.
+        var qbuf: [2048]u8 = undefined;
+        if (std.mem.eql(u8, name, "web_search") and self.last_user_len > 0 and queryWeak(args)) {
+            var qw = Io.Writer.fixed(&qbuf);
+            const okq = blk: {
+                qw.writeAll("{\"query\":\"") catch break :blk false;
+                wesc(&qw, self.last_user[0..self.last_user_len]);
+                qw.writeAll("\"}") catch break :blk false;
+                break :blk true;
+            };
+            if (okq) args = qw.buffered();
         }
 
         var stbuf: [96]u8 = undefined;
@@ -1412,6 +1433,43 @@ pub fn toolCall(full: []const u8) ?ToolCall {
     return null;
 }
 
+/// Loose recovery: find the LAST "TOOL:" ANYWHERE in text (not just line-start) and parse a tool name +
+/// a balanced {...} args blob after it. Used ONLY on the reasoning channel when content is empty — a
+/// reasoning model narrates its decision ("...so we issue TOOL: web_search {\"query\":\"x\"}") there. More
+/// permissive than toolCall on purpose; the strict parser owns the content path.
+pub fn toolCallLoose(text: []const u8) ?ToolCall {
+    const key = "TOOL:";
+    var at: ?usize = null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, key)) |p| {
+        at = p;
+        search = p + key.len;
+    }
+    var i = (at orelse return null) + key.len;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    const nstart = i;
+    while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
+    const name = std.mem.trim(u8, text[nstart..i], " \t:`*\"");
+    if (name.len == 0 or name.len > 40) return null;
+    var args: []const u8 = "{}";
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+    if (i < text.len and text[i] == '{') {
+        const astart = i;
+        var depth: i32 = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '{') depth += 1 else if (text[i] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+        if (depth == 0 and i > astart + 1) args = text[astart..i];
+    }
+    return .{ .name = name, .args = args };
+}
+
 /// Did the user's message explicitly ask to cast a swarm? Case-insensitive: a cast verb
 /// (cast/run/spin/deploy/launch/summon) together with "swarm" or "hive". Used to honor an explicit
 /// request even when the model flakes and emits no CAST line.
@@ -1579,6 +1637,15 @@ fn hasRealId(args: []const u8) bool {
     if (t.len == 0) return false;
     if (std.mem.eql(u8, t, "current") or std.mem.eql(u8, t, "the current") or std.mem.eql(u8, t, "<id>") or std.mem.eql(u8, t, "id")) return false;
     return true;
+}
+
+/// Is a web_search "query" arg missing or a placeholder ("", "...", "…", "<query>")? A reasoning-recovered
+/// call often carries shorthand; treat anything under 3 real chars (after stripping dots/brackets) as weak.
+fn queryWeak(args: []const u8) bool {
+    var b: [128]u8 = undefined;
+    const q = jStr(args, "query", &b) orelse return true;
+    const t = std.mem.trim(u8, q, " .\t\r\n<>…\"");
+    return t.len < 3;
 }
 
 /// Extract a JSON string value for `key`, UNESCAPING into `out` (handles \" \\ \/ \n \r \t \b \f and, best-
@@ -1941,6 +2008,21 @@ test "toolCall parses name + raw json args" {
     try std.testing.expect(toolCall("a\nb\nc\nd\ne\nf\nTOOL: too_deep {}") == null);
 }
 
+test "toolCallLoose recovers a call narrated inside reasoning" {
+    // the exact gpt-oss failure: content empty, the decision lives mid-sentence in reasoning
+    const r = "We must use web_search tool. That is not a cast. So we issue TOOL: web_search {\"query\":\"Zig 0.16 release highlights\"}";
+    const a = toolCallLoose(r).?;
+    try std.testing.expectEqualStrings("web_search", a.name);
+    try std.testing.expectEqualStrings("{\"query\":\"Zig 0.16 release highlights\"}", a.args);
+    // takes the LAST occurrence; balanced braces
+    const b = toolCallLoose("first TOOL: list_swarms {} then decide TOOL: stop_swarm {\"id\":\"x\"}").?;
+    try std.testing.expectEqualStrings("stop_swarm", b.name);
+    try std.testing.expectEqualStrings("{\"id\":\"x\"}", b.args);
+    // bare name, no args -> {}
+    try std.testing.expectEqualStrings("{}", toolCallLoose("so I will run TOOL: list_swarms now").?.args);
+    try std.testing.expect(toolCallLoose("no tool mentioned here") == null);
+}
+
 test "jsonStrInto unescapes; extractToolResult picks the right field" {
     var out: [256]u8 = undefined;
     // newlines + escaped quotes survive
@@ -1960,6 +2042,14 @@ test "hasRealId distinguishes real ids from placeholders" {
     try std.testing.expect(!hasRealId("{}"));
     try std.testing.expect(!hasRealId("{\"id\":\"\"}"));
     try std.testing.expect(!hasRealId("{\"id\":\"current\"}"));
+}
+
+test "queryWeak catches missing/placeholder web_search queries" {
+    try std.testing.expect(queryWeak("{}")); // no query field
+    try std.testing.expect(queryWeak("{\"query\":\"\"}"));
+    try std.testing.expect(queryWeak("{\"query\":\"...\"}"));
+    try std.testing.expect(queryWeak("{\"query\":\"   \"}"));
+    try std.testing.expect(!queryWeak("{\"query\":\"Zig 0.16 release\"}"));
 }
 
 test "userWantsCast detects explicit cast requests" {
