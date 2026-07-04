@@ -121,7 +121,7 @@ pub const ChatRole = enum(u8) { user, veil, cast_note };
 /// thread owns the full history on disk, this is the render copy.
 pub const ChatMsg = struct {
     role: ChatRole = .user,
-    text: [3072]u8 = [_]u8{0} ** 3072,
+    text: [12288]u8 = [_]u8{0} ** 12288, // 12K: LLM answers (esp. reasoning + tables/code) blew past 3K and clipped
     text_len: u16 = 0,
 
     pub fn textStr(m: *const ChatMsg) []const u8 {
@@ -238,7 +238,7 @@ pub const Store = struct {
     conv_active_len: u8 = 0,
     msgs: [MAX_CHAT_MSGS]ChatMsg = undefined,
     msg_count: usize = 0,
-    stream_text: [8192]u8 = undefined, // the in-flight assistant reply, grown as deltas land
+    stream_text: [16384]u8 = undefined, // the in-flight assistant reply, grown as deltas land (16K: don't clip long answers)
     stream_len: usize = 0,
     stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
     stream_reason_len: usize = 0,

@@ -883,9 +883,9 @@ pub const Chat = struct {
             self.appendMsg(dd, .veil, text);
             return;
         }
-        var buf: [3072]u8 = undefined;
+        var buf: [12288]u8 = undefined; // matches ChatMsg.text — reasoning preview + full answer without clipping
         var w: usize = 0;
-        const cap = @min(reasoning.len, 700);
+        const cap = @min(reasoning.len, 1200);
         // blockquote each reasoning line
         var it = std.mem.splitScalar(u8, reasoning[0..cap], '\n');
         while (it.next()) |line| {
@@ -1147,9 +1147,9 @@ pub const Chat = struct {
             }
         }
         jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab)", .{rel}) catch {};
-        // Keep as much of the digest as the ChatMsg buffer (3072b) holds — the synthesis IS the answer, so
-        // we want it whole, not clipped to the old 3000b. appendMsg truncates to the buffer anyway.
-        const digest = jb.items[0..@min(jb.items.len, 3060)];
+        // Keep as much of the digest as the ChatMsg buffer (12288b) holds — the synthesis IS the answer, so
+        // we want it whole, not clipped. appendMsg truncates to the buffer anyway.
+        const digest = jb.items[0..@min(jb.items.len, 12200)];
         self.appendMsg(dd, .cast_note, digest);
         self.setStatus("composing the answer...");
         self.startTurn(dd, .collect);
