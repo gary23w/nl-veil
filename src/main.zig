@@ -140,7 +140,16 @@ pub fn main(init: std.process.Init) !void {
     if (cf_account.len > 0 and wai_token.len > 0) std.debug.print("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint\n", .{}) else std.debug.print("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)\n", .{});
 
     const port: u16 = 8787;
-    var server = try httpz.Server(*App).init(io, gpa, .{ .address = if (bind_all) .all(port) else .localhost(port) }, &app);
+    // On Windows httpz runs the BLOCKING thread-per-connection worker (one pool thread per live socket),
+    // and its ONLY idle/half-open reaping is SO_RCVTIMEO — which is never set unless we pass timeouts here.
+    // Without these, a keep-alive connection that dies without a clean FIN (laptop sleep, tab crash, network
+    // blip) strands its pool thread forever; enough of them starve the 32-thread pool and fresh casts fail
+    // with curl status 000. keepalive=60 reaps idle sockets; request=15 caps slow/half-sent requests;
+    // request_count recycles a connection after N requests so no single socket lives unboundedly.
+    var server = try httpz.Server(*App).init(io, gpa, .{
+        .address = if (bind_all) .all(port) else .localhost(port),
+        .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1000 },
+    }, &app);
     defer {
         server.stop();
         server.deinit();

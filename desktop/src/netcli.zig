@@ -25,9 +25,17 @@ pub const Resp = struct {
 const STAT_MARK = "\n__NCSTAT__";
 const STAT_FMT = STAT_MARK ++ "%{http_code}";
 
+// A momentarily starved server pool (a stranded keep-alive/SSE thread freeing within tens of ms) accepts the
+// TCP connection but closes without a full reply — curl reports that as a fast non-zero exit (empty reply /
+// recv error), i.e. the classic status 000. That's transient, not "server down", so retry it a couple times
+// for IDEMPOTENT requests before giving up.
+const MAX_ATTEMPTS = 3;
+
 /// One HTTP round-trip to the local veil server via curl. `timeout_s` is a hard ceiling (curl --max-time):
 /// a healthy localhost server answers in milliseconds, so a call that hits the ceiling means the server is
 /// wedged/slow — we return null and let the caller report it rather than blocking the thread indefinitely.
+/// Transient failures are retried for GET/DELETE; a POST is tried once (an empty reply might mean the server
+/// already processed it, and a retry would deploy a duplicate swarm).
 fn curlReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: []const u8, token: []const u8, body_json: ?[]const u8, timeout_s: []const u8) ?Resp {
     var url_buf: [320]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path }) catch return null;
@@ -47,29 +55,55 @@ fn curlReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
     if (body_json) |b| argv.appendSlice(gpa, &.{ "-H", "Content-Type: application/json", "--data-binary", b }) catch return null;
     argv.appendSlice(gpa, &.{ "-w", STAT_FMT, url }) catch return null;
 
-    const res = std.process.run(gpa, io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch |e| {
-        log.err("http: curl {s} {s} spawn failed: {t}", .{ method, path, e });
-        return null;
-    };
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
-    if (res.term != .exited or res.term.exited != 0) {
-        // non-zero curl exit = connect refused / --max-time hit / transport error. Bounded, not a hang.
-        log.warn("http: curl {s} {s} did not complete (exit {any}) — server slow or down", .{ method, path, res.term });
-        return null;
-    }
+    // POST has side effects (deploy/cast) — an empty reply could mean the server already ran it, so retrying
+    // could deploy a duplicate. Only GET/DELETE (idempotent) are retried on a transient failure.
+    const idempotent = !std.mem.eql(u8, method, "POST");
+    var attempt: u8 = 0;
+    while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
+        if (attempt > 0) {
+            // Linear backoff (120ms, 240ms): long enough for a starved worker thread to free, short enough
+            // that a healthy call (which never reaches here) is unaffected.
+            io.sleep(.{ .nanoseconds = @as(u64, attempt) * 120 * std.time.ns_per_ms }, .awake) catch {};
+        }
 
-    const out = res.stdout;
-    const mark = std.mem.lastIndexOf(u8, out, STAT_MARK) orelse {
-        log.warn("http: {s} {s} — no status marker in {d}b reply", .{ method, path, out.len });
-        return null;
-    };
-    const code = std.mem.trim(u8, out[mark + STAT_MARK.len ..], " \r\n\t");
-    const status = std.fmt.parseInt(u16, code, 10) catch 0;
-    if (status == 0) return null;
-    const body = gpa.dupe(u8, out[0..mark]) catch return null;
-    log.dbg("http: {s} {s} -> {d} ({d}b)", .{ method, path, status, body.len });
-    return .{ .status = status, .body = body };
+        const res = std.process.run(gpa, io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch |e| {
+            log.err("http: curl {s} {s} spawn failed: {t}", .{ method, path, e });
+            return null; // curl itself won't spawn — retrying won't help
+        };
+        defer gpa.free(res.stdout);
+        defer gpa.free(res.stderr);
+
+        if (res.term == .exited and res.term.exited == 0) {
+            const out = res.stdout;
+            if (std.mem.lastIndexOf(u8, out, STAT_MARK)) |mark| {
+                const code = std.mem.trim(u8, out[mark + STAT_MARK.len ..], " \r\n\t");
+                const status = std.fmt.parseInt(u16, code, 10) catch 0;
+                if (status != 0) {
+                    const body = gpa.dupe(u8, out[0..mark]) catch return null;
+                    log.dbg("http: {s} {s} -> {d} ({d}b)", .{ method, path, status, body.len });
+                    return .{ .status = status, .body = body };
+                }
+            }
+            log.warn("http: {s} {s} — no status in {d}b reply (attempt {d}/{d})", .{ method, path, out.len, attempt + 1, MAX_ATTEMPTS });
+        } else {
+            const curl_exit: i64 = if (res.term == .exited) res.term.exited else -1;
+            // curl 7 = couldn't connect (nothing listening): the server really is down — fail fast.
+            // curl 28 = --max-time hit: the server is wedged; retrying just multiplies the stall — fail fast.
+            if (curl_exit == 7) {
+                log.err("http: curl {s} {s} connect refused (exit 7) — server not running", .{ method, path });
+                return null;
+            }
+            if (curl_exit == 28) {
+                log.warn("http: curl {s} {s} timed out (exit 28) — server wedged/slow", .{ method, path });
+                return null;
+            }
+            log.warn("http: curl {s} {s} did not complete (exit {any}) — server busy (attempt {d}/{d})", .{ method, path, res.term, attempt + 1, MAX_ATTEMPTS });
+        }
+
+        if (!idempotent) return null; // side-effecting POST: one shot only, never retry
+    }
+    log.err("http: {s} {s} failed after {d} attempts — server busy or down", .{ method, path, MAX_ATTEMPTS });
+    return null;
 }
 
 /// GET /api/v1/fleet — unauthenticated; returns the raw JSON body for the caller to scan. Short timeout:
