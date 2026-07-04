@@ -223,6 +223,15 @@ pub fn hovering(r: Rect) bool {
     return mouse.over(r);
 }
 
+// When an overlay (an open dropdown list) is drawn on top of a form, clicks meant for the overlay would
+// otherwise ALSO fire the widgets underneath (which were hit-tested earlier in the frame). While this is set,
+// button()/checkbox() ignore clicks — the caller sets it true before drawing the covered widgets and false
+// again before drawing the overlay itself, so only the overlay consumes the click.
+var clicks_blocked: bool = false;
+pub fn setBlockClicks(v: bool) void {
+    clicks_blocked = v;
+}
+
 /// A button; returns true on click. `accent` tints the hover fill + left edge so primary/danger/ghost
 /// buttons read differently without a separate widget per kind.
 pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
@@ -233,7 +242,7 @@ pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
     const tc = if (!enabled) comment else if (hot) accent else fg;
     const tw = measure(label, 14); // the loaded TTF — NOT raylib's blocky default (the "ugly button font")
     text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 14) / 2), 14, tc);
-    return enabled and mouse.over(r) and rl.isMouseButtonPressed(.left);
+    return enabled and mouse.over(r) and rl.isMouseButtonPressed(.left) and !clicks_blocked;
 }
 
 /// A tab in the tab strip: active gets a filled pill + an accent underline, the nl-veil web-UI look.
@@ -296,7 +305,7 @@ pub fn checkbox(r: Rect, label: [:0]const u8, on: bool) bool {
     panelBordered(box, if (on) withAlpha(green, 60) else bg, if (on) green else border);
     if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 14, green);
     text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, fg_dim);
-    return mouse.over(r) and rl.isMouseButtonPressed(.left);
+    return mouse.over(r) and rl.isMouseButtonPressed(.left) and !clicks_blocked;
 }
 
 /// A small +/- stepper for an integer in [lo,hi]. Returns the new value.
