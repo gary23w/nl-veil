@@ -677,3 +677,91 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
         w.emit("growth", std.fmt.allocPrint(w.a(), ",\"mind\":\"orchestrator\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":0,\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round }) catch ",\"round\":0");
     }
 }
+
+/// Does the goal read like a GATHER/RESEARCH task (needs real, current, external knowledge) rather than a
+/// pure build? Used as the research FLOOR: such a cast must field at least one scout or it will hallucinate
+/// its "findings" from the model's memory (the exact bug seen in the Iran-news casts: 0 web fetches, files
+/// written from thin air). Case-insensitive substring scan — cheap and good enough as a floor.
+pub fn looksLikeResearch(goal: []const u8) bool {
+    const cues = [_][]const u8{ "research", "gather", "find ", "latest", "news", "search", "look up", "current ", "recent", "report on", "reports on", "compile", "investigate", "discover", "what is happening", "up to date", "up-to-date", "state of the art", "state-of-the-art" };
+    var buf: [1024]u8 = undefined;
+    const n = @min(goal.len, buf.len);
+    for (0..n) |i| buf[i] = std.ascii.toLower(goal[i]);
+    for (cues) |c| if (std.mem.indexOf(u8, buf[0..n], c) != null) return true;
+    return false;
+}
+
+/// planCast — the CAST planner (runs ONCE up front, not per round like planRoles). The LEAD reads the goal
+/// and gives EACH mind an archetype ROLE + a specific sub-goal, choosing SCOUTS liberally for anything that
+/// needs real/current knowledge — because a research goal answered from memory HALLUCINATES. Reuses
+/// matchArchetype for the lane + research flag and planRoles' prose-tolerant JSON fallback. Best-effort: on
+/// any parse failure the seed roles stand. Sets mi.lane + mi.scout; a research-looking goal is guaranteed
+/// >=1 scout. This is the fast strike-team half of a cast; the between-wave dependency ordering + synthesis
+/// are layered on top by run.zig.
+pub fn planCast(w: *Worker, minds: []MindState, goal: []const u8) void {
+    const gpa = w.gpa;
+    if (minds.len == 0) return;
+    var roster: std.ArrayListUnmanaged(u8) = .empty;
+    defer roster.deinit(gpa);
+    for (minds) |mi| {
+        roster.appendSlice(gpa, mi.name) catch {};
+        roster.append(gpa, '\n') catch {};
+    }
+    const sys = "You are the LEAD of a fast STRIKE TEAM (a 'cast'): a small purpose-built team that gathers/analyzes/produces and returns QUICKLY. Given the goal, assign EACH mind ONE role and a SPECIFIC, DISTINCT sub-goal (divide the work so no two overlap). ROLES: scout (research=true — the mind ACTUALLY web_fetch/deep_crawl to GATHER real, current facts and brings them into shared memory; assign scouts generously whenever the goal needs news / latest / live / real-world information the model cannot already know — NEVER answer such a goal from memory), analyst (tear open the target artifact/problem and find the concrete root cause), implementer (build one concrete part of the deliverable), reviewer (verify/QA teammates' work), outreach (write clear external comms about the result). RULE: for any GATHER / FIND / RESEARCH / NEWS / LATEST goal, MOST minds MUST be scouts that search — do not just write files from memory. Output STRICT JSON on ONE line and nothing else: {\"team\":[{\"mind\":\"<name>\",\"role\":\"<scout|analyst|implementer|reviewer|outreach>\",\"goal\":\"<this mind's specific sub-goal>\",\"research\":<true|false>}]}";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\nMinds to assign (give each ONE role + a distinct sub-goal):\n{s}", .{ clip(goal, 400), roster.items }) catch return;
+    defer gpa.free(user);
+    const reply = llm.chat(gpa, w.io, w.run_dir, "planner", w.base_url, w.key, w.model, sys, user, 480);
+    defer gpa.free(reply.content);
+    if (!reply.ok) return;
+    const P = struct {
+        team: []const struct { mind: []const u8 = "", role: []const u8 = "", goal: []const u8 = "", research: bool = false } = &.{},
+    };
+    const trimmed = std.mem.trim(u8, reply.content, " \r\n\t`");
+    var parsed = std.json.parseFromSlice(P, gpa, trimmed, .{ .ignore_unknown_fields = true }) catch blk: {
+        const lb = std.mem.indexOfScalar(u8, trimmed, '{');
+        const rb = std.mem.lastIndexOfScalar(u8, trimmed, '}');
+        if (lb != null and rb != null and rb.? > lb.?) {
+            if (std.json.parseFromSlice(P, gpa, trimmed[lb.? .. rb.? + 1], .{ .ignore_unknown_fields = true })) |p2| break :blk p2 else |_| {}
+        }
+        return;
+    };
+    defer parsed.deinit();
+    if (parsed.value.team.len == 0) return;
+    var scouts: u32 = 0;
+    var plan_ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer plan_ev.deinit(gpa);
+    for (parsed.value.team) |a| {
+        const amind = std.mem.trim(u8, a.mind, " \r\n\t");
+        var mm: ?*MindState = null;
+        for (minds) |*m| if (std.ascii.eqlIgnoreCase(m.name, amind)) {
+            mm = m;
+            break;
+        };
+        const mi = mm orelse continue;
+        const arch = matchArchetype(a.role);
+        const is_scout = (if (arch) |x| x.research else false) or a.research;
+        const sub = std.mem.trim(u8, a.goal, " \r\n\t");
+        const lane_txt: []const u8 = if (arch) |x|
+            (std.fmt.allocPrint(gpa, "{s}\nYOUR SPECIFIC TASK: {s}", .{ x.lane, clip(sub, 220) }) catch continue)
+        else if (sub.len >= 4)
+            (gpa.dupe(u8, clip(sub, 300)) catch continue)
+        else
+            continue;
+        if (mi.lane_owned and mi.lane.ptr != mi.name.ptr) gpa.free(@constCast(mi.lane));
+        mi.lane = lane_txt;
+        mi.lane_owned = true;
+        mi.scout = is_scout and w.internet;
+        if (mi.scout) scouts += 1;
+        if (plan_ev.items.len > 0) plan_ev.appendSlice(gpa, " | ") catch {};
+        const pev = std.fmt.allocPrint(gpa, "{s}={s}{s}", .{ amind, if (a.role.len > 0) clip(a.role, 20) else "mind", if (mi.scout) " (scout)" else "" }) catch "";
+        plan_ev.appendSlice(gpa, pev) catch {};
+        if (pev.len > 0) gpa.free(@constCast(pev));
+    }
+    // RESEARCH FLOOR: a gather/find/news goal that ended up with NO scout will hallucinate — force the first
+    // mind to scout so SOMETHING actually searches.
+    if (scouts == 0 and w.internet and looksLikeResearch(goal)) {
+        minds[0].scout = true;
+        scouts = 1;
+    }
+    w.act("orchestrator", 0, "cast_plan", if (plan_ev.items.len > 0) plan_ev.items else "team assigned", std.fmt.allocPrint(w.a(), "cast team: {d} scout(s) across {d} minds", .{ scouts, minds.len }) catch "cast team planned");
+}

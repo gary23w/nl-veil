@@ -145,6 +145,7 @@ pub const Worker = struct {
     hyperspace: bool = false, // Lever 2: settle a dense hierarchy of grounding in-process before each model call
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
     quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
+    cast: bool = false, // CAST fast-path: a planCast-assigned role team (scouts SEARCH, builders build) runs ONE bounded moment, then synthesize. Shares quick's skip-scaffolding + single-round stop, but NOT quick's 3-turn edit profile.
     roster: []const u8 = "",
     last_bench: BenchResult = .{},
     last_bench_str: []const u8 = "",
@@ -574,7 +575,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     // one-shot mode). style="quick" or the (otherwise-dead) mode="oneshot" field select it. A small edit skips
     // all plan scaffolding + round-end engine calls and stops after one moment.
     const trimmed_mode = std.mem.trim(u8, m.mode, " \t");
-    w.quick = std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, trimmed_mode, "oneshot") or std.mem.eql(u8, trimmed_mode, "cast");
+    w.cast = std.mem.eql(u8, trimmed_mode, "cast");
+    // cast shares quick's fast path (skip build scaffolding, stop after one round) but gets its OWN capacity
+    // profile below (a 3-turn EDIT profile can't fetch/crawl — scouts need real turns).
+    w.quick = w.cast or std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, trimmed_mode, "oneshot");
     {
         const tenv = dupeEnv(gpa, environ, "NL_TIER");
         defer if (tenv) |t| gpa.free(t);
@@ -586,7 +590,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.cap = rsi.profileForTier(rsi.seedTier(model));
             w.cap_pinned = false;
         }
-        if (w.quick) {
+        if (w.cast) {
+            // a CAST strike team: NOT the one-edit profile — a scout needs real turns to web_fetch/deep_crawl
+            // a few sources and observe, a builder to produce from those findings. assembler regime + a raised
+            // turn budget; pinned so RSI doesn't churn a single-pass cast.
+            w.cap = rsi.profileForTier(.assembler);
+            w.cap.max_turns = 6;
+            w.cap.one_slot = false;
+            w.cap.exemplar = false;
+            w.cap_pinned = true;
+        } else if (w.quick) {
             // an EDIT profile, not a build profile: lean + temp-floor like extractor, but max_turns=3 so a 20B can
             // read_file -> write_file -> confirm, and one_slot=false (edit an existing file, don't scaffold a tree).
             w.cap = rsi.profileForTier(.extractor);
@@ -719,7 +732,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (rwp.len > 0) std.Io.Dir.cwd().deleteFile(io, rwp) catch {};
     }
     if (live) {
-        if (w.quick) {
+        if (w.cast) {
+            w.discourse = false; // the raw goal is the instruction — no classify round-trip
+            w.internet = true; // a cast is a research strike team — it MUST be able to search, or it hallucinates
+            w.act("engine", 0, "mode", "cast", "CAST strike team — the lead assigns each mind a role (scouts SEARCH the web, builders build from findings), one bounded moment each, then synthesize");
+            rsi.planCast(&w, minds.items, goal); // plan the role team ONCE up front (this is what makes a research cast actually scout)
+        } else if (w.quick) {
             w.discourse = false; // a direct edit — no research classify round-trip
             w.act("engine", 0, "mode", "quick", "INTERACTIVE one-shot edit — skipping goal-rewrite, classify, and blueprint; single mind, edit-and-stop");
         } else if (std.mem.eql(u8, m.style, "build") or std.mem.eql(u8, m.style, "build_use")) {
