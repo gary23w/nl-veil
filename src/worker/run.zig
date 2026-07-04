@@ -1192,6 +1192,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         // INTERACTIVE one-shot: after the single edit moment ran, stop — do not loop continuous.
         if (w.quick and live and any_llm_ok and !w.stop_now) {
+            // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
+            // research-only) wrote no files. Compose the final answer from those findings before stopping,
+            // so the chat/Deploy tab has an artifact to surface instead of an empty run.
+            if (w.cast) castSynthesize(&w, goal);
             w.stop_now = true;
             w.stop_why = "quick_done";
         }
@@ -2417,6 +2421,91 @@ fn netFlip(w: *Worker, round: u32, online: bool) void {
     w.internet = online;
     w.emit("net", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"online\":{s}", .{ round, if (online) "true" else "false" }) catch ",\"online\":false");
     w.act("engine", round, "connectivity", if (online) "online" else "offline", if (online) "uplink restored — web research re-enabled for the minds" else "uplink lost — falling back to lexical recall from hive memory; probing to reconnect");
+}
+
+/// A CAST returns a COMPOSED ANSWER, not a pile of scout notes. After the team's moment(s), the lead reads
+/// everything the scouts gathered into shared hive memory (KNOWLEDGE_SCOPE) and writes ONE final report to
+/// work/synthesis.md, grounded ONLY in those findings. Without this a research cast (an all-scout team, which
+/// can't write files) leaves its findings stranded in memory with no artifact — so the chat/Deploy tab shows
+/// an empty result (the "collected via web but returned nothing" bug). Best-effort: on any failure, no file.
+/// The raw (still-escaped) value of a top-level "key":"..." string in one JSON line; null if absent.
+fn jsonFieldRaw(line: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [48]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":\"", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, line, needle) orelse return null;
+    const start = at + needle.len;
+    var i = start;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '\\') {
+            i += 1;
+            continue;
+        }
+        if (line[i] == '"') return line[start..i];
+    }
+    return line[start..];
+}
+
+/// Read what the scouts ACTUALLY retrieved this run straight from the events (web_search / web_fetch /
+/// deep_crawl / scout_learn / observe results). This is the RELIABLE source of a cast's findings — it does
+/// NOT depend on the findings making it into hive memory (which fails when a fetch 404s or the scout never
+/// notes). Returns a gpa-owned bulleted blob capped at `cap`.
+fn gatherCastFindings(w: *Worker, cap: usize) []u8 {
+    const gpa = w.gpa;
+    const ev_path = std.fmt.allocPrint(gpa, "{s}/events.jsonl", .{w.run_dir}) catch return &.{};
+    defer gpa.free(ev_path);
+    const data = std.Io.Dir.cwd().readFileAlloc(w.io, ev_path, gpa, .limited(8 << 20)) catch return &.{};
+    defer gpa.free(data);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const cues = [_][]const u8{ "\"tool\":\"web_search\"", "\"tool\":\"web_fetch\"", "\"tool\":\"deep_crawl\"", "\"tool\":\"scout_learn\"", "\"tool\":\"scout_search\"", "\"tool\":\"observe\"", "\"tool\":\"read_url\"" };
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (line.len < 20) continue;
+        var hit = false;
+        for (cues) |c| if (std.mem.indexOf(u8, line, c) != null) {
+            hit = true;
+            break;
+        };
+        if (!hit) continue;
+        const raw = jsonFieldRaw(line, "result") orelse continue;
+        if (raw.len < 20) continue;
+        const un = jsonUnescape(gpa, raw);
+        defer gpa.free(un);
+        const t = std.mem.trim(u8, un, " \r\n\t");
+        if (t.len < 20) continue;
+        if (std.mem.indexOf(u8, t, "404 Not Found") != null and t.len < 300) continue; // skip dead-page bodies
+        if (out.items.len + t.len + 4 > cap) break;
+        out.appendSlice(gpa, "- ") catch {};
+        out.appendSlice(gpa, t) catch {};
+        out.append(gpa, '\n') catch {};
+    }
+    return out.toOwnedSlice(gpa) catch &.{};
+}
+
+fn castSynthesize(w: *Worker, goal: []const u8) void {
+    const gpa = w.gpa;
+    const retrieved = gatherCastFindings(w, 8000); // what the scouts pulled from the web THIS run (events)
+    defer gpa.free(retrieved);
+    const hive = w.mem.list(tools.KNOWLEDGE_SCOPE);
+    defer gpa.free(hive);
+    const has_web = std.mem.trim(u8, retrieved, " \r\n\t").len >= 20;
+    if (!has_web and std.mem.trim(u8, hive, " \r\n\t").len < 20) {
+        w.act("veil", 1, "synthesis", "no usable findings — the scouts returned nothing to compose from", "");
+        return;
+    }
+    const sys = "You are the LEAD of a research strike team. Below is what your scouts RETRIEVED from the web this run (search results and fetched page content) plus any team notes. Compose the FINAL ANSWER to the goal: a clear, organized, COMPLETE report that directly answers it, grounded ONLY in this retrieved material — cite the source URL where one appears, and do NOT invent facts not present. If the material is thin or search-only, report what WAS found and name the sources; never fabricate. This report is exactly what the user receives.";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above.", .{ clip(goal, 300), if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 2000) }) catch return;
+    defer gpa.free(user);
+    const reply = llm.chat(gpa, w.io, w.run_dir, "synthesis", w.base_url, w.key, w.model, sys, user, 2048);
+    defer gpa.free(reply.content);
+    if (!reply.ok or std.mem.trim(u8, reply.content, " \r\n\t").len < 20) return;
+    const wdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch return;
+    defer gpa.free(wdir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(w.io, wdir, .default_dir) catch {};
+    const path = std.fmt.allocPrint(gpa, "{s}/synthesis.md", .{wdir}) catch return;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = reply.content }) catch {};
+    w.act("veil", 1, "synthesis", "composed the final answer from the team's retrieved findings", clip(reply.content, 500));
+    w.emit("synthesis", std.fmt.allocPrint(w.a(), ",\"chars\":{d}", .{reply.content.len}) catch ",\"chars\":0");
 }
 
 /// Thin wrapper so a mind's moment can be spawned into an `Io.Group` (concurrent), writing its result into
