@@ -56,7 +56,19 @@ fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    const io = init.io;
+    // A real threaded io instead of the default init.io. httpz runs a pool of ~32 worker threads that
+    // correctly BLOCK on a condition variable when there is no work — but the default init.io busy-SPINS
+    // those blocking waits on Windows, pinning ~10 CPU cores with the server completely idle (0 swarms, no
+    // requests) and cooking the machine. std.Io.Threaded (exactly what the desktop already uses, and which
+    // sits at ~0% idle) sleeps its waits on OS primitives. MUST carry the process environ or Winsock +
+    // subprocess spawns break on Windows (the empty-environ gotcha) — the server spawns workers/neuron/curl.
+    const environ: std.process.Environ = if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     if (std.process.Args.Iterator.initAllocator(init.minimal.args, gpa)) |it_const| {
         var it = it_const;
