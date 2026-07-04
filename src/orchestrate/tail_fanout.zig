@@ -1,6 +1,7 @@
 //! Event delivery to the browser, two ways over the SAME events.jsonl cursor:
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const Supervisor = @import("supervisor.zig").Supervisor;
@@ -67,6 +68,25 @@ pub fn startStream(app: *App, res: *httpz.Response, id: []const u8, run_dir: []c
 // in seconds (the ping write fails), and cap the total lifetime so a HALF-OPEN peer is recycled — the
 // browser's EventSource just auto-reconnects. httpz's keepalive timeout can't help here (the connection
 // is disowned out of httpz's worker), so the stream has to police itself.
+// This loop runs on a RAW, detached std.Thread (response.zig startEventStream), NOT an Io-managed task.
+// io.sleep throws on such a thread; swallowing that error turns the loop into a 100%-CPU spin that pins a
+// core and thrashes the events.jsonl re-read until the http pool starves and /health wedges — the exact
+// footgun supervisor.zig already fixed. Sleep via the OS directly instead.
+const winSleep = if (builtin.os.tag == .windows)
+    struct {
+        extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
+    }.Sleep
+else
+    {};
+
+fn tickSleep(io: std.Io) void {
+    if (builtin.os.tag == .windows) {
+        winSleep(@intCast(STREAM_TICK_MS));
+    } else {
+        io.sleep(.{ .nanoseconds = STREAM_TICK_MS * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
+
 const STREAM_TICK_MS: u64 = 500;
 const PING_EVERY_TICKS: u32 = 10; // ~5s — bound how long a cleanly-closed socket lingers in CLOSE_WAIT
 const MAX_STREAM_TICKS: u32 = (10 * 60 * 1000) / STREAM_TICK_MS; // ~10 min hard lifetime cap
@@ -100,11 +120,16 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
         // thread + socket (CLOSE_WAIT) indefinitely. Break WITHOUT an `event: gone` frame — that would tell
         // the browser the swarm is gone and stop its EventSource; a plain drop makes it reconnect instead.
         if (ticks >= MAX_STREAM_TICKS) break;
-        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ev_path, ctx.gpa, .limited(8 << 20)) catch "";
-        defer if (data.len > 0) ctx.gpa.free(data);
-        if (data.len < cursor) cursor = data.len;
-        if (data.len > cursor) {
-            var it = std.mem.splitScalar(u8, data[cursor..], '\n');
+        // Cheap size check FIRST: only re-read the (growing, multi-MB) log when it has actually grown past what
+        // we've already streamed. Without this, every 500ms tick did an O(filesize) readFileAlloc even when no
+        // new event arrived — several such streams turned into the multi-core burn during a watched cast.
+        const cur_size: usize = if (std.Io.Dir.cwd().statFile(ctx.io, ev_path, .{})) |st| @intCast(st.size) else |_| 0;
+        if (cur_size < cursor) cursor = cur_size;
+        if (cur_size > cursor) {
+            const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ev_path, ctx.gpa, .limited(8 << 20)) catch "";
+            defer if (data.len > 0) ctx.gpa.free(data);
+            const from = @min(cursor, data.len);
+            var it = std.mem.splitScalar(u8, data[from..], '\n');
             while (it.next()) |raw| {
                 const line = std.mem.trim(u8, raw, "\r");
                 if (line.len == 0) continue;
@@ -122,7 +147,7 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
                 w.flush() catch return;
             }
         }
-        ctx.io.sleep(.{ .nanoseconds = STREAM_TICK_MS * std.time.ns_per_ms }, .awake) catch {};
+        tickSleep(ctx.io);
         ticks += 1;
     }
 }

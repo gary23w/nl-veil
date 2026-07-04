@@ -204,7 +204,12 @@ pub fn main(init: std.process.Init) !void {
     // request_count recycles a connection after N requests so no single socket lives unboundedly.
     var server = try httpz.Server(*App).init(io, gpa, .{
         .address = if (bind_all) .all(port) else .localhost(port),
-        .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1000 },
+        // request_count = 1: close the connection after every response (the Connection: close path). This
+        // stops a half-closed keepalive socket from lingering in httpz's blocking worker, where recv()==0 on a
+        // FIN'd peer returns "not done, no error" forever and pins a pool thread at 100% CPU. Every client here
+        // is localhost (desktop netcli already sends Connection: close; the web UI reconnects), so the extra
+        // handshake per request is free.
+        .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1 },
     }, &app);
     defer {
         server.stop();

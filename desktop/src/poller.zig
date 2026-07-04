@@ -24,6 +24,14 @@ pub const Poller = struct {
     prev_online: bool = false,
     prev_online_set: bool = false,
     miss_streak: u8 = 0, // consecutive failed fleet polls — debounces the online/offline flap
+    // events.jsonl re-read cache: skip the (up to 8MB) read+2-pass-parse when the file hasn't grown since the
+    // last tick. During a cast the file grows, but only in bursts — between bursts (most ticks) this is a no-op,
+    // which is what stops the desktop from pegging a core re-parsing a multi-MB log every second.
+    ev_cache_size: u64 = 0,
+    ev_cache_sel: [64]u8 = undefined,
+    ev_cache_sel_len: usize = 0,
+    ev_cache_n: usize = 0,
+    ev_cache_metrics: scan.Metrics = .{},
     prev_live_ids: [scan.MAX_SWARMS][64]u8 = undefined,
     prev_live_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     prev_live_n: usize = 0,
@@ -378,7 +386,20 @@ pub const Poller = struct {
             const ep = std.fmt.allocPrint(self.gpa, "{s}/{s}/events.jsonl", .{ dd, selbuf[0..sel_len] }) catch "";
             if (ep.len > 0) {
                 defer self.gpa.free(ep);
-                ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &metrics);
+                const cur_size: u64 = if (Io.Dir.cwd().statFile(self.io, ep, .{})) |st| st.size else |_| 0;
+                const same_sel = self.ev_cache_sel_len == sel_len and std.mem.eql(u8, self.ev_cache_sel[0..self.ev_cache_sel_len], selbuf[0..sel_len]);
+                if (same_sel and cur_size == self.ev_cache_size and cur_size > 0) {
+                    // unchanged since last tick — reuse the parsed ring (still in ev_scratch) + metrics
+                    ev_n = self.ev_cache_n;
+                    metrics = self.ev_cache_metrics;
+                } else {
+                    ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &metrics);
+                    self.ev_cache_size = cur_size;
+                    @memcpy(self.ev_cache_sel[0..sel_len], selbuf[0..sel_len]);
+                    self.ev_cache_sel_len = sel_len;
+                    self.ev_cache_n = ev_n;
+                    self.ev_cache_metrics = metrics;
+                }
             }
             // Files tab: list built files, and (if one is open) re-read its content.
             file_n = scan.listWorkFiles(self.io, self.gpa, dd, selbuf[0..sel_len], &self.file_scratch);
