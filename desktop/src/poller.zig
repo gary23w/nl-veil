@@ -305,19 +305,23 @@ pub const Poller = struct {
         var ver_len: u8 = 0;
         if (now_s - self.last_fleet_s >= FLEET_EVERY_S) {
             self.last_fleet_s = now_s;
-            online = scan.serverOnline(self.io, self.port());
-            if (online) {
-                if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
-                    defer if (resp.body.len > 0) self.gpa.free(resp.body);
-                    fs = jint(resp.body, "swarms");
-                    fl = jint(resp.body, "live_swarms");
-                    fm = jint(resp.body, "live_minds");
-                    fh = jint(resp.body, "headroom");
-                    if (jstr(resp.body, "version")) |v| {
-                        const n = @min(v.len, ver.len);
-                        @memcpy(ver[0..n], v[0..n]);
-                        ver_len = @intCast(n);
-                    }
+            // Liveness comes from the fleet GET itself — do NOT do a separate raw TCP probe. serverOnline()
+            // opened a connection and closed it WITHOUT sending a request, which left the server half-open
+            // (CLOSE_WAIT) with a worker thread spinning on the dead socket — a handful of those pinned ~7
+            // CPU cores. The fleet curl sends a real request with `Connection: close`, so the server closes
+            // cleanly. online == "the fleet request came back".
+            online = false;
+            if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
+                online = true;
+                defer if (resp.body.len > 0) self.gpa.free(resp.body);
+                fs = jint(resp.body, "swarms");
+                fl = jint(resp.body, "live_swarms");
+                fm = jint(resp.body, "live_minds");
+                fh = jint(resp.body, "headroom");
+                if (jstr(resp.body, "version")) |v| {
+                    const n = @min(v.len, ver.len);
+                    @memcpy(ver[0..n], v[0..n]);
+                    ver_len = @intCast(n);
                 }
             }
         } else {
