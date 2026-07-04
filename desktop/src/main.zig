@@ -1080,6 +1080,16 @@ fn copyChip(x: f32, y: f32) bool {
     return hot and rl.isMouseButtonPressed(.left);
 }
 
+/// A SMALL copy chip that lives in a code block's top-right corner. Only drawn while the block is hovered
+/// (the caller gates on it), so it stays out of the way until wanted. Returns true on click.
+fn codeCopyChip(x: f32, y: f32) bool {
+    const r = t.Rect{ .x = x, .y = y, .width = 40, .height = 15 };
+    const hot = t.hovering(r);
+    t.panelBordered(r, if (hot) t.bg_sel else t.bg_dark, if (hot) t.blue else t.border);
+    t.text(t.z("copy", .{}), @intFromFloat(x + 8), @intFromFloat(y + 1), 10, if (hot) t.fg else t.comment);
+    return hot and rl.isMouseButtonPressed(.left);
+}
+
 /// The code block's raw content, from just after the opening fence line to the closing fence.
 fn codeBlockSlice(text_: []const u8, from: usize) []const u8 {
     var i = from;
@@ -1127,23 +1137,37 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     }
 
     var i: usize = 0;
-    var in_code = false;
     while (i < n) : (i += 1) {
         const raw = lines[i];
         const tl = std.mem.trim(u8, raw, " \r\t");
-        // fenced code
+        // fenced code block — rendered as ONE padded panel (top/bottom + left inset so text never touches the
+        // border) with a small copy chip tucked in the top-right corner that only appears while the block is
+        // hovered. The whole block is grouped by lookahead to the closing fence so height is exact in both the
+        // measure and draw passes.
         if (std.mem.startsWith(u8, tl, "```")) {
-            if (!in_code and draw and inView(view, yy, MSG_FENCE_H + 17)) {
-                const off = @intFromPtr(raw.ptr) - @intFromPtr(text_.ptr);
-                const from = @min(off + raw.len + 1, text_.len);
-                if (copyChip(view.x + view.width - 60, yy - 2)) copyToClipboard(codeBlockSlice(text_, from));
+            var j = i + 1;
+            while (j < n and !std.mem.startsWith(u8, std.mem.trim(u8, lines[j], " \r\t"), "```")) : (j += 1) {}
+            const n_code = j - (i + 1);
+            const pad_v: f32 = 8;
+            const block_h = pad_v * 2 + @as(f32, @floatFromInt(n_code)) * MSG_LINE_H;
+            const bx = view.x + 8;
+            const bw = view.width - 16;
+            if (draw and inView(view, yy, block_h)) {
+                const block = t.Rect{ .x = bx, .y = yy, .width = bw, .height = block_h };
+                t.panelBordered(block, t.withAlpha(t.bg_hl, 170), t.border);
+                var k: usize = 0;
+                while (k < n_code) : (k += 1) {
+                    const cl = std.mem.trimEnd(u8, lines[i + 1 + k], "\r");
+                    t.textMonoClip(cl, @intFromFloat(bx + 14), @intFromFloat(yy + pad_v + @as(f32, @floatFromInt(k)) * MSG_LINE_H), fsz, t.cyan, @intFromFloat(bw - 28));
+                }
+                if (t.hovering(block)) {
+                    const off = @intFromPtr(lines[i].ptr) - @intFromPtr(text_.ptr);
+                    const from = @min(off + lines[i].len + 1, text_.len);
+                    if (codeCopyChip(bx + bw - 46, yy + 6)) copyToClipboard(codeBlockSlice(text_, from));
+                }
             }
-            in_code = !in_code;
-            yy += MSG_FENCE_H;
-            continue;
-        }
-        if (in_code) {
-            yy = renderWrapped(view, yy, raw, cols, fsz, draw, .code, dim);
+            yy += block_h + 4; // a little breathing room below the block
+            i = j; // the for-loop's i += 1 resumes after the closing fence
             continue;
         }
         // horizontal rule
