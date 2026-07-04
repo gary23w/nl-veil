@@ -86,9 +86,11 @@ fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.En
     // bare `ollama serve` has no tray to relaunch it, so killing it would leave the machine with no model. The
     // vars apply on Ollama's next start (reboot / tray restart / manual `ollama serve`); print the one-liner so
     // the user can apply them now if they want the speedup this session.
-    if (!par_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_NUM_PARALLEL", "4" });
+    // 2, not 4: on a single box a 20b model at 4 parallel slots (3 cast minds + a chat turn) saturates the
+    // CPU/RAM until the HTTP server starves. 2 keeps some concurrency for steering without oversubscribing.
+    if (!par_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_NUM_PARALLEL", "2" });
     if (!ctx_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_CONTEXT_LENGTH", "8192" });
-    std.debug.print("nl-veil: persisted Ollama tuning (OLLAMA_NUM_PARALLEL=4, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.\n", .{});
+    std.debug.print("nl-veil: persisted Ollama tuning (OLLAMA_NUM_PARALLEL=2, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
