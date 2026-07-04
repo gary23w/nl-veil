@@ -398,14 +398,51 @@ fn engineHome(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
     return gpa.dupe(u8, home);
 }
 
+const PackFact = struct { src: []const u8, sent: []const u8 };
+
+/// Parse one `pack.facts` line ("[src:zig/documentation-p03] <sentence>") into its source tag + clean
+/// sentence. null for header/blank/too-short lines. `sent`/`src` alias into `line_raw` (no allocation).
+fn parsePackLine(line_raw: []const u8, default_src: []const u8) ?PackFact {
+    const line = std.mem.trim(u8, line_raw, " \r\t");
+    if (line.len < 24 or line[0] == '#') return null;
+    var sent = line;
+    var src = default_src;
+    if (line[0] == '[') if (std.mem.indexOfScalar(u8, line, ']')) |rb| {
+        if (rb > 5 and std.mem.startsWith(u8, line[1..rb], "src:")) src = line[5..rb];
+        sent = std.mem.trim(u8, line[rb + 1 ..], " \t");
+    };
+    if (sent.len < 24) return null;
+    return .{ .src = src, .sent = sent };
+}
+
+/// Query-decoration words that carry no topic — a fact matching only these isn't actually about the goal.
+fn isGoalStopword(word: []const u8) bool {
+    const sw = [_][]const u8{ "about", "with", "that", "this", "from", "give", "them", "then", "into", "will", "have", "more", "these", "their", "your", "sourced", "summary", "concise", "please", "research", "report", "facts", "result", "results", "using", "should", "official", "documentation", "docs", "guide", "reference", "manual", "tutorial", "overview", "introduction", "latest", "features", "usage", "patterns", "example", "examples" };
+    for (sw) |s| if (std.ascii.eqlIgnoreCase(word, s)) return true;
+    return false;
+}
+
+/// True when a fact is ON-TOPIC for the goal: it contains a significant (>=4 char, non-decoration) goal word.
+/// This is what steers the prefetch to the comptime/build pages instead of only the pack's intro page.
+fn factRelevant(sent: []const u8, goal: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, goal, " \t\r\n,.;:!?()[]{}\"'`-/");
+    while (it.next()) |wd| {
+        if (wd.len < 4 or isGoalStopword(wd)) continue;
+        if (std.ascii.indexOfIgnoreCase(sent, wd) != null) return true;
+    }
+    return false;
+}
+
 /// nl-rag PACK PREFETCH — the engine does the two-hop a weak model won't. On an atlas match, pull the matched
 /// domain's distilled `pack.facts` (deterministic raw.githubusercontent url derived from the pack INDEX url;
-/// rides the shared 7-day fetch cache, so it costs one GET ever) and seed its top facts straight into the
-/// shared KNOWLEDGE hive as grounded canonical neurons. This is the "give a low-budget model strength" floor
-/// made real: a scout STARTS grounded on real documentation facts instead of firing blind web_searches that
-/// 404 on the search scrape's mangled breadcrumb urls (observed live — casts fetched pack urls ZERO times,
-/// then 404-marched the open web). Pure additive: any fetch/parse miss leaves the run exactly as before, and
-/// it is skipped under an egress allowlist so off-allowlist github content never enters a gated run.
+/// rides the shared 7-day fetch cache, so it costs one GET ever) and seed GOAL-RELEVANT facts straight into the
+/// shared KNOWLEDGE hive as grounded canonical neurons. This is the "give a low-budget model strength" floor:
+/// a scout STARTS grounded on real documentation facts instead of firing blind web_searches that 404 on the
+/// search scrape's mangled breadcrumb urls (observed live — casts fetched pack urls ZERO times, then 404-marched
+/// the open web). Two passes: (1) seed facts that match the goal's own words — so a "comptime" goal gets comptime
+/// facts, not just the pack's generic intro page (the earlier "first 8 lines" version seeded ONLY page 1, which
+/// made RAG-first answer specific questions from generic material); (2) if the goal barely matched, top up with a
+/// stride sample across the file for a diverse floor. Pure additive; skipped under an egress allowlist.
 fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
     if (!w.internet or egress_allow.len > 0) return;
     const gpa = w.gpa;
@@ -423,30 +460,41 @@ fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
         defer gpa.free(body);
         if (body.len < 80 or std.mem.indexOf(u8, body[0..@min(body.len, 48)], "Not Found") != null) continue; // 404 / empty
         var here: u32 = 0;
-        var it = std.mem.splitScalar(u8, body, '\n');
-        while (it.next()) |raw| {
-            if (here >= 8) break; // per-domain grounding FLOOR, not a data dump — the hive rides into every prompt
-            const line = std.mem.trim(u8, raw, " \r\t");
-            if (line.len < 24 or line[0] == '#') continue; // header / blank
-            // strip the "[src:zig/documentation-p01] " provenance prefix into a clean sentence + short source tag
-            var sent = line;
-            var src = loc.name;
-            if (line[0] == '[') if (std.mem.indexOfScalar(u8, line, ']')) |rb| {
-                if (rb > 5 and std.mem.startsWith(u8, line[1..rb], "src:")) src = line[5..rb];
-                sent = std.mem.trim(u8, line[rb + 1 ..], " \t");
-            };
-            if (sent.len < 24) continue;
-            const fact = std.fmt.allocPrint(gpa, "[nl-rag {s}] {s}", .{ src, clip(sent, 400) }) catch continue;
+        // PASS 1 — on-topic facts (scan the WHOLE pack, not just the top): a scout asking about comptime must
+        // find comptime facts. Cap ~14: relevant grounding is worth the prompt budget (recall re-ranks per query).
+        var it1 = std.mem.splitScalar(u8, body, '\n');
+        while (it1.next()) |raw| {
+            if (here >= 14) break;
+            const pf = parsePackLine(raw, loc.name) orelse continue;
+            if (!factRelevant(pf.sent, goal)) continue;
+            const fact = std.fmt.allocPrint(gpa, "[nl-rag {s}] {s}", .{ pf.src, clip(pf.sent, 400) }) catch continue;
             defer gpa.free(fact);
             _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, fact);
             seeded += 1;
             here += 1;
         }
+        // PASS 2 — thin match? add a spread of general facts (every 7th line) for a floor, skipping ones already
+        // seeded in pass 1, so the hive is never empty even when the goal's words don't appear in the pack.
+        if (here < 4) {
+            var idx: u32 = 0;
+            var it2 = std.mem.splitScalar(u8, body, '\n');
+            while (it2.next()) |raw| {
+                if (here >= 8) break;
+                const pf = parsePackLine(raw, loc.name) orelse continue;
+                idx += 1;
+                if (idx % 7 != 0 or factRelevant(pf.sent, goal)) continue; // stride for page diversity; skip dup
+                const fact = std.fmt.allocPrint(gpa, "[nl-rag {s}] {s}", .{ pf.src, clip(pf.sent, 400) }) catch continue;
+                defer gpa.free(fact);
+                _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, fact);
+                seeded += 1;
+                here += 1;
+            }
+        }
         if (here > 0) domains += 1;
         if (domains >= 2) break;
     }
     if (seeded > 0) {
-        const note = std.fmt.allocPrint(gpa, "prefetched {d} distilled nl-rag pack fact(s) across {d} domain(s) into the hive — scouts start grounded on canonical docs, not a blind web-scrape", .{ seeded, domains }) catch "";
+        const note = std.fmt.allocPrint(gpa, "prefetched {d} goal-relevant nl-rag pack fact(s) across {d} domain(s) into the hive — scouts start grounded on the RIGHT canonical docs, not a blind web-scrape", .{ seeded, domains }) catch "";
         defer if (note.len > 0) gpa.free(note);
         w.act("engine", 0, "pack", note, "");
     }
