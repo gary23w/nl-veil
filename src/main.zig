@@ -81,11 +81,13 @@ fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.En
     const par_ok = (std.fmt.parseInt(u32, cur_par, 10) catch 0) >= 2;
     const ctx_ok = cur_ctx.len > 0; // any explicit context = the user's choice, leave it
     if (par_ok and ctx_ok) return; // already tuned — nothing to do
+    // Persist sane defaults for the NEXT Ollama start. We deliberately DO NOT kill a running Ollama here — a
+    // bare `ollama serve` has no tray to relaunch it, so killing it would leave the machine with no model. The
+    // vars apply on Ollama's next start (reboot / tray restart / manual `ollama serve`); print the one-liner so
+    // the user can apply them now if they want the speedup this session.
     if (!par_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_NUM_PARALLEL", "4" });
     if (!ctx_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_CONTEXT_LENGTH", "8192" });
-    std.debug.print("nl-veil: auto-tuned Ollama for local agentic use (OLLAMA_NUM_PARALLEL=4, OLLAMA_CONTEXT_LENGTH=8192) — restarting the Ollama server to apply\n", .{});
-    // Kill the Ollama server; its tray app (ollama app.exe) relaunches it with the now-updated user env.
-    runQuiet(gpa, io, &.{ "taskkill", "/F", "/IM", "ollama.exe" });
+    std.debug.print("nl-veil: persisted Ollama tuning (OLLAMA_NUM_PARALLEL=4, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.\n", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
