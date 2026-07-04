@@ -225,49 +225,49 @@ pub fn main() !void {
 
     syncThemeFromStore(&store);
 
-    // AUTOMATION HOOK — if <data>/.veil-desk/SIM.txt exists, send its contents as a chat message once (a couple
-    // seconds after the server is reachable), then delete it. Drives the FULL desktop chat→cast→collect path for
-    // testing without any synthetic UI input, which a borderless window delivers unreliably — it pushes the exact
-    // same .send command the Send button would. No trigger file = normal run (no-op).
-    var sim_sent = false;
+    // AUTOMATION HOOK — poll <data>/.veil-desk/SIM.txt: whenever it exists AND the chat is idle + connected,
+    // send its contents as a chat message and delete it. This drives MULTI-TURN STEERING sims — drop the next
+    // SIM.txt after each answer lands and the veil is steered again — with zero synthetic UI input (a borderless
+    // window delivers that unreliably). No trigger file = normal run (no-op). `sim_mode` (set once any trigger
+    // fires) holds 30fps so a headless, unfocused run's turn/cast poll stays responsive.
     var sim_ticks: u32 = 0;
+    var sim_mode = false;
 
     var auto_selected = false;
     while (!rl.windowShouldClose() and !ui.close_req) {
-        // 60fps focused = snappy scroll/type/hover; 10fps backgrounded for heat control — but hold 30fps until a
-        // pending sim trigger has fired so its connect/poll stays responsive with the window unfocused.
-        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else if (!sim_sent) 30 else 10);
+        store.lock();
+        const online0 = store.server_online;
+        const busy0 = store.chat_busy;
+        store.unlock();
+        // 60fps focused = snappy; 10fps backgrounded for heat — 30fps while a sim/turn is live so poll stays smooth.
+        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else if (sim_mode or busy0) 30 else 10);
         tray.pump();
         pumpTray(&store, &tray, gpa);
         syncThemeFromStore(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
-        if (!sim_sent) {
+        sim_ticks += 1;
+        if (online0 and !busy0 and sim_ticks >= 30) { // ~1s cadence, only fire when connected AND idle
+            sim_ticks = 0;
+            var ddb: [512]u8 = undefined;
             store.lock();
-            const online = store.server_online;
+            const dd = store.settings.dataDir();
+            const ddn = @min(dd.len, ddb.len);
+            @memcpy(ddb[0..ddn], dd[0..ddn]);
             store.unlock();
-            if (online) sim_ticks += 1; // count only once we're actually connected
-            if (sim_ticks > 45) { // ~1.5s after first-online: settle, then check for a trigger file exactly once
-                sim_sent = true;
-                var ddb: [512]u8 = undefined;
-                store.lock();
-                const dd = store.settings.dataDir();
-                const ddn = @min(dd.len, ddb.len);
-                @memcpy(ddb[0..ddn], dd[0..ddn]);
-                store.unlock();
-                var pathb: [640]u8 = undefined;
-                const path = std.fmt.bufPrint(&pathb, "{s}/.veil-desk/SIM.txt", .{ddb[0..ddn]}) catch "";
-                if (path.len > 0) {
-                    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8000))) |content| {
-                        defer gpa.free(content);
-                        const msg = std.mem.trim(u8, content, " \r\n\t");
-                        if (msg.len > 0) {
-                            setTab(.chat); // land on Chat so the run is visible
-                            store.pushChatCmd(store_mod.mkChatCmd(.send, "", msg));
-                            log.info("SIM.txt auto-sent chat message ({d} bytes)", .{msg.len});
-                        }
-                        std.Io.Dir.cwd().deleteFile(io, path) catch {};
-                    } else |_| {}
-                }
+            var pathb: [640]u8 = undefined;
+            const path = std.fmt.bufPrint(&pathb, "{s}/.veil-desk/SIM.txt", .{ddb[0..ddn]}) catch "";
+            if (path.len > 0) {
+                if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8000))) |content| {
+                    defer gpa.free(content);
+                    std.Io.Dir.cwd().deleteFile(io, path) catch {}; // consume immediately — never double-send
+                    const msg = std.mem.trim(u8, content, " \r\n\t");
+                    if (msg.len > 0) {
+                        sim_mode = true;
+                        setTab(.chat); // land on Chat so the run is visible
+                        store.pushChatCmd(store_mod.mkChatCmd(.send, "", msg));
+                        log.info("SIM.txt auto-sent chat message ({d} bytes)", .{msg.len});
+                    }
+                } else |_| {}
             }
         }
         handleWindowChrome();
@@ -1271,28 +1271,69 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
 
 const LineStyle = enum { prose, code, quote };
 
-/// One logical line, wrapped into `cols`-char rows. Code rows get a filled backdrop; quote rows (the
-/// model's reasoning) are indented and dimmed.
+/// One logical line, wrapped to fit `view`. CODE stays MONOSPACE + character-wrapped (column alignment is
+/// load-bearing for code). PROSE/QUOTE now render in the PROPORTIONAL ui font with real WORD wrap, so chat
+/// answers read like text instead of terminal output. The measure pass (draw=false) and the draw pass run the
+/// identical wrap loop — only the actual pixel calls are gated on `draw` — so scroll height and pixels agree.
 fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, draw: bool, style: LineStyle, dim: bool) f32 {
     var yy = y0;
-    var i: usize = 0;
-    while (true) {
-        const end = @min(seg.len, i + cols);
-        if (draw and yy + MSG_LINE_H >= view.y and yy <= view.y + view.height) {
-            if (style == .code) {
+    if (style == .code) {
+        var i: usize = 0;
+        while (true) {
+            const end = @min(seg.len, i + cols);
+            if (draw and inView(view, yy, MSG_LINE_H)) {
                 t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
                 t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
-            } else if (style == .quote) {
-                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 18), @intFromFloat(yy), fsz, t.comment, @intFromFloat(view.width - 30));
-            } else {
-                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (dim) t.fg_dim else t.fg, @intFromFloat(view.width - 26));
+            }
+            i = end;
+            if (i >= seg.len) break;
+            yy += MSG_LINE_H;
+        }
+        return yy + MSG_LINE_H;
+    }
+    // proportional word-wrap for prose + quote
+    const left: f32 = if (style == .quote) 18 else 14;
+    const x0: f32 = view.x + left;
+    const max_w: f32 = @max(40, view.width - left - 12);
+    const color = if (style == .quote) t.comment else (if (dim) t.fg_dim else t.fg);
+    var line_buf: [1024]u8 = undefined;
+    var ll: usize = 0;
+    var rows: u32 = 0;
+    var wit = std.mem.tokenizeScalar(u8, seg, ' ');
+    while (wit.next()) |word| {
+        var cand: [1024]u8 = undefined; // current line + (space) + word, null-terminated for measure
+        var cl: usize = 0;
+        if (ll > 0) {
+            @memcpy(cand[0..ll], line_buf[0..ll]);
+            cl = ll;
+            if (cl < cand.len) {
+                cand[cl] = ' ';
+                cl += 1;
             }
         }
-        i = end;
-        if (i >= seg.len) break;
-        yy += MSG_LINE_H;
+        const wl = @min(word.len, cand.len -| cl -| 1);
+        @memcpy(cand[cl..][0..wl], word[0..wl]);
+        cl += wl;
+        cand[cl] = 0;
+        const cw: f32 = @floatFromInt(t.measure(cand[0..cl :0], fsz));
+        if (ll > 0 and cw > max_w) {
+            if (draw and inView(view, yy, MSG_LINE_H)) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+            yy += MSG_LINE_H;
+            rows += 1;
+            @memcpy(line_buf[0..wl], word[0..wl]);
+            ll = wl;
+        } else {
+            @memcpy(line_buf[0..cl], cand[0..cl]);
+            ll = cl;
+        }
     }
-    return yy + MSG_LINE_H;
+    if (ll > 0) {
+        if (draw and inView(view, yy, MSG_LINE_H)) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+        yy += MSG_LINE_H;
+        rows += 1;
+    }
+    if (rows == 0) yy += MSG_LINE_H; // an empty/all-space segment still occupies one line
+    return yy;
 }
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
