@@ -113,7 +113,7 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
         scrubUtf8(c); // file content may not be valid UTF-8; res.json requires it
         text = c;
     } else |_| {
-        const ev_path = try std.fmt.allocPrint(res.arena, "{s}/work/events.jsonl", .{sw.run_dir});
+        const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{sw.run_dir}); // events.jsonl lives at the run_dir ROOT (synthesis.md is under work/)
         if (std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(256 << 10))) |c| {
             scrubUtf8(c);
             text = tailLines(c, 6000);
