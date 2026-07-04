@@ -1460,7 +1460,7 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     store.* = .{};
     @memcpy(store.settings.data_dir[0..dd.len], dd);
     store.settings.data_dir_len = dd.len;
-    const model = "llama3.1:8b"; // small = fast; this is a plumbing test, not a quality test
+    const model = if (Io.Dir.cwd().access(io, "../data/.veil_gptoss", .{})) |_| "gpt-oss:20b" else |_| "llama3.1:8b"; // marker → test the thinking model's pump path
     @memcpy(store.settings.chat_model[0..model.len], model);
     store.settings.chat_model_len = model.len;
 
@@ -1471,8 +1471,9 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     chat.cmdSend(dd, "Reply with exactly one short sentence: what is the capital of France?");
     try std.testing.expect(chat.turn == .user);
     var waited: usize = 0;
-    while (chat.turn != .idle and waited < 1800) : (waited += 1) { // up to ~3min for a cold model
+    while (chat.turn != .idle and waited < 3000) : (waited += 1) { // up to ~5min for a cold thinking model
         chat.pumpStream(dd);
+        if (waited % 50 == 0) std.debug.print("[live] t+{d}s turn={s} content={d}b reason={d}b done={} saw_any={}\n", .{ waited / 10, @tagName(chat.turn), chat.stream.content.items.len, chat.stream.reasoning.items.len, chat.stream.done, chat.stream.saw_any });
         io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
     }
     try std.testing.expect(chat.turn == .idle);
@@ -1492,6 +1493,110 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     const data = Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(1 << 20)) catch unreachable;
     defer std.testing.allocator.free(data);
     try std.testing.expect(std.mem.indexOf(u8, data, "capital of France") != null);
+}
+
+// Full-workflow live test (opt-in): drives the REAL Chat worker through the whole cowork chain against a
+// live veil server + local gpt-oss — explicit cast fires, the chat answers a SECOND question in parallel
+// while the swarm runs, then on completion the collect turn answers from the swarm's built file. Heavy
+// (~6-10 min on local gpt-oss), so it only runs when VEIL_E2E=1 AND both servers are up; otherwise it skips.
+test "E2E cowork: explicit cast fires, chat replies in parallel, collect answers from the swarm's file" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    // opt-in via a marker file (heavy test): `touch ../data/.veil_e2e` before running, remove it after
+    Io.Dir.cwd().access(io, "../data/.veil_e2e", .{}) catch {
+        std.debug.print("\n[E2E] create ../data/.veil_e2e to run the full cowork test — skipping\n", .{});
+        return;
+    };
+    if (!scan.serverOnline(io, 11434)) {
+        std.debug.print("\n[E2E] no Ollama on :11434 — skipping\n", .{});
+        return;
+    }
+    if (!scan.serverOnline(io, 8787)) {
+        std.debug.print("\n[E2E] no veil server on :8787 — skipping\n", .{});
+        return;
+    }
+    const dd = "zig-e2e-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    const model = "gpt-oss:20b";
+    @memcpy(store.settings.chat_model[0..model.len], model);
+    store.settings.chat_model_len = model.len;
+    store.settings.port = 8787;
+    // the veil server drops an admin key at <home>/data/.desktop_key; the test cwd is desktop/, so ../data
+    if (Io.Dir.cwd().readFileAlloc(io, "../data/.desktop_key", std.testing.allocator, .limited(4096)) catch null) |key| {
+        defer std.testing.allocator.free(key);
+        const kt = std.mem.trim(u8, key, " \r\n\t");
+        if (kt.len > 0 and kt.len <= store.settings.token.len) {
+            @memcpy(store.settings.token[0..kt.len], kt);
+            store.settings.token_len = @intCast(kt.len);
+        }
+    }
+
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    // make sure any swarm we spawn gets stopped even if an assertion fails mid-test
+    defer if (chat.cast_rel_len > 0) {
+        _ = scan.writeControl(io, std.testing.allocator, dd, chat.cast_rel[0..chat.cast_rel_len], "{\"op\":\"stop\"}");
+    };
+
+    const tick = struct {
+        fn pump(c: *Chat, d: []const u8, i: std.Io, w: usize, tag: []const u8) void {
+            c.pumpStream(d);
+            c.watchCast(d);
+            if (w % 100 == 0) std.debug.print("[E2E] {s} t+{d}s turn={s} cast_active={} msgs={d}\n", .{ tag, w / 10, @tagName(c.turn), c.cast_active, c.store.msg_count });
+            i.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+        }
+    };
+
+    // 1) explicit cast request -> user turn completes -> a cast fires (CAST line or the userWantsCast recovery)
+    std.debug.print("[E2E] step1: sending cast request...\n", .{});
+    chat.cmdSend(dd, "cast a swarm to write two facts about the moon to facts.md");
+    var waited: usize = 0;
+    while (chat.turn != .idle and waited < 3600) : (waited += 1) tick.pump(chat, dd, io, waited, "s1"); // <=6min for the turn
+    try std.testing.expect(chat.cast_active); // the cast deployed
+    std.debug.print("\n[E2E] step1 OK — cast fired: {s}\n", .{chat.cast_hex[0..chat.cast_hex_len]});
+
+    // 2) PARALLEL COWORK: with the swarm still running, the chat answers a second, unrelated question
+    try std.testing.expect(chat.cast_active); // still running
+    const before = store.msg_count;
+    chat.cmdSend(dd, "While that runs, answer directly: what is 7 times 8? Reply with just the number.");
+    waited = 0;
+    while (chat.turn != .idle and waited < 2400) : (waited += 1) tick.pump(chat, dd, io, waited, "s2"); // <=4min
+    try std.testing.expect(store.msg_count > before);
+    const par = &store.msgs[store.msg_count - 1];
+    try std.testing.expect(par.role == .veil and par.text_len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, par.textStr(), "(model error") == null);
+    std.debug.print("[E2E] step2 OK — parallel reply while cast_active={}: {s}\n", .{ chat.cast_active, par.textStr()[0..@min(par.text_len, 80)] });
+
+    // 3) let the swarm finish -> collectCast folds the digest + RAGs the file -> collect turn answers
+    waited = 0;
+    while (chat.cast_active and waited < 7200) : (waited += 1) tick.pump(chat, dd, io, waited, "s3-cast"); // <=12min for the cast
+    try std.testing.expect(!chat.cast_active); // completed + collected (not timed out mid-run)
+    // drain the collect turn the collector started
+    waited = 0;
+    while (chat.turn != .idle and waited < 2400) : (waited += 1) tick.pump(chat, dd, io, waited, "s3-collect");
+
+    // a [cast] digest landed AND the swarm built facts.md
+    var saw_digest = false;
+    var saw_file = false;
+    var i: usize = 0;
+    while (i < store.msg_count) : (i += 1) {
+        const t = store.msgs[i].textStr();
+        if (store.msgs[i].role == .cast_note and std.mem.indexOf(u8, t, "[cast] finished") != null) saw_digest = true;
+        if (std.mem.indexOf(u8, t, "facts.md") != null) saw_file = true;
+    }
+    try std.testing.expect(saw_digest);
+    try std.testing.expect(saw_file);
+    const final = &store.msgs[store.msg_count - 1];
+    std.debug.print("[E2E] step3 OK — cast collected; digest+facts.md folded in; final reply ({d}b): {s}\n", .{ final.text_len, final.textStr()[0..@min(final.text_len, 120)] });
 }
 
 test "castGoal fires on a CAST line within the first few lines" {
