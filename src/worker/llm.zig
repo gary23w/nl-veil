@@ -235,11 +235,15 @@ fn effectiveCtx() u32 {
     return if (caps.ctx_tokens > 0) @min(NATIVE_CTX, caps.ctx_tokens) else NATIVE_CTX;
 }
 
+// keep_alive "2m": once a cast finishes and the worker exits, the local model is released a couple minutes
+// later instead of Ollama's 5-min default — so a partly-CPU model stops spinning llama-server soon after the
+// swarm is done. During the run, every request resets the timer, so it stays loaded.
+const OLLAMA_KEEP_ALIVE = "2m";
 fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, ctx: u32, temp_frag: []const u8) ![]u8 {
     return if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, np, ctx, temp_frag })
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag })
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, np, ctx, temp_frag });
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag });
 }
 
 fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8) Step {

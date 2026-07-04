@@ -46,6 +46,9 @@ pub const providers = [_]Provider{
 
 pub const styles = [_][]const u8{ "auto", "build", "build_use", "investigate", "debate" };
 pub const stacks = [_][]const u8{ "general", "static", "node" };
-pub const modes = [_][]const u8{ "continuous", "checkpoint", "refine" };
+// "cast" is the fast scatter-gather type: the lead decomposes the goal, each mind runs ONE moment on its
+// slice, then it stops (~1-2 min) and the result is synthesized — vs "continuous" which loops for the whole
+// budget. Deploy it from here just like any other swarm, or from the chat.
+pub const modes = [_][]const u8{ "continuous", "checkpoint", "refine", "cast" };
 pub const minutes = [_]u32{ 0, 5, 15, 30, 60 };
 pub const minutes_lbl = [_][]const u8{ "until stopped", "5", "15", "30", "60" };

@@ -82,6 +82,11 @@ const TOTAL_TIMEOUT_S = 900;
 // seconds on a 20B), starving the chat AND slowing the cast. Same ctx → one shared runner, plain queueing.
 const OLLAMA_NUM_CTX: u32 = 32768;
 const OLLAMA_NUM_PREDICT: u32 = 8192; // room for hidden reasoning + the answer on thinking models
+// Auto-unload idle local models. A partly-CPU model (gpt-oss:20b doesn't fully fit most GPUs) keeps
+// Ollama's llama-server busy-spinning several cores WHILE LOADED — even when you're not using it. keep_alive
+// resets on every request, so an active back-and-forth never reloads; only true idle (~2 min with no
+// messages) releases the model and stops the spin. BYOK/cloud never loads a local model, so this is moot there.
+const OLLAMA_KEEP_ALIVE = "2m";
 
 fn isLocalOllama(u: []const u8) bool {
     const local = std.mem.indexOf(u8, u, "127.0.0.1") != null or std.mem.indexOf(u8, u, "localhost") != null;
@@ -132,7 +137,7 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
     // ("error parsing tool call: ... 'C'"); handleStreamLine RECOVERS the raw text from that error rather
     // than failing. num_ctx matches the engine so chat + swarm share one runner (no reload thrash).
     const body = if (native)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_ctx\":{d},\"num_predict\":{d}}}}}", .{ prov.model, messages_json, OLLAMA_KEEP_ALIVE, OLLAMA_NUM_CTX, OLLAMA_NUM_PREDICT }) catch return false
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"max_tokens\":{d}}}", .{ prov.model, messages_json, max_tokens }) catch return false;
     defer gpa.free(body);
