@@ -398,6 +398,60 @@ fn engineHome(gpa: std.mem.Allocator, io: std.Io) ![]const u8 {
     return gpa.dupe(u8, home);
 }
 
+/// nl-rag PACK PREFETCH — the engine does the two-hop a weak model won't. On an atlas match, pull the matched
+/// domain's distilled `pack.facts` (deterministic raw.githubusercontent url derived from the pack INDEX url;
+/// rides the shared 7-day fetch cache, so it costs one GET ever) and seed its top facts straight into the
+/// shared KNOWLEDGE hive as grounded canonical neurons. This is the "give a low-budget model strength" floor
+/// made real: a scout STARTS grounded on real documentation facts instead of firing blind web_searches that
+/// 404 on the search scrape's mangled breadcrumb urls (observed live — casts fetched pack urls ZERO times,
+/// then 404-marched the open web). Pure additive: any fetch/parse miss leaves the run exactly as before, and
+/// it is skipped under an egress allowlist so off-allowlist github content never enters a gated run.
+fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
+    if (!w.internet or egress_allow.len > 0) return;
+    const gpa = w.gpa;
+    var top: [2]*const locs.Loc = undefined;
+    const n = locs.match(goal, top[0..]);
+    if (n == 0) return;
+    var seeded: u32 = 0;
+    var domains: u32 = 0;
+    for (top[0..n]) |loc| {
+        if (loc.pack.len == 0 or !std.mem.endsWith(u8, loc.pack, "/INDEX.md")) continue;
+        const base = loc.pack[0 .. loc.pack.len - "INDEX.md".len]; // ".../packs/<domain>/"
+        const facts_url = std.fmt.allocPrint(gpa, "{s}pack.facts", .{base}) catch continue;
+        defer gpa.free(facts_url);
+        const body = tools.fetchCached(w.io, gpa, w.run_dir, "engine", facts_url, false, 12000, 262144, "");
+        defer gpa.free(body);
+        if (body.len < 80 or std.mem.indexOf(u8, body[0..@min(body.len, 48)], "Not Found") != null) continue; // 404 / empty
+        var here: u32 = 0;
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |raw| {
+            if (here >= 8) break; // per-domain grounding FLOOR, not a data dump — the hive rides into every prompt
+            const line = std.mem.trim(u8, raw, " \r\t");
+            if (line.len < 24 or line[0] == '#') continue; // header / blank
+            // strip the "[src:zig/documentation-p01] " provenance prefix into a clean sentence + short source tag
+            var sent = line;
+            var src = loc.name;
+            if (line[0] == '[') if (std.mem.indexOfScalar(u8, line, ']')) |rb| {
+                if (rb > 5 and std.mem.startsWith(u8, line[1..rb], "src:")) src = line[5..rb];
+                sent = std.mem.trim(u8, line[rb + 1 ..], " \t");
+            };
+            if (sent.len < 24) continue;
+            const fact = std.fmt.allocPrint(gpa, "[nl-rag {s}] {s}", .{ src, clip(sent, 400) }) catch continue;
+            defer gpa.free(fact);
+            _ = w.mem.observe(tools.KNOWLEDGE_SCOPE, fact);
+            seeded += 1;
+            here += 1;
+        }
+        if (here > 0) domains += 1;
+        if (domains >= 2) break;
+    }
+    if (seeded > 0) {
+        const note = std.fmt.allocPrint(gpa, "prefetched {d} distilled nl-rag pack fact(s) across {d} domain(s) into the hive — scouts start grounded on canonical docs, not a blind web-scrape", .{ seeded, domains }) catch "";
+        defer if (note.len > 0) gpa.free(note);
+        w.act("engine", 0, "pack", note, "");
+    }
+}
+
 pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, run_dir: []const u8, neuron_bin: []const u8, cli_model: []const u8) !void {
     const mani_path = try std.fmt.allocPrint(gpa, "{s}/swarm.json", .{run_dir});
     defer gpa.free(mani_path);
@@ -805,6 +859,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             defer gpa.free(@constCast(srcs));
             w.act("engine", 0, "atlas", "curated source atlas matched this goal — research directives will steer scouts to canonical documentation first", srcs);
         }
+        // ...and don't just POINT at the packs — actually pull them. The engine prefetches the matched domain's
+        // distilled nl-rag facts into the hive so a weak scout starts grounded instead of 404-marching the web.
+        prefetchPacks(&w, goal, environ.get("NL_EGRESS_ALLOWLIST") orelse "");
     }
     if (m.benchmark.len > 0) w.bench_fixed = gpa.dupe(u8, m.benchmark) catch "";
     defer if (w.bench_fixed.len > 0) gpa.free(@constCast(w.bench_fixed));
