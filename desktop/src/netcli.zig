@@ -125,6 +125,13 @@ pub fn cast(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_j
     return curlReq(io, gpa, "POST", port, "/api/v1/cast", token, body_json, "15");
 }
 
+/// POST /api/v1/chat/tool — run ONE shared tool (mind tool or orchestration verb) exactly the way a
+/// hive mind would. body_json = {"tool":..,"args":<json-string>,"id":..}. Generous timeout: a web_search
+/// mind tool can spend ~30s on curl before it answers.
+pub fn chatTool(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    return curlReq(io, gpa, "POST", port, "/api/v1/chat/tool", token, body_json, "45");
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     var pbuf: [160]u8 = undefined;
