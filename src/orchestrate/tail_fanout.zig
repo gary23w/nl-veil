@@ -60,6 +60,17 @@ pub fn startStream(app: *App, res: *httpz.Response, id: []const u8, run_dir: []c
     try res.startEventStream(ctx, streamLoop);
 }
 
+// SSE hygiene. This loop is disowned onto a detached thread and never READS the socket, so it can't see
+// a client's FIN between writes — a departed browser's socket sits in CLOSE_WAIT until the next write
+// fails, and a half-open peer (laptop sleep, crashed tab, dropped network — no FIN/RST ever arrives)
+// would pin this thread + fd forever. Two portable guards: ping often enough that a CLEAN close is caught
+// in seconds (the ping write fails), and cap the total lifetime so a HALF-OPEN peer is recycled — the
+// browser's EventSource just auto-reconnects. httpz's keepalive timeout can't help here (the connection
+// is disowned out of httpz's worker), so the stream has to police itself.
+const STREAM_TICK_MS: u64 = 500;
+const PING_EVERY_TICKS: u32 = 10; // ~5s — bound how long a cleanly-closed socket lingers in CLOSE_WAIT
+const MAX_STREAM_TICKS: u32 = (10 * 60 * 1000) / STREAM_TICK_MS; // ~10 min hard lifetime cap
+
 fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
     defer {
         stream.close(ctx.io);
@@ -78,12 +89,17 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
 
     var cursor: usize = 0;
     var idle: u32 = 0;
+    var ticks: u32 = 0;
     while (true) {
         if (ctx.sup.get(ctx.id) == null) {
             w.writeAll("event: gone\ndata: {}\n\n") catch {};
             w.flush() catch {};
             break;
         }
+        // Hard lifetime cap: recycle the connection so a client that vanished without a FIN can't pin this
+        // thread + socket (CLOSE_WAIT) indefinitely. Break WITHOUT an `event: gone` frame — that would tell
+        // the browser the swarm is gone and stop its EventSource; a plain drop makes it reconnect instead.
+        if (ticks >= MAX_STREAM_TICKS) break;
         const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ev_path, ctx.gpa, .limited(8 << 20)) catch "";
         defer if (data.len > 0) ctx.gpa.free(data);
         if (data.len < cursor) cursor = data.len;
@@ -101,11 +117,12 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
             idle = 0;
         } else {
             idle += 1;
-            if (idle % 30 == 0) {
+            if (idle % PING_EVERY_TICKS == 0) {
                 w.writeAll(": ping\n\n") catch return;
                 w.flush() catch return;
             }
         }
-        ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};
+        ctx.io.sleep(.{ .nanoseconds = STREAM_TICK_MS * std.time.ns_per_ms }, .awake) catch {};
+        ticks += 1;
     }
 }

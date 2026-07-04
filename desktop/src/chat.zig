@@ -966,10 +966,10 @@ pub const Chat = struct {
         }
 
         const resp = netcli.cast(self.io, self.gpa, port, tokb[0..tok_n], w.buffered()) orelse {
-            log.err("cast: netcli returned NULL (connect/read failed) — server on :{d}?", .{port});
-            self.appendMsg(dd, .cast_note, "[cast] failed — the veil server isn't running on :8787. Start it (run the veil server / `python deploy.py`), then ask again.");
-            self.updateCastRow(.failed, 0, -1, "veil server unreachable on :8787", "");
-            self.store.pushNotif("Cast failed", "veil server not running on :8787", 2);
+            log.err("cast: netcli returned NULL (no response after retries) — server on :{d}?", .{port});
+            self.appendMsg(dd, .cast_note, "[cast] no response from the veil server on :8787 — it may be starting up or briefly busy. If casts keep failing, make sure the server is running (run the veil server / `python deploy.py`), then try again.");
+            self.updateCastRow(.failed, 0, -1, "no response from :8787 (busy or down)", "");
+            self.store.pushNotif("Cast failed", "no response from :8787 — try again", 2);
             self.setStatus("");
             return;
         };
