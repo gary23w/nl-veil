@@ -23,6 +23,7 @@ pub const Poller = struct {
     // transition memory for notifications (poller-local, no lock needed)
     prev_online: bool = false,
     prev_online_set: bool = false,
+    miss_streak: u8 = 0, // consecutive failed fleet polls — debounces the online/offline flap
     prev_live_ids: [scan.MAX_SWARMS][64]u8 = undefined,
     prev_live_lens: [scan.MAX_SWARMS]u8 = [_]u8{0} ** scan.MAX_SWARMS,
     prev_live_n: usize = 0,
@@ -296,6 +297,7 @@ pub const Poller = struct {
         // 1) server liveness + fleet counters — THROTTLED to every ~5s (see last_fleet_s). Between polls we
         // carry the previous values so the dashboard counters stay put instead of flickering to 0/offline.
         const FLEET_EVERY_S: i64 = 5;
+        const OFFLINE_AFTER: u8 = 2; // consecutive missed polls before declaring offline (~10s) — debounces the flap
         var online: bool = undefined;
         var fs: i32 = 0;
         var fl: i32 = 0;
@@ -308,11 +310,10 @@ pub const Poller = struct {
             // Liveness comes from the fleet GET itself — do NOT do a separate raw TCP probe. serverOnline()
             // opened a connection and closed it WITHOUT sending a request, which left the server half-open
             // (CLOSE_WAIT) with a worker thread spinning on the dead socket — a handful of those pinned ~7
-            // CPU cores. The fleet curl sends a real request with `Connection: close`, so the server closes
-            // cleanly. online == "the fleet request came back".
-            online = false;
+            // CPU cores. The fleet curl sends a real request with `Connection: close`, so the server closes cleanly.
+            var raw_ok = false;
             if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
-                online = true;
+                raw_ok = true;
                 defer if (resp.body.len > 0) self.gpa.free(resp.body);
                 fs = jint(resp.body, "swarms");
                 fl = jint(resp.body, "live_swarms");
@@ -324,8 +325,29 @@ pub const Poller = struct {
                     ver_len = @intCast(n);
                 }
             }
+            // Debounce: ONE wedged/slow poll (curl timeout while a cast pegs the CPU) must not flip the
+            // dashboard offline — that toggle IS the flapping the user sees. Go offline only after
+            // OFFLINE_AFTER consecutive misses; go online again on the first success.
+            if (raw_ok) {
+                self.miss_streak = 0;
+                online = true;
+            } else {
+                if (self.miss_streak < OFFLINE_AFTER) self.miss_streak += 1; // caps at OFFLINE_AFTER (no overflow)
+                if (self.miss_streak >= OFFLINE_AFTER) {
+                    online = false;
+                } else {
+                    // within the grace window: hold the last-known online + counters instead of zeroing them
+                    self.store.lock();
+                    online = self.store.server_online;
+                    fs = self.store.fleet_swarms;
+                    fl = self.store.fleet_live;
+                    fm = self.store.fleet_minds;
+                    fh = self.store.fleet_headroom;
+                    self.store.unlock();
+                }
+            }
         } else {
-            // carry the last-known server state forward
+            // between polls: carry the last-known server state forward
             self.store.lock();
             online = self.store.server_online;
             fs = self.store.fleet_swarms;

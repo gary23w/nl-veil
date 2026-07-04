@@ -158,33 +158,50 @@ pub const Supervisor = struct {
     }
 
     pub fn stop(self: *Supervisor, id: []const u8) void {
-        const sw = self.get(id) orelse return;
+        // Read run_dir + set state UNDER the lock (respawn/meter/reconcile touch the same Swarm concurrently
+        // on other httpz threads); the STOP-file IO runs after on a local copy of the path.
         var buf: [1024]u8 = undefined;
-        const stop_path = std.fmt.bufPrint(&buf, "{s}/STOP", .{sw.run_dir}) catch return;
+        var stop_path: []const u8 = "";
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            const sw = self.swarms.get(id) orelse return;
+            stop_path = std.fmt.bufPrint(&buf, "{s}/STOP", .{sw.run_dir}) catch return;
+            sw.state = .stopped;
+        }
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = stop_path, .data = "" }) catch {};
-        sw.state = .stopped;
     }
 
     pub fn remove(self: *Supervisor, id: []const u8) void {
-        const sw = self.get(id) orelse return;
-        var pbuf: [1024]u8 = undefined;
-        const sp = std.fmt.bufPrint(&pbuf, "{s}/STOP", .{sw.run_dir}) catch sw.run_dir;
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = sp, .data = "" }) catch {};
-        if (sw.child != null) {
-            sw.child.?.kill(self.io);
+        // Snapshot run_dir, take ownership of the ?Child, and UNLINK the map entry — all UNDER the lock — so
+        // no other thread can race the ?Child (respawn writes it under the same lock) or get() a swarm that's
+        // mid-teardown. The slow STOP-write + process kill + rmTree then run on LOCAL copies, lock released.
+        // The *Swarm heap object is intentionally NOT freed: other threads may still hold a get() pointer to
+        // it, and the small per-remove leak is far cheaper than a use-after-free.
+        var rd_buf: [1024]u8 = undefined;
+        var run_dir: []const u8 = "";
+        var child_copy: ?std.process.Child = null;
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            const sw = self.swarms.get(id) orelse return;
+            const n = @min(sw.run_dir.len, rd_buf.len);
+            @memcpy(rd_buf[0..n], sw.run_dir[0..n]);
+            run_dir = rd_buf[0..n];
+            child_copy = sw.child;
             sw.child = null;
-        } else {
-            self.killByPidFile(sw.run_dir);
+            sw.state = .stopped;
+            _ = self.swarms.remove(id);
         }
-        sw.state = .stopped;
+        var pbuf: [1024]u8 = undefined;
+        const sp = std.fmt.bufPrint(&pbuf, "{s}/STOP", .{run_dir}) catch run_dir;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = sp, .data = "" }) catch {};
+        if (child_copy) |*c| c.kill(self.io) else self.killByPidFile(run_dir);
         var i: usize = 0;
         while (i < 10) : (i += 1) {
-            if (self.rmTree(sw.run_dir)) break;
+            if (self.rmTree(run_dir)) break;
             self.io.sleep(.{ .nanoseconds = 300 * std.time.ns_per_ms }, .awake) catch {};
         }
-        self.mu.lockUncancelable(self.io);
-        defer self.mu.unlock(self.io);
-        _ = self.swarms.remove(id);
     }
 
     fn rmTree(self: *Supervisor, path: []const u8) bool {
