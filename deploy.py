@@ -45,6 +45,8 @@ PROVIDERS = {
     "groq":       {"base_url": "https://api.groq.com/openai/v1", "model": "llama-3.3-70b-versatile",                      "needs_key": True},
     "together":   {"base_url": "https://api.together.xyz/v1",    "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",      "needs_key": True},
     "openrouter": {"base_url": "https://openrouter.ai/api/v1",   "model": "meta-llama/llama-3.3-70b-instruct",            "needs_key": True},
+    "deepseek":   {"base_url": "https://api.deepseek.com/v1",    "model": "deepseek-v4-flash",                            "needs_key": True},
+    "google":     {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model": "gemini-3.5-flash", "needs_key": True},
     "custom":     {"base_url": "https://api.openai.com/v1",      "model": "gpt-4.1-mini",                                 "needs_key": True},
 }
 
