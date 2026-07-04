@@ -40,12 +40,33 @@ const SYSTEM_PROMPT =
     "DO NOT cast for greetings, small talk, definitions, or timeless facts you know confidently.\n" ++
     "A cast runs for minutes; the user watches its live activity beside this chat. When it finishes you " ++
     "receive its findings in a [cast] message and must then answer the user's request from them.\n" ++
+    "\n" ++
+    "TOOLS — for a quick, single action (NOT minutes of work), you may run ONE tool. Make the reply exactly " ++
+    "one line, nothing else:\n" ++
+    "TOOL: <name> <compact-json-args>\n" ++
+    "Then STOP. I run it and reply with a [tool:<name>] message containing the result; read that and either " ++
+    "run another TOOL or give your final answer. Never put a TOOL line and prose in the same reply.\n" ++
+    "Available tools:\n" ++
+    "- list_swarms {}  — the swarms currently running (id, name, model, state).\n" ++
+    "- stop_swarm {}  — stop the currently running cast (omit id; I target the live one) or {\"id\":\"<id>\"}.\n" ++
+    "- swarm_findings {}  — what the current cast has collected so far (its synthesis / recent events); or {\"id\":\"<id>\"}.\n" ++
+    "- web_search {\"query\":\"...\"}  — a quick keyless web search (top results + excerpts).\n" ++
+    "- web_fetch {\"url\":\"...\"}  — fetch one page as clean text.\n" ++
+    "- fetch_json {\"url\":\"...\"}  — GET a JSON API and return the body.\n" ++
+    "- recall_hive {\"query\":\"...\"}  — what the shared memory already knows.\n" ++
+    "- observe {\"fact\":\"...\"}  — store a durable fact into the shared memory.\n" ++
+    "Use a TOOL for a one-shot lookup or to inspect/steer a running cast (e.g. the user says 'kill the swarm " ++
+    "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Use CAST for open-ended " ++
+    "research or building. For a brand-new web question, a single web_search TOOL is often faster than a cast.\n" ++
     "Otherwise reply normally in plain text.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 2048;
 
-const Turn = enum { idle, user, collect };
+const Turn = enum { idle, user, collect, tool_follow };
+
+// Bound the model→tool→model loop so a confused local model can't spin forever on tool calls.
+const MAX_TOOL_ITERS: u32 = 5;
 
 pub const Chat = struct {
     io: Io,
@@ -59,6 +80,7 @@ pub const Chat = struct {
     parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
+    tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -350,6 +372,7 @@ pub const Chat = struct {
         // puts its whole reply in the hidden reasoning channel and emits no CAST line in the content).
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
+        self.tool_iters = 0; // fresh tool budget for this user turn
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -896,6 +919,22 @@ pub const Chat = struct {
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
+        // TOOL: <name> <args> — a single shared-tool call. Run it, fold the result back, continue the loop.
+        // Not on a .collect turn (that turn's job is to compose the cast's final answer, not run tools).
+        if (kind != .collect) {
+            if (toolCall(full)) |tc| {
+                if (self.tool_iters >= MAX_TOOL_ITERS) {
+                    self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
+                    self.stream.deinit(self.gpa);
+                    self.setBusy(false);
+                    return;
+                }
+                self.tool_iters += 1;
+                self.stream.deinit(self.gpa); // free this turn's stream before the next one starts
+                self.runToolAndContinue(dd, tc);
+                return; // a fresh .tool_follow turn is now live; stay busy
+            }
+        }
         if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (castGoal(full)) |goal| {
@@ -1064,6 +1103,69 @@ pub const Chat = struct {
         self.updateCastRow(.deploying, 0, -1, "worker starting...", hex); // stamp the row with the real id
         self.store.pushNotif("Hive cast", goal, 1);
         log.info("chat cast: id={s} goal={s}", .{ hex, goal[0..@min(goal.len, 80)] });
+    }
+
+    // ------------------------------------------------------------------------------ shared tools (chat side)
+
+    /// Run ONE shared tool through the server (POST /api/v1/chat/tool — the SAME executor a hive mind uses),
+    /// fold the result back into the conversation as a [tool:NAME] message, and re-enter the turn loop so the
+    /// model reads it and either runs another tool or answers. Blocking netcli call, but we are on the chat
+    /// WORKER thread (not the UI thread), so the block is invisible — the status line set just before keeps
+    /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
+    /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
+    fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
+        var abuf: [256]u8 = undefined;
+        var args = tc.args;
+        const orchestration = std.mem.eql(u8, tc.name, "stop_swarm") or std.mem.eql(u8, tc.name, "swarm_findings");
+        if (orchestration and self.cast_active and self.cast_hex_len > 0 and !hasRealId(tc.args)) {
+            args = std.fmt.bufPrint(&abuf, "{{\"id\":\"{s}\"}}", .{self.cast_hex[0..self.cast_hex_len]}) catch tc.args;
+        }
+
+        var stbuf: [96]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s}...", .{tc.name}) catch "running a tool...");
+        log.info("chat tool: run {s} args={s}", .{ tc.name, args[0..@min(args.len, 100)] });
+
+        var tokb: [128]u8 = undefined;
+        var tok_n: usize = 0;
+        var port: u16 = 8787;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            port = self.store.settings.port;
+            tok_n = self.store.settings.token_len;
+            @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
+        }
+
+        // body = {"tool":NAME,"args":"<escaped raw json>"} — args ride as a JSON string (tool-call convention)
+        var body: [2048]u8 = undefined;
+        var w = Io.Writer.fixed(&body);
+        const bok = blk: {
+            w.print("{{\"tool\":\"{s}\",\"args\":\"", .{tc.name}) catch break :blk false;
+            wesc(&w, args);
+            w.writeAll("\"}") catch break :blk false;
+            break :blk true;
+        };
+
+        var rbuf: [8192]u8 = undefined;
+        var result: []const u8 = "(tool error)";
+        if (!bok) {
+            result = "(the tool arguments were too long to send)";
+        } else if (netcli.chatTool(self.io, self.gpa, port, tokb[0..tok_n], w.buffered())) |resp| {
+            defer if (resp.body.len > 0) self.gpa.free(resp.body);
+            log.info("chat tool: {s} -> status={d} body={s}", .{ tc.name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
+            result = extractToolResult(resp.body, &rbuf);
+            if (std.mem.eql(u8, tc.name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
+        } else {
+            result = "(no response from the veil server on :8787 — is it running?)";
+            log.err("chat tool: {s} netcli NULL", .{tc.name});
+        }
+
+        // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
+        // model sees it as user content; it's also the user-visible record that the tool ran).
+        var fb: [8320]u8 = undefined;
+        const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ tc.name, result }) catch result;
+        self.appendMsg(dd, .cast_note, folded);
+        self.startTurn(dd, .tool_follow);
     }
 
     /// Add a fresh "deploying" cast row (newest) to the activity panel; evicts the oldest when full.
@@ -1268,6 +1370,37 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const ToolCall = struct { name: []const u8, args: []const u8 };
+
+/// If a "TOOL: <name> <json-args>" line appears within the reply's first few substantive lines, return
+/// the tool name + its raw JSON args ("{}" when the model omits them). Same tolerance as castGoal: a short
+/// preamble above the tag is fine; a TOOL mention buried deep in prose is narration, not an action. The
+/// args are passed to the server verbatim, so a malformed blob is the server's problem to reject, not ours.
+pub fn toolCall(full: []const u8) ?ToolCall {
+    var it = std.mem.splitScalar(u8, full, '\n');
+    var seen: usize = 0;
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "TOOL:")) {
+            const rest = std.mem.trim(u8, line[5..], " \r\t");
+            if (rest.len == 0) return null;
+            var name = rest;
+            var args: []const u8 = "{}";
+            if (std.mem.indexOfAny(u8, rest, " \t{")) |sp| {
+                name = std.mem.trim(u8, rest[0..sp], " \t:");
+                const a = std.mem.trim(u8, rest[sp..], " \r\t");
+                if (a.len > 0) args = a;
+            }
+            if (name.len == 0) return null;
+            return .{ .name = name, .args = args };
+        }
+        seen += 1;
+        if (seen >= 5) return null;
+    }
+    return null;
+}
+
 /// Did the user's message explicitly ask to cast a swarm? Case-insensitive: a cast verb
 /// (cast/run/spin/deploy/launch/summon) together with "swarm" or "hive". Used to honor an explicit
 /// request even when the model flakes and emits no CAST line.
@@ -1424,6 +1557,74 @@ fn jStr(body: []const u8, key: []const u8, out: []u8) ?[]const u8 {
         w += 1;
     }
     return jstr_buf[0..w];
+}
+
+/// Does `args` carry a real swarm id (not empty, not a placeholder)? When it doesn't and a cast is live,
+/// runToolAndContinue substitutes the running cast's id so the model needn't know the hex.
+fn hasRealId(args: []const u8) bool {
+    var b: [64]u8 = undefined;
+    const id = jStr(args, "id", &b) orelse return false;
+    const t = std.mem.trim(u8, id, " ");
+    if (t.len == 0) return false;
+    if (std.mem.eql(u8, t, "current") or std.mem.eql(u8, t, "the current") or std.mem.eql(u8, t, "<id>") or std.mem.eql(u8, t, "id")) return false;
+    return true;
+}
+
+/// Extract a JSON string value for `key`, UNESCAPING into `out` (handles \" \\ \/ \n \r \t \b \f and, best-
+/// effort, \uXXXX -> '?'). Unlike jStr this is not capped at 64b and survives escaped quotes + newlines —
+/// tool results routinely contain both. Returns the written slice, or null if the key is absent.
+fn jsonStrInto(body: []const u8, key: []const u8, out: []u8) ?[]const u8 {
+    var kbuf: [48]u8 = undefined;
+    if (key.len + 3 > kbuf.len) return null;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    kbuf[2 + key.len] = ':';
+    const needle = kbuf[0 .. 3 + key.len];
+    const at = std.mem.indexOf(u8, body, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t')) i += 1;
+    if (i >= body.len or body[i] != '"') return null;
+    i += 1;
+    var w: usize = 0;
+    while (i < body.len and w < out.len) {
+        const c = body[i];
+        if (c == '"') break;
+        if (c == '\\' and i + 1 < body.len) {
+            const e = body[i + 1];
+            i += 2;
+            out[w] = switch (e) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                'b' => 8,
+                'f' => 12,
+                'u' => blk: {
+                    if (i + 4 <= body.len) i += 4; // skip the code point; emit a placeholder
+                    break :blk '?';
+                },
+                else => e, // \" \\ \/ and anything else -> the literal char
+            };
+            w += 1;
+            continue;
+        }
+        out[w] = c;
+        w += 1;
+        i += 1;
+    }
+    return out[0..w];
+}
+
+/// The human-readable payload of a /api/v1/chat/tool response: the mind-tool "result", else the swarm
+/// "findings", else an "err" string, else the raw JSON body (list_swarms/stop_swarm hand back a small
+/// object the model can read directly). Always returns a slice of `out` or `body`.
+fn extractToolResult(body: []const u8, out: []u8) []const u8 {
+    if (jsonStrInto(body, "result", out)) |r| return r;
+    if (jsonStrInto(body, "findings", out)) |r| return r;
+    if (jsonStrInto(body, "err", out)) |r| return r;
+    const n = @min(body.len, out.len);
+    @memcpy(out[0..n], body[0..n]);
+    return out[0..n];
 }
 
 // ------------------------------------------------------------------------------ tests
@@ -1708,6 +1909,46 @@ test "castGoal fires on a CAST line within the first few lines" {
     try std.testing.expect(castGoal("CAST:") == null);
     // a CAST buried deep in prose is narration
     try std.testing.expect(castGoal("a\nb\nc\nd\ne\nf\nCAST: too deep") == null);
+}
+
+test "toolCall parses name + raw json args" {
+    const a = toolCall("TOOL: web_search {\"query\":\"zig 0.16\"}").?;
+    try std.testing.expectEqualStrings("web_search", a.name);
+    try std.testing.expectEqualStrings("{\"query\":\"zig 0.16\"}", a.args);
+    // no args -> defaults to {}
+    const b = toolCall("TOOL: stop_swarm").?;
+    try std.testing.expectEqualStrings("stop_swarm", b.name);
+    try std.testing.expectEqualStrings("{}", b.args);
+    // brace flush against the name (no space)
+    const c = toolCall("TOOL: swarm_findings{\"id\":\"abc\"}").?;
+    try std.testing.expectEqualStrings("swarm_findings", c.name);
+    try std.testing.expectEqualStrings("{\"id\":\"abc\"}", c.args);
+    // preamble tolerated; empty/absent -> null
+    try std.testing.expectEqualStrings("list_swarms", toolCall("Sure, let me check.\nTOOL: list_swarms {}").?.name);
+    try std.testing.expect(toolCall("just chatting") == null);
+    try std.testing.expect(toolCall("TOOL:") == null);
+    try std.testing.expect(toolCall("a\nb\nc\nd\ne\nf\nTOOL: too_deep {}") == null);
+}
+
+test "jsonStrInto unescapes; extractToolResult picks the right field" {
+    var out: [256]u8 = undefined;
+    // newlines + escaped quotes survive
+    try std.testing.expectEqualStrings("line1\nsaid \"hi\"", jsonStrInto("{\"result\":\"line1\\nsaid \\\"hi\\\"\"}", "result", &out).?);
+    try std.testing.expect(jsonStrInto("{\"ok\":true}", "result", &out) == null);
+    // extractToolResult precedence: result > findings > err > raw body
+    try std.testing.expectEqualStrings("hey", extractToolResult("{\"ok\":true,\"result\":\"hey\"}", &out));
+    try std.testing.expectEqualStrings("synth", extractToolResult("{\"ok\":true,\"findings\":\"synth\"}", &out));
+    try std.testing.expectEqualStrings("not found", extractToolResult("{\"ok\":false,\"err\":\"not found\"}", &out));
+    // list_swarms has no string field -> raw body handed back
+    const raw = "{\"ok\":true,\"tool\":\"list_swarms\",\"swarms\":[]}";
+    try std.testing.expectEqualStrings(raw, extractToolResult(raw, &out));
+}
+
+test "hasRealId distinguishes real ids from placeholders" {
+    try std.testing.expect(hasRealId("{\"id\":\"3dd9cc6d\"}"));
+    try std.testing.expect(!hasRealId("{}"));
+    try std.testing.expect(!hasRealId("{\"id\":\"\"}"));
+    try std.testing.expect(!hasRealId("{\"id\":\"current\"}"));
 }
 
 test "userWantsCast detects explicit cast requests" {
