@@ -78,6 +78,8 @@ const Ui = struct {
     dd_scroll: f32 = 0, // scroll offset (rows) for a long dropdown list
     // window chrome
     dragging: bool = false,
+    drag_grab_x: f32 = 0, // mouse-in-window offset captured at drag start (absolute-tracking, not delta)
+    drag_grab_y: f32 = 0,
     resizing: bool = false,
     file_menu: bool = false,
     close_req: bool = false,
@@ -347,12 +349,20 @@ fn handleWindowChrome() void {
     const over_file = mp.x > 40 and mp.x < 90;
     const over_theme = mp.x > 104 and mp.x < 236;
     const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 96 and !(over_file or over_theme);
-    if (rl.isMouseButtonPressed(.left) and in_title and !ui.resizing) ui.dragging = true;
+    if (rl.isMouseButtonPressed(.left) and in_title and !ui.resizing) {
+        ui.dragging = true;
+        const g = rl.getMousePosition(); // remember WHERE on the title bar we grabbed
+        ui.drag_grab_x = g.x;
+        ui.drag_grab_y = g.y;
+    }
     if (ui.dragging) {
         if (rl.isMouseButtonDown(.left)) {
-            const d = rl.getMouseDelta();
+            // Absolute tracking: keep the grabbed point under the cursor. getMouseDelta() is window-relative,
+            // and moving the window shifts the mouse's window coords, corrupting the delta into a jitter loop —
+            // which is why dragging didn't work. screen_mouse = windowPos + mousePos; new = screen_mouse - grab.
             const p = rl.getWindowPosition();
-            rl.setWindowPosition(@intFromFloat(p.x + d.x), @intFromFloat(p.y + d.y));
+            const m = rl.getMousePosition();
+            rl.setWindowPosition(@intFromFloat(p.x + m.x - ui.drag_grab_x), @intFromFloat(p.y + m.y - ui.drag_grab_y));
         } else ui.dragging = false;
     }
 }
@@ -927,8 +937,16 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var inflight_buf: [13312]u8 = undefined;
     const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n]);
 
+    var cast_live = false;
+    for (casts[0..cast_n]) |*c| {
+        if (c.status == .deploying or c.status == .running or c.status == .collecting) {
+            cast_live = true;
+            break;
+        }
+    }
+
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
-    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n]);
+    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], tail[0..tail_n], cast_live);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
 }
 
@@ -1039,11 +1057,21 @@ fn monoCols(w: f32, size: i32) usize {
 // copy chip), headings, bullets, **bold** markers stripped; body text stays mono so wrap math is exact.
 
 var clip_buf: [65536]u8 = undefined; // 64K: long answers / whole-conversation copies shouldn't truncate
+var copy_flash_until: f64 = 0;
+
 fn copyToClipboard(s: []const u8) void {
     const n = @min(s.len, clip_buf.len - 1);
     @memcpy(clip_buf[0..n], s[0..n]);
     clip_buf[n] = 0;
     rl.setClipboardText(clip_buf[0..n :0]);
+}
+
+fn markCopied() void {
+    copy_flash_until = rl.getTime() + 1.2;
+}
+
+fn copyIsFresh() bool {
+    return rl.getTime() < copy_flash_until;
 }
 
 fn bufAppend(buf: []u8, n: *usize, s: []const u8) void {
@@ -1075,8 +1103,9 @@ fn copyConversation(store: *Store) void {
 fn copyChip(x: f32, y: f32) bool {
     const r = t.Rect{ .x = x, .y = y, .width = 46, .height = 17 };
     const hot = t.hovering(r);
+    const copied = copyIsFresh();
     t.panelBordered(r, if (hot) t.bg_sel else t.bg_hl, if (hot) t.blue else t.border);
-    t.text(t.z("copy", .{}), @intFromFloat(x + 9), @intFromFloat(y + 2), 11, if (hot) t.fg else t.comment);
+    t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 4) else 9)), @intFromFloat(y + 2), 11, if (hot) t.fg else t.comment);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -1085,8 +1114,9 @@ fn copyChip(x: f32, y: f32) bool {
 fn codeCopyChip(x: f32, y: f32) bool {
     const r = t.Rect{ .x = x, .y = y, .width = 40, .height = 15 };
     const hot = t.hovering(r);
+    const copied = copyIsFresh();
     t.panelBordered(r, if (hot) t.bg_sel else t.bg_dark, if (hot) t.blue else t.border);
-    t.text(t.z("copy", .{}), @intFromFloat(x + 8), @intFromFloat(y + 1), 10, if (hot) t.fg else t.comment);
+    t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 3) else 8)), @intFromFloat(y + 1), 10, if (hot) t.fg else t.comment);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -1163,7 +1193,10 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
                 if (t.hovering(block)) {
                     const off = @intFromPtr(lines[i].ptr) - @intFromPtr(text_.ptr);
                     const from = @min(off + lines[i].len + 1, text_.len);
-                    if (codeCopyChip(bx + bw - 46, yy + 6)) copyToClipboard(codeBlockSlice(text_, from));
+                    if (codeCopyChip(bx + bw - 46, yy + 6)) {
+                        copyToClipboard(codeBlockSlice(text_, from));
+                        markCopied();
+                    }
                 }
             }
             yy += block_h + 4; // a little breathing room below the block
@@ -1376,7 +1409,30 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
     };
 }
 
-fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8) void {
+/// While the hive runs, stream its LIVE activity into the MAIN chat flow (the most recent events, refreshed
+/// every tick) so the user watches it work and reads findings AS THEY LAND — instead of dead air with only a
+/// side-pane and a % until the cast completes. Renders inside the same scrollable view as the messages.
+fn renderCastLive(view: t.Rect, y0: f32, tail: []const scan.Ev, status: []const u8, fsz: i32, draw: bool) f32 {
+    var yy = y0;
+    if (draw and inView(view, yy, MSG_LINE_H + 2)) {
+        t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H + 2), t.withAlpha(t.green, 34));
+        const spin = [_][]const u8{ "|", "/", "-", "\\" };
+        const s = spin[@as(usize, @intFromFloat(@mod(rl.getTime() * 6.0, 4.0)))];
+        t.text(t.z("{s} the hive is working live — {s}", .{ s, if (status.len > 0) status else "casting" }), @intFromFloat(view.x + 14), @intFromFloat(yy), 12, t.green);
+    }
+    yy += MSG_LINE_H + 6;
+    const n = tail.len;
+    const start = if (n > 14) n - 14 else 0; // the last ~14 events = the swarm's current work, streaming
+    for (tail[start..n]) |*ev| {
+        if (draw and inView(view, yy, MSG_LINE_H)) {
+            t.textMonoClip(ev.textStr(), @intFromFloat(view.x + 16), @intFromFloat(yy), fsz - 1, t.fg_dim, @intFromFloat(view.width - 28));
+        }
+        yy += MSG_LINE_H;
+    }
+    return yy + MSG_GAP_H;
+}
+
+fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, tail: []const scan.Ev, cast_live: bool) void {
     const input_h: f32 = 38;
     const status_h: f32 = 20;
     const view = t.Rect{ .x = r.x, .y = r.y, .width = r.width, .height = r.height - input_h - status_h - 10 };
@@ -1389,6 +1445,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     var total: f32 = 8;
     for (msgs) |*m| total += renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
     if (busy or stream.len > 0) total += renderMsg(view, 0, .veil, stream, cols, fsz, false, false) + MSG_LINE_H;
+    if (cast_live) total += renderCastLive(view, 0, tail, status, fsz, false);
 
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
@@ -1409,12 +1466,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
-            if (copyChip(view.x + view.width - 60, y0)) copyToClipboard(m.textStr());
+            if (copyChip(view.x + view.width - 60, y0)) {
+                copyToClipboard(m.textStr());
+                markCopied();
+            }
         }
     }
     if (busy or stream.len > 0) {
         yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
     }
+    if (cast_live) yy = renderCastLive(view, yy, tail, status, fsz, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
         t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
     }
