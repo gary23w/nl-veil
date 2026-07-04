@@ -573,7 +573,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     // INTERACTIVE fast-path (opt-in, explicit only — NO global env, which would silently force every swarm into
     // one-shot mode). style="quick" or the (otherwise-dead) mode="oneshot" field select it. A small edit skips
     // all plan scaffolding + round-end engine calls and stops after one moment.
-    w.quick = std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, std.mem.trim(u8, m.mode, " \t"), "oneshot");
+    const trimmed_mode = std.mem.trim(u8, m.mode, " \t");
+    w.quick = std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, trimmed_mode, "oneshot") or std.mem.eql(u8, trimmed_mode, "cast");
     {
         const tenv = dupeEnv(gpa, environ, "NL_TIER");
         defer if (tenv) |t| gpa.free(t);

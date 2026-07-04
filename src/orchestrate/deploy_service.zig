@@ -320,12 +320,16 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .provider = if (rq.provider.len > 0) rq.provider else "workers-ai",
         .model = rq.model,
         .stack = "general",
-        .style = rq.style,
-        .mode = "continuous",
+        // A cast is a FAST scatter-gather, not an 8-minute build loop: each mind runs ONE moment on its
+        // slice of the goal and stops (mode="oneshot" -> the engine's quick path), then the caller (the chat
+        // collect turn, or the Deploy tab) synthesizes. This is what makes a cast return quickly and stops
+        // one cast from lingering on the model and starving the next.
+        .style = if (rq.style.len > 0) rq.style else "investigate",
+        .mode = "oneshot",
         .goal = rq.goal,
         .api_key = rq.api_key,
         .base_url = rq.base_url,
-        .minutes = if (rq.minutes == 0) 8 else rq.minutes,
+        .minutes = if (rq.minutes == 0) 4 else @min(rq.minutes, 4), // hard cap; oneshot finishes well under this
         .gateway_model = rq.gateway_model,
         // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
