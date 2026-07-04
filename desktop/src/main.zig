@@ -234,7 +234,7 @@ pub fn main() !void {
         syncThemeFromStore(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
         handleWindowChrome();
-        handleKeys();
+        handleKeys(&store);
 
         rl.beginDrawing();
         defer rl.endDrawing();
@@ -628,7 +628,7 @@ fn setTab(tabv: Tab) void {
     if (tabv == .chat) while (rl.getCharPressed() > 0) {}; // drain the trigger digit; don't type it into the field
 }
 
-fn handleKeys() void {
+fn handleKeys(store: *Store) void {
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) setTab(.dashboard);
@@ -637,6 +637,24 @@ fn handleKeys() void {
         if (rl.isKeyPressed(.four)) setTab(.swarm);
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
+        // Ctrl+C with nothing focused copies the LAST veil answer — a reliable keyboard copy for the response
+        // text (the per-message hover "copy" chip needs a precise mouse hover; this doesn't). Field-scoped
+        // Ctrl+C is handled in editField, so this only runs when no field owns the keyboard.
+        const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+        if (ctrl and rl.isKeyPressed(.c)) {
+            var last: ?store_mod.ChatMsg = null;
+            store.lock();
+            var i: usize = store.msg_count;
+            while (i > 0) {
+                i -= 1;
+                if (store.msgs[i].role == .veil) {
+                    last = store.msgs[i];
+                    break;
+                }
+            }
+            store.unlock();
+            if (last) |m| if (m.textStr().len > 0) copyToClipboard(m.textStr());
+        }
     }
     switch (ui.focus) {
         .none => {},
