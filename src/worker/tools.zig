@@ -2502,19 +2502,64 @@ pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process
     return enriched;
 }
 
+/// Freshness cues in a query mean the LOCAL RAG must NOT short-circuit the web: a "latest/current/today/news"
+/// question needs live sources even when the hive holds solid background on the topic. Everything else is
+/// stable knowledge the RAG database can legitimately answer without a web round-trip.
+fn queryWantsFresh(query: []const u8) bool {
+    const cues = [_][]const u8{ "latest", "current", "today", "recent", "news", "2024", "2025", "2026", "price", "release", "version", "update", "breaking", " live", "right now", "this week", "this year", "as of" };
+    for (cues) |c| if (std.ascii.indexOfIgnoreCase(query, c) != null) return true;
+    return false;
+}
+
 /// Keyless multi-engine web search tool: our crawler first, then the self-healing registry (see searchWeb).
+///
+/// RAG-FIRST (user policy: "always check our rag database first"): before spending a web round-trip, the
+/// engine consults the swarm's OWN knowledge — the prefetched nl-rag pack facts plus every teammate finding
+/// in the KNOWLEDGE/INTEL hive — with a spreading-activation recall on the same query. If the hive already
+/// answers it AND the query isn't asking for something fresh, those grounded facts are returned and the web is
+/// SKIPPED (the RAG database is genuinely consulted first, and a redundant scrape — the 404-march source — is
+/// avoided). Otherwise the local hits are PREPENDED to the live web results, so the model always sees what is
+/// already known before it reads the open web. A weak/empty hive degrades cleanly to the prior web-only path.
+/// This is a general retrieval-order floor, not a per-task rule.
 fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { query: []const u8 = "", source: []const u8 = "web", limit: u32 = 5 };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "empty query");
+    const query = std.mem.trim(u8, p.value.query, " \r\n\t");
+    if (query.len == 0) return dupe(gpa, "empty query");
     if (ctx.egress_allow.len > 0) return dupe(gpa, "web_search is disabled under an egress allowlist (search returns arbitrary hosts) — fetch a specific allowlisted URL with web_fetch/fetch_json");
+
+    // RAG-first consult: gather what our own knowledge base already holds for this exact query.
+    const k_local = ctx.mem.assoc(KNOWLEDGE_SCOPE, query, 1, 10);
+    defer gpa.free(k_local);
+    const i_local = ctx.mem.assoc(INTEL_SCOPE, query, 1, 6);
+    defer gpa.free(i_local);
+    var local: std.ArrayListUnmanaged(u8) = .empty;
+    defer local.deinit(gpa);
+    for ([_][]const u8{ k_local, i_local }) |part| {
+        const t = std.mem.trim(u8, part, " \r\n\t");
+        if (t.len == 0) continue;
+        if (local.items.len > 0) local.append(gpa, '\n') catch {};
+        local.appendSlice(gpa, t) catch {};
+    }
+    const local_facts: usize = if (local.items.len == 0) 0 else std.mem.count(u8, local.items, "\n") + 1;
+    const strong = local_facts >= 3 and local.items.len >= 200;
+
+    if (strong and !queryWantsFresh(query)) {
+        return std.fmt.allocPrint(gpa, "LOCAL RAG (nl-rag + hive) answered this — checked FIRST per policy; cite these. If you still need FRESH or external detail the hive lacks, refine the query and web_search again:\n{s}", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
+    }
+
     const lim = if (p.value.limit == 0 or p.value.limit > 10) 5 else p.value.limit;
-    const out = searchWeb(ctx.io, gpa, ctx.environ, ctx.run_dir, ctx.workdir, ctx.mind, p.value.source, p.value.query, lim);
+    const out = searchWeb(ctx.io, gpa, ctx.environ, ctx.run_dir, ctx.workdir, ctx.mind, p.value.source, query, lim);
     defer gpa.free(@constCast(out));
-    if (std.mem.trim(u8, out, " \r\n\t").len == 0) return dupe(gpa, "(no results: all search backends unavailable — try again later)");
-    return dupe(gpa, clip(out, 4000));
+    const web = std.mem.trim(u8, out, " \r\n\t");
+    if (web.len == 0) {
+        if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (checked first; live web backends are unavailable right now):\n{s}", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
+        return dupe(gpa, "(no results: all search backends unavailable — try again later)");
+    }
+    if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (nl-rag + hive) — checked first, prefer these when they answer:\n{s}\n\n--- WEB RESULTS ---\n{s}", .{ clip(local.items, 1600), clip(web, 3200) }) catch dupe(gpa, clip(web, 4000));
+    return dupe(gpa, clip(web, 4000));
 }
 
 const SEARCH_PY =
