@@ -2511,6 +2511,30 @@ fn queryWantsFresh(query: []const u8) bool {
     return false;
 }
 
+/// Query-decoration words that carry no topic — a query "matched" only on these isn't really covered.
+fn isQueryDecoration(word: []const u8) bool {
+    const sw = [_][]const u8{ "official", "documentation", "docs", "guide", "reference", "manual", "tutorial", "overview", "introduction", "latest", "features", "usage", "patterns", "example", "examples", "about", "using", "explain", "summary" };
+    for (sw) |s| if (std.ascii.eqlIgnoreCase(word, s)) return true;
+    return false;
+}
+
+/// True when the local RAG hits actually COVER the query — at least half of its significant (>=5 char,
+/// non-decoration) terms appear in them. Without this, three GENERIC facts short-circuit a SPECIFIC question:
+/// observed live, a "Zig comptime official documentation" query got answered from the pack's generic intro page
+/// and the scout never fetched comptime docs. Skipping the web is only justified when the hive is on-topic for
+/// THIS query; a thin/off-topic match must fall through to the web (with the local hits still prepended).
+fn localCoversQuery(local: []const u8, query: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:!?()[]{}\"'`-/");
+    var sig: u32 = 0;
+    var hit: u32 = 0;
+    while (it.next()) |wd| {
+        if (wd.len < 5 or isQueryDecoration(wd)) continue;
+        sig += 1;
+        if (std.ascii.indexOfIgnoreCase(local, wd) != null) hit += 1;
+    }
+    return sig > 0 and hit * 2 >= sig;
+}
+
 /// Keyless multi-engine web search tool: our crawler first, then the self-healing registry (see searchWeb).
 ///
 /// RAG-FIRST (user policy: "always check our rag database first"): before spending a web round-trip, the
@@ -2546,7 +2570,7 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const local_facts: usize = if (local.items.len == 0) 0 else std.mem.count(u8, local.items, "\n") + 1;
     const strong = local_facts >= 3 and local.items.len >= 200;
 
-    if (strong and !queryWantsFresh(query)) {
+    if (strong and !queryWantsFresh(query) and localCoversQuery(local.items, query)) {
         return std.fmt.allocPrint(gpa, "LOCAL RAG (nl-rag + hive) answered this — checked FIRST per policy; cite these. If you still need FRESH or external detail the hive lacks, refine the query and web_search again:\n{s}", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
     }
 
