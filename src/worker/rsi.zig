@@ -41,6 +41,8 @@ const ARCHETYPES = [_]Archetype{
     .{ .key = "domain-learner", .lane = SCOUT_LANE, .research = true },
     .{ .key = "capability-builder", .lane = "CAPABILITY-BUILDER — find the ONE capability gap blocking the benchmark; research the technique if needed, then AUTHOR it with make_tool (Python reading ARGS, printing one JSON line) so the team gains a permanent, callable tool, and verify it. Your output is a NEW TOOL, not a one-off script.", .research = false },
     .{ .key = "inventor", .lane = "INVENTOR — the current approach is stuck; do NOT iterate the failing path. Devise a DIFFERENT method (new algorithm/decomposition, or a new tool via make_tool) and prototype it.", .research = false },
+    .{ .key = "analyst", .lane = "ANALYST — tear open the target artifact/problem (a bug, a failing test, a design, a dataset): reproduce it, isolate the exact mechanism, and report the concrete ROOT CAUSE + the minimal fix. Diagnose precisely; do NOT rewrite it yourself.", .research = false },
+    .{ .key = "outreach", .lane = "OUTREACH — turn the team's result into clear external communication: a concise release note / social post / message that states what was done and why it matters. Write for the audience, grounded ONLY in what the team actually produced.", .research = false },
 };
 
 /// The engine-defined knob set for each tier — the ONLY place the per-tier budget lives (the minds never control
