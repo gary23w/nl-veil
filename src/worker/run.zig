@@ -146,6 +146,7 @@ pub const Worker = struct {
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
     quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
     cast: bool = false, // CAST fast-path: a planCast-assigned role team (scouts SEARCH, builders build) runs ONE bounded moment, then synthesize. Shares quick's skip-scaffolding + single-round stop, but NOT quick's 3-turn edit profile.
+    serial_minds: bool = false, // single-slot backend (local Ollama): run mind-moments ONE AT A TIME. N concurrent requests to a 1-slot Ollama just queue and thrash (reloads, timeouts); serial keeps the model hot and each mind gets full throughput.
     roster: []const u8 = "",
     last_bench: BenchResult = .{},
     last_bench_str: []const u8 = "",
@@ -562,6 +563,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .fence_writes = llm.fenceWrites(base_url, model),
     };
     w.mem.trust = true;
+    // Single-slot local Ollama: run mind-moments SERIALLY. With OLLAMA_NUM_PARALLEL unset (=1), N concurrent
+    // requests just queue inside Ollama and thrash the one runner (reloads/timeouts) — serial keeps the model
+    // hot and each mind gets full throughput. If the user HAS set OLLAMA_NUM_PARALLEL>=2, honor their slots and
+    // stay concurrent. The env is inherited from the server that spawned this worker.
+    {
+        const local_ollama = std.mem.eql(u8, m.provider, "ollama") or std.mem.indexOf(u8, base_url, "11434") != null;
+        const par: u32 = if (environ.get("OLLAMA_NUM_PARALLEL")) |v|
+            (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 1)
+        else
+            1;
+        w.serial_minds = local_ollama and par <= 1;
+        if (w.serial_minds) w.act("engine", 0, "sched", "single-slot local Ollama — running mind-moments serially (set OLLAMA_NUM_PARALLEL>=2 to parallelize)", "");
+    }
     // Resolve the DEFAULT patch_system root once: the engine's own source tree (executable home). With this
     // set, RSI self-modification is ON by default — a mind is root of its own VM — without any operator env.
     // An explicit NL_PATCH_SYSTEM_ROOT still overrides it (checked per-call in patchSystemRoot).
@@ -987,8 +1001,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
         }
         const t_mind0 = w.nowSecs();
-        if (minds.items.len <= 1) {
-            for (minds.items) |*mi| results[0] = doMoment(&w, mi, goal, round, live, environ);
+        if (minds.items.len <= 1 or w.serial_minds) {
+            // one mind, or a single-slot local backend: run each moment one at a time (no Io.Group)
+            for (minds.items, 0..) |*mi, i| results[i] = doMoment(&w, mi, goal, round, live, environ);
         } else {
             var grp: std.Io.Group = .init;
             for (minds.items, 0..) |*mi, i| {
