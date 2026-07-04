@@ -930,8 +930,7 @@ pub const Chat = struct {
                     return;
                 }
                 self.tool_iters += 1;
-                self.stream.deinit(self.gpa); // free this turn's stream before the next one starts
-                self.runToolAndContinue(dd, tc);
+                self.runToolAndContinue(dd, tc); // copies tc off the stream, THEN frees it, THEN re-enters
                 return; // a fresh .tool_follow turn is now live; stay busy
             }
         }
@@ -1114,16 +1113,28 @@ pub const Chat = struct {
     /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
+        // tc.name/tc.args are slices INTO self.stream.content — copy them onto the stack BEFORE we free the
+        // stream, or they dangle (a use-after-free that surfaced as a mojibake tool name + netcli NULL).
+        var namebuf: [64]u8 = undefined;
+        var rawbuf: [1024]u8 = undefined;
+        const nn = @min(tc.name.len, namebuf.len);
+        @memcpy(namebuf[0..nn], tc.name[0..nn]);
+        const name = namebuf[0..nn];
+        const rn = @min(tc.args.len, rawbuf.len);
+        @memcpy(rawbuf[0..rn], tc.args[0..rn]);
+        const raw_args = rawbuf[0..rn];
+        self.stream.deinit(self.gpa); // now safe — name/raw_args are owned copies
+
         var abuf: [256]u8 = undefined;
-        var args = tc.args;
-        const orchestration = std.mem.eql(u8, tc.name, "stop_swarm") or std.mem.eql(u8, tc.name, "swarm_findings");
-        if (orchestration and self.cast_active and self.cast_hex_len > 0 and !hasRealId(tc.args)) {
-            args = std.fmt.bufPrint(&abuf, "{{\"id\":\"{s}\"}}", .{self.cast_hex[0..self.cast_hex_len]}) catch tc.args;
+        var args = raw_args;
+        const orchestration = std.mem.eql(u8, name, "stop_swarm") or std.mem.eql(u8, name, "swarm_findings");
+        if (orchestration and self.cast_active and self.cast_hex_len > 0 and !hasRealId(raw_args)) {
+            args = std.fmt.bufPrint(&abuf, "{{\"id\":\"{s}\"}}", .{self.cast_hex[0..self.cast_hex_len]}) catch raw_args;
         }
 
         var stbuf: [96]u8 = undefined;
-        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s}...", .{tc.name}) catch "running a tool...");
-        log.info("chat tool: run {s} args={s}", .{ tc.name, args[0..@min(args.len, 100)] });
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s}...", .{name}) catch "running a tool...");
+        log.info("chat tool: run {s} args={s}", .{ name, args[0..@min(args.len, 100)] });
 
         var tokb: [128]u8 = undefined;
         var tok_n: usize = 0;
@@ -1140,7 +1151,7 @@ pub const Chat = struct {
         var body: [2048]u8 = undefined;
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
-            w.print("{{\"tool\":\"{s}\",\"args\":\"", .{tc.name}) catch break :blk false;
+            w.print("{{\"tool\":\"{s}\",\"args\":\"", .{name}) catch break :blk false;
             wesc(&w, args);
             w.writeAll("\"}") catch break :blk false;
             break :blk true;
@@ -1152,18 +1163,18 @@ pub const Chat = struct {
             result = "(the tool arguments were too long to send)";
         } else if (netcli.chatTool(self.io, self.gpa, port, tokb[0..tok_n], w.buffered())) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
-            log.info("chat tool: {s} -> status={d} body={s}", .{ tc.name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
+            log.info("chat tool: {s} -> status={d} body={s}", .{ name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
             result = extractToolResult(resp.body, &rbuf);
-            if (std.mem.eql(u8, tc.name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
+            if (std.mem.eql(u8, name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
         } else {
             result = "(no response from the veil server on :8787 — is it running?)";
-            log.err("chat tool: {s} netcli NULL", .{tc.name});
+            log.err("chat tool: {s} netcli NULL", .{name});
         }
 
         // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
         // model sees it as user content; it's also the user-visible record that the tool ran).
         var fb: [8320]u8 = undefined;
-        const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ tc.name, result }) catch result;
+        const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ name, result }) catch result;
         self.appendMsg(dd, .cast_note, folded);
         self.startTurn(dd, .tool_follow);
     }
