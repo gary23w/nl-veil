@@ -2601,19 +2601,68 @@ fn gatherCastFindings(w: *Worker, cap: usize) []u8 {
     return out.toOwnedSlice(gpa) catch &.{};
 }
 
+/// Read the files the team ACTUALLY built this run (from .build_manifest) with their real contents, so the
+/// synthesis reports what was delivered instead of an abstract plan. Dedups by path (a file grows across
+/// rounds), skips its own synthesis + pycache/binary noise, and bounds total + per-file size.
+fn gatherBuiltFiles(w: *Worker, cap: usize) []u8 {
+    const gpa = w.gpa;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{w.run_dir}) catch return &.{};
+    defer gpa.free(mpath);
+    const manifest = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(256 << 10)) catch return &.{};
+    defer gpa.free(manifest);
+    var uniq: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer uniq.deinit(gpa);
+    var it = std.mem.splitScalar(u8, manifest, '\n');
+    while (it.next()) |line| {
+        const bar = std.mem.indexOfScalar(u8, line, '|') orelse continue;
+        var p = std.mem.trim(u8, line[0..bar], " \r\t");
+        if (std.mem.startsWith(u8, p, "work/")) p = p["work/".len..];
+        if (p.len == 0) continue;
+        if (std.mem.endsWith(u8, p, "synthesis.md") or std.mem.endsWith(u8, p, ".pyc") or std.mem.indexOf(u8, p, "__pycache__") != null) continue;
+        var dup = false;
+        for (uniq.items) |u| {
+            if (std.mem.eql(u8, u, p)) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) uniq.append(gpa, p) catch {};
+    }
+    for (uniq.items) |p| {
+        if (out.items.len >= cap) break;
+        const fpath = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, p }) catch continue;
+        defer gpa.free(fpath);
+        const content = std.Io.Dir.cwd().readFileAlloc(w.io, fpath, gpa, .limited(8 << 10)) catch continue;
+        defer gpa.free(content);
+        const hdr = std.fmt.allocPrint(gpa, "=== FILE: {s} ({d} bytes) ===\n", .{ p, content.len }) catch continue;
+        defer gpa.free(hdr);
+        out.appendSlice(gpa, hdr) catch {};
+        out.appendSlice(gpa, clip(content, 1800)) catch {};
+        out.appendSlice(gpa, "\n\n") catch {};
+    }
+    return out.toOwnedSlice(gpa) catch &.{};
+}
+
 fn castSynthesize(w: *Worker, goal: []const u8) void {
     const gpa = w.gpa;
-    const retrieved = gatherCastFindings(w, 8000); // what the scouts pulled from the web THIS run (events)
+    const retrieved = gatherCastFindings(w, 6000); // what the scouts pulled from the web THIS run (events)
     defer gpa.free(retrieved);
+    const built = gatherBuiltFiles(w, 6000); // the files the team ACTUALLY wrote, with real contents
+    defer gpa.free(built);
     const hive = w.mem.list(tools.KNOWLEDGE_SCOPE);
     defer gpa.free(hive);
     const has_web = std.mem.trim(u8, retrieved, " \r\n\t").len >= 20;
-    if (!has_web and std.mem.trim(u8, hive, " \r\n\t").len < 20) {
+    const has_built = std.mem.trim(u8, built, " \r\n\t").len > 0;
+    if (!has_web and !has_built and std.mem.trim(u8, hive, " \r\n\t").len < 20) {
         w.act("veil", 1, "synthesis", "no usable findings — the scouts returned nothing to compose from", "");
         return;
     }
-    const sys = "You are the LEAD of a research strike team. Below is what your scouts RETRIEVED from the web this run (search results and fetched page content) plus any team notes. Compose the FINAL ANSWER to the goal: a clear, organized, COMPLETE report that directly answers it, grounded ONLY in this retrieved material — cite the source URL where one appears, and do NOT invent facts not present. If the material is thin or search-only, report what WAS found and name the sources; never fabricate. This report is exactly what the user receives.";
-    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above.", .{ clip(goal, 300), if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 2000) }) catch return;
+    // Build-aware: if the team wrote files, the report must describe the DELIVERED code (grounded in its real
+    // content), not an abstract plan — the old research-only prompt made a good build's synthesis read as
+    // "here's what you should implement" and even offer to "provide code" it had already written.
+    const sys = "You are the LEAD of a strike team reporting the FINAL result of this run to the user. Ground your report ONLY in the material below: the FILES YOUR TEAM ACTUALLY BUILT (their real contents are shown), plus anything the scouts retrieved and the team notes. Report WHAT WAS DELIVERED — describe each built file by what the code ACTUALLY does (you can SEE the code, so state it plainly — never hedge with 'likely'/'should'), how to run it, and HONESTLY name anything the goal asked for that is missing or incomplete. NEVER claim a file exists that is not in the list, and NEVER offer to 'provide code' or 'example snippets' — the code is already built and shown above. If the run was research-only (no files), report the findings + name the sources instead. This report is exactly what the user receives.";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n=== FILES YOUR TEAM BUILT (actual contents) ===\n{s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above: describe what was built (and what's missing vs the goal).", .{ clip(goal, 300), if (has_built) built else "(no files were built this run — this was research-only)", if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 1500) }) catch return;
     defer gpa.free(user);
     const reply = llm.chat(gpa, w.io, w.run_dir, "synthesis", w.base_url, w.key, w.model, sys, user, 2048);
     defer gpa.free(reply.content);
@@ -2624,7 +2673,7 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
     const path = std.fmt.allocPrint(gpa, "{s}/synthesis.md", .{wdir}) catch return;
     defer gpa.free(path);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = reply.content }) catch {};
-    w.act("veil", 1, "synthesis", "composed the final answer from the team's retrieved findings", clip(reply.content, 500));
+    w.act("veil", 1, "synthesis", if (has_built) "composed the final report from the team's BUILT files + findings" else "composed the final answer from the team's retrieved findings", clip(reply.content, 500));
     w.emit("synthesis", std.fmt.allocPrint(w.a(), ",\"chars\":{d}", .{reply.content.len}) catch ",\"chars\":0");
 }
 
