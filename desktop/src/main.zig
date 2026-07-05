@@ -46,6 +46,7 @@ const Ui = struct {
     mh_count: usize = 0,
     mh_cols: usize = 0,
     mh_fp: u64 = 0,
+    tool_open: ?usize = null, // which tool-call message is expanded (else all collapsed to a one-line chip)
     chat: Field = .{},
     // Chat tab
     c_input: Field = .{},
@@ -1451,6 +1452,52 @@ fn renderCastLive(view: t.Rect, y0: f32, status: []const u8, draw: bool) f32 {
     return y0 + MSG_LINE_H + 6 + MSG_GAP_H;
 }
 
+const TOOL_CHIP_H: f32 = 30;
+
+/// If a chat message is a tool call — the model's "TOOL: name ..." request or the "[tool:name]\n<result>"
+/// result — return the tool name. These are hidden behind a compact clickable chip instead of dumping the raw
+/// JSON/result into the chat (the user reads a friendly line; the model still gets the full text).
+fn toolName(text: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, text, "[tool:")) {
+        const close = std.mem.indexOfScalar(u8, text[6..], ']') orelse return null;
+        return text[6 .. 6 + close];
+    }
+    if (std.mem.startsWith(u8, text, "TOOL:")) {
+        const rest = std.mem.trim(u8, text[5..], " \r\t");
+        const sp = std.mem.indexOfAny(u8, rest, " \t{\r\n") orelse rest.len;
+        const nm = std.mem.trim(u8, rest[0..sp], " \t:");
+        return if (nm.len > 0) nm else null;
+    }
+    return null;
+}
+
+/// An engaging, human one-liner for a tool name (the collapsed chip label).
+fn toolFriendly(name: []const u8) [:0]const u8 {
+    if (std.mem.eql(u8, name, "web_search")) return t.z("searched the web", .{});
+    if (std.mem.eql(u8, name, "web_fetch")) return t.z("fetched a page", .{});
+    if (std.mem.eql(u8, name, "fetch_json")) return t.z("fetched data", .{});
+    if (std.mem.eql(u8, name, "read_url")) return t.z("read a page", .{});
+    if (std.mem.eql(u8, name, "deep_crawl")) return t.z("crawled the web", .{});
+    if (std.mem.eql(u8, name, "list_swarms")) return t.z("checked the swarms", .{});
+    if (std.mem.eql(u8, name, "stop_swarm")) return t.z("stopped the swarm", .{});
+    if (std.mem.eql(u8, name, "swarm_findings")) return t.z("read the swarm's findings", .{});
+    if (std.mem.eql(u8, name, "recall_hive")) return t.z("recalled memory", .{});
+    if (std.mem.eql(u8, name, "observe")) return t.z("saved a note to memory", .{});
+    if (std.mem.eql(u8, name, "share")) return t.z("shared to the hive", .{});
+    return t.z("used a tool", .{});
+}
+
+/// Draw the collapsed tool chip (one line, hover-highlit). Returns true on click (to expand/collapse).
+fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
+    const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 22 };
+    const hot = t.hovering(r) and t.hovering(view);
+    t.panelBordered(r, if (hot) t.bg_sel else t.bg_hl, if (hot) t.blue else t.border);
+    t.text(t.z("tool", .{}), @intFromFloat(r.x + 8), @intFromFloat(y0 + 9), 10, t.blue);
+    t.text(toolFriendly(name), @intFromFloat(r.x + 44), @intFromFloat(y0 + 8), 12, t.fg);
+    t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 36), @intFromFloat(y0 + 9), 10, if (hot) t.fg else t.comment);
+    return hot and rl.isMouseButtonPressed(.left);
+}
+
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
     const input_h: f32 = 38;
     const status_h: f32 = 20;
@@ -1464,8 +1511,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // long chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
     var fp: u64 = 0;
     for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
+    fp +%= @as(u64, ui.tool_open orelse 0xffff) << 40; // expand/collapse changes a tool message's height
     if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
-        for (msgs, 0..) |*m, i| ui.mh[i] = renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+        for (msgs, 0..) |*m, i| {
+            ui.mh[i] = if (toolName(m.textStr()) != null and ui.tool_open != i)
+                TOOL_CHIP_H // collapsed tool call = a one-line chip (keeps huge JSON/results out of the layout)
+            else
+                renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+        }
         ui.mh_count = msgs.len;
         ui.mh_cols = cols;
         ui.mh_fp = fp;
@@ -1496,6 +1549,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
+        if (toolName(m.textStr())) |tn| {
+            // Tool calls render as a compact chip (raw JSON/result hidden). Click to expand/collapse; the full
+            // text is untouched in the message, so the model still receives it and copy still grabs it.
+            if (ui.tool_open == i) {
+                _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = 20 };
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
+            } else if (toolChip(view, y0, tn, false)) {
+                ui.tool_open = i;
+            }
+            continue;
+        }
         _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
