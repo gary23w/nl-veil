@@ -1108,6 +1108,36 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
 
 /// Compose the streaming display: reasoning as a `> ` blockquote, a blank line, then the answer. Matches
 /// how a finished veil message is stored (Chat.appendVeil), so the live view and the settled view agree.
+/// While a turn STREAMS a tool call, the raw `TOOL: write_file {"content":"<!DOCTYPE…"}` — a whole escaped file —
+/// otherwise dumps into the chat as a wall of JSON until the turn settles and collapses to a chip. Detect the
+/// tool-call prefix live and return a compact one-line placeholder ("writing snake.html…"); null if not a tool call.
+fn streamToolLabel(content: []const u8, buf: []u8) ?[]const u8 {
+    const c = std.mem.trimStart(u8, content, " \r\n\t");
+    var name: []const u8 = "";
+    if (std.mem.startsWith(u8, c, "TOOL:")) {
+        const rest = std.mem.trimStart(u8, c[5..], " ");
+        var i: usize = 0;
+        while (i < rest.len and (std.ascii.isAlphanumeric(rest[i]) or rest[i] == '_')) i += 1;
+        name = rest[0..i];
+    } else if (std.mem.startsWith(u8, c, "<tool:")) {
+        const rest = c[6..];
+        name = rest[0 .. std.mem.indexOfScalar(u8, rest, '>') orelse rest.len];
+    } else return null;
+    if (name.len == 0) return null;
+    // pull "path":"…" out of the (still-streaming) args for a friendlier label; empty until it arrives
+    var path: []const u8 = "";
+    if (std.mem.indexOf(u8, c, "\"path\"")) |at| {
+        const after = c[at + 6 ..];
+        if (std.mem.indexOfScalar(u8, after, ':')) |colon| {
+            const v = std.mem.trimStart(u8, after[colon + 1 ..], " ");
+            if (v.len > 1 and v[0] == '"') path = v[1 .. std.mem.indexOfScalarPos(u8, v, 1, '"') orelse v.len];
+        }
+    }
+    const verb: []const u8 = if (std.mem.eql(u8, name, "write_file")) "writing" else if (std.mem.eql(u8, name, "edit_file")) "editing" else if (std.mem.eql(u8, name, "read_file")) "reading" else if (std.mem.eql(u8, name, "run_tests")) "running tests" else if (std.mem.eql(u8, name, "run_python")) "running" else "calling";
+    const target = if (path.len > 0) path else name;
+    return std.fmt.bufPrint(buf, "{s} {s}...", .{ verb, target }) catch null;
+}
+
 fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8) []const u8 {
     var w: usize = 0;
     if (reasoning.len > 0) {
@@ -1129,8 +1159,12 @@ fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8) []const 
             w += 1;
         }
     }
-    const cn = @min(content.len, buf.len - w);
-    @memcpy(buf[w .. w + cn], content[0..cn]);
+    // If the reply is streaming a tool call, show a compact "writing <file>…" line instead of the raw escaped
+    // JSON body (which is a wall of text until the turn settles and collapses to a chip).
+    var tbuf: [160]u8 = undefined;
+    const shown = streamToolLabel(content, &tbuf) orelse content;
+    const cn = @min(shown.len, buf.len - w);
+    @memcpy(buf[w .. w + cn], shown[0..cn]);
     w += cn;
     return buf[0..w];
 }
