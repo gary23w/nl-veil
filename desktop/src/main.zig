@@ -54,6 +54,7 @@ const Ui = struct {
     c_renaming: bool = false, // the active conversation's title is being edited in the left pane
     chat_scroll: f32 = 0,
     chat_follow: bool = true,
+    chat_metrics: bool = false, // center pane shows the Metrics view (perf graphs) instead of the conversation
     // Settings: chat model provider fields
     s_model: Field = .{},
     s_url: Field = .{},
@@ -1606,7 +1607,15 @@ fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
     const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
     const status_h: f32 = 20;
-    const view = t.Rect{ .x = r.x, .y = r.y, .width = r.width, .height = r.height - input_h - status_h - 10 };
+    const tab_h: f32 = 22;
+    // Chat | Metrics inner tabs (Metrics = live per-turn performance graphs for the current model)
+    if (t.tab(.{ .x = r.x, .y = r.y, .width = 86, .height = tab_h }, t.z("Chat", .{}), !ui.chat_metrics)) ui.chat_metrics = false;
+    if (t.tab(.{ .x = r.x + 90, .y = r.y, .width = 86, .height = tab_h }, t.z("Metrics", .{}), ui.chat_metrics)) ui.chat_metrics = true;
+    if (ui.chat_metrics) {
+        drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - tab_h - 2 });
+        return;
+    }
+    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - input_h - status_h - 10 - tab_h - 2 };
     t.panelBordered(view, t.bg_dark, t.border);
 
     const fsz: i32 = 14;
@@ -1735,6 +1744,109 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         ui.c_input.len = 0;
         ui.chat_follow = true;
     }
+}
+
+/// A small labeled stat readout (label above, big value below) — compact, borderless, for the Metrics row.
+fn metricStat(x: f32, y: f32, label: [:0]const u8, value: [:0]const u8) void {
+    t.text(label, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+    t.text(value, @intFromFloat(x), @intFromFloat(y + 15), 18, t.fg);
+}
+
+/// A titled bar chart of `vals` (one bar per turn, newest at the right), scaled to its own max. Bars for a
+/// failed turn are tinted red. Returns the next y below the chart.
+fn barRow(r: t.Rect, label: [:0]const u8, vals: []const f32, samples: []const store_mod.TurnMetric, color: t.Color, y: f32) f32 {
+    const pad: f32 = 14;
+    t.text(label, @intFromFloat(r.x + pad), @intFromFloat(y), 12, t.fg_dim);
+    const gy = y + 18;
+    const gh: f32 = 54;
+    const gw = r.width - pad * 2;
+    const n = vals.len;
+    var maxv: f32 = 0.0001;
+    for (vals) |v| {
+        if (v > maxv) maxv = v;
+    }
+    // max-value label at the top-right of the chart
+    t.text(t.z("{d:.0}", .{maxv}), @intFromFloat(r.x + r.width - pad - 44), @intFromFloat(y), 11, t.comment);
+    const slot = if (n > 0) gw / @as(f32, @floatFromInt(n)) else gw;
+    const bw = @max(2.0, slot - 1.0);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const h = @max(1.0, vals[i] / maxv * gh);
+        const bx = r.x + pad + @as(f32, @floatFromInt(i)) * slot;
+        const c = if (samples[i].ok) color else t.red;
+        t.fillRect(@intFromFloat(bx), @intFromFloat(gy + gh - h), @intFromFloat(bw), @intFromFloat(h), c);
+    }
+    t.hline(@intFromFloat(r.x + pad), @intFromFloat(gy + gh + 1), @intFromFloat(gw), t.border);
+    return gy + gh + 20;
+}
+
+/// The Metrics inner tab — live per-turn performance graphs for the current model (tok/s, first-byte latency,
+/// turn time) + aggregate stats. This is both the "how is it doing" developer view and the harness for
+/// comparing open-source models on the same tasks.
+fn drawChatMetrics(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    var samples: [store_mod.METRIC_RING]store_mod.TurnMetric = undefined;
+    var model_buf: [96]u8 = undefined;
+    store.lock();
+    const total = store.turn_metric_count;
+    const n = @min(total, store_mod.METRIC_RING);
+    const startidx = if (total > store_mod.METRIC_RING) total % store_mod.METRIC_RING else 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) samples[i] = store.turn_metrics[(startidx + i) % store_mod.METRIC_RING];
+    const kind = store.settings.chat_kind;
+    const byok = store.settings.chat_byok;
+    const model_n = store.settings.chat_model_len;
+    @memcpy(model_buf[0..model_n], store.settings.chat_model[0..model_n]);
+    store.unlock();
+
+    const pad: f32 = 14;
+    var y: f32 = r.y + 12;
+    const prov_lbl: [:0]const u8 = switch (kind) {
+        1 => t.zs(catalog.providers[@min(byok, catalog.providers.len - 1)].label),
+        2 => t.z("custom endpoint", .{}),
+        else => t.z("local (Ollama)", .{}),
+    };
+    t.text(t.z("Model performance", .{}), @intFromFloat(r.x + pad), @intFromFloat(y), 16, t.fg);
+    t.text(prov_lbl, @intFromFloat(r.x + r.width - pad - @as(f32, @floatFromInt(t.measure(prov_lbl, 12)))), @intFromFloat(y + 3), 12, t.comment);
+    y += 24;
+    t.textClip(if (model_n > 0) model_buf[0..model_n] else "(no model set)", @intFromFloat(r.x + pad), @intFromFloat(y), 13, t.cyan, @intFromFloat(r.width - pad * 2));
+    y += 26;
+
+    if (n == 0) {
+        t.text(t.z("no turns recorded yet - send a message and the graphs populate here.", .{}), @intFromFloat(r.x + pad), @intFromFloat(y + 8), 12, t.comment);
+        return;
+    }
+
+    // aggregates: tok/s + first-byte over successful turns; success rate over all
+    var sum_toks: f32 = 0;
+    var toks_n: usize = 0;
+    var sum_fb: f64 = 0;
+    var oks: usize = 0;
+    for (samples[0..n]) |s| {
+        if (!s.ok) continue;
+        oks += 1;
+        sum_fb += @floatFromInt(s.first_byte_ms);
+        if (s.tok_per_s > 0) {
+            sum_toks += s.tok_per_s;
+            toks_n += 1;
+        }
+    }
+    const avg_toks: f32 = if (toks_n > 0) sum_toks / @as(f32, @floatFromInt(toks_n)) else 0;
+    const avg_fb: f64 = if (oks > 0) sum_fb / @as(f64, @floatFromInt(oks)) else 0;
+    const okpct: f32 = @as(f32, @floatFromInt(oks)) / @as(f32, @floatFromInt(n)) * 100.0;
+    metricStat(r.x + pad, y, t.z("turns", .{}), t.z("{d}", .{total}));
+    metricStat(r.x + pad + 120, y, t.z("avg tok/s", .{}), t.z("{d:.1}", .{avg_toks}));
+    metricStat(r.x + pad + 250, y, t.z("avg 1st-byte", .{}), t.z("{d:.0} ms", .{avg_fb}));
+    metricStat(r.x + pad + 400, y, t.z("success", .{}), t.z("{d:.0}%", .{okpct}));
+    y += 52;
+
+    var vals: [store_mod.METRIC_RING]f32 = undefined;
+    for (0..n) |k| vals[k] = samples[k].tok_per_s;
+    y = barRow(r, t.z("output tok/s (per turn)", .{}), vals[0..n], samples[0..n], t.green, y);
+    for (0..n) |k| vals[k] = @floatFromInt(samples[k].first_byte_ms);
+    y = barRow(r, t.z("first-byte latency (ms)", .{}), vals[0..n], samples[0..n], t.cyan, y);
+    for (0..n) |k| vals[k] = @floatFromInt(samples[k].total_ms);
+    y = barRow(r, t.z("turn time (ms)", .{}), vals[0..n], samples[0..n], t.blue, y);
 }
 
 fn castStatusColor(st: store_mod.CastStatus) t.Color {
