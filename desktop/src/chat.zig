@@ -90,9 +90,11 @@ const SYSTEM_PROMPT =
     "RUN: <shell command>\n" ++
     "Then STOP. I run it in the Veil console tab and reply with a [console] message containing its output; read " ++
     "that, then either RUN another command or give your final answer. One command per reply, never RUN with prose " ++
-    "in the same reply. Only use RUN when the user actually wants system/terminal work — quote paths with spaces, " ++
-    "prefer non-destructive commands, and never run something irreversible (deleting data, killing processes) " ++
-    "without the user asking for it. For pure web/research questions use web_search or CAST, not RUN.\n" ++
+    "in the same reply. This is WINDOWS cmd — use the Windows commands (dir, type, cd, copy, del, findstr, " ++
+    "python), NOT unix ones (ls, cat, pwd, head, rm) which don't exist here and will error. Only use RUN when the " ++
+    "user actually wants system/terminal work — quote paths with spaces, prefer non-destructive commands, and " ++
+    "never run something irreversible (deleting data, killing processes) without the user asking. For pure " ++
+    "web/research questions use web_search or CAST, not RUN.\n" ++
     "\n" ++
     "GROUND YOURSELF — you have NO live knowledge. Before you answer anything about current events, prices, " ++
     "versions, or the SPECIFIC steps of a task you're not sure how to do (e.g. 'how do I host this on Cloudflare', " ++
@@ -115,8 +117,9 @@ const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) we
 
 const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer };
 
-// Bound the model→tool→model loop so a confused local model can't spin forever on tool calls.
-const MAX_TOOL_ITERS: u32 = 5;
+// Bound the model→tool→model loop so a confused local model can't spin forever on tool calls. A real build
+// legitimately reads + writes + tests many files in a row, so this must be generous (5 gave up mid-build).
+const MAX_TOOL_ITERS: u32 = 20;
 
 // Prompt-loop (full-auto mode): after a turn settles, the AI writes the NEXT user message itself and sends it,
 // continuing the conversation toward the goal until it emits DONE or hits the iteration cap. LOOP_MAX_ITERS is
