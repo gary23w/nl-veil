@@ -33,41 +33,37 @@ const ToolReq = struct {
     dir: []const u8 = "", // conversation id → a per-conversation build workdir (sanitized server-side)
 };
 
-// Read-only / research / memory tools a chat turn may run in-process. Host + engine-patch tools (host_*,
-// patch_system, send_message) stay excluded. Orchestration verbs are handled ahead of this list.
-const MIND_ALLOW = [_][]const u8{
-    "web_search", "web_fetch",  "fetch_json", "read_url",
-    "recall_hive", "observe",   "share",      "deep_crawl",
+// FULL TOOL CONVERGENCE — the chat AI gets the SAME tool surface a hive mind has (the user's ask). The tools
+// route to the identical tools.execute() the swarm uses; they split by RISK, not by capability:
+//
+// SAFE_TOOLS run for ANY authed user — research + memory + persona + coordination + files. The file tools are
+// confined by tools.safeRel to the per-conversation workdir; the rest write only into the chat's own run_dir /
+// memory DB, or degrade gracefully with no swarm context (probe → "no spatial grid", send_message → a note).
+const SAFE_TOOLS = [_][]const u8{
+    "web_search",   "web_fetch",  "fetch_json",     "read_url",     "deep_crawl",
+    "recall_hive",  "recall",     "observe",        "share",        "note_stance",
+    "save_skill",   "journal",    "set_directive",  "add_task",     "complete_task",
+    "send_message", "probe",      "write_file",     "edit_file",    "read_file",
+    "list_dir",     "delete_file",
 };
 
-// The FILE tools — the SAME executor + workdir discipline a hive mind uses. Opening these gives the single
-// chat AI full convergence with the swarm: it writes real files to its build workdir (not just the chat
-// buffer), chunks big files, and edits in place. Confined by tools.safeRel (rejects absolute paths + "..")
-// to the per-conversation build workdir — so a chat can build exactly like a cast. Safe for any authed user.
-const BUILD_FILE_ALLOW = [_][]const u8{
-    "write_file", "edit_file", "read_file", "list_dir", "delete_file",
+// ADMIN_TOOLS are the powerful ones — arbitrary code exec, HOST control, engine self-modification, tool
+// authoring, egress, aggressive recon. Casts run these but pass deployCore's entitlement gates; this endpoint
+// has none and serves "any external client", so gate them to ADMINS. The desktop is admin on localhost, so it
+// gets the FULL hive-mind surface; a hosted non-admin tenant gets the safe subset.
+const ADMIN_TOOLS = [_][]const u8{
+    "run_python",     "run_tests",     "patch_system",  "make_tool",     "propose_change",
+    "simulate_change", "stage_delivery", "osint_scan",   "host_status",   "host_command",
+    "host_explore",
 };
 
-// The EXEC tools run arbitrary code (with cwd = the workdir but NO fs sandbox). Casts already run these, but
-// they pass through deployCore's entitlement/metering gates; the chat/tool endpoint has none, and it serves
-// "any external client". So gate code-exec to ADMINS — the desktop is admin on localhost (full build+test),
-// while a hosted non-admin tenant gets file-writing but not unmetered arbitrary execution.
-const BUILD_EXEC_ALLOW = [_][]const u8{
-    "run_tests", "run_python",
-};
-
-fn mindAllowed(name: []const u8) bool {
-    for (MIND_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
+fn toolSafe(name: []const u8) bool {
+    for (SAFE_TOOLS) |a| if (std.mem.eql(u8, a, name)) return true;
     return false;
 }
 
-fn buildFileAllowed(name: []const u8) bool {
-    for (BUILD_FILE_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
-    return false;
-}
-
-fn buildExecAllowed(name: []const u8) bool {
-    for (BUILD_EXEC_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
+fn toolAdminOnly(name: []const u8) bool {
+    for (ADMIN_TOOLS) |a| if (std.mem.eql(u8, a, name)) return true;
     return false;
 }
 
@@ -101,15 +97,17 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (std.mem.eql(u8, tool, "stop_swarm")) return stopSwarm(app, u.id, argId(body), res);
     if (std.mem.eql(u8, tool, "swarm_findings")) return findings(app, u.id, argId(body), res);
 
-    // --- mind + build tools (the same executor the hive uses) ------------------------------
-    // Code-exec (run_python / run_tests) is admin-only: it has no fs sandbox and this endpoint has no
-    // metering, unlike the cast path. File tools are safe for any authed user (safeRel-confined).
-    if (buildExecAllowed(tool) and !app.auth.isAdmin(u)) {
+    // --- the full hive-mind tool surface (the same executor the hive uses) -----------------
+    // SAFE tools run for any authed user; ADMIN tools (code-exec, host control, engine self-mod, egress) are
+    // admin-only — the desktop is admin on localhost, so it gets the complete swarm surface.
+    const safe = toolSafe(tool);
+    const admin_only = toolAdminOnly(tool);
+    if (!safe and !admin_only) return badReq(res, "unknown or disallowed tool");
+    if (admin_only and !app.auth.isAdmin(u)) {
         res.status = 403;
-        try res.json(.{ .ok = false, .err = "run_python/run_tests is admin-only on the chat surface" }, .{});
+        try res.json(.{ .ok = false, .err = "this tool is admin-only on the chat surface (code-exec / host / engine / egress)" }, .{});
         return;
     }
-    if (!mindAllowed(tool) and !buildFileAllowed(tool) and !buildExecAllowed(tool)) return badReq(res, "unknown or disallowed tool");
     return runMindTool(app, u.id, tool, body.args, safeSeg(body.dir), res);
 }
 
