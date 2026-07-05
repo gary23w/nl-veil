@@ -12,7 +12,8 @@ pub const Entitlements = struct {
 };
 
 pub fn entitlements(plan: Plan, is_admin: bool) Entitlements {
-    if (is_admin) return .{ .max_swarms = 10, .max_minds = 50, .per_swarm_minds = 10, .workers_ai = true, .cloudflare_deploy = true, .encrypted = true };
+    // admin (self-host / localhost operator): a big per-swarm ceiling so a chat-cast can line up up to 30 minds
+    if (is_admin) return .{ .max_swarms = 10, .max_minds = 60, .per_swarm_minds = 30, .workers_ai = true, .cloudflare_deploy = true, .encrypted = true };
     return switch (plan) {
         .free => .{ .max_swarms = 1, .max_minds = 3, .per_swarm_minds = 5, .workers_ai = true, .cloudflare_deploy = false, .encrypted = false },
         .pro => .{ .max_swarms = 3, .max_minds = 5, .per_swarm_minds = 5, .workers_ai = true, .cloudflare_deploy = true, .encrypted = false },

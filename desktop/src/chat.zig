@@ -27,7 +27,16 @@ const SYSTEM_PROMPT =
     "casting a swarm is your primary reasoning tool for real work.\n" ++
     "To cast, make the FIRST line of your reply exactly:\n" ++
     "CAST: <one-line goal for the hive>\n" ++
-    "After that line you may add a short note to the user. Only one cast runs at a time.\n" ++
+    "You CONFIGURE the swarm — right after the CAST line you may add any of these (each on its own line) to load " ++
+    "the payload before it fires:\n" ++
+    "  MINDS <n>   — how many minds to line up (2-30; default 3). Scale to the job: a quick lookup = 2-3, a big " ++
+    "multi-part build = 6-12+. More minds = more parallel workers dividing the labor.\n" ++
+    "  LONG        — a SUSTAINED hivemind (continuous mode) for a big multi-step task that one quick strike can't " ++
+    "finish (a whole app, a deep investigation). Omit it for the default fast one-shot strike (~1-4 min).\n" ++
+    "  MINUTES <n> — the time budget (only meaningful with LONG; e.g. 20, 40).\n" ++
+    "Example — a real build:  CAST: build a complete Flask REST API with auth, 5 endpoints, tests, and a README\\n" ++
+    "MINDS 8\\nLONG\\nMINUTES 30 .  Match the size + posture to the target; a cast is you loading a swarm and " ++
+    "firing it. After the config lines you may add a short note to the user. Only one cast runs at a time.\n" ++
     "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'have the hive research/build X', 'spin up a swarm'. An explicit request is a command: emit the CAST line, never answer it from memory instead.\n" ++
     "OTHERWISE, cast whenever real work would help (do NOT answer from memory):\n" ++
     "- ANY question about current events, news, or the state of the world (you have NO live knowledge and " ++
@@ -218,6 +227,7 @@ pub const Chat = struct {
     cast_rel: [96]u8 = [_]u8{0} ** 96, // resolved run path relative to data dir
     cast_rel_len: usize = 0,
     cast_deadline_s: i64 = 0,
+    cast_minutes: u32 = CAST_MINUTES, // the time budget of the ACTIVE cast (AI-configurable; drives deadline + progress %)
     cast_stop_sent: bool = false,
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
     ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
@@ -1454,7 +1464,7 @@ pub const Chat = struct {
             }
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
-        } else if (castGoal(full)) |goal| {
+        } else if (parseCastSpec(full)) |spec| {
             var nb: [3072]u8 = undefined;
             const note = noteWithoutCast(full, &nb);
             if (self.cast_active) {
@@ -1462,7 +1472,7 @@ pub const Chat = struct {
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
             } else {
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
-                self.fireCast(dd, goal);
+                self.fireCast(dd, spec);
             }
         } else if (kind == .user and !self.cast_active and userWantsCast(self.last_user[0..self.last_user_len])) {
             // The user EXPLICITLY asked to cast but the model didn't emit a CAST line (gpt-oss commonly
@@ -1472,7 +1482,7 @@ pub const Chat = struct {
             const goal = castGoalFromUser(self.last_user[0..self.last_user_len], &gb);
             log.info("cast recovery: model emitted no CAST line; casting from the user request", .{});
             if (full.len > 0 or reason.len > 0) self.appendVeil(dd, reason, full);
-            self.fireCast(dd, goal);
+            self.fireCast(dd, .{ .goal = goal });
         } else if (full.len > 0) {
             self.appendVeil(dd, reason, full);
         } else if (reason.len > 0) {
@@ -1619,9 +1629,15 @@ pub const Chat = struct {
 
     // ------------------------------------------------------------------------------ casting (the existing door)
 
-    /// CAST through the server's cast endpoint (POST /api/v1/cast) — the server owns the cast defaults
-    /// (minutes budget, minds, autonomy dials); the chat only says WHAT to cast and WITH WHICH provider.
-    pub fn fireCast(self: *Chat, dd: []const u8, goal: []const u8) void {
+    /// CAST through the server's cast endpoint (POST /api/v1/cast). The AI configures the payload — the goal,
+    /// how many minds, quick strike vs a sustained (LONG/continuous) hivemind, and the time budget — and the
+    /// chat fires it on the chat's own provider. The server clamps to the plan's ceilings.
+    pub fn fireCast(self: *Chat, dd: []const u8, spec: CastSpec) void {
+        const goal = spec.goal;
+        const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
+        const minutes: u32 = if (spec.minutes > 0) std.math.clamp(spec.minutes, 1, 120) else if (spec.long) 20 else CAST_MINUTES;
+        const mode: []const u8 = if (spec.long) "continuous" else "cast";
+        self.cast_minutes = minutes;
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
         var mb: [96]u8 = undefined;
@@ -1652,13 +1668,13 @@ pub const Chat = struct {
         // Show a "deploying" row + status the INSTANT casting starts, BEFORE building the body — so even a
         // body-build failure is visible (a stuck row) rather than a silent nothing.
         self.pushCastRow(goal);
-        self.setStatus("casting the hive...");
-        log.info("cast: start provider={s} model={s} base={s} port={d} token={d}b goal={s}", .{ prov_key, prov.model, prov.base_url, port, tok_n, goal[0..@min(goal.len, 60)] });
+        self.setStatus(if (spec.long) "casting a long-term hive..." else "casting the hive...");
+        log.info("cast: start provider={s} model={s} minds={d} mode={s} minutes={d} goal={s}", .{ prov_key, prov.model, minds, mode, minutes, goal[0..@min(goal.len, 60)] });
 
         var body: [3072]u8 = undefined;
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
-            w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"api_key\":\"", .{ prov_key, prov.model, prov.base_url, CAST_MINUTES }) catch break :blk false;
+            w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"api_key\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
             wesc(&w, prov.key);
             w.writeAll("\",\"goal\":\"") catch break :blk false;
             wesc(&w, goal);
@@ -1714,7 +1730,7 @@ pub const Chat = struct {
         self.cast_hex_len = @min(hex.len, self.cast_hex.len);
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
-        self.cast_deadline_s = self.nowS() + @as(i64, CAST_MINUTES) * 60 + 120;
+        self.cast_deadline_s = self.nowS() + @as(i64, self.cast_minutes) * 60 + 120;
         var gb: [200]u8 = undefined;
         const note = std.fmt.bufPrint(&gb, "[cast] hive deployed ({s}) — watching", .{hex}) catch "[cast] hive deployed";
         self.appendMsg(dd, .cast_note, note);
@@ -1928,9 +1944,9 @@ pub const Chat = struct {
             // local cast) fall back to an elapsed-vs-budget estimate capped at 90% so the label MOVES instead of
             // sitting at 0 the whole time. cast_deadline_s = start + CAST_MINUTES*60 + 120, so start is derivable.
             const shown_pct: i32 = if (m.pct >= 0) m.pct else blk: {
-                const start = self.cast_deadline_s - (@as(i64, CAST_MINUTES) * 60 + 120);
+                const start = self.cast_deadline_s - (@as(i64, self.cast_minutes) * 60 + 120);
                 const elapsed = self.nowS() - start;
-                const budget: i64 = @as(i64, CAST_MINUTES) * 60;
+                const budget: i64 = @as(i64, self.cast_minutes) * 60;
                 if (elapsed <= 0 or budget <= 0) break :blk 0;
                 break :blk @intCast(@min(@divTrunc(elapsed * 100, budget), 90));
             };
@@ -2065,6 +2081,42 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
         if (seen >= 5) return null; // a CAST mention deep in prose is narration, not an action
     }
     return null;
+}
+
+/// The AI's full cast "payload": the goal + how many minds to line up + quick-strike vs a sustained
+/// (continuous) hivemind + a time budget. This is the AI loading + configuring its swarm before it fires.
+pub const CastSpec = struct { goal: []const u8, minds: u32 = 0, long: bool = false, minutes: u32 = 0 };
+
+fn uintAfter(line: []const u8, key: []const u8) ?u32 {
+    const rest = std.mem.trim(u8, line[key.len..], " :\t=");
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+/// Parse the AI's cast directive: a `CAST: <goal>` line, optionally followed (within the reply's first lines)
+/// by `MINDS <n>` (swarm size, 2-30), `LONG` (a sustained continuous hivemind vs the default quick strike),
+/// and `MINUTES <n>` (time budget). Returns null if there's no CAST line. Config lines must ride near the top,
+/// not buried in prose.
+pub fn parseCastSpec(full: []const u8) ?CastSpec {
+    const g = castGoal(full) orelse return null;
+    var spec = CastSpec{ .goal = g };
+    var it = std.mem.splitScalar(u8, full, '\n');
+    var n: usize = 0;
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t#*-");
+        n += 1;
+        if (n > 8) break;
+        if (std.mem.startsWith(u8, line, "MINDS")) {
+            if (uintAfter(line, "MINDS")) |v| spec.minds = v;
+        } else if (std.mem.startsWith(u8, line, "MINUTES")) {
+            if (uintAfter(line, "MINUTES")) |v| spec.minutes = v;
+        } else if (std.mem.eql(u8, line, "LONG") or std.mem.startsWith(u8, line, "LONG ") or std.mem.eql(u8, line, "CONTINUOUS")) {
+            spec.long = true;
+        }
+    }
+    return spec;
 }
 
 /// Should we run the self-check (reflect) pass for this completed turn? Only a SUBSTANTIVE answer to a
@@ -2322,6 +2374,9 @@ pub fn noteWithoutCast(full: []const u8, buf: []u8) []const u8 {
             removed = true;
             continue;
         }
+        // also drop the cast CONFIG lines so the user-facing note doesn't show "MINDS 8 / LONG / MINUTES 30"
+        if (removed and (std.mem.startsWith(u8, line, "MINDS") or std.mem.startsWith(u8, line, "MINUTES") or
+            std.mem.eql(u8, line, "LONG") or std.mem.startsWith(u8, line, "LONG ") or std.mem.eql(u8, line, "CONTINUOUS"))) continue;
         if (w + raw.len + 1 > buf.len) break;
         if (w > 0) {
             buf[w] = '\n';
@@ -2771,6 +2826,26 @@ test "castGoal fires on a CAST line within the first few lines" {
     try std.testing.expect(castGoal("CAST:") == null);
     // a CAST buried deep in prose is narration
     try std.testing.expect(castGoal("a\nb\nc\nd\ne\nf\nCAST: too deep") == null);
+}
+
+test "parseCastSpec reads the AI's swarm config (minds / LONG / minutes)" {
+    // bare cast → defaults
+    const a = parseCastSpec("CAST: research the topic").?;
+    try std.testing.expectEqualStrings("research the topic", a.goal);
+    try std.testing.expectEqual(@as(u32, 0), a.minds);
+    try std.testing.expect(!a.long);
+    // full payload
+    const b = parseCastSpec("CAST: build a full REST API\nMINDS 8\nLONG\nMINUTES 30\nnote to user").?;
+    try std.testing.expectEqualStrings("build a full REST API", b.goal);
+    try std.testing.expectEqual(@as(u32, 8), b.minds);
+    try std.testing.expect(b.long);
+    try std.testing.expectEqual(@as(u32, 30), b.minutes);
+    // MINDS with a colon; CONTINUOUS as an alias for LONG
+    const c = parseCastSpec("CAST: x\nMINDS: 12\nCONTINUOUS").?;
+    try std.testing.expectEqual(@as(u32, 12), c.minds);
+    try std.testing.expect(c.long);
+    // no CAST line → null
+    try std.testing.expect(parseCastSpec("MINDS 5\nno cast here") == null);
 }
 
 test "shouldReflectPass: only substantive answers to real requests reflect (hello never recurses)" {
