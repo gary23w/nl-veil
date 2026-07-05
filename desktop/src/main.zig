@@ -1593,14 +1593,25 @@ fn toolFriendly(name: []const u8) [:0]const u8 {
     return t.z("used a tool", .{});
 }
 
-/// Draw the collapsed tool chip (one line, hover-highlit). Returns true on click (to expand/collapse).
-fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
-    const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 22 };
+/// The tokens a tool call put into context (result bytes / ~4) — the visible "cost" on the chip line. For a
+/// `[tool:NAME]\n<result>` message that's the result; for a bare `TOOL:` request, the whole line.
+fn tokCostOf(text: []const u8) usize {
+    const body = if (std.mem.indexOfScalar(u8, text, '\n')) |nl| text[nl + 1 ..] else text;
+    return body.len / 4;
+}
+
+/// Draw the collapsed tool line — NO background or border: a colored marker, the tool NAME, its ~token cost,
+/// and a view/hide affordance. Click toggles the detailed dropdown (the full request/result). Returns true on
+/// click.
+fn toolChip(view: t.Rect, y0: f32, name: []const u8, text: []const u8, expanded: bool) bool {
+    const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
     const hot = t.hovering(r) and t.hovering(view);
-    t.panelBordered(r, if (hot) t.bg_sel else t.bg_hl, if (hot) t.blue else t.border);
-    t.text(t.z("tool", .{}), @intFromFloat(r.x + 8), @intFromFloat(y0 + 9), 10, t.blue);
-    t.text(toolFriendly(name), @intFromFloat(r.x + 44), @intFromFloat(y0 + 8), 12, t.fg);
-    t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 36), @intFromFloat(y0 + 9), 10, if (hot) t.fg else t.comment);
+    t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.blue); // small marker dot
+    const nm = t.zs(name); // the actual tool called (read_file, write_file, web_search, …)
+    t.text(nm, @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.fg_dim);
+    const nmw: f32 = @floatFromInt(t.measure(nm, 12));
+    t.text(t.z("~{d} tok", .{tokCostOf(text)}), @intFromFloat(r.x + 24 + nmw), @intFromFloat(y0 + 9), 11, t.comment);
+    t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -1670,7 +1681,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
-            } else if (toolChip(view, y0, tn, false)) {
+            } else if (toolChip(view, y0, tn, m.textStr(), false)) {
                 ui.tool_open = i;
             }
             continue;
@@ -1734,15 +1745,21 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
     textArea(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
     const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy + input_h - 34, .width = 88, .height = 34 };
-    const can_send = ui.c_input.len > 0 and !busy;
-    const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
-    // Enter sends; Shift+Enter is reserved for a future literal newline. Only when the input owns the keyboard.
-    const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
-    const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
-    if (can_send and (clicked or (ui.focus == .c_input and enter))) {
-        store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
-        ui.c_input.len = 0;
-        ui.chat_follow = true;
+    // While a turn is generating (or auto-loop is driving), the send button becomes a red STOP that aborts the
+    // in-flight turn + halts auto-loop, so the user can always take back control.
+    if (busy or loop_on) {
+        if (t.button(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+    } else {
+        const can_send = ui.c_input.len > 0;
+        const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
+        // Enter sends; Shift+Enter is reserved for a future literal newline. Only when the input owns the keyboard.
+        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+        const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
+        if (can_send and (clicked or (ui.focus == .c_input and enter))) {
+            store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
+            ui.c_input.len = 0;
+            ui.chat_follow = true;
+        }
     }
 }
 

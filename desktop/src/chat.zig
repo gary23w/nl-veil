@@ -501,6 +501,7 @@ pub const Chat = struct {
                 .console_run => self.cmdConsoleRun(dd, std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
                 .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
                 .loop_kick => self.maybeLoop(dd), // user just enabled auto-loop while idle → start it now
+                .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
             }
         }
     }
@@ -591,11 +592,15 @@ pub const Chat = struct {
         // scrollback shows the user's ORIGINAL command (trimmed) — only the launched command carries the cd.
         var ecb: [1600]u8 = undefined;
         const run_cmd: []const u8 = if (self.build_dir_len > 0) blk: {
-            const bd = self.build_dir[0..self.build_dir_len];
-            break :blk (if (builtin.os.tag == .windows)
-                std.fmt.bufPrint(&ecb, "cd /d \"{s}\" && {s}", .{ bd, trimmed })
-            else
-                std.fmt.bufPrint(&ecb, "cd \"{s}\" && {s}", .{ bd, trimmed })) catch trimmed;
+            if (builtin.os.tag == .windows) {
+                // cmd's `cd /d` chokes on forward slashes ("The system cannot find the path specified") — the
+                // build dir arrives as {data}/u1/_chat/builds/... (mixed/forward slashes). Normalize to '\\'.
+                var bdw: [400]u8 = undefined;
+                const bd = self.build_dir[0..@min(self.build_dir_len, bdw.len)];
+                for (bd, 0..) |c, k| bdw[k] = if (c == '/') '\\' else c;
+                break :blk std.fmt.bufPrint(&ecb, "cd /d \"{s}\" && {s}", .{ bdw[0..bd.len], trimmed }) catch trimmed;
+            }
+            break :blk std.fmt.bufPrint(&ecb, "cd \"{s}\" && {s}", .{ self.build_dir[0..self.build_dir_len], trimmed }) catch trimmed;
         } else trimmed;
         // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
         const argv = if (builtin.os.tag == .windows)
@@ -1391,7 +1396,9 @@ pub const Chat = struct {
             // Primary: a strict TOOL line in content. Recovery: gpt-oss-style reasoning models sometimes leave
             // content empty and narrate the call in the hidden reasoning ("...so we issue TOOL: web_search {..}")
             // — pull the last TOOL: out of the reasoning so the tool still fires (mirrors the cast recovery).
-            const tc_opt = toolCall(full) orelse (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null);
+            // TOOL: line first; then the `<tool:NAME>{...}</tool:NAME>` XML form (many models use it, even inline);
+            // then a loose recovery from the reasoning channel when content is empty.
+            const tc_opt = toolCall(full) orelse toolCallXml(full) orelse (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null);
             if (tc_opt) |tc| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
@@ -1536,6 +1543,26 @@ pub const Chat = struct {
         self.tool_iters = 0;
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
+    }
+
+    /// The input's Stop button: abort the in-flight model turn (kills the curl stream), halt auto-loop, and
+    /// return to idle so the user can take over. A running CAST is left alone — it has its own Stop in the
+    /// swarm panel — but auto-loop won't re-fire behind it.
+    fn stopTurn(self: *Chat, dd: []const u8) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.chat_loop = false;
+        }
+        self.loop_iter = 0;
+        if (self.turn != .idle) {
+            llm.abort(&self.stream, self.io);
+            self.stream.deinit(self.gpa);
+            self.turn = .idle;
+            self.appendMsg(dd, .cast_note, "(stopped)");
+        }
+        self.setStatus("");
+        self.setBusy(false);
     }
 
     /// Turn auto-loop off and tell the user why (the verifiable stop condition fired).
@@ -2094,6 +2121,38 @@ pub fn toolCall(full: []const u8) ?ToolCall {
         if (seen >= 5) return null;
     }
     return null;
+}
+
+/// Many models emit tool calls as `<tool:NAME>{json-args}</tool:NAME>` (or just `<tool:NAME>{...}`) instead of
+/// the `TOOL:` convention — even inline in prose. Find the FIRST such call anywhere in the reply and return
+/// name+args. Without this those calls render as inert text and the model loops forever re-issuing them (the
+/// Mario walkthrough failure: every `<tool:read_file>` was dropped, so the model never saw the files).
+pub fn toolCallXml(text: []const u8) ?ToolCall {
+    const open = std.mem.indexOf(u8, text, "<tool:") orelse return null;
+    var i = open + "<tool:".len;
+    const nstart = i;
+    while (i < text.len and text[i] != '>' and text[i] != ' ' and text[i] != '\n' and text[i] != '\r' and text[i] != '\t') i += 1;
+    const name = std.mem.trim(u8, text[nstart..i], " \t:`*\"/");
+    if (name.len == 0 or name.len > 40) return null;
+    while (i < text.len and text[i] != '>') i += 1; // skip to the tag close
+    if (i < text.len) i += 1; // skip '>'
+    var args: []const u8 = "{}";
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) i += 1;
+    if (i < text.len and text[i] == '{') { // a balanced {...} blob after the tag
+        const astart = i;
+        var depth: i32 = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '{') depth += 1 else if (text[i] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+        if (depth == 0 and i > astart + 1) args = text[astart..i];
+    }
+    return .{ .name = name, .args = args };
 }
 
 /// Loose recovery: find the LAST "TOOL:" ANYWHERE in text (not just line-start) and parse a tool name +
@@ -2768,6 +2827,19 @@ test "toolCallLoose recovers a call narrated inside reasoning" {
     // bare name, no args -> {}
     try std.testing.expectEqualStrings("{}", toolCallLoose("so I will run TOOL: list_swarms now").?.args);
     try std.testing.expect(toolCallLoose("no tool mentioned here") == null);
+}
+
+test "toolCallXml parses the <tool:NAME>{...}</tool:NAME> form that broke the Mario walkthrough" {
+    const a = toolCallXml("<tool:read_file>{\"path\":\"index.html\"}</tool:read_file>").?;
+    try std.testing.expectEqualStrings("read_file", a.name);
+    try std.testing.expectEqualStrings("{\"path\":\"index.html\"}", a.args);
+    // inline in prose, takes the FIRST one; balanced braces even with nested objects
+    const b = toolCallXml("Let me check. <tool:list_dir>{\"path\":\".\"}</tool:list_dir> then read it").?;
+    try std.testing.expectEqualStrings("list_dir", b.name);
+    try std.testing.expectEqualStrings("{\"path\":\".\"}", b.args);
+    // no args -> {}; not a tool -> null
+    try std.testing.expectEqualStrings("{}", toolCallXml("<tool:list_swarms></tool:list_swarms>").?.args);
+    try std.testing.expect(toolCallXml("just chatting, no tools") == null);
 }
 
 test "loopIsDone recognizes only a bare completion signal, not prose that mentions done" {
