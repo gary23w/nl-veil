@@ -48,12 +48,18 @@ const Spawned = struct { id: []const u8, state: []const u8, minds: usize, run_di
 pub fn deploy(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const body = (try req.json(DeployReq)) orelse return badReq(res, "bad body");
-    const sp = (try deployCore(app, res, u, body)) orelse return;
+    // A raw /deploy request never picks its own run_dir — that would be a path-traversal hole. Only the cast
+    // path (below) supplies a server-sanitized build dir so a chat cast lands in the chat's conversation folder.
+    const sp = (try deployCore(app, res, u, body, "")) orelse return;
     res.status = 201;
     try res.json(.{ .ok = true, .id = sp.id, .state = sp.state, .minds = sp.minds }, .{});
 }
 
-fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq) !?Spawned {
+/// `run_dir_override`, when non-empty, replaces the default `{data}/u{uid}/{id}` run_dir. The swarm id stays a
+/// fresh random hex (URLs + supervisor tracking key off it), but the on-disk run_dir — and therefore the
+/// worker's `{run_dir}/work` build dir — is redirected to a caller-chosen, already-sanitized absolute path.
+/// This is how a chat cast builds IN the chat's conversation dir instead of its own throwaway folder.
+fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, run_dir_override: []const u8) !?Spawned {
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
     if (body.minds.len == 0) {
         try badReq(res, "a swarm needs at least 1 mind");
@@ -93,7 +99,13 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq) !?
     var rnd: [8]u8 = undefined;
     app.io.random(&rnd);
     const id = try std.fmt.allocPrint(res.arena, "{s}", .{std.fmt.bytesToHex(rnd, .lower)});
-    const run_dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/{s}", .{ app.data, u.id, id });
+    // run_dir is the override (a chat conversation dir) when the cast asked to build in place, else the default
+    // per-swarm folder. Either way `{run_dir}/work` is the deliverable dir the worker uses — the worker needs no
+    // change, it just inherits whichever run_dir we spawn it with.
+    const run_dir = if (run_dir_override.len > 0)
+        try res.arena.dupe(u8, run_dir_override)
+    else
+        try std.fmt.allocPrint(res.arena, "{s}/u{d}/{s}", .{ app.data, u.id, id });
     const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{run_dir});
 
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
@@ -273,7 +285,7 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .gateway_model = rq.gateway_model,
         .minds = minds,
     };
-    const sp = (try deployCore(app, res, u, body)) orelse return;
+    const sp = (try deployCore(app, res, u, body, "")) orelse return;
     if (req.header("accept") orelse req.header("Accept")) |acc| {
         if (std.mem.indexOf(u8, acc, "text/event-stream") != null)
             return tail_fanout.startStream(app, res, sp.id, sp.run_dir);
@@ -309,7 +321,21 @@ const CastReq = struct {
     style: []const u8 = "auto",
     name: []const u8 = "",
     mode: []const u8 = "", // "" / "cast" = fast one-shot strike; "continuous" = a sustained long-term hivemind
+    dir: []const u8 = "", // chat conversation id → build IN that chat's dir (so the cast + chat share files)
 };
+
+/// Sanitize a chat conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
+/// bounded). Empty / unsafe → "" and the caller keeps the default throwaway run_dir. Mirrors chat_tools.safeSeg
+/// so the cast's `{data}/u{uid}/_chat/builds/{seg}/work` matches the chat build tools' workdir exactly.
+fn safeConv(arena: std.mem.Allocator, raw: []const u8) []const u8 {
+    const t = std.mem.trim(u8, raw, " \r\n\t");
+    if (t.len == 0 or t.len > 64) return "";
+    for (t) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return "";
+    }
+    return arena.dupe(u8, t) catch "";
+}
 
 pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
@@ -358,7 +384,20 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
         .minds = minds,
     };
-    const sp = (try deployCore(app, res, u, body)) orelse return;
+    // Build IN the chat's conversation dir when the caller named one, so the hive's `{run_dir}/work` is the SAME
+    // folder the chat's own build tools (and the desktop console) use — the cast and the chat co-edit one tree
+    // instead of the cast disappearing into a throwaway `{hex}/work`. Blank/unsafe conv → default per-swarm dir.
+    const conv = safeConv(res.arena, rq.dir);
+    const build_override = if (conv.len > 0)
+        try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/builds/{s}", .{ app.data, u.id, conv })
+    else
+        "";
+    if (build_override.len > 0) {
+        // The chat's build tools create `.../builds/{conv}/work`; the worker will create it too, but make the
+        // parent now so the run_dir root (events.jsonl, swarm.json, minds/) has somewhere to land.
+        _ = std.Io.Dir.cwd().createDirPathStatus(app.io, build_override, .default_dir) catch {};
+    }
+    const sp = (try deployCore(app, res, u, body, build_override)) orelse return;
     res.status = 201;
     try res.json(.{
         .ok = true,

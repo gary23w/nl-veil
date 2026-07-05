@@ -180,14 +180,17 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
     const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, uid });
     // A per-conversation build workdir keeps each chat's files apart (and matches the dir the desktop cd's its
     // console into); no/blank conv id falls back to the shared _chat/work. `conv` is already safeSeg'd.
+    // The `/work` tail is deliberate: a cast for this conversation spawns with run_dir=`.../builds/{conv}`, and
+    // the worker builds in `{run_dir}/work` — so pointing the chat's OWN build tools at `.../builds/{conv}/work`
+    // makes the chat and its hive cast co-edit ONE tree (the user: "work inside the SAME/targeted directory").
     const workdir = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}", .{ base, conv })
+        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}/work", .{ base, conv })
     else
         try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     // data-relative form the desktop can cd its console into (shared filesystem, same machine)
     const workdir_rel = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "u{d}/_chat/builds/{s}", .{ uid, conv })
+        try std.fmt.allocPrint(res.arena, "u{d}/_chat/builds/{s}/work", .{ uid, conv })
     else
         try std.fmt.allocPrint(res.arena, "u{d}/_chat/work", .{uid});
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
