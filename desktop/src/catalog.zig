@@ -2,14 +2,39 @@
 //! web/public/models.json and the wizard's dropdowns. Kept in-binary (not read from disk) so the Deploy form
 //! works with zero external files; the field names + values match the server's DeployReq exactly.
 
+const std = @import("std");
+
 pub const Model = struct { id: []const u8, label: []const u8 };
 pub const Provider = struct {
     key: []const u8,
     label: []const u8,
-    base_url: []const u8, // sent verbatim; "cloudflare"/"local" are resolved server-side
+    base_url: []const u8, // sent verbatim; "cloudflare"/"local" are resolved server-side. May contain the
+    // "{account}" placeholder (Cloudflare) — resolveBase() substitutes the account id before it's used/sent.
     needs_key: bool,
     models: []const Model,
+    needs_account: bool = false, // provider also needs an account id (Cloudflare Workers AI) to build its URL
 };
+
+/// Resolve a provider's base_url. If the template carries the "{account}" placeholder (Cloudflare Workers AI),
+/// substitute the account id into `out` and return that slice; with no account id, return the "cloudflare"
+/// sentinel so the server falls back to its own included/env credentials. Non-templated URLs pass through.
+pub fn resolveBase(p: *const Provider, account: []const u8, out: []u8) []const u8 {
+    const marker = "{account}";
+    const at = std.mem.indexOf(u8, p.base_url, marker) orelse return p.base_url;
+    const acct = std.mem.trim(u8, account, " \t\r\n");
+    if (acct.len == 0) return "cloudflare"; // no account → let the server use its configured Workers AI creds
+    const pre = p.base_url[0..at];
+    const post = p.base_url[at + marker.len ..];
+    if (pre.len + acct.len + post.len > out.len) return "cloudflare"; // won't fit → safe fallback
+    var w: usize = 0;
+    @memcpy(out[w .. w + pre.len], pre);
+    w += pre.len;
+    @memcpy(out[w .. w + acct.len], acct);
+    w += acct.len;
+    @memcpy(out[w .. w + post.len], post);
+    w += post.len;
+    return out[0..w];
+}
 
 pub const providers = [_]Provider{
     .{ .key = "anthropic", .label = "Anthropic (Claude)", .base_url = "https://api.anthropic.com/v1", .needs_key = true, .models = &.{
@@ -31,7 +56,10 @@ pub const providers = [_]Provider{
         .{ .id = "qwen2.5:14b", .label = "Qwen2.5 14B" },
         .{ .id = "llama3.1:8b", .label = "Llama 3.1 8B" },
     } },
-    .{ .key = "workers-ai", .label = "Cloudflare Workers AI (included)", .base_url = "cloudflare", .needs_key = false, .models = &.{
+    // Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (built into the URL)
+    // and an API token. Leaving both blank sends the "cloudflare" sentinel so a server configured with
+    // NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN uses its own (included) credentials instead. See resolveBase().
+    .{ .key = "workers-ai", .label = "Cloudflare Workers AI", .base_url = "https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1", .needs_key = true, .needs_account = true, .models = &.{
         .{ .id = "@cf/meta/llama-3.3-70b-instruct-fp8-fast", .label = "Llama 3.3 70B (fast)" },
         .{ .id = "@cf/meta/llama-3.1-8b-instruct", .label = "Llama 3.1 8B" },
         .{ .id = "@cf/qwen/qwen2.5-coder-32b-instruct", .label = "Qwen2.5 Coder 32B" },
@@ -54,6 +82,22 @@ pub const providers = [_]Provider{
     } },
     .{ .key = "mock", .label = "Mock (dry run — no calls)", .base_url = "", .needs_key = false, .models = &.{
         .{ .id = "mock", .label = "mock" },
+    } },
+    // Hugging Face Inference Providers — one hf_ token routes to hundreds of open models across partner
+    // providers (Cerebras, Groq, Together, Novita, ...). OpenAI-compatible at router.huggingface.co/v1, so it
+    // flows through the standard BYOK path (chat + hive) with no server change. Appended LAST so saved
+    // chat_byok / provider indices above stay valid. The default (no suffix) routes to the fastest provider;
+    // a model id may carry a ":provider"/":cheapest" suffix if the user wants to pin one.
+    .{ .key = "huggingface", .label = "Hugging Face (Inference Providers)", .base_url = "https://router.huggingface.co/v1", .needs_key = true, .models = &.{
+        .{ .id = "openai/gpt-oss-120b", .label = "GPT-OSS 120B" },
+        .{ .id = "openai/gpt-oss-20b", .label = "GPT-OSS 20B" },
+        .{ .id = "deepseek-ai/DeepSeek-V3-0324", .label = "DeepSeek V3" },
+        .{ .id = "deepseek-ai/DeepSeek-R1", .label = "DeepSeek R1" },
+        .{ .id = "meta-llama/Llama-3.3-70B-Instruct", .label = "Llama 3.3 70B" },
+        .{ .id = "meta-llama/Llama-3.1-8B-Instruct", .label = "Llama 3.1 8B" },
+        .{ .id = "Qwen/Qwen2.5-72B-Instruct", .label = "Qwen2.5 72B" },
+        .{ .id = "Qwen/Qwen2.5-Coder-32B-Instruct", .label = "Qwen2.5 Coder 32B" },
+        .{ .id = "mistralai/Mistral-Small-24B-Instruct-2501", .label = "Mistral Small 24B" },
     } },
 };
 

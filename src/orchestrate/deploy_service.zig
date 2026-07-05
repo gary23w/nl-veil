@@ -106,7 +106,11 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq) !?
     var eff_base: []const u8 = body.base_url;
     var eff_model: []const u8 = body.model;
     const wants_cf_ai = std.mem.eql(u8, body.provider, "workers-ai") or std.mem.eql(u8, body.provider, "cloudflare");
-    if (wants_cf_ai and body.api_key.len == 0) {
+    // A client can BYO Cloudflare by sending the fully-resolved account URL + its own token. If it doesn't
+    // (base is the "cloudflare" sentinel or still carries the "{account}" placeholder), fall back to this
+    // server's own configured Workers AI credentials — so a missing account id never yields a broken URL.
+    const cf_base_ok = std.mem.startsWith(u8, body.base_url, "http") and std.mem.indexOf(u8, body.base_url, "{account}") == null;
+    if (wants_cf_ai and (body.api_key.len == 0 or !cf_base_ok)) {
         if (!e.workers_ai) {
             try capErr(res, "Workers AI is not enabled for your account");
             return null;
