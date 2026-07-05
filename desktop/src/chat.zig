@@ -84,6 +84,9 @@ const SYSTEM_PROMPT =
     "write_file then extend it with edit_file — never send one giant file that truncates. After writing code, " ++
     "run_tests (or run_python) to VERIFY it, read the result, fix, and repeat until it works. It's good to also " ++
     "give the user a short summary in the chat of what you wrote — but the real work goes to the files.\n" ++
+    "DON'T THRASH: once a file is written, do NOT re-write the whole thing again next turn. If it's correct, move " ++
+    "to the next file/step or give your final answer; if it needs a change, use edit_file for the specific fix. " ++
+    "Re-emitting the same file over and over never converges — one clean write, then verify or finish.\n" ++
     "\n" ++
     "SHELL — when the user asks you to run a command, work in a directory, inspect files, or drive the system, " ++
     "you have a real terminal on their machine. Make the reply exactly one line:\n" ++
@@ -207,6 +210,11 @@ pub const Chat = struct {
     gpa: std.mem.Allocator,
     store: *Store,
     stop: std.atomic.Value(bool) = .init(false),
+    // Set by the Stop button (stopTurn); checked at every point the turn CHAIN could re-enter (startTurn,
+    // runToolAndContinue, runShellAndContinue). The tool-follow chain has a window where `turn == .idle` while a
+    // BLOCKING tool network call is in flight, so aborting only the live stream let one more tool round-trip fire
+    // after Stop. This flag pre-empts the re-entry. Cleared when a genuinely new user/loop turn begins.
+    abort_turn: std.atomic.Value(bool) = .init(false),
 
     stream: llm.Stream = .{},
     turn: Turn = .idle,
@@ -819,6 +827,7 @@ pub const Chat = struct {
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -1247,6 +1256,14 @@ pub const Chat = struct {
     }
 
     fn startTurn(self: *Chat, dd: []const u8, kind: Turn) void {
+        // Stop was pressed while this turn's chain was mid-flight — do NOT start the next model call. A genuinely
+        // new user/loop turn clears the flag first (cmdSend / loopContinue), so this only pre-empts a re-entry.
+        if (self.abort_turn.load(.monotonic)) {
+            self.turn = .idle;
+            self.setBusy(false);
+            self.setStatus("");
+            return;
+        }
         var msgs: std.ArrayListUnmanaged(u8) = .empty;
         defer msgs.deinit(self.gpa);
         var dbuf: [96]u8 = undefined;
@@ -1525,6 +1542,7 @@ pub const Chat = struct {
             self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
             return;
         }
+        self.abort_turn.store(false, .monotonic); // reaching here means the loop is (re)starting deliberately
         var sb: [64]u8 = undefined;
         self.setStatus(std.fmt.bufPrint(&sb, "auto-loop {d}/{d}: planning next step...", .{ self.loop_iter + 1, LOOP_MAX_ITERS }) catch "auto-loop: planning...");
         self.startTurn(dd, .loop_infer);
@@ -1567,6 +1585,10 @@ pub const Chat = struct {
     /// return to idle so the user can take over. A running CAST is left alone — it has its own Stop in the
     /// swarm panel — but auto-loop won't re-fire behind it.
     fn stopTurn(self: *Chat, dd: []const u8) void {
+        // Raise the abort flag BEFORE anything else: the tool-follow chain may be idle-but-live (a blocking tool
+        // call in flight) right now, and every re-entry seam checks this flag, so setting it first guarantees no
+        // further tool round-trip or auto-loop turn can start behind the Stop.
+        self.abort_turn.store(true, .monotonic);
         {
             self.store.lock();
             defer self.store.unlock();
@@ -1763,6 +1785,14 @@ pub const Chat = struct {
     /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
+        // Stop pressed while the previous stream was settling → don't fire another (blocking) tool round-trip.
+        if (self.abort_turn.load(.monotonic)) {
+            self.stream.deinit(self.gpa);
+            self.turn = .idle;
+            self.setBusy(false);
+            self.setStatus("");
+            return;
+        }
         // tc.name/tc.args are slices INTO self.stream.content — copy them off BEFORE we free the stream, or they
         // dangle (a use-after-free). The NAME is short (stack), but args can be a WHOLE FILE now (write_file /
         // edit_file), so HEAP-dupe them — a fixed [1024] stack copy silently truncated any real source file
@@ -1874,6 +1904,14 @@ pub const Chat = struct {
     /// pumpConsole folds the [console] output back and re-enters a .tool_follow turn once it finishes. The
     /// turn stays busy (turn is idle while it awaits the console — see consoleAiBusy) the whole time.
     fn runShellAndContinue(self: *Chat, dd: []const u8, cmd: []const u8) void {
+        // Stop pressed while the previous stream settled → don't launch the AI's next shell command.
+        if (self.abort_turn.load(.monotonic)) {
+            self.stream.deinit(self.gpa);
+            self.turn = .idle;
+            self.setBusy(false);
+            self.setStatus("");
+            return;
+        }
         var cmdbuf: [1024]u8 = undefined;
         const cn = @min(cmd.len, cmdbuf.len);
         @memcpy(cmdbuf[0..cn], cmd[0..cn]);
