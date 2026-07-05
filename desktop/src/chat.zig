@@ -1433,7 +1433,21 @@ pub const Chat = struct {
             // — pull the last TOOL: out of the reasoning so the tool still fires (mirrors the cast recovery).
             // TOOL: line first; then the `<tool:NAME>{...}</tool:NAME>` XML form (many models use it, even inline);
             // then a loose recovery from the reasoning channel when content is empty.
-            const tc_opt = toolCall(full) orelse toolCallXml(full) orelse (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null);
+            // Last resort for a BUILD task: the model sometimes PASTES the whole file as a ```fenced code block
+            // (or the auto-loop asked it to "replace the content of X") instead of using TOOL: write_file — so the
+            // file never lands on disk and the run "achieves nothing" while claiming success. If a filename is
+            // recoverable from the user's request and there's a substantial code block, synthesize the write_file.
+            var synth_args: ?[]u8 = null;
+            defer if (synth_args) |s| self.gpa.free(s); // freed AFTER runToolAndContinue dupes it (returns at 1446)
+            const tc_opt = toolCall(full) orelse toolCallXml(full) orelse
+                (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null) orelse blk: {
+                    if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
+                        synth_args = s;
+                        log.info("build recovery: model pasted a code block instead of write_file — synthesizing the write", .{});
+                        break :blk ToolCall{ .name = "write_file", .args = s };
+                    }
+                    break :blk null;
+                };
             if (tc_opt) |tc| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
@@ -2260,6 +2274,50 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
     return .{ .name = name, .args = args };
 }
 
+/// Recover a filename token (foo.html, src/game.js) from a build request — used to rescue a pasted file.
+fn recoverFilename(text: []const u8) ?[]const u8 {
+    const exts = [_][]const u8{ ".html", ".js", ".py", ".css", ".json", ".ts", ".tsx", ".md", ".txt", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".java", ".rb", ".php", ".sh" };
+    for (exts) |ext| {
+        const at = std.mem.indexOf(u8, text, ext) orelse continue;
+        // the char after the ext must not continue the extension (so ".js" in ".json" isn't a false hit)
+        const after = at + ext.len;
+        if (after < text.len and (std.ascii.isAlphanumeric(text[after]))) continue;
+        var s = at;
+        while (s > 0) {
+            const ch = text[s - 1];
+            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == '/') s -= 1 else break;
+        }
+        const name = std.mem.trimStart(u8, text[s..after], "/."); // never absolute / dotfile-leading (safeRel would reject)
+        if (name.len > ext.len and name.len < 100 and std.mem.indexOf(u8, name, "..") == null) return name;
+    }
+    return null;
+}
+
+/// BUILD rescue: the model pasted a whole file as a ```fenced code block instead of TOOL: write_file, so it
+/// never hit disk. If a filename is recoverable from the user's request and the block is substantial, build a
+/// write_file args blob {"path":..,"content":..} (heap-owned; caller frees). null = not a paste we can rescue.
+fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u8) ?[]u8 {
+    const fname = recoverFilename(last_user) orelse return null;
+    const open = std.mem.indexOf(u8, full, "```") orelse return null;
+    var cstart = open + 3;
+    while (cstart < full.len and full[cstart] != '\n') cstart += 1; // skip an optional ```lang tag
+    if (cstart >= full.len) return null;
+    cstart += 1;
+    const close = std.mem.indexOfPos(u8, full, cstart, "```") orelse return null;
+    const code = std.mem.trim(u8, full[cstart..close], " \r\n");
+    if (code.len < 200) return null; // a small snippet, not a file — don't hijack it
+    if (code.len * 2 < full.len) return null; // must be >50% of the reply: a genuine PASTE of the file, not a
+    // code snippet inside an explanation (which we must NOT write — it would clobber the real file).
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"path\":\"") catch return null;
+    escJson(&out, gpa, fname);
+    out.appendSlice(gpa, "\",\"content\":\"") catch return null;
+    escJson(&out, gpa, code);
+    out.appendSlice(gpa, "\"}") catch return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
 /// Loose recovery: find the LAST "TOOL:" ANYWHERE in text (not just line-start) and parse a tool name +
 /// a balanced {...} args blob after it. Used ONLY on the reasoning channel when content is empty — a
 /// reasoning model narrates its decision ("...so we issue TOOL: web_search {\"query\":\"x\"}") there. More
@@ -3006,6 +3064,24 @@ test "toolCall parses name + raw json args" {
     try std.testing.expect(toolCall("just chatting") == null);
     try std.testing.expect(toolCall("TOOL:") == null);
     try std.testing.expect(toolCall("a\nb\nc\nd\ne\nf\nTOOL: too_deep {}") == null);
+}
+
+test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames" {
+    const gpa = std.testing.allocator;
+    // a real paste: user named a file, reply is mostly a ```block > 200 chars
+    const big = "x" ** 400;
+    const reply = "Here it is:\n```html\n" ++ big ++ "\n```";
+    const s = codeBlockWrite(gpa, "Replace the content of arkanoid.html with the full game", reply).?;
+    defer gpa.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"path\":\"arkanoid.html\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"content\":\"") != null);
+    // no filename in the request -> no rescue
+    try std.testing.expect(codeBlockWrite(gpa, "explain how this works", reply) == null);
+    // a small snippet inside a long explanation -> no rescue (would clobber the real file)
+    const expl = "The key part is:\n```js\nconst x=1;\n```\n" ++ ("and here is a long explanation " ** 40);
+    try std.testing.expect(codeBlockWrite(gpa, "improve game.js", expl) == null);
+    try std.testing.expectEqualStrings("game.js", recoverFilename("please edit game.js now").?);
+    try std.testing.expect(recoverFilename("no file mentioned") == null);
 }
 
 test "toolCallLoose recovers a call narrated inside reasoning" {
