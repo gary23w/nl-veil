@@ -1637,6 +1637,11 @@ pub const Chat = struct {
     /// chat fires it on the chat's own provider. The server clamps to the plan's ceilings.
     pub fn fireCast(self: *Chat, dd: []const u8, spec: CastSpec) void {
         const goal = spec.goal;
+        // The conversation id doubles as the cast's build dir: the server points the hive's run_dir at this
+        // chat's `_chat/builds/{conv}` folder, so the cast builds in the SAME tree the chat's own build tools
+        // (and the desktop console) use — not a throwaway `{hex}/work` the chat can never see.
+        var convb: [96]u8 = undefined;
+        const conv = self.convScope(&convb);
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
         const minutes: u32 = if (spec.minutes > 0) std.math.clamp(spec.minutes, 1, 120) else if (spec.long) 20 else CAST_MINUTES;
         const mode: []const u8 = if (spec.long) "continuous" else "cast";
@@ -1677,7 +1682,9 @@ pub const Chat = struct {
         var body: [3072]u8 = undefined;
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
-            w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"api_key\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
+            w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"dir\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
+            wesc(&w, conv);
+            w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
             w.writeAll("\",\"goal\":\"") catch break :blk false;
             wesc(&w, goal);

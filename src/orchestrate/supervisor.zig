@@ -293,11 +293,61 @@ pub const Supervisor = struct {
     }
 
     fn rmTree(self: *Supervisor, path: []const u8) bool {
+        // A chat cast builds IN the chat's conversation dir (`.../_chat/builds/{conv}`) so the chat and its hive
+        // co-edit one tree. That dir is OWNED BY THE CHAT, not the cast — tree-deleting it (on explicit stop or
+        // retention GC) would wipe the user's files. For those, strip only the cast's own metadata (so retention
+        // stops re-listing it and a re-cast starts from a clean slate) and LEAVE the deliverables under work/.
+        if (std.mem.indexOf(u8, path, "_chat/builds") != null or std.mem.indexOf(u8, path, "_chat\\builds") != null) {
+            self.cleanCastMeta(path);
+            return true;
+        }
         // Native recursive delete — NO PowerShell/rm subprocess. Spawning a shell per delete on the httpz
         // request thread starves the worker pool under load (the DELETE-flood wedge). deleteTree is idempotent
         // (an already-absent tree is success); a locked file (a still-dying worker) errors -> caller retries.
         std.Io.Dir.cwd().deleteTree(self.io, path) catch return false;
         return true;
+    }
+
+    /// Remove a cast's own bookkeeping from a chat-owned build dir without touching the deliverables. Deleting
+    /// events.jsonl + swarm.json is what actually matters for lifecycle: retention GC lists by events.jsonl age
+    /// and reconcile rediscovers by swarm.json, so pulling both stops the dir from being re-swept — while work/
+    /// and any user files stay put for the chat (and the next cast into the same conversation). Crucially it also
+    /// sweeps the per-mind curl scratch: `.curlcfg-<mind>` embeds the API key in an `Authorization: Bearer …`
+    /// line, so a normal swarm's full-tree wipe scrubs it — for a chat dir we must scrub it explicitly or the
+    /// key would be stranded on disk. `.build_manifest` and DELIVERY/ are deliberately kept (the chat reads them).
+    fn cleanCastMeta(self: *Supervisor, run_dir: []const u8) void {
+        const meta = [_][]const u8{ "swarm.json", "worker.pid", "STOP", "events.jsonl", "control.jsonl", "mind.sqlite", ".usage", ".round_writes", ".explore_seen", "keys.env", "keys.env.enc" };
+        var buf: [1200]u8 = undefined;
+        for (meta) |f| {
+            const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ run_dir, f }) catch continue;
+            std.Io.Dir.cwd().deleteFile(self.io, p) catch {};
+        }
+        const md = std.fmt.bufPrint(&buf, "{s}/minds", .{run_dir}) catch return;
+        std.Io.Dir.cwd().deleteTree(self.io, md) catch {};
+
+        // Per-mind scratch (`.curlcfg-<mind>`, `.llmreq-<mind>.json`) is dynamically named, so sweep by prefix.
+        // Collect names first, THEN delete — mutating a dir mid-iteration is asking for a skipped/aliased entry.
+        var dir = std.Io.Dir.cwd().openDir(self.io, run_dir, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (names.items) |n| self.gpa.free(n);
+            names.deinit(self.gpa);
+        }
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |ent| {
+            if (ent.kind != .file) continue;
+            if (!std.mem.startsWith(u8, ent.name, ".curlcfg-") and !std.mem.startsWith(u8, ent.name, ".llmreq-")) continue;
+            const dup = self.gpa.dupe(u8, ent.name) catch continue;
+            names.append(self.gpa, dup) catch {
+                self.gpa.free(dup);
+                continue;
+            };
+        }
+        for (names.items) |n| {
+            const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ run_dir, n }) catch continue;
+            std.Io.Dir.cwd().deleteFile(self.io, p) catch {};
+        }
     }
 
     fn killByPidFile(self: *Supervisor, run_dir: []const u8) void {
