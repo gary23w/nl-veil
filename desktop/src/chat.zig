@@ -84,6 +84,21 @@ const SYSTEM_PROMPT =
     "in the same reply. Only use RUN when the user actually wants system/terminal work — quote paths with spaces, " ++
     "prefer non-destructive commands, and never run something irreversible (deleting data, killing processes) " ++
     "without the user asking for it. For pure web/research questions use web_search or CAST, not RUN.\n" ++
+    "\n" ++
+    "GROUND YOURSELF — you have NO live knowledge. Before you answer anything about current events, prices, " ++
+    "versions, or the SPECIFIC steps of a task you're not sure how to do (e.g. 'how do I host this on Cloudflare', " ++
+    "a library's exact API, an ops/deploy procedure), do NOT guess — first run TOOL: recall_hive {\"query\":\"...\"} " ++
+    "to check what the shared memory already knows, and if that's thin, TOOL: web_search {\"query\":\"...\"} to look " ++
+    "it up. Answer FROM what you find. Guessing a deploy command or an API is worse than taking one tool call to " ++
+    "verify it. When you learn something durable and correct, TOOL: observe {\"fact\":\"...\"} it so the hive keeps it.\n" ++
+    "\n" ++
+    "MORE TOOLS — you share the hive mind's full toolset. Beyond the above you can also call: recall {\"query\"} " ++
+    "(your own memory), save_skill / journal / note_stance (record a technique, a note, a stance), set_directive / " ++
+    "add_task / complete_task (plan + track your own work), deep_crawl (crawl a site), fetch_json / read_url. On " ++
+    "this machine (admin) you additionally have: make_tool (author a new tool), host_command / host_status / " ++
+    "host_explore (drive the host), patch_system + propose_change + simulate_change (modify the engine itself), " ++
+    "osint_scan, stage_delivery. Same one-line TOOL: <name> <json> protocol. Reach for the simplest tool that does " ++
+    "the job; don't use the powerful ones unless the task truly calls for it.\n" ++
     "Otherwise reply normally in plain text.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
@@ -107,8 +122,10 @@ const LOOP_SYSTEM =
     "as the user would (first person, imperative), with NO preamble, NO quotes, NO explanation — just the message text.\n" ++
     "Do NOT answer it yourself and do NOT include a TOOL:/CAST:/RUN: line — you are composing the user's next prompt, " ++
     "not the assistant's reply. Keep it to one or two sentences.\n" ++
-    "When the goal is fully achieved (the assistant has delivered what was asked and no further step would add value), " ++
-    "output EXACTLY the single word: DONE";
+    "If this is a BUILD/code task, do not settle for 'it looks done' — the next step should write/extend the real " ++
+    "files and then run_tests (or run_python) to VERIFY; only treat the goal as achieved once it actually works.\n" ++
+    "When the goal is fully achieved (the assistant has delivered what was asked, verified where possible, and no " ++
+    "further step would add value), output EXACTLY the single word: DONE";
 
 // Recursive-thought (reflect) loop: one extra self-check pass — but ONLY for substantive answers to
 // substantive requests, never for chit-chat (a "hello" must not recurse). REFLECT_MIN_ANSWER is the answer
