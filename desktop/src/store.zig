@@ -110,6 +110,19 @@ pub const MAX_CONVS = 32;
 pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
 pub const MAX_OLLAMA_MODELS = 48;
+pub const METRIC_RING = 60; // per-turn performance samples for the chat Metrics tab
+
+/// One completed chat turn's performance sample — the raw material for the Metrics tab's live graphs and the
+/// "how is this model performing" read (the same numbers you'd use to compare open-source models fairly).
+pub const TurnMetric = struct {
+    first_byte_ms: u32 = 0, // latency to the first streamed token
+    total_ms: u32 = 0, // wall-clock for the whole turn
+    out_chars: u32 = 0, // characters produced (a ~4x proxy for output tokens)
+    tok_per_s: f32 = 0, // approx output tokens/sec (out_chars/4 over the generation window)
+    tools: u16 = 0, // tool calls fired on this turn
+    kind: u8 = 0, // Turn tag (0 user / 1 collect / 2 tool_follow / 3 reflect / 4 loop_infer)
+    ok: bool = true, // completed vs errored
+};
 
 /// One locally-installed Ollama model name (from GET /api/tags), for the Settings model dropdown.
 pub const OllamaModel = struct {
@@ -264,6 +277,9 @@ pub const Store = struct {
     cast_count: usize = 0,
     cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast
     cast_tail_count: usize = 0,
+    // per-turn chat performance ring (chat worker appends, Metrics tab reads)
+    turn_metrics: [METRIC_RING]TurnMetric = undefined,
+    turn_metric_count: usize = 0, // total turns recorded (may exceed the ring; @min with METRIC_RING to iterate)
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,
@@ -314,6 +330,14 @@ pub const Store = struct {
         if ((s.chat_cmd_head + 1) % CHAT_CMD_RING == s.chat_cmd_tail) return;
         s.chat_cmds[s.chat_cmd_head] = c;
         s.chat_cmd_head = (s.chat_cmd_head + 1) % CHAT_CMD_RING;
+    }
+
+    /// Record one completed turn's performance sample (chat worker → Metrics tab).
+    pub fn pushMetric(s: *Store, m: TurnMetric) void {
+        s.lock();
+        defer s.unlock();
+        s.turn_metrics[s.turn_metric_count % METRIC_RING] = m;
+        s.turn_metric_count += 1;
     }
 
     /// Append `text` to a console scrollback (ai=Veil console, else You). Keeps the newest ~half on overflow.

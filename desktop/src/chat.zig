@@ -199,6 +199,8 @@ pub const Chat = struct {
     stream: llm.Stream = .{},
     turn: Turn = .idle,
     first_byte_logged: bool = false, // one timing line per turn
+    turn_start_ms: i64 = 0, // wall-clock (ms) this turn's model call started — for the Metrics tab
+    turn_fb_ms: u32 = 0, // ms to the first streamed token this turn (0 until seen)
     parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
@@ -283,6 +285,29 @@ pub const Chat = struct {
 
     fn nowS(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+    }
+
+    fn nowMs(self: *Chat) i64 {
+        return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    }
+
+    /// Record one completed turn's performance into the Metrics ring (chars are a ~4x proxy for tokens; the
+    /// tok/s is measured over the GENERATION window = total minus first-byte, so queue/prefill latency doesn't
+    /// deflate the rate). Called once per turn, at the settle point and the error path.
+    fn recordMetric(self: *Chat, kind: Turn, ok: bool, out_chars: usize) void {
+        const total_ms: u32 = @intCast(@max(0, self.nowMs() - self.turn_start_ms));
+        const gen_ms = if (total_ms > self.turn_fb_ms) total_ms - self.turn_fb_ms else total_ms;
+        const toks: f32 = @as(f32, @floatFromInt(out_chars)) / 4.0;
+        const tok_s: f32 = if (gen_ms > 0) toks / (@as(f32, @floatFromInt(gen_ms)) / 1000.0) else 0;
+        self.store.pushMetric(.{
+            .first_byte_ms = self.turn_fb_ms,
+            .total_ms = total_ms,
+            .out_chars = @intCast(@min(out_chars, std.math.maxInt(u32))),
+            .tok_per_s = tok_s,
+            .tools = @intCast(@min(self.tool_iters, std.math.maxInt(u16))),
+            .kind = @intFromEnum(kind),
+            .ok = ok,
+        });
     }
 
     /// The chat's hippocampus client (neuron-db). All ops no-op when the binary/db is unavailable.
@@ -1280,6 +1305,8 @@ pub const Chat = struct {
         }
         self.turn = kind;
         self.first_byte_logged = false;
+        self.turn_start_ms = self.nowMs();
+        self.turn_fb_ms = 0;
         self.setBusy(true);
         self.setStatus("thinking...");
         log.info("chat turn start: kind={t} prompt={d}b model_msgs history", .{ kind, msgs.items.len });
@@ -1324,6 +1351,7 @@ pub const Chat = struct {
             }
             if (self.stream.saw_any and !self.first_byte_logged) {
                 self.first_byte_logged = true;
+                if (self.turn_fb_ms == 0) self.turn_fb_ms = @intCast(@max(1, self.nowMs() - self.turn_start_ms));
                 log.info("chat turn: first byte after {d}s", .{el});
             }
             return;
@@ -1335,6 +1363,7 @@ pub const Chat = struct {
             var eb: [260]u8 = undefined;
             const emsg = std.fmt.bufPrint(&eb, "(model error: {s})", .{self.stream.errStr()}) catch "(model error)";
             log.err("chat turn FAILED after {d}s: {s}", .{ now - self.stream.started_s, self.stream.errStr() });
+            self.recordMetric(kind, false, self.stream.content.items.len);
             self.appendMsg(dd, .veil, emsg);
             self.store.pushNotif("Chat model error", self.stream.errStr(), 2);
             self.stream.deinit(self.gpa);
@@ -1344,6 +1373,7 @@ pub const Chat = struct {
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
+        self.recordMetric(kind, true, self.stream.content.items.len); // one perf sample per completed turn (Metrics tab)
         // A loop-infer turn produced the NEXT user message (not an assistant reply) — copy it off the stream and
         // either send it (continue the auto-loop) or stop. Handled BEFORE tool/cast/reflect detection.
         if (kind == .loop_infer) {
