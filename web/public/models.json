@@ -83,6 +83,13 @@
       "kind": "openai-compatible",
       "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
       "needs_key": true
+    },
+    {
+      "key": "huggingface",
+      "label": "Hugging Face (Inference Providers)",
+      "kind": "openai-compatible",
+      "base_url": "https://router.huggingface.co/v1",
+      "needs_key": true
     }
   ],
   "models": [
@@ -635,6 +642,46 @@
       "tools": "reliable",
       "cost": "low",
       "note": "Stable price/perf reasoning model, function calling + web search + structured output. 1M context. Cheaper, fully-GA alternative to 3.5 Flash for high-volume swarms. Budget tiers: gemini-2.5-flash-lite (cheapest 2.5)."
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "label": "GPT-OSS 120B (HF Inference Providers)",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "OpenAI open-weight reasoning model routed through Hugging Face's provider network (Cerebras/Groq/Together/...). One hf_ fine-grained token (Inference Providers permission), OpenAI-compatible at https://router.huggingface.co/v1. Default routes to the fastest provider; append ':provider' (e.g. ':groq') or ':cheapest' to the model id to pin one. Strong agentic tool caller."
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V3-0324",
+      "label": "DeepSeek V3 (HF Inference Providers)",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 163840,
+      "tools": "partial",
+      "cost": "low",
+      "note": "DeepSeek V3 via HF Inference Providers (one hf_ token, auto provider routing). OpenAI-compatible router endpoint. DeepSeek tool-calling is good but verify in dense swarms. Append ':provider'/':cheapest' to pin routing."
+    },
+    {
+      "id": "meta-llama/Llama-3.3-70B-Instruct",
+      "label": "Llama 3.3 70B (HF Inference Providers)",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Meta Llama 3.3 70B via HF Inference Providers. Reliable, low-cost agentic baseline behind one hf_ token; the router auto-selects the fastest upstream provider. Append ':provider'/':cheapest' to pin."
+    },
+    {
+      "id": "Qwen/Qwen2.5-Coder-32B-Instruct",
+      "label": "Qwen2.5 Coder 32B (HF Inference Providers)",
+      "provider": "huggingface",
+      "hosting": "hosted",
+      "context": 32768,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Strong coder/tool-caller via HF Inference Providers (one hf_ token). Best HF pick for code-heavy or structured-output minds. Append ':provider'/':cheapest' to pin routing."
     }
   ],
   "defaults": {

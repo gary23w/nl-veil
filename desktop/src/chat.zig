@@ -73,16 +73,89 @@ const SYSTEM_PROMPT =
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 2048;
 
-const Turn = enum { idle, user, collect, tool_follow, reflect };
+const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer };
 
 // Bound the model→tool→model loop so a confused local model can't spin forever on tool calls.
 const MAX_TOOL_ITERS: u32 = 5;
+
+// Prompt-loop (full-auto mode): after a turn settles, the AI writes the NEXT user message itself and sends it,
+// continuing the conversation toward the goal until it emits DONE or hits the iteration cap. LOOP_MAX_ITERS is
+// the verifiable stop condition that prevents an endless/costly loop.
+const LOOP_MAX_ITERS: u32 = 12;
+const LOOP_SYSTEM =
+    "You are the autonomous DRIVER of this conversation. The user has enabled full-auto mode: rather than typing " ++
+    "each message themselves, YOU write the next message on their behalf to keep making progress toward the goal " ++
+    "of the thread (the goal is set by the first user message and everything since).\n" ++
+    "Read the whole conversation, judge what has been accomplished and what is still missing, then output ONLY the " ++
+    "next message to send — a single concrete instruction, question, or refinement that advances the goal. Write it " ++
+    "as the user would (first person, imperative), with NO preamble, NO quotes, NO explanation — just the message text.\n" ++
+    "Do NOT answer it yourself and do NOT include a TOOL:/CAST:/RUN: line — you are composing the user's next prompt, " ++
+    "not the assistant's reply. Keep it to one or two sentences.\n" ++
+    "When the goal is fully achieved (the assistant has delivered what was asked and no further step would add value), " ++
+    "output EXACTLY the single word: DONE";
 
 // Recursive-thought (reflect) loop: one extra self-check pass — but ONLY for substantive answers to
 // substantive requests, never for chit-chat (a "hello" must not recurse). REFLECT_MIN_ANSWER is the answer
 // length below which an answer is considered trivial and skips the pass.
 const REFLECT_PASSES: u8 = 1;
 const REFLECT_MIN_ANSWER: usize = 500;
+
+// ---- micro-console (dual-tab shell) ---------------------------------------------------------------------
+// A shell command MUST NOT run inline on this worker thread: a hang (a dev server, `ping -t`, a REPL) would
+// freeze chat turns AND cast-watching until it returned. Instead a command runs as an INDEPENDENT OS process
+// writing to temp sink files, and run()'s loop POLLS it every ~100ms tick (pumpConsole) — so even a hard hang
+// never wedges the thread. Three guards bound it: a wall-clock deadline (kill + report), a Stop button
+// (console_cancel), and an output-flood cap. One command runs at a time.
+const CONSOLE_TIMEOUT_AI_S: i64 = 60; // AI RUN: door — a turn must not hang on a command the model chose
+const CONSOLE_TIMEOUT_YOU_S: i64 = 300; // You tab — the user may deliberately run something longer
+const CONSOLE_MAX_OUTPUT: u64 = 4 << 20; // force-stop a command that floods more than ~4MB into its sink
+
+// Native, no-subprocess exit poll (std.process has no non-blocking wait). Mirrors supervisor.zig's winproc
+// pattern: on Windows read the exit code straight off the child HANDLE. Termination itself uses Child.kill
+// (native TerminateProcess via the Io vtable — no taskkill child, same spirit as terminateVeilPid).
+const winproc = if (builtin.os.tag == .windows) struct {
+    const STILL_ACTIVE: u32 = 259;
+    extern "kernel32" fn GetExitCodeProcess(h: *anyopaque, code: *u32) callconv(.c) c_int;
+} else struct {};
+
+/// Non-blocking: has `child` exited? Windows peeks the exit code off the process handle (the caller still
+/// reaps via Child.wait); POSIX reaps with waitpid(WNOHANG) and nulls child.id so the caller must NOT wait.
+fn procExited(child: *std.process.Child) bool {
+    const id = child.id orelse return true; // already reaped / killed
+    if (builtin.os.tag == .windows) {
+        var code: u32 = 0;
+        if (winproc.GetExitCodeProcess(id, &code) == 0) return true; // handle unusable → treat as done
+        return code != winproc.STILL_ACTIVE;
+    } else {
+        var status: c_int = undefined;
+        const r = std.c.waitpid(id, &status, 1); // 1 = WNOHANG
+        if (r == 0) return false; // still running
+        child.id = null; // reaped here — don't Child.wait again
+        return true;
+    }
+}
+
+/// One in-flight micro-console command, run off the worker's blocking path (see pumpConsole). `ai` selects
+/// the tab: Veil (the AI's RUN: door, whose result folds back into the turn) vs You (the user's own shell).
+/// stdout and stderr go to SEPARATE sink files ("<base>.out"/".err") because Windows reopens each inherited
+/// handle independently — one shared file would let the two streams clobber each other at offset 0.
+const ConsoleProc = struct {
+    child: std.process.Child,
+    ai: bool,
+    started_s: i64,
+    deadline_s: i64, // wall-clock time to force-kill (the hang guard)
+    base: [320]u8 = undefined, // sink path stem; "<base>.out" + "<base>.err" hold stdout/stderr
+    base_len: usize = 0,
+    cmd: [1024]u8 = undefined, // the command text (for the [console] fold + the timeout message)
+    cmd_len: usize = 0,
+
+    fn baseStr(p: *const ConsoleProc) []const u8 {
+        return p.base[0..p.base_len];
+    }
+    fn cmdStr(p: *const ConsoleProc) []const u8 {
+        return p.cmd[0..p.cmd_len];
+    }
+};
 
 pub const Chat = struct {
     io: Io,
@@ -97,6 +170,7 @@ pub const Chat = struct {
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
+    loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     reflect_draft: [12288]u8 = undefined, // first-pass draft used by the one-step reflect turn
     reflect_draft_len: usize = 0,
 
@@ -114,6 +188,10 @@ pub const Chat = struct {
     // HIPPOCAMPUS — the chat's own neuron-db (gpa-owned; "" = disabled → all memory ops no-op)
     mind_bin: []const u8 = "",
     mind_db: []const u8 = "",
+
+    // micro-console: the one in-flight shell command (null = idle), polled from run() so it never blocks
+    console: ?ConsoleProc = null,
+    console_cancel: bool = false, // Stop button pressed → pumpConsole kills the running command next tick
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -144,6 +222,7 @@ pub const Chat = struct {
             const dd = self.dataDir(&db);
             self.drainCommands(dd);
             self.pumpStream(dd);
+            self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
@@ -152,6 +231,8 @@ pub const Chat = struct {
         }
         llm.abort(&self.stream, self.io);
         self.stream.deinit(self.gpa);
+        if (self.console) |*p| p.child.kill(self.io); // don't leave a shell child running past shutdown
+        self.console = null;
     }
 
     // ------------------------------------------------------------------------------ plumbing
@@ -357,7 +438,9 @@ pub const Chat = struct {
                 .stop_cast => self.cmdStopCast(dd, c.idStr()),
                 .save_settings => self.saveSettings(dd),
                 .save_key => self.cmdSaveKey(dd, c.textStr()),
-                .console_run => self.cmdConsoleRun(std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
+                .console_run => self.cmdConsoleRun(dd, std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
+                .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
+                .loop_kick => self.maybeLoop(dd), // user just enabled auto-loop while idle → start it now
             }
         }
     }
@@ -368,50 +451,235 @@ pub const Chat = struct {
         if (ai) self.store.console_busy_ai = v else self.store.console_busy_you = v;
     }
 
-    /// A user-typed micro-console command (the "You"/"Veil" tab). Runs it and streams output into the
-    /// scrollback; the return value is ignored on the user path.
-    fn cmdConsoleRun(self: *Chat, ai: bool, cmd: []const u8) void {
-        var fold: [16]u8 = undefined; // user path doesn't fold back to a model — a tiny throwaway buffer
-        _ = self.execConsole(ai, cmd, &fold);
+    /// Is the AI's RUN: door mid-command? While it awaits pumpConsole the model turn is logically in flight
+    /// (busy is true, turn is idle) — new turns/loops must not start over it.
+    fn consoleAiBusy(self: *Chat) bool {
+        return if (self.console) |*p| p.ai else false;
     }
 
-    /// Shared shell executor for the micro-console. Streams `> cmd` + combined stdout/stderr into the console
-    /// scrollback (tab selected by `ai`), and ALSO copies a bounded prefix of the output into `fold` so an
-    /// AI-driven RUN: can hand the result back to the model. Blocking on the chat worker thread (same thread
-    /// that spawns curl for casts), so the render thread stays responsive. Returns the slice of `fold` written.
-    fn execConsole(self: *Chat, ai: bool, cmd: []const u8, fold: []u8) []const u8 {
+    /// A user-typed / AI-issued micro-console command (the "You"/"Veil" tab). Launches it asynchronously via
+    /// consoleStart; pumpConsole reports the result (and, for the Veil tab, folds it back into the turn).
+    fn cmdConsoleRun(self: *Chat, dd: []const u8, ai: bool, cmd: []const u8) void {
+        self.consoleStart(dd, ai, cmd);
+    }
+
+    /// Launch a micro-console command as an INDEPENDENT OS process and register it as the in-flight console
+    /// proc; pumpConsole polls it to completion. Returns immediately — the command NEVER runs on this worker's
+    /// blocking path, so a hang can't freeze chat or cast-watching. stdout/stderr are captured to two temp
+    /// sink files (see ConsoleProc). At most one command runs at a time; a second is refused (and, on the AI
+    /// door, the refusal folds straight back so the turn still continues).
+    fn consoleStart(self: *Chat, dd: []const u8, ai: bool, cmd: []const u8) void {
         const trimmed = std.mem.trim(u8, cmd, " \r\n\t");
-        if (trimmed.len == 0) return fold[0..0];
+        if (trimmed.len == 0) {
+            if (ai) self.foldConsoleAi(dd, "", "(empty command)");
+            return;
+        }
+        if (self.console != null) {
+            self.store.consoleAppend(ai, "\n(the console is busy with another command)\n");
+            if (ai) self.foldConsoleAi(dd, trimmed, "(the console was busy; command not run)");
+            return;
+        }
         self.store.consoleAppend(ai, "\n> ");
         self.store.consoleAppend(ai, trimmed);
         self.store.consoleAppend(ai, "\n");
-        self.setConsoleBusy(ai, true);
-        defer self.setConsoleBusy(ai, false);
+
+        // Sink files: <dd>/.veil-desk/console_{ai|you}.{out,err}. createFile truncates, so a prior run's bytes
+        // never bleed in. Two files (not one) because Windows reopens each inherited handle independently, so a
+        // shared sink would let stdout and stderr clobber each other at offset 0.
+        var bb: [320]u8 = undefined;
+        const base = std.fmt.bufPrint(&bb, "{s}/.veil-desk/console_{s}", .{ dd, if (ai) "ai" else "you" }) catch {
+            self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
+            return;
+        };
+        var ob: [332]u8 = undefined;
+        var eb: [332]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{base}) catch {
+            self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
+            return;
+        };
+        const errp = std.fmt.bufPrint(&eb, "{s}.err", .{base}) catch {
+            self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
+            return;
+        };
+        const of = Io.Dir.cwd().createFile(self.io, outp, .{}) catch {
+            self.consoleLaunchFailed(dd, ai, "(failed to open the console output file)");
+            return;
+        };
+        const ef = Io.Dir.cwd().createFile(self.io, errp, .{}) catch {
+            of.close(self.io);
+            self.consoleLaunchFailed(dd, ai, "(failed to open the console output file)");
+            return;
+        };
         // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
         const argv = if (builtin.os.tag == .windows)
             [_][]const u8{ "cmd", "/c", trimmed }
         else
             [_][]const u8{ "sh", "-c", trimmed };
-        const res = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch {
-            const msg = "(failed to launch the command)\n";
-            self.store.consoleAppend(ai, msg);
-            return copyInto(fold, msg);
+        const child = std.process.spawn(self.io, .{
+            .argv = &argv,
+            .stdin = .ignore,
+            .stdout = .{ .file = of },
+            .stderr = .{ .file = ef },
+            .create_no_window = true, // don't flash a console window per command on Windows
+        }) catch {
+            of.close(self.io);
+            ef.close(self.io);
+            self.consoleLaunchFailed(dd, ai, "(failed to launch the command)");
+            return;
         };
-        defer self.gpa.free(res.stdout);
-        defer self.gpa.free(res.stderr);
-        if (res.stdout.len > 0) self.store.consoleAppend(ai, res.stdout);
-        if (res.stderr.len > 0) self.store.consoleAppend(ai, res.stderr);
-        if (res.stdout.len == 0 and res.stderr.len == 0) self.store.consoleAppend(ai, "(no output)\n");
-        // fold buffer for the model: stdout first, then stderr, bounded to `fold.len`
-        var w: usize = 0;
-        w += copyInto(fold[w..], res.stdout).len;
-        w += copyInto(fold[w..], res.stderr).len;
-        if (w == 0) w += copyInto(fold[w..], "(no output)").len;
-        return fold[0..w];
+        // The child inherited its own copies; drop ours so the sinks have a single writer we can read cleanly
+        // once the process is dead.
+        of.close(self.io);
+        ef.close(self.io);
+
+        const now = self.nowS();
+        var p: ConsoleProc = .{
+            .child = child,
+            .ai = ai,
+            .started_s = now,
+            .deadline_s = now + (if (ai) CONSOLE_TIMEOUT_AI_S else CONSOLE_TIMEOUT_YOU_S),
+        };
+        const cn = @min(trimmed.len, p.cmd.len);
+        @memcpy(p.cmd[0..cn], trimmed[0..cn]);
+        p.cmd_len = cn;
+        const bn = @min(base.len, p.base.len);
+        @memcpy(p.base[0..bn], base[0..bn]);
+        p.base_len = bn;
+        self.console = p;
+        self.console_cancel = false;
+        self.setConsoleBusy(ai, true);
+        log.info("console: {s} launched: {s}", .{ if (ai) "veil" else "you", trimmed[0..@min(trimmed.len, 120)] });
+    }
+
+    /// Report a launch failure into the scrollback and — on the AI door — fold it back so the turn continues
+    /// (no console proc was registered, so nothing else will finalize it).
+    fn consoleLaunchFailed(self: *Chat, dd: []const u8, ai: bool, msg: []const u8) void {
+        self.store.consoleAppend(ai, msg);
+        self.store.consoleAppend(ai, "\n");
+        if (ai) self.foldConsoleAi(dd, "", msg);
+    }
+
+    /// Fold a finished console command's output back into the conversation as a [console] message and re-enter
+    /// a .tool_follow turn so the model reads the result and continues (the AI RUN: door only).
+    fn foldConsoleAi(self: *Chat, dd: []const u8, cmd: []const u8, result: []const u8) void {
+        var fb: [7168]u8 = undefined;
+        const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ cmd, result }) catch result;
+        self.appendMsg(dd, .cast_note, folded);
+        self.startTurn(dd, .tool_follow);
+    }
+
+    /// Poll the in-flight micro-console command each tick WITHOUT blocking. While it runs, do nothing; once it
+    /// finishes (natural exit) or must be stopped (deadline, Stop button, or output flood), read its captured
+    /// output, append it + a status note to the scrollback, and — for the AI door — fold the result back and
+    /// continue the turn. No-op when nothing is running.
+    fn pumpConsole(self: *Chat, dd: []const u8) void {
+        const p = if (self.console) |*pp| pp else return;
+        const now = self.nowS();
+
+        const Outcome = enum { running, exited, timed_out, canceled, flooded };
+        var outcome: Outcome = .running;
+        if (procExited(&p.child)) {
+            outcome = .exited;
+        } else if (self.console_cancel) {
+            outcome = .canceled;
+        } else if (now >= p.deadline_s) {
+            outcome = .timed_out;
+        } else if (self.consoleSinkBytes(p) > CONSOLE_MAX_OUTPUT) {
+            outcome = .flooded;
+        }
+        if (outcome == .running) return; // still going — poll again next tick
+
+        // Reap the child (natural exit) or force-kill it. Child.kill is native TerminateProcess via the Io
+        // vtable (no taskkill child, mirroring terminateVeilPid) and also reaps + closes the handle. On a
+        // natural exit, Windows peeked the code without reaping (id still set → reap now); POSIX's waitpid
+        // already reaped and nulled id, so wait would trip the id!=null assert — the null guard skips it there.
+        if (outcome == .exited) {
+            if (p.child.id != null) {
+                if (p.child.wait(self.io)) |_| {} else |_| {}
+            }
+        } else {
+            p.child.kill(self.io);
+        }
+
+        const ai = p.ai;
+        const timeout_s = if (ai) CONSOLE_TIMEOUT_AI_S else CONSOLE_TIMEOUT_YOU_S;
+
+        // Read the captured output (stdout then stderr), bounded — one heap scratch split between the sinks.
+        var ob: [332]u8 = undefined;
+        var eb: [332]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch "";
+        const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch "";
+        const scratch: ?[]u8 = self.gpa.alloc(u8, 48 << 10) catch null;
+        defer if (scratch) |s| self.gpa.free(s);
+        const out_slice = if (scratch) |s| self.readSink(outp, s[0 .. 40 << 10]) else "";
+        const err_slice = if (scratch) |s| self.readSink(errp, s[40 << 10 ..]) else "";
+        Io.Dir.cwd().deleteFile(self.io, outp) catch {}; // data is in scratch now — clean up the sinks
+        Io.Dir.cwd().deleteFile(self.io, errp) catch {};
+
+        // Status note for the non-clean exits — the required "(command timed out after Ns)" lives here.
+        var nb: [64]u8 = undefined;
+        const note: []const u8 = switch (outcome) {
+            .running, .exited => "",
+            .timed_out => std.fmt.bufPrint(&nb, "(command timed out after {d}s)\n", .{timeout_s}) catch "(command timed out)\n",
+            .canceled => "(command stopped)\n",
+            .flooded => "(command produced too much output — stopped)\n",
+        };
+
+        // Scrollback: stdout, then stderr, then the note (matches the old separate-stream append order).
+        if (out_slice.len > 0) self.store.consoleAppend(ai, out_slice);
+        if (err_slice.len > 0) self.store.consoleAppend(ai, err_slice);
+        if (out_slice.len == 0 and err_slice.len == 0) self.store.consoleAppend(ai, "(no output)\n");
+        if (note.len > 0) self.store.consoleAppend(ai, note);
+        self.setConsoleBusy(ai, false);
+        log.info("console: {s} finished ({t}) — {d}b out, {d}b err", .{ if (ai) "veil" else "you", outcome, out_slice.len, err_slice.len });
+
+        // The AI door hands the result back to the model. Copy what's needed off `p` BEFORE clearing the slot,
+        // then clear it so foldConsoleAi (which re-enters a turn) sees a clean idle console state.
+        if (ai) {
+            var cmdb: [1024]u8 = undefined;
+            const cl = @min(p.cmd_len, cmdb.len);
+            @memcpy(cmdb[0..cl], p.cmd[0..cl]);
+            var rb: [6144]u8 = undefined;
+            const result = composeConsoleResult(&rb, out_slice, err_slice, note);
+            self.console = null;
+            self.console_cancel = false;
+            self.foldConsoleAi(dd, cmdb[0..cl], result);
+        } else {
+            self.console = null;
+            self.console_cancel = false;
+        }
+    }
+
+    /// Read up to buf.len bytes from the TAIL of a console sink file (the newest output — most useful for a
+    /// killed/timed-out command). Empty on any error / missing file.
+    fn readSink(self: *Chat, path: []const u8, buf: []u8) []const u8 {
+        if (path.len == 0) return buf[0..0];
+        const f = Io.Dir.cwd().openFile(self.io, path, .{}) catch return buf[0..0];
+        defer f.close(self.io);
+        const size = (f.stat(self.io) catch return buf[0..0]).size;
+        const off: u64 = if (size > buf.len) size - buf.len else 0;
+        const n = f.readPositionalAll(self.io, buf, off) catch return buf[0..0];
+        return buf[0..n];
+    }
+
+    /// Combined byte size of a command's two sink files (the output-flood guard). 0 on any stat error.
+    fn consoleSinkBytes(self: *Chat, p: *const ConsoleProc) u64 {
+        var ob: [332]u8 = undefined;
+        var eb: [332]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch return 0;
+        const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch return 0;
+        var total: u64 = 0;
+        if (Io.Dir.cwd().statFile(self.io, outp, .{})) |st| {
+            total += st.size;
+        } else |_| {}
+        if (Io.Dir.cwd().statFile(self.io, errp, .{})) |st| {
+            total += st.size;
+        } else |_| {}
+        return total;
     }
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
-        if (text.len == 0 or self.turn != .idle) return;
+        if (text.len == 0 or self.turn != .idle or self.consoleAiBusy()) return; // AI RUN: still in flight
         // a conversation's FIRST message names it — whether the user typed straight away (auto-create)
         // or clicked + first (the "new chat" placeholder title gets replaced here).
         var have_conv = false;
@@ -440,6 +708,7 @@ pub const Chat = struct {
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0; // fresh tool budget for this user turn
+        self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -584,6 +853,8 @@ pub const Chat = struct {
         var theme: u8 = 0;
         var lopen = true;
         var ropen = true;
+        var cfa: [64]u8 = undefined;
+        var cfa_n: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
@@ -595,6 +866,8 @@ pub const Chat = struct {
             @memcpy(base[0..base_n], s.chat_base[0..base_n]);
             model_n = s.chat_model_len;
             @memcpy(model[0..model_n], s.chat_model[0..model_n]);
+            cfa_n = s.cf_account_len;
+            @memcpy(cfa[0..cfa_n], s.cf_account[0..cfa_n]);
             lopen = s.chat_left_open;
             ropen = s.chat_right_open;
         }
@@ -605,6 +878,8 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, base[0..base_n]);
         jb.appendSlice(self.gpa, "\",\"model\":\"") catch return;
         escJson(&jb, self.gpa, model[0..model_n]);
+        jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
+        escJson(&jb, self.gpa, cfa[0..cfa_n]);
         jb.print(self.gpa, "\",\"left\":{},\"right\":{}}}", .{ lopen, ropen }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
@@ -635,6 +910,12 @@ pub const Chat = struct {
             const n = @min(m.len, s.chat_model.len);
             @memcpy(s.chat_model[0..n], m[0..n]);
             s.chat_model_len = @intCast(n);
+        }
+        if (llm.jsonUnescape(self.gpa, data, "cf_account")) |a| {
+            defer self.gpa.free(a);
+            const n = @min(a.len, s.cf_account.len);
+            @memcpy(s.cf_account[0..n], a[0..n]);
+            s.cf_account_len = @intCast(n);
         }
         s.chat_left_open = std.mem.indexOf(u8, data, "\"left\":false") == null;
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
@@ -817,9 +1098,11 @@ pub const Chat = struct {
         const s = &self.store.settings;
         var base: []const u8 = undefined;
         var key: []const u8 = "";
+        var acct_scratch: [256]u8 = undefined;
         switch (s.chat_kind) {
             1 => {
-                base = catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].base_url;
+                // resolveBase substitutes the Cloudflare {account} placeholder (no-op for every other provider)
+                base = catalog.resolveBase(&catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)], s.cfAccount(), &acct_scratch);
                 key = s.chatKey();
             },
             2 => {
@@ -858,7 +1141,8 @@ pub const Chat = struct {
         defer msgs.deinit(self.gpa);
         var dbuf: [96]u8 = undefined;
         msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
-        escJson(&msgs, self.gpa, SYSTEM_PROMPT);
+        // A loop-infer turn wears the DRIVER hat (write the user's next message); every other turn is the assistant.
+        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else SYSTEM_PROMPT);
         escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
         // HIPPOCAMPUS: draw the facts most relevant to THIS query in from the chat's own neuron-db — earlier
@@ -915,6 +1199,9 @@ pub const Chat = struct {
         }
         if (kind == .collect) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. Using the [cast] findings above, give the user a direct, complete answer to their original request. Do not cast again.\"}") catch return;
+        }
+        if (kind == .loop_infer) {
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Output the next message to send now (or exactly DONE if the goal is already complete). Reply with only that message text.\"}") catch return;
         }
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
@@ -995,6 +1282,17 @@ pub const Chat = struct {
         const full = std.mem.trim(u8, self.stream.content.items, " \r\n\t");
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
+        // A loop-infer turn produced the NEXT user message (not an assistant reply) — copy it off the stream and
+        // either send it (continue the auto-loop) or stop. Handled BEFORE tool/cast/reflect detection.
+        if (kind == .loop_infer) {
+            var nb: [1024]u8 = undefined;
+            const src = if (full.len > 0) full else reason;
+            const n = @min(src.len, nb.len);
+            @memcpy(nb[0..n], src[0..n]);
+            self.stream.deinit(self.gpa);
+            self.loopContinue(dd, nb[0..n]);
+            return;
+        }
         // TOOL: <name> <args> — a single shared-tool call. Run it, fold the result back, continue the loop.
         // Not on a .collect/.reflect turn (those turns are answer-composition passes).
         if (kind != .collect and kind != .reflect) {
@@ -1034,23 +1332,26 @@ pub const Chat = struct {
             self.reflect_draft_len = @min(full.len, self.reflect_draft.len);
             @memcpy(self.reflect_draft[0..self.reflect_draft_len], full[0..self.reflect_draft_len]);
             self.stream.deinit(self.gpa);
-            self.setStatus("self-checking...");
+            // KEEP the first-pass draft visible (it used to be replaced by the revision, which read as "wrote it,
+            // deleted it, rewrote it"). Commit the draft now; the revision lands as its own message below so the
+            // user watches the recursive self-check happen.
+            self.appendVeil(dd, reason_fb[0..rn], self.reflect_draft[0..self.reflect_draft_len]);
+            self.setStatus("self-checking the draft above...");
             self.startTurn(dd, .reflect);
-            // If the second pass fails to start, fall back to the first draft so the user still gets an answer.
-            if (self.turn != .reflect) {
-                self.appendVeil(dd, reason_fb[0..rn], self.reflect_draft[0..self.reflect_draft_len]);
-                self.reflect_draft_len = 0;
-            }
+            // If the second pass fails to start, the draft is already shown — nothing more to do.
+            if (self.turn != .reflect) self.reflect_draft_len = 0;
             return;
         }
         if (kind == .reflect) {
             self.reflect_draft_len = 0;
             if (full.len > 0) {
+                self.appendMsg(dd, .cast_note, "revised after self-check:");
                 self.appendVeil(dd, reason, full);
             } else if (reason.len > 0) {
+                self.appendMsg(dd, .cast_note, "revised after self-check:");
                 self.appendMsg(dd, .veil, reason);
             } else {
-                self.appendMsg(dd, .veil, "(self-check produced an empty reply)");
+                self.appendMsg(dd, .cast_note, "self-check found nothing to change — the draft above stands.");
             }
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
@@ -1082,6 +1383,79 @@ pub const Chat = struct {
             self.appendMsg(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)");
         }
         self.stream.deinit(self.gpa);
+        self.setBusy(false);
+        self.maybeLoop(dd); // full-auto: if loop mode is on and nothing else is pending, drive the next message
+    }
+
+    // ------------------------------------------------------------------------------ prompt loop (full-auto)
+
+    /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
+    /// (no in-flight turn, no running cast). Called at the settle point and on a fresh toggle-on (.loop_kick).
+    fn maybeLoop(self: *Chat, dd: []const u8) void {
+        if (self.turn != .idle or self.cast_active or self.consoleAiBusy()) return; // wait for casts/turns/console
+        const on = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk self.store.chat_loop;
+        };
+        if (!on) return;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (self.store.msg_count == 0) return; // nothing to continue from yet — wait for the first message
+        }
+        if (self.loop_iter >= LOOP_MAX_ITERS) {
+            self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
+            return;
+        }
+        var sb: [64]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&sb, "auto-loop {d}/{d}: planning next step...", .{ self.loop_iter + 1, LOOP_MAX_ITERS }) catch "auto-loop: planning...");
+        self.startTurn(dd, .loop_infer);
+    }
+
+    /// Handle the message a loop-infer turn produced: stop on DONE / empty / user-toggled-off / cap, else send it.
+    fn loopContinue(self: *Chat, dd: []const u8, raw: []const u8) void {
+        const text = std.mem.trim(u8, raw, " \r\n\t`*\"'");
+        const on = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk self.store.chat_loop;
+        };
+        if (!on) { // the user switched auto-loop off while it was inferring — stop quietly
+            self.setBusy(false);
+            return;
+        }
+        if (text.len == 0) {
+            self.stopLoop(dd, "auto-loop ended: no next step was inferred.");
+            return;
+        }
+        if (loopIsDone(text)) {
+            self.stopLoop(dd, "auto-loop complete: the goal looks achieved.");
+            return;
+        }
+        if (self.loop_iter >= LOOP_MAX_ITERS) {
+            self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
+            return;
+        }
+        self.loop_iter += 1;
+        // send the inferred message as a (visible) user turn — same path as a manual send, minus the counter reset
+        self.last_user_len = @min(text.len, self.last_user.len);
+        @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
+        self.tool_iters = 0;
+        self.appendMsg(dd, .user, text);
+        self.startTurn(dd, .user);
+    }
+
+    /// Turn auto-loop off and tell the user why (the verifiable stop condition fired).
+    fn stopLoop(self: *Chat, dd: []const u8, why: []const u8) void {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.chat_loop = false;
+        }
+        self.loop_iter = 0;
+        self.appendMsg(dd, .cast_note, why);
+        self.setStatus("");
         self.setBusy(false);
     }
 
@@ -1312,8 +1686,9 @@ pub const Chat = struct {
     }
 
     /// The AI's RUN: door. `cmd` is a slice INTO self.stream.content — copy it before freeing the stream (same
-    /// UAF discipline as runToolAndContinue). Runs it on the Veil console tab, folds the output back as a
-    /// [console] message, and re-enters a .tool_follow turn so the model reads the result and continues.
+    /// UAF discipline as runToolAndContinue). Launches it on the Veil console tab ASYNCHRONOUSLY (consoleStart);
+    /// pumpConsole folds the [console] output back and re-enters a .tool_follow turn once it finishes. The
+    /// turn stays busy (turn is idle while it awaits the console — see consoleAiBusy) the whole time.
     fn runShellAndContinue(self: *Chat, dd: []const u8, cmd: []const u8) void {
         var cmdbuf: [1024]u8 = undefined;
         const cn = @min(cmd.len, cmdbuf.len);
@@ -1332,13 +1707,9 @@ pub const Chat = struct {
         self.setStatus(std.fmt.bufPrint(&stbuf, "running: {s}", .{command[0..@min(command.len, 60)]}) catch "running a command...");
         log.info("chat RUN: {s}", .{command[0..@min(command.len, 120)]});
 
-        var out: [6144]u8 = undefined;
-        const result = self.execConsole(true, command, &out);
-
-        var fb: [7168]u8 = undefined;
-        const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ command, result }) catch result;
-        self.appendMsg(dd, .cast_note, folded);
-        self.startTurn(dd, .tool_follow);
+        // Async: consoleStart never blocks. On an immediate launch failure it folds the error back itself, so
+        // the turn always continues; on success pumpConsole finalizes + folds when the command exits.
+        self.consoleStart(dd, true, command);
     }
 
     /// Add a fresh "deploying" cast row (newest) to the activity panel; evicts the oldest when full.
@@ -1636,11 +2007,39 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
     return .{ .name = name, .args = args };
 }
 
+/// The auto-loop driver signals completion with a bare "DONE". Be strict so a normal next-message that merely
+/// mentions "done" doesn't halt the loop: the whole (short) reply must be a completion word.
+fn loopIsDone(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \t\r\n.!\"'`*:");
+    if (t.len == 0 or t.len > 16) return false;
+    return std.ascii.eqlIgnoreCase(t, "DONE") or
+        std.ascii.eqlIgnoreCase(t, "COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "GOAL COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "TASK COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "FINISHED");
+}
+
 /// Copy as much of `src` as fits into `dst`; returns the slice of `dst` actually written.
 fn copyInto(dst: []u8, src: []const u8) []const u8 {
     const n = @min(dst.len, src.len);
     @memcpy(dst[0..n], src[0..n]);
     return dst[0..n];
+}
+
+/// Build the bounded [console] payload the AI door hands back to the model: stdout, then stderr, then the
+/// status note. The note is ALWAYS kept (room is reserved for it) so a "(command timed out …)"/stop note
+/// survives even when the output alone would fill `buf`. Pure — unit-tested.
+fn composeConsoleResult(buf: []u8, out: []const u8, err: []const u8, note: []const u8) []const u8 {
+    const body_cap = if (buf.len > note.len) buf.len - note.len else 0; // reserve room for the note
+    var w: usize = 0;
+    w += copyInto(buf[w..body_cap], out).len;
+    w += copyInto(buf[w..body_cap], err).len;
+    if (w == 0 and body_cap > 0) w += copyInto(buf[w..body_cap], "(no output)").len;
+    if (note.len > 0 and w + note.len <= buf.len) {
+        @memcpy(buf[w .. w + note.len], note);
+        w += note.len;
+    }
+    return buf[0..w];
 }
 
 /// A reply that is exactly a "RUN: <shell command>" line (the AI's micro-console door). Returns the command,
@@ -2237,6 +2636,18 @@ test "toolCallLoose recovers a call narrated inside reasoning" {
     try std.testing.expect(toolCallLoose("no tool mentioned here") == null);
 }
 
+test "loopIsDone recognizes only a bare completion signal, not prose that mentions done" {
+    try std.testing.expect(loopIsDone("DONE"));
+    try std.testing.expect(loopIsDone("done"));
+    try std.testing.expect(loopIsDone("  DONE. "));
+    try std.testing.expect(loopIsDone("Complete"));
+    try std.testing.expect(loopIsDone("GOAL COMPLETE"));
+    // a real next-message that merely contains "done" must NOT halt the loop
+    try std.testing.expect(!loopIsDone("Now that the intro is done, add a pricing section."));
+    try std.testing.expect(!loopIsDone("Are we done with the outline?"));
+    try std.testing.expect(!loopIsDone(""));
+}
+
 test "runCall parses the AI's RUN: shell door" {
     try std.testing.expectEqualStrings("dir", runCall("RUN: dir").?);
     try std.testing.expectEqualStrings("git status", runCall("RUN: git status").?);
@@ -2305,6 +2716,87 @@ test "castProviderId routes a cast to the chat's configured backend (local vs BY
     try std.testing.expectEqualStrings("openai", castProviderId(1, 1));
     try std.testing.expectEqualStrings("ollama", castProviderId(1, 2));
     try std.testing.expectEqualStrings("groq", castProviderId(1, 4));
+    // the two providers added for BYO Cloudflare + Hugging Face route by their catalog key
+    try std.testing.expectEqualStrings("workers-ai", castProviderId(1, 3));
+    const hf = for (catalog.providers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.key, "huggingface")) break i;
+    } else unreachable;
+    try std.testing.expectEqualStrings("huggingface", castProviderId(1, @intCast(hf)));
+}
+
+test "resolveBase substitutes the Cloudflare {account}, falls back to the sentinel, and passes others through" {
+    var out: [256]u8 = undefined;
+    const cf = for (&catalog.providers) |*p| {
+        if (std.mem.eql(u8, p.key, "workers-ai")) break p;
+    } else unreachable;
+    // account id spliced into the template
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1", catalog.resolveBase(cf, "abc123", &out));
+    // whitespace trimmed
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1", catalog.resolveBase(cf, "  abc123 \n", &out));
+    // no account → the "cloudflare" sentinel (server uses its own included creds)
+    try std.testing.expectEqualStrings("cloudflare", catalog.resolveBase(cf, "", &out));
+    // a non-templated provider passes its base_url through untouched
+    const oa = &catalog.providers[1]; // openai
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", catalog.resolveBase(oa, "ignored", &out));
+}
+
+test "a BYOK Hugging Face chat resolves the router endpoint + hf model + token" {
+    const hf_idx: u8 = for (catalog.providers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.key, "huggingface")) break @intCast(i);
+    } else unreachable;
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.settings.chat_kind = 1;
+    store.settings.chat_byok = hf_idx;
+    const model = "meta-llama/Llama-3.3-70B-Instruct";
+    @memcpy(store.settings.chat_model[0..model.len], model);
+    store.settings.chat_model_len = @intCast(model.len);
+    const key = "hf_abc123";
+    @memcpy(store.settings.chat_key[0..key.len], key);
+    store.settings.chat_key_len = @intCast(key.len);
+
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = undefined, .gpa = std.testing.allocator, .store = store };
+    var bb: [256]u8 = undefined;
+    var kb: [192]u8 = undefined;
+    var mb: [96]u8 = undefined;
+    const prov = chat.resolveProvider(&bb, &kb, &mb);
+    try std.testing.expectEqualStrings("https://router.huggingface.co/v1", prov.base_url);
+    try std.testing.expectEqualStrings("meta-llama/Llama-3.3-70B-Instruct", prov.model);
+    try std.testing.expectEqualStrings("hf_abc123", prov.key);
+    try std.testing.expectEqualStrings("huggingface", castProviderId(1, hf_idx));
+}
+
+test "a BYO Cloudflare chat builds the account URL from the saved account id" {
+    const cf_idx: u8 = for (catalog.providers, 0..) |p, i| {
+        if (std.mem.eql(u8, p.key, "workers-ai")) break @intCast(i);
+    } else unreachable;
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.settings.chat_kind = 1;
+    store.settings.chat_byok = cf_idx;
+    const acct = "deadbeef00";
+    @memcpy(store.settings.cf_account[0..acct.len], acct);
+    store.settings.cf_account_len = @intCast(acct.len);
+    const model = "@cf/meta/llama-3.1-8b-instruct";
+    @memcpy(store.settings.chat_model[0..model.len], model);
+    store.settings.chat_model_len = @intCast(model.len);
+
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = undefined, .gpa = std.testing.allocator, .store = store };
+    var bb: [256]u8 = undefined;
+    var kb: [192]u8 = undefined;
+    var mb: [96]u8 = undefined;
+    const prov = chat.resolveProvider(&bb, &kb, &mb);
+    try std.testing.expectEqualStrings("https://api.cloudflare.com/client/v4/accounts/deadbeef00/ai/v1", prov.base_url);
+    // with no account id, the same provider yields the sentinel so the server uses its own creds
+    store.settings.cf_account_len = 0;
+    const prov2 = chat.resolveProvider(&bb, &kb, &mb);
+    try std.testing.expectEqualStrings("cloudflare", prov2.base_url);
 }
 
 test "a BYOK-OpenAI chat resolves an OpenAI cast (base_url + chat model + key); a local chat resolves Ollama" {
@@ -2372,4 +2864,141 @@ test "jStr and jInt read the deploy response" {
     const body = "{\"ok\":true,\"id\":\"a1b2c3d4e5f60708\",\"state\":\"running\",\"minds\":3}";
     try std.testing.expectEqualStrings("a1b2c3d4e5f60708", jStr(body, "id", &b).?);
     try std.testing.expectEqual(@as(i64, 3), jInt(body, "minds").?);
+}
+
+test "composeConsoleResult keeps stdout then stderr, and always the status note" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("outerr", composeConsoleResult(&buf, "out", "err", ""));
+    try std.testing.expectEqualStrings("(no output)", composeConsoleResult(&buf, "", "", ""));
+    try std.testing.expectEqualStrings("hi(stopped)", composeConsoleResult(&buf, "hi", "", "(stopped)"));
+    // when the body alone would overflow, room is reserved so the note (e.g. a timeout) still survives
+    var small: [12]u8 = undefined;
+    const note = "(timed out)"; // 11 bytes
+    const r = composeConsoleResult(&small, "xxxxxxxxxxxxxxxxxxxx", "", note);
+    try std.testing.expect(std.mem.endsWith(u8, r, note));
+    try std.testing.expect(r.len <= small.len);
+}
+
+// A tiny harness for the async-console tests: a Chat wired to a throwaway data dir. Caller owns teardown.
+const ConsoleTestCtx = struct {
+    threaded: *std.Io.Threaded,
+    store: *Store,
+    chat: *Chat,
+    fn init(dd: []const u8, dead_endpoint: bool) ConsoleTestCtx {
+        const a = std.testing.allocator;
+        const threaded = a.create(std.Io.Threaded) catch unreachable;
+        threaded.* = std.Io.Threaded.init(a, .{ .environ = llm.osEnviron() });
+        const tio = threaded.io();
+        _ = Io.Dir.cwd().createDirPathStatus(tio, dd, .default_dir) catch {};
+        var vb: [256]u8 = undefined;
+        const vd = std.fmt.bufPrint(&vb, "{s}/.veil-desk/chats", .{dd}) catch unreachable;
+        _ = Io.Dir.cwd().createDirPathStatus(tio, vd, .default_dir) catch {};
+        const store = a.create(Store) catch unreachable;
+        store.* = .{};
+        @memcpy(store.settings.data_dir[0..dd.len], dd);
+        store.settings.data_dir_len = @intCast(dd.len);
+        if (dead_endpoint) {
+            const base = "http://127.0.0.1:1/v1"; // a follow-up turn's curl goes nowhere
+            @memcpy(store.settings.chat_base[0..base.len], base);
+            store.settings.chat_base_len = base.len;
+        }
+        const chat = a.create(Chat) catch unreachable;
+        chat.* = .{ .io = tio, .gpa = a, .store = store };
+        return .{ .threaded = threaded, .store = store, .chat = chat };
+    }
+    fn io(self: *ConsoleTestCtx) Io {
+        return self.threaded.io();
+    }
+    /// Pump the console loop until the in-flight command finalizes (bounded so a stuck test can't hang).
+    fn drain(self: *ConsoleTestCtx, dd: []const u8) void {
+        var i: usize = 0;
+        while (self.chat.console != null and i < 400) : (i += 1) {
+            self.chat.pumpConsole(dd);
+            if (self.chat.console == null) break;
+            self.io().sleep(.{ .nanoseconds = 25 * std.time.ns_per_ms }, .awake) catch {};
+        }
+    }
+    fn deinit(self: *ConsoleTestCtx, dd: []const u8) void {
+        const a = std.testing.allocator;
+        if (self.chat.console) |*p| p.child.kill(self.io());
+        Io.Dir.cwd().deleteTree(self.io(), dd) catch {};
+        self.threaded.deinit();
+        a.destroy(self.chat);
+        a.destroy(self.store);
+        a.destroy(self.threaded);
+    }
+};
+
+fn consoleScrollHas(store: *Store, ai: bool, needle: []const u8) bool {
+    const s = if (ai) store.console_ai[0..store.console_ai_len] else store.console_you[0..store.console_you_len];
+    return std.mem.indexOf(u8, s, needle) != null;
+}
+
+test "micro-console: a You command runs async (non-blocking), streams its output, and clears busy" {
+    const dd = "zig-console-you-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    ctx.chat.consoleStart(dd, false, "echo neuron-db-console-probe");
+    // launched but NOT yet finished — proves it did not block the caller
+    try std.testing.expect(ctx.chat.console != null);
+    try std.testing.expect(ctx.store.console_busy_you);
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null); // finalized
+    try std.testing.expect(!ctx.store.console_busy_you); // busy cleared
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "neuron-db-console-probe"));
+}
+
+test "micro-console: a command that overruns its wall-clock deadline is killed and reported" {
+    const dd = "zig-console-timeout-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    const longcmd = if (builtin.os.tag == .windows) "ping -n 20 127.0.0.1" else "sleep 20";
+    ctx.chat.consoleStart(dd, false, longcmd);
+    try std.testing.expect(ctx.chat.console != null);
+    ctx.chat.console.?.deadline_s = ctx.chat.nowS() - 1; // force the deadline into the past
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null); // killed + finalized
+    try std.testing.expect(!ctx.store.console_busy_you);
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "timed out"));
+}
+
+test "micro-console: the Stop button (console_cancel) interrupts a running command" {
+    const dd = "zig-console-cancel-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    const longcmd = if (builtin.os.tag == .windows) "ping -n 20 127.0.0.1" else "sleep 20";
+    ctx.chat.consoleStart(dd, false, longcmd);
+    try std.testing.expect(ctx.chat.console != null);
+    ctx.chat.console_cancel = true; // what the .console_cancel command sets
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    try std.testing.expect(!ctx.store.console_busy_you);
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "stopped"));
+}
+
+test "micro-console: an AI RUN: command folds its output back as a [console] message" {
+    const dd = "zig-console-ai-tmp";
+    var ctx = ConsoleTestCtx.init(dd, true);
+    defer ctx.deinit(dd);
+    ctx.chat.cmdNewConv(dd); // an active conversation for the fold to append into
+    ctx.chat.consoleStart(dd, true, "echo neuron-db-ai-probe");
+    try std.testing.expect(ctx.store.console_busy_ai);
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    try std.testing.expect(!ctx.store.console_busy_ai);
+    var found = false;
+    {
+        ctx.store.lock();
+        defer ctx.store.unlock();
+        var k: usize = 0;
+        while (k < ctx.store.msg_count) : (k += 1) {
+            const txt = ctx.store.msgs[k].textStr();
+            if (std.mem.indexOf(u8, txt, "[console]") != null and std.mem.indexOf(u8, txt, "neuron-db-ai-probe") != null) found = true;
+        }
+    }
+    try std.testing.expect(found);
+    // tear down the follow-up turn's stream (foldConsoleAi started one against the dead endpoint)
+    llm.abort(&ctx.chat.stream, ctx.io());
+    ctx.chat.stream.deinit(std.testing.allocator);
+    ctx.chat.turn = .idle;
 }

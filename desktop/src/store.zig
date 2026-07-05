@@ -77,6 +77,8 @@ pub const Settings = struct {
     chat_model_len: u8 = 0,
     chat_key: [192]u8 = [_]u8{0} ** 192, // in-memory only; persisted via secrets.zig, never plaintext
     chat_key_len: u8 = 0,
+    cf_account: [64]u8 = [_]u8{0} ** 64, // Cloudflare account id — built into the Workers AI base_url (not a secret)
+    cf_account_len: u8 = 0,
     // chat pane collapse state (persisted with the chat settings)
     chat_left_open: bool = true,
     chat_right_open: bool = true,
@@ -95,6 +97,9 @@ pub const Settings = struct {
     }
     pub fn chatKey(s: *const Settings) []const u8 {
         return s.chat_key[0..s.chat_key_len];
+    }
+    pub fn cfAccount(s: *const Settings) []const u8 {
+        return s.cf_account[0..s.cf_account_len];
     }
 };
 
@@ -169,7 +174,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick };
 
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
@@ -243,6 +248,7 @@ pub const Store = struct {
     stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
     stream_reason_len: usize = 0,
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
+    chat_loop: bool = false, // full-auto: the AI writes + sends its own next message until DONE or the cap (runtime only)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,
     // Micro-console (below Swarm activity): two independent shell sessions — "You" (the user drives it) and

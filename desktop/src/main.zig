@@ -58,10 +58,12 @@ const Ui = struct {
     s_model: Field = .{},
     s_url: Field = .{},
     s_ckey: Field = .{},
+    s_cfacct: Field = .{}, // Cloudflare account id (chat BYOK, when the provider needs one)
     s_seeded: bool = false, // provider fields copied from the store once (after the chat thread loads)
     // deploy form
     d_name: Field = .{},
     d_key: Field = .{},
+    d_cfacct: Field = .{}, // Cloudflare account id (Deploy form, when the provider needs one)
     d_goal: Field = .{},
     d_gateway: Field = .{},
     d_provider: usize = 0,
@@ -100,7 +102,7 @@ const Ui = struct {
     log_scroll: f32 = 0,
     log_follow: bool = true,
 
-    const Focus = enum { none, chat, d_name, d_key, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, con_input };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, con_input };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -744,6 +746,7 @@ fn handleKeys(store: *Store) void {
         .chat => editField(&ui.chat),
         .d_name => editField(&ui.d_name),
         .d_key => editField(&ui.d_key),
+        .d_cfacct => editField(&ui.d_cfacct),
         .d_goal => editField(&ui.d_goal),
         .d_gateway => editField(&ui.d_gateway),
         .c_input => editField(&ui.c_input),
@@ -751,6 +754,7 @@ fn handleKeys(store: *Store) void {
         .s_model => editField(&ui.s_model),
         .s_url => editField(&ui.s_url),
         .s_ckey => editField(&ui.s_ckey),
+        .s_cfacct => editField(&ui.s_cfacct),
         .con_input => editField(&ui.con_input),
     }
     if (rl.isKeyPressed(.escape)) {
@@ -1053,20 +1057,31 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
 
     // ---- input row (only the You tab is user-typable; the Veil tab is driven by the AI) ----
     const iy: f32 = r.y + r.height - input_h - 2;
+    const runw: f32 = 52;
+    // While a command runs, a red Stop button (either tab) pushes a console_cancel so the user can kill a hang.
+    const stopb = t.Rect{ .x = r.x + r.width - runw - 2, .y = iy, .width = runw, .height = input_h };
     if (ai) {
-        t.textMono(if (busy) t.z("veil is running a command...", .{}) else t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment);
+        if (busy) {
+            t.textMonoClip(t.z("veil is running a command...", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment, @intFromFloat(r.width - runw - 16));
+            if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "veil", ""));
+        } else {
+            t.textMono(t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment);
+        }
         return;
     }
-    const runw: f32 = 52;
     const cf = t.Rect{ .x = r.x + 2, .y = iy, .width = r.width - runw - 8, .height = input_h };
     textField(cf, &ui.con_input, ui.focus == .con_input, "> command", .con_input);
-    const rb = t.Rect{ .x = r.x + r.width - runw - 2, .y = iy, .width = runw, .height = input_h };
-    const can = ui.con_input.len > 0 and !busy;
-    const clicked = t.button(rb, t.z("Run", .{}), t.green, can);
-    const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
-    if (can and (clicked or (ui.focus == .con_input and enter))) {
-        store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
-        ui.con_input.len = 0;
+    if (busy) {
+        // a command is running — swap Run for Stop so the user can interrupt it from here
+        if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "you", ""));
+    } else {
+        const can = ui.con_input.len > 0;
+        const clicked = t.button(stopb, t.z("Run", .{}), t.green, can);
+        const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
+        if (can and (clicked or (ui.focus == .con_input and enter))) {
+            store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
+            ui.con_input.len = 0;
+        }
     }
 }
 
@@ -1679,11 +1694,32 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else if (status.len > 0) {
         t.text(t.zs(status), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment);
     }
+    // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
+    // 12-step cap). Right-aligned on the status row so it sits just above the input the user asked it beside.
+    const loop_on = blk: {
+        store.lock();
+        defer store.unlock();
+        break :blk store.chat_loop;
+    };
+    const ltog = t.Rect{ .x = r.x + r.width - 132, .y = sy - 2, .width = 132, .height = 18 };
+    if (t.button(ltog, if (loop_on) t.z("auto-loop: ON", .{}) else t.z("auto-loop: off", .{}), if (loop_on) t.green else t.comment, true)) {
+        var now_on = false;
+        {
+            store.lock();
+            defer store.unlock();
+            store.chat_loop = !store.chat_loop;
+            now_on = store.chat_loop;
+        }
+        // Turning it on with an idle, non-empty conversation kicks the first iteration immediately; otherwise it
+        // engages after the next turn settles. Turning it off just stops new iterations (the in-flight turn finishes).
+        if (now_on) store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
+        store.pushNotif(if (now_on) "Auto-loop on" else "Auto-loop off", if (now_on) "the veil will drive the conversation until it's done" else "stopping after the current turn", 1);
+    }
     sy += status_h;
 
     // input row
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
-    textField(cf, &ui.c_input, ui.focus == .c_input, "message the veil - Enter to send", .c_input);
+    textField(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input);
     const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
     const can_send = ui.c_input.len > 0 and !busy;
     const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
@@ -1842,8 +1878,14 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), prov.models[ui.d_model].label, .model);
     ly += fh + gap;
 
+    if (prov.needs_account) {
+        flabel(x, ly, "CLOUDFLARE ACCOUNT ID (blank = use the server's own Workers AI creds)");
+        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
+        ly += fh + 14 + gap - 14;
+    }
     if (prov.needs_key) {
-        flabel(x, ly, "API KEY (nlk_... or provider key)");
+        const kh: [:0]const u8 = if (std.mem.eql(u8, prov.key, "huggingface")) t.z("HF TOKEN (hf_...)", .{}) else if (prov.needs_account) t.z("CLOUDFLARE API TOKEN (blank = server creds)", .{}) else t.z("API KEY (nlk_... or provider key)", .{});
+        flabel(x, ly, kh);
         textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
         ly += fh + 14 + gap - 14;
     }
@@ -2066,11 +2108,14 @@ fn portOf(store: *Store) u16 {
 fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     var b: [3072]u8 = undefined;
     var w = std.Io.Writer.fixed(&b);
+    // Resolve the Cloudflare {account} placeholder (no-op for every other provider) before sending.
+    var basebuf: [256]u8 = undefined;
+    const eff_base = catalog.resolveBase(prov, ui.d_cfacct.str(), &basebuf);
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
     w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
         prov.key,               prov.models[ui.d_model].id,    catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
-        prov.base_url,          catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),      boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
+        eff_base,               catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),      boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
         boolStr(ui.d_internet), boolStr(ui.d_gap),             boolStr(ui.d_breakout),     boolStr(ui.d_psyche),
     }) catch return;
     jesc(&w, ui.d_key.str());
@@ -2440,6 +2485,9 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     var cbb: [192]u8 = undefined;
     const cbn: usize = store.settings.chat_base_len;
     @memcpy(cbb[0..cbn], store.settings.chat_base[0..cbn]);
+    var cfab: [64]u8 = undefined;
+    const cfan: usize = store.settings.cf_account_len;
+    @memcpy(cfab[0..cfan], store.settings.cf_account[0..cfan]);
     store.unlock();
 
     flabel(x, y, "DATA DIRECTORY (read live)");
@@ -2480,9 +2528,10 @@ fn drawSettings(store: *Store, body: t.Rect) void {
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
     // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
-    if (!ui.s_seeded and (cmn > 0 or cbn > 0)) {
+    if (!ui.s_seeded and (cmn > 0 or cbn > 0 or cfan > 0)) {
         setField(&ui.s_model, cmb[0..cmn]);
         setField(&ui.s_url, cbb[0..cbn]);
+        setField(&ui.s_cfacct, cfab[0..cfan]);
         ui.s_seeded = true;
     }
     t.hline(@intFromFloat(x), @intFromFloat(y), @intFromFloat(colw), t.border);
@@ -2539,9 +2588,29 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         y += 56;
     }
 
+    // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
+    if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
+        flabel(x, y, "CLOUDFLARE ACCOUNT ID (from your Cloudflare dashboard - not a secret)");
+        y += 14;
+        textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
+        if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save id", .{}), t.blue, true)) {
+            store.lock();
+            const s = &store.settings;
+            const n = @min(ui.s_cfacct.len, s.cf_account.len);
+            @memcpy(s.cf_account[0..n], ui.s_cfacct.buf[0..n]);
+            s.cf_account_len = @intCast(n);
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif("Account id saved", "used to build the Workers AI endpoint", 1);
+            ui.focus = .none;
+        }
+        y += 44;
+    }
+
     // API key (BYOK only — local needs none, custom uses this too)
     if (chat_kind != 0) {
-        flabel(x, y, "API KEY (stored in the OS-protected local store, never plaintext)");
+        const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
+        flabel(x, y, key_hint);
         y += 14;
         textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
         if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save key", .{}), t.blue, ui.s_ckey.len > 0)) {
