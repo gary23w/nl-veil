@@ -63,10 +63,16 @@ const SYSTEM_PROMPT =
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 2048;
 
-const Turn = enum { idle, user, collect, tool_follow };
+const Turn = enum { idle, user, collect, tool_follow, reflect };
 
 // Bound the model→tool→model loop so a confused local model can't spin forever on tool calls.
 const MAX_TOOL_ITERS: u32 = 5;
+
+// Recursive-thought (reflect) loop: one extra self-check pass — but ONLY for substantive answers to
+// substantive requests, never for chit-chat (a "hello" must not recurse). REFLECT_MIN_ANSWER is the answer
+// length below which an answer is considered trivial and skips the pass.
+const REFLECT_PASSES: u8 = 1;
+const REFLECT_MIN_ANSWER: usize = 500;
 
 pub const Chat = struct {
     io: Io,
@@ -81,6 +87,8 @@ pub const Chat = struct {
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
+    reflect_draft: [12288]u8 = undefined, // first-pass draft used by the one-step reflect turn
+    reflect_draft_len: usize = 0,
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -840,6 +848,12 @@ pub const Chat = struct {
                 msgs.appendSlice(self.gpa, "\"}") catch return;
             }
         }
+        if (kind == .reflect and self.reflect_draft_len > 0) {
+            msgs.appendSlice(self.gpa, ",{\"role\":\"assistant\",\"content\":\"") catch return;
+            escJson(&msgs, self.gpa, self.reflect_draft[0..self.reflect_draft_len]);
+            msgs.appendSlice(self.gpa, "\"}") catch return;
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Quick self-check pass: revise the draft for correctness and completeness. Keep the same intent, fix mistakes, and return only the final answer text. Do not emit TOOL: or CAST:.\"}") catch return;
+        }
         if (kind == .collect) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. Using the [cast] findings above, give the user a direct, complete answer to their original request. Do not cast again.\"}") catch return;
         }
@@ -851,7 +865,7 @@ pub const Chat = struct {
         const side = sideDir(dd, &sb);
         if (!llm.start(&self.stream, self.io, self.gpa, side, prov, msgs.items, MAX_TOKENS, self.nowS())) {
             self.store.pushNotif("Chat failed", "could not start the model call (is curl available?)", 2);
-            // A .tool_follow (or .collect) re-entry gets here with busy already true — clear it or the chat
+            // A .tool_follow, .reflect (or .collect) re-entry gets here with busy already true — clear it or the chat
             // wedges "busy" forever. turn is already .idle (set by the caller before re-entry).
             self.setBusy(false);
             return;
@@ -923,8 +937,8 @@ pub const Chat = struct {
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
         // TOOL: <name> <args> — a single shared-tool call. Run it, fold the result back, continue the loop.
-        // Not on a .collect turn (that turn's job is to compose the cast's final answer, not run tools).
-        if (kind != .collect) {
+        // Not on a .collect/.reflect turn (those turns are answer-composition passes).
+        if (kind != .collect and kind != .reflect) {
             // Primary: a strict TOOL line in content. Recovery: gpt-oss-style reasoning models sometimes leave
             // content empty and narrate the call in the hidden reasoning ("...so we issue TOOL: web_search {..}")
             // — pull the last TOOL: out of the reasoning so the tool still fires (mirrors the cast recovery).
@@ -941,7 +955,32 @@ pub const Chat = struct {
                 return; // a fresh .tool_follow turn is now live; stay busy
             }
         }
-        if (kind == .collect) {
+        if (REFLECT_PASSES > 0 and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
+            var reason_fb: [1200]u8 = undefined;
+            const rn = @min(reason.len, reason_fb.len);
+            @memcpy(reason_fb[0..rn], reason[0..rn]);
+            self.reflect_draft_len = @min(full.len, self.reflect_draft.len);
+            @memcpy(self.reflect_draft[0..self.reflect_draft_len], full[0..self.reflect_draft_len]);
+            self.stream.deinit(self.gpa);
+            self.setStatus("self-checking...");
+            self.startTurn(dd, .reflect);
+            // If the second pass fails to start, fall back to the first draft so the user still gets an answer.
+            if (self.turn != .reflect) {
+                self.appendVeil(dd, reason_fb[0..rn], self.reflect_draft[0..self.reflect_draft_len]);
+                self.reflect_draft_len = 0;
+            }
+            return;
+        }
+        if (kind == .reflect) {
+            self.reflect_draft_len = 0;
+            if (full.len > 0) {
+                self.appendVeil(dd, reason, full);
+            } else if (reason.len > 0) {
+                self.appendMsg(dd, .veil, reason);
+            } else {
+                self.appendMsg(dd, .veil, "(self-check produced an empty reply)");
+            }
+        } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (castGoal(full)) |goal| {
             var nb: [3072]u8 = undefined;
@@ -1400,6 +1439,31 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
         if (seen >= 5) return null; // a CAST mention deep in prose is narration, not an action
     }
     return null;
+}
+
+/// Should we run the self-check (reflect) pass for this completed turn? Only a SUBSTANTIVE answer to a
+/// SUBSTANTIVE request qualifies — a greeting or a one-liner must NOT recurse ("hello" -> short reply -> no
+/// second pass). This mirrors how Claude Code iterates on real TASKS, not on chit-chat. Control lines
+/// (TOOL:/CAST:) and the non-answer turns (collect/reflect/idle) never reflect.
+fn shouldReflectPass(kind: Turn, user_msg: []const u8, full: []const u8) bool {
+    if (kind != .user and kind != .tool_follow) return false;
+    if (full.len == 0) return false;
+    if (castGoal(full) != null or toolCall(full) != null) return false;
+    if (full.len < REFLECT_MIN_ANSWER) return false; // trivial/short answers don't need a self-check
+    if (isSmallTalk(user_msg)) return false; // greetings/acks/tiny queries never warrant a reflect pass
+    return true;
+}
+
+/// A greeting, thanks, or tiny query — the kind of message a reflection pass must never fire on.
+fn isSmallTalk(msg: []const u8) bool {
+    const m = std.mem.trim(u8, msg, " \r\n\t");
+    if (m.len < 24) return true;
+    var buf: [24]u8 = undefined;
+    const n = @min(m.len, buf.len);
+    for (m[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const openers = [_][]const u8{ "hello", "hi ", "hey", "thanks", "thank you", "good morning", "good evening", "how are you", "what's up", "yo " };
+    for (openers) |w| if (std.mem.startsWith(u8, buf[0..n], w)) return true;
+    return false;
 }
 
 pub const ToolCall = struct { name: []const u8, args: []const u8 };
@@ -1987,6 +2051,28 @@ test "castGoal fires on a CAST line within the first few lines" {
     try std.testing.expect(castGoal("CAST:") == null);
     // a CAST buried deep in prose is narration
     try std.testing.expect(castGoal("a\nb\nc\nd\ne\nf\nCAST: too deep") == null);
+}
+
+test "shouldReflectPass: only substantive answers to real requests reflect (hello never recurses)" {
+    var longbuf: [600]u8 = undefined;
+    @memset(&longbuf, 'x');
+    const long = longbuf[0..];
+    const q = "Explain in detail how a red-black tree stays balanced and why rotations preserve the invariants.";
+    // substantive question + substantive answer -> reflect
+    try std.testing.expect(shouldReflectPass(.user, q, long));
+    try std.testing.expect(shouldReflectPass(.tool_follow, q, long));
+    // THE BUG: a greeting must NOT recurse
+    try std.testing.expect(!shouldReflectPass(.user, "hello", "Hi! How can I help you today?"));
+    try std.testing.expect(!shouldReflectPass(.user, "hi there", long)); // small-talk user msg
+    try std.testing.expect(!shouldReflectPass(.user, "thanks!", long));
+    // trivial (short) answer never reflects even for a real question
+    try std.testing.expect(!shouldReflectPass(.user, q, "Short answer."));
+    // control lines + non-answer turns never reflect
+    try std.testing.expect(!shouldReflectPass(.collect, q, long));
+    try std.testing.expect(!shouldReflectPass(.reflect, q, long));
+    try std.testing.expect(!shouldReflectPass(.user, q, "CAST: research this repo"));
+    try std.testing.expect(!shouldReflectPass(.user, q, "TOOL: web_search {}"));
+    try std.testing.expect(!shouldReflectPass(.user, q, ""));
 }
 
 test "toolCall parses name + raw json args" {
