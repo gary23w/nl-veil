@@ -169,7 +169,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run };
 
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
@@ -245,6 +245,15 @@ pub const Store = struct {
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,
+    // Micro-console (below Swarm activity): two independent shell sessions — "You" (the user drives it) and
+    // "Veil" (the AI drives it via RUN:). Each keeps a scrollback ring the chat worker appends command output to.
+    console_you: [16384]u8 = undefined,
+    console_you_len: usize = 0,
+    console_ai: [16384]u8 = undefined,
+    console_ai_len: usize = 0,
+    console_busy_you: bool = false,
+    console_busy_ai: bool = false,
+    console_show_veil: bool = false, // one-shot: the AI ran a RUN: — the UI flips to the Veil tab, then clears it
     casts: [MAX_CASTS]CastRow = undefined,
     cast_count: usize = 0,
     cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast
@@ -299,6 +308,23 @@ pub const Store = struct {
         if ((s.chat_cmd_head + 1) % CHAT_CMD_RING == s.chat_cmd_tail) return;
         s.chat_cmds[s.chat_cmd_head] = c;
         s.chat_cmd_head = (s.chat_cmd_head + 1) % CHAT_CMD_RING;
+    }
+
+    /// Append `text` to a console scrollback (ai=Veil console, else You). Keeps the newest ~half on overflow.
+    pub fn consoleAppend(s: *Store, ai: bool, text: []const u8) void {
+        s.lock();
+        defer s.unlock();
+        const buf = if (ai) &s.console_ai else &s.console_you;
+        const lenp = if (ai) &s.console_ai_len else &s.console_you_len;
+        if (lenp.* + text.len > buf.len) {
+            const keep = buf.len / 2;
+            const from = if (lenp.* > keep) lenp.* - keep else 0;
+            std.mem.copyForwards(u8, buf[0..], buf[from..lenp.*]);
+            lenp.* -= from;
+        }
+        const n = @min(text.len, buf.len - lenp.*);
+        @memcpy(buf[lenp.* .. lenp.* + n], text[0..n]);
+        lenp.* += n;
     }
 
     /// Chat thread: pop the next chat command, or null.

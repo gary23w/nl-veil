@@ -9,6 +9,7 @@
 //!     <data>/.veil-desk/settings.json, the API key sealed via secrets.zig. All chat-side io lives here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
@@ -58,6 +59,15 @@ const SYSTEM_PROMPT =
     "Use a TOOL for a one-shot lookup or to inspect/steer a running cast (e.g. the user says 'kill the swarm " ++
     "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Use CAST for open-ended " ++
     "research or building. For a brand-new web question, a single web_search TOOL is often faster than a cast.\n" ++
+    "\n" ++
+    "SHELL — when the user asks you to run a command, work in a directory, inspect files, or drive the system, " ++
+    "you have a real terminal on their machine. Make the reply exactly one line:\n" ++
+    "RUN: <shell command>\n" ++
+    "Then STOP. I run it in the Veil console tab and reply with a [console] message containing its output; read " ++
+    "that, then either RUN another command or give your final answer. One command per reply, never RUN with prose " ++
+    "in the same reply. Only use RUN when the user actually wants system/terminal work — quote paths with spaces, " ++
+    "prefer non-destructive commands, and never run something irreversible (deleting data, killing processes) " ++
+    "without the user asking for it. For pure web/research questions use web_search or CAST, not RUN.\n" ++
     "Otherwise reply normally in plain text.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
@@ -347,8 +357,57 @@ pub const Chat = struct {
                 .stop_cast => self.cmdStopCast(dd, c.idStr()),
                 .save_settings => self.saveSettings(dd),
                 .save_key => self.cmdSaveKey(dd, c.textStr()),
+                .console_run => self.cmdConsoleRun(std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
             }
         }
+    }
+
+    fn setConsoleBusy(self: *Chat, ai: bool, v: bool) void {
+        self.store.lock();
+        defer self.store.unlock();
+        if (ai) self.store.console_busy_ai = v else self.store.console_busy_you = v;
+    }
+
+    /// A user-typed micro-console command (the "You"/"Veil" tab). Runs it and streams output into the
+    /// scrollback; the return value is ignored on the user path.
+    fn cmdConsoleRun(self: *Chat, ai: bool, cmd: []const u8) void {
+        var fold: [16]u8 = undefined; // user path doesn't fold back to a model — a tiny throwaway buffer
+        _ = self.execConsole(ai, cmd, &fold);
+    }
+
+    /// Shared shell executor for the micro-console. Streams `> cmd` + combined stdout/stderr into the console
+    /// scrollback (tab selected by `ai`), and ALSO copies a bounded prefix of the output into `fold` so an
+    /// AI-driven RUN: can hand the result back to the model. Blocking on the chat worker thread (same thread
+    /// that spawns curl for casts), so the render thread stays responsive. Returns the slice of `fold` written.
+    fn execConsole(self: *Chat, ai: bool, cmd: []const u8, fold: []u8) []const u8 {
+        const trimmed = std.mem.trim(u8, cmd, " \r\n\t");
+        if (trimmed.len == 0) return fold[0..0];
+        self.store.consoleAppend(ai, "\n> ");
+        self.store.consoleAppend(ai, trimmed);
+        self.store.consoleAppend(ai, "\n");
+        self.setConsoleBusy(ai, true);
+        defer self.setConsoleBusy(ai, false);
+        // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
+        const argv = if (builtin.os.tag == .windows)
+            [_][]const u8{ "cmd", "/c", trimmed }
+        else
+            [_][]const u8{ "sh", "-c", trimmed };
+        const res = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch {
+            const msg = "(failed to launch the command)\n";
+            self.store.consoleAppend(ai, msg);
+            return copyInto(fold, msg);
+        };
+        defer self.gpa.free(res.stdout);
+        defer self.gpa.free(res.stderr);
+        if (res.stdout.len > 0) self.store.consoleAppend(ai, res.stdout);
+        if (res.stderr.len > 0) self.store.consoleAppend(ai, res.stderr);
+        if (res.stdout.len == 0 and res.stderr.len == 0) self.store.consoleAppend(ai, "(no output)\n");
+        // fold buffer for the model: stdout first, then stderr, bounded to `fold.len`
+        var w: usize = 0;
+        w += copyInto(fold[w..], res.stdout).len;
+        w += copyInto(fold[w..], res.stderr).len;
+        if (w == 0) w += copyInto(fold[w..], "(no output)").len;
+        return fold[0..w];
     }
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
@@ -954,6 +1013,19 @@ pub const Chat = struct {
                 self.runToolAndContinue(dd, tc); // copies tc off the stream, THEN frees it, THEN re-enters
                 return; // a fresh .tool_follow turn is now live; stay busy
             }
+            // RUN: <shell command> — the AI's micro-console door. Same agentic loop as TOOL (shared iteration
+            // budget), output streams into the Veil console tab and folds back so the model reads the result.
+            if (runCall(full)) |cmd| {
+                if (self.tool_iters >= MAX_TOOL_ITERS) {
+                    self.appendMsg(dd, .veil, "(I ran several commands in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
+                    self.stream.deinit(self.gpa);
+                    self.setBusy(false);
+                    return;
+                }
+                self.tool_iters += 1;
+                self.runShellAndContinue(dd, cmd); // copies cmd off the stream, THEN frees it, THEN re-enters
+                return;
+            }
         }
         if (REFLECT_PASSES > 0 and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
             var reason_fb: [1200]u8 = undefined;
@@ -1235,6 +1307,36 @@ pub const Chat = struct {
         // model sees it as user content; it's also the user-visible record that the tool ran).
         var fb: [8320]u8 = undefined;
         const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ name, result }) catch result;
+        self.appendMsg(dd, .cast_note, folded);
+        self.startTurn(dd, .tool_follow);
+    }
+
+    /// The AI's RUN: door. `cmd` is a slice INTO self.stream.content — copy it before freeing the stream (same
+    /// UAF discipline as runToolAndContinue). Runs it on the Veil console tab, folds the output back as a
+    /// [console] message, and re-enters a .tool_follow turn so the model reads the result and continues.
+    fn runShellAndContinue(self: *Chat, dd: []const u8, cmd: []const u8) void {
+        var cmdbuf: [1024]u8 = undefined;
+        const cn = @min(cmd.len, cmdbuf.len);
+        @memcpy(cmdbuf[0..cn], cmd[0..cn]);
+        const command = cmdbuf[0..cn];
+        self.stream.deinit(self.gpa); // now safe — command is an owned copy
+
+        {
+            // surface the Veil tab so the user watches the AI's command land (best-effort; store owns the flag)
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.console_show_veil = true;
+        }
+
+        var stbuf: [96]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running: {s}", .{command[0..@min(command.len, 60)]}) catch "running a command...");
+        log.info("chat RUN: {s}", .{command[0..@min(command.len, 120)]});
+
+        var out: [6144]u8 = undefined;
+        const result = self.execConsole(true, command, &out);
+
+        var fb: [7168]u8 = undefined;
+        const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ command, result }) catch result;
         self.appendMsg(dd, .cast_note, folded);
         self.startTurn(dd, .tool_follow);
     }
@@ -1532,6 +1634,32 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
         if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
+}
+
+/// Copy as much of `src` as fits into `dst`; returns the slice of `dst` actually written.
+fn copyInto(dst: []u8, src: []const u8) []const u8 {
+    const n = @min(dst.len, src.len);
+    @memcpy(dst[0..n], src[0..n]);
+    return dst[0..n];
+}
+
+/// A reply that is exactly a "RUN: <shell command>" line (the AI's micro-console door). Returns the command,
+/// trimmed, or null. Mirrors toolCall: only fires if RUN: leads one of the first few substantive lines so a
+/// passing mention in prose can't trigger a shell command.
+pub fn runCall(full: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, full, '\n');
+    var seen: u32 = 0;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r`*");
+        if (line.len == 0) continue;
+        seen += 1;
+        if (seen > 4) return null;
+        if (std.mem.startsWith(u8, line, "RUN:")) {
+            const cmd = std.mem.trim(u8, line["RUN:".len..], " \t\r");
+            return if (cmd.len == 0 or cmd.len > 900) null else cmd;
+        }
+    }
+    return null;
 }
 
 /// Did the user's message explicitly ask to cast a swarm? Case-insensitive: a cast verb
@@ -2107,6 +2235,19 @@ test "toolCallLoose recovers a call narrated inside reasoning" {
     // bare name, no args -> {}
     try std.testing.expectEqualStrings("{}", toolCallLoose("so I will run TOOL: list_swarms now").?.args);
     try std.testing.expect(toolCallLoose("no tool mentioned here") == null);
+}
+
+test "runCall parses the AI's RUN: shell door" {
+    try std.testing.expectEqualStrings("dir", runCall("RUN: dir").?);
+    try std.testing.expectEqualStrings("git status", runCall("RUN: git status").?);
+    // a short preamble above the RUN line is tolerated (mirrors toolCall)
+    try std.testing.expectEqualStrings("ls -la", runCall("Sure, let me look.\nRUN: ls -la").?);
+    // strips a markdown code fence marker / bullet
+    try std.testing.expectEqualStrings("echo hi", runCall("* RUN: echo hi").?);
+    // not a command line -> null; empty command -> null; buried deep -> null (narration)
+    try std.testing.expect(runCall("just chatting about running things") == null);
+    try std.testing.expect(runCall("RUN:") == null);
+    try std.testing.expect(runCall("a\nb\nc\nd\ne\nRUN: too_deep") == null);
 }
 
 test "jsonStrInto unescapes; extractToolResult picks the right field" {
