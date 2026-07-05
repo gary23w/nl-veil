@@ -273,6 +273,11 @@ pub const Chat = struct {
             self.drainCommands(dd);
             self.pumpStream(dd);
             self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
+            // ~1Hz auto-loop backstop: a .loop_kick that lands the instant a turn is finishing hits maybeLoop's
+            // `turn != .idle` guard and is lost — the settle-point call can't recover it if the turn had already
+            // settled. Re-checking every idle tick self-heals that gap (maybeLoop no-ops unless loop is on AND the
+            // chat is genuinely idle with something to continue from, so this can't run away or double-fire).
+            if (tick % 10 == 5) self.maybeLoop(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
