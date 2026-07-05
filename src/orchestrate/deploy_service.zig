@@ -250,7 +250,12 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (n == 0) n = 1;
     const names = [_][]const u8{ "nova", "ada", "rex", "lux", "sol" };
     const minds = try res.arena.alloc(MindSpec, n);
-    for (minds, 0..) |*m, i| m.* = .{ .name = names[i % names.len], .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
+    // UNIQUE names past the first 5 (a big cast can line up to 30) — `i % len` would repeat "nova/ada/…" and two
+    // minds with the same name collide on their minds/<name> dir + per-mind memory scope.
+    for (minds, 0..) |*m, i| {
+        const nm = if (i < names.len) names[i] else try std.fmt.allocPrint(res.arena, "mind{d}", .{i + 1});
+        m.* = .{ .name = nm, .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
+    }
     var sfx: [3]u8 = undefined;
     app.io.random(&sfx);
     const name = if (rq.name.len > 0) rq.name else try std.fmt.allocPrint(res.arena, "run-{s}", .{std.fmt.bytesToHex(sfx, .lower)});
@@ -303,6 +308,7 @@ const CastReq = struct {
     gateway_model: []const u8 = "",
     style: []const u8 = "auto",
     name: []const u8 = "",
+    mode: []const u8 = "", // "" / "cast" = fast one-shot strike; "continuous" = a sustained long-term hivemind
 };
 
 pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -315,7 +321,12 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (n == 0) n = 1;
     const names = [_][]const u8{ "nova", "ada", "rex", "lux", "sol" };
     const minds = try res.arena.alloc(MindSpec, n);
-    for (minds, 0..) |*m, i| m.* = .{ .name = names[i % names.len], .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
+    // UNIQUE names past the first 5 (a big cast can line up to 30) — `i % len` would repeat "nova/ada/…" and two
+    // minds with the same name collide on their minds/<name> dir + per-mind memory scope.
+    for (minds, 0..) |*m, i| {
+        const nm = if (i < names.len) names[i] else try std.fmt.allocPrint(res.arena, "mind{d}", .{i + 1});
+        m.* = .{ .name = nm, .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
+    }
     var sfx: [3]u8 = undefined;
     app.io.random(&sfx);
     const name = if (rq.name.len > 0) rq.name else try std.fmt.allocPrint(res.arena, "cast-{s}", .{std.fmt.bytesToHex(sfx, .lower)});
@@ -329,11 +340,19 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // bounded moment, then it stops and the caller (the chat collect turn, or the Deploy tab) synthesizes.
         // NOT "oneshot" — oneshot is the 3-turn edit path that skips planning, so a research cast never scouts.
         .style = if (rq.style.len > 0) rq.style else "investigate",
-        .mode = "cast",
+        // The AI can request a SUSTAINED hivemind (continuous mode) for a big multi-step task instead of the fast
+        // one-shot strike — the difference is the engine loop keeps working for the whole budget vs stopping after
+        // one moment. Everything else about a cast (planCast, roles, autonomy dials) is identical.
+        .mode = if (std.mem.eql(u8, rq.mode, "continuous")) "continuous" else "cast",
         .goal = rq.goal,
         .api_key = rq.api_key,
         .base_url = rq.base_url,
-        .minutes = if (rq.minutes == 0) 4 else @min(rq.minutes, 4), // hard cap; the cast finishes well under this
+        // Quick strike: hard-capped short so it finishes fast. Sustained hivemind: a real budget (default 20,
+        // capped at 60) for work that genuinely needs the time.
+        .minutes = if (std.mem.eql(u8, rq.mode, "continuous"))
+            (if (rq.minutes == 0) 20 else @min(rq.minutes, 60))
+        else
+            (if (rq.minutes == 0) 4 else @min(rq.minutes, 4)),
         .gateway_model = rq.gateway_model,
         // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
