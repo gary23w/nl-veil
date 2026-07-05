@@ -1604,7 +1604,7 @@ fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
 }
 
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
-    const input_h: f32 = 38;
+    const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
     const status_h: f32 = 20;
     const view = t.Rect{ .x = r.x, .y = r.y, .width = r.width, .height = r.height - input_h - status_h - 10 };
     t.panelBordered(view, t.bg_dark, t.border);
@@ -1695,14 +1695,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         t.text(t.zs(status), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment);
     }
     // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
-    // 12-step cap). Right-aligned on the status row so it sits just above the input the user asked it beside.
+    // 12-step cap). Plain clickable label — no button chrome; the TEXT alone turns green when engaged.
     const loop_on = blk: {
         store.lock();
         defer store.unlock();
         break :blk store.chat_loop;
     };
-    const ltog = t.Rect{ .x = r.x + r.width - 132, .y = sy - 2, .width = 132, .height = 18 };
-    if (t.button(ltog, if (loop_on) t.z("auto-loop: ON", .{}) else t.z("auto-loop: off", .{}), if (loop_on) t.green else t.comment, true)) {
+    const ltxt: [:0]const u8 = if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
+    const ltw: f32 = @floatFromInt(t.measure(ltxt, 12));
+    const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = 17 };
+    const lhot = t.hovering(ltog);
+    t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
+    if (lhot and rl.isMouseButtonPressed(.left)) {
         var now_on = false;
         {
             store.lock();
@@ -1717,13 +1721,15 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     sy += status_h;
 
-    // input row
+    // input row — a 3-row growing/scrolling text area (a long prompt wraps + scrolls instead of running off-screen)
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
-    textField(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input);
-    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
+    textArea(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
+    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy + input_h - 34, .width = 88, .height = 34 };
     const can_send = ui.c_input.len > 0 and !busy;
     const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
-    const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter); // accept numpad Enter too
+    // Enter sends; Shift+Enter is reserved for a future literal newline. Only when the input owns the keyboard.
+    const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+    const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
     if (can_send and (clicked or (ui.focus == .c_input and enter))) {
         store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
         ui.c_input.len = 0;
@@ -2755,6 +2761,67 @@ fn flushChatDropdown(store: *Store) void {
 }
 
 // -------------------------------------------------------------------------------- shared widgets
+
+/// Greedy word-wrap `s` into `out` display lines at pixel width `maxw` (font size 13). Accumulates single-glyph
+/// widths (O(n), no O(n^2) re-measure) and breaks at the last space that fits. Returns the line count.
+fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
+    var n: usize = 0;
+    var ls: usize = 0; // current line start
+    var lastbreak: usize = 0; // index after the last space seen on the current line (a candidate wrap point)
+    var cur_w: f32 = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        var cb = [2]u8{ s[i], 0 };
+        const cs: [:0]const u8 = cb[0..1 :0];
+        cur_w += @floatFromInt(t.measure(cs, 13));
+        if (cur_w > maxw and i > ls) {
+            const brk = if (lastbreak > ls and lastbreak <= i) lastbreak else i; // break at word, else mid-word
+            if (n >= out.len) return n;
+            out[n] = s[ls..brk];
+            n += 1;
+            ls = brk;
+            lastbreak = ls;
+            cur_w = 0;
+            i = brk - 1; // re-scan from the break (the loop's +=1 lands on brk)
+            continue;
+        }
+        if (s[i] == ' ') lastbreak = i + 1;
+    }
+    if (ls < s.len and n < out.len) {
+        out[n] = s[ls..];
+        n += 1;
+    }
+    return n;
+}
+
+/// A multi-row, tail-scrolling text input. The Field holds ONE logical line (paste flattens newlines); this
+/// wraps it across up to `rows` visible rows and keeps the tail (caret) in view — so a long prompt grows
+/// downward and scrolls instead of running off the right edge.
+fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize) void {
+    t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
+    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
+    const inner_x: i32 = @intFromFloat(r.x + 10);
+    const line_h: f32 = 18;
+    if (f.len == 0 and !focused) {
+        t.text(placeholder, inner_x, @intFromFloat(r.y + 8), 13, t.comment);
+        return;
+    }
+    var lines: [96][]const u8 = undefined;
+    const nl = wrapInto(f.str(), r.width - 20, &lines);
+    const first = if (nl > rows) nl - rows else 0; // show the tail so the caret stays visible
+    var yy: f32 = r.y + 8;
+    var li = first;
+    while (li < nl) : (li += 1) {
+        t.text(t.zs(lines[li]), inner_x, @intFromFloat(yy), 13, t.fg);
+        yy += line_h;
+    }
+    if (focused and @mod(rl.getTime(), 1.0) < 0.5) {
+        const lastline: []const u8 = if (nl > 0) lines[nl - 1] else "";
+        const lw = t.measure(t.zs(lastline), 13);
+        const shown: f32 = @floatFromInt(if (nl == 0) @as(usize, 0) else @min(nl, rows) - 1);
+        t.fillRect(inner_x + lw + 1, @intFromFloat(r.y + 8 + shown * line_h), 2, 15, t.blue);
+    }
+}
 
 fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);

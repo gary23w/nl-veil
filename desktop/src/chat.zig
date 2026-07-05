@@ -71,7 +71,7 @@ const SYSTEM_PROMPT =
     "Otherwise reply normally in plain text.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
-const MAX_TOKENS: u32 = 2048;
+const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
 
 const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer };
 
@@ -1565,12 +1565,20 @@ pub const Chat = struct {
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         log.info("cast: POST -> status={d} body={s}", .{ resp.status, resp.body[0..@min(resp.body.len, 160)] });
         if (resp.status != 200 and resp.status != 201) {
-            var nb: [200]u8 = undefined;
-            const msg = std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d}): {s}", .{ resp.status, resp.body[0..@min(resp.body.len, 120)] }) catch "[cast] rejected";
+            // 404 specifically means the RUNNING veil.exe predates the /api/v1/cast route — a stale server binary
+            // (also the usual cause of the on/offline flapping, since it predates the crash + httpz-spin fixes).
+            var nb: [280]u8 = undefined;
+            const msg = if (resp.status == 404)
+                std.fmt.bufPrint(&nb, "[cast] the veil server is out of date — its build predates the cast endpoint (HTTP 404). Rebuild + restart it (`zig build --release=fast` then relaunch veil.exe, or `python deploy.py`). I'll answer directly from chat in the meantime.", .{}) catch "[cast] server out of date (404) — rebuild + restart it"
+            else
+                std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d}): {s}", .{ resp.status, resp.body[0..@min(resp.body.len, 120)] }) catch "[cast] rejected";
             self.appendMsg(dd, .cast_note, msg);
-            self.updateCastRow(.failed, 0, -1, if (resp.status == 401 or resp.status == 403) "unauthorized - set an API token" else "server rejected the cast", "");
-            self.store.pushNotif("Cast rejected", if (resp.status == 401 or resp.status == 403) "set an API token in Settings" else "server error", 2);
+            self.updateCastRow(.failed, 0, -1, if (resp.status == 404) "server out of date - rebuild it" else if (resp.status == 401 or resp.status == 403) "unauthorized - set an API token" else "server rejected the cast", "");
+            self.store.pushNotif("Cast unavailable", if (resp.status == 404) "server is out of date — rebuild + restart veil.exe" else if (resp.status == 401 or resp.status == 403) "set an API token in Settings" else "server error", 2);
             self.setStatus("");
+            // Graceful fallback: the model builds/answers directly from chat. pumpStream settles this turn right
+            // after fireCast returns (setBusy(false) + maybeLoop), so auto-loop — or the user — drives the next step.
+            self.appendMsg(dd, .cast_note, "[cast] proceeding without the hive — I'll build/answer directly here.");
             return;
         }
         var idb: [64]u8 = undefined;
