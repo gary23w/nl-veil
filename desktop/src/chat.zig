@@ -613,28 +613,25 @@ pub const Chat = struct {
             self.consoleLaunchFailed(dd, ai, "(failed to open the console output file)");
             return;
         };
-        // Run in the chat's build workdir if one has been set (so `dir`/`ls`/`python app.py` see the AI's files);
-        // the console is stateless (a fresh shell per command), so we prepend `cd` rather than hold a cwd. The
-        // scrollback shows the user's ORIGINAL command (trimmed) — only the launched command carries the cd.
-        var ecb: [1600]u8 = undefined;
-        const run_cmd: []const u8 = if (self.build_dir_len > 0) blk: {
-            if (builtin.os.tag == .windows) {
-                // cmd's `cd /d` chokes on forward slashes ("The system cannot find the path specified") — the
-                // build dir arrives as {data}/u1/_chat/builds/... (mixed/forward slashes). Normalize to '\\'.
-                var bdw: [400]u8 = undefined;
-                const bd = self.build_dir[0..@min(self.build_dir_len, bdw.len)];
-                for (bd, 0..) |c, k| bdw[k] = if (c == '/') '\\' else c;
-                break :blk std.fmt.bufPrint(&ecb, "cd /d \"{s}\" && {s}", .{ bdw[0..bd.len], trimmed }) catch trimmed;
-            }
-            break :blk std.fmt.bufPrint(&ecb, "cd \"{s}\" && {s}", .{ self.build_dir[0..self.build_dir_len], trimmed }) catch trimmed;
-        } else trimmed;
+        // Run in the chat's build workdir if one has been set (so `dir`/`ls`/`python app.py` see the AI's files).
+        // Set the child's CWD via a DIR HANDLE rather than prepending `cd /d …`: a prepended `cd` runs in the
+        // spawned cmd's own initial directory (which differed from ours → "The system cannot find the path
+        // specified" even though the AI's files were right there). Opening the build dir with the same
+        // Io.Dir.cwd() the desktop's own (working) file ops use, then handing CreateProcessW the handle, makes
+        // Windows infer the correct absolute path — no relative/absolute or slash ambiguity.
+        var cwd_dir: ?Io.Dir = if (self.build_dir_len > 0)
+            (Io.Dir.cwd().openDir(self.io, self.build_dir[0..self.build_dir_len], .{}) catch null)
+        else
+            null;
+        defer if (cwd_dir) |*d| d.close(self.io); // valid through the spawn call; closed after
         // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
         const argv = if (builtin.os.tag == .windows)
-            [_][]const u8{ "cmd", "/c", run_cmd }
+            [_][]const u8{ "cmd", "/c", trimmed }
         else
-            [_][]const u8{ "sh", "-c", run_cmd };
+            [_][]const u8{ "sh", "-c", trimmed };
         const child = std.process.spawn(self.io, .{
             .argv = &argv,
+            .cwd = if (cwd_dir) |d| .{ .dir = d } else .inherit,
             .stdin = .ignore,
             .stdout = .{ .file = of },
             .stderr = .{ .file = ef },
