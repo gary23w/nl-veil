@@ -38,6 +38,14 @@ const Ui = struct {
     tab: Tab = .dashboard,
     inner: InnerTab = .console,
     focus: Focus = .none,
+    input_active: bool = false, // handleKeys/editField set this when they consume a keystroke — drives FPS
+    hot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
+    // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) was the
+    // client CPU chug on long chats. Cache heights; recompute only when the message set or wrap width changes.
+    mh: [store_mod.MAX_CHAT_MSGS]f32 = undefined,
+    mh_count: usize = 0,
+    mh_cols: usize = 0,
+    mh_fp: u64 = 0,
     chat: Field = .{},
     // Chat tab
     c_input: Field = .{},
@@ -241,8 +249,21 @@ pub fn main() !void {
         const online0 = store.server_online;
         const busy0 = store.chat_busy;
         store.unlock();
-        // 60fps focused = snappy; 10fps backgrounded for heat — 30fps while a sim/turn is live so poll stays smooth.
-        rl.setTargetFPS(if (rl.isWindowFocused()) 60 else if (sim_mode or busy0) 30 else 10);
+        // Activity-gated frame rate. This is an immediate-mode UI: EVERY frame re-lays-out + redraws every chat
+        // message's markdown, so holding 60fps while the user is just READING pins a CPU core (worse with more
+        // messages/tabs — the "client chugs" report, even on a hosted model that does ZERO client compute).
+        // Stay at 60 only when something is actually changing — mouse activity, a keystroke, or a live token
+        // stream — and idle down otherwise. Input is still polled every frame; only the redraw rate drops.
+        {
+            const mdelta = rl.getMouseDelta();
+            const mouse_active = mdelta.x != 0 or mdelta.y != 0 or rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right) or rl.getMouseWheelMove() != 0;
+            if (mouse_active or ui.input_active or busy0) ui.hot_frames = 40; // ~0.66s of 60fps after any activity
+            ui.input_active = false; // handleKeys/editField below re-arm it for the next frame
+            const focused = rl.isWindowFocused();
+            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 20 else 8;
+            if (ui.hot_frames > 0) ui.hot_frames -= 1;
+            rl.setTargetFPS(fps);
+        }
         tray.pump();
         pumpTray(&store, &tray, gpa);
         syncThemeFromStore(&store);
@@ -676,6 +697,10 @@ fn setTab(tabv: Tab) void {
 }
 
 fn handleKeys(store: *Store) void {
+    // any handled shortcut counts as activity so the redraw stays at 60fps for a beat (see the FPS gate)
+    if (rl.isKeyPressed(.f12) or rl.isKeyPressed(.one) or rl.isKeyPressed(.two) or rl.isKeyPressed(.three) or
+        rl.isKeyPressed(.four) or rl.isKeyPressed(.five) or rl.isKeyPressed(.six) or rl.isKeyPressed(.enter) or
+        rl.isKeyPressed(.escape) or rl.isKeyPressed(.tab) or rl.isKeyDown(.left_control)) ui.input_active = true;
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) setTab(.dashboard);
@@ -752,12 +777,16 @@ fn editField(f: *Ui.Field) void {
     if (ctrl and rl.isKeyPressed(.c) and f.len > 0) copyToClipboard(f.str());
     var c = rl.getCharPressed();
     while (c > 0) : (c = rl.getCharPressed()) {
+        ui.input_active = true; // keep 60fps while typing
         if (c >= 32 and c < 127 and f.len < f.buf.len - 1) {
             f.buf[f.len] = @intCast(c);
             f.len += 1;
         }
     }
-    if ((rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace)) and f.len > 0) f.len -= 1;
+    if ((rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace)) and f.len > 0) {
+        ui.input_active = true;
+        f.len -= 1;
+    }
 }
 
 // -------------------------------------------------------------------------------- tab bar
@@ -1431,9 +1460,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const fsz: i32 = 14;
     const cols = monoCols(view.width - 28, fsz);
 
-    // total content height via the SAME renderer that draws (streaming reply is one more message)
+    // total content height — from the per-message height CACHE (renderMsg word-wrap is the client CPU chug on
+    // long chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
+    var fp: u64 = 0;
+    for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
+    if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
+        for (msgs, 0..) |*m, i| ui.mh[i] = renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+        ui.mh_count = msgs.len;
+        ui.mh_cols = cols;
+        ui.mh_fp = fp;
+    }
     var total: f32 = 8;
-    for (msgs) |*m| total += renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+    for (msgs, 0..) |_, i| total += ui.mh[i];
     if (busy or stream.len > 0) total += renderMsg(view, 0, .veil, stream, cols, fsz, false, false) + MSG_LINE_H;
     if (cast_live) total += renderCastLive(view, 0, status, false);
 
@@ -1450,9 +1488,15 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
 
     rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
     var yy: f32 = view.y + 8 - ui.chat_scroll;
-    for (msgs) |*m| {
+    const vtop = view.y;
+    const vbot = view.y + view.height;
+    for (msgs, 0..) |*m, i| {
         const y0 = yy;
-        yy = renderMsg(view, yy, m.role, m.textStr(), cols, fsz, true, false);
+        yy = y0 + ui.mh[i]; // cached height (draw + measure share layout, so this matches renderMsg's advance)
+        // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
+        // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
+        if (yy < vtop or y0 > vbot) continue;
+        _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
