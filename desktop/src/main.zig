@@ -79,6 +79,9 @@ const Ui = struct {
     d_gap: bool = true,
     d_breakout: bool = false,
     d_psyche: bool = false,
+    // micro-console (below the swarm activity): dual-tab shell
+    con_tab: u8 = 0, // 0 = You, 1 = Veil (the AI's tab)
+    con_input: Field = .{},
     // Files tab view state
     file_scroll: f32 = 0,
     // deploy dropdowns
@@ -97,7 +100,7 @@ const Ui = struct {
     log_scroll: f32 = 0,
     log_follow: bool = true,
 
-    const Focus = enum { none, chat, d_name, d_key, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey };
+    const Focus = enum { none, chat, d_name, d_key, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, con_input };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -748,6 +751,7 @@ fn handleKeys(store: *Store) void {
         .s_model => editField(&ui.s_model),
         .s_url => editField(&ui.s_url),
         .s_ckey => editField(&ui.s_ckey),
+        .con_input => editField(&ui.con_input),
     }
     if (rl.isKeyPressed(.escape)) {
         ui.focus = .none;
@@ -952,6 +956,16 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var tail: [store_mod.CAST_TAIL]scan.Ev = undefined;
     const tail_n = store.cast_tail_count;
     @memcpy(tail[0..tail_n], store.cast_tail[0..tail_n]);
+    if (store.console_show_veil) { // the AI just ran a command — surface its tab once, then clear the flag
+        ui.con_tab = 1;
+        store.console_show_veil = false;
+    }
+    var con_buf: [16384]u8 = undefined;
+    const con_ai = ui.con_tab == 1;
+    const con_src = if (con_ai) store.console_ai[0..store.console_ai_len] else store.console_you[0..store.console_you_len];
+    const con_n = con_src.len;
+    @memcpy(con_buf[0..con_n], con_src);
+    const con_busy = if (con_ai) store.console_busy_ai else store.console_busy_you;
     const left_open = store.settings.chat_left_open;
     const right_open = store.settings.chat_right_open;
     store.unlock();
@@ -960,7 +974,12 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const right_w: f32 = if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W;
     const ph = body.height - pad * 2;
     const left = t.Rect{ .x = pad, .y = body.y + pad, .width = left_w, .height = ph };
-    const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph };
+    // The right column stacks the swarm-activity panel over a micro-console (only when the pane is open and
+    // there's room). The console gets ~40% of the height, clamped to a sane band.
+    const con_h: f32 = if (right_open and ph > 380) @min(280, ph * 0.42) else 0;
+    const con_gap: f32 = if (con_h > 0) pad else 0;
+    const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph - con_h - con_gap };
+    const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
     const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = right.x - (left.x + left_w) - pad * 2, .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
@@ -978,6 +997,77 @@ fn drawChat(store: *Store, body: t.Rect) void {
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
+    if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy);
+}
+
+/// A dual-tab micro-terminal under the swarm activity: tab "You" runs shell commands the user types; tab
+/// "Veil" shows (and lets the AI drive) its own shell. Output streams into the scrollback in store.console_*.
+fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy: bool) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    // ---- tab header (You = user shell, Veil = AI shell) ----
+    const th: f32 = 24;
+    const tw = (r.width - 6) / 2;
+    if (t.tab(.{ .x = r.x + 2, .y = r.y + 2, .width = tw, .height = th }, t.z("You", .{}), ui.con_tab == 0)) ui.con_tab = 0;
+    if (t.tab(.{ .x = r.x + 4 + tw, .y = r.y + 2, .width = tw, .height = th }, t.z("Veil", .{}), ui.con_tab == 1)) ui.con_tab = 1;
+    if (busy) t.statusDot(@intFromFloat(r.x + r.width - 12), @intFromFloat(r.y + 14), t.yellow);
+
+    // ---- scrollback (mono, tail-anchored, viewport-culled) ----
+    const input_h: f32 = 26;
+    const body_y: f32 = r.y + 2 + th + 4;
+    const body_h: f32 = r.height - (body_y - r.y) - input_h - 6;
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(body_y), @intFromFloat(r.width - 2), @intFromFloat(body_h));
+    const line_h: f32 = 15;
+    const cols: usize = @intFromFloat(@max(8, (r.width - 16) / 7)); // ~7px per mono glyph at size 12
+    // wrap the scrollback into display lines, then show only the tail that fits
+    var lines: [512][]const u8 = undefined;
+    var ln: usize = 0;
+    var it = std.mem.splitScalar(u8, scroll, '\n');
+    while (it.next()) |raw| {
+        var seg = raw;
+        while (true) {
+            if (ln >= lines.len) break;
+            if (seg.len <= cols) {
+                lines[ln] = seg;
+                ln += 1;
+                break;
+            }
+            lines[ln] = seg[0..cols];
+            ln += 1;
+            seg = seg[cols..];
+        }
+        if (ln >= lines.len) break;
+    }
+    const rows: usize = @intFromFloat(@max(1, body_h / line_h));
+    const first = if (ln > rows) ln - rows else 0;
+    var yy: f32 = body_y;
+    if (ln == 0) {
+        const hint = if (ai) t.z("the veil runs shell commands here (RUN: ...)", .{}) else t.z("type a shell command, Enter to run", .{});
+        t.textMonoClip(hint, @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.comment, @intFromFloat(r.width - 16));
+    }
+    var li = first;
+    while (li < ln) : (li += 1) {
+        t.textMonoClip(lines[li], @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.fg_dim, @intFromFloat(r.width - 14));
+        yy += line_h;
+    }
+    rl.endScissorMode();
+
+    // ---- input row (only the You tab is user-typable; the Veil tab is driven by the AI) ----
+    const iy: f32 = r.y + r.height - input_h - 2;
+    if (ai) {
+        t.textMono(if (busy) t.z("veil is running a command...", .{}) else t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment);
+        return;
+    }
+    const runw: f32 = 52;
+    const cf = t.Rect{ .x = r.x + 2, .y = iy, .width = r.width - runw - 8, .height = input_h };
+    textField(cf, &ui.con_input, ui.focus == .con_input, "> command", .con_input);
+    const rb = t.Rect{ .x = r.x + r.width - runw - 2, .y = iy, .width = runw, .height = input_h };
+    const can = ui.con_input.len > 0 and !busy;
+    const clicked = t.button(rb, t.z("Run", .{}), t.green, can);
+    const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
+    if (can and (clicked or (ui.focus == .con_input and enter))) {
+        store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
+        ui.con_input.len = 0;
+    }
 }
 
 /// Compose the streaming display: reasoning as a `> ` blockquote, a blank line, then the answer. Matches
