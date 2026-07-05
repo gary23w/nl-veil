@@ -2398,34 +2398,100 @@ pub fn noteWithoutCast(full: []const u8, buf: []u8) []const u8 {
     return std.mem.trim(u8, buf[0..w], " \r\n\t");
 }
 
+// A lone high byte that is NOT part of a valid UTF-8 sequence would make the JSON body invalid UTF-8, which the
+// server's std.json REJECTS with error.SyntaxError (a 500 that killed every cast/build whose text carried smart
+// punctuation). Models + some APIs emit CP1252 punctuation as bare high bytes (em dash 0x97, smart quotes, …);
+// fold those to their ASCII lookalike, anything else to '?'. Valid multi-byte UTF-8 is passed through untouched
+// (the server accepts raw UTF-8 fine) — this only rewrites bytes that would otherwise corrupt the body.
+fn foldBadByte(c: u8) u8 {
+    return switch (c) {
+        0x91, 0x92 => '\'',
+        0x93, 0x94 => '"',
+        0x95 => '*',
+        0x96, 0x97 => '-',
+        0x85 => '.',
+        0xA0 => ' ',
+        else => '?',
+    };
+}
+
+/// Advance over a UTF-8 sequence at s[i]. Returns the number of bytes to emit verbatim (a VALID 1–4 byte
+/// sequence) or 0 if s[i] is an invalid/truncated lead/continuation byte (caller folds it to one ASCII byte).
+fn utf8Run(s: []const u8, i: usize) usize {
+    const n = std.unicode.utf8ByteSequenceLength(s[i]) catch return 0;
+    if (i + n > s.len) return 0;
+    if (!std.unicode.utf8ValidateSlice(s[i .. i + n])) return 0;
+    return n;
+}
+
 fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) void {
-    for (s) |c| {
-        switch (c) {
-            '"' => list.appendSlice(gpa, "\\\"") catch {},
-            '\\' => list.appendSlice(gpa, "\\\\") catch {},
-            '\n' => list.appendSlice(gpa, "\\n") catch {},
-            '\r' => {},
-            '\t' => list.appendSlice(gpa, "\\t") catch {},
-            else => {
-                if (c < 0x20) list.appendSlice(gpa, " ") catch {} else list.append(gpa, c) catch {};
-            },
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => list.appendSlice(gpa, "\\\"") catch {},
+                '\\' => list.appendSlice(gpa, "\\\\") catch {},
+                '\n' => list.appendSlice(gpa, "\\n") catch {},
+                '\r' => {},
+                '\t' => list.appendSlice(gpa, "\\t") catch {},
+                else => {
+                    if (c < 0x20) list.append(gpa, ' ') catch {} else list.append(gpa, c) catch {};
+                },
+            }
+            i += 1;
+            continue;
+        }
+        const n = utf8Run(s, i);
+        if (n == 0) {
+            list.append(gpa, foldBadByte(c)) catch {};
+            i += 1;
+        } else {
+            list.appendSlice(gpa, s[i .. i + n]) catch {};
+            i += n;
         }
     }
 }
 
 fn wesc(w: *Io.Writer, s: []const u8) void {
-    for (s) |c| {
-        switch (c) {
-            '"' => w.writeAll("\\\"") catch {},
-            '\\' => w.writeAll("\\\\") catch {},
-            '\n' => w.writeAll("\\n") catch {},
-            '\r' => {},
-            '\t' => w.writeAll(" ") catch {},
-            else => {
-                if (c < 0x20) w.writeAll(" ") catch {} else w.writeByte(c) catch {};
-            },
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => w.writeAll("\\\"") catch {},
+                '\\' => w.writeAll("\\\\") catch {},
+                '\n' => w.writeAll("\\n") catch {},
+                '\r' => {},
+                '\t' => w.writeAll(" ") catch {},
+                else => {
+                    if (c < 0x20) w.writeByte(' ') catch {} else w.writeByte(c) catch {};
+                },
+            }
+            i += 1;
+            continue;
+        }
+        const n = utf8Run(s, i);
+        if (n == 0) {
+            w.writeByte(foldBadByte(c)) catch {};
+            i += 1;
+        } else {
+            w.writeAll(s[i .. i + n]) catch {};
+            i += n;
         }
     }
+}
+
+test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)" {
+    var buf: [96]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    // a lone 0x97 (CP1252 em dash — INVALID utf8, the byte that 500'd every cast) + a REAL utf8 em dash + a quote
+    wesc(&w, "a \x97 b \xe2\x80\x94 c \"q\"");
+    const out = w.buffered();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out)); // the whole body must be valid utf8
+    try std.testing.expect(std.mem.indexOf(u8, out, "a - b") != null); // 0x97 -> '-'
+    try std.testing.expect(std.mem.indexOf(u8, out, "\xe2\x80\x94") != null); // real em dash preserved
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\\"q\\\"") != null); // quote escaped
 }
 
 fn jInt(line: []const u8, key: []const u8) ?i64 {

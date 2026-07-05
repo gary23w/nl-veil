@@ -293,9 +293,29 @@ pub fn main() !void {
                     const msg = std.mem.trim(u8, content, " \r\n\t");
                     if (msg.len > 0) {
                         sim_mode = true;
-                        setTab(.chat); // land on Chat so the run is visible
-                        store.pushChatCmd(store_mod.mkChatCmd(.send, "", msg));
-                        log.info("SIM.txt auto-sent chat message ({d} bytes)", .{msg.len});
+                        // DEV/TEST control: a line beginning with `::` steers the UI headlessly (switch tabs,
+                        // toggle the auto-loop) instead of sending a chat message — for automated verification
+                        // when synthetic clicks can't reach a borderless window. Only reachable by dropping
+                        // SIM.txt, which a normal user never does, so it's inert in real use.
+                        if (std.mem.startsWith(u8, msg, "::")) {
+                            const cmd = std.mem.trim(u8, msg[2..], " \r\n\t");
+                            if (std.mem.eql(u8, cmd, "loop on")) {
+                                store.chat_loop = true;
+                                store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
+                            } else if (std.mem.eql(u8, cmd, "loop off")) {
+                                store.chat_loop = false;
+                            } else if (std.mem.startsWith(u8, cmd, "tab ")) {
+                                const tn = std.mem.trim(u8, cmd[4..], " \r\n\t");
+                                const tv: ?Tab =
+                                    if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "deploy")) .deploy else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "settings")) .settings else null;
+                                if (tv) |v| setTab(v);
+                            }
+                            log.info("SIM.txt control command: {s}", .{cmd});
+                        } else {
+                            setTab(.chat); // land on Chat so the run is visible
+                            store.pushChatCmd(store_mod.mkChatCmd(.send, "", msg));
+                            log.info("SIM.txt auto-sent chat message ({d} bytes)", .{msg.len});
+                        }
                     }
                 } else |_| {}
             }
