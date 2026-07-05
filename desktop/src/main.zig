@@ -1600,17 +1600,14 @@ fn tokCostOf(text: []const u8) usize {
     return body.len / 4;
 }
 
-/// Draw the collapsed tool line — NO background or border: a colored marker, the tool NAME, its ~token cost,
-/// and a view/hide affordance. Click toggles the detailed dropdown (the full request/result). Returns true on
-/// click.
-fn toolChip(view: t.Rect, y0: f32, name: []const u8, text: []const u8, expanded: bool) bool {
+/// Draw the collapsed tool line — NO background or border: a colored marker, the tool NAME, and a view/hide
+/// affordance. The token cost lives in the expanded dropdown (see drawChatCenter). Returns true on click.
+fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
     const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
     const hot = t.hovering(r) and t.hovering(view);
     t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.blue); // small marker dot
     const nm = t.zs(name); // the actual tool called (read_file, write_file, web_search, …)
     t.text(nm, @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.fg_dim);
-    const nmw: f32 = @floatFromInt(t.measure(nm, 12));
-    t.text(t.z("~{d} tok", .{tokCostOf(text)}), @intFromFloat(r.x + 24 + nmw), @intFromFloat(y0 + 9), 11, t.comment);
     t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
     return hot and rl.isMouseButtonPressed(.left);
 }
@@ -1679,9 +1676,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // text is untouched in the message, so the model still receives it and copy still grabs it.
             if (ui.tool_open == i) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+                // the token cost now lives in the expanded dropdown (top-right), not the collapsed line
+                t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
-            } else if (toolChip(view, y0, tn, m.textStr(), false)) {
+            } else if (toolChip(view, y0, tn, false)) {
                 ui.tool_open = i;
             }
             continue;
@@ -2896,25 +2895,31 @@ fn flushChatDropdown(store: *Store) void {
 fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
     var n: usize = 0;
     var ls: usize = 0; // current line start
-    var lastbreak: usize = 0; // index after the last space seen on the current line (a candidate wrap point)
-    var cur_w: f32 = 0;
     var i: usize = 0;
-    while (i < s.len) : (i += 1) {
-        var cb = [2]u8{ s[i], 0 };
-        const cs: [:0]const u8 = cb[0..1 :0];
-        cur_w += @floatFromInt(t.measure(cs, 13));
-        if (cur_w > maxw and i > ls) {
-            const brk = if (lastbreak > ls and lastbreak <= i) lastbreak else i; // break at word, else mid-word
-            if (n >= out.len) return n;
-            out[n] = s[ls..brk];
-            n += 1;
-            ls = brk;
-            lastbreak = ls;
-            cur_w = 0;
-            i = brk - 1; // re-scan from the break (the loop's +=1 lands on brk)
+    // Measure whole candidate LINES (word by word), not single chars — t.measure includes inter-char spacing,
+    // so summing single-char widths underestimates and lines overflow the box (the reported "falls out" bug).
+    while (i < s.len and n < out.len) {
+        var we = i; // extend through the next word + its trailing spaces
+        while (we < s.len and s[we] != ' ') we += 1;
+        while (we < s.len and s[we] == ' ') we += 1;
+        const w: f32 = @floatFromInt(t.measure(t.zs(s[ls..we]), 13));
+        if (w <= maxw) {
+            i = we;
             continue;
         }
-        if (s[i] == ' ') lastbreak = i + 1;
+        if (i > ls) { // the line has content before this word — break there, retry the word on the next line
+            out[n] = s[ls..i];
+            n += 1;
+            ls = i;
+            continue;
+        }
+        // a single word is wider than the whole line — hard-break it by character
+        var j = ls + 1;
+        while (j < we and @as(f32, @floatFromInt(t.measure(t.zs(s[ls .. j + 1]), 13))) <= maxw) j += 1;
+        out[n] = s[ls..j];
+        n += 1;
+        ls = j;
+        i = j;
     }
     if (ls < s.len and n < out.len) {
         out[n] = s[ls..];
