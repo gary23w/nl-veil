@@ -60,6 +60,22 @@ const SYSTEM_PROMPT =
     "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Use CAST for open-ended " ++
     "research or building. For a brand-new web question, a single web_search TOOL is often faster than a cast.\n" ++
     "\n" ++
+    "BUILD — you have your own persistent build workdir on this machine (the SAME file tools a hive mind uses). " ++
+    "When the user asks you to build/create/fix code or files, WRITE them to disk — don't just paste the whole " ++
+    "file into the chat. Use the TOOL: protocol (one tool per reply):\n" ++
+    "- write_file {\"path\":\"app.py\",\"content\":\"...\"}  — write/overwrite a file (relative path, in your workdir).\n" ++
+    "- edit_file {\"path\":\"app.py\",\"ops\":[{\"search\":\"old\",\"replace\":\"new\"}]}  — patch an existing file in place.\n" ++
+    "- read_file {\"path\":\"app.py\"}  — read a file back before you change it.\n" ++
+    "- list_dir {\"path\":\".\"}  — see what's already in the workdir.\n" ++
+    "- run_tests {}  — run the project's tests (pytest / test_*.py) and get pass/fail.\n" ++
+    "- run_python {\"code\":\"...\"}  — run a short Python script in the workdir.\n" ++
+    "- delete_file {\"path\":\"...\"}  — remove a file you created.\n" ++
+    "KNOW YOUR LIMITS: your reply has a length cap, so a large file will get CUT OFF if you write it all at once. " ++
+    "For anything big, either write it across MULTIPLE files (module per file), or write the first part with " ++
+    "write_file then extend it with edit_file — never send one giant file that truncates. After writing code, " ++
+    "run_tests (or run_python) to VERIFY it, read the result, fix, and repeat until it works. It's good to also " ++
+    "give the user a short summary in the chat of what you wrote — but the real work goes to the files.\n" ++
+    "\n" ++
     "SHELL — when the user asks you to run a command, work in a directory, inspect files, or drive the system, " ++
     "you have a real terminal on their machine. Make the reply exactly one line:\n" ++
     "RUN: <shell command>\n" ++
@@ -171,6 +187,8 @@ pub const Chat = struct {
     last_user_len: usize = 0,
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
+    build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
+    build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
     reflect_draft: [12288]u8 = undefined, // first-pass draft used by the one-step reflect turn
     reflect_draft_len: usize = 0,
 
@@ -463,6 +481,22 @@ pub const Chat = struct {
         self.consoleStart(dd, ai, cmd);
     }
 
+    /// Point THIS chat's build workdir (and thus the console) at `rel` (server data-relative, e.g.
+    /// "u1/_chat/builds/c6a4"). Called from a build tool's response so the console (You + Veil) `cd`s into the
+    /// same folder the AI is writing files to. Only announces + creates when the directory actually changes.
+    fn setBuildDir(self: *Chat, dd: []const u8, rel: []const u8) void {
+        var ab: [400]u8 = undefined;
+        const abs = std.fmt.bufPrint(&ab, "{s}/{s}", .{ dd, rel }) catch return;
+        if (std.mem.eql(u8, abs, self.build_dir[0..self.build_dir_len])) return; // unchanged — no re-announce
+        const n = @min(abs.len, self.build_dir.len);
+        @memcpy(self.build_dir[0..n], abs[0..n]);
+        self.build_dir_len = n;
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, abs, .default_dir) catch {}; // ensure it exists locally too
+        var nb: [480]u8 = undefined;
+        const note = std.fmt.bufPrint(&nb, "[build] working directory: {s} — the console (You + Veil tabs) is cd'd here, so you can inspect and run the files.", .{rel}) catch "[build] working directory set";
+        self.appendMsg(dd, .cast_note, note);
+    }
+
     /// Launch a micro-console command as an INDEPENDENT OS process and register it as the in-flight console
     /// proc; pumpConsole polls it to completion. Returns immediately — the command NEVER runs on this worker's
     /// blocking path, so a hang can't freeze chat or cast-watching. stdout/stderr are captured to two temp
@@ -510,11 +544,22 @@ pub const Chat = struct {
             self.consoleLaunchFailed(dd, ai, "(failed to open the console output file)");
             return;
         };
+        // Run in the chat's build workdir if one has been set (so `dir`/`ls`/`python app.py` see the AI's files);
+        // the console is stateless (a fresh shell per command), so we prepend `cd` rather than hold a cwd. The
+        // scrollback shows the user's ORIGINAL command (trimmed) — only the launched command carries the cd.
+        var ecb: [1600]u8 = undefined;
+        const run_cmd: []const u8 = if (self.build_dir_len > 0) blk: {
+            const bd = self.build_dir[0..self.build_dir_len];
+            break :blk (if (builtin.os.tag == .windows)
+                std.fmt.bufPrint(&ecb, "cd /d \"{s}\" && {s}", .{ bd, trimmed })
+            else
+                std.fmt.bufPrint(&ecb, "cd \"{s}\" && {s}", .{ bd, trimmed })) catch trimmed;
+        } else trimmed;
         // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
         const argv = if (builtin.os.tag == .windows)
-            [_][]const u8{ "cmd", "/c", trimmed }
+            [_][]const u8{ "cmd", "/c", run_cmd }
         else
-            [_][]const u8{ "sh", "-c", trimmed };
+            [_][]const u8{ "sh", "-c", run_cmd };
         const child = std.process.spawn(self.io, .{
             .argv = &argv,
             .stdin = .ignore,
@@ -1613,16 +1658,21 @@ pub const Chat = struct {
     /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
-        // tc.name/tc.args are slices INTO self.stream.content — copy them onto the stack BEFORE we free the
-        // stream, or they dangle (a use-after-free that surfaced as a mojibake tool name + netcli NULL).
+        // tc.name/tc.args are slices INTO self.stream.content — copy them off BEFORE we free the stream, or they
+        // dangle (a use-after-free). The NAME is short (stack), but args can be a WHOLE FILE now (write_file /
+        // edit_file), so HEAP-dupe them — a fixed [1024] stack copy silently truncated any real source file
+        // (the file-writing convergence then failed at the transport, not the model). Bounded by the reply size.
         var namebuf: [64]u8 = undefined;
-        var rawbuf: [1024]u8 = undefined;
         const nn = @min(tc.name.len, namebuf.len);
         @memcpy(namebuf[0..nn], tc.name[0..nn]);
         const name = namebuf[0..nn];
-        const rn = @min(tc.args.len, rawbuf.len);
-        @memcpy(rawbuf[0..rn], tc.args[0..rn]);
-        const raw_args = rawbuf[0..rn];
+        const raw_args = self.gpa.dupe(u8, tc.args) catch {
+            self.stream.deinit(self.gpa);
+            self.appendMsg(dd, .cast_note, "[tool] out of memory building the request");
+            self.setBusy(false);
+            return;
+        };
+        defer self.gpa.free(raw_args);
         self.stream.deinit(self.gpa); // now safe — name/raw_args are owned copies
 
         var abuf: [256]u8 = undefined;
@@ -1661,13 +1711,25 @@ pub const Chat = struct {
             @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
         }
 
-        // body = {"tool":NAME,"args":"<escaped raw json>"} — args ride as a JSON string (tool-call convention)
-        var body: [2048]u8 = undefined;
-        var w = Io.Writer.fixed(&body);
+        // the active conversation id → a per-conversation build workdir the server writes into + the console cd's to
+        var convb: [40]u8 = undefined;
+        const conv = self.convScope(&convb);
+
+        // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call
+        // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
+        // fixed [2048] used to reject any write_file over ~1.5KB ("arguments were too long to send"). netcli
+        // passes the body straight to curl --data-binary (no cap), and a reply is bounded by MAX_TOKENS.
+        const body = self.gpa.alloc(u8, args.len * 2 + name.len + conv.len + 64) catch {
+            self.appendMsg(dd, .cast_note, "[tool] out of memory building the request");
+            self.setBusy(false);
+            return;
+        };
+        defer self.gpa.free(body);
+        var w = Io.Writer.fixed(body);
         const bok = blk: {
             w.print("{{\"tool\":\"{s}\",\"args\":\"", .{name}) catch break :blk false;
             wesc(&w, args);
-            w.writeAll("\"}") catch break :blk false;
+            w.print("\",\"dir\":\"{s}\"}}", .{conv}) catch break :blk false;
             break :blk true;
         };
 
@@ -1679,6 +1741,15 @@ pub const Chat = struct {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("chat tool: {s} -> status={d} body={s}", .{ name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
             result = extractToolResult(resp.body, &rbuf);
+            // the server echoes the workdir on EVERY tool response, but only a real BUILD tool means the AI is
+            // writing files there — only then adopt it as the build dir + cd the console (a web_search turn must
+            // NOT announce a build dir or redirect the console into an empty folder).
+            if (isBuildToolName(name)) {
+                var wdb: [256]u8 = undefined;
+                if (jStr(resp.body, "workdir", &wdb)) |wd| {
+                    if (wd.len > 0) self.setBuildDir(dd, wd);
+                }
+            }
             if (std.mem.eql(u8, name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
         } else {
             result = "(no response from the veil server on :8787 — is it running?)";
@@ -2025,6 +2096,14 @@ fn loopIsDone(text: []const u8) bool {
         std.ascii.eqlIgnoreCase(t, "GOAL COMPLETE") or
         std.ascii.eqlIgnoreCase(t, "TASK COMPLETE") or
         std.ascii.eqlIgnoreCase(t, "FINISHED");
+}
+
+/// True for the build (file/exec) tools whose response workdir means the AI is building there — used to gate
+/// adopting the build dir + cd'ing the console (research tools also echo a workdir but write no files).
+fn isBuildToolName(name: []const u8) bool {
+    const bt = [_][]const u8{ "write_file", "edit_file", "read_file", "list_dir", "delete_file", "run_tests", "run_python" };
+    for (bt) |b| if (std.mem.eql(u8, name, b)) return true;
+    return false;
 }
 
 /// Copy as much of `src` as fits into `dst`; returns the slice of `dst` actually written.

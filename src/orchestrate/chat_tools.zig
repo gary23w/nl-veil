@@ -30,20 +30,57 @@ const ToolReq = struct {
     tool: []const u8 = "",
     args: []const u8 = "{}", // JSON *string* (tool-call convention), passed verbatim to tools.execute
     id: []const u8 = "", // convenience for orchestration verbs (also parsed out of args)
+    dir: []const u8 = "", // conversation id → a per-conversation build workdir (sanitized server-side)
 };
 
-// Read-only / research / memory tools a chat turn may run in-process. Mutating + host + code-exec
-// tools (write_file, edit_file, run_python, host_*, patch_system, send_message) are deliberately
-// excluded: a chat tool call is not a sandboxed mind moment. Orchestration verbs are handled ahead
-// of this list. Grow this set as shared, side-effect-safe tools land.
+// Read-only / research / memory tools a chat turn may run in-process. Host + engine-patch tools (host_*,
+// patch_system, send_message) stay excluded. Orchestration verbs are handled ahead of this list.
 const MIND_ALLOW = [_][]const u8{
     "web_search", "web_fetch",  "fetch_json", "read_url",
     "recall_hive", "observe",   "share",      "deep_crawl",
 };
 
+// The FILE tools — the SAME executor + workdir discipline a hive mind uses. Opening these gives the single
+// chat AI full convergence with the swarm: it writes real files to its build workdir (not just the chat
+// buffer), chunks big files, and edits in place. Confined by tools.safeRel (rejects absolute paths + "..")
+// to the per-conversation build workdir — so a chat can build exactly like a cast. Safe for any authed user.
+const BUILD_FILE_ALLOW = [_][]const u8{
+    "write_file", "edit_file", "read_file", "list_dir", "delete_file",
+};
+
+// The EXEC tools run arbitrary code (with cwd = the workdir but NO fs sandbox). Casts already run these, but
+// they pass through deployCore's entitlement/metering gates; the chat/tool endpoint has none, and it serves
+// "any external client". So gate code-exec to ADMINS — the desktop is admin on localhost (full build+test),
+// while a hosted non-admin tenant gets file-writing but not unmetered arbitrary execution.
+const BUILD_EXEC_ALLOW = [_][]const u8{
+    "run_tests", "run_python",
+};
+
 fn mindAllowed(name: []const u8) bool {
     for (MIND_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
     return false;
+}
+
+fn buildFileAllowed(name: []const u8) bool {
+    for (BUILD_FILE_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
+fn buildExecAllowed(name: []const u8) bool {
+    for (BUILD_EXEC_ALLOW) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
+/// Sanitize a conversation id into a single safe path segment for the build workdir (no separators, no "..",
+/// bounded length). Empty / unsafe → "" so the caller falls back to the shared workdir.
+fn safeSeg(id: []const u8) []const u8 {
+    const t = std.mem.trim(u8, id, " \r\n\t");
+    if (t.len == 0 or t.len > 64) return "";
+    for (t) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return "";
+    }
+    return t;
 }
 
 /// The swarm id the caller means: explicit top-level `id`, else the "id" field parsed out of `args`.
@@ -64,9 +101,16 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (std.mem.eql(u8, tool, "stop_swarm")) return stopSwarm(app, u.id, argId(body), res);
     if (std.mem.eql(u8, tool, "swarm_findings")) return findings(app, u.id, argId(body), res);
 
-    // --- mind tools (the same executor the hive uses) --------------------------------------
-    if (!mindAllowed(tool)) return badReq(res, "unknown or disallowed tool");
-    return runMindTool(app, u.id, tool, body.args, res);
+    // --- mind + build tools (the same executor the hive uses) ------------------------------
+    // Code-exec (run_python / run_tests) is admin-only: it has no fs sandbox and this endpoint has no
+    // metering, unlike the cast path. File tools are safe for any authed user (safeRel-confined).
+    if (buildExecAllowed(tool) and !app.auth.isAdmin(u)) {
+        res.status = 403;
+        try res.json(.{ .ok = false, .err = "run_python/run_tests is admin-only on the chat surface" }, .{});
+        return;
+    }
+    if (!mindAllowed(tool) and !buildFileAllowed(tool) and !buildExecAllowed(tool)) return badReq(res, "unknown or disallowed tool");
+    return runMindTool(app, u.id, tool, body.args, safeSeg(body.dir), res);
 }
 
 // ----- orchestration -------------------------------------------------------------------------
@@ -129,15 +173,25 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 // ----- mind tools ----------------------------------------------------------------------------
 
-fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *httpz.Response) !void {
+fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []const u8, res: *httpz.Response) !void {
     const environ = app.sup.parent_env orelse return serverErr(res, "server env unavailable");
     // Per-user scratch + memory DB so observe/share/recall_hive on the chat surface never cross accounts
     // (the endpoint is multi-tenant on the productized server). Isolation is by the per-uid DB FILE — NOT by
     // scope: recall_hive reads the fixed KNOWLEDGE/INTEL/SKILL scopes, so overriding learn_scope would just
     // make observe write somewhere recall_hive never looks (a stored-and-forgotten fact). Keep both default.
     const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, uid });
-    const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
+    // A per-conversation build workdir keeps each chat's files apart (and matches the dir the desktop cd's its
+    // console into); no/blank conv id falls back to the shared _chat/work. `conv` is already safeSeg'd.
+    const workdir = if (conv.len > 0)
+        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}", .{ base, conv })
+    else
+        try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+    // data-relative form the desktop can cd its console into (shared filesystem, same machine)
+    const workdir_rel = if (conv.len > 0)
+        try std.fmt.allocPrint(res.arena, "u{d}/_chat/builds/{s}", .{ uid, conv })
+    else
+        try std.fmt.allocPrint(res.arena, "u{d}/_chat/work", .{uid});
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
 
     // The executor increments these; the chat surface ignores them (one shared sink is fine).
@@ -165,7 +219,9 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, res: *ht
     // dupe() fallback in execute() can hand back a static "" (len 0) that must NOT be freed.
     scrubUtf8(result);
     defer if (result.len > 0) app.gpa.free(result);
-    try res.json(.{ .ok = true, .tool = tool, .result = result }, .{});
+    // workdir_rel lets the desktop cd its micro-console into the SAME folder the build tools write to, so the
+    // user + the AI share one working directory (the user's ask: "cd the user's console to the same folder").
+    try res.json(.{ .ok = true, .tool = tool, .result = result, .workdir = workdir_rel }, .{});
 }
 
 /// Distill a still-running cast's events.jsonl into the readable research narrative a chat can summarize: the
