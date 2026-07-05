@@ -4,15 +4,18 @@
     .fingerprint = 0xd137d40acdb7c43e,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        // Vendored (was git+https://github.com/karlseguin/http.zig#20076ad8) so a local patch survives: httpz's
+        // blocking-worker read loop spun a thread at 100% CPU on a half-closed (FIN'd) socket — see
+        // vendor/httpz/src/request.zig. A gitignored zig-pkg fetch would drop the patch on every re-resolve.
         .httpz = .{
-            .url = "git+https://github.com/karlseguin/http.zig#20076ad87f91eb068ee14376ddba02c2331b6ce9",
-            .hash = "httpz-0.0.0-PNVzrIDeCABKV7yA3QNNPMvThuact7-XyawnWsmVyeuP",
+            .path = "vendor/httpz",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "vendor",
         "web",
         "LICENSE",
         "README.md",
