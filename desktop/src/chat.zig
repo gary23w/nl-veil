@@ -1529,6 +1529,15 @@ pub const Chat = struct {
         } else {
             self.appendMsg(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)");
         }
+        // LEARNING (neuron-db Hebbian plasticity): a completed answer turn means the query topic + the memory
+        // recalled for it proved useful — reinforce that topic so it out-ranks the alternatives in later
+        // trust-weighted recall. The chat's hippocampus now LEARNS from engagement instead of only accumulating;
+        // paired with the trust-weighted recall() this closes the perception→learning→belief loop. No-op on fail.
+        if ((kind == .user or kind == .collect) and full.len > 0 and self.last_user_len > 3 and self.mind().enabled()) {
+            var scope_buf: [40]u8 = undefined;
+            const scope = self.convScope(&scope_buf);
+            if (scope.len > 0) self.mind().reinforce(scope, self.last_user[0..self.last_user_len], "answered");
+        }
         self.stream.deinit(self.gpa);
         self.setBusy(false);
         self.maybeLoop(dd); // full-auto: if loop mode is on and nothing else is pending, drive the next message

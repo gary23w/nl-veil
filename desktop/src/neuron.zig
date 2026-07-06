@@ -38,16 +38,42 @@ pub const Db = struct {
         if (self.run(&.{ "observe", scope, t[0..@min(t.len, 1400)] })) |o| self.gpa.free(o);
     }
 
-    /// Spreading-activation recall of the facts relevant to `query`, copied into `out`. Empty slice on miss.
+    /// TRUST-WEIGHTED spreading-activation recall: the facts relevant to `query`, ranked by relevance × the
+    /// learned per-tag-class trust (the `--trust` floor), so sources that proved reliable out-rank noise. Copied
+    /// into `out`; empty slice on miss. Belief → recall. Degrades to plain assoc on an older binary (no-op on fail).
     pub fn recall(self: Db, scope: []const u8, query: []const u8, out: []u8) []const u8 {
         const q = std.mem.trim(u8, query, " \r\n\t");
         if (q.len < 3) return out[0..0];
-        const o = self.run(&.{ "assoc", scope, q[0..@min(q.len, 400)] }) orelse return out[0..0];
+        const o = self.run(&.{ "--trust", "assoc", scope, q[0..@min(q.len, 400)] }) orelse return out[0..0];
         defer self.gpa.free(o);
         const trimmed = std.mem.trim(u8, o, " \r\n\t");
         // neuron prints "(the hive knows nothing…)" style lines on a miss — treat a short/parenthetical reply
         // as empty so we never inject noise.
         if (trimmed.len < 24 or trimmed[0] == '(') return out[0..0];
+        const n = @min(trimmed.len, out.len);
+        @memcpy(out[0..n], trimmed[0..n]);
+        return out[0..n];
+    }
+
+    /// HEBBIAN plasticity (learning → plasticity): strengthen the facts under `scope` whose key matches `topic`
+    /// and fade the competitors, so a topic the chat engaged with successfully out-ranks the alternatives in
+    /// later recall — the chat's memory LEARNS from outcomes instead of only accumulating. No-op on any failure.
+    pub fn reinforce(self: Db, scope: []const u8, topic: []const u8, feeling: []const u8) void {
+        const t = std.mem.trim(u8, topic, " \r\n\t");
+        if (t.len < 3) return;
+        const f = if (feeling.len > 0) feeling else "useful";
+        if (self.run(&.{ "reinforce", scope, t[0..@min(t.len, 200)], f })) |o| self.gpa.free(o);
+    }
+
+    /// Relational multi-hop CHAIN traversal (reasoning → chain): walk `start` --relation--> … over the fact
+    /// graph, recalling at each hop. Deterministic, no model round-trip — how a caller reasons over a
+    /// causal/dependency chain instead of re-deriving it. Returns the endpoint value into `out`; empty on a break.
+    pub fn chain(self: Db, scope: []const u8, start: []const u8, relation: []const u8, out: []u8) []const u8 {
+        if (start.len == 0 or relation.len == 0) return out[0..0];
+        const o = self.run(&.{ "chain", scope, start, relation }) orelse return out[0..0];
+        defer self.gpa.free(o);
+        const trimmed = std.mem.trim(u8, o, " \r\n\t");
+        if (trimmed.len == 0 or trimmed[0] == '(') return out[0..0]; // "(chain broke after …)" = no path
         const n = @min(trimmed.len, out.len);
         @memcpy(out[0..n], trimmed[0..n]);
         return out[0..n];
