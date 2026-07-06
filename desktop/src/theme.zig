@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const rl = @import("raylib");
+const log = @import("log.zig");
 
 pub const Color = rl.Color;
 pub const Rect = rl.Rectangle;
@@ -128,6 +129,7 @@ fn applyPalette(p: Palette) void {
 
 pub fn setScheme(s: Scheme) void {
     if (scheme == s) return;
+    log.trace("theme.setScheme {t} -> {t}", .{ scheme, s });
     scheme = s;
     applyPalette(if (s == .light) light_palette else dark_palette);
 }
@@ -260,12 +262,15 @@ fn scrubTransparentRgb(img: *rl.Image) void {
 }
 
 pub fn setFont(f: rl.Font) void {
+    log.trace("theme.setFont", .{});
     ui_font = f;
 }
 pub fn setMono(f: rl.Font) void {
+    log.trace("theme.setMono", .{});
     mono_font = f;
 }
 pub fn deinit() void {
+    log.trace("theme.deinit", .{});
     if (mark_tex) |tex| rl.unloadTexture(tex);
     mark_tex = null;
     mark_tex_attempted = false;
@@ -273,6 +278,7 @@ pub fn deinit() void {
 
 fn ensureMarkTexture() void {
     if (mark_tex_attempted) return;
+    log.trace("theme.ensureMarkTexture loading", .{});
     mark_tex_attempted = true;
     const candidates = [_][:0]const u8{
         "assets/icon.png",

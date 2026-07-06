@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const log = @import("log.zig");
 
 pub const Db = struct {
     gpa: std.mem.Allocator,
@@ -13,6 +14,7 @@ pub const Db = struct {
     db: []const u8 = "", //  path to the chat sqlite ("" = disabled)
 
     fn run(self: Db, args: []const []const u8) ?[]u8 {
+        log.trace("neuron.Db.run args0={s} db={s}", .{ if (args.len > 0) args[0] else "", self.db });
         if (self.bin.len == 0 or self.db.len == 0) return null;
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
@@ -33,6 +35,7 @@ pub const Db = struct {
 
     /// Store one fact under `scope`. Trimmed + capped so facts stay atomic; no-op on any failure.
     pub fn observe(self: Db, scope: []const u8, text: []const u8) void {
+        log.trace("neuron.Db.observe scope={s} text_len={d}", .{ scope, text.len });
         const t = std.mem.trim(u8, text, " \r\n\t");
         if (t.len < 3) return;
         if (self.run(&.{ "observe", scope, t[0..@min(t.len, 1400)] })) |o| self.gpa.free(o);
@@ -42,6 +45,7 @@ pub const Db = struct {
     /// learned per-tag-class trust (the `--trust` floor), so sources that proved reliable out-rank noise. Copied
     /// into `out`; empty slice on miss. Belief → recall. Degrades to plain assoc on an older binary (no-op on fail).
     pub fn recall(self: Db, scope: []const u8, query: []const u8, out: []u8) []const u8 {
+        log.trace("neuron.Db.recall scope={s} query_len={d}", .{ scope, query.len });
         const q = std.mem.trim(u8, query, " \r\n\t");
         if (q.len < 3) return out[0..0];
         const o = self.run(&.{ "--trust", "assoc", scope, q[0..@min(q.len, 400)] }) orelse return out[0..0];
@@ -59,6 +63,7 @@ pub const Db = struct {
     /// and fade the competitors, so a topic the chat engaged with successfully out-ranks the alternatives in
     /// later recall — the chat's memory LEARNS from outcomes instead of only accumulating. No-op on any failure.
     pub fn reinforce(self: Db, scope: []const u8, topic: []const u8, feeling: []const u8) void {
+        log.trace("neuron.Db.reinforce scope={s} topic={s} feeling={s}", .{ scope, topic, feeling });
         const t = std.mem.trim(u8, topic, " \r\n\t");
         if (t.len < 3) return;
         const f = if (feeling.len > 0) feeling else "useful";
@@ -68,6 +73,7 @@ pub const Db = struct {
     /// Drop the facts under `scope` that contain `match` (substring). Used to delete one durable memory when the
     /// user (or the AI, via FORGET:) retires a stale key/preference. No-op on any failure or empty match.
     pub fn forget(self: Db, scope: []const u8, match: []const u8) void {
+        log.trace("neuron.Db.forget scope={s} match={s}", .{ scope, match });
         const m = std.mem.trim(u8, match, " \r\n\t");
         if (m.len < 3) return; // never pass an empty match — that would wipe the whole scope
         if (self.run(&.{ "forget", scope, m[0..@min(m.len, 120)] })) |o| self.gpa.free(o);
@@ -77,6 +83,7 @@ pub const Db = struct {
     /// graph, recalling at each hop. Deterministic, no model round-trip — how a caller reasons over a
     /// causal/dependency chain instead of re-deriving it. Returns the endpoint value into `out`; empty on a break.
     pub fn chain(self: Db, scope: []const u8, start: []const u8, relation: []const u8, out: []u8) []const u8 {
+        log.trace("neuron.Db.chain scope={s} start={s} relation={s}", .{ scope, start, relation });
         if (start.len == 0 or relation.len == 0) return out[0..0];
         const o = self.run(&.{ "chain", scope, start, relation }) orelse return out[0..0];
         defer self.gpa.free(o);
@@ -91,6 +98,7 @@ pub const Db = struct {
 /// Locate the neuron binary near the app (cwd is the nl-veil home when launched normally). "" if not found;
 /// caller owns the returned slice.
 pub fn findBin(gpa: std.mem.Allocator, io: Io) []const u8 {
+    log.trace("neuron.findBin", .{});
     const cands = [_][]const u8{ "bin/neuron.exe", "bin/neuron", "neuron.exe", "./neuron.exe", "../bin/neuron.exe", "../bin/neuron" };
     for (cands) |c| {
         if (Io.Dir.cwd().statFile(io, c, .{})) |_| {

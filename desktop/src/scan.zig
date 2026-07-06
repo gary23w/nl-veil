@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const Io = std.Io;
+const log = @import("log.zig");
 
 pub const MAX_LOG = 400; // ring of the most-recent event lines held for the log console
 pub const MAX_SWARMS = 64;
@@ -171,6 +172,7 @@ fn jsonInt(line: []const u8, key: []const u8) ?i64 {
 /// tailing only the final window of the file — the console never needs the whole history, and a swarm's
 /// stream grows to megabytes. Returns the number of Ev written into `out`, oldest-first.
 pub fn tailEvents(io: Io, gpa: std.mem.Allocator, path: []const u8, out: []Ev, metrics: *Metrics) usize {
+    log.trace("scan.tailEvents path={s}", .{path});
     const data = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 << 20)) catch return 0;
     defer gpa.free(data);
     metrics.* = .{};
@@ -304,6 +306,7 @@ fn composeText(ev: *Ev, a: []const u8, b: []const u8) void {
 /// container dir, descend one level and take each data/X/child that has events.jsonl. The stored `id` is
 /// the path RELATIVE to data_dir (so control/tail resolve correctly for both layouts); `name` is friendly.
 pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []SwarmSummary, now_s: i64, live_window_s: i64) usize {
+    log.trace("scan.listSwarms data_dir={s}", .{data_dir});
     var dir = Io.Dir.cwd().openDir(io, data_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     var it = dir.iterate();
@@ -420,6 +423,7 @@ fn readGoalBrief(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, name: []c
 /// paths keeping the latest size. Falls back to walking work/ (one level) when there's no manifest yet
 /// (early in a run). `rel` is the swarm path relative to data_dir. Returns count written into `out`.
 pub fn listWorkFiles(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, out: []FileRow) usize {
+    log.trace("scan.listWorkFiles rel={s}", .{rel});
     var n: usize = 0;
     const mp = std.fmt.allocPrint(gpa, "{s}/{s}/.build_manifest", .{ data_dir, rel }) catch return 0;
     defer gpa.free(mp);
@@ -519,6 +523,7 @@ fn walkWork(io: Io, gpa: std.mem.Allocator, work_root: []const u8, prefix: []con
 /// Read a built file's content for the Files viewer, from <data>/<rel>/work/<sub>. Copies up to out.len
 /// bytes; sets trunc if the file was larger. Rejects absolute/escape paths. Returns bytes copied.
 pub fn readWorkFile(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, sub: []const u8, out: []u8, trunc: *bool) usize {
+    log.trace("scan.readWorkFile rel={s} sub={s}", .{ rel, sub });
     trunc.* = false;
     if (sub.len == 0 or sub[0] == '/' or sub[0] == '\\' or std.mem.indexOf(u8, sub, "..") != null) return 0;
     const fp = std.fmt.allocPrint(gpa, "{s}/{s}/work/{s}", .{ data_dir, rel, sub }) catch return 0;
@@ -535,6 +540,7 @@ pub fn readWorkFile(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: [
 /// dead local port refuses immediately, so no timeout is needed (and this Zig's Windows connect panics on
 /// a timeout option — .none is the only portable choice).
 pub fn serverOnline(io: Io, port: u16) bool {
+    log.trace("scan.serverOnline port={d}", .{port});
     const addr = Io.net.IpAddress{ .ip4 = Io.net.Ip4Address.loopback(port) };
     var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return false;
     stream.close(io);
@@ -545,6 +551,7 @@ pub fn serverOnline(io: Io, port: u16) bool {
 /// {"op":"say","to":"all","text":"..."} / {"op":"set_goal","goal":"..."} / {"op":"stop"}. Same-machine,
 /// so we append directly instead of routing through the authenticated HTTP control endpoint.
 pub fn writeControl(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, id: []const u8, line_json: []const u8) bool {
+    log.trace("scan.writeControl id={s} line={s}", .{ id, line_json[0..@min(line_json.len, 120)] });
     const path = std.fmt.allocPrint(gpa, "{s}/{s}/control.jsonl", .{ data_dir, id }) catch return false;
     defer gpa.free(path);
     const prior = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 << 10)) catch &[_]u8{};

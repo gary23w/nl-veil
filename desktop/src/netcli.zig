@@ -37,6 +37,7 @@ const MAX_ATTEMPTS = 3;
 /// Transient failures are retried for GET/DELETE; a POST is tried once (an empty reply might mean the server
 /// already processed it, and a retry would deploy a duplicate swarm).
 fn curlReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: []const u8, token: []const u8, body_json: ?[]const u8, timeout_s: []const u8) ?Resp {
+    log.trace("netcli.curlReq {s} {s} timeout={s}s has_body={}", .{ method, path, timeout_s, body_json != null });
     var url_buf: [320]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, path }) catch return null;
     var auth_buf: [220]u8 = undefined;
@@ -109,12 +110,14 @@ fn curlReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
 /// GET /api/v1/fleet — unauthenticated; returns the raw JSON body for the caller to scan. Short timeout:
 /// the poller calls this on every refresh, so a slow server must not stall the poller for long.
 pub fn fleet(io: Io, gpa: std.mem.Allocator, port: u16) ?Resp {
+    log.trace("netcli.fleet port={d}", .{port});
     return curlReq(io, gpa, "GET", port, "/api/v1/fleet", "", null, "6");
 }
 
 /// POST /api/v1/swarms — the full deploy the Deploy button fires. `token` (if non-empty) is the bearer key;
 /// with no token the server 401s and the caller surfaces "connect a token in Settings".
 pub fn deploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.deploy port={d} body_len={d}", .{ port, body_json.len });
     return curlReq(io, gpa, "POST", port, "/api/v1/swarms", token, body_json, "15");
 }
 
@@ -122,6 +125,7 @@ pub fn deploy(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body
 /// swarm with the SERVER's cast defaults and returns {ok,id,...} at once. Bounded so a slow server can never
 /// freeze the chat turn that fired the cast.
 pub fn cast(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.cast port={d} body_len={d}", .{ port, body_json.len });
     return curlReq(io, gpa, "POST", port, "/api/v1/cast", token, body_json, "15");
 }
 
@@ -129,11 +133,13 @@ pub fn cast(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_j
 /// hive mind would. body_json = {"tool":..,"args":<json-string>,"id":..}. Generous timeout: a web_search
 /// mind tool can spend ~30s on curl before it answers.
 pub fn chatTool(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.chatTool port={d} body_len={d}", .{ port, body_json.len });
     return curlReq(io, gpa, "POST", port, "/api/v1/chat/tool", token, body_json, "45");
 }
 
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
+    log.trace("netcli.delete port={d} id={s}", .{ port, id });
     var pbuf: [160]u8 = undefined;
     const path = std.fmt.bufPrint(&pbuf, "/api/v1/swarms/{s}", .{id}) catch return null;
     return curlReq(io, gpa, "DELETE", port, path, token, null, "15");

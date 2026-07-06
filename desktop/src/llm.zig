@@ -101,6 +101,7 @@ fn ollamaRoot(u: []const u8) []const u8 {
 }
 
 fn setErr(s: *Stream, msg: []const u8) void {
+    log.trace("llm.setErr {s}", .{msg});
     const n = @min(msg.len, s.err.len);
     @memcpy(s.err[0..n], msg[0..n]);
     s.err_len = @intCast(n);
@@ -111,6 +112,7 @@ fn setErr(s: *Stream, msg: []const u8) void {
 /// Kick off one streaming chat completion. `messages_json` is the inside of "messages":[ … ] (caller-built
 /// and escaped). Scratch files live under `dir` (the .veil-desk sidecar). Returns false on spawn failure.
 pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: Provider, messages_json: []const u8, max_tokens: u32, now_s: i64) bool {
+    log.trace("llm.start dir={s} model={s} msgs_len={d} max_tokens={d}", .{ dir, prov.model, messages_json.len, max_tokens });
     const native = isLocalOllama(prov.base_url);
     s.* = .{ .started_s = now_s, .last_growth_s = now_s, .native = native };
 
@@ -238,6 +240,7 @@ pub fn poll(s: *Stream, io: Io, gpa: std.mem.Allocator, now_s: i64, patient: boo
 /// and message.thinking (the reasoning), and RECOVERS the model's text when Ollama's gpt-oss harmony
 /// parser fails with "error parsing tool call: raw='...'" — that raw IS the intended reply.
 fn finishNativeWhole(s: *Stream, io: Io, gpa: std.mem.Allocator, code: []const u8, body: []const u8) void {
+    log.trace("llm.finishNativeWhole code={s} body_len={d}", .{ code, body.len });
     abort(s, io); // reap the (already-exited) child
     if (s.done) return;
     // Ollama surfaces server-side failures as a top-level {"error":"..."}.
@@ -313,6 +316,7 @@ fn errBodyHead(body: []const u8) []const u8 {
 /// curl has exited (its STAT sentinel is on disk). Reap it and decide the turn's outcome from the HTTP
 /// code + whatever body arrived. `code` is the 3-digit string ("000" on a failed connect).
 fn finishBySentinel(s: *Stream, io: Io, gpa: std.mem.Allocator, code: []const u8, body: []const u8) void {
+    log.trace("llm.finishBySentinel code={s} body_len={d}", .{ code, body.len });
     abort(s, io); // reap the (already-exited) child
     if (s.done) return;
     // If the framed parse produced nothing, try a direct whole-body content extraction — a backend that
@@ -347,6 +351,7 @@ fn checkTimeouts(s: *Stream, io: Io, now_s: i64, patient: bool) void {
     const stall_to = s.saw_any and now_s - s.last_growth_s > STALL_TIMEOUT_S;
     const total_to = now_s - s.started_s > TOTAL_TIMEOUT_S + 15;
     if (first_to or stall_to or total_to) {
+        log.trace("llm.checkTimeouts firing: first={} stall={} total={} elapsed_s={d}", .{ first_to, stall_to, total_to, now_s - s.started_s });
         abort(s, io);
         var eb: [200]u8 = undefined;
         const msg = if (first_to)
@@ -595,6 +600,7 @@ pub fn jsonUnescape(gpa: std.mem.Allocator, obj: []const u8, key: []const u8) ?[
 /// Kill the curl child (timeout / user abort). Child.kill terminates, reaps and cleans up in one call
 /// (idempotent) — calling wait() after it would assert on the cleared handle.
 pub fn abort(s: *Stream, io: Io) void {
+    log.trace("llm.abort has_child={}", .{s.child != null});
     if (s.child) |*c| {
         c.kill(io);
         s.child = null;
@@ -606,6 +612,7 @@ pub fn abort(s: *Stream, io: Io) void {
 /// endpoint holds the SSE connection open past its application-level [DONE] sentinel. kill() terminates
 /// AND reaps in one idempotent call, so a normally-exited curl is just reaped and a lingering one is cut.
 pub fn finish(s: *Stream, io: Io) void {
+    log.trace("llm.finish content_len={d} reasoning_len={d} failed={}", .{ s.content.items.len, s.reasoning.items.len, s.failed });
     if (s.child) |*c| {
         c.kill(io);
         s.child = null;
