@@ -63,8 +63,9 @@ const SYSTEM_PROMPT =
     "- web_search {\"query\":\"...\"}  — a quick keyless web search (top results + excerpts).\n" ++
     "- web_fetch {\"url\":\"...\"}  — fetch one page as clean text.\n" ++
     "- fetch_json {\"url\":\"...\"}  — GET a JSON API and return the body.\n" ++
-    "- recall_hive {\"query\":\"...\"}  — what the shared memory already knows.\n" ++
-    "- observe {\"fact\":\"...\"}  — store a durable fact into the shared memory.\n" ++
+    "- recall_hive {\"query\":\"...\"}  — what the shared hive's COLLECTIVE knowledge already knows (general facts).\n" ++
+    "- observe {\"fact\":\"...\"}  — add a GENERAL fact to the shared hive knowledge (NOT the user's private memory — " ++
+    "for anything personal to this user, keys, logins, or preferences, use a REMEMBER: line instead; see MEMORY below).\n" ++
     "Use a TOOL for a one-shot lookup or to inspect/steer a running cast (e.g. the user says 'kill the swarm " ++
     "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Use CAST for open-ended " ++
     "research or building. For a brand-new web question, a single web_search TOOL is often faster than a cast.\n" ++
@@ -104,7 +105,9 @@ const SYSTEM_PROMPT =
     "a library's exact API, an ops/deploy procedure), do NOT guess — first run TOOL: recall_hive {\"query\":\"...\"} " ++
     "to check what the shared memory already knows, and if that's thin, TOOL: web_search {\"query\":\"...\"} to look " ++
     "it up. Answer FROM what you find. Guessing a deploy command or an API is worse than taking one tool call to " ++
-    "verify it. When you learn something durable and correct, TOOL: observe {\"fact\":\"...\"} it so the hive keeps it.\n" ++
+    "verify it. When you learn a GENERAL durable fact (about the world, a tool, an API), TOOL: observe {\"fact\":\"...\"} " ++
+    "it so the hive keeps it — but a fact about THIS USER (their key, login, environment, or preference) goes to your " ++
+    "PRIVATE memory with a REMEMBER: line instead (see MEMORY), never observe.\n" ++
     "\n" ++
     "MORE TOOLS — you share the hive mind's full toolset. Beyond the above you can also call: recall {\"query\"} " ++
     "(your own memory), save_skill / journal / note_stance (record a technique, a note, a stance), set_directive / " ++
@@ -121,12 +124,19 @@ const SYSTEM_PROMPT =
     "10.0.0.5', 'remember that...' — SAVE it by writing on its OWN line:\n" ++
     "REMEMBER: [category] the fact to keep\n" ++
     "where category is one word: key, login, preference, or fact (e.g. `REMEMBER: [key] OpenAI API key: sk-abc123`). " ++
-    "You may include a REMEMBER: line alongside your normal reply — it is stripped from what the user sees and quietly " ++
-    "stored; a brief 'Saved.' is enough, no fanfare. To drop a stale memory, write on its own line:\n" ++
+    "You may include REMEMBER: line(s) alongside your normal reply — they are stripped from what the user sees and " ++
+    "quietly stored. Put them at the VERY END with NO sentence introducing them (do NOT write 'Saved preferences:' or " ++
+    "'I've remembered:' — those headers would be left dangling once the lines are stripped); just the bare REMEMBER: " ++
+    "lines. To drop a stale memory, write on its own line:\n" ++
     "FORGET: <a few words identifying it>\n" ++
     "Your current memories are given to you at the top of each turn under 'YOUR MEMORY' — use them to answer directly " ++
-    "(if the user asks 'what's my API key', read it from there, don't cast or claim you can't). Save proactively when " ++
-    "the user shares something durable, but don't nag; never reveal a stored secret to anyone but this user.\n" ++
+    "(if the user asks 'what's my API key', read it from there, don't cast or claim you can't). " ++
+    "PREFER REMEMBER: over observe for ANYTHING personal to this user — keys, logins, credentials, preferences, their " ++
+    "environment; if you're unsure which store a fact belongs in, use REMEMBER:. observe is only for the shared hive's " ++
+    "general knowledge. CONSOLIDATE as you think: at the end of each substantive answer, decide what durable facts " ++
+    "about this user you learned or that changed, and emit REMEMBER:/FORGET: lines accordingly — proactively, without " ++
+    "waiting to be told (e.g. the user mentions in passing they deploy to us-west-2 → REMEMBER: [preference] ...). " ++
+    "Don't nag; never reveal a stored secret to anyone but this user.\n" ++
     "Otherwise reply normally in plain text.";
 
 // The neuron-db scope for the chat's DURABLE cross-conversation memory (keys/logins/preferences/facts). Distinct
@@ -136,7 +146,23 @@ const MEMORY_SCOPE = "veil-memory";
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
 
-const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer };
+const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer, consolidate };
+
+// MEMORY INSIDE RECURSIVE THOUGHT — after a substantive answer that involved the user personally, run ONE focused
+// consolidation pass that extracts durable facts about the user (keys/logins/prefs/environment) into memory. This
+// is DETERMINISTIC: it does not rely on the model volunteering a REMEMBER: mid-answer (empirically it doesn't).
+// Gated by a personal-signal heuristic so pure-technical turns don't spend a call. One flag to disable.
+const MEMORY_CONSOLIDATE: bool = true;
+const CONSOLIDATE_SYSTEM =
+    "You are the Veil's MEMORY CONSOLIDATION step — you are NOT answering the user now. Review the conversation and " ++
+    "the YOUR MEMORY block, and decide what durable facts about THIS user to keep on their own local machine. " ++
+    "Extract every fact the user shared, implied, or CHANGED that is worth remembering across conversations: API " ++
+    "keys, logins, passwords, tokens, credentials, account names, their environment/setup (regions, tools, stacks, " ++
+    "hosts they use), and stable preferences. Output ONLY directive lines — nothing else, no prose:\n" ++
+    "REMEMBER: [category] the fact    (category = key | login | preference | fact)\n" ++
+    "FORGET: <a few words>            (only to drop a fact that is now wrong/outdated)\n" ++
+    "Do NOT repeat a fact already present in YOUR MEMORY. Do NOT store ephemeral one-off details or general world " ++
+    "knowledge — only durable facts about THIS user. If there is nothing new or changed to store, output exactly: NONE";
 
 // Bound the model→tool→model loop so a confused local model can't spin forever on tool calls. A real build
 // legitimately reads + writes + tests many files in a row, so this must be generous (5 gave up mid-build).
@@ -172,6 +198,13 @@ const REFLECT_MIN_ANSWER: usize = 500;
 // two solutions when the hive finishes. Costs extra model calls per cast (the veil's own attempt), so it's a
 // single flag to disable if a run should be cast-only.
 const CONCURRENT_VEIL: bool = true;
+
+// MEMORY INSIDE RECURSIVE THOUGHT: mirror the veil's reasoning-time `observe` tool into the durable per-user
+// memory (the Memory tab) for PERSONAL facts (keys/logins/prefs). Without this, what the veil learns WHILE
+// reasoning lands only in the shared hive store and never reaches the store the user manages. Strictly additive
+// (the server `observe` still runs); gated so it's one flag to disable. See personalFact + the mirror in
+// runToolAndContinue.
+const MIRROR_OBSERVE: bool = true;
 
 // ---- micro-console (dual-tab shell) ---------------------------------------------------------------------
 // A shell command MUST NOT run inline on this worker thread: a hang (a dev server, `ping -t`, a REPL) would
@@ -1280,7 +1313,11 @@ pub const Chat = struct {
             w += cn;
             first = false;
         }
-        return std.mem.trim(u8, self.mem_scratch[0..w], " \r\n\t");
+        var out = std.mem.trim(u8, self.mem_scratch[0..w], " \r\n\t");
+        // If directives were stripped, the model may have left a dangling intro line ("Saved preferences:", "I've
+        // remembered:") that now points at nothing — drop that one trailing line so the shown answer reads clean.
+        if (self.mem_saved_n > 0 or self.mem_forgot_n > 0) out = stripDanglingMemoryIntro(out);
+        return out;
     }
 
     pub fn cmdStopCast(self: *Chat, dd: []const u8, rel: []const u8) void {
@@ -1613,15 +1650,16 @@ pub const Chat = struct {
         defer msgs.deinit(self.gpa);
         var dbuf: [96]u8 = undefined;
         msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
-        // A loop-infer turn wears the DRIVER hat (write the user's next message); every other turn is the assistant.
-        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else SYSTEM_PROMPT);
+        // A loop-infer turn wears the DRIVER hat (write the user's next message); a consolidate turn is the memory
+        // step (not an answer); every other turn is the assistant.
+        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else SYSTEM_PROMPT);
         escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
         // HIPPOCAMPUS: draw the facts most relevant to THIS query in from the chat's own neuron-db — earlier
         // turns and cast findings, including ones evicted from the 24KB visible history — and inject them as a
         // grounded-context message. Additive + guarded: if recall is empty/disabled, the prompt is byte-identical
         // to the token-tail-only version, so this can only help, never break the turn.
-        if (self.mind().enabled() and self.last_user_len > 0) {
+        if (kind != .consolidate and self.mind().enabled() and self.last_user_len > 0) {
             var scope_buf: [40]u8 = undefined;
             const scope = self.convScope(&scope_buf);
             if (scope.len > 0) {
@@ -1687,6 +1725,9 @@ pub const Chat = struct {
         }
         if (kind == .loop_infer) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Output the next message to send now (or exactly DONE if the goal is already complete). Reply with only that message text.\"}") catch return;
+        }
+        if (kind == .consolidate) {
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Consolidation step. From the conversation above, output the REMEMBER:/FORGET: lines for any durable facts about ME (keys, logins, credentials, environment/setup, stable preferences) that I shared or changed and that are not already in YOUR MEMORY. One directive per line, no other text. If there is nothing new or changed, output exactly NONE.\"}") catch return;
         }
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
@@ -1783,6 +1824,27 @@ pub const Chat = struct {
             self.loopContinue(dd, nb[0..n]);
             return;
         }
+        // A CONSOLIDATE turn's output is durable-memory directives (REMEMBER:/FORGET:) or NONE — process them into
+        // memory and go idle. Handled BEFORE tool/cast/reflect detection: it is never an answer, a tool, or a cast.
+        if (kind == .consolidate) {
+            const src = if (full.len > 0) full else reason;
+            _ = self.processMemory(dd, src); // stores/forgets for side-effects; the stripped return is discarded
+            const saved = self.mem_saved_n;
+            const dropped = self.mem_forgot_n;
+            self.stream.deinit(self.gpa);
+            if (saved > 0 or dropped > 0) {
+                var nb: [96]u8 = undefined;
+                const note = if (dropped > 0)
+                    std.fmt.bufPrint(&nb, "(memory consolidated: {d} saved, {d} updated)", .{ saved, dropped }) catch "(memory consolidated)"
+                else
+                    std.fmt.bufPrint(&nb, "(remembered {d} durable fact{s})", .{ saved, if (saved == 1) "" else "s" }) catch "(remembered)";
+                self.appendMsg(dd, .cast_note, note);
+                log.info("chat memory: consolidation stored {d}, dropped {d}", .{ saved, dropped });
+            }
+            self.setBusy(false);
+            self.maybeLoop(dd);
+            return;
+        }
         // TOOL: <name> <args> — a single shared-tool call. Run it, fold the result back, continue the loop.
         // Not on a .collect/.reflect turn (those turns are answer-composition passes).
         if (kind != .collect and kind != .reflect) {
@@ -1860,8 +1922,13 @@ pub const Chat = struct {
                 // ITERATIVE self-critique: the pass still improved the answer, so feed the improved text back for
                 // ANOTHER critique — recursive refinement that CONVERGES (critique → fix → re-critique …) the way
                 // a careful reasoner works, instead of a single shot. Copy it out BEFORE we free the stream.
-                const rn2 = @min(revised.len, self.reflect_draft.len);
-                @memcpy(self.reflect_draft[0..rn2], revised[0..rn2]);
+                // MEMORY INSIDE RECURSIVE THOUGHT: a REMEMBER:/FORGET: the veil settles on DURING this reflection
+                // pass was previously dropped (processMemory only ran at draft + finalize). Run it here so a fact
+                // decided mid-critique is stored — and copy the CLEANED (directive-stripped) text into the draft so
+                // the next pass never re-critiques its own directive (which would poison the convergence heuristic).
+                const cleaned = self.processMemory(dd, revised);
+                const rn2 = @min(cleaned.len, self.reflect_draft.len);
+                @memcpy(self.reflect_draft[0..rn2], cleaned[0..rn2]);
                 self.reflect_draft_len = rn2;
                 self.stream.deinit(self.gpa);
                 var sb2: [72]u8 = undefined;
@@ -1976,9 +2043,32 @@ pub const Chat = struct {
             const scope = self.convScope(&scope_buf);
             if (scope.len > 0) self.mind().reinforce(scope, self.last_user[0..self.last_user_len], "answered");
         }
+        // MEMORY INSIDE RECURSIVE THOUGHT: an answer turn just finalized — decide (BEFORE freeing the stream, since
+        // `full` is a stream slice) whether to run the deterministic consolidation pass that persists durable facts
+        // about the user. If it fires, its own settle does setBusy(false)+maybeLoop, so we return here.
+        const consolidate = self.shouldConsolidate(kind, full);
         self.stream.deinit(self.gpa);
+        if (consolidate) {
+            self.setStatus("consolidating memory...");
+            self.startTurn(dd, .consolidate);
+            if (self.turn == .consolidate) return; // the consolidation turn is live; it settles + goes idle later
+        }
         self.setBusy(false);
         self.maybeLoop(dd); // full-auto: if loop mode is on and nothing else is pending, drive the next message
+    }
+
+    /// Should we run the deterministic memory-consolidation pass after this just-finalized answer? Only after a
+    /// genuine ANSWER turn (never an internal consolidate/collect/loop/veil-work turn), only when the exchange has a
+    /// PERSONAL signal (so pure-technical Q&A doesn't spend a model call), and never while a cast/veil-work is in
+    /// flight. `full` must still be a live stream slice when this is called.
+    fn shouldConsolidate(self: *Chat, kind: Turn, full: []const u8) bool {
+        if (!MEMORY_CONSOLIDATE or !self.mind().enabled()) return false;
+        if (self.abort_turn.load(.monotonic)) return false;
+        if (kind != .user and kind != .tool_follow and kind != .reflect) return false; // answer turns only (no self-loop)
+        if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
+        if (full.len == 0 and self.last_user_len == 0) return false;
+        // Personal-signal gate: the user is who shares durable facts, so key off THEIR message. Skips "explain X".
+        return exchangeHasPersonalSignal(self.last_user[0..self.last_user_len]);
     }
 
     // ------------------------------------------------------------------------------ prompt loop (full-auto)
@@ -2408,6 +2498,21 @@ pub const Chat = struct {
             log.err("chat tool: {s} netcli NULL", .{name});
         }
 
+        // MEMORY INSIDE RECURSIVE THOUGHT (write-side unification): the veil reaches for `observe` while reasoning
+        // to keep a fact — but observe writes to the shared HIVE store, invisible to the user's durable Memory tab.
+        // Mirror a PERSONAL/durable observe (a key/login/preference about THIS user) into veil-memory too, so what
+        // it learns mid-thought reaches the store the user manages. Additive (the server observe already ran);
+        // personal-only (tight filter → research observes stay hive-only); never during the veil's parallel research
+        // work (in_veil_work → a research-goal observe must not land in the private tab). Gated by MIRROR_OBSERVE.
+        if (MIRROR_OBSERVE and !self.in_veil_work and std.mem.eql(u8, name, "observe") and result.len > 0 and result[0] != '(') {
+            if (llm.jsonUnescape(self.gpa, raw_args, "fact")) |fact| {
+                defer self.gpa.free(fact);
+                if (personalFact(fact)) |cat| {
+                    self.storeMemory(dd, cat, fact);
+                    log.info("chat memory: mirrored personal observe -> [{s}] durable", .{cat});
+                }
+            }
+        }
         // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
         // model sees it as user content; it's also the user-visible record that the tool ran).
         var fb: [8320]u8 = undefined;
@@ -2847,6 +2952,76 @@ fn reflectChanged(prior: []const u8, revised: []const u8) bool {
 
 /// Parse the body of a `REMEMBER:` directive into (category, fact). An optional leading `[category]` picks the
 /// bucket (key/login/preference/fact); without it the whole body is a plain `fact`. Pure — unit-tested.
+/// Is this observed fact PERSONAL/durable to THIS user (a credential or preference worth the private Memory tab)
+/// rather than general hive knowledge? Returns the coarse category, or null = not personal (stays hive-only).
+/// Deliberately biased to FALSE NEGATIVES: a miss just keeps today's hive-only behavior, but a false positive would
+/// leak research noise into the user's private secret store. So the credential classes REQUIRE a first-person /
+/// possessive marker ("my", "i ", "'s ") to fire — "the API key rotation interval is 90 days" must NOT match, while
+/// "my openai api key is sk-…" must. Preferences fire on explicit first-person preference verbs. Pure; unit-tested.
+fn personalFact(fact: []const u8) ?[]const u8 {
+    var lb: [512]u8 = undefined;
+    const n = @min(fact.len, lb.len);
+    for (fact[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const low = lb[0..n];
+    const H = struct {
+        fn has(h: []const u8, needle: []const u8) bool {
+            return std.mem.indexOf(u8, h, needle) != null;
+        }
+    };
+    // Does the fact refer to THIS user? First-person only — deliberately strict so a general-knowledge observe
+    // ("that's the api key rotation interval") can't slip into the private store. Explicit third-person personal
+    // secrets ("gary's password …") are expected to go via a REMEMBER: line (which the prompt steers hard), not
+    // through this observe backstop; missing them is the safe (false-negative) direction.
+    const mine = H.has(low, "my ") or std.mem.startsWith(u8, low, "i ") or H.has(low, " i ") or std.mem.startsWith(u8, low, "i'");
+    if (mine) {
+        if (H.has(low, "password") or H.has(low, "passphrase")) return "login";
+        if (H.has(low, "api key") or H.has(low, "apikey") or H.has(low, "secret") or H.has(low, "token") or
+            H.has(low, "signing key") or H.has(low, "private key") or H.has(low, "credential") or H.has(low, "access key")) return "key";
+        if (H.has(low, "login") or H.has(low, "email") or H.has(low, "username") or H.has(low, "account")) return "login";
+    }
+    // Preferences carry their own first-person signal.
+    if (H.has(low, "i prefer") or H.has(low, "i like") or H.has(low, "i always") or H.has(low, "i use") or
+        H.has(low, "my preference") or H.has(low, "prefer to")) return "preference";
+    return null; // general knowledge → hive-only (unchanged)
+}
+
+/// Drop a trailing "intro to the (now-stripped) directives" line — a short line ending in ':' that announces a
+/// save, e.g. "**Saved preferences:**" or "I've remembered:". Only touches the LAST line and only when it clearly
+/// reads as such an intro, so real prose ending in a colon (a list header with content under it) is left alone.
+fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
+    const nl = std.mem.lastIndexOfScalar(u8, text, '\n');
+    const last_raw = if (nl) |i| text[i + 1 ..] else text;
+    const ll = std.mem.trim(u8, last_raw, " \t*_#>`-—");
+    if (ll.len == 0 or ll.len > 48 or ll[ll.len - 1] != ':') return text;
+    var lb: [64]u8 = undefined;
+    const n = @min(ll.len, lb.len);
+    for (ll[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const low = lb[0..n];
+    const intro = std.mem.indexOf(u8, low, "sav") != null or std.mem.indexOf(u8, low, "remember") != null or
+        std.mem.indexOf(u8, low, "prefer") != null or std.mem.indexOf(u8, low, "memor") != null or
+        std.mem.indexOf(u8, low, "stored") != null or std.mem.indexOf(u8, low, "noted") != null or
+        std.mem.indexOf(u8, low, "keep") != null;
+    if (!intro) return text;
+    return std.mem.trimEnd(u8, if (nl) |i| text[0..i] else "", " \r\n\t*_#>`-—");
+}
+
+/// Does this message plausibly contain a durable fact about the user (a first-person statement, a credential, a
+/// preference, an environment detail)? Gates the consolidation pass so a purely technical exchange ("explain
+/// quicksort") doesn't spend a model call. Permissive on the personal side, since a missed consolidation is worse
+/// than an occasional NONE-returning call. Case-insensitive substring scan; cheap.
+fn exchangeHasPersonalSignal(user: []const u8) bool {
+    const sigs = [_][]const u8{
+        "my ",        "i'm",        "i am",   "i use",      "i prefer",  "i like",    "i always",
+        "i work",     "i deploy",   "i run",  "i host",     "i keep",    "we use",    "our ",
+        "remember",   "forget",     "password", "api key",  "apikey",    "secret",    "token",
+        "credential", "login",      "username", "email",    "account",   "prefer",    "@",
+    };
+    for (sigs) |s| {
+        if (std.ascii.indexOfIgnoreCase(user, s) != null) return true;
+    }
+    return false;
+}
+
 const RememberSpec = struct { cat: []const u8, fact: []const u8 };
 fn parseRememberBody(body_in: []const u8) RememberSpec {
     const body = std.mem.trim(u8, body_in, " \t");
@@ -3317,6 +3492,33 @@ test "parseRememberBody splits [category] from the fact" {
     const d = parseRememberBody("[] just this");
     try std.testing.expectEqualStrings("fact", d.cat);
     try std.testing.expectEqualStrings("just this", d.fact);
+}
+
+test "personalFact mirrors personal observes but leaves general knowledge hive-only" {
+    // personal credentials/prefs -> a category (mirrored into the private Memory tab)
+    try std.testing.expectEqualStrings("key", personalFact("my openai api key is sk-abc123").?);
+    try std.testing.expectEqualStrings("login", personalFact("my password is hunter2").?);
+    try std.testing.expectEqualStrings("login", personalFact("my login email is gary@x.com").?);
+    // third-person possessive is intentionally NOT mirrored via observe (goes through REMEMBER: instead) — bias to
+    // false-negative so a general-knowledge observe can never leak into the private secret store
+    try std.testing.expect(personalFact("gary's password is 123456") == null);
+    try std.testing.expectEqualStrings("preference", personalFact("I prefer dark mode and concise answers").?);
+    try std.testing.expectEqualStrings("preference", personalFact("I always deploy to us-west-2").?);
+    // GENERAL knowledge must NOT be mirrored (stays hive-only) — the false-positive class we must avoid
+    try std.testing.expect(personalFact("the API key rotation interval is 90 days") == null);
+    try std.testing.expect(personalFact("JWT tokens are signed with a secret") == null);
+    try std.testing.expect(personalFact("Postgres listens on port 5432 by default") == null);
+    try std.testing.expect(personalFact("OAuth2 uses an access token and a refresh token") == null);
+}
+
+test "stripDanglingMemoryIntro drops a dangling save-intro but keeps real prose" {
+    // the exact live artifact: a bold header pointing at the (stripped) REMEMBER: lines
+    try std.testing.expectEqualStrings("Here is the plan.", stripDanglingMemoryIntro("Here is the plan.\n\n**Saved preferences:**"));
+    try std.testing.expectEqualStrings("Done.", stripDanglingMemoryIntro("Done.\nI've remembered:"));
+    // a real colon-terminated line that is NOT a memory intro is preserved
+    try std.testing.expectEqualStrings("The steps are:", stripDanglingMemoryIntro("The steps are:"));
+    // no trailing colon -> untouched
+    try std.testing.expectEqualStrings("A normal answer.", stripDanglingMemoryIntro("A normal answer."));
 }
 
 test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)" {
