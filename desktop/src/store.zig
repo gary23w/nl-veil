@@ -187,7 +187,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder };
 
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
@@ -264,6 +264,15 @@ pub const Store = struct {
     chat_loop: bool = false, // full-auto: the AI writes + sends its own next message until DONE or the cap (runtime only)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,
+    // Chat FILES inner tab — files produced inside THIS chat's own build dir ({conv}/work). The chat worker scans
+    // + publishes here (mirrors the swarm-file viewer's `files` channel, but scoped to the conversation).
+    chat_files: [scan.MAX_FILES]scan.FileRow = undefined,
+    chat_file_count: usize = 0,
+    chat_sel_file: [128]u8 = [_]u8{0} ** 128,
+    chat_sel_file_len: usize = 0,
+    chat_file_content: [1 << 14]u8 = undefined, // up to 16KB of the selected file, for the viewer
+    chat_file_content_len: usize = 0,
+    chat_file_content_trunc: bool = false,
     // Micro-console (below Swarm activity): two independent shell sessions — "You" (the user drives it) and
     // "Veil" (the AI drives it via RUN:). Each keeps a scrollback ring the chat worker appends command output to.
     console_you: [16384]u8 = undefined,
