@@ -237,6 +237,8 @@ pub const Chat = struct {
     cast_hex_len: usize = 0,
     cast_rel: [96]u8 = [_]u8{0} ** 96, // resolved run path relative to data dir
     cast_rel_len: usize = 0,
+    cast_conv: [40]u8 = [_]u8{0} ** 40, // the conv this cast was fired for — its run dir is _chat/builds/<conv>
+    cast_conv_len: usize = 0, // (chat casts build in the conv dir, so the run-dir basename is <conv>, not the hex)
     cast_deadline_s: i64 = 0,
     cast_minutes: u32 = CAST_MINUTES, // the time budget of the ACTIVE cast (AI-configurable; drives deadline + progress %)
     cast_stop_sent: bool = false,
@@ -1778,6 +1780,10 @@ pub const Chat = struct {
         self.cast_hex_len = @min(hex.len, self.cast_hex.len);
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
+        // the cast builds in this conversation's dir (_chat/builds/<conv>); remember <conv> so watchCast can find
+        // the run dir (its basename is <conv>, not the hex id). `conv` is the convScope captured above in fireCast.
+        self.cast_conv_len = @min(conv.len, self.cast_conv.len);
+        @memcpy(self.cast_conv[0..self.cast_conv_len], conv[0..self.cast_conv_len]);
         self.cast_deadline_s = self.nowS() + @as(i64, self.cast_minutes) * 60 + 120;
         var gb: [200]u8 = undefined;
         const note = std.fmt.bufPrint(&gb, "[cast] hive deployed ({s}) — watching", .{hex}) catch "[cast] hive deployed";
@@ -1968,10 +1974,13 @@ pub const Chat = struct {
         if (self.cast_rel_len == 0) {
             const n = scan.listSwarms(self.io, self.gpa, dd, &self.sw_scratch, now, 45);
             const hex = self.cast_hex[0..self.cast_hex_len];
+            const conv = self.cast_conv[0..self.cast_conv_len];
             for (self.sw_scratch[0..n]) |*sw| {
                 const id = sw.idStr();
                 const base = if (std.mem.lastIndexOfScalar(u8, id, '/')) |sl| id[sl + 1 ..] else id;
-                if (std.mem.eql(u8, base, hex)) {
+                // A chat cast builds in the conversation dir, so its run-dir basename is <conv>, NOT the hex id
+                // (the v27 build-in-place change) — match that first; fall back to the hex for any legacy path.
+                if ((conv.len > 0 and std.mem.eql(u8, base, conv)) or std.mem.eql(u8, base, hex)) {
                     self.cast_rel_len = @min(id.len, self.cast_rel.len);
                     @memcpy(self.cast_rel[0..self.cast_rel_len], id[0..self.cast_rel_len]);
                     self.updateCastRow(.running, 0, -1, "", id);
