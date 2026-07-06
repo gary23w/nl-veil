@@ -335,6 +335,8 @@ pub const Chat = struct {
     mem_scratch: [12288]u8 = undefined, // durable-memory directive stripping (REMEMBER:/FORGET: removed from the answer)
     mem_saved_n: usize = 0, // memories stored on the turn being finalized (set by processMemory, read by appendVeil)
     mem_forgot_n: usize = 0, //   "" forgotten — lets appendVeil confirm a directives-only reply that strips to empty
+    internal_turn: bool = false, // the current turn's `last_user` is a MACHINE directive (merge/nudge), not a real
+    //                              user message — so it must NOT trigger memory consolidation. Cleared in cmdSend.
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -936,6 +938,7 @@ pub const Chat = struct {
         // puts its whole reply in the hidden reasoning channel and emits no CAST line in the content).
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
+        self.internal_turn = false; // this is a REAL user message → its turn may consolidate memory
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
         self.reflect_pass = 0; // fresh iterative self-critique budget for this user turn
@@ -1140,7 +1143,6 @@ pub const Chat = struct {
         var n: usize = 0;
         var it = std.mem.splitScalar(u8, data, '\n');
         while (it.next()) |line| {
-            if (n >= rows.len) break;
             const ln = std.mem.trim(u8, line, " \r\t");
             if (ln.len < 5 or ln[0] != '{') continue;
             var row: store_mod.MemRow = .{};
@@ -1157,8 +1159,15 @@ pub const Chat = struct {
                 @memcpy(row.cat[0..cn], c[0..cn]);
                 row.cat_len = @intCast(cn);
             }
-            rows[n] = row;
-            n += 1;
+            // Keep the NEWEST 128 (memories.jsonl grows by APPEND, so past the cap drop the oldest, not the newest —
+            // else freshly consolidated facts would never load into the Memory tab / YOUR MEMORY injection).
+            if (n < rows.len) {
+                rows[n] = row;
+                n += 1;
+            } else {
+                std.mem.copyForwards(store_mod.MemRow, rows[0 .. rows.len - 1], rows[1..rows.len]);
+                rows[rows.len - 1] = row;
+            }
         }
         self.store.lock();
         defer self.store.unlock();
@@ -1834,8 +1843,10 @@ pub const Chat = struct {
             self.stream.deinit(self.gpa);
             if (saved > 0 or dropped > 0) {
                 var nb: [96]u8 = undefined;
-                const note = if (dropped > 0)
-                    std.fmt.bufPrint(&nb, "(memory consolidated: {d} saved, {d} updated)", .{ saved, dropped }) catch "(memory consolidated)"
+                const note = if (saved > 0 and dropped > 0)
+                    std.fmt.bufPrint(&nb, "(memory: {d} saved, {d} dropped)", .{ saved, dropped }) catch "(memory updated)"
+                else if (dropped > 0)
+                    std.fmt.bufPrint(&nb, "(memory: dropped {d} stale fact{s})", .{ dropped, if (dropped == 1) "" else "s" }) catch "(memory updated)"
                 else
                     std.fmt.bufPrint(&nb, "(remembered {d} durable fact{s})", .{ saved, if (saved == 1) "" else "s" }) catch "(remembered)";
                 self.appendMsg(dd, .cast_note, note);
@@ -1997,6 +2008,7 @@ pub const Chat = struct {
                 self.appendMsg(dd, .cast_note, p);
                 self.last_user_len = @min(p.len, self.last_user.len);
                 @memcpy(self.last_user[0..self.last_user_len], p[0..self.last_user_len]);
+                self.internal_turn = true; // machine directive, not a user message → don't consolidate memory off it
                 self.setStatus("veil working the goal directly...");
                 self.startTurn(dd, .user);
                 return;
@@ -2065,6 +2077,7 @@ pub const Chat = struct {
         if (!MEMORY_CONSOLIDATE or !self.mind().enabled()) return false;
         if (self.abort_turn.load(.monotonic)) return false;
         if (kind != .user and kind != .tool_follow and kind != .reflect) return false; // answer turns only (no self-loop)
+        if (self.internal_turn) return false; // a machine-authored merge/nudge turn is not a user exchange
         if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
         if (full.len == 0 and self.last_user_len == 0) return false;
         // Personal-signal gate: the user is who shares durable facts, so key off THEIR message. Skips "explain X".
@@ -2778,6 +2791,7 @@ pub const Chat = struct {
         self.appendMsg(dd, .cast_note, directive);
         self.last_user_len = @min(directive.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], directive[0..self.last_user_len]);
+        self.internal_turn = true; // the merge directive is machine-authored → its turn must not consolidate memory
         self.tool_iters = 0;
         self.reflect_pass = 0;
         self.reflect_dirty = false;
@@ -2979,9 +2993,9 @@ fn personalFact(fact: []const u8) ?[]const u8 {
             H.has(low, "signing key") or H.has(low, "private key") or H.has(low, "credential") or H.has(low, "access key")) return "key";
         if (H.has(low, "login") or H.has(low, "email") or H.has(low, "username") or H.has(low, "account")) return "login";
     }
-    // Preferences carry their own first-person signal.
+    // Preferences — first-person only (dropped bare "prefer to", which matched "most teams prefer to use postgres").
     if (H.has(low, "i prefer") or H.has(low, "i like") or H.has(low, "i always") or H.has(low, "i use") or
-        H.has(low, "my preference") or H.has(low, "prefer to")) return "preference";
+        H.has(low, "my preference")) return "preference";
     return null; // general knowledge → hive-only (unchanged)
 }
 
@@ -3010,11 +3024,13 @@ fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
 /// quicksort") doesn't spend a model call. Permissive on the personal side, since a missed consolidation is worse
 /// than an occasional NONE-returning call. Case-insensitive substring scan; cheap.
 fn exchangeHasPersonalSignal(user: []const u8) bool {
+    // ONLY unambiguous first-person / explicit-directive markers. Bare 'token'/'secret'/'account'/'email'/'@'/'our '
+    // were dropped — they matched ordinary technical questions ("explain tokenization", "the @ decorator", "four"),
+    // spending a wasted consolidation call. A durable fact the user shares reliably carries one of these instead.
     const sigs = [_][]const u8{
-        "my ",        "i'm",        "i am",   "i use",      "i prefer",  "i like",    "i always",
-        "i work",     "i deploy",   "i run",  "i host",     "i keep",    "we use",    "our ",
-        "remember",   "forget",     "password", "api key",  "apikey",    "secret",    "token",
-        "credential", "login",      "username", "email",    "account",   "prefer",    "@",
+        "my ",       "i'm",      "i am",       "i use",     "i prefer",   "i like",   "i always",
+        "i work",    "i deploy", "i run",      "i host",    "i keep",     "we use",   "we deploy",
+        "remember",  "forget",   "password",   "api key",   "apikey",     "credential",
     };
     for (sigs) |s| {
         if (std.ascii.indexOfIgnoreCase(user, s) != null) return true;
@@ -3509,6 +3525,19 @@ test "personalFact mirrors personal observes but leaves general knowledge hive-o
     try std.testing.expect(personalFact("JWT tokens are signed with a secret") == null);
     try std.testing.expect(personalFact("Postgres listens on port 5432 by default") == null);
     try std.testing.expect(personalFact("OAuth2 uses an access token and a refresh token") == null);
+}
+
+test "exchangeHasPersonalSignal fires on personal facts, not ordinary technical questions" {
+    // personal → consolidation should run
+    try std.testing.expect(exchangeHasPersonalSignal("I always deploy to us-west-2 and I use pnpm"));
+    try std.testing.expect(exchangeHasPersonalSignal("my api key is sk-123"));
+    try std.testing.expect(exchangeHasPersonalSignal("please remember my staging host"));
+    // pure-technical questions must NOT fire (the dropped bare-substring false positives)
+    try std.testing.expect(!exchangeHasPersonalSignal("explain how tokenization works"));
+    try std.testing.expect(!exchangeHasPersonalSignal("what is a secret sharing scheme?"));
+    try std.testing.expect(!exchangeHasPersonalSignal("what does the @ decorator do in Python?"));
+    try std.testing.expect(!exchangeHasPersonalSignal("how many hours are in four days?"));
+    try std.testing.expect(!exchangeHasPersonalSignal("describe an account balance class"));
 }
 
 test "stripDanglingMemoryIntro drops a dangling save-intro but keeps real prose" {
