@@ -187,7 +187,23 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem };
+
+/// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
+/// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.
+/// This is a LOCAL, single-user store — secrets are fine to hold in plaintext here per the user's direction.
+pub const MemRow = struct {
+    cat: [24]u8 = [_]u8{0} ** 24, // one-word category: key / login / preference / fact
+    cat_len: u8 = 0,
+    text: [280]u8 = [_]u8{0} ** 280, // the remembered content
+    text_len: u16 = 0,
+    pub fn catStr(m: *const MemRow) []const u8 {
+        return m.cat[0..m.cat_len];
+    }
+    pub fn textStr(m: *const MemRow) []const u8 {
+        return m.text[0..m.text_len];
+    }
+};
 
 /// A UI→chat-thread command; same copy-by-value ring discipline as Command.
 pub const ChatCommand = struct {
@@ -273,6 +289,10 @@ pub const Store = struct {
     chat_file_content: [1 << 14]u8 = undefined, // up to 16KB of the selected file, for the viewer
     chat_file_content_len: usize = 0,
     chat_file_content_trunc: bool = false,
+    // Chat MEMORY tab — durable things the AI remembers for the user (keys, logins, preferences, facts). The chat
+    // worker publishes these from memories.jsonl; neuron-db holds the same facts for relevance recall into prompts.
+    chat_mem: [128]MemRow = undefined,
+    chat_mem_count: usize = 0,
     // Micro-console (below Swarm activity): two independent shell sessions — "You" (the user drives it) and
     // "Veil" (the AI drives it via RUN:). Each keeps a scrollback ring the chat worker appends command output to.
     console_you: [16384]u8 = undefined,

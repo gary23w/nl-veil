@@ -113,7 +113,25 @@ const SYSTEM_PROMPT =
     "host_explore (drive the host), patch_system + propose_change + simulate_change (modify the engine itself), " ++
     "osint_scan, stage_delivery. Same one-line TOOL: <name> <json> protocol. Reach for the simplest tool that does " ++
     "the job; don't use the powerful ones unless the task truly calls for it.\n" ++
+    "\n" ++
+    "MEMORY — you keep a DURABLE, PRIVATE memory for this user that persists across every conversation. It lives on " ++
+    "THEIR OWN local machine and only they can see it, so it is safe to store secrets here verbatim: API keys, " ++
+    "logins/passwords, tokens, account names, and their preferences, environment details, and recurring facts. When " ++
+    "the user tells you something worth keeping — 'my OpenAI key is sk-...', 'I prefer dark mode', 'my server is at " ++
+    "10.0.0.5', 'remember that...' — SAVE it by writing on its OWN line:\n" ++
+    "REMEMBER: [category] the fact to keep\n" ++
+    "where category is one word: key, login, preference, or fact (e.g. `REMEMBER: [key] OpenAI API key: sk-abc123`). " ++
+    "You may include a REMEMBER: line alongside your normal reply — it is stripped from what the user sees and quietly " ++
+    "stored; a brief 'Saved.' is enough, no fanfare. To drop a stale memory, write on its own line:\n" ++
+    "FORGET: <a few words identifying it>\n" ++
+    "Your current memories are given to you at the top of each turn under 'YOUR MEMORY' — use them to answer directly " ++
+    "(if the user asks 'what's my API key', read it from there, don't cast or claim you can't). Save proactively when " ++
+    "the user shares something durable, but don't nag; never reveal a stored secret to anyone but this user.\n" ++
     "Otherwise reply normally in plain text.";
+
+// The neuron-db scope for the chat's DURABLE cross-conversation memory (keys/logins/preferences/facts). Distinct
+// from the per-conversation convScope: memories saved in one chat are recallable from every chat. See storeMemory.
+const MEMORY_SCOPE = "veil-memory";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
@@ -281,6 +299,9 @@ pub const Chat = struct {
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
     sw_scratch: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
     file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
+    mem_scratch: [12288]u8 = undefined, // durable-memory directive stripping (REMEMBER:/FORGET: removed from the answer)
+    mem_saved_n: usize = 0, // memories stored on the turn being finalized (set by processMemory, read by appendVeil)
+    mem_forgot_n: usize = 0, //   "" forgotten — lets appendVeil confirm a directives-only reply that strips to empty
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -298,6 +319,7 @@ pub const Chat = struct {
         self.loadSettings(dd0);
         self.loadKey(dd0);
         self.refreshConvs(dd0, true);
+        self.refreshMemory(dd0); // publish saved durable memories into the Memory tab at startup
         self.fetchOllamaModels();
 
         var tick: u32 = 0;
@@ -563,6 +585,7 @@ pub const Chat = struct {
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
                 .chat_open_folder => self.cmdChatOpenFolder(dd), // Files tab: open this chat's build folder in the OS
+                .forget_mem => self.forgetMemory(dd, c.textStr()), // Memory tab: delete-button drops one saved memory
             }
         }
     }
@@ -1064,6 +1087,202 @@ pub const Chat = struct {
         _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
+    // ------------------------------------------------------------------------------ durable memory (keys / logins / prefs)
+    // The chat AI keeps facts the user wants remembered across conversations. neuron-db (MEMORY_SCOPE) is the RECALL
+    // engine — observe on save, relevance-recall into prompts; memories.jsonl is the readable mirror the Memory tab
+    // shows + the source we rebuild the "YOUR MEMORY" prompt block from. LOCAL single-user store, so secrets are OK.
+
+    /// Read memories.jsonl → publish rows into Store.chat_mem for the Memory tab. Cheap; on load + after any change.
+    fn refreshMemory(self: *Chat, dd: []const u8) void {
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.chat_mem_count = 0; // no file yet → no memories
+            return;
+        };
+        defer self.gpa.free(data);
+        var rows: [128]store_mod.MemRow = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (n >= rows.len) break;
+            const ln = std.mem.trim(u8, line, " \r\t");
+            if (ln.len < 5 or ln[0] != '{') continue;
+            var row: store_mod.MemRow = .{};
+            if (llm.jsonUnescape(self.gpa, ln, "text")) |tx| {
+                defer self.gpa.free(tx);
+                const tn = @min(tx.len, row.text.len);
+                @memcpy(row.text[0..tn], tx[0..tn]);
+                row.text_len = @intCast(tn);
+            } else continue;
+            if (row.text_len == 0) continue;
+            if (llm.jsonUnescape(self.gpa, ln, "cat")) |c| {
+                defer self.gpa.free(c);
+                const cn = @min(c.len, row.cat.len);
+                @memcpy(row.cat[0..cn], c[0..cn]);
+                row.cat_len = @intCast(cn);
+            }
+            rows[n] = row;
+            n += 1;
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.chat_mem[0..n], rows[0..n]);
+        self.store.chat_mem_count = n;
+    }
+
+    /// Format the current memories as a compact "- [cat] text" list (newest first) up to `buf`, for the "YOUR MEMORY"
+    /// prompt block. Reads the published Store.chat_mem under lock — the small local set is injected in full so the AI
+    /// always has the user's keys/logins/preferences on hand (no relevance gating for such a bounded set).
+    fn memoryBlock(self: *Chat, buf: []u8) []const u8 {
+        self.store.lock();
+        defer self.store.unlock();
+        var w: usize = 0;
+        var i: usize = self.store.chat_mem_count;
+        while (i > 0) {
+            i -= 1;
+            const m = &self.store.chat_mem[i];
+            const cat = m.catStr();
+            const tx = m.textStr();
+            if (w + cat.len + tx.len + 8 > buf.len) break;
+            buf[w] = '-';
+            buf[w + 1] = ' ';
+            w += 2;
+            if (cat.len > 0) {
+                buf[w] = '[';
+                w += 1;
+                @memcpy(buf[w .. w + cat.len], cat);
+                w += cat.len;
+                buf[w] = ']';
+                buf[w + 1] = ' ';
+                w += 2;
+            }
+            @memcpy(buf[w .. w + tx.len], tx);
+            w += tx.len;
+            buf[w] = '\n';
+            w += 1;
+        }
+        return buf[0..w];
+    }
+
+    /// Persist one durable memory: append to memories.jsonl AND observe it into neuron-db. Dedups on exact text.
+    fn storeMemory(self: *Chat, dd: []const u8, cat_in: []const u8, fact_in: []const u8) void {
+        const fact = std.mem.trim(u8, fact_in, " \r\n\t");
+        if (fact.len < 2) return;
+        var cat = std.mem.trim(u8, cat_in, " \r\n\t[]");
+        if (cat.len == 0) cat = "fact";
+        if (cat.len > 20) cat = cat[0..20];
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const existing: ?[]u8 = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch null;
+        defer if (existing) |e| self.gpa.free(e);
+        const ex: []const u8 = existing orelse "";
+        // build the escaped JSON line
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        jb.appendSlice(self.gpa, "{\"cat\":\"") catch return;
+        escJson(&jb, self.gpa, cat);
+        jb.appendSlice(self.gpa, "\",\"text\":\"") catch return;
+        escJson(&jb, self.gpa, fact[0..@min(fact.len, 260)]);
+        jb.appendSlice(self.gpa, "\"}") catch return;
+        if (ex.len > 0 and std.mem.indexOf(u8, ex, jb.items) != null) return; // exact dup → skip
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        if (ex.len > 0) {
+            const trimmed = std.mem.trimEnd(u8, ex, "\r\n");
+            if (trimmed.len > 0) {
+                out.appendSlice(self.gpa, trimmed) catch return;
+                out.append(self.gpa, '\n') catch return;
+            }
+        }
+        out.appendSlice(self.gpa, jb.items) catch return;
+        out.append(self.gpa, '\n') catch return;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.items }) catch return;
+        // neuron-db: observe "cat: fact" under the global memory scope for cross-conversation relevance recall
+        var ob: [340]u8 = undefined;
+        const obs = std.fmt.bufPrint(&ob, "{s}: {s}", .{ cat, fact[0..@min(fact.len, 300)] }) catch fact;
+        self.mind().observe(MEMORY_SCOPE, obs);
+        log.info("chat memory: stored [{s}] ({d}b)", .{ cat, fact.len });
+        self.refreshMemory(dd);
+    }
+
+    /// Drop the durable memory/memories whose text CONTAINS `match`: rewrite memories.jsonl without them + forget
+    /// them from neuron-db. Driven by a FORGET: directive or the Memory tab's delete button (which passes exact text).
+    fn forgetMemory(self: *Chat, dd: []const u8, match_in: []const u8) void {
+        const match = std.mem.trim(u8, match_in, " \r\n\t");
+        if (match.len < 2) return;
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch return;
+        defer self.gpa.free(data);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        var removed = false;
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            const ln = std.mem.trim(u8, line, " \r\t");
+            if (ln.len == 0) continue;
+            var drop = false;
+            if (llm.jsonUnescape(self.gpa, ln, "text")) |tx| {
+                defer self.gpa.free(tx);
+                if (std.ascii.indexOfIgnoreCase(tx, match) != null) drop = true;
+            }
+            if (drop) {
+                removed = true;
+                continue;
+            }
+            out.appendSlice(self.gpa, ln) catch return;
+            out.append(self.gpa, '\n') catch return;
+        }
+        if (!removed) return;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = out.items }) catch return;
+        self.mind().forget(MEMORY_SCOPE, match);
+        log.info("chat memory: forgot match ({d}b)", .{match.len});
+        self.refreshMemory(dd);
+    }
+
+    /// Scan a finalized answer for durable-memory directives (REMEMBER: / FORGET: on their own line), act on each,
+    /// and return the answer with those lines stripped (so they never render). Fast-paths when neither is present.
+    fn processMemory(self: *Chat, dd: []const u8, text: []const u8) []const u8 {
+        self.mem_saved_n = 0; // reset per finalize so appendVeil sees only THIS turn's directive count
+        self.mem_forgot_n = 0;
+        if (std.mem.indexOf(u8, text, "REMEMBER:") == null and std.mem.indexOf(u8, text, "FORGET:") == null) return text;
+        var w: usize = 0;
+        var first = true;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const ln = std.mem.trim(u8, line, " \r\t");
+            if (std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) {
+                const spec = parseRememberBody(std.mem.trim(u8, ln["REMEMBER:".len..], " \t"));
+                if (spec.fact.len >= 2) {
+                    self.storeMemory(dd, spec.cat, spec.fact);
+                    self.mem_saved_n += 1;
+                }
+                continue; // strip
+            }
+            if (std.ascii.startsWithIgnoreCase(ln, "FORGET:")) {
+                const m = std.mem.trim(u8, ln["FORGET:".len..], " \t");
+                if (m.len >= 2) {
+                    self.forgetMemory(dd, m);
+                    self.mem_forgot_n += 1;
+                }
+                continue; // strip
+            }
+            const src = std.mem.trimEnd(u8, line, "\r");
+            if (!first and w < self.mem_scratch.len) {
+                self.mem_scratch[w] = '\n';
+                w += 1;
+            }
+            const cn = @min(src.len, self.mem_scratch.len - w);
+            @memcpy(self.mem_scratch[w .. w + cn], src[0..cn]);
+            w += cn;
+            first = false;
+        }
+        return std.mem.trim(u8, self.mem_scratch[0..w], " \r\n\t");
+    }
+
     pub fn cmdStopCast(self: *Chat, dd: []const u8, rel: []const u8) void {
         if (rel.len == 0) return;
         _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
@@ -1414,6 +1633,19 @@ pub const Chat = struct {
                     msgs.appendSlice(self.gpa, "\"}") catch return;
                     log.info("chat hippocampus: injected {d}b of recalled memory", .{mem.len});
                 }
+            }
+        }
+        // DURABLE MEMORY: the user's saved keys/logins/preferences/facts (from the Memory tab / REMEMBER: directives).
+        // This is a small LOCAL set, so inject it IN FULL (up to a budget) every turn — the AI should always have the
+        // user's own key or preference on hand to answer directly, not have to relevance-recall or cast for it.
+        {
+            var mb2: [3072]u8 = undefined;
+            const block = self.memoryBlock(&mb2);
+            if (block.len > 0) {
+                msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"YOUR MEMORY (durable facts you saved for THIS user on their own local machine — keys, logins, preferences. Use them to answer directly; they are private to this user. Add one with a REMEMBER: line, drop one with FORGET:):\\n") catch return;
+                escJson(&msgs, self.gpa, block);
+                msgs.appendSlice(self.gpa, "\"}") catch return;
+                log.info("chat memory: injected {d}b of durable memory", .{block.len});
             }
         }
         {
@@ -1861,8 +2093,24 @@ pub const Chat = struct {
         // Never let a raw TOOL:/RUN:/<tool:> call (esp. write_file{"content":<whole file>}) leak into the chat as
         // visible text — that only happens when a reflect/collect turn re-emits a tool call it can't run; strip it
         // so only the prose survives (the call itself runs in the tool loop + shows as a chip, or is dropped).
-        const text = stripToolTail(text_raw);
-        if (text.len == 0 and reasoning.len == 0) return; // nothing left to show
+        // Then act on + strip any durable-memory directives (REMEMBER:/FORGET:) so they persist but never render.
+        const text = self.processMemory(dd, stripToolTail(text_raw));
+        if (text.len == 0 and reasoning.len == 0) {
+            // The whole reply was memory directives (nothing left to render). Don't go silent — confirm the save so
+            // the user gets feedback that their key/preference landed (it's in the Memory tab now).
+            if (self.mem_saved_n > 0 or self.mem_forgot_n > 0) {
+                const note: []const u8 = if (self.mem_saved_n > 0 and self.mem_forgot_n > 0)
+                    "Updated your memory."
+                else if (self.mem_saved_n == 1)
+                    "Saved that to memory."
+                else if (self.mem_saved_n > 1)
+                    "Saved those to memory."
+                else
+                    "Removed that from memory.";
+                self.appendMsg(dd, .veil, note);
+            }
+            return; // nothing left to show
+        }
         if (reasoning.len == 0) {
             self.appendMsg(dd, .veil, text);
             return;
@@ -2597,6 +2845,21 @@ fn reflectChanged(prior: []const u8, revised: []const u8) bool {
     return !std.mem.eql(u8, a[0..n], b[0..n]);
 }
 
+/// Parse the body of a `REMEMBER:` directive into (category, fact). An optional leading `[category]` picks the
+/// bucket (key/login/preference/fact); without it the whole body is a plain `fact`. Pure — unit-tested.
+const RememberSpec = struct { cat: []const u8, fact: []const u8 };
+fn parseRememberBody(body_in: []const u8) RememberSpec {
+    const body = std.mem.trim(u8, body_in, " \t");
+    if (body.len > 0 and body[0] == '[') {
+        if (std.mem.indexOfScalar(u8, body, ']')) |cb| {
+            const cat = std.mem.trim(u8, body[1..cb], " \t");
+            const fact = std.mem.trim(u8, body[cb + 1 ..], " \t");
+            return .{ .cat = if (cat.len > 0) cat else "fact", .fact = fact };
+        }
+    }
+    return .{ .cat = "fact", .fact = body };
+}
+
 /// Should we run the self-check (reflect) pass for this completed turn? Only a SUBSTANTIVE answer to a
 /// SUBSTANTIVE request qualifies — a greeting or a one-liner must NOT recurse ("hello" -> short reply -> no
 /// second pass). This mirrors how Claude Code iterates on real TASKS, not on chit-chat. Control lines
@@ -3036,6 +3299,24 @@ test "stripToolTail removes a tool call (incl. mid-line) but keeps prose + prose
     try std.testing.expectEqualStrings("use the TOOL: menu to pick one", stripToolTail("use the TOOL: menu to pick one"));
     // a plain answer is untouched
     try std.testing.expectEqualStrings("just a normal answer", stripToolTail("just a normal answer"));
+}
+
+test "parseRememberBody splits [category] from the fact" {
+    const a = parseRememberBody("[key] OpenAI API key: sk-abc123");
+    try std.testing.expectEqualStrings("key", a.cat);
+    try std.testing.expectEqualStrings("OpenAI API key: sk-abc123", a.fact);
+    // no category -> everything is a plain fact
+    const b = parseRememberBody("the server is at 10.0.0.5");
+    try std.testing.expectEqualStrings("fact", b.cat);
+    try std.testing.expectEqualStrings("the server is at 10.0.0.5", b.fact);
+    // spaces inside the bracket + around it are trimmed
+    const c = parseRememberBody("  [ preference ]  dark mode ");
+    try std.testing.expectEqualStrings("preference", c.cat);
+    try std.testing.expectEqualStrings("dark mode", c.fact);
+    // empty bracket falls back to fact
+    const d = parseRememberBody("[] just this");
+    try std.testing.expectEqualStrings("fact", d.cat);
+    try std.testing.expectEqualStrings("just this", d.fact);
 }
 
 test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)" {
