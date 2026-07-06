@@ -210,6 +210,12 @@ pub fn main(init: std.process.Init) !void {
         // is localhost (desktop netcli already sends Connection: close; the web UI reconnects), so the extra
         // handshake per request is free.
         .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1 },
+        // httpz here runs the BLOCKING worker model (thread-per-request); a cast/deploy handler holds its pool
+        // thread for the whole synchronous spawn. The 32-thread default starves under a burst of concurrent
+        // casts (each also leaving a live worker behind) — new casts then hang + return curl 000. Give admission
+        // real headroom so a handful of slow spawns can't wedge the pool. (The worker-CPU amplifier is bounded
+        // separately by the live-swarm cap in deployCore + the worker's unreachable-LLM backoff.)
+        .thread_pool = .{ .count = 128 },
     }, &app);
     defer {
         server.stop();

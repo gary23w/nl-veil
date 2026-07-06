@@ -1339,6 +1339,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live) {
             if (any_llm_fatal or !any_llm_ok) {
                 w.api_fail_streak += 1;
+                // A live round where NO mind got a completion = the provider is unreachable/erroring. With no
+                // pause the loop retries INSTANTLY, free-spinning a CPU core through every failure round until
+                // the failsafe trips; many such workers together saturate the box and starve the server's httpz
+                // thread pool (new casts then hang at the 15s timeout). Back off (escalating, capped) so a dead
+                // endpoint can't peg a core — the failsafe below still halts the run after API_FAIL_MAX rounds.
+                const backoff_ms: u64 = @min(@as(u64, 700) * w.api_fail_streak, 5000);
+                io.sleep(.{ .nanoseconds = backoff_ms * std.time.ns_per_ms }, .awake) catch {};
             } else {
                 w.api_fail_streak = 0;
             }
