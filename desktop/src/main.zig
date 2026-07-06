@@ -34,6 +34,7 @@ const InnerTab = enum { console, details, files };
 const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model };
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
+const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -58,6 +59,12 @@ const Ui = struct {
     chat_follow: bool = true,
     chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
+    right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
+    mem_scroll: f32 = 0, // scroll offset for the Memory tab list
+    sel_msg: ?usize = null, // chat text selection: which message (null = none), and the [anchor,cursor) flat range
+    sel_anchor: usize = 0,
+    sel_cursor: usize = 0,
+    sel_dragging: bool = false,
     // Settings: chat model provider fields
     s_model: Field = .{},
     s_url: Field = .{},
@@ -319,6 +326,10 @@ pub fn main() !void {
                                 const tv: ?Tab =
                                     if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "deploy")) .deploy else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                 if (tv) |v| setTab(v);
+                            } else if (std.mem.startsWith(u8, cmd, "right ")) {
+                                // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
+                                const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
+                                if (std.mem.eql(u8, rn, "memory")) ui.right_tab = .memory else if (std.mem.eql(u8, rn, "activity")) ui.right_tab = .activity;
                             }
                             log.info("SIM.txt control command: {s}", .{cmd});
                         } else {
@@ -801,7 +812,11 @@ fn handleKeys(store: *Store) void {
         const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         if (ctrl and rl.isKeyPressed(.c)) {
-            if (shift) {
+            if (ui.tab == .chat and ui.chat_inner == .chat and sel_text_len > 0) {
+                // an active drag-selection takes precedence over the copy-last-answer shortcut
+                copyToClipboard(sel_text[0..sel_text_len]);
+                markCopied();
+            } else if (shift) {
                 copyConversation(store);
             } else {
                 var last: ?store_mod.ChatMsg = null;
@@ -1611,9 +1626,13 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
         var i: usize = 0;
         while (true) {
             const end = @min(seg.len, i + cols);
-            if (draw and inView(view, yy, MSG_LINE_H)) {
-                t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
-                t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
+            if (draw) {
+                const shown = inView(view, yy, MSG_LINE_H);
+                if (shown) {
+                    t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
+                    t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
+                }
+                captureSelLine(shown, yy, view.x + 16, fsz, true, seg[i..end]);
             }
             i = end;
             if (i >= seg.len) break;
@@ -1647,7 +1666,11 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
         cand[cl] = 0;
         const cw: f32 = @floatFromInt(t.measure(cand[0..cl :0], fsz));
         if (ll > 0 and cw > max_w) {
-            if (draw and inView(view, yy, MSG_LINE_H)) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+            if (draw) {
+                const shown = inView(view, yy, MSG_LINE_H);
+                if (shown) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+                captureSelLine(shown, yy, x0, fsz, false, line_buf[0..ll]);
+            }
             yy += MSG_LINE_H;
             rows += 1;
             @memcpy(line_buf[0..wl], word[0..wl]);
@@ -1658,7 +1681,11 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
         }
     }
     if (ll > 0) {
-        if (draw and inView(view, yy, MSG_LINE_H)) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+        if (draw) {
+            const shown = inView(view, yy, MSG_LINE_H);
+            if (shown) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
+            captureSelLine(shown, yy, x0, fsz, false, line_buf[0..ll]);
+        }
         yy += MSG_LINE_H;
         rows += 1;
     }
@@ -1749,6 +1776,125 @@ fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
     return hot and rl.isMouseButtonPressed(.left);
 }
 
+// ---- chat text selection: drag-select over the DISPLAYED glyphs + Ctrl+C copies the selection ----
+// Each frame the message draw loop captures the geometry of every visible text line into sel_lines; a selection
+// is a (message, [anchor,cursor) flat-char range) over that message's folded display text. Highlight is drawn
+// translucent over the glyphs; the selected text is cached in sel_text for Ctrl+C.
+// bytes sized to the draw-path fold cap (theme.nextBuf is [2048]) so a captured line never truncates the glyphs
+// that were actually drawn — otherwise a >400-char wrapped line on a wide window would be partly uncopyable.
+const SelLine = struct { msg: usize, char0: usize, y: f32, x0: f32, size: i32, mono: bool, drawn: bool = false, bytes: [2048]u8 = undefined, len: usize = 0 };
+var sel_lines: [1400]SelLine = undefined;
+var sel_line_n: usize = 0;
+var cur_sel_msg: usize = std.math.maxInt(usize); // the message index currently being drawn (max = don't capture)
+var cur_sel_char0: usize = 0; // running flat offset within the current message (in folded/display bytes)
+var sel_text: [1 << 14]u8 = undefined; // the selected text, cached each frame for Ctrl+C
+var sel_text_len: usize = 0;
+
+fn captureSelLine(drawn: bool, y: f32, x0: f32, size: i32, mono: bool, raw: []const u8) void {
+    if (cur_sel_msg == std.math.maxInt(usize)) return;
+    var fb: [2048]u8 = undefined;
+    const fl = t.foldAscii(&fb, raw); // capture what's ON SCREEN (folded), so measure + copy match the glyphs
+    // Store on-screen lines (for hit-test + highlight) AND every line of the SELECTED message even when scrolled
+    // out of view — so Ctrl+C copies the whole selection, not just the visible slice. `drawn` gates the highlight.
+    const is_sel = if (ui.sel_msg) |sm| cur_sel_msg == sm else false;
+    if ((drawn or is_sel) and sel_line_n < sel_lines.len) {
+        const g = &sel_lines[sel_line_n];
+        g.msg = cur_sel_msg;
+        g.char0 = cur_sel_char0;
+        g.y = y;
+        g.x0 = x0;
+        g.size = size;
+        g.mono = mono;
+        g.drawn = drawn;
+        @memcpy(g.bytes[0..fl], fb[0..fl]);
+        g.len = fl;
+        sel_line_n += 1;
+    }
+    cur_sel_char0 += fl + 1; // advance for EVERY line (incl. culled) so offsets stay stable across scroll
+}
+
+fn selPrefixPx(g: *const SelLine, c: usize) f32 {
+    const n = @min(c, g.len);
+    if (n == 0) return 0;
+    var b: [2049]u8 = undefined;
+    @memcpy(b[0..n], g.bytes[0..n]);
+    b[n] = 0;
+    return @floatFromInt(if (g.mono) t.measureMono(b[0..n :0], g.size) else t.measure(b[0..n :0], g.size));
+}
+
+fn selColAt(g: *const SelLine, mx: f32) usize {
+    const target = mx - g.x0;
+    if (target <= 0) return 0;
+    var lo: usize = 0;
+    var hi: usize = g.len;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) / 2;
+        if (selPrefixPx(g, mid) <= target) lo = mid else hi = mid - 1;
+    }
+    return lo;
+}
+
+const SelHit = struct { msg: usize, flat: usize };
+fn selHit(mx: f32, my: f32) ?SelHit {
+    var best: ?usize = null;
+    var bestdy: f32 = 1e9;
+    var i: usize = 0;
+    while (i < sel_line_n) : (i += 1) {
+        const g = &sel_lines[i];
+        if (!g.drawn) continue; // off-screen lines of the selected msg live in sel_lines for copy, not hit-testing
+        if (my >= g.y - 2 and my <= g.y + MSG_LINE_H) return .{ .msg = g.msg, .flat = g.char0 + selColAt(g, mx) };
+        const dy = @abs(my - (g.y + MSG_LINE_H / 2));
+        if (dy < bestdy) {
+            bestdy = dy;
+            best = i;
+        }
+    }
+    // Nearest-line fallback ONLY within a line's height of some prose — else a click in the empty area below the
+    // last message returns null so the caller's `else` branch can clear the selection (click-to-deselect).
+    if (best) |bi| {
+        if (bestdy <= MSG_LINE_H) {
+            const g = &sel_lines[bi];
+            return .{ .msg = g.msg, .flat = g.char0 + selColAt(g, mx) };
+        }
+    }
+    return null;
+}
+
+/// Draw the selection highlight over the captured glyphs + cache the selected text for Ctrl+C. Call after the
+/// message draw loop (geometry captured), inside the chat scissor.
+fn drawSelection() void {
+    sel_text_len = 0;
+    const sm = ui.sel_msg orelse return;
+    const lo = @min(ui.sel_anchor, ui.sel_cursor);
+    const hi = @max(ui.sel_anchor, ui.sel_cursor);
+    if (hi <= lo) return;
+    var i: usize = 0;
+    while (i < sel_line_n) : (i += 1) {
+        const g = &sel_lines[i];
+        if (g.msg != sm) continue;
+        const ls = g.char0;
+        const le = g.char0 + g.len;
+        if (hi <= ls or lo >= le) continue; // >= : a selection anchored exactly at end-of-line adds no leading \n
+        const a = if (lo > ls) lo - ls else 0;
+        const b = if (hi < le) hi - ls else g.len;
+        if (b > a) {
+            if (g.drawn) { // highlight only what's on screen; copy (below) still grabs scrolled-off lines
+                const xa = g.x0 + selPrefixPx(g, a);
+                const xb = g.x0 + selPrefixPx(g, b);
+                t.fillRect(@intFromFloat(xa), @intFromFloat(g.y - 1), @intFromFloat(@max(3, xb - xa)), g.size + 4, t.withAlpha(t.blue, 80));
+            }
+            if (sel_text_len + (b - a) < sel_text.len) {
+                @memcpy(sel_text[sel_text_len..][0 .. b - a], g.bytes[a..b]);
+                sel_text_len += b - a;
+            }
+        }
+        if (hi > le and sel_text_len < sel_text.len) {
+            sel_text[sel_text_len] = '\n';
+            sel_text_len += 1;
+        }
+    }
+}
+
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
     const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
     const status_h: f32 = 20;
@@ -1776,6 +1922,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     var fp: u64 = 0;
     for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
     fp +%= @as(u64, ui.tool_open orelse 0xffff) << 40; // expand/collapse changes a tool message's height
+    // message set / wrap width changed → drop a stale selection — but NOT mid-drag, or a background message commit
+    // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
+    if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
     if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
         for (msgs, 0..) |*m, i| {
             ui.mh[i] = if (toolName(m.textStr()) != null and ui.tool_open != i)
@@ -1804,12 +1953,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
 
     rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
+    sel_line_n = 0; // rebuild this frame's selection line-geometry as we draw
     var yy: f32 = view.y + 8 - ui.chat_scroll;
     const vtop = view.y;
     const vbot = view.y + view.height;
     for (msgs, 0..) |*m, i| {
         const y0 = yy;
         yy = y0 + ui.mh[i]; // cached height (draw + measure share layout, so this matches renderMsg's advance)
+        cur_sel_msg = std.math.maxInt(usize); // default: don't capture (tool chips etc. aren't selectable prose)
         // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
@@ -1827,6 +1978,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             }
             continue;
         }
+        cur_sel_msg = i; // capture THIS message's text-line geometry for selection
+        cur_sel_char0 = 0;
         _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
@@ -1837,6 +1990,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             }
         }
     }
+    cur_sel_msg = std.math.maxInt(usize); // the streaming/cast-live rows change every frame — not selectable
     if (busy or stream.len > 0) {
         yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
     }
@@ -1844,6 +1998,26 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (msgs.len == 0 and !busy and stream.len == 0) {
         t.text(t.z("talk to the veil - it casts the hive when a task needs real work", .{}), @intFromFloat(view.x + 14), @intFromFloat(view.y + 14), 13, t.comment);
     }
+    // TEXT SELECTION: drag over the message text to select; the highlight + cached copy text are computed from the
+    // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
+    // copies sel_text. Gated on hovering the chat view + not on a tool/copy chip row.
+    const mp = rl.getMousePosition();
+    if (t.hovering(view) and rl.isMouseButtonPressed(.left)) {
+        if (selHit(mp.x, mp.y)) |h| {
+            ui.sel_msg = h.msg;
+            ui.sel_anchor = h.flat;
+            ui.sel_cursor = h.flat;
+            ui.sel_dragging = true;
+        } else ui.sel_msg = null;
+    }
+    if (ui.sel_dragging) {
+        if (rl.isMouseButtonDown(.left)) {
+            if (selHit(mp.x, mp.y)) |h| {
+                if (ui.sel_msg == h.msg) ui.sel_cursor = h.flat;
+            }
+        } else ui.sel_dragging = false;
+    }
+    drawSelection();
     rl.endScissorMode();
 
     // status line
@@ -2031,6 +2205,99 @@ fn castStatusWord(st: store_mod.CastStatus) [:0]const u8 {
     };
 }
 
+// a stable colour per memory category so the chips read at a glance
+fn memCatColor(cat: []const u8) t.Color {
+    if (std.mem.eql(u8, cat, "key")) return t.red;
+    if (std.mem.eql(u8, cat, "login")) return t.yellow;
+    if (std.mem.eql(u8, cat, "preference")) return t.cyan;
+    return t.blue;
+}
+// proportional-font char budget per wrapped line (slightly conservative so a chunk never over-runs maxw)
+fn memColsPerLine(size: i32, maxw: f32) usize {
+    const cw = @as(f32, @floatFromInt(size)) * 0.62;
+    return @max(6, @as(usize, @intFromFloat(@max(1, maxw / cw))));
+}
+fn memLineCount(text_len: usize, size: i32, maxw: f32) usize {
+    const cpl = memColsPerLine(size, maxw);
+    return @max(1, @min(6, (text_len + cpl - 1) / cpl));
+}
+// draw `text` char-wrapped (handles long unbroken tokens like API keys) up to 6 lines; returns lines drawn
+fn drawMemText(text: []const u8, x: f32, y0: f32, size: i32, color: t.Color, maxw: f32) usize {
+    const cpl = memColsPerLine(size, maxw);
+    var off: usize = 0;
+    var line: usize = 0;
+    var y = y0;
+    while (off < text.len and line < 6) {
+        const end = @min(off + cpl, text.len);
+        t.textClip(text[off..end], @intFromFloat(x), @intFromFloat(y), size, color, @intFromFloat(maxw));
+        off = end;
+        y += 16;
+        line += 1;
+    }
+    return @max(1, line);
+}
+
+/// The Memory tab: the durable facts the chat AI keeps for the user (keys, logins, preferences). Each is a card
+/// showing its category chip + the stored text (fully wrapped so a long key is readable) + an × to forget it.
+/// The AI writes these via REMEMBER: (stored to neuron-db + memories.jsonl); this is the human-facing view.
+fn drawChatMemory(store: *Store, r: t.Rect) void {
+    var rows: [128]store_mod.MemRow = undefined;
+    var n: usize = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        n = @min(store.chat_mem_count, rows.len);
+        @memcpy(rows[0..n], store.chat_mem[0..n]);
+    }
+    var yy0: f32 = r.y + 36;
+    t.textClip("keys, logins & preferences the veil keeps for you", @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
+    yy0 += 15;
+    t.textClip(t.z("{d} saved  -  private to this machine", .{n}), @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
+    yy0 += 22;
+    if (n == 0) {
+        t.text(t.z("nothing saved yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy0 + 6), 12, t.fg_dim);
+        t.textClip("tell the veil something to keep -", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 30), 11, t.comment, @intFromFloat(r.width - 20));
+        t.textClip("\"my openai key is sk-...\", a login,", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 46), 11, t.comment, @intFromFloat(r.width - 20));
+        t.textClip("or a preference - and it lands here.", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 62), 11, t.comment, @intFromFloat(r.width - 20));
+        return;
+    }
+    const view = t.Rect{ .x = r.x + 1, .y = yy0, .width = r.width - 2, .height = r.y + r.height - yy0 - 6 };
+    const txtw = view.width - 16 - 24; // card padding + the delete button gutter
+    // total height for scroll clamping
+    var total: f32 = 4;
+    {
+        var i: usize = 0;
+        while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 10;
+    }
+    const max_scroll = if (total > view.height) total - view.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.mem_scroll -= wheel * 3 * 18;
+    if (ui.mem_scroll < 0) ui.mem_scroll = 0;
+    if (ui.mem_scroll > max_scroll) ui.mem_scroll = max_scroll;
+
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    var forget_idx: ?usize = null; // capture a delete click; act after the draw loop (don't mutate mid-draw)
+    var y: f32 = view.y - ui.mem_scroll;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const m = &rows[i];
+        const lines = memLineCount(m.text_len, 12, txtw);
+        const card_h = 24 + @as(f32, @floatFromInt(lines)) * 16 + 6;
+        if (y + card_h >= view.y and y <= view.y + view.height) {
+            const card = t.Rect{ .x = view.x + 4, .y = y + 2, .width = view.width - 8, .height = card_h - 4 };
+            t.panelBordered(card, t.bg, t.border);
+            const cat = m.catStr();
+            t.text(t.z("[{s}]", .{if (cat.len > 0) cat else "fact"}), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, memCatColor(cat));
+            const del = t.Rect{ .x = card.x + card.width - 24, .y = card.y + 4, .width = 20, .height = 18 };
+            if (t.button(del, t.z("x", .{}), t.red, true)) forget_idx = i;
+            _ = drawMemText(m.textStr(), card.x + 8, card.y + 24, 12, t.fg, txtw);
+        }
+        y += card_h;
+    }
+    if (forget_idx) |fi| store.pushChatCmd(store_mod.mkChatCmd(.forget_mem, "", rows[fi].textStr()));
+}
+
 fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
@@ -2040,8 +2307,14 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
         if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z("<", .{}), false)) togglePane(store, false);
         return;
     }
-    t.text(t.z("Swarm activity", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 10), 14, t.fg);
+    // collapse chevron + the "Swarm activity | Memory" tab strip (Memory = durable keys/logins/prefs the AI keeps)
     if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z(">", .{}), false)) togglePane(store, false);
+    if (t.tab(.{ .x = r.x + 8, .y = r.y + 6, .width = 106, .height = 22 }, t.z("Swarm activity", .{}), ui.right_tab == .activity)) ui.right_tab = .activity;
+    if (t.tab(.{ .x = r.x + 118, .y = r.y + 6, .width = 66, .height = 22 }, t.z("Memory", .{}), ui.right_tab == .memory)) ui.right_tab = .memory;
+    if (ui.right_tab == .memory) {
+        drawChatMemory(store, r);
+        return;
+    }
 
     var yy: f32 = r.y + 36;
 

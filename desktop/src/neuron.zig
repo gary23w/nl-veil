@@ -65,6 +65,14 @@ pub const Db = struct {
         if (self.run(&.{ "reinforce", scope, t[0..@min(t.len, 200)], f })) |o| self.gpa.free(o);
     }
 
+    /// Drop the facts under `scope` that contain `match` (substring). Used to delete one durable memory when the
+    /// user (or the AI, via FORGET:) retires a stale key/preference. No-op on any failure or empty match.
+    pub fn forget(self: Db, scope: []const u8, match: []const u8) void {
+        const m = std.mem.trim(u8, match, " \r\n\t");
+        if (m.len < 3) return; // never pass an empty match — that would wipe the whole scope
+        if (self.run(&.{ "forget", scope, m[0..@min(m.len, 120)] })) |o| self.gpa.free(o);
+    }
+
     /// Relational multi-hop CHAIN traversal (reasoning → chain): walk `start` --relation--> … over the fact
     /// graph, recalling at each hop. Deterministic, no model round-trip — how a caller reasons over a
     /// causal/dependency chain instead of re-deriving it. Returns the endpoint value into `out`; empty on a break.
