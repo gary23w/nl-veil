@@ -142,10 +142,12 @@ const LOOP_SYSTEM =
     "When the goal is fully achieved (the assistant has delivered what was asked, verified where possible, and no " ++
     "further step would add value), output EXACTLY the single word: DONE";
 
-// Recursive-thought (reflect) loop: one extra self-check pass — but ONLY for substantive answers to
-// substantive requests, never for chit-chat (a "hello" must not recurse). REFLECT_MIN_ANSWER is the answer
-// length below which an answer is considered trivial and skips the pass.
-const REFLECT_PASSES: u8 = 1;
+// Recursive-thought (reflect) loop: ITERATIVE self-critique — keep re-reviewing the draft while each pass still
+// meaningfully changes it (that's how a careful reasoner converges: critique → fix → re-critique → … until it's
+// stable), capped so it always terminates. ONLY for substantive answers to substantive requests, never chit-chat
+// (a "hello" must not recurse). REFLECT_MIN_ANSWER is the answer length below which an answer is trivial + skips.
+const REFLECT_PASSES: u8 = 1; // >0 enables the loop; the depth is bounded by REFLECT_MAX_PASSES
+const REFLECT_MAX_PASSES: u8 = 3; // hard ceiling on self-check iterations (each is one model call)
 const REFLECT_MIN_ANSWER: usize = 500;
 
 // ---- micro-console (dual-tab shell) ---------------------------------------------------------------------
@@ -228,8 +230,10 @@ pub const Chat = struct {
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
     build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
-    reflect_draft: [12288]u8 = undefined, // first-pass draft used by the one-step reflect turn
+    reflect_draft: [12288]u8 = undefined, // the current draft being iteratively self-critiqued
     reflect_draft_len: usize = 0,
+    reflect_pass: u8 = 0, // how many self-check iterations have run for this answer (bounded by REFLECT_MAX_PASSES)
+    reflect_dirty: bool = false, // did ANY self-check pass change the draft (so the final differs from the first)?
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -826,6 +830,8 @@ pub const Chat = struct {
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        self.reflect_pass = 0; // fresh iterative self-critique budget for this user turn
+        self.reflect_dirty = false;
         self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
@@ -1321,7 +1327,7 @@ pub const Chat = struct {
             msgs.appendSlice(self.gpa, ",{\"role\":\"assistant\",\"content\":\"") catch return;
             escJson(&msgs, self.gpa, self.reflect_draft[0..self.reflect_draft_len]);
             msgs.appendSlice(self.gpa, "\"}") catch return;
-            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Quick self-check pass: revise the draft for correctness and completeness. Keep the same intent, fix mistakes, and return only the final answer text. Do not emit TOOL: or CAST:.\"}") catch return;
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Self-critique pass. Review the draft above as if it were someone else's work you must catch mistakes in: check the logic and facts for errors, look for missing steps, unstated assumptions, unhandled edge cases, and unclear structure. If a claim is uncertain, hedge it or note it. Fix everything you find and make it sharper. If the draft is ALREADY correct and complete, return it exactly unchanged. Return ONLY the final answer text — no meta-commentary, no 'here is the revision', no TOOL: or CAST:.\"}") catch return;
         }
         if (kind == .collect) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. Using the [cast] findings above, give the user a direct, complete answer to their original request. Do not cast again.\"}") catch return;
@@ -1476,6 +1482,8 @@ pub const Chat = struct {
             var reason_fb: [1200]u8 = undefined;
             const rn = @min(reason.len, reason_fb.len);
             @memcpy(reason_fb[0..rn], reason[0..rn]);
+            self.reflect_pass = 0; // fresh iterative-critique budget for this answer
+            self.reflect_dirty = false; // no pass has changed anything yet
             self.reflect_draft_len = @min(full.len, self.reflect_draft.len);
             @memcpy(self.reflect_draft[0..self.reflect_draft_len], full[0..self.reflect_draft_len]);
             self.stream.deinit(self.gpa);
@@ -1490,16 +1498,50 @@ pub const Chat = struct {
             return;
         }
         if (kind == .reflect) {
-            self.reflect_draft_len = 0;
-            if (full.len > 0) {
+            const revised = if (full.len > 0) full else reason; // the critiqued result (slice into the stream)
+            const prior = self.reflect_draft[0..self.reflect_draft_len];
+            const changed = revised.len > 0 and reflectChanged(prior, revised);
+            if (changed) self.reflect_dirty = true; // remember that SOME pass improved the answer (cumulative)
+            self.reflect_pass += 1;
+            if (changed and self.reflect_pass < REFLECT_MAX_PASSES) {
+                // ITERATIVE self-critique: the pass still improved the answer, so feed the improved text back for
+                // ANOTHER critique — recursive refinement that CONVERGES (critique → fix → re-critique …) the way
+                // a careful reasoner works, instead of a single shot. Copy it out BEFORE we free the stream.
+                const rn2 = @min(revised.len, self.reflect_draft.len);
+                @memcpy(self.reflect_draft[0..rn2], revised[0..rn2]);
+                self.reflect_draft_len = rn2;
+                self.stream.deinit(self.gpa);
+                var sb2: [72]u8 = undefined;
+                self.setStatus(std.fmt.bufPrint(&sb2, "self-checking (pass {d} of up to {d})...", .{ self.reflect_pass + 1, REFLECT_MAX_PASSES }) catch "self-checking...");
+                self.startTurn(dd, .reflect);
+                if (self.turn == .reflect) return; // another critique pass is live; it settles later
+                // couldn't start another pass → show the best draft we have + stop
+                self.appendVeil(dd, "", self.reflect_draft[0..self.reflect_draft_len]);
+                self.reflect_draft_len = 0;
+                self.reflect_pass = 0;
+                self.setBusy(false);
+                return;
+            }
+            // stabilized (the answer stopped changing) or hit the cap → finalize (falls through to the settle).
+            // Use the CUMULATIVE dirty flag, not just this pass: if an earlier pass revised the draft and the
+            // last pass merely confirmed it, the final answer STILL differs from the first draft, so we must show
+            // that final answer (never leave the user seeing only the superseded original). `revised` is the last
+            // pass's output (slice into the stream, valid until the settle frees it below); fall back to the
+            // carried draft if this pass returned empty content.
+            const dirty = self.reflect_dirty;
+            const final_ans = if (revised.len > 0) revised else self.reflect_draft[0..self.reflect_draft_len];
+            log.info("reflect finalize: pass={d} dirty={} changed={} final_len={d}", .{ self.reflect_pass, dirty, changed, final_ans.len });
+            if (dirty) {
                 self.appendMsg(dd, .cast_note, "revised after self-check:");
-                self.appendVeil(dd, reason, full);
-            } else if (reason.len > 0) {
-                self.appendMsg(dd, .cast_note, "revised after self-check:");
-                self.appendMsg(dd, .veil, reason);
+                self.appendVeil(dd, reason, final_ans);
+            } else if (final_ans.len > 0) {
+                self.appendMsg(dd, .cast_note, "self-check confirmed the answer above — no changes needed.");
             } else {
                 self.appendMsg(dd, .cast_note, "self-check found nothing to change — the draft above stands.");
             }
+            self.reflect_draft_len = 0;
+            self.reflect_pass = 0;
+            self.reflect_dirty = false;
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (parseCastSpec(full)) |spec| {
@@ -1533,7 +1575,7 @@ pub const Chat = struct {
         // recalled for it proved useful — reinforce that topic so it out-ranks the alternatives in later
         // trust-weighted recall. The chat's hippocampus now LEARNS from engagement instead of only accumulating;
         // paired with the trust-weighted recall() this closes the perception→learning→belief loop. No-op on fail.
-        if ((kind == .user or kind == .collect) and full.len > 0 and self.last_user_len > 3 and self.mind().enabled()) {
+        if ((kind == .user or kind == .collect or kind == .reflect) and full.len > 0 and self.last_user_len > 3 and self.mind().enabled()) {
             var scope_buf: [40]u8 = undefined;
             const scope = self.convScope(&scope_buf);
             if (scope.len > 0) self.mind().reinforce(scope, self.last_user[0..self.last_user_len], "answered");
@@ -1617,6 +1659,9 @@ pub const Chat = struct {
             self.store.chat_loop = false;
         }
         self.loop_iter = 0;
+        self.reflect_pass = 0; // abandon any pending self-critique iteration
+        self.reflect_dirty = false;
+        self.reflect_draft_len = 0;
         if (self.turn != .idle) {
             llm.abort(&self.stream, self.io);
             self.stream.deinit(self.gpa);
@@ -2199,6 +2244,19 @@ pub fn parseCastSpec(full: []const u8) ?CastSpec {
         }
     }
     return spec;
+}
+
+/// Did a self-critique pass meaningfully change the draft? Used to decide whether to iterate again: while the
+/// answer keeps changing we keep refining; once it stabilizes (near-identical revision) we stop. Heuristic:
+/// a >~4% length shift, or a differing sampled prefix, counts as changed.
+fn reflectChanged(prior: []const u8, revised: []const u8) bool {
+    const a = std.mem.trim(u8, prior, " \r\n\t");
+    const b = std.mem.trim(u8, revised, " \r\n\t");
+    if (a.len == 0) return true;
+    const dlen = if (a.len > b.len) a.len - b.len else b.len - a.len;
+    if (dlen * 25 > a.len) return true; // length shifted more than ~4%
+    const n = @min(@min(a.len, b.len), 240); // cheap proxy for "the wording changed"
+    return !std.mem.eql(u8, a[0..n], b[0..n]);
 }
 
 /// Should we run the self-check (reflect) pass for this completed turn? Only a SUBSTANTIVE answer to a
