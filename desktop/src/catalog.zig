@@ -3,6 +3,7 @@
 //! works with zero external files; the field names + values match the server's DeployReq exactly.
 
 const std = @import("std");
+const log = @import("log.zig");
 
 pub const Model = struct { id: []const u8, label: []const u8 };
 pub const Provider = struct {
@@ -19,6 +20,7 @@ pub const Provider = struct {
 /// substitute the account id into `out` and return that slice; with no account id, return the "cloudflare"
 /// sentinel so the server falls back to its own included/env credentials. Non-templated URLs pass through.
 pub fn resolveBase(p: *const Provider, account: []const u8, out: []u8) []const u8 {
+    log.trace("catalog.resolveBase provider={s} has_account={}", .{ p.key, account.len > 0 });
     const marker = "{account}";
     const at = std.mem.indexOf(u8, p.base_url, marker) orelse return p.base_url;
     const acct = std.mem.trim(u8, account, " \t\r\n");

@@ -1364,9 +1364,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             }
         }
 
-        if (w.drainControl(&goal)) break;
-        if (w.stopRequested()) break;
-        if (m.minutes > 0 and (w.nowSecs() - start) >= @as(i64, m.minutes) * 60) break;
+        if (w.drainControl(&goal)) {
+            stop_reason = "stopped_by_operator";
+            break;
+        }
+        if (w.stopRequested()) {
+            stop_reason = "stopped_by_operator";
+            break;
+        }
+        if (m.minutes > 0 and (w.nowSecs() - start) >= @as(i64, m.minutes) * 60) {
+            stop_reason = "time_budget";
+            break;
+        }
         if (!live) io.sleep(.{ .nanoseconds = 600 * std.time.ns_per_ms }, .awake) catch {};
     }
 

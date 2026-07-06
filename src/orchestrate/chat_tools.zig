@@ -26,6 +26,16 @@ const notFound = http.notFound;
 const serverErr = http.serverErr;
 const unauth = http.unauth;
 
+// Serializes edit_file's swarm micro-VCS commits (vcs.zig) across concurrent /api/v1/chat/tool requests IN
+// THIS gateway process. A live hive cast building in the SAME conversation dir runs as a SEPARATE worker
+// process with its OWN such mutex (see run.zig's files_mtx) — the two lock domains can't rendezvous across a
+// process boundary, so a genuinely-simultaneous chat-edit and hive-edit to the same file has a narrow
+// (microseconds) race window between commitEdit's HEAD-read and its atomic write. Both sides still rebase
+// their ops onto whatever HEAD they read and land it via a same-dir atomic rename, so this is far safer than
+// the old design (a separate, unmerged veil build reconciled by an LLM after the fact): edits route through
+// the SAME version-control mechanic the swarm's own minds use, instead of inventing a second one.
+var chat_vcs_mtx: std.Io.Mutex = .init;
+
 const ToolReq = struct {
     tool: []const u8 = "",
     args: []const u8 = "{}", // JSON *string* (tool-call convention), passed verbatim to tools.execute
@@ -40,10 +50,10 @@ const ToolReq = struct {
 // confined by tools.safeRel to the per-conversation workdir; the rest write only into the chat's own run_dir /
 // memory DB, or degrade gracefully with no swarm context (probe → "no spatial grid", send_message → a note).
 const SAFE_TOOLS = [_][]const u8{
-    "web_search",   "web_fetch",  "fetch_json",     "read_url",     "deep_crawl",
-    "recall_hive",  "recall",     "observe",        "share",        "note_stance",
-    "save_skill",   "journal",    "set_directive",  "add_task",     "complete_task",
-    "send_message", "probe",      "write_file",     "edit_file",    "read_file",
+    "web_search",   "web_fetch",   "fetch_json",    "read_url",  "deep_crawl",
+    "recall_hive",  "recall",      "observe",       "share",     "note_stance",
+    "save_skill",   "journal",     "set_directive", "add_task",  "complete_task",
+    "send_message", "probe",       "write_file",    "edit_file", "read_file",
     "list_dir",     "delete_file",
 };
 
@@ -52,8 +62,8 @@ const SAFE_TOOLS = [_][]const u8{
 // has none and serves "any external client", so gate them to ADMINS. The desktop is admin on localhost, so it
 // gets the FULL hive-mind surface; a hosted non-admin tenant gets the safe subset.
 const ADMIN_TOOLS = [_][]const u8{
-    "run_python",     "run_tests",     "patch_system",  "make_tool",     "propose_change",
-    "simulate_change", "stage_delivery", "osint_scan",   "host_status",   "host_command",
+    "run_python",      "run_tests",      "patch_system", "make_tool",   "propose_change",
+    "simulate_change", "stage_delivery", "osint_scan",   "host_status", "host_command",
     "host_explore",
 };
 
@@ -180,13 +190,15 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
     const base = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat", .{ app.data, uid });
     // A per-conversation build workdir keeps each chat's files apart (and matches the dir the desktop cd's its
     // console into); no/blank conv id falls back to the shared _chat/work. `conv` is already safeSeg'd.
-    // The `/work` tail is deliberate: a cast for this conversation spawns with run_dir=`.../builds/{conv}`, and
-    // the worker builds in `{run_dir}/work` — so pointing the chat's OWN build tools at `.../builds/{conv}/work`
-    // makes the chat and its hive cast co-edit ONE tree (the user: "work inside the SAME/targeted directory").
-    const workdir = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}/work", .{ base, conv })
+    // `run_root` is deliberately the SAME dir a cast for this conversation spawns with as its run_dir
+    // (`.../builds/{conv}`, worker builds in `{run_dir}/work`) — so the chat's OWN build tools and a hive cast
+    // co-edit ONE tree (the user's ask: "work inside the SAME/targeted directory"), and vcs.zig's `.vcs` history
+    // for that tree lives in the SAME place the worker process would put it.
+    const run_root = if (conv.len > 0)
+        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}", .{ base, conv })
     else
-        try std.fmt.allocPrint(res.arena, "{s}/work", .{base});
+        base;
+    const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{run_root});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     // data-relative form the desktop can cd its console into (shared filesystem, same machine)
     const workdir_rel = if (conv.len > 0)
@@ -201,7 +213,7 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .gpa = app.gpa,
         .io = app.io,
         .environ = environ,
-        .run_dir = base,
+        .run_dir = run_root,
         .workdir = workdir,
         .scope = "chat",
         .mind = "chat",
@@ -213,6 +225,8 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .directives_set = &counters[3],
         .tools_made = &counters[4],
         .internet = true,
+        .fmtx = &chat_vcs_mtx,
+        .vcs_enabled = conv.len > 0, // route edit_file through the swarm's micro-VCS on a real per-conversation build
     };
     const result = tools.execute(&ctx, tool, args);
     // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid

@@ -12,26 +12,38 @@ const log = @import("log.zig");
 pub const Tray = struct {
     inited: bool = false,
     online: bool = false,
+    notify_enabled: bool = true,
+    notify_enabled_set: bool = false,
     impl: Impl = .{},
 
     pub const MenuAction = enum { none, open_settings, toggle_notifications, refresh_now, quit };
 
     pub fn init(t: *Tray, title: []const u8) void {
+        log.trace("tray.init title={s}", .{title});
         t.inited = Impl.init(&t.impl, title);
     }
     pub fn deinit(t: *Tray) void {
+        log.trace("tray.deinit inited={}", .{t.inited});
         if (t.inited) t.impl.deinit();
         t.inited = false;
     }
     pub fn setOnline(t: *Tray, online: bool) void {
         if (t.online == online) return;
+        log.trace("tray.setOnline {} -> {}", .{ t.online, online });
         t.online = online;
         if (t.inited) t.impl.setOnline(online);
     }
     pub fn setNotifyEnabled(t: *Tray, enabled: bool) void {
+        // pumpTray() calls this every frame with the current setting — only log/act on an actual change,
+        // else this floods the log at frame rate instead of on real toggles.
+        if (t.notify_enabled_set and t.notify_enabled == enabled) return;
+        log.trace("tray.setNotifyEnabled {}", .{enabled});
+        t.notify_enabled = enabled;
+        t.notify_enabled_set = true;
         if (t.inited) t.impl.setNotifyEnabled(enabled);
     }
     pub fn notify(t: *Tray, gpa: std.mem.Allocator, title: []const u8, body: []const u8, accent: u8) void {
+        log.trace("tray.notify title={s} accent={d}", .{ title, accent });
         if (t.inited) t.impl.notify(gpa, title, body, accent);
     }
     /// Drain the tray window's message queue (Windows). Call once per UI frame.
@@ -387,6 +399,7 @@ const WindowsTray = struct {
         return self.live;
     }
     fn deinit(self: *WindowsTray) void {
+        log.trace("tray.WindowsTray.deinit live={}", .{self.live});
         if (self.live) _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
         if (self.hwnd) |h| _ = DestroyWindow(h);
         if (self.icon_owned and self.icon_handle != null) _ = DestroyIcon(self.icon_handle);
@@ -396,6 +409,7 @@ const WindowsTray = struct {
         if (g_self == self) g_self = null;
     }
     fn setOnline(self: *WindowsTray, online: bool) void {
+        log.trace("tray.WindowsTray.setOnline {}", .{online});
         if (!self.live) return;
         self.nid.uFlags = NIF_TIP;
         utf16z(&self.nid.szTip, if (online) "veil-desk — server ONLINE" else "veil-desk — server offline");
@@ -403,6 +417,7 @@ const WindowsTray = struct {
     }
     fn notify(self: *WindowsTray, gpa: std.mem.Allocator, title: []const u8, body: []const u8, accent: u8) void {
         _ = gpa;
+        log.trace("tray.WindowsTray.notify title={s} accent={d}", .{ title, accent });
         if (!self.live) return;
         self.nid.uFlags = NIF_INFO;
         self.nid.dwInfoFlags = if (accent == 2) NIIF_WARNING else NIIF_INFO;

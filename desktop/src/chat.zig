@@ -194,9 +194,15 @@ const REFLECT_PASSES: u8 = 1; // >0 enables the loop; the depth is bounded by RE
 const REFLECT_MAX_PASSES: u8 = 3; // hard ceiling on self-check iterations (each is one model call)
 const REFLECT_MIN_ANSWER: usize = 500;
 
-// Concurrent Veil: while a cast runs, the primary Veil ALSO solves the goal itself, then compares + merges the
-// two solutions when the hive finishes. Costs extra model calls per cast (the veil's own attempt), so it's a
-// single flag to disable if a run should be cast-only.
+// Concurrent Veil: while a cast runs, the primary Veil ALSO works the SAME goal, in parallel, directly inside
+// the hive's own shared build dir — it JOINS the swarm rather than building a rival copy. A separate isolated
+// workdir + a post-hoc AI "pick the better one or merge them" pass never worked: two independently-evolving
+// trees are two version histories, and reconciling divergent builds is exactly the merge problem the swarm's
+// OWN micro-VCS (vcs.zig, see chat_tools.zig's vcs_enabled) already exists to solve — running a SECOND ad-hoc
+// merge on top of it just breaks builds instead of fixing them. So there is no separate veil dir and no compare
+// step: the veil's tool calls target the identical dir the hive is building in, and the swarm's own concurrent-
+// edit safety is what reconciles the two streams of edits. Costs extra model calls per cast (the veil's own
+// attempt), so it's a single flag to disable if a run should be cast-only.
 const CONCURRENT_VEIL: bool = true;
 
 // MEMORY INSIDE RECURSIVE THOUGHT: mirror the veil's reasoning-time `observe` tool into the durable per-user
@@ -268,10 +274,6 @@ pub const Chat = struct {
     gpa: std.mem.Allocator,
     store: *Store,
     stop: std.atomic.Value(bool) = .init(false),
-    // Set by the Stop button (stopTurn); checked at every point the turn CHAIN could re-enter (startTurn,
-    // runToolAndContinue, runShellAndContinue). The tool-follow chain has a window where `turn == .idle` while a
-    // BLOCKING tool network call is in flight, so aborting only the live stream let one more tool round-trip fire
-    // after Stop. This flag pre-empts the re-entry. Cleared when a genuinely new user/loop turn begins.
     abort_turn: std.atomic.Value(bool) = .init(false),
 
     stream: llm.Stream = .{},
@@ -305,20 +307,17 @@ pub const Chat = struct {
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
     ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
 
-    // CONCURRENT VEIL: while a hive cast runs, the primary Veil independently solves the SAME goal in its own
-    // isolated workdir; when the cast finishes, the two solutions are compared and the best is merged into the
-    // canonical conv workdir. Isolation dirs: hive -> _chat/builds/{conv}-hive/work, veil -> {conv}-veil/work,
-    // merged winner -> {conv}/work (the dir the chat's own build tools + console use).
-    veil_work_active: bool = false, // a parallel veil build is running the cast's goal
+    // CONCURRENT VEIL: while a hive cast runs, the primary Veil ALSO works the SAME goal in parallel, writing
+    // into the SAME shared build dir the cast is using (_chat/builds/{conv}/work) — it joins the swarm's build
+    // instead of keeping a separate copy, so there is nothing to compare/merge afterward.
+    veil_work_active: bool = false, // a parallel veil turn is running the cast's goal
     veil_started: bool = false, //     the one veil-work turn has been kicked off (drives idle-after-start completion)
-    veil_done: bool = false, //        the veil's own turn has fully settled — its solution is ready to compare
-    in_veil_work: bool = false, //     the CURRENT turn is the veil-work turn -> its tools target veil_dir, not conv
+    veil_done: bool = false, //        the veil's own turn has fully settled
+    in_veil_work: bool = false, //     the CURRENT turn is the veil-work turn (still targets the SAME shared dir)
     veil_nudged: bool = false, //      the veil tried to CAST instead of working; re-issued once as a direct task
-    cast_awaiting_merge: bool = false, // cast finished; waiting on veil_done to run the compare/merge
+    cast_awaiting_veil: bool = false, // cast finished; waiting on veil_done before folding the (single) tree into the answer
     veil_goal: [1600]u8 = undefined, // the cast goal the veil works in parallel
     veil_goal_len: usize = 0,
-    veil_dir: [96]u8 = undefined, // the veil's isolated build seg ("{conv}-veil")
-    veil_dir_len: usize = 0,
 
     // HIPPOCAMPUS — the chat's own neuron-db (gpa-owned; "" = disabled → all memory ops no-op)
     mind_bin: []const u8 = "",
@@ -371,7 +370,7 @@ pub const Chat = struct {
             if (tick % 10 == 5) self.maybeLoop(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
-            if (tick % 10 == 3) self.maybeCompareMerge(dd); // concurrent veil: fold both once cast + veil are done
+            if (tick % 10 == 3) self.maybeFinishAfterVeil(dd); // concurrent veil: compose the answer once cast + veil are both done
             if (tick % 20 == 11) self.refreshChatFiles(dd); // ~2s: publish this chat's build files for the Files tab
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
@@ -645,13 +644,13 @@ pub const Chat = struct {
         // is still pending (cast_awaiting_merge) and the veil turn may still be running (veil_work_active). A switch
         // in those idle gaps would repoint conv_active and the settling veil/merge appends would overwrite the
         // newly-selected chat. Mirror maybeLoop's guard.
-        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_merge;
+        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil;
     }
 
     /// Is a cast in flight anywhere in its lifecycle (deploying/running, or the concurrent-veil parallel attempt /
-    /// pending compare-merge)? Used to refuse a SECOND cast that would clobber the first's pending merge state.
+    /// pending finish)? Used to refuse a SECOND cast that would clobber the first's pending finish state.
     fn castPending(self: *Chat) bool {
-        return self.cast_active or self.cast_awaiting_merge or self.veil_work_active;
+        return self.cast_active or self.cast_awaiting_veil or self.veil_work_active;
     }
 
     /// A user-typed / AI-issued micro-console command (the "You"/"Veil" tab). Launches it asynchronously via
@@ -1334,7 +1333,7 @@ pub const Chat = struct {
         _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
         self.store.pushNotif("Stop sent", rel, 2);
         self.cast_stop_sent = true;
-        self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending merge
+        self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending finish
     }
 
     fn cmdSaveKey(self: *Chat, dd: []const u8, key: []const u8) void {
@@ -1872,13 +1871,13 @@ pub const Chat = struct {
             defer if (synth_args) |s| self.gpa.free(s); // freed AFTER runToolAndContinue dupes it (returns at 1446)
             const tc_opt = toolCall(full) orelse toolCallXml(full) orelse
                 (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null) orelse blk: {
-                    if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
-                        synth_args = s;
-                        log.info("build recovery: model pasted a code block instead of write_file — synthesizing the write", .{});
-                        break :blk ToolCall{ .name = "write_file", .args = s };
-                    }
-                    break :blk null;
-                };
+                if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
+                    synth_args = s;
+                    log.info("build recovery: model pasted a code block instead of write_file — synthesizing the write", .{});
+                    break :blk ToolCall{ .name = "write_file", .args = s };
+                }
+                break :blk null;
+            };
             if (tc_opt) |tc| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
@@ -1901,6 +1900,25 @@ pub const Chat = struct {
                 }
                 self.tool_iters += 1;
                 self.runShellAndContinue(dd, cmd); // copies cmd off the stream, THEN frees it, THEN re-enters
+                return;
+            }
+            // Neither TOOL:/<tool:>/RUN: parsed, but the text still LOOKS like an attempted tool call in some
+            // other dialect (DeepSeek-style "<｜tool▁calls｜>" special tokens, Claude-style <invoke name="...">,
+            // etc.) — left alone, this renders as garbage and the turn "finishes" having done NOTHING, which is
+            // exactly the lock-up bug: the model tried to act, failed silently, and the caller (esp. the veil's
+            // parallel attempt, which has no human watching to notice and correct it) treats it as a real answer.
+            // Nudge ONCE (shares the tool budget so this can't loop forever) with the exact required format.
+            if (looksLikeFailedToolCall(full) and self.tool_iters < MAX_TOOL_ITERS) {
+                self.tool_iters += 1;
+                self.stream.deinit(self.gpa);
+                self.appendMsg(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)");
+                const p = "Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call as exactly one line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.";
+                self.appendMsg(dd, .cast_note, p);
+                self.last_user_len = @min(p.len, self.last_user.len);
+                @memcpy(self.last_user[0..self.last_user_len], p[0..self.last_user_len]);
+                self.internal_turn = true; // corrective directive, not a real user turn — don't consolidate memory off it
+                self.setStatus("retrying in the right tool format...");
+                self.startTurn(dd, kind);
                 return;
             }
         }
@@ -1962,7 +1980,7 @@ pub const Chat = struct {
             const dirty = self.reflect_dirty;
             const final_ans = if (revised.len > 0) revised else self.reflect_draft[0..self.reflect_draft_len];
             log.info("reflect finalize: pass={d} dirty={} changed={} final_len={d}", .{ self.reflect_pass, dirty, changed, final_ans.len });
-            // If the self-check draft ITSELF emitted a tool call (e.g. the merge deciding to write_file), reflect
+            // If the self-check draft ITSELF emitted a tool call (e.g. the finish turn deciding to write_file), reflect
             // turns are excluded from tool execution — so RUN it now (showing only the prose part) instead of
             // dumping the raw TOOL:{content} blob as chat text.
             if (self.tool_iters < MAX_TOOL_ITERS) {
@@ -1997,7 +2015,7 @@ pub const Chat = struct {
             // The veil tried to DELEGATE to a swarm instead of doing the work itself (common on research goals,
             // since the system prompt encourages casting for current-events). Convert its intent into DIRECT work:
             // re-issue the veil turn ONCE with a hard "no cast — do it yourself" instruction. If it casts again,
-            // give up its parallel attempt (the merge falls back to the hive).
+            // give up its parallel attempt (the answer falls back to the hive's shared build alone).
             self.stream.deinit(self.gpa);
             if (!self.veil_nudged) {
                 self.veil_nudged = true;
@@ -2020,8 +2038,8 @@ pub const Chat = struct {
             var nb: [3072]u8 = undefined;
             const note = noteWithoutCast(full, &nb);
             // Refuse a second cast not just while one is ACTIVE but through the whole concurrent-veil pipeline
-            // (awaiting-merge / veil still working) — a new cast there would reset cast_rel + the veil fields and
-            // silently clobber the pending compare/merge of the first cast.
+            // (awaiting-veil / veil still working) — a new cast there would reset cast_rel + the veil fields and
+            // silently clobber the first cast's pending finish.
             if (self.castPending()) {
                 self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
@@ -2077,7 +2095,7 @@ pub const Chat = struct {
         if (!MEMORY_CONSOLIDATE or !self.mind().enabled()) return false;
         if (self.abort_turn.load(.monotonic)) return false;
         if (kind != .user and kind != .tool_follow and kind != .reflect) return false; // answer turns only (no self-loop)
-        if (self.internal_turn) return false; // a machine-authored merge/nudge turn is not a user exchange
+        if (self.internal_turn) return false; // a machine-authored finish/nudge turn is not a user exchange
         if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
         if (full.len == 0 and self.last_user_len == 0) return false;
         // Personal-signal gate: the user is who shares durable facts, so key off THEIR message. Skips "explain X".
@@ -2089,9 +2107,9 @@ pub const Chat = struct {
     /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
     /// (no in-flight turn, no running cast). Called at the settle point and on a fresh toggle-on (.loop_kick).
     fn maybeLoop(self: *Chat, dd: []const u8) void {
-        // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending merge (else auto-loop
-        // would grab the shared turn slot out from under the veil work / merge).
-        if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_merge) return;
+        // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending finish (else auto-loop
+        // would grab the shared turn slot out from under the veil work / finish).
+        if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil) return;
         const on = blk: {
             self.store.lock();
             defer self.store.unlock();
@@ -2262,13 +2280,11 @@ pub const Chat = struct {
         // (and the desktop console) use — not a throwaway `{hex}/work` the chat can never see.
         var convb: [96]u8 = undefined;
         const conv = self.convScope(&convb);
-        // Concurrent Veil: give the HIVE its own isolated build dir ("{conv}-hive") so it can't clobber the Veil's
-        // parallel build ("{conv}-veil"); after the cast, the compare/merge step writes the winner into the
-        // canonical "{conv}/work". '-' is allowed by the server's safeConv, so no server change is needed. When
-        // concurrent-veil is off (or there's no conv), fall back to the classic co-edit dir = conv.
-        var hive_db: [96]u8 = undefined;
-        const use_veil = CONCURRENT_VEIL and conv.len > 0 and conv.len + 5 <= self.cast_conv.len;
-        const hive_dir = if (use_veil) (std.fmt.bufPrint(&hive_db, "{s}-hive", .{conv}) catch conv) else conv;
+        // Concurrent Veil: the veil's parallel attempt JOINS the hive here — both build in this SAME "{conv}"
+        // dir (no separate "-veil" copy), so the swarm's own concurrent-edit safety (not a post-hoc AI merge)
+        // is what reconciles the two streams of edits. veil_join just gates whether maybeVeilWork fires.
+        const veil_join = CONCURRENT_VEIL and conv.len > 0 and conv.len <= self.cast_conv.len;
+        const hive_dir = conv;
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
         const minutes: u32 = if (spec.minutes > 0) std.math.clamp(spec.minutes, 1, 120) else if (spec.long) 20 else CAST_MINUTES;
         const mode: []const u8 = if (spec.long) "continuous" else "cast";
@@ -2310,7 +2326,7 @@ pub const Chat = struct {
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
             w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"dir\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
-            wesc(&w, hive_dir); // the hive builds in {conv}-hive (isolated) when concurrent-veil is on, else {conv}
+            wesc(&w, hive_dir); // the hive builds in {conv} — the SAME dir the veil's parallel attempt joins
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
             w.writeAll("\",\"goal\":\"") catch break :blk false;
@@ -2368,23 +2384,21 @@ pub const Chat = struct {
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
         // the cast builds in this conversation's dir (_chat/builds/<hive_dir>); remember it so watchCast can find
-        // the run dir (its basename is <hive_dir>, not the hex id). <hive_dir> is {conv}-hive when concurrent-veil
-        // is on, else {conv}.
+        // the run dir (its basename is <hive_dir>).
         self.cast_conv_len = @min(hive_dir.len, self.cast_conv.len);
         @memcpy(self.cast_conv[0..self.cast_conv_len], hive_dir[0..self.cast_conv_len]);
         self.cast_deadline_s = self.nowS() + @as(i64, self.cast_minutes) * 60 + 120;
-        // Concurrent-Veil: kick off the primary Veil's own parallel attempt at the SAME goal (in {conv}-veil). The
-        // tick loop's maybeVeilWork drives it; when the cast finishes, maybeCompareMerge folds both in.
-        if (use_veil) {
+        // Concurrent-Veil: kick off the primary Veil's own parallel attempt at the SAME goal, in the SAME shared
+        // dir the hive just started building in. The tick loop's maybeVeilWork drives it; when the cast finishes,
+        // maybeFinishAfterVeil waits for the veil's turn to settle, then folds the (one, shared) tree into the answer.
+        if (veil_join) {
             self.veil_goal_len = @min(goal.len, self.veil_goal.len);
             @memcpy(self.veil_goal[0..self.veil_goal_len], goal[0..self.veil_goal_len]);
-            const vd = std.fmt.bufPrint(&self.veil_dir, "{s}-veil", .{conv}) catch "";
-            self.veil_dir_len = vd.len;
-            self.veil_work_active = self.veil_dir_len > 0;
+            self.veil_work_active = true;
             self.veil_started = false;
             self.veil_done = false;
             self.in_veil_work = false;
-            self.cast_awaiting_merge = false;
+            self.cast_awaiting_veil = false;
         }
         var gb: [200]u8 = undefined;
         const note = std.fmt.bufPrint(&gb, "[cast] hive deployed ({s}) — watching", .{hex}) catch "[cast] hive deployed";
@@ -2465,10 +2479,11 @@ pub const Chat = struct {
         }
 
         // the active conversation id → a per-conversation build workdir the server writes into + the console cd's to.
-        // While the veil works its PARALLEL attempt (in_veil_work), redirect its tools to the isolated {conv}-veil
-        // dir so it can't clobber the hive's {conv}-hive tree.
+        // The veil's PARALLEL attempt (in_veil_work) targets this SAME dir too — it joins the hive's build rather
+        // than a separate copy, so there's nothing to reconcile afterward (the server's edit_file already
+        // serializes/merges concurrent edits the same way it does for multiple hive minds).
         var convb: [40]u8 = undefined;
-        const conv = if (self.in_veil_work and self.veil_dir_len > 0) self.veil_dir[0..self.veil_dir_len] else self.convScope(&convb);
+        const conv = self.convScope(&convb);
 
         // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call
         // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
@@ -2664,13 +2679,14 @@ pub const Chat = struct {
         }
     }
 
-    /// The hive cast has finished. In concurrent-veil mode, defer to the compare/merge (which waits until the
-    /// Veil's own parallel attempt is also done); otherwise collect the hive result directly (the classic path).
+    /// The hive cast has finished. In concurrent-veil mode, defer finishing until the Veil's own parallel turn
+    /// (writing into this SAME shared dir) has also settled, so its last edits are in the tree before the answer
+    /// is composed; otherwise collect the result directly (the classic path).
     fn castFinished(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         if (CONCURRENT_VEIL and self.veil_work_active) {
             self.cast_active = false;
-            self.cast_awaiting_merge = true;
-            self.updateCastRow(.comparing, m.round, m.pct, "", rel);
+            self.cast_awaiting_veil = true;
+            self.updateCastRow(.finishing, m.round, m.pct, "", rel);
             self.setStatus("hive done - waiting on the veil's own attempt...");
         } else {
             self.collectCast(dd, rel, m, ev_n);
@@ -2681,25 +2697,26 @@ pub const Chat = struct {
         self.appendMsg(dd, .cast_note, msg);
         self.updateCastRow(.failed, 0, -1, "", self.cast_hex[0..self.cast_hex_len]);
         self.cast_active = false;
-        self.resetVeilWork(); // abandon any parallel veil attempt + pending merge
+        self.resetVeilWork(); // abandon any parallel veil attempt + the pending finish
         self.setStatus("");
     }
 
-    /// Clear all concurrent-veil state (on cast failure/stop, or after a merge completes).
+    /// Clear all concurrent-veil state (on cast failure/stop, or after the finish completes).
     fn resetVeilWork(self: *Chat) void {
         self.veil_work_active = false;
         self.veil_started = false;
         self.veil_done = false;
         self.in_veil_work = false;
         self.veil_nudged = false;
-        self.cast_awaiting_merge = false;
+        self.cast_awaiting_veil = false;
     }
 
-    /// CONCURRENT VEIL driver (tick loop): while a cast runs, kick off the primary Veil's OWN attempt at the same
-    /// goal once, in its isolated {conv}-veil workdir; then — once that turn has fully settled — mark it done so
-    /// the compare/merge can run. Completion is detected as "we started it AND we're idle again" (tool/console
-    /// re-entry is synchronous within a tick, and this runs after pumpStream+pumpConsole, so a mid-chain idle is
-    /// never observed).
+    /// CONCURRENT VEIL driver (tick loop): while a cast runs, kick off the primary Veil's OWN turn at the same
+    /// goal once, writing into the SAME shared build dir the hive is using (it joins the swarm's build rather
+    /// than keeping a separate copy); then — once that turn has fully settled — mark it done so
+    /// maybeFinishAfterVeil can compose the answer. Completion is detected as "we started it AND we're idle
+    /// again" (tool/console re-entry is synchronous within a tick, and this runs after pumpStream+pumpConsole,
+    /// so a mid-chain idle is never observed).
     fn maybeVeilWork(self: *Chat, dd: []const u8) void {
         if (!CONCURRENT_VEIL or !self.veil_work_active or self.veil_done) return;
         if (self.turn != .idle or self.consoleAiBusy()) return; // never contend with a live turn/console
@@ -2712,7 +2729,7 @@ pub const Chat = struct {
             self.reflect_dirty = false;
             self.abort_turn.store(false, .monotonic);
             var pb: [1900]u8 = undefined;
-            const prompt = std.fmt.bufPrint(&pb, "[parallel] You are the primary Veil, working ALONE and in parallel with a background hive. You do NOT have a cast/swarm tool here and you must NEVER output 'CAST:' — casting is disabled for you. Solve this goal YOURSELF, right now, with your OWN tools: for research, call web_search then web_fetch on the best results; for a build, use write_file/edit_file/run_python. Do the ACTUAL work and write your result to a file in your workdir. If you emit CAST: it is ignored and you fail this task. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Independently solve the cast goal yourself with your own tools (never CAST).";
+            const prompt = std.fmt.bufPrint(&pb, "[parallel] You are the primary Veil, working alongside a background hive on this SAME goal, in the SAME shared build files — you are not keeping a separate copy, so read what's already there (list_dir/read_file) before writing, and extend/fix it rather than starting a rival build from scratch; the swarm's own concurrent-edit safety merges disjoint edits automatically. You do NOT have a cast/swarm tool here and you must NEVER output 'CAST:' — casting is disabled for you. Do the ACTUAL work with your own tools: for research, call web_search then web_fetch on the best results; for a build, use write_file/edit_file/run_python. If you emit CAST: it is ignored and you fail this task. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Work the cast goal yourself, in the hive's shared build files, with your own tools (never CAST).";
             self.last_user_len = @min(prompt.len, self.last_user.len);
             @memcpy(self.last_user[0..self.last_user_len], prompt[0..self.last_user_len]);
             // a cast_note renders dim/distinct (not a fake user bubble) but still maps to a user turn in the prompt
@@ -2724,80 +2741,24 @@ pub const Chat = struct {
         // veil_started AND idle again => the veil-work turn (and its whole tool/reflect chain) has settled.
         self.in_veil_work = false;
         self.veil_done = true;
-        log.info("concurrent-veil: the veil's own attempt settled; ready to compare", .{});
+        log.info("concurrent-veil: the veil's own attempt settled; ready to finish", .{});
     }
 
-    /// Append a build tree's file contents into `jb`, budget-bounded (skips synthesis.md — shown separately).
-    fn foldTree(self: *Chat, dd: []const u8, jb: *std.ArrayListUnmanaged(u8), rel: []const u8, budget: usize) void {
-        const fn_ = scan.listWorkFiles(self.io, self.gpa, dd, rel, &self.file_scratch);
-        if (fn_ == 0) {
-            jb.appendSlice(self.gpa, "\n(no files)") catch {};
-            return;
-        }
-        var used: usize = 0;
-        var i: usize = 0;
-        while (i < fn_ and used < budget) : (i += 1) {
-            const path = self.file_scratch[i].pathStr();
-            if (std.mem.eql(u8, path, "synthesis.md")) continue;
-            const allow = @min(budget - used, 2200);
-            if (allow < 80) break;
-            const buf = self.gpa.alloc(u8, allow) catch break;
-            defer self.gpa.free(buf);
-            var trunc = false;
-            const cn = scan.readWorkFile(self.io, self.gpa, dd, rel, path, buf, &trunc);
-            if (cn == 0) continue;
-            jb.print(self.gpa, "\n--- {s} ({d}b) ---\n{s}{s}", .{ path, self.file_scratch[i].size, buf[0..cn], if (trunc) "\n[...]" else "" }) catch {};
-            used += cn;
-        }
-    }
-
-    /// CONCURRENT VEIL merge (tick loop): once the cast finished AND the veil's own attempt settled, fold BOTH
-    /// deliverables into a [compare] digest and run a merge turn that judges/merges them and writes the winner
-    /// into the canonical {conv}/work (the merge turn's tools use conv, since in_veil_work is now false).
-    fn maybeCompareMerge(self: *Chat, dd: []const u8) void {
-        if (!self.cast_awaiting_merge or !self.veil_done) return;
+    /// Once the cast finished AND the veil's own parallel turn (in the SAME shared dir) has settled, compose the
+    /// final answer from that one tree — no compare/merge step, since both sides already edited the same build.
+    fn maybeFinishAfterVeil(self: *Chat, dd: []const u8) void {
+        if (!self.cast_awaiting_veil or !self.veil_done) return;
         if (self.turn != .idle or self.consoleAiBusy()) return;
-        self.cast_awaiting_merge = false;
+        self.cast_awaiting_veil = false;
         self.veil_work_active = false;
-        self.updateCastRow(.merging, 0, -1, "comparing + merging", "");
-        const hive_rel = self.cast_rel[0..self.cast_rel_len];
-        var vrb: [128]u8 = undefined;
-        const veil_rel: []const u8 = if (std.mem.endsWith(u8, hive_rel, "-hive"))
-            (std.fmt.bufPrint(&vrb, "{s}-veil", .{hive_rel[0 .. hive_rel.len - 5]}) catch "")
-        else
-            "";
-        var jb: std.ArrayListUnmanaged(u8) = .empty;
-        defer jb.deinit(self.gpa);
-        jb.appendSlice(self.gpa, "[compare] The hive finished. Two independent attempts at the same goal now exist: YOUR OWN answer (in the conversation above) and the HIVE's deliverable below.\n\n=== HIVE DELIVERABLE ===") catch {};
-        {
-            var sbuf: [3500]u8 = undefined;
-            var st = false;
-            const sn = scan.readWorkFile(self.io, self.gpa, dd, hive_rel, "synthesis.md", &sbuf, &st);
-            if (sn > 0) {
-                jb.appendSlice(self.gpa, "\nsynthesis.md:\n") catch {};
-                jb.appendSlice(self.gpa, sbuf[0..sn]) catch {};
-                if (st) jb.appendSlice(self.gpa, "\n[...]") catch {};
-            }
-        }
-        self.foldTree(dd, &jb, hive_rel, 4000);
-        jb.appendSlice(self.gpa, "\n\n=== VEIL'S OWN FILES (from its parallel build; its written answer is in the chat above) ===") catch {};
-        if (veil_rel.len > 0) self.foldTree(dd, &jb, veil_rel, 4000) else jb.appendSlice(self.gpa, "\n(no separate files)") catch {};
-        const digest = jb.items[0..@min(jb.items.len, 12200)];
-        self.appendMsg(dd, .cast_note, digest);
-        // The merge runs as a normal .user turn (NOT .collect) so it can WRITE the merged result to the canonical
-        // {conv}/work via write_file (collect turns are tool-free). in_veil_work is already false here, so the
-        // tools target conv, not the veil dir. The directive is the last user message the turn responds to.
-        const directive = "Two independent solutions to the same goal now exist: YOUR OWN answer earlier in this conversation, and the HIVE's deliverable in the [compare] block above. Compare them honestly, then produce the FINAL best result - pick the stronger one or MERGE the strongest parts of each. IMPORTANT: if the best available result is INCOMPLETE or just a plan/stub, do NOT merely report that it fell short - FINISH the job yourself now with your own tools (web_search/web_fetch for research, write_file/run_python for a build) and deliver a complete result. Then WRITE the final result to your workdir with write_file (the canonical output the user keeps) and briefly note what each side contributed. Do not cast.";
-        self.appendMsg(dd, .cast_note, directive);
-        self.last_user_len = @min(directive.len, self.last_user.len);
-        @memcpy(self.last_user[0..self.last_user_len], directive[0..self.last_user_len]);
-        self.internal_turn = true; // the merge directive is machine-authored → its turn must not consolidate memory
-        self.tool_iters = 0;
-        self.reflect_pass = 0;
-        self.reflect_dirty = false;
-        self.abort_turn.store(false, .monotonic); // the merge is a fresh deliberate turn — clear any stale Stop
-        self.setStatus("comparing + merging the two solutions...");
-        self.startTurn(dd, .user);
+        const rel = self.cast_rel[0..self.cast_rel_len];
+        var m: scan.Metrics = .{};
+        var ev_n: usize = 0;
+        var ep_buf: [700]u8 = undefined;
+        if (std.fmt.bufPrint(&ep_buf, "{s}/{s}/events.jsonl", .{ dd, rel })) |ep| {
+            ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &m);
+        } else |_| {}
+        self.collectCast(dd, rel, &m, ev_n);
     }
 
     /// Fold the finished cast into the conversation as a [cast] findings digest, then ask the model to
@@ -3028,9 +2989,9 @@ fn exchangeHasPersonalSignal(user: []const u8) bool {
     // were dropped — they matched ordinary technical questions ("explain tokenization", "the @ decorator", "four"),
     // spending a wasted consolidation call. A durable fact the user shares reliably carries one of these instead.
     const sigs = [_][]const u8{
-        "my ",       "i'm",      "i am",       "i use",     "i prefer",   "i like",   "i always",
-        "i work",    "i deploy", "i run",      "i host",    "i keep",     "we use",   "we deploy",
-        "remember",  "forget",   "password",   "api key",   "apikey",     "credential",
+        "my ",      "i'm",      "i am",     "i use",   "i prefer", "i like",     "i always",
+        "i work",   "i deploy", "i run",    "i host",  "i keep",   "we use",     "we deploy",
+        "remember", "forget",   "password", "api key", "apikey",   "credential",
     };
     for (sigs) |s| {
         if (std.ascii.indexOfIgnoreCase(user, s) != null) return true;
@@ -3247,6 +3208,20 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
         if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
+}
+
+/// Does `text` look like a tool-call ATTEMPT in some dialect none of toolCall/toolCallXml/toolCallLoose speak,
+/// rather than a genuine prose answer? Catches the observed failure modes: DeepSeek/Qwen-style special tokens
+/// using the fullwidth vertical bar (U+FF5C) around "tool" markers (e.g. "<｜tool▁calls｜>", or a model garbling
+/// its own token set into something like "<｜｜DSML｜｜tool_calls>"), and Claude/Anthropic-style
+/// `<invoke name="...">`/`<function_calls>` XML. Deliberately loose (false positives just cost one corrective
+/// retry) — the alternative is silently accepting the garbage as the final answer, which is the actual bug.
+fn looksLikeFailedToolCall(text: []const u8) bool {
+    const markers = [_][]const u8{
+        "\u{FF5C}tool", "tool\u{FF5C}", "tool_calls>", "tool_call>", "invoke name=", "function_calls>", "antml:invoke",
+    };
+    for (markers) |m| if (std.mem.indexOf(u8, text, m) != null) return true;
+    return false;
 }
 
 /// The auto-loop driver signals completion with a bare "DONE". Be strict so a normal next-message that merely

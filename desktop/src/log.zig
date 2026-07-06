@@ -26,13 +26,30 @@ pub const Line = struct {
     }
 };
 
-const CAP = 512;
+// Bumped from 512: whole-app function-entry tracing (see `trace`) is FAR heavier volume than the old
+// info/warn/err-only log ever was, and a small ring would evict real signal (errors, tool calls, cast
+// lifecycle) behind a firehose of trace lines within seconds. 8192 lines * 220B = ~1.8MB, fine for a
+// desktop app's static data.
+const CAP = 8192;
 
 var g_lines: [CAP]Line = undefined;
 var g_write: usize = 0; // monotonic next-write index
 var g_drain: usize = 0; // next index the file-flusher hasn't consumed
 var g_clock: i64 = 0;
 var g_held = std.atomic.Value(bool).init(false);
+
+/// Function-entry tracing toggle (see `trace`). Defaults ON so every function call across the app logs
+/// straight to veil-desk.log without extra setup; flip off (`log.setTraceEnabled(false)`) if the volume
+/// gets in the way. Atomic: the poller thread and UI thread both call `trace`.
+var g_trace_on = std.atomic.Value(bool).init(true);
+
+pub fn setTraceEnabled(on: bool) void {
+    g_trace_on.store(on, .monotonic);
+}
+
+pub fn traceEnabled() bool {
+    return g_trace_on.load(.monotonic);
+}
 
 fn lock() void {
     while (g_held.swap(true, .acquire)) std.atomic.spinLoopHint();
@@ -70,6 +87,17 @@ pub fn dbg(comptime fmt: []const u8, args: anytype) void {
 }
 pub fn err(comptime fmt: []const u8, args: anytype) void {
     emit(.err, fmt, args);
+}
+
+/// Function-entry tracing: one call at the top of (almost) every non-hot-path function in the desktop app,
+/// so a live run's veil-desk.log reads as a call trace (which function ran, in what order, with what key
+/// arguments) — the exact thing that was MISSING when root-causing the DSML lock-up / crash bug. Deliberately
+/// excluded from main.zig's per-frame draw/render functions (60fps would flood the ring and defeat the
+/// purpose); everything else gets one. Gated by `g_trace_on` (default on) so it can be silenced without a
+/// rebuild if the volume ever gets in the way.
+pub fn trace(comptime fmt: []const u8, args: anytype) void {
+    if (!g_trace_on.load(.monotonic)) return;
+    emit(.dbg, fmt, args);
 }
 
 /// Consuming read for the file flusher: copies the lines written since the last drain into `out`

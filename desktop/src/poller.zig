@@ -56,6 +56,7 @@ pub const Poller = struct {
     stopped_n: usize = 0,
 
     pub fn run(self: *Poller) void {
+        log.trace("poller.run starting", .{});
         while (!self.stop.load(.monotonic)) {
             self.drainCommands();
             self.refresh();
@@ -93,6 +94,7 @@ pub const Poller = struct {
         var dbuf: [512]u8 = undefined;
         const dd = self.dataDir(&dbuf);
         while (self.store.popCmd()) |c| {
+            log.trace("poller.drainCommands kind={t} id={s}", .{ c.kind, c.idStr() });
             switch (c.kind) {
                 .none, .refresh_now => {},
                 .select => self.setSelected(c.idStr()),
@@ -108,6 +110,7 @@ pub const Poller = struct {
     }
 
     fn setSelected(self: *Poller, id: []const u8) void {
+        log.trace("poller.setSelected id={s}", .{id});
         self.store.lock();
         defer self.store.unlock();
         const n = @min(id.len, self.store.selected.len);
@@ -123,6 +126,7 @@ pub const Poller = struct {
     /// Files tab: remember which file the viewer is showing; refresh() re-reads it each pass so a live
     /// build's file updates as it grows.
     fn setSelFile(self: *Poller, sub: []const u8) void {
+        log.trace("poller.setSelFile sub={s}", .{sub});
         self.store.lock();
         defer self.store.unlock();
         const n = @min(sub.len, self.store.sel_file.len);
@@ -132,6 +136,7 @@ pub const Poller = struct {
     }
 
     fn doControl(self: *Poller, dd: []const u8, id: []const u8, op: []const u8, text: []const u8, goal: []const u8) void {
+        log.trace("poller.doControl id={s} op={s} text_len={d} goal_len={d}", .{ id, op, text.len, goal.len });
         if (id.len == 0) return;
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -155,6 +160,7 @@ pub const Poller = struct {
     }
 
     fn doDeploy(self: *Poller, body: []const u8) void {
+        log.trace("poller.doDeploy body_len={d}", .{body.len});
         // `body` is the complete DeployReq JSON built by the UI (Deploy form). Post it verbatim.
         if (body.len == 0) {
             log.err("deploy: EMPTY body (submitDeploy built nothing — buffer overflow or bad state)", .{});
@@ -192,6 +198,7 @@ pub const Poller = struct {
     /// CLI run is removed by deleting exactly its own dir. Only ever the one dir the user picked — never a
     /// sweep.
     fn doDelete(self: *Poller, dd: []const u8, rel: []const u8) void {
+        log.trace("poller.doDelete rel={s}", .{rel});
         if (rel.len == 0) return;
         const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
         if (std.mem.indexOfScalar(u8, rel, '/') != null) {
@@ -235,6 +242,7 @@ pub const Poller = struct {
     /// the desktop started or rotate it, and a stale token was silently rejecting deploy + delete (fixed by
     /// a restart before). Skips if the user manually saved their own token.
     fn syncDesktopKey(self: *Poller, dd: []const u8) void {
+        log.trace("poller.syncDesktopKey dd={s}", .{dd});
         {
             self.store.lock();
             const manual = self.store.settings.token_manual;
@@ -260,6 +268,7 @@ pub const Poller = struct {
     /// Open the data dir in the OS file browser (best-effort). Set the child's cwd to the data dir and
     /// open "." — sidesteps resolving `dd` to an absolute path (getCwd is gone in this Zig).
     fn doOpenFolder(self: *Poller, dd: []const u8) void {
+        log.trace("poller.doOpenFolder dd={s}", .{dd});
         const argv: []const []const u8 = switch (builtin.os.tag) {
             .windows => &.{ "explorer.exe", "." },
             .macos => &.{ "open", "." },
@@ -274,6 +283,7 @@ pub const Poller = struct {
         var lb: [128]log.Line = undefined;
         const n = log.drain(&lb);
         if (n == 0) return;
+        log.trace("poller.flushLog draining {d} lines to {s}/veil-desk.log", .{ n, dd });
         for (lb[0..n]) |ln| {
             const hh: u64 = @intCast(@mod(@divTrunc(ln.t_s, 3600), 24));
             const mm: u64 = @intCast(@mod(@divTrunc(ln.t_s, 60), 60));
@@ -293,6 +303,7 @@ pub const Poller = struct {
     }
 
     fn refresh(self: *Poller) void {
+        log.trace("poller.refresh tick", .{});
         var dbuf: [512]u8 = undefined;
         const dd = self.dataDir(&dbuf);
         const now_ns = Io.Timestamp.now(self.io, .real).nanoseconds;
@@ -448,6 +459,7 @@ pub const Poller = struct {
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {
+        log.trace("poller.notifyTransitions online={} swarms={d}", .{ online, swarms.len });
         // server up/down
         if (self.prev_online_set and online != self.prev_online) {
             if (online) self.store.pushNotif("veil server online", "the control plane is up", 1) else self.store.pushNotif("veil server offline", "the control plane went away", 2);

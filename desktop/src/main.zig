@@ -2186,8 +2186,7 @@ fn castStatusColor(st: store_mod.CastStatus) t.Color {
         .deploying => t.yellow,
         .running => t.green,
         .collecting => t.cyan,
-        .comparing => t.cyan,
-        .merging => t.blue,
+        .finishing => t.blue,
         .done => t.comment,
         .failed => t.red,
     };
@@ -2198,8 +2197,7 @@ fn castStatusWord(st: store_mod.CastStatus) [:0]const u8 {
         .deploying => t.z("deploying", .{}),
         .running => t.z("running", .{}),
         .collecting => t.z("stopping", .{}),
-        .comparing => t.z("comparing", .{}),
-        .merging => t.z("merging", .{}),
+        .finishing => t.z("finishing", .{}),
         .done => t.z("done", .{}),
         .failed => t.z("failed", .{}),
     };
@@ -3219,13 +3217,33 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             ui.focus = .none;
         }
         y += 42;
+    } else if (chat_kind == 0) {
+        // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
+        // the model may live on another machine on the LAN — let the user override the endpoint.
+        const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
+        selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("MODEL", .{}), model_disp, .chat_model);
+        flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
+        const ew = half - 90;
+        textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = 32 }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
+        if (t.button(.{ .x = x + half + 10 + ew + 4, .y = y + 14, .width = 82, .height = 32 }, t.z("Save", .{}), t.blue, true)) {
+            store.lock();
+            const s = &store.settings;
+            const bn2 = @min(ui.s_url.len, s.chat_base.len);
+            @memcpy(s.chat_base[0..bn2], ui.s_url.buf[0..bn2]);
+            s.chat_base_len = @intCast(bn2);
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
+            ui.focus = .none;
+        }
+        y += 56;
+        const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
+        t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        y += 20;
     } else {
         const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
         selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("MODEL", .{}), model_disp, .chat_model);
-        const hint = if (chat_kind == 0)
-            (if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{}))
-        else
-            t.z("models available on {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label});
+        const hint = t.z("models available on {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label});
         t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 16), 11, t.comment);
         y += 56;
     }

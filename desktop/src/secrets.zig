@@ -27,6 +27,7 @@ fn path(gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
 
 /// Persist `key` under `dir` (the .veil-desk sidecar dir). An empty key removes the stored secret.
 pub fn save(io: Io, gpa: std.mem.Allocator, dir: []const u8, key: []const u8) bool {
+    log.trace("secrets.save dir={s} key_len={d}", .{ dir, key.len });
     const p = path(gpa, dir) orelse return false;
     defer gpa.free(p);
     if (key.len == 0) {
@@ -54,6 +55,7 @@ pub fn save(io: Io, gpa: std.mem.Allocator, dir: []const u8, key: []const u8) bo
 
 /// Load the stored key into `out`; returns its length (0 = none stored / unreadable).
 pub fn load(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
+    log.trace("secrets.load dir={s}", .{dir});
     const p = path(gpa, dir) orelse return 0;
     defer gpa.free(p);
     const data = Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(4 << 10)) catch return 0;

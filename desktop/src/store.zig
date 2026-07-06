@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const scan = @import("scan.zig");
+const log = @import("log.zig");
 
 /// A tiny io-free spinlock. std.Thread.Mutex is gone in this Zig and std.Io.Mutex needs an io handle the
 /// UI thread doesn't carry. Critical sections here are microscopic (copying a few small fixed arrays under
@@ -162,7 +163,7 @@ pub const ConvRow = struct {
     }
 };
 
-pub const CastStatus = enum(u8) { deploying, running, collecting, comparing, merging, done, failed };
+pub const CastStatus = enum(u8) { deploying, running, collecting, finishing, done, failed };
 
 /// One swarm cast fired from the chat, for the right-hand activity pane.
 pub const CastRow = struct {
@@ -335,9 +336,13 @@ pub const Store = struct {
     /// UI thread: enqueue a command for the poller. Drops silently if the ring is full (poller is ~1s
     /// behind at worst; a dropped duplicate say/refresh is harmless).
     pub fn pushCmd(s: *Store, c: Command) void {
+        log.trace("store.pushCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         s.lock();
         defer s.unlock();
-        if ((s.cmd_head + 1) % CMD_RING == s.cmd_tail) return;
+        if ((s.cmd_head + 1) % CMD_RING == s.cmd_tail) {
+            log.trace("store.pushCmd DROPPED (ring full)", .{});
+            return;
+        }
         s.cmds[s.cmd_head] = c;
         s.cmd_head = (s.cmd_head + 1) % CMD_RING;
     }
@@ -349,20 +354,26 @@ pub const Store = struct {
         if (s.cmd_tail == s.cmd_head) return null;
         const c = s.cmds[s.cmd_tail];
         s.cmd_tail = (s.cmd_tail + 1) % CMD_RING;
+        log.trace("store.popCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         return c;
     }
 
     /// UI thread: enqueue a command for the chat thread. Same drop-when-full discipline as pushCmd.
     pub fn pushChatCmd(s: *Store, c: ChatCommand) void {
+        log.trace("store.pushChatCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         s.lock();
         defer s.unlock();
-        if ((s.chat_cmd_head + 1) % CHAT_CMD_RING == s.chat_cmd_tail) return;
+        if ((s.chat_cmd_head + 1) % CHAT_CMD_RING == s.chat_cmd_tail) {
+            log.trace("store.pushChatCmd DROPPED (ring full)", .{});
+            return;
+        }
         s.chat_cmds[s.chat_cmd_head] = c;
         s.chat_cmd_head = (s.chat_cmd_head + 1) % CHAT_CMD_RING;
     }
 
     /// Record one completed turn's performance sample (chat worker → Metrics tab).
     pub fn pushMetric(s: *Store, m: TurnMetric) void {
+        log.trace("store.pushMetric kind={d} ok={} first_byte_ms={d} total_ms={d} tools={d}", .{ m.kind, m.ok, m.first_byte_ms, m.total_ms, m.tools });
         s.lock();
         defer s.unlock();
         s.turn_metrics[s.turn_metric_count % METRIC_RING] = m;
@@ -371,6 +382,7 @@ pub const Store = struct {
 
     /// Append `text` to a console scrollback (ai=Veil console, else You). Keeps the newest ~half on overflow.
     pub fn consoleAppend(s: *Store, ai: bool, text: []const u8) void {
+        log.trace("store.consoleAppend ai={} len={d}", .{ ai, text.len });
         s.lock();
         defer s.unlock();
         const buf = if (ai) &s.console_ai else &s.console_you;
@@ -393,11 +405,13 @@ pub const Store = struct {
         if (s.chat_cmd_tail == s.chat_cmd_head) return null;
         const c = s.chat_cmds[s.chat_cmd_tail];
         s.chat_cmd_tail = (s.chat_cmd_tail + 1) % CHAT_CMD_RING;
+        log.trace("store.popChatCmd kind={t} id={s}", .{ c.kind, c.idStr() });
         return c;
     }
 
     /// Poller thread: raise a notification. Overwrites the oldest when full.
     pub fn pushNotif(s: *Store, title: []const u8, body: []const u8, accent: u8) void {
+        log.trace("store.pushNotif title={s} accent={d}", .{ title, accent });
         s.lock();
         defer s.unlock();
         var n: Notif = .{ .accent = accent, .fresh = true };
@@ -419,6 +433,7 @@ pub const Store = struct {
 };
 
 pub fn mkCmd(kind: CmdKind, id: []const u8, text: []const u8) Command {
+    log.trace("store.mkCmd kind={t} id={s} text_len={d}", .{ kind, id, text.len });
     var c: Command = .{ .kind = kind };
     const il = @min(id.len, c.id.len);
     @memcpy(c.id[0..il], id[0..il]);
@@ -430,6 +445,7 @@ pub fn mkCmd(kind: CmdKind, id: []const u8, text: []const u8) Command {
 }
 
 pub fn mkChatCmd(kind: ChatCmdKind, id: []const u8, text: []const u8) ChatCommand {
+    log.trace("store.mkChatCmd kind={t} id={s} text_len={d}", .{ kind, id, text.len });
     var c: ChatCommand = .{ .kind = kind };
     const il = @min(id.len, c.id.len);
     @memcpy(c.id[0..il], id[0..il]);
