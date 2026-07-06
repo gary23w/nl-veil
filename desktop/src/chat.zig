@@ -262,6 +262,7 @@ pub const Chat = struct {
     veil_started: bool = false, //     the one veil-work turn has been kicked off (drives idle-after-start completion)
     veil_done: bool = false, //        the veil's own turn has fully settled — its solution is ready to compare
     in_veil_work: bool = false, //     the CURRENT turn is the veil-work turn -> its tools target veil_dir, not conv
+    veil_nudged: bool = false, //      the veil tried to CAST instead of working; re-issued once as a direct task
     cast_awaiting_merge: bool = false, // cast finished; waiting on veil_done to run the compare/merge
     veil_goal: [1600]u8 = undefined, // the cast goal the veil works in parallel
     veil_goal_len: usize = 0,
@@ -314,6 +315,7 @@ pub const Chat = struct {
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
             if (tick % 10 == 3) self.maybeCompareMerge(dd); // concurrent veil: fold both once cast + veil are done
+            if (tick % 20 == 11) self.refreshChatFiles(dd); // ~2s: publish this chat's build files for the Files tab
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
             tick +%= 1;
@@ -559,6 +561,8 @@ pub const Chat = struct {
                 .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
                 .loop_kick => self.maybeLoop(dd), // user just enabled auto-loop while idle → start it now
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
+                .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
+                .chat_open_folder => self.cmdChatOpenFolder(dd), // Files tab: open this chat's build folder in the OS
             }
         }
     }
@@ -990,6 +994,74 @@ pub const Chat = struct {
             }
             if (nn > 0) self.cmdSelectConv(dd, nid[0..nn]);
         }
+    }
+
+    // ---------------------------------------------------------------------- chat Files tab (this chat's own dir)
+
+    /// The data-relative build dir for THIS conversation ("u{uid}/_chat/builds/{conv}"); "" if no active conv.
+    /// The uid is taken from the leading "uN" segment of build_dir (set when a build tool ran) — defaults to u1,
+    /// which is the desktop's admin user on localhost.
+    fn chatBuildRel(self: *Chat, buf: []u8) []const u8 {
+        var cb: [40]u8 = undefined;
+        const conv = self.convScope(&cb);
+        if (conv.len == 0) return "";
+        var uid: []const u8 = "u1";
+        if (self.build_dir_len > 0) {
+            const bd = self.build_dir[0..self.build_dir_len];
+            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
+                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
+            }
+        }
+        return std.fmt.bufPrint(buf, "{s}/_chat/builds/{s}", .{ uid, conv }) catch "";
+    }
+
+    /// Scan this chat's own build dir ({conv}/work) and publish the file list into the Store for the Files tab.
+    /// Cheap (a manifest read + a shallow walk); called on a slow tick. No-op when there's no conv/build dir.
+    fn refreshChatFiles(self: *Chat, dd: []const u8) void {
+        var rb: [160]u8 = undefined;
+        const rel = self.chatBuildRel(&rb);
+        var n: usize = 0;
+        if (rel.len > 0) n = scan.listWorkFiles(self.io, self.gpa, dd, rel, &self.file_scratch);
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.chat_files[0..n], self.file_scratch[0..n]);
+        self.store.chat_file_count = n;
+    }
+
+    /// Load a chat build file's content into the Store for the viewer (row-click in the Files tab).
+    fn cmdChatOpenFile(self: *Chat, dd: []const u8, sub: []const u8) void {
+        if (sub.len == 0) return;
+        var rb: [160]u8 = undefined;
+        const rel = self.chatBuildRel(&rb);
+        if (rel.len == 0) return;
+        var buf: [1 << 14]u8 = undefined;
+        var trunc = false;
+        const n = scan.readWorkFile(self.io, self.gpa, dd, rel, sub, &buf, &trunc);
+        self.store.lock();
+        defer self.store.unlock();
+        const sl = @min(sub.len, self.store.chat_sel_file.len);
+        @memcpy(self.store.chat_sel_file[0..sl], sub[0..sl]);
+        self.store.chat_sel_file_len = sl;
+        @memcpy(self.store.chat_file_content[0..n], buf[0..n]);
+        self.store.chat_file_content_len = n;
+        self.store.chat_file_content_trunc = trunc;
+    }
+
+    /// Open this chat's build folder in the OS file browser (the "Open" button in the Files tab).
+    fn cmdChatOpenFolder(self: *Chat, dd: []const u8) void {
+        var rb: [160]u8 = undefined;
+        const rel = self.chatBuildRel(&rb);
+        if (rel.len == 0) return;
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/{s}/work", .{ dd, rel }) catch return;
+        // ensure it exists so explorer doesn't error on a chat that hasn't built anything yet
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, path, .default_dir) catch {};
+        const argv: []const []const u8 = switch (builtin.os.tag) {
+            .windows => &.{ "explorer.exe", "." },
+            .macos => &.{ "open", "." },
+            else => &.{ "xdg-open", "." },
+        };
+        _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
     pub fn cmdStopCast(self: *Chat, dd: []const u8, rel: []const u8) void {
@@ -1580,6 +1652,24 @@ pub const Chat = struct {
             const dirty = self.reflect_dirty;
             const final_ans = if (revised.len > 0) revised else self.reflect_draft[0..self.reflect_draft_len];
             log.info("reflect finalize: pass={d} dirty={} changed={} final_len={d}", .{ self.reflect_pass, dirty, changed, final_ans.len });
+            // If the self-check draft ITSELF emitted a tool call (e.g. the merge deciding to write_file), reflect
+            // turns are excluded from tool execution — so RUN it now (showing only the prose part) instead of
+            // dumping the raw TOOL:{content} blob as chat text.
+            if (self.tool_iters < MAX_TOOL_ITERS) {
+                if (toolCall(final_ans) orelse toolCallXml(final_ans)) |tc| {
+                    const prose = stripToolTail(final_ans);
+                    if (prose.len > 0) {
+                        if (dirty) self.appendMsg(dd, .cast_note, "revised after self-check:");
+                        self.appendVeil(dd, reason, prose);
+                    }
+                    self.reflect_draft_len = 0;
+                    self.reflect_pass = 0;
+                    self.reflect_dirty = false;
+                    self.tool_iters += 1;
+                    self.runToolAndContinue(dd, tc); // copies tc off the stream, frees it, re-enters .tool_follow
+                    return;
+                }
+            }
             if (dirty) {
                 self.appendMsg(dd, .cast_note, "revised after self-check:");
                 self.appendVeil(dd, reason, final_ans);
@@ -1593,6 +1683,28 @@ pub const Chat = struct {
             self.reflect_dirty = false;
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
+        } else if (self.in_veil_work and parseCastSpec(full) != null) {
+            // The veil tried to DELEGATE to a swarm instead of doing the work itself (common on research goals,
+            // since the system prompt encourages casting for current-events). Convert its intent into DIRECT work:
+            // re-issue the veil turn ONCE with a hard "no cast — do it yourself" instruction. If it casts again,
+            // give up its parallel attempt (the merge falls back to the hive).
+            self.stream.deinit(self.gpa);
+            if (!self.veil_nudged) {
+                self.veil_nudged = true;
+                self.tool_iters = 0;
+                var pb: [1800]u8 = undefined;
+                const p = std.fmt.bufPrint(&pb, "Do NOT cast — you have no swarm here, you ARE the worker. DO THE WORK YOURSELF NOW: call web_search then web_fetch on the best results to gather what you need (or write_file/run_python for a build), then write your result to a file in your workdir. Task: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "Do the work yourself now with web_search/write_file — do not cast.";
+                self.appendMsg(dd, .cast_note, "(the veil must work directly, not cast — retrying with its own tools)");
+                self.appendMsg(dd, .cast_note, p);
+                self.last_user_len = @min(p.len, self.last_user.len);
+                @memcpy(self.last_user[0..self.last_user_len], p[0..self.last_user_len]);
+                self.setStatus("veil working the goal directly...");
+                self.startTurn(dd, .user);
+                return;
+            }
+            self.appendMsg(dd, .cast_note, "(the veil kept trying to cast; using the hive's result for this one)");
+            self.setBusy(false);
+            return;
         } else if (parseCastSpec(full)) |spec| {
             var nb: [3072]u8 = undefined;
             const note = noteWithoutCast(full, &nb);
@@ -1745,7 +1857,12 @@ pub const Chat = struct {
 
     /// Append a veil message, prepending the model's reasoning (if any) as a capped markdown blockquote so
     /// the user can see how it thought. Reasoning is trimmed to leave room for the answer in the message.
-    fn appendVeil(self: *Chat, dd: []const u8, reasoning: []const u8, text: []const u8) void {
+    fn appendVeil(self: *Chat, dd: []const u8, reasoning: []const u8, text_raw: []const u8) void {
+        // Never let a raw TOOL:/RUN:/<tool:> call (esp. write_file{"content":<whole file>}) leak into the chat as
+        // visible text — that only happens when a reflect/collect turn re-emits a tool call it can't run; strip it
+        // so only the prose survives (the call itself runs in the tool loop + shows as a chip, or is dropped).
+        const text = stripToolTail(text_raw);
+        if (text.len == 0 and reasoning.len == 0) return; // nothing left to show
         if (reasoning.len == 0) {
             self.appendMsg(dd, .veil, text);
             return;
@@ -2208,6 +2325,7 @@ pub const Chat = struct {
         self.veil_started = false;
         self.veil_done = false;
         self.in_veil_work = false;
+        self.veil_nudged = false;
         self.cast_awaiting_merge = false;
     }
 
@@ -2222,12 +2340,13 @@ pub const Chat = struct {
         if (!self.veil_started) {
             self.veil_started = true;
             self.in_veil_work = true;
+            self.veil_nudged = false;
             self.tool_iters = 0;
             self.reflect_pass = 0;
             self.reflect_dirty = false;
             self.abort_turn.store(false, .monotonic);
             var pb: [1900]u8 = undefined;
-            const prompt = std.fmt.bufPrint(&pb, "[parallel] A hive of agents is working this same goal in the background right now. INDEPENDENTLY produce your OWN best solution to it — research with your tools, write real files to your workdir, and verify as needed. Be complete but concise; I'll compare your work against the hive's when it finishes. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Independently solve the cast goal yourself while the hive works it too.";
+            const prompt = std.fmt.bufPrint(&pb, "[parallel] You are the primary Veil, working ALONE and in parallel with a background hive. You do NOT have a cast/swarm tool here and you must NEVER output 'CAST:' — casting is disabled for you. Solve this goal YOURSELF, right now, with your OWN tools: for research, call web_search then web_fetch on the best results; for a build, use write_file/edit_file/run_python. Do the ACTUAL work and write your result to a file in your workdir. If you emit CAST: it is ignored and you fail this task. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Independently solve the cast goal yourself with your own tools (never CAST).";
             self.last_user_len = @min(prompt.len, self.last_user.len);
             @memcpy(self.last_user[0..self.last_user_len], prompt[0..self.last_user_len]);
             // a cast_note renders dim/distinct (not a fake user bubble) but still maps to a user turn in the prompt
@@ -2302,7 +2421,7 @@ pub const Chat = struct {
         // The merge runs as a normal .user turn (NOT .collect) so it can WRITE the merged result to the canonical
         // {conv}/work via write_file (collect turns are tool-free). in_veil_work is already false here, so the
         // tools target conv, not the veil dir. The directive is the last user message the turn responds to.
-        const directive = "Two independent solutions to the same goal now exist: YOUR OWN answer earlier in this conversation, and the HIVE's deliverable in the [compare] block above. Compare them honestly on correctness and completeness, then produce the FINAL best result - pick the stronger one or MERGE the strongest parts of each. Files/code are involved, so WRITE the merged result to your workdir with write_file (this is the canonical output the user keeps). Briefly note what each side contributed and why. Do not cast again.";
+        const directive = "Two independent solutions to the same goal now exist: YOUR OWN answer earlier in this conversation, and the HIVE's deliverable in the [compare] block above. Compare them honestly, then produce the FINAL best result - pick the stronger one or MERGE the strongest parts of each. IMPORTANT: if the best available result is INCOMPLETE or just a plan/stub, do NOT merely report that it fell short - FINISH the job yourself now with your own tools (web_search/web_fetch for research, write_file/run_python for a build) and deliver a complete result. Then WRITE the final result to your workdir with write_file (the canonical output the user keeps) and briefly note what each side contributed. Do not cast.";
         self.appendMsg(dd, .cast_note, directive);
         self.last_user_len = @min(directive.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], directive[0..self.last_user_len]);
@@ -2504,6 +2623,35 @@ fn isSmallTalk(msg: []const u8) bool {
 }
 
 pub const ToolCall = struct { name: []const u8, args: []const u8 };
+
+/// Cut a trailing TOOL:/RUN:/<tool:...> call out of DISPLAYED text and return only the prose before it. A tool
+/// call reaching a displayed answer means a reflect/collect turn re-emitted it as text (those turns can't run
+/// tools), so the huge write_file{"content":<file>} blob would otherwise dump into the chat. Conservative: a
+/// "TOOL:" line only counts as a call if a '{' follows it (real args), so a prose mention isn't clipped.
+pub fn stripToolTail(text: []const u8) []const u8 {
+    var cut = text.len;
+    // TOOL: <name> {args} may appear MID-LINE ("...let me write it now.TOOL: write_file {...}"), so search the
+    // whole text, not just line starts. Require a '{' after the tag so a prose mention of "TOOL:" isn't clipped.
+    if (std.mem.indexOf(u8, text, "TOOL:")) |p| {
+        if (std.mem.indexOfScalarPos(u8, text, p, '{') != null) cut = @min(cut, p);
+    }
+    if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
+    // RUN: <shell command> — only at a line start (a prose "RUN:" mid-sentence isn't a shell call).
+    {
+        var i: usize = 0;
+        while (i < text.len) {
+            const nl = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
+            const line = std.mem.trimStart(u8, text[i..nl], " \t");
+            if (std.mem.startsWith(u8, line, "RUN:") and line.len > 4) {
+                cut = @min(cut, i);
+                break;
+            }
+            if (nl >= text.len) break;
+            i = nl + 1;
+        }
+    }
+    return std.mem.trimEnd(u8, text[0..cut], " \r\n\t");
+}
 
 /// If a "TOOL: <name> <json-args>" line appears within the reply's first few substantive lines, return
 /// the tool name + its raw JSON args ("{}" when the model omits them). Same tolerance as castGoal: a short
@@ -2873,6 +3021,21 @@ fn wesc(w: *Io.Writer, s: []const u8) void {
             i += n;
         }
     }
+}
+
+test "stripToolTail removes a tool call (incl. mid-line) but keeps prose + prose mentions" {
+    // mid-line TOOL: (the real leak) — keep the prose before it
+    try std.testing.expectEqualStrings("I compared both. Let me write it now.", stripToolTail("I compared both. Let me write it now.TOOL: write_file {\"path\":\"x.md\",\"content\":\"# X\"}"));
+    // line-start TOOL:
+    try std.testing.expectEqualStrings("Here it is:", stripToolTail("Here it is:\nTOOL: write_file {\"path\":\"a\"}"));
+    // <tool:> XML form
+    try std.testing.expectEqualStrings("done", stripToolTail("done <tool:read_file>{\"path\":\"a\"}</tool:read_file>"));
+    // RUN: at line start
+    try std.testing.expectEqualStrings("run this", stripToolTail("run this\nRUN: python a.py"));
+    // a prose mention of TOOL: with no args is NOT clipped
+    try std.testing.expectEqualStrings("use the TOOL: menu to pick one", stripToolTail("use the TOOL: menu to pick one"));
+    // a plain answer is untouched
+    try std.testing.expectEqualStrings("just a normal answer", stripToolTail("just a normal answer"));
 }
 
 test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)" {

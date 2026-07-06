@@ -33,6 +33,8 @@ const TAB_H = 34;
 const InnerTab = enum { console, details, files };
 const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model };
 
+const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
+
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
     tab: Tab = .dashboard,
@@ -54,7 +56,8 @@ const Ui = struct {
     c_renaming: bool = false, // the active conversation's title is being edited in the left pane
     chat_scroll: f32 = 0,
     chat_follow: bool = true,
-    chat_metrics: bool = false, // center pane shows the Metrics view (perf graphs) instead of the conversation
+    chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
+    chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
     // Settings: chat model provider fields
     s_model: Field = .{},
     s_url: Field = .{},
@@ -1750,11 +1753,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
     const status_h: f32 = 20;
     const tab_h: f32 = 22;
-    // Chat | Metrics inner tabs (Metrics = live per-turn performance graphs for the current model)
-    if (t.tab(.{ .x = r.x, .y = r.y, .width = 86, .height = tab_h }, t.z("Chat", .{}), !ui.chat_metrics)) ui.chat_metrics = false;
-    if (t.tab(.{ .x = r.x + 90, .y = r.y, .width = 86, .height = tab_h }, t.z("Metrics", .{}), ui.chat_metrics)) ui.chat_metrics = true;
-    if (ui.chat_metrics) {
+    // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
+    if (t.tab(.{ .x = r.x, .y = r.y, .width = 86, .height = tab_h }, t.z("Chat", .{}), ui.chat_inner == .chat)) ui.chat_inner = .chat;
+    if (t.tab(.{ .x = r.x + 90, .y = r.y, .width = 86, .height = tab_h }, t.z("Metrics", .{}), ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
+    if (t.tab(.{ .x = r.x + 180, .y = r.y, .width = 86, .height = tab_h }, t.z("Files", .{}), ui.chat_inner == .files)) ui.chat_inner = .files;
+    if (ui.chat_inner == .metrics) {
         drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - tab_h - 2 });
+        return;
+    }
+    if (ui.chat_inner == .files) {
+        drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - tab_h - 2 });
         return;
     }
     const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - input_h - status_h - 10 - tab_h - 2 };
@@ -2689,6 +2697,95 @@ fn fmtSize(sz: u64) [:0]const u8 {
     if (sz < 1024) return t.z("{d}b", .{sz});
     if (sz < 1024 * 1024) return t.z("{d}k", .{sz / 1024});
     return t.z("{d}.{d}M", .{ sz / (1024 * 1024), (sz % (1024 * 1024)) / (105 * 1024) });
+}
+
+/// The Chat FILES inner tab — a two-pane viewer for the files THIS conversation built (its {conv}/work dir),
+/// mirroring the Swarm file viewer but fed by the chat worker's Store.chat_files channel. An "Open folder"
+/// button reveals the dir in the OS file browser. The chat worker owns the IO; this only reads the Store.
+fn drawChatFiles(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    const hdr_h: f32 = 26;
+    t.text(t.z("files built in this chat", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 13, t.comment);
+    if (t.button(.{ .x = r.x + r.width - 100, .y = r.y + 3, .width = 92, .height = 20 }, t.z("Open folder", .{}), t.blue, true)) {
+        store.pushChatCmd(store_mod.mkChatCmd(.chat_open_folder, "", ""));
+    }
+    const body = t.Rect{ .x = r.x, .y = r.y + hdr_h, .width = r.width, .height = r.height - hdr_h };
+    const list_w: f32 = @min(280, body.width * 0.38);
+    t.fillRect(@intFromFloat(body.x + list_w), @intFromFloat(body.y + 1), 1, @intFromFloat(body.height - 2), t.border);
+
+    store.lock();
+    const nfiles = store.chat_file_count;
+    var files: [scan.MAX_FILES]scan.FileRow = undefined;
+    @memcpy(files[0..nfiles], store.chat_files[0..nfiles]);
+    var selfile: [128]u8 = undefined;
+    const sfl = store.chat_sel_file_len;
+    @memcpy(selfile[0..sfl], store.chat_sel_file[0..sfl]);
+    const cl = store.chat_file_content_len;
+    var content: [1 << 14]u8 = undefined;
+    @memcpy(content[0..cl], store.chat_file_content[0..cl]);
+    const trunc = store.chat_file_content_trunc;
+    store.unlock();
+
+    // ---- left: file list ----
+    {
+        rl.beginScissorMode(@intFromFloat(body.x + 1), @intFromFloat(body.y + 1), @intFromFloat(list_w - 2), @intFromFloat(body.height - 2));
+        defer rl.endScissorMode();
+        if (nfiles == 0) {
+            t.text(t.z("no files built in this chat yet", .{}), @intFromFloat(body.x + 12), @intFromFloat(body.y + 12), 13, t.comment);
+        }
+        var yy: f32 = body.y + 6;
+        const row_h: f32 = 30;
+        var i: usize = 0;
+        while (i < nfiles and yy < body.y + body.height - 4) : (i += 1) {
+            const f = &files[i];
+            const rr = t.Rect{ .x = body.x + 5, .y = yy, .width = list_w - 10, .height = row_h - 4 };
+            const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
+            const hot = t.hovering(rr);
+            if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+            t.textClip(f.pathStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 3), 13, if (is_sel) t.fg else t.fg_dim, @intFromFloat(rr.width - 62));
+            t.textMono(fmtSize(f.size), @intFromFloat(rr.x + rr.width - 50), @intFromFloat(rr.y + 4), 11, t.comment);
+            if (hot and rl.isMouseButtonPressed(.left)) {
+                store.pushChatCmd(store_mod.mkChatCmd(.chat_open_file, "", f.pathStr()));
+                ui.chat_file_scroll = 0;
+            }
+            yy += row_h;
+        }
+    }
+
+    // ---- right: content ----
+    const cx = body.x + list_w + 12;
+    const cw = body.width - list_w - 20;
+    if (sfl == 0) {
+        t.text(t.z("select a file to view its contents", .{}), @intFromFloat(cx), @intFromFloat(body.y + 14), 13, t.comment);
+        return;
+    }
+    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(body.y + 10), 13, t.cyan, @intFromFloat(cw - 120));
+    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(body.y + 11), 11, t.orange);
+    const view = t.Rect{ .x = cx, .y = body.y + 30, .width = cw, .height = body.height - 40 };
+    rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
+    defer rl.endScissorMode();
+    const line_h: f32 = 17;
+    const visible: usize = @intFromFloat(view.height / line_h);
+    var total_lines: usize = 1;
+    for (content[0..cl]) |ch| {
+        if (ch == '\n') total_lines += 1;
+    }
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(view)) ui.chat_file_scroll -= wheel * 3;
+    if (ui.chat_file_scroll < 0) ui.chat_file_scroll = 0;
+    const maxs: f32 = if (total_lines > visible) @floatFromInt(total_lines - visible) else 0;
+    if (ui.chat_file_scroll > maxs) ui.chat_file_scroll = maxs;
+    const skip: usize = @intFromFloat(ui.chat_file_scroll);
+    var yy: f32 = view.y;
+    var it = std.mem.splitScalar(u8, content[0..cl], '\n');
+    var ln: usize = 0;
+    while (it.next()) |line| : (ln += 1) {
+        if (ln < skip) continue;
+        if (yy > view.y + view.height - line_h) break;
+        t.textMonoClip(line, @intFromFloat(view.x + 2), @intFromFloat(yy), 13, t.fg_dim, @intFromFloat(view.width - 6));
+        yy += line_h;
+    }
+    if (cl == 0) t.text(t.z("(empty or still being written)", .{}), @intFromFloat(view.x + 2), @intFromFloat(view.y), 12, t.comment);
 }
 
 fn kindColor(kind: []const u8) t.Color {
