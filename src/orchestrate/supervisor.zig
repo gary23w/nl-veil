@@ -103,6 +103,11 @@ pub const Supervisor = struct {
     io: std.Io,
     neuron_bin: []const u8,
     mu: std.Io.Mutex = .init,
+    // Serializes worker CreateProcess/spawn calls. On Windows, std.process.spawn calls CreateProcessW with
+    // bInheritHandles=TRUE and no HANDLE_LIST, so two spawns racing on different threads cross-inherit each
+    // other's inheritable pipe handles — which under a concurrent-cast burst wedged the pipe reads and hard-died
+    // the server. Spawns are ~2-6ms, so serializing them is negligible latency and closes the race.
+    launch_mu: std.Io.Mutex = .init,
     swarms: std.StringHashMapUnmanaged(*Swarm) = .empty,
     server_key: [32]u8 = undefined,
     parent_env: ?*const std.process.Environ.Map = null,
@@ -174,7 +179,11 @@ pub const Supervisor = struct {
     }
 
     pub fn spawn(self: *Supervisor, uid: u64, id: []const u8, name: []const u8, run_dir: []const u8, model: []const u8, minds: usize) !*Swarm {
-        const launched = try self.launch(run_dir, model);
+        const launched = blk: {
+            self.launch_mu.lockUncancelable(self.io); // serialize CreateProcess against concurrent spawns
+            defer self.launch_mu.unlock(self.io);
+            break :blk try self.launch(run_dir, model);
+        };
 
         const sw = try self.gpa.create(Swarm);
         sw.* = .{
@@ -210,7 +219,11 @@ pub const Supervisor = struct {
             run_dir = std.fmt.bufPrint(&rd_buf, "{s}", .{sw.run_dir}) catch return;
             model = std.fmt.bufPrint(&md_buf, "{s}", .{sw.model}) catch return;
         }
-        const launched = self.launch(run_dir, model) catch return;
+        const launched = blk: {
+            self.launch_mu.lockUncancelable(self.io); // serialize CreateProcess against concurrent spawns
+            defer self.launch_mu.unlock(self.io);
+            break :blk self.launch(run_dir, model) catch return;
+        };
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
