@@ -325,7 +325,24 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
             if (ce.kind != .directory or ce.name.len == 0 or ce.name[0] == '.') continue;
             var rbuf: [96]u8 = undefined;
             const rel = std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ name, ce.name }) catch continue;
-            _ = addSwarm(io, gpa, data_dir, rel, out, &n, now_s, live_window_s);
+            if (addSwarm(io, gpa, data_dir, rel, out, &n, now_s, live_window_s)) continue;
+            // A chat CAST builds in u<uid>/_chat/builds/<conv> (the v27 build-in-place change), which is one level
+            // deeper than a normal u<uid>/<hex> swarm — descend into _chat/builds/* so the chat can watch + collect
+            // its own casts (else it never sees the run dir and hangs on "watching").
+            if (std.mem.eql(u8, ce.name, "_chat")) {
+                var bbuf: [512]u8 = undefined;
+                const builds = std.fmt.bufPrint(&bbuf, "{s}/{s}/_chat/builds", .{ data_dir, name }) catch continue;
+                var bd = Io.Dir.cwd().openDir(io, builds, .{ .iterate = true }) catch continue;
+                defer bd.close(io);
+                var bit = bd.iterate();
+                while (n < out.len) {
+                    const be = (bit.next(io) catch break) orelse break;
+                    if (be.kind != .directory or be.name.len == 0 or be.name[0] == '.') continue;
+                    var r2: [96]u8 = undefined;
+                    const rel2 = std.fmt.bufPrint(&r2, "{s}/_chat/builds/{s}", .{ name, be.name }) catch continue;
+                    _ = addSwarm(io, gpa, data_dir, rel2, out, &n, now_s, live_window_s);
+                }
+            }
         }
     }
     // newest activity first
