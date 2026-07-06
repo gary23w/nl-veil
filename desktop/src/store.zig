@@ -162,7 +162,7 @@ pub const ConvRow = struct {
     }
 };
 
-pub const CastStatus = enum(u8) { deploying, running, collecting, done, failed };
+pub const CastStatus = enum(u8) { deploying, running, collecting, comparing, merging, done, failed };
 
 /// One swarm cast fired from the chat, for the right-hand activity pane.
 pub const CastRow = struct {

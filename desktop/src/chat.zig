@@ -150,6 +150,11 @@ const REFLECT_PASSES: u8 = 1; // >0 enables the loop; the depth is bounded by RE
 const REFLECT_MAX_PASSES: u8 = 3; // hard ceiling on self-check iterations (each is one model call)
 const REFLECT_MIN_ANSWER: usize = 500;
 
+// Concurrent Veil: while a cast runs, the primary Veil ALSO solves the goal itself, then compares + merges the
+// two solutions when the hive finishes. Costs extra model calls per cast (the veil's own attempt), so it's a
+// single flag to disable if a run should be cast-only.
+const CONCURRENT_VEIL: bool = true;
+
 // ---- micro-console (dual-tab shell) ---------------------------------------------------------------------
 // A shell command MUST NOT run inline on this worker thread: a hang (a dev server, `ping -t`, a REPL) would
 // freeze chat turns AND cast-watching until it returned. Instead a command runs as an INDEPENDENT OS process
@@ -249,6 +254,20 @@ pub const Chat = struct {
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
     ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
 
+    // CONCURRENT VEIL: while a hive cast runs, the primary Veil independently solves the SAME goal in its own
+    // isolated workdir; when the cast finishes, the two solutions are compared and the best is merged into the
+    // canonical conv workdir. Isolation dirs: hive -> _chat/builds/{conv}-hive/work, veil -> {conv}-veil/work,
+    // merged winner -> {conv}/work (the dir the chat's own build tools + console use).
+    veil_work_active: bool = false, // a parallel veil build is running the cast's goal
+    veil_started: bool = false, //     the one veil-work turn has been kicked off (drives idle-after-start completion)
+    veil_done: bool = false, //        the veil's own turn has fully settled — its solution is ready to compare
+    in_veil_work: bool = false, //     the CURRENT turn is the veil-work turn -> its tools target veil_dir, not conv
+    cast_awaiting_merge: bool = false, // cast finished; waiting on veil_done to run the compare/merge
+    veil_goal: [1600]u8 = undefined, // the cast goal the veil works in parallel
+    veil_goal_len: usize = 0,
+    veil_dir: [96]u8 = undefined, // the veil's isolated build seg ("{conv}-veil")
+    veil_dir_len: usize = 0,
+
     // HIPPOCAMPUS — the chat's own neuron-db (gpa-owned; "" = disabled → all memory ops no-op)
     mind_bin: []const u8 = "",
     mind_db: []const u8 = "",
@@ -293,6 +312,8 @@ pub const Chat = struct {
             // chat is genuinely idle with something to continue from, so this can't run away or double-fire).
             if (tick % 10 == 5) self.maybeLoop(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
+            if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
+            if (tick % 10 == 3) self.maybeCompareMerge(dd); // concurrent veil: fold both once cast + veil are done
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
             tick +%= 1;
@@ -523,8 +544,12 @@ pub const Chat = struct {
             switch (c.kind) {
                 .none => {},
                 .send => self.cmdSend(dd, c.textStr()),
-                .new_conv => self.cmdNewConv(dd),
-                .select_conv => self.cmdSelectConv(dd, c.idStr()),
+                // Guard a chat switch/new-chat while ANY work is pending (a streaming reply, a running cast, or an
+                // AI console command): switching would repoint conv_active and the settling output would land in —
+                // and overwrite — the wrong chat (the "old chat bleeds into the new chat" bug). Mirror the
+                // cmdDeleteConv precedent: refuse with a clear notice instead of corrupting state.
+                .new_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before starting a new chat", 2) else self.cmdNewConv(dd),
+                .select_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before switching chats", 2) else self.cmdSelectConv(dd, c.idStr()),
                 .rename_conv => self.cmdRenameConv(dd, c.idStr(), c.textStr()),
                 .delete_conv => self.cmdDeleteConv(dd, c.idStr()),
                 .stop_cast => self.cmdStopCast(dd, c.idStr()),
@@ -548,6 +573,23 @@ pub const Chat = struct {
     /// (busy is true, turn is idle) — new turns/loops must not start over it.
     fn consoleAiBusy(self: *Chat) bool {
         return if (self.console) |*p| p.ai else false;
+    }
+
+    /// Is there work in flight that a chat switch/new-chat would corrupt (a live model turn, a running cast, or an
+    /// AI console command)? Any settling output resolves its target conversation from conv_active at write time, so
+    /// repointing it mid-flight misroutes the reply — refuse the switch while this is true.
+    fn busyForSwitch(self: *Chat) bool {
+        // Also block during the WHOLE concurrent-veil window: castFinished flips cast_active false while the merge
+        // is still pending (cast_awaiting_merge) and the veil turn may still be running (veil_work_active). A switch
+        // in those idle gaps would repoint conv_active and the settling veil/merge appends would overwrite the
+        // newly-selected chat. Mirror maybeLoop's guard.
+        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_merge;
+    }
+
+    /// Is a cast in flight anywhere in its lifecycle (deploying/running, or the concurrent-veil parallel attempt /
+    /// pending compare-merge)? Used to refuse a SECOND cast that would clobber the first's pending merge state.
+    fn castPending(self: *Chat) bool {
+        return self.cast_active or self.cast_awaiting_merge or self.veil_work_active;
     }
 
     /// A user-typed / AI-issued micro-console command (the "You"/"Veil" tab). Launches it asynchronously via
@@ -800,7 +842,13 @@ pub const Chat = struct {
     }
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
-        if (text.len == 0 or self.turn != .idle or self.consoleAiBusy()) return; // AI RUN: still in flight
+        if (text.len == 0) return;
+        if (self.turn != .idle or self.consoleAiBusy()) {
+            // Don't silently drop the message (the "new chat fails to deploy / nothing happens" report) — tell the
+            // user why. Sending DURING a cast is fine (cast_active isn't blocked here); only a live turn/console is.
+            self.store.pushNotif("Busy", "finish or Stop the current reply before sending", 2);
+            return;
+        }
         // a conversation's FIRST message names it — whether the user typed straight away (auto-create)
         // or clicked + first (the "new chat" placeholder title gets replaced here).
         var have_conv = false;
@@ -865,7 +913,7 @@ pub const Chat = struct {
     }
 
     fn cmdSelectConv(self: *Chat, dd: []const u8, id: []const u8) void {
-        if (id.len == 0 or self.turn != .idle) return;
+        if (id.len == 0) return; // busy-guard is at the .select_conv dispatch (busyForSwitch), which also notifies
         {
             self.store.lock();
             defer self.store.unlock();
@@ -949,6 +997,7 @@ pub const Chat = struct {
         _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
         self.store.pushNotif("Stop sent", rel, 2);
         self.cast_stop_sent = true;
+        self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending merge
     }
 
     fn cmdSaveKey(self: *Chat, dd: []const u8, key: []const u8) void {
@@ -1330,7 +1379,7 @@ pub const Chat = struct {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Self-critique pass. Review the draft above as if it were someone else's work you must catch mistakes in: check the logic and facts for errors, look for missing steps, unstated assumptions, unhandled edge cases, and unclear structure. If a claim is uncertain, hedge it or note it. Fix everything you find and make it sharper. If the draft is ALREADY correct and complete, return it exactly unchanged. Return ONLY the final answer text — no meta-commentary, no 'here is the revision', no TOOL: or CAST:.\"}") catch return;
         }
         if (kind == .collect) {
-            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. Using the [cast] findings above, give the user a direct, complete answer to their original request. Do not cast again.\"}") catch return;
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"The cast has finished. The files listed above are WHATEVER the hive actually produced - their names may NOT match what the goal asked for (a file called COORDINATOR_PLAN.md or research.py might be the real deliverable, or a goal-named file might be missing). INVENTORY the files, judge which ones actually answer the user's original request, and compose your answer STRICTLY from their real content shown above - never invent content and never claim a file exists that isn't listed. If the goal asked for specific files that aren't present, say so plainly and point to the odd-named files that cover (or fail to cover) that need. Do not cast again.\"}") catch return;
         }
         if (kind == .loop_infer) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Output the next message to send now (or exactly DONE if the goal is already complete). Reply with only that message text.\"}") catch return;
@@ -1547,14 +1596,17 @@ pub const Chat = struct {
         } else if (parseCastSpec(full)) |spec| {
             var nb: [3072]u8 = undefined;
             const note = noteWithoutCast(full, &nb);
-            if (self.cast_active) {
+            // Refuse a second cast not just while one is ACTIVE but through the whole concurrent-veil pipeline
+            // (awaiting-merge / veil still working) — a new cast there would reset cast_rel + the veil fields and
+            // silently clobber the pending compare/merge of the first cast.
+            if (self.castPending()) {
                 self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
             } else {
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, spec);
             }
-        } else if (kind == .user and !self.cast_active and userWantsCast(self.last_user[0..self.last_user_len])) {
+        } else if (kind == .user and !self.castPending() and userWantsCast(self.last_user[0..self.last_user_len])) {
             // The user EXPLICITLY asked to cast but the model didn't emit a CAST line (gpt-oss commonly
             // leaves `content` empty, putting everything in its hidden reasoning). Honor the request:
             // cast using the user's own words as the goal so an explicit "cast a swarm to X" always fires.
@@ -1590,7 +1642,9 @@ pub const Chat = struct {
     /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
     /// (no in-flight turn, no running cast). Called at the settle point and on a fresh toggle-on (.loop_kick).
     fn maybeLoop(self: *Chat, dd: []const u8) void {
-        if (self.turn != .idle or self.cast_active or self.consoleAiBusy()) return; // wait for casts/turns/console
+        // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending merge (else auto-loop
+        // would grab the shared turn slot out from under the veil work / merge).
+        if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_merge) return;
         const on = blk: {
             self.store.lock();
             defer self.store.unlock();
@@ -1662,6 +1716,10 @@ pub const Chat = struct {
         self.reflect_pass = 0; // abandon any pending self-critique iteration
         self.reflect_dirty = false;
         self.reflect_draft_len = 0;
+        // Abandon any concurrent-veil parallel work + pending compare/merge. Without this, in_veil_work could stay
+        // TRUE and a later normal turn would write its files into the isolated {conv}-veil dir (lost work), and a
+        // pending merge would fire behind the Stop. The hive's own output stays saved (viewable in the Swarm tab).
+        self.resetVeilWork();
         if (self.turn != .idle) {
             llm.abort(&self.stream, self.io);
             self.stream.deinit(self.gpa);
@@ -1736,6 +1794,13 @@ pub const Chat = struct {
         // (and the desktop console) use — not a throwaway `{hex}/work` the chat can never see.
         var convb: [96]u8 = undefined;
         const conv = self.convScope(&convb);
+        // Concurrent Veil: give the HIVE its own isolated build dir ("{conv}-hive") so it can't clobber the Veil's
+        // parallel build ("{conv}-veil"); after the cast, the compare/merge step writes the winner into the
+        // canonical "{conv}/work". '-' is allowed by the server's safeConv, so no server change is needed. When
+        // concurrent-veil is off (or there's no conv), fall back to the classic co-edit dir = conv.
+        var hive_db: [96]u8 = undefined;
+        const use_veil = CONCURRENT_VEIL and conv.len > 0 and conv.len + 5 <= self.cast_conv.len;
+        const hive_dir = if (use_veil) (std.fmt.bufPrint(&hive_db, "{s}-hive", .{conv}) catch conv) else conv;
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
         const minutes: u32 = if (spec.minutes > 0) std.math.clamp(spec.minutes, 1, 120) else if (spec.long) 20 else CAST_MINUTES;
         const mode: []const u8 = if (spec.long) "continuous" else "cast";
@@ -1777,7 +1842,7 @@ pub const Chat = struct {
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
             w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"dir\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
-            wesc(&w, conv);
+            wesc(&w, hive_dir); // the hive builds in {conv}-hive (isolated) when concurrent-veil is on, else {conv}
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
             w.writeAll("\",\"goal\":\"") catch break :blk false;
@@ -1834,11 +1899,25 @@ pub const Chat = struct {
         self.cast_hex_len = @min(hex.len, self.cast_hex.len);
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
-        // the cast builds in this conversation's dir (_chat/builds/<conv>); remember <conv> so watchCast can find
-        // the run dir (its basename is <conv>, not the hex id). `conv` is the convScope captured above in fireCast.
-        self.cast_conv_len = @min(conv.len, self.cast_conv.len);
-        @memcpy(self.cast_conv[0..self.cast_conv_len], conv[0..self.cast_conv_len]);
+        // the cast builds in this conversation's dir (_chat/builds/<hive_dir>); remember it so watchCast can find
+        // the run dir (its basename is <hive_dir>, not the hex id). <hive_dir> is {conv}-hive when concurrent-veil
+        // is on, else {conv}.
+        self.cast_conv_len = @min(hive_dir.len, self.cast_conv.len);
+        @memcpy(self.cast_conv[0..self.cast_conv_len], hive_dir[0..self.cast_conv_len]);
         self.cast_deadline_s = self.nowS() + @as(i64, self.cast_minutes) * 60 + 120;
+        // Concurrent-Veil: kick off the primary Veil's own parallel attempt at the SAME goal (in {conv}-veil). The
+        // tick loop's maybeVeilWork drives it; when the cast finishes, maybeCompareMerge folds both in.
+        if (use_veil) {
+            self.veil_goal_len = @min(goal.len, self.veil_goal.len);
+            @memcpy(self.veil_goal[0..self.veil_goal_len], goal[0..self.veil_goal_len]);
+            const vd = std.fmt.bufPrint(&self.veil_dir, "{s}-veil", .{conv}) catch "";
+            self.veil_dir_len = vd.len;
+            self.veil_work_active = self.veil_dir_len > 0;
+            self.veil_started = false;
+            self.veil_done = false;
+            self.in_veil_work = false;
+            self.cast_awaiting_merge = false;
+        }
         var gb: [200]u8 = undefined;
         const note = std.fmt.bufPrint(&gb, "[cast] hive deployed ({s}) — watching", .{hex}) catch "[cast] hive deployed";
         self.appendMsg(dd, .cast_note, note);
@@ -1917,9 +1996,11 @@ pub const Chat = struct {
             @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
         }
 
-        // the active conversation id → a per-conversation build workdir the server writes into + the console cd's to
+        // the active conversation id → a per-conversation build workdir the server writes into + the console cd's to.
+        // While the veil works its PARALLEL attempt (in_veil_work), redirect its tools to the isolated {conv}-veil
+        // dir so it can't clobber the hive's {conv}-hive tree.
         var convb: [40]u8 = undefined;
-        const conv = self.convScope(&convb);
+        const conv = if (self.in_veil_work and self.veil_dir_len > 0) self.veil_dir[0..self.veil_dir_len] else self.convScope(&convb);
 
         // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call
         // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
@@ -2082,8 +2163,8 @@ pub const Chat = struct {
         }
 
         if (m.stopped) {
-            // a user turn may still be streaming — keep cast_active and collect on a later tick
-            if (self.turn == .idle) self.collectCast(dd, rel, &m, ev_n);
+            // a user (or the veil-work) turn may still be streaming — collect/merge on a later idle tick
+            if (self.turn == .idle) self.castFinished(dd, rel, &m, ev_n);
             return;
         }
         if (now > self.cast_deadline_s) {
@@ -2094,9 +2175,22 @@ pub const Chat = struct {
                 self.updateCastRow(.collecting, m.round, m.pct, last, rel);
                 self.setStatus("asking the hive to stop...");
             } else if (self.turn == .idle) {
-                // it never stopped cleanly — collect what exists
-                self.collectCast(dd, rel, &m, ev_n);
+                // it never stopped cleanly — collect/merge what exists
+                self.castFinished(dd, rel, &m, ev_n);
             }
+        }
+    }
+
+    /// The hive cast has finished. In concurrent-veil mode, defer to the compare/merge (which waits until the
+    /// Veil's own parallel attempt is also done); otherwise collect the hive result directly (the classic path).
+    fn castFinished(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
+        if (CONCURRENT_VEIL and self.veil_work_active) {
+            self.cast_active = false;
+            self.cast_awaiting_merge = true;
+            self.updateCastRow(.comparing, m.round, m.pct, "", rel);
+            self.setStatus("hive done - waiting on the veil's own attempt...");
+        } else {
+            self.collectCast(dd, rel, m, ev_n);
         }
     }
 
@@ -2104,25 +2198,142 @@ pub const Chat = struct {
         self.appendMsg(dd, .cast_note, msg);
         self.updateCastRow(.failed, 0, -1, "", self.cast_hex[0..self.cast_hex_len]);
         self.cast_active = false;
+        self.resetVeilWork(); // abandon any parallel veil attempt + pending merge
         self.setStatus("");
+    }
+
+    /// Clear all concurrent-veil state (on cast failure/stop, or after a merge completes).
+    fn resetVeilWork(self: *Chat) void {
+        self.veil_work_active = false;
+        self.veil_started = false;
+        self.veil_done = false;
+        self.in_veil_work = false;
+        self.cast_awaiting_merge = false;
+    }
+
+    /// CONCURRENT VEIL driver (tick loop): while a cast runs, kick off the primary Veil's OWN attempt at the same
+    /// goal once, in its isolated {conv}-veil workdir; then — once that turn has fully settled — mark it done so
+    /// the compare/merge can run. Completion is detected as "we started it AND we're idle again" (tool/console
+    /// re-entry is synchronous within a tick, and this runs after pumpStream+pumpConsole, so a mid-chain idle is
+    /// never observed).
+    fn maybeVeilWork(self: *Chat, dd: []const u8) void {
+        if (!CONCURRENT_VEIL or !self.veil_work_active or self.veil_done) return;
+        if (self.turn != .idle or self.consoleAiBusy()) return; // never contend with a live turn/console
+        if (!self.veil_started) {
+            self.veil_started = true;
+            self.in_veil_work = true;
+            self.tool_iters = 0;
+            self.reflect_pass = 0;
+            self.reflect_dirty = false;
+            self.abort_turn.store(false, .monotonic);
+            var pb: [1900]u8 = undefined;
+            const prompt = std.fmt.bufPrint(&pb, "[parallel] A hive of agents is working this same goal in the background right now. INDEPENDENTLY produce your OWN best solution to it — research with your tools, write real files to your workdir, and verify as needed. Be complete but concise; I'll compare your work against the hive's when it finishes. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Independently solve the cast goal yourself while the hive works it too.";
+            self.last_user_len = @min(prompt.len, self.last_user.len);
+            @memcpy(self.last_user[0..self.last_user_len], prompt[0..self.last_user_len]);
+            // a cast_note renders dim/distinct (not a fake user bubble) but still maps to a user turn in the prompt
+            self.appendMsg(dd, .cast_note, prompt);
+            self.setStatus("veil working the goal in parallel...");
+            self.startTurn(dd, .user);
+            return;
+        }
+        // veil_started AND idle again => the veil-work turn (and its whole tool/reflect chain) has settled.
+        self.in_veil_work = false;
+        self.veil_done = true;
+        log.info("concurrent-veil: the veil's own attempt settled; ready to compare", .{});
+    }
+
+    /// Append a build tree's file contents into `jb`, budget-bounded (skips synthesis.md — shown separately).
+    fn foldTree(self: *Chat, dd: []const u8, jb: *std.ArrayListUnmanaged(u8), rel: []const u8, budget: usize) void {
+        const fn_ = scan.listWorkFiles(self.io, self.gpa, dd, rel, &self.file_scratch);
+        if (fn_ == 0) {
+            jb.appendSlice(self.gpa, "\n(no files)") catch {};
+            return;
+        }
+        var used: usize = 0;
+        var i: usize = 0;
+        while (i < fn_ and used < budget) : (i += 1) {
+            const path = self.file_scratch[i].pathStr();
+            if (std.mem.eql(u8, path, "synthesis.md")) continue;
+            const allow = @min(budget - used, 2200);
+            if (allow < 80) break;
+            const buf = self.gpa.alloc(u8, allow) catch break;
+            defer self.gpa.free(buf);
+            var trunc = false;
+            const cn = scan.readWorkFile(self.io, self.gpa, dd, rel, path, buf, &trunc);
+            if (cn == 0) continue;
+            jb.print(self.gpa, "\n--- {s} ({d}b) ---\n{s}{s}", .{ path, self.file_scratch[i].size, buf[0..cn], if (trunc) "\n[...]" else "" }) catch {};
+            used += cn;
+        }
+    }
+
+    /// CONCURRENT VEIL merge (tick loop): once the cast finished AND the veil's own attempt settled, fold BOTH
+    /// deliverables into a [compare] digest and run a merge turn that judges/merges them and writes the winner
+    /// into the canonical {conv}/work (the merge turn's tools use conv, since in_veil_work is now false).
+    fn maybeCompareMerge(self: *Chat, dd: []const u8) void {
+        if (!self.cast_awaiting_merge or !self.veil_done) return;
+        if (self.turn != .idle or self.consoleAiBusy()) return;
+        self.cast_awaiting_merge = false;
+        self.veil_work_active = false;
+        self.updateCastRow(.merging, 0, -1, "comparing + merging", "");
+        const hive_rel = self.cast_rel[0..self.cast_rel_len];
+        var vrb: [128]u8 = undefined;
+        const veil_rel: []const u8 = if (std.mem.endsWith(u8, hive_rel, "-hive"))
+            (std.fmt.bufPrint(&vrb, "{s}-veil", .{hive_rel[0 .. hive_rel.len - 5]}) catch "")
+        else
+            "";
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        jb.appendSlice(self.gpa, "[compare] The hive finished. Two independent attempts at the same goal now exist: YOUR OWN answer (in the conversation above) and the HIVE's deliverable below.\n\n=== HIVE DELIVERABLE ===") catch {};
+        {
+            var sbuf: [3500]u8 = undefined;
+            var st = false;
+            const sn = scan.readWorkFile(self.io, self.gpa, dd, hive_rel, "synthesis.md", &sbuf, &st);
+            if (sn > 0) {
+                jb.appendSlice(self.gpa, "\nsynthesis.md:\n") catch {};
+                jb.appendSlice(self.gpa, sbuf[0..sn]) catch {};
+                if (st) jb.appendSlice(self.gpa, "\n[...]") catch {};
+            }
+        }
+        self.foldTree(dd, &jb, hive_rel, 4000);
+        jb.appendSlice(self.gpa, "\n\n=== VEIL'S OWN FILES (from its parallel build; its written answer is in the chat above) ===") catch {};
+        if (veil_rel.len > 0) self.foldTree(dd, &jb, veil_rel, 4000) else jb.appendSlice(self.gpa, "\n(no separate files)") catch {};
+        const digest = jb.items[0..@min(jb.items.len, 12200)];
+        self.appendMsg(dd, .cast_note, digest);
+        // The merge runs as a normal .user turn (NOT .collect) so it can WRITE the merged result to the canonical
+        // {conv}/work via write_file (collect turns are tool-free). in_veil_work is already false here, so the
+        // tools target conv, not the veil dir. The directive is the last user message the turn responds to.
+        const directive = "Two independent solutions to the same goal now exist: YOUR OWN answer earlier in this conversation, and the HIVE's deliverable in the [compare] block above. Compare them honestly on correctness and completeness, then produce the FINAL best result - pick the stronger one or MERGE the strongest parts of each. Files/code are involved, so WRITE the merged result to your workdir with write_file (this is the canonical output the user keeps). Briefly note what each side contributed and why. Do not cast again.";
+        self.appendMsg(dd, .cast_note, directive);
+        self.last_user_len = @min(directive.len, self.last_user.len);
+        @memcpy(self.last_user[0..self.last_user_len], directive[0..self.last_user_len]);
+        self.tool_iters = 0;
+        self.reflect_pass = 0;
+        self.reflect_dirty = false;
+        self.abort_turn.store(false, .monotonic); // the merge is a fresh deliberate turn — clear any stale Stop
+        self.setStatus("comparing + merging the two solutions...");
+        self.startTurn(dd, .user);
     }
 
     /// Fold the finished cast into the conversation as a [cast] findings digest, then ask the model to
     /// answer from it.
     fn collectCast(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         self.cast_active = false;
+        self.abort_turn.store(false, .monotonic); // the collect is a fresh deliberate turn — a stale Stop (from the
+        // input's Stop button during the cast) must not abort composing the cast's answer.
         self.updateCastRow(.done, m.round, m.pct, "", rel);
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         jb.print(self.gpa, "[cast] finished run {s}: rounds {d}, score {d}% (best {d}%)", .{ rel, m.round, if (m.pct < 0) 0 else m.pct, m.best_pct }) catch return;
         if (m.stop_reason_len > 0) jb.print(self.gpa, ", stopped: {s}", .{m.stop_reason[0..m.stop_reason_len]}) catch {};
-        // built files
+        // FULL inventory of EVERY file the hive produced (any name, nested, manifest or not — listWorkFiles now
+        // unions the manifest with a recursive work/ walk). The hive often writes oddly-named files that don't
+        // match the goal's expected names, so the model must see the COMPLETE set and judge relevance itself.
         const fn_ = scan.listWorkFiles(self.io, self.gpa, dd, rel, &self.file_scratch);
         if (fn_ > 0) {
-            jb.appendSlice(self.gpa, "\nfiles built:") catch {};
+            jb.print(self.gpa, "\nfiles the hive produced ({d}) — names may NOT match what you'd expect:", .{fn_}) catch {};
             var i: usize = 0;
-            while (i < @min(fn_, 20)) : (i += 1) {
-                jb.print(self.gpa, " {s}({d}b)", .{ self.file_scratch[i].pathStr(), self.file_scratch[i].size }) catch {};
+            while (i < fn_) : (i += 1) {
+                jb.print(self.gpa, "\n  - {s} ({d}b)", .{ self.file_scratch[i].pathStr(), self.file_scratch[i].size }) catch {};
             }
         }
         // the tail of what the hive said/did (for a research cast, scout_learn notes carry the findings)
@@ -2135,28 +2346,36 @@ pub const Chat = struct {
                 jb.print(self.gpa, "\n- {s} {s}: {s}", .{ e.kindStr(), e.mindStr(), e.textStr() }) catch {};
             }
         }
-        // THE CAST'S ANSWER: the lead's synthesis.md is the composed result of the whole team's web research
-        // — surface it FIRST and nearly in full (a cast is judged by this, not by scraps of intermediate
-        // files). Only if there is no synthesis do we fall back to RAGing the top built files. The full run
-        // (every file, event, memory) stays saved under <data>/<rel> and reopens from the Swarm tab.
-        var sbuf: [2600]u8 = undefined;
-        var strunc = false;
-        const sn = scan.readWorkFile(self.io, self.gpa, dd, rel, "synthesis.md", &sbuf, &strunc);
-        if (sn > 0) {
-            jb.appendSlice(self.gpa, "\n\n=== THE CAST'S ANSWER (the lead composed this from the team's web research — cite its sources) ===\n") catch {};
-            jb.appendSlice(self.gpa, sbuf[0..sn]) catch {};
-            if (strunc) jb.appendSlice(self.gpa, "\n[...full report saved in the run dir]") catch {};
-        } else if (fn_ > 0) {
-            var fi: usize = 0;
-            var shown: usize = 0;
-            while (fi < fn_ and shown < 2) : (fi += 1) {
-                var cbuf: [1400]u8 = undefined;
-                var trunc = false;
-                const cn = scan.readWorkFile(self.io, self.gpa, dd, rel, self.file_scratch[fi].pathStr(), &cbuf, &trunc);
-                if (cn == 0) continue;
-                jb.print(self.gpa, "\n\n--- {s} ---\n{s}{s}", .{ self.file_scratch[fi].pathStr(), cbuf[0..cn], if (trunc) "\n[...truncated; full file saved in the run dir]" else "" }) catch {};
-                shown += 1;
+        // CONTENT: surface synthesis.md first (the lead's own summary), then the ACTUAL CONTENT of every other
+        // file up to a byte budget — so the model can reiterate from whatever the odd-named files really contain
+        // instead of assuming the goal's file names were used. Read into a budget-sized heap buffer (not tiny
+        // stack buffers) so a large deliverable isn't double-truncated. The full run stays saved under <data>/<rel>.
+        const CONTENT_BUDGET: usize = 9000;
+        var used: usize = 0;
+        {
+            var sbuf: [4500]u8 = undefined;
+            var strunc = false;
+            const sn = scan.readWorkFile(self.io, self.gpa, dd, rel, "synthesis.md", &sbuf, &strunc);
+            if (sn > 0) {
+                jb.appendSlice(self.gpa, "\n\n=== synthesis.md (the lead's own summary of the run) ===\n") catch {};
+                jb.appendSlice(self.gpa, sbuf[0..sn]) catch {};
+                if (strunc) jb.appendSlice(self.gpa, "\n[...truncated; full file in the run dir]") catch {};
+                used += sn;
             }
+        }
+        var fi: usize = 0;
+        while (fi < fn_ and used < CONTENT_BUDGET) : (fi += 1) {
+            const path = self.file_scratch[fi].pathStr();
+            if (std.mem.eql(u8, path, "synthesis.md")) continue; // already shown
+            const allow = @min(CONTENT_BUDGET - used, 2400); // per-file cap so one big file can't crowd out the rest
+            if (allow < 80) break;
+            const buf = self.gpa.alloc(u8, allow) catch break;
+            defer self.gpa.free(buf);
+            var trunc = false;
+            const cn = scan.readWorkFile(self.io, self.gpa, dd, rel, path, buf, &trunc);
+            if (cn == 0) continue;
+            jb.print(self.gpa, "\n\n--- {s} ({d}b) ---\n{s}{s}", .{ path, self.file_scratch[fi].size, buf[0..cn], if (trunc) "\n[...truncated; full file in the run dir]" else "" }) catch {};
+            used += cn;
         }
         jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab)", .{rel}) catch {};
         // Keep as much of the digest as the ChatMsg buffer (12288b) holds — the synthesis IS the answer, so

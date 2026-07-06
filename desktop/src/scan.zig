@@ -453,25 +453,67 @@ pub fn listWorkFiles(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: 
             out[n] = f;
             n += 1;
         }
-        if (n > 0) return n;
     } else |_| {}
-    // fallback: walk work/ names (flat) when the manifest isn't written yet
+    // UNION with a recursive filesystem walk: the manifest only records files written through write_file, and
+    // only flat — but a hive can produce oddly-named or NESTED files (research/RESEARCH_AMERICAS.md) or files
+    // created some other way. Walk work/ so collect sees EVERYTHING actually on disk, not just manifest rows.
     const wp = std.fmt.allocPrint(gpa, "{s}/{s}/work", .{ data_dir, rel }) catch return n;
     defer gpa.free(wp);
-    var wd = Io.Dir.cwd().openDir(io, wp, .{ .iterate = true }) catch return n;
-    defer wd.close(io);
-    var wit = wd.iterate();
-    while (n < out.len) {
-        const e = (wit.next(io) catch break) orelse break;
-        if (e.kind != .file or e.name.len == 0 or e.name[0] == '.') continue;
-        var f: FileRow = .{};
-        const pn = @min(e.name.len, f.path.len);
-        @memcpy(f.path[0..pn], e.name[0..pn]);
-        f.path_len = @intCast(pn);
-        out[n] = f;
-        n += 1;
-    }
+    walkWork(io, gpa, wp, "", out, &n, 0);
     return n;
+}
+
+/// Recursively add every file under `work_root`/`prefix` (work-relative sub-path, '/'-joined) into `out`,
+/// skipping dotfiles / __pycache__ / *.pyc and files already present (from the manifest). Bounded depth so a
+/// pathological tree can't spin. Missing dir -> no-op. Sizes come from statFile.
+fn walkWork(io: Io, gpa: std.mem.Allocator, work_root: []const u8, prefix: []const u8, out: []FileRow, n: *usize, depth: u8) void {
+    if (n.* >= out.len or depth > 4) return;
+    const dpath = if (prefix.len == 0)
+        gpa.dupe(u8, work_root) catch return
+    else
+        std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_root, prefix }) catch return;
+    defer gpa.free(dpath);
+    var d = Io.Dir.cwd().openDir(io, dpath, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (n.* < out.len) {
+        const e = (it.next(io) catch break) orelse break;
+        if (e.name.len == 0 or e.name[0] == '.') continue; // dotfiles, ., ..
+        var subbuf: [200]u8 = undefined;
+        const sub = (if (prefix.len == 0)
+            std.fmt.bufPrint(&subbuf, "{s}", .{e.name})
+        else
+            std.fmt.bufPrint(&subbuf, "{s}/{s}", .{ prefix, e.name })) catch continue;
+        if (e.kind == .directory) {
+            if (std.mem.eql(u8, e.name, "__pycache__")) continue;
+            walkWork(io, gpa, work_root, sub, out, n, depth + 1);
+            continue;
+        }
+        if (e.kind != .file) continue;
+        if (std.mem.endsWith(u8, e.name, ".pyc")) continue;
+        var dup = false;
+        var k: usize = 0;
+        while (k < n.*) : (k += 1) {
+            if (std.mem.eql(u8, out[k].path[0..out[k].path_len], sub)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        var f: FileRow = .{};
+        const pn = @min(sub.len, f.path.len);
+        @memcpy(f.path[0..pn], sub[0..pn]);
+        f.path_len = @intCast(pn);
+        const fpath = std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_root, sub }) catch "";
+        defer if (fpath.len > 0) gpa.free(fpath);
+        if (fpath.len > 0) {
+            if (Io.Dir.cwd().statFile(io, fpath, .{})) |st| {
+                f.size = st.size;
+            } else |_| {}
+        }
+        out[n.*] = f;
+        n.* += 1;
+    }
 }
 
 /// Read a built file's content for the Files viewer, from <data>/<rel>/work/<sub>. Copies up to out.len
