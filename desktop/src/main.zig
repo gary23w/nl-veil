@@ -98,6 +98,13 @@ const Ui = struct {
     resizing: bool = false,
     file_menu: bool = false,
     close_req: bool = false,
+    // manual maximize/restore (the window is undecorated, so we drive it ourselves): on maximize we save the
+    // current rect and grow to fill the monitor; on restore we write the saved rect back.
+    win_max: bool = false,
+    saved_x: i32 = 0,
+    saved_y: i32 = 0,
+    saved_w: i32 = 0,
+    saved_h: i32 = 0,
     show_log: bool = false, // F12 debug overlay
     // log console
     log_scroll: f32 = 0,
@@ -391,14 +398,16 @@ fn handleWindowChrome() void {
             const nw = @max(760, rl.getScreenWidth() + @as(i32, @intFromFloat(d.x)));
             const nh = @max(520, rl.getScreenHeight() + @as(i32, @intFromFloat(d.y)));
             rl.setWindowSize(nw, nh);
+            ui.win_max = false; // a manual resize means we're no longer "fullscreen"
         } else ui.resizing = false;
     }
     // title-bar drag (empty zone only: not over window controls, File, or the theme selector)
     const over_file = mp.x > 40 and mp.x < 90;
     const over_theme = mp.x > 104 and mp.x < 236;
-    const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 96 and !(over_file or over_theme);
+    const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 142 and !(over_file or over_theme);
     if (rl.isMouseButtonPressed(.left) and in_title and !ui.resizing) {
         ui.dragging = true;
+        ui.win_max = false; // dragging undocks a fullscreen window
         const g = rl.getMousePosition(); // remember WHERE on the title bar we grabbed
         ui.drag_grab_x = g.x;
         ui.drag_grab_y = g.y;
@@ -412,6 +421,28 @@ fn handleWindowChrome() void {
             const m = rl.getMousePosition();
             rl.setWindowPosition(@intFromFloat(p.x + m.x - ui.drag_grab_x), @intFromFloat(p.y + m.y - ui.drag_grab_y));
         } else ui.dragging = false;
+    }
+}
+
+/// Toggle the window between its normal rect and filling the current monitor ("fullscreen"). The window is
+/// undecorated so rl.maximizeWindow() is unreliable across platforms — we drive size/pos ourselves and remember
+/// the pre-maximize rect to restore it. The self-drawn titlebar (incl. this button) stays visible at the top.
+fn toggleMaximize() void {
+    if (!ui.win_max) {
+        const p = rl.getWindowPosition();
+        ui.saved_x = @intFromFloat(p.x);
+        ui.saved_y = @intFromFloat(p.y);
+        ui.saved_w = rl.getScreenWidth();
+        ui.saved_h = rl.getScreenHeight();
+        const mon = rl.getCurrentMonitor();
+        const mp = rl.getMonitorPosition(mon);
+        rl.setWindowPosition(@intFromFloat(mp.x), @intFromFloat(mp.y));
+        rl.setWindowSize(rl.getMonitorWidth(mon), rl.getMonitorHeight(mon));
+        ui.win_max = true;
+    } else {
+        rl.setWindowPosition(ui.saved_x, ui.saved_y);
+        rl.setWindowSize(@max(760, ui.saved_w), @max(520, ui.saved_h));
+        ui.win_max = false;
     }
 }
 
@@ -443,20 +474,23 @@ fn drawTitlebar(store: *Store) void {
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
 
-    // right: server status + minimize + close
+    // right: server status + minimize + maximize/restore + close  (3 buttons = 138px flush-right)
     store.lock();
     const online = store.server_online;
     const minds = store.fleet_minds;
     store.unlock();
     const label = if (online) t.z("online   {d} minds", .{minds}) else t.z("offline", .{});
     const lw = t.measure(label, 12);
-    const lx = sw - @as(f32, @floatFromInt(lw)) - 108;
+    const lx = sw - @as(f32, @floatFromInt(lw)) - 154;
     t.statusDot(@intFromFloat(lx - 11), 15, if (online) t.green else t.comment);
     t.text(label, @intFromFloat(lx), 9, 12, if (online) t.green else t.comment);
 
-    const minb = t.Rect{ .x = sw - 92, .y = 0, .width = 46, .height = TITLE_H };
+    const minb = t.Rect{ .x = sw - 138, .y = 0, .width = 46, .height = TITLE_H };
+    const maxb = t.Rect{ .x = sw - 92, .y = 0, .width = 46, .height = TITLE_H };
     const clsb = t.Rect{ .x = sw - 46, .y = 0, .width = 46, .height = TITLE_H };
     if (t.winButton(minb, t.z("_", .{}), false)) rl.minimizeWindow();
+    // "[]" = go fullscreen; "><" = shrink back to the previous size (glyphs are ASCII — foldAscii drops Unicode).
+    if (t.winButton(maxb, if (ui.win_max) t.z("><", .{}) else t.z("[]", .{}), false)) toggleMaximize();
     if (t.winButton(clsb, t.z("x", .{}), true)) ui.close_req = true;
 }
 
@@ -506,8 +540,14 @@ fn drawResizeGrip() void {
 // codepoints from the TTF makes them render as the proper space/dash instead of tofu.
 const glyph_set = blk: {
     const extra = [_]i32{ 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x2192, 0x25CF, 0x25CB };
+    // Math glyphs so LaTeX-ish formulas render legibly (see mdutil.mathToUnicode): fraction slash, arrows,
+    // operators/relations, set symbols, a couple of scattered subscript letters (i j r u v). Greek block and the
+    // contiguous super/subscript block are added as ranges below.
+    const mathops = [_]i32{ 0x2044, 0x2190, 0x2191, 0x2193, 0x21D2, 0x2202, 0x2207, 0x2208, 0x2209, 0x220F, 0x2211, 0x221A, 0x221D, 0x221E, 0x2229, 0x222A, 0x222B, 0x2248, 0x2260, 0x2261, 0x2264, 0x2265, 0x22C5, 0x25E6, 0x1D62, 0x1D63, 0x1D64, 0x1D65, 0x2C7C };
     const latin1 = 0xFF - 0xA0 + 1; // 0xA0..0xFF inclusive
-    var arr: [95 + latin1 + extra.len]i32 = undefined;
+    const greek = 0x03C9 - 0x0391 + 1; // Greek letters used in math (upper + lower)
+    const supsub = 0x209C - 0x2070 + 1; // super/subscript digits, signs, and common subscript letters
+    var arr: [95 + latin1 + extra.len + mathops.len + greek + supsub]i32 = undefined;
     var i: usize = 0;
     var c: i32 = 32;
     while (c <= 126) : (c += 1) {
@@ -519,7 +559,21 @@ const glyph_set = blk: {
         arr[i] = c;
         i += 1;
     }
+    c = 0x0391;
+    while (c <= 0x03C9) : (c += 1) {
+        arr[i] = c;
+        i += 1;
+    }
+    c = 0x2070;
+    while (c <= 0x209C) : (c += 1) {
+        arr[i] = c;
+        i += 1;
+    }
     for (extra) |e| {
+        arr[i] = e;
+        i += 1;
+    }
+    for (mathops) |e| {
         arr[i] = e;
         i += 1;
     }
@@ -1294,7 +1348,7 @@ fn copyChip(x: f32, y: f32) bool {
     const r = t.Rect{ .x = x, .y = y, .width = 46, .height = 17 };
     const hot = t.hovering(r);
     const copied = copyIsFresh();
-    t.panelBordered(r, if (hot) t.bg_sel else t.bg_hl, if (hot) t.blue else t.border);
+    // No background/border — just the bare "copy"/"copied" label that brightens on hover (user request).
     t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 4) else 9)), @intFromFloat(y + 2), 11, if (hot) t.fg else t.comment);
     return hot and rl.isMouseButtonPressed(.left);
 }
@@ -1407,15 +1461,26 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             i = j - 1; // for-loop adds 1
             continue;
         }
-        // heading
+        // heading — sized by level (# = h1 biggest ... ###### = smallest), with a little top lead for separation
         if (std.mem.startsWith(u8, tl, "#")) {
+            var lvl: u8 = 0;
             var h = tl;
-            while (h.len > 0 and h[0] == '#') h = h[1..];
+            while (h.len > 0 and h[0] == '#' and lvl < 6) {
+                h = h[1..];
+                lvl += 1;
+            }
             h = std.mem.trimStart(u8, h, " ");
             var hb: [512]u8 = undefined;
             const hn = md.cleanInline(&hb, h);
-            if (draw and inView(view, yy, MSG_HEADING_H)) t.textClip(hb[0..hn], @intFromFloat(view.x + 14), @intFromFloat(yy + 4), 16, t.fg, @intFromFloat(view.width - 28));
-            yy += MSG_HEADING_H;
+            const hsz: i32 = switch (lvl) {
+                1 => 21,
+                2 => 18,
+                3 => 16,
+                else => 15,
+            };
+            const hh: f32 = @as(f32, @floatFromInt(hsz)) + 12; // glyph + top/bottom lead
+            if (draw and inView(view, yy, hh)) t.textClip(hb[0..hn], @intFromFloat(view.x + 14), @intFromFloat(yy + 8), hsz, t.fg, @intFromFloat(view.width - 28));
+            yy += hh;
             continue;
         }
         // blockquote (used for the model's reasoning): dim text with a left accent bar
@@ -1427,23 +1492,38 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             if (draw and inView(view, y_before, yy - y_before)) t.fillRect(@intFromFloat(view.x + 10), @intFromFloat(y_before - 1), 2, @intFromFloat(yy - y_before - MSG_LINE_H + 2), t.comment);
             continue;
         }
-        // bullet / prose with inline cleanup
+        // bullet / ordered-list / prose with inline cleanup
         var lb: [2048]u8 = undefined;
         var w: usize = 0;
         var src = raw;
         const is_bullet = std.mem.startsWith(u8, tl, "- ") or std.mem.startsWith(u8, tl, "* ") or std.mem.startsWith(u8, tl, "+ ");
-        if (is_bullet) {
+        // ordered list: "N. " or "N) " (up to a couple of digits)
+        var ord_len: usize = 0;
+        if (!is_bullet) {
+            var k: usize = 0;
+            while (k < tl.len and k < 3 and tl[k] >= '0' and tl[k] <= '9') k += 1;
+            if (k > 0 and k + 1 < tl.len and (tl[k] == '.' or tl[k] == ')') and tl[k + 1] == ' ') ord_len = k + 2;
+        }
+        if (is_bullet or ord_len > 0) {
             const indent = raw.len - std.mem.trimStart(u8, raw, " \t").len;
             const pad = @min(indent + 1, 6);
             @memset(lb[0..pad], ' ');
             w = pad;
-            lb[w] = 0xE2; // "•"
-            lb[w + 1] = 0x80;
-            lb[w + 2] = 0xA2;
-            w += 3;
-            lb[w] = ' ';
-            w += 1;
-            src = tl[2..];
+            if (ord_len > 0) {
+                for (tl[0..ord_len]) |mc| { // copy the "N. " marker verbatim
+                    lb[w] = mc;
+                    w += 1;
+                }
+                src = tl[ord_len..];
+            } else {
+                lb[w] = 0xE2; // "•" (U+2022 — foldAscii now passes it through as a real bullet)
+                lb[w + 1] = 0x80;
+                lb[w + 2] = 0xA2;
+                w += 3;
+                lb[w] = ' ';
+                w += 1;
+                src = tl[2..];
+            }
         }
         w += md.cleanInline(lb[w..], src);
         if (w == 0) {
@@ -1924,6 +2004,8 @@ fn castStatusColor(st: store_mod.CastStatus) t.Color {
         .deploying => t.yellow,
         .running => t.green,
         .collecting => t.cyan,
+        .comparing => t.cyan,
+        .merging => t.blue,
         .done => t.comment,
         .failed => t.red,
     };
@@ -1934,6 +2016,8 @@ fn castStatusWord(st: store_mod.CastStatus) [:0]const u8 {
         .deploying => t.z("deploying", .{}),
         .running => t.z("running", .{}),
         .collecting => t.z("stopping", .{}),
+        .comparing => t.z("comparing", .{}),
+        .merging => t.z("merging", .{}),
         .done => t.z("done", .{}),
         .failed => t.z("failed", .{}),
     };

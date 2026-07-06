@@ -212,12 +212,16 @@ pub fn foldAscii(dst: []u8, src: []const u8) usize {
             0xAD, 0x2010...0x2015, 0x2043, 0x2212 => "-",
             0x2018, 0x2019, 0x201A, 0x201B, 0x2032 => "'",
             0x201C, 0x201D, 0x201E, 0x201F, 0x2033 => "\"",
-            0x2022, 0x2023, 0x2027, 0x25AA, 0x25CB, 0x25CF => "*",
+            0x2023, 0x2027, 0x25AA => "*", // bullets the atlas lacks -> '*'
             0x2026 => "...",
-            0x2192, 0x21D2 => "->",
-            0x2190, 0x21D0 => "<-",
+            0x21D0 => "<-", // <= not in the atlas
             0x2713, 0x2714 => "v",
             0x00A1...0x00AC, 0x00AE...0x00FF => orig, // printable Latin-1 — atlas has it, keep verbatim
+            // Greek + super/subscript blocks — now in the font atlas, so pass through for real math rendering.
+            0x0391...0x03C9, 0x2070...0x209C => orig,
+            // Math operators/relations, real bullets/circles/arrows, and the scattered subscript letters (i j r u v)
+            // — all added to the atlas (see main.glyph_set), so keep them verbatim instead of dropping/ASCII-folding.
+            0x2022, 0x25CB, 0x25CF, 0x25E6, 0x2044, 0x2190...0x2193, 0x21D2, 0x2202, 0x2207, 0x2208, 0x2209, 0x220F, 0x2211, 0x221A, 0x221D, 0x221E, 0x2229, 0x222A, 0x222B, 0x2248, 0x2260, 0x2261, 0x2264, 0x2265, 0x22C5, 0x1D62...0x1D65, 0x2C7C => orig,
             else => "", // emoji / CJK / rare symbol — drop, never tofu
         };
         for (rep) |rb| {
