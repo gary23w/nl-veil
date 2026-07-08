@@ -83,6 +83,7 @@ pub const Settings = struct {
     // chat pane collapse state (persisted with the chat settings)
     chat_left_open: bool = true,
     chat_right_open: bool = true,
+    shell_always_allow: bool = false, // "Bypass" chosen once → the veil's RUN: shell commands skip the approval prompt
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
@@ -193,7 +194,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.
@@ -308,6 +309,12 @@ pub const Store = struct {
     console_busy_you: bool = false,
     console_busy_ai: bool = false,
     console_show_veil: bool = false, // one-shot: the AI ran a RUN: — the UI flips to the Veil tab, then clears it
+    // Command-approval gate: a veil RUN: shell command PARKS here awaiting the user's Approve / Bypass(always) /
+    // Deny. The chat thread sets console_pending + the command; the Veil tab renders the buttons; the choice
+    // rides back as a console_approve/console_deny ChatCommand. (Bypass persists via Settings.shell_always_allow.)
+    console_pending: bool = false,
+    console_pending_cmd: [1024]u8 = undefined,
+    console_pending_len: usize = 0,
     casts: [MAX_CASTS]CastRow = undefined,
     cast_count: usize = 0,
     cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast

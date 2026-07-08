@@ -27,8 +27,18 @@ pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
 const WIN_W = 1220;
 const WIN_H = 820;
-const TITLE_H = 30;
-const TAB_H = 34;
+const TITLE_H = 34;
+const TAB_H = 38;
+
+// Titlebar interactive zones — ONE definition shared by drawTitlebar (pixels) and handleWindowChrome
+// (drag hit-test). They used to be two hand-kept sets of magic numbers that had already drifted apart:
+// the right half of the File button both dragged the window AND opened the menu.
+fn tbFileRect() t.Rect {
+    return .{ .x = 70, .y = 5, .width = 46, .height = TITLE_H - 10 };
+}
+fn tbThemeRect() t.Rect {
+    return .{ .x = 124, .y = 5, .width = 128, .height = TITLE_H - 10 };
+}
 
 const InnerTab = enum { console, details, files };
 const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model };
@@ -367,6 +377,33 @@ pub fn main() !void {
         syncThemeFromStore(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
         sim_ticks += 1;
+        // Command-approval controls must work WHILE the chat is busy (a parked shell command holds the turn),
+        // so ::approve/::bypass/::deny bypass the !busy gate below. Dropped as their own SIM.txt; inert in real use.
+        if (store.console_pending) {
+            var ddb2: [512]u8 = undefined;
+            store.lock();
+            const dd2 = store.settings.dataDir();
+            const ddn2 = @min(dd2.len, ddb2.len);
+            @memcpy(ddb2[0..ddn2], dd2[0..ddn2]);
+            store.unlock();
+            var pb2: [640]u8 = undefined;
+            if (std.fmt.bufPrint(&pb2, "{s}/.veil-desk/SIM.txt", .{ddb2[0..ddn2]})) |p2| {
+                if (std.Io.Dir.cwd().readFileAlloc(io, p2, gpa, .limited(64))) |c2| {
+                    defer gpa.free(c2);
+                    const m2 = std.mem.trim(u8, c2, " \r\n\t");
+                    if (std.mem.eql(u8, m2, "::approve")) {
+                        std.Io.Dir.cwd().deleteFile(io, p2) catch {};
+                        store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "once", ""));
+                    } else if (std.mem.eql(u8, m2, "::bypass")) {
+                        std.Io.Dir.cwd().deleteFile(io, p2) catch {};
+                        store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "always", ""));
+                    } else if (std.mem.eql(u8, m2, "::deny")) {
+                        std.Io.Dir.cwd().deleteFile(io, p2) catch {};
+                        store.pushChatCmd(store_mod.mkChatCmd(.console_deny, "veil", ""));
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
         if (online0 and !busy0 and sim_ticks >= 30) { // ~1s cadence, only fire when connected AND idle
             sim_ticks = 0;
             var ddb: [512]u8 = undefined;
@@ -404,6 +441,12 @@ pub fn main() !void {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
                                 if (std.mem.eql(u8, rn, "memory")) ui.right_tab = .memory else if (std.mem.eql(u8, rn, "activity")) ui.right_tab = .activity;
+                            } else if (std.mem.eql(u8, cmd, "approve")) {
+                                store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "once", "")); // headless: approve a parked command
+                            } else if (std.mem.eql(u8, cmd, "bypass")) {
+                                store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "always", ""));
+                            } else if (std.mem.eql(u8, cmd, "deny")) {
+                                store.pushChatCmd(store_mod.mkChatCmd(.console_deny, "veil", ""));
                             }
                             log.info("SIM.txt control command: {s}", .{cmd});
                         } else {
@@ -438,6 +481,7 @@ pub fn main() !void {
         if (ui.file_menu) drawFileMenu(&store);
         drawToasts(&store);
         if (ui.show_log) drawLogOverlay();
+        t.applyCursor(); // one OS-cursor update per frame: pointer over buttons, I-beam over inputs
     }
 }
 
@@ -481,6 +525,7 @@ fn handleWindowChrome() void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     // resize grip (bottom-right 18px)
     const grip = t.Rect{ .x = sw - 18, .y = @as(f32, @floatFromInt(rl.getScreenHeight())) - 18, .width = 18, .height = 18 };
+    if (rl.checkCollisionPointRec(mp, grip) or ui.resizing) t.wantCursor(.resize_nwse);
     if (rl.isMouseButtonPressed(.left) and rl.checkCollisionPointRec(mp, grip)) ui.resizing = true;
     if (ui.resizing) {
         if (rl.isMouseButtonDown(.left)) {
@@ -491,9 +536,10 @@ fn handleWindowChrome() void {
             ui.win_max = false; // a manual resize means we're no longer "fullscreen"
         } else ui.resizing = false;
     }
-    // title-bar drag (empty zone only: not over window controls, File, or the theme selector)
-    const over_file = mp.x > 40 and mp.x < 90;
-    const over_theme = mp.x > 104 and mp.x < 236;
+    // title-bar drag (empty zone only: not over window controls, File, or the theme selector — the SAME
+    // rects drawTitlebar renders, so the drag zone can never drift out of sync with the pixels again)
+    const over_file = rl.checkCollisionPointRec(mp, tbFileRect());
+    const over_theme = rl.checkCollisionPointRec(mp, tbThemeRect());
     const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 142 and !(over_file or over_theme);
     if (rl.isMouseButtonPressed(.left) and in_title and !ui.resizing) {
         ui.dragging = true;
@@ -541,20 +587,23 @@ fn drawTitlebar(store: *Store) void {
     t.fillRect(0, 0, @intFromFloat(sw), TITLE_H, t.bg_dark);
     t.hline(0, TITLE_H - 1, @intFromFloat(sw), t.border);
     // mark + wordmark (just "veil")
-    t.drawMark(16, TITLE_H / 2, 9, false);
-    t.text(t.z("veil", .{}), 30, 8, 15, t.fg);
-    // File menu button
-    const fr = t.Rect{ .x = 68, .y = 3, .width = 42, .height = TITLE_H - 6 };
+    t.drawMark(18, TITLE_H / 2, 9, false);
+    t.text(t.z("veil", .{}), 32, (TITLE_H - 15) / 2, 15, t.fg);
+    // File menu button (rect shared with handleWindowChrome so the drag zone matches the pixels)
+    const fr = tbFileRect();
     if (t.hovering(fr) or ui.file_menu) t.panel(fr, t.bg_hl);
-    t.text(t.z("File", .{}), 76, 8, 13, t.fg_dim);
+    const fw = t.measure(t.z("File", .{}), 13);
+    t.text(t.z("File", .{}), @intFromFloat(fr.x + (fr.width - @as(f32, @floatFromInt(fw))) / 2), @intFromFloat(fr.y + (fr.height - 13) / 2), 13, if (t.hovering(fr) or ui.file_menu) t.fg else t.fg_dim);
+    if (t.hovering(fr)) t.wantCursor(.pointing_hand);
     if (t.hovering(fr) and rl.isMouseButtonPressed(.left)) ui.file_menu = !ui.file_menu;
 
     // Theme selector beside File
-    const tr = t.Rect{ .x = 114, .y = 3, .width = 118, .height = TITLE_H - 6 };
+    const tr = tbThemeRect();
     const scheme_now = t.getScheme();
     const theme_hot = t.hovering(tr);
     if (theme_hot) t.panel(tr, t.bg_hl);
-    t.text(if (scheme_now == .light) t.z("Theme: Light", .{}) else t.z("Theme: Dark", .{}), @intFromFloat(tr.x + 8), @intFromFloat(tr.y + 5), 12, if (theme_hot) t.fg else t.fg_dim);
+    t.text(if (scheme_now == .light) t.z("Theme: Light", .{}) else t.z("Theme: Dark", .{}), @intFromFloat(tr.x + 10), @intFromFloat(tr.y + (tr.height - 12) / 2), 12, if (theme_hot) t.fg else t.fg_dim);
+    if (theme_hot) t.wantCursor(.pointing_hand);
     if (theme_hot and rl.isMouseButtonPressed(.left)) {
         const next: t.Scheme = if (scheme_now == .dark) .light else .dark;
         t.setScheme(next);
@@ -572,8 +621,8 @@ fn drawTitlebar(store: *Store) void {
     const label = if (online) t.z("online   {d} minds", .{minds}) else t.z("offline", .{});
     const lw = t.measure(label, 12);
     const lx = sw - @as(f32, @floatFromInt(lw)) - 154;
-    t.statusDot(@intFromFloat(lx - 11), 15, if (online) t.green else t.comment);
-    t.text(label, @intFromFloat(lx), 9, 12, if (online) t.green else t.comment);
+    t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, if (online) t.green else t.comment);
+    t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, if (online) t.green else t.comment);
 
     const minb = t.Rect{ .x = sw - 138, .y = 0, .width = 46, .height = TITLE_H };
     const maxb = t.Rect{ .x = sw - 92, .y = 0, .width = 46, .height = TITLE_H };
@@ -586,18 +635,22 @@ fn drawTitlebar(store: *Store) void {
 
 fn drawFileMenu(store: *Store) void {
     const items = [_][:0]const u8{ t.z("New swarm", .{}), t.z("Refresh now", .{}), t.z("Open data folder", .{}), t.z("Quit", .{}) };
-    const w: f32 = 180;
-    const ih: f32 = 30;
-    const r = t.Rect{ .x = 68, .y = TITLE_H, .width = w, .height = ih * items.len + 8 };
+    const w: f32 = 190;
+    const ih: f32 = 32;
+    const fr = tbFileRect();
+    const r = t.Rect{ .x = fr.x, .y = TITLE_H, .width = w, .height = ih * items.len + 12 };
     t.panelBordered(r, t.bg_dark, t.border);
     // click-away closes
-    if (rl.isMouseButtonPressed(.left) and !t.hovering(r) and !t.hovering(.{ .x = 68, .y = 3, .width = 42, .height = TITLE_H - 6 })) ui.file_menu = false;
-    var yy = r.y + 4;
+    if (rl.isMouseButtonPressed(.left) and !t.hovering(r) and !t.hovering(fr)) ui.file_menu = false;
+    var yy = r.y + 6;
     for (items, 0..) |it, i| {
-        const ir = t.Rect{ .x = r.x + 4, .y = yy, .width = w - 8, .height = ih };
+        const ir = t.Rect{ .x = r.x + 6, .y = yy, .width = w - 12, .height = ih };
         const hot = t.hovering(ir);
-        if (hot) t.panel(ir, t.bg_hl);
-        t.text(it, @intFromFloat(ir.x + 10), @intFromFloat(ir.y + 8), 13, if (i == 3) t.red else t.fg);
+        if (hot) {
+            t.panel(ir, t.bg_hl);
+            t.wantCursor(.pointing_hand);
+        }
+        t.text(it, @intFromFloat(ir.x + 12), @intFromFloat(ir.y + (ih - 13) / 2), 13, if (i == 3) t.red else t.fg);
         if (hot and rl.isMouseButtonPressed(.left)) {
             ui.file_menu = false;
             switch (i) {
@@ -1037,24 +1090,24 @@ fn drawTabbar(store: *Store) void {
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
     const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
     const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .settings };
-    var x: f32 = 12;
+    var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
-        const w: f32 = @floatFromInt(t.measure(lb, 13) + 26);
-        const r = t.Rect{ .x = x, .y = TITLE_H + 4, .width = w, .height = TAB_H - 6 };
+        const w = t.tabW(lb);
+        const r = t.Rect{ .x = x, .y = TITLE_H + 5, .width = w, .height = TAB_H - 10 };
         if (t.tab(r, lb, ui.tab == tabv)) setTab(tabv);
-        x += w + 4;
+        x += w + 6;
     }
 }
 
 // -------------------------------------------------------------------------------- dashboard
 
 fn drawDashboard(store: *Store, body: t.Rect) void {
-    const pad: f32 = 16;
+    const pad: f32 = t.PAD;
     var y: f32 = body.y + pad;
     const x: f32 = pad;
     const colw: f32 = body.width - pad * 2;
     t.text(t.z("Dashboard", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
-    y += 34;
+    y += 38;
 
     store.lock();
     const online = store.server_online;
@@ -1064,26 +1117,27 @@ fn drawDashboard(store: *Store, body: t.Rect) void {
     const sc = store.swarm_count;
     store.unlock();
 
-    const card_w = (colw - 30) / 4;
-    statCard(x + 0 * (card_w + 10), y, card_w, "SERVER", if (online) "online" else "offline", if (online) t.green else t.red);
-    statCard(x + 1 * (card_w + 10), y, card_w, "LIVE SWARMS", t.z("{d}", .{fl}), t.cyan);
-    statCard(x + 2 * (card_w + 10), y, card_w, "LIVE MINDS", t.z("{d}", .{fm}), t.magenta);
-    statCard(x + 3 * (card_w + 10), y, card_w, "HEADROOM", t.z("{d}", .{fh}), if (fh > 0) t.green else t.orange);
-    y += 102;
+    const card_w = (colw - 3 * t.GAP) / 4;
+    statCard(x + 0 * (card_w + t.GAP), y, card_w, "SERVER", if (online) "online" else "offline", if (online) t.green else t.red);
+    statCard(x + 1 * (card_w + t.GAP), y, card_w, "LIVE SWARMS", t.z("{d}", .{fl}), t.cyan);
+    statCard(x + 2 * (card_w + t.GAP), y, card_w, "LIVE MINDS", t.z("{d}", .{fm}), t.magenta);
+    statCard(x + 3 * (card_w + t.GAP), y, card_w, "HEADROOM", t.z("{d}", .{fh}), if (fh > 0) t.green else t.orange);
+    y += 92 + t.PAD;
 
-    const nb = t.Rect{ .x = x, .y = y, .width = 150, .height = 34 };
-    if (t.button(nb, t.z("+ New swarm", .{}), t.blue, true)) ui.tab = .deploy;
-    t.text(t.z("Swarms ({d})", .{sc}), @intFromFloat(x + 166), @intFromFloat(y + 9), 14, t.fg_dim);
-    y += 46;
+    const nb_label = t.z("+ New swarm", .{});
+    const nb = t.Rect{ .x = x, .y = y, .width = t.btnW(nb_label, t.BTN_MD), .height = t.BTN_MD };
+    if (t.buttonSolid(nb, nb_label, t.blue, true)) ui.tab = .deploy;
+    t.text(t.z("Swarms ({d})", .{sc}), @intFromFloat(nb.x + nb.width + t.PAD), @intFromFloat(y + (t.BTN_MD - 14) / 2), 14, t.fg_dim);
+    y += t.BTN_MD + t.GAP;
     const list_r = t.Rect{ .x = x, .y = y, .width = colw, .height = body.y + body.height - y - pad };
     drawRoster(store, list_r);
 }
 
 fn statCard(x: f32, y: f32, w: f32, label: [:0]const u8, value: [:0]const u8, accent: t.Color) void {
-    const r = t.Rect{ .x = x, .y = y, .width = w, .height = 88 };
+    const r = t.Rect{ .x = x, .y = y, .width = w, .height = 92 };
     t.panelBordered(r, t.bg_dark, t.border);
-    t.text(label, @intFromFloat(x + 14), @intFromFloat(y + 14), 12, t.comment);
-    t.text(value, @intFromFloat(x + 14), @intFromFloat(y + 40), 26, accent);
+    t.text(label, @intFromFloat(x + 16), @intFromFloat(y + 16), 11, t.comment);
+    t.text(value, @intFromFloat(x + 16), @intFromFloat(y + 42), 26, accent);
 }
 
 fn drawRoster(store: *Store, r: t.Rect) void {
@@ -1103,7 +1157,7 @@ fn drawRoster(store: *Store, r: t.Rect) void {
     // drop any "deleting…" ids that are no longer in the roster (the delete landed)
     pruneDeleting(rows[0..n]);
 
-    const row_h: f32 = 46;
+    const row_h: f32 = 50;
     var yy: f32 = r.y + 6;
     var idx: usize = 0;
     while (idx < n) : (idx += 1) {
@@ -1113,20 +1167,20 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         const deleting = isDeleting(sw.idStr());
         const hot = t.hovering(rr) and !deleting;
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
-        t.statusDot(@intFromFloat(rr.x + 12), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
+        t.statusDot(@intFromFloat(rr.x + 14), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
         const name_c = if (deleting) t.comment else t.fg;
-        // Reserve only ~124px on the right for the round/status columns. The old 236 reserve left the
+        // Reserve only ~130px on the right for the round/status columns. The old 236 reserve left the
         // name ~22px in the narrow (270px) swarm-tab panel → "sw.." — unreadable. This keeps the name
         // wide in both the wide dashboard row and the narrow side panel while clearing the right block.
-        const name_w: f32 = @max(48, rr.width - 124);
-        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 6), 14, name_c, @intFromFloat(name_w));
-        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 26), @intFromFloat(rr.y + 24), 12, t.comment, @intFromFloat(name_w));
+        const name_w: f32 = @max(48, rr.width - 130);
+        t.textClip(sw.nameStr(), @intFromFloat(rr.x + 30), @intFromFloat(rr.y + 7), 14, name_c, @intFromFloat(name_w));
+        if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 30), @intFromFloat(rr.y + 26), 12, t.comment, @intFromFloat(name_w));
         // ✕ delete button (right edge, on row hover)
-        const xb = t.Rect{ .x = rr.x + rr.width - 26, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
+        const xb = t.Rect{ .x = rr.x + rr.width - 30, .y = rr.y + (rr.height - 24) / 2, .width = 24, .height = 24 };
         if (deleting) {
-            t.text(t.z("deleting...", .{}), @intFromFloat(rr.x + rr.width - 88), @intFromFloat(rr.y + 24), 11, t.red);
+            t.text(t.z("deleting...", .{}), @intFromFloat(rr.x + rr.width - 92), @intFromFloat(rr.y + 26), 11, t.red);
         } else {
-            if (hot and t.winButton(xb, t.z("x", .{}), true)) {
+            if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
                 markDeleting(sw.idStr());
                 store.pushCmd(store_mod.mkCmd(.delete, sw.idStr(), ""));
             }
@@ -1134,10 +1188,11 @@ fn drawRoster(store: *Store, r: t.Rect) void {
             const rt = if (pct >= 0) t.z("r{d}  {d}%", .{ sw.round, pct }) else t.z("r{d}", .{sw.round});
             const rtw = t.measure(rt, 12);
             const pc = if (pct >= 100) t.green else if (pct >= 50) t.cyan else if (pct >= 0) t.yellow else t.comment;
-            t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(rtw)) - 36), @intFromFloat(rr.y + 6), 12, pc);
+            t.text(rt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(rtw)) - 40), @intFromFloat(rr.y + 7), 12, pc);
             const stt = if (sw.stopped) t.z("done", .{}) else if (sw.live) t.z("LIVE", .{}) else t.z("idle", .{});
-            t.text(stt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(stt, 11))) - 36), @intFromFloat(rr.y + 24), 11, if (sw.live) t.green else t.comment);
+            t.text(stt, @intFromFloat(rr.x + rr.width - @as(f32, @floatFromInt(t.measure(stt, 11))) - 40), @intFromFloat(rr.y + 26), 11, if (sw.live) t.green else t.comment);
         }
+        if (hot and !t.hovering(xb)) t.wantCursor(.pointing_hand);
         if (hot and !t.hovering(xb) and rl.isMouseButtonPressed(.left)) {
             store.pushCmd(store_mod.mkCmd(.select, sw.idStr(), ""));
             ui.tab = .swarm;
@@ -1147,7 +1202,7 @@ fn drawRoster(store: *Store, r: t.Rect) void {
     }
     if (n == 0) {
         const msg = if (scanned) t.z("no swarms yet - Deploy one", .{}) else t.z("scanning run directories...", .{});
-        t.text(msg, @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
+        t.text(msg, @intFromFloat(r.x + t.PAD_IN + 2), @intFromFloat(r.y + t.PAD_IN + 2), 13, t.comment);
     }
 }
 
@@ -1241,16 +1296,16 @@ fn drawChat(store: *Store, body: t.Rect) void {
 fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy: bool) void {
     t.panelBordered(r, t.bg_dark, t.border);
     // ---- tab header (You = user shell, Veil = AI shell) ----
-    const th: f32 = 24;
-    const tw = (r.width - 6) / 2;
-    if (t.tab(.{ .x = r.x + 2, .y = r.y + 2, .width = tw, .height = th }, t.z("You", .{}), ui.con_tab == 0)) ui.con_tab = 0;
-    if (t.tab(.{ .x = r.x + 4 + tw, .y = r.y + 2, .width = tw, .height = th }, t.z("Veil", .{}), ui.con_tab == 1)) ui.con_tab = 1;
-    if (busy) t.statusDot(@intFromFloat(r.x + r.width - 12), @intFromFloat(r.y + 14), t.yellow);
+    const th: f32 = 26;
+    const tw = (r.width - 10) / 2;
+    if (t.tab(.{ .x = r.x + 3, .y = r.y + 3, .width = tw, .height = th }, t.z("You", .{}), ui.con_tab == 0)) ui.con_tab = 0;
+    if (t.tab(.{ .x = r.x + 7 + tw, .y = r.y + 3, .width = tw, .height = th }, t.z("Veil", .{}), ui.con_tab == 1)) ui.con_tab = 1;
+    if (busy) t.statusDot(@intFromFloat(r.x + r.width - 14), @intFromFloat(r.y + 16), t.yellow);
 
     // ---- scrollback (mono, tail-anchored, viewport-culled, wheel-scrollable) ----
-    const input_h: f32 = 26;
-    const body_y: f32 = r.y + 2 + th + 4;
-    const body_h: f32 = r.height - (body_y - r.y) - input_h - 6;
+    const input_h: f32 = 30;
+    const body_y: f32 = r.y + 3 + th + 5;
+    const body_h: f32 = r.height - (body_y - r.y) - input_h - 10;
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(body_y), @intFromFloat(r.width - 2), @intFromFloat(body_h));
     const line_h: f32 = 15;
     const cols: usize = @intFromFloat(@max(8, (r.width - 16) / 7)); // ~7px per mono glyph at size 12
@@ -1307,27 +1362,54 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
     }
 
     // ---- input row (only the You tab is user-typable; the Veil tab is driven by the AI) ----
-    const iy: f32 = r.y + r.height - input_h - 2;
-    const runw: f32 = 52;
+    const iy: f32 = r.y + r.height - input_h - 4;
+    // one fixed slot wide enough for BOTH labels, so the input doesn't shift width when Run swaps to Stop
+    const runw: f32 = @max(t.btnW(t.z("Run", .{}), input_h), t.btnW(t.z("Stop", .{}), input_h));
     // While a command runs, a red Stop button (either tab) pushes a console_cancel so the user can kill a hang.
-    const stopb = t.Rect{ .x = r.x + r.width - runw - 2, .y = iy, .width = runw, .height = input_h };
+    const stopb = t.Rect{ .x = r.x + r.width - runw - 4, .y = iy, .width = runw, .height = input_h };
     if (ai) {
+        // APPROVAL GATE: a veil RUN: command is parked awaiting the user's decision — show it + Approve/Always/Deny.
+        var pending = false;
+        var pcmd: [1024]u8 = undefined;
+        var pn: usize = 0;
+        {
+            store.lock();
+            pending = store.console_pending;
+            if (pending) {
+                pn = @min(store.console_pending_len, pcmd.len);
+                @memcpy(pcmd[0..pn], store.console_pending_cmd[0..pn]);
+            }
+            store.unlock();
+        }
+        if (pending) {
+            // the command, prominent, one line above the buttons
+            t.textMono(t.z("the veil wants to run a command:", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy - 34), 11, t.yellow);
+            t.textMonoClip(pcmd[0..pn], @intFromFloat(r.x + 8), @intFromFloat(iy - 18), 12, t.fg, @intFromFloat(r.width - 16));
+            const bw = (r.width - 24) / 3;
+            const ay = t.Rect{ .x = r.x + 4, .y = iy, .width = bw, .height = input_h };
+            const by = t.Rect{ .x = r.x + 12 + bw, .y = iy, .width = bw, .height = input_h };
+            const dy = t.Rect{ .x = r.x + 20 + bw * 2, .y = iy, .width = bw, .height = input_h };
+            if (t.buttonSolid(ay, t.z("Approve", .{}), t.green, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "once", ""));
+            if (t.button(by, t.z("Always", .{}), t.blue, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "always", ""));
+            if (t.button(dy, t.z("Deny", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_deny, "veil", ""));
+            return;
+        }
         if (busy) {
-            t.textMonoClip(t.z("veil is running a command...", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment, @intFromFloat(r.width - runw - 16));
+            t.textMonoClip(t.z("veil is running a command...", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + (input_h - 12) / 2), 12, t.comment, @intFromFloat(r.width - runw - 20));
             if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "veil", ""));
         } else {
-            t.textMono(t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + 6), 12, t.comment);
+            t.textMono(t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + (input_h - 12) / 2), 12, t.comment);
         }
         return;
     }
-    const cf = t.Rect{ .x = r.x + 2, .y = iy, .width = r.width - runw - 8, .height = input_h };
+    const cf = t.Rect{ .x = r.x + 4, .y = iy, .width = r.width - runw - 12, .height = input_h };
     textField(cf, &ui.con_input, ui.focus == .con_input, "> command", .con_input);
     if (busy) {
         // a command is running — swap Run for Stop so the user can interrupt it from here
         if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "you", ""));
     } else {
         const can = ui.con_input.len > 0;
-        const clicked = t.button(stopb, t.z("Run", .{}), t.green, can);
+        const clicked = t.buttonSolid(stopb, t.z("Run", .{}), t.blue, can);
         const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
         if (can and (clicked or (ui.focus == .con_input and enter))) {
             store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
@@ -1409,18 +1491,18 @@ fn togglePane(store: *Store, left: bool) void {
 fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
-        if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z(">", .{}), false)) togglePane(store, true);
+        if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, true);
         return;
     }
-    t.text(t.z("Chats", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 10), 14, t.fg);
-    if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z("<", .{}), false)) togglePane(store, true);
-    if (t.winButton(.{ .x = r.x + r.width - 56, .y = r.y + 6, .width = 24, .height = 22 }, t.z("+", .{}), false)) {
+    t.text(t.z("Chats", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(r.y + 11), 14, t.fg);
+    if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, true);
+    if (t.buttonGhost(.{ .x = r.x + r.width - 62, .y = r.y + 7, .width = 26, .height = 24 }, t.z("+", .{}), t.blue, true)) {
         store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
         ui.c_renaming = false;
     }
 
-    const list = t.Rect{ .x = r.x + 1, .y = r.y + 34, .width = r.width - 2, .height = r.height - 38 };
-    const row_h: f32 = 40;
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
+    const row_h: f32 = 42;
     // wheel-scroll the list (it had no offset at all — rows past the pane bottom were unreachable)
     const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h;
     const max_scroll = if (total > list.height) total - list.height else 0;
@@ -1430,14 +1512,14 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     if (ui.conv_scroll > max_scroll) ui.conv_scroll = max_scroll;
     rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
     defer rl.endScissorMode();
-    var yy: f32 = r.y + 38 - ui.conv_scroll;
+    var yy: f32 = r.y + 42 - ui.conv_scroll;
     for (convs) |*cv| {
         // cull rows outside the view but keep advancing yy so offsets stay stable
         if (yy + row_h < list.y or yy > r.y + r.height - 8) {
             yy += row_h;
             continue;
         }
-        const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 5 };
+        const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 6 };
         const is_active = std.mem.eql(u8, cv.idStr(), active);
         const hot = t.hovering(rr);
         if (is_active) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
@@ -1451,9 +1533,10 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
             }
         } else {
             const title = if (cv.title_len > 0) cv.titleStr() else cv.idStr();
-            t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + 9), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
-            const xb = t.Rect{ .x = rr.x + rr.width - 26, .y = rr.y + (rr.height - 20) / 2, .width = 20, .height = 20 };
-            if (hot and t.winButton(xb, t.z("x", .{}), true)) {
+            t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + (rr.height - 13) / 2), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
+            const xb = t.Rect{ .x = rr.x + rr.width - 28, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
+            if (hot and !t.hovering(xb)) t.wantCursor(.pointing_hand);
+            if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
                 store.pushChatCmd(store_mod.mkChatCmd(.delete_conv, cv.idStr(), ""));
             } else if (hot and rl.isMouseButtonPressed(.left)) {
                 if (is_active) {
@@ -1538,17 +1621,19 @@ fn copyChip(x: f32, y: f32) bool {
     const copied = copyIsFresh();
     // No background/border — just the bare "copy"/"copied" label that brightens on hover (user request).
     t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 4) else 9)), @intFromFloat(y + 2), 11, if (hot) t.fg else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
 /// A SMALL copy chip that lives in a code block's top-right corner. Only drawn while the block is hovered
 /// (the caller gates on it), so it stays out of the way until wanted. Returns true on click.
 fn codeCopyChip(x: f32, y: f32) bool {
-    const r = t.Rect{ .x = x, .y = y, .width = 40, .height = 15 };
+    const r = t.Rect{ .x = x, .y = y, .width = 44, .height = 17 };
     const hot = t.hovering(r);
     const copied = copyIsFresh();
     t.panelBordered(r, if (hot) t.bg_sel else t.bg_dark, if (hot) t.blue else t.border);
-    t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 3) else 8)), @intFromFloat(y + 1), 10, if (hot) t.fg else t.comment);
+    t.text(if (copied) t.z("copied", .{}) else t.z("copy", .{}), @intFromFloat(x + (if (copied) @as(f32, 5) else 10)), @intFromFloat(y + 2), 10, if (hot) t.fg else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -1565,8 +1650,8 @@ fn codeBlockSlice(text_: []const u8, from: usize) []const u8 {
 }
 
 const MSG_LINE_H: f32 = 19;
-const MSG_HEAD_H: f32 = 17;
-const MSG_GAP_H: f32 = 9;
+const MSG_HEAD_H: f32 = 18;
+const MSG_GAP_H: f32 = 12;
 const MSG_HEADING_H: f32 = 24;
 const MSG_FENCE_H: f32 = 6;
 const MSG_HR_H: f32 = 12;
@@ -1610,7 +1695,7 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             var j = i + 1;
             while (j < n and !std.mem.startsWith(u8, std.mem.trim(u8, lines[j], " \r\t"), "```")) : (j += 1) {}
             const n_code = j - (i + 1);
-            const pad_v: f32 = 8;
+            const pad_v: f32 = 10;
             const block_h = pad_v * 2 + @as(f32, @floatFromInt(n_code)) * MSG_LINE_H;
             const bx = view.x + 8;
             const bw = view.width - 16;
@@ -1631,7 +1716,7 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
                     }
                 }
             }
-            yy += block_h + 4; // a little breathing room below the block
+            yy += block_h + 6; // a little breathing room below the block
             i = j; // the for-loop's i += 1 resumes after the closing fence
             continue;
         }
@@ -1889,6 +1974,7 @@ fn thoughtChip(view: t.Rect, y0: f32, expanded: bool) bool {
     t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.comment); // dim marker dot
     t.text(t.z("reasoning", .{}), @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.comment);
     t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -1958,6 +2044,7 @@ fn toolChip(view: t.Rect, y0: f32, name: []const u8, expanded: bool) bool {
     const nm = t.zs(name); // the actual tool called (read_file, write_file, web_search, …)
     t.text(nm, @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.fg_dim);
     t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
+    if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -2082,21 +2169,27 @@ fn drawSelection() void {
 
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
     const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
-    const status_h: f32 = 20;
-    const tab_h: f32 = 22;
+    const status_h: f32 = 22;
+    const tab_h: f32 = 26;
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
-    if (t.tab(.{ .x = r.x, .y = r.y, .width = 86, .height = tab_h }, t.z("Chat", .{}), ui.chat_inner == .chat)) ui.chat_inner = .chat;
-    if (t.tab(.{ .x = r.x + 90, .y = r.y, .width = 86, .height = tab_h }, t.z("Metrics", .{}), ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
-    if (t.tab(.{ .x = r.x + 180, .y = r.y, .width = 86, .height = tab_h }, t.z("Files", .{}), ui.chat_inner == .files)) ui.chat_inner = .files;
+    const tl_chat = t.z("Chat", .{});
+    const tl_metrics = t.z("Metrics", .{});
+    const tl_files = t.z("Files", .{});
+    var tx = r.x;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_chat), .height = tab_h }, tl_chat, ui.chat_inner == .chat)) ui.chat_inner = .chat;
+    tx += t.tabW(tl_chat) + 6;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_metrics), .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
+    tx += t.tabW(tl_metrics) + 6;
+    if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_files), .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
     if (ui.chat_inner == .metrics) {
-        drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - tab_h - 2 });
+        drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
         return;
     }
     if (ui.chat_inner == .files) {
-        drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - tab_h - 2 });
+        drawChatFiles(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
         return;
     }
-    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 2, .width = r.width, .height = r.height - input_h - status_h - 10 - tab_h - 2 };
+    const view = t.Rect{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - input_h - status_h - 14 - tab_h - 6 };
     t.panelBordered(view, t.bg_dark, t.border);
 
     const fsz: i32 = 14;
@@ -2247,6 +2340,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = 17 };
     const lhot = t.hovering(ltog);
     t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
+    if (lhot) t.wantCursor(.pointing_hand);
     if (lhot and rl.isMouseButtonPressed(.left)) {
         var now_on = false;
         {
@@ -2263,18 +2357,19 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     sy += status_h;
 
     // input row — a 3-row growing/scrolling text area (a long prompt wraps + scrolls instead of running off-screen)
-    const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
+    const send_w: f32 = 92;
+    const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
     textArea(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
     // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
     // deriving y/height from input_h keeps the two aligned even if the row height changes later.
-    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
+    const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
     // While a turn is generating (or auto-loop is driving), the send button becomes a red STOP that aborts the
     // in-flight turn + halts auto-loop, so the user can always take back control.
     if (busy or loop_on) {
-        if (t.button(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+        if (t.buttonSolid(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
     } else {
         const can_send = ui.c_input.len > 0;
-        const clicked = t.button(sendb, t.z("Send", .{}), t.blue, can_send);
+        const clicked = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, can_send);
         // Enter sends; Shift+Enter is reserved for a future literal newline. Only when the input owns the keyboard.
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
@@ -2455,7 +2550,7 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         n = @min(store.chat_mem_count, rows.len);
         @memcpy(rows[0..n], store.chat_mem[0..n]);
     }
-    var yy0: f32 = r.y + 36;
+    var yy0: f32 = r.y + 40;
     t.textClip("keys, logins & preferences the veil keeps for you", @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 15;
     t.textClip(t.z("{d} saved  -  private to this machine", .{n}), @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
@@ -2497,8 +2592,8 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
             t.panelBordered(card, t.bg, t.border);
             const cat = m.catStr();
             t.text(t.z("[{s}]", .{if (cat.len > 0) cat else "fact"}), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, memCatColor(cat));
-            const del = t.Rect{ .x = card.x + card.width - 24, .y = card.y + 4, .width = 20, .height = 18 };
-            if (t.button(del, t.z("x", .{}), t.red, true)) forget_idx = i;
+            const del = t.Rect{ .x = card.x + card.width - 26, .y = card.y + 4, .width = 22, .height = 20 };
+            if (t.buttonGhost(del, t.z("x", .{}), t.red, true)) forget_idx = i;
             // copy the stored fact (keys/logins live here — copy is the whole point of keeping them)
             if (copyChip(card.x + card.width - 74, card.y + 4)) {
                 copyToClipboard(m.textStr());
@@ -2517,19 +2612,21 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
         // collapsed rail: a status dot when a cast is live so the user knows to expand it
         const live = casts.len > 0 and (casts[casts.len - 1].status == .deploying or casts[casts.len - 1].status == .running or casts[casts.len - 1].status == .collecting);
         if (live) t.statusDot(@intFromFloat(r.x + r.width / 2), @intFromFloat(r.y + 40), t.green);
-        if (t.winButton(.{ .x = r.x + 1, .y = r.y + 4, .width = r.width - 2, .height = 24 }, t.z("<", .{}), false)) togglePane(store, false);
+        if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, false);
         return;
     }
     // collapse chevron + the "Swarm activity | Memory" tab strip (Memory = durable keys/logins/prefs the AI keeps)
-    if (t.winButton(.{ .x = r.x + r.width - 28, .y = r.y + 6, .width = 24, .height = 22 }, t.z(">", .{}), false)) togglePane(store, false);
-    if (t.tab(.{ .x = r.x + 8, .y = r.y + 6, .width = 106, .height = 22 }, t.z("Swarm activity", .{}), ui.right_tab == .activity)) ui.right_tab = .activity;
-    if (t.tab(.{ .x = r.x + 118, .y = r.y + 6, .width = 66, .height = 22 }, t.z("Memory", .{}), ui.right_tab == .memory)) ui.right_tab = .memory;
+    if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, false);
+    const tl_act = t.z("Swarm activity", .{});
+    const tl_mem = t.z("Memory", .{});
+    if (t.tab(.{ .x = r.x + 8, .y = r.y + 7, .width = t.tabW(tl_act), .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
+    if (t.tab(.{ .x = r.x + 8 + t.tabW(tl_act) + 6, .y = r.y + 7, .width = t.tabW(tl_mem), .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
     if (ui.right_tab == .memory) {
         drawChatMemory(store, r);
         return;
     }
 
-    var yy: f32 = r.y + 36;
+    var yy: f32 = r.y + 40;
 
     if (casts.len == 0) {
         t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
@@ -2544,27 +2641,31 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     // ---- the newest cast gets a prominent DETAIL card (goal + phase + metrics + Stop) ----
     const c = &casts[casts.len - 1];
     const live = c.status == .deploying or c.status == .running or c.status == .collecting;
-    const card = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = 92 };
+    const card = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = 96 };
     t.panelBordered(card, t.bg, if (live) castStatusColor(c.status) else t.border);
-    t.statusDot(@intFromFloat(card.x + 12), @intFromFloat(card.y + 14), castStatusColor(c.status));
-    t.text(castStatusWord(c.status), @intFromFloat(card.x + 24), @intFromFloat(card.y + 8), 12, castStatusColor(c.status));
-    if (c.run_len > 0) t.textClip(c.runStr(), @intFromFloat(card.x + 92), @intFromFloat(card.y + 9), 10, t.comment, @intFromFloat(card.width - 150));
+    t.statusDot(@intFromFloat(card.x + 14), @intFromFloat(card.y + 16), castStatusColor(c.status));
+    t.text(castStatusWord(c.status), @intFromFloat(card.x + 26), @intFromFloat(card.y + 10), 12, castStatusColor(c.status));
+    if (c.run_len > 0) t.textClip(c.runStr(), @intFromFloat(card.x + 96), @intFromFloat(card.y + 11), 10, t.comment, @intFromFloat(card.width - 160));
     if (live) {
-        const sb = t.Rect{ .x = card.x + card.width - 54, .y = card.y + 6, .width = 48, .height = 20 };
-        if (t.button(sb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_cast, c.runStr(), ""));
+        const sb_label = t.z("Stop", .{});
+        const sbw = t.btnW(sb_label, 22);
+        const sb = t.Rect{ .x = card.x + card.width - sbw - 8, .y = card.y + 7, .width = sbw, .height = 22 };
+        if (t.button(sb, sb_label, t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_cast, c.runStr(), ""));
     }
     // goal, up to two clipped lines
-    t.textClip(c.goalStr(), @intFromFloat(card.x + 12), @intFromFloat(card.y + 30), 13, t.fg, @intFromFloat(card.width - 24));
+    t.textClip(c.goalStr(), @intFromFloat(card.x + 14), @intFromFloat(card.y + 32), 13, t.fg, @intFromFloat(card.width - 28));
     // metrics row
     const mrt = if (c.pct >= 0) t.z("round {d}   {d}%", .{ c.round, c.pct }) else t.z("round {d}", .{c.round});
-    t.text(mrt, @intFromFloat(card.x + 12), @intFromFloat(card.y + 52), 13, if (c.pct >= 100) t.green else if (c.pct >= 50) t.cyan else if (c.pct >= 0) t.yellow else t.comment);
+    t.text(mrt, @intFromFloat(card.x + 14), @intFromFloat(card.y + 56), 13, if (c.pct >= 100) t.green else if (c.pct >= 50) t.cyan else if (c.pct >= 0) t.yellow else t.comment);
     // open in the full Swarm tab for the complete console/metrics/files
-    const ob = t.Rect{ .x = card.x + card.width - 96, .y = card.y + card.height - 26, .width = 90, .height = 20 };
-    if (c.run_len > 0 and t.button(ob, t.z("open swarm", .{}), t.blue, true)) {
+    const ob_label = t.z("open swarm", .{});
+    const obw = t.btnW(ob_label, t.BTN_SM);
+    const ob = t.Rect{ .x = card.x + card.width - obw - 8, .y = card.y + card.height - t.BTN_SM - 6, .width = obw, .height = t.BTN_SM };
+    if (c.run_len > 0 and t.button(ob, ob_label, t.blue, true)) {
         store.pushCmd(store_mod.mkCmd(.select, c.runStr(), ""));
         ui.tab = .swarm;
     }
-    yy += 100;
+    yy += 104;
 
     // older casts, one compact line each (up to 2)
     var shown_old: usize = 0;
@@ -2639,29 +2740,29 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
 fn drawDeploy(store: *Store, body: t.Rect) void {
     t.setBlockClicks(ui.open_dd != .none); // same dropdown-overlay guard as Settings (cleared before flushDropdown)
     defer t.setBlockClicks(false);
-    const pad: f32 = 16;
+    const pad: f32 = t.PAD;
     const x: f32 = pad;
     const colw = @min(body.width - pad * 2, 900);
     var y: f32 = body.y + pad;
     t.text(t.z("Deploy a swarm", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     t.text(t.z("full configuration - the same knobs as the web console", .{}), @intFromFloat(x + 200), @intFromFloat(y + 6), 12, t.comment);
-    y += 36;
+    y += 40;
 
     const prov = &catalog.providers[ui.d_provider];
     if (ui.d_model >= prov.models.len) ui.d_model = 0;
 
     // two columns
-    const cw = (colw - 16) / 2;
-    const rx = x + cw + 16;
+    const cw = (colw - t.PAD) / 2;
+    const rx = x + cw + t.PAD;
     var ly = y;
     var ry = y;
-    const fh: f32 = 46;
-    const gap: f32 = 10;
+    const fh: f32 = 48; // one field row: 14px label + 34px input
+    const gap: f32 = t.GAP;
 
     // left column: identity + endpoint
     flabel(x, ly, "NAME");
-    textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
-    ly += fh + 14 + gap - 14;
+    textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
+    ly += fh + gap;
 
     selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), prov.label, .provider);
     ly += fh + gap;
@@ -2670,14 +2771,14 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 
     if (prov.needs_account) {
         flabel(x, ly, "CLOUDFLARE ACCOUNT ID (blank = use the server's own Workers AI creds)");
-        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
-        ly += fh + 14 + gap - 14;
+        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
+        ly += fh + gap;
     }
     if (prov.needs_key) {
         const kh: [:0]const u8 = if (std.mem.eql(u8, prov.key, "huggingface")) t.z("HF TOKEN (hf_...)", .{}) else if (prov.needs_account) t.z("CLOUDFLARE API TOKEN (blank = server creds)", .{}) else t.z("API KEY (nlk_... or provider key)", .{});
         flabel(x, ly, kh);
-        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = 32 }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
-        ly += fh + 14 + gap - 14;
+        textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
+        ly += fh + gap;
     }
 
     // right column: knobs
@@ -2687,39 +2788,39 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     ry += fh + gap;
     selector(.{ .x = rx, .y = ry, .width = cw, .height = fh }, t.z("RUNTIME (min, 0=until stopped)", .{}), catalog.minutes_lbl[ui.d_minutes], .minutes);
     ry += fh + gap;
-    selector(.{ .x = rx, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("STACK", .{}), catalog.stacks[ui.d_stack], .stack);
-    selector(.{ .x = rx + cw / 2 + 5, .y = ry, .width = cw / 2 - 5, .height = fh }, t.z("MODE", .{}), catalog.modes[ui.d_mode], .mode);
+    selector(.{ .x = rx, .y = ry, .width = cw / 2 - 6, .height = fh }, t.z("STACK", .{}), catalog.stacks[ui.d_stack], .stack);
+    selector(.{ .x = rx + cw / 2 + 6, .y = ry, .width = cw / 2 - 6, .height = fh }, t.z("MODE", .{}), catalog.modes[ui.d_mode], .mode);
     ry += fh + gap;
 
     // goal spans full width below the columns
     var gy = @max(ly, ry) + 6;
     flabel(x, gy, "GOAL");
-    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 54 }, &ui.d_goal, ui.focus == .d_goal, "one line: what should the hive build or research?", .d_goal);
-    gy += 78;
+    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 56 }, &ui.d_goal, ui.focus == .d_goal, "one line: what should the hive build or research?", .d_goal);
+    gy += 14 + 56 + gap;
 
     // gateway
     flabel(x, gy, "GATEWAY MODEL (optional - cheap model for mechanical calls)");
-    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = 32 }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
-    gy += 56;
+    textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
+    gy += fh + gap;
 
     // RSI DIALS — the same knobs the deploy wizard writes into swarm.json. Omitting these is what made a
     // desktop-deployed swarm behave differently from a wizard one (breakout / psyche / living-hive OFF).
     flabel(x, gy, "RSI DIALS");
-    gy += 18;
-    const tcw = (colw - 3 * 8) / 4;
+    gy += 20;
+    const tcw = (colw - 3 * t.GAP) / 4;
     const c0 = x;
-    const c1 = x + (tcw + 8);
-    const c2 = x + 2 * (tcw + 8);
-    const c3 = x + 3 * (tcw + 8);
+    const c1 = x + (tcw + t.GAP);
+    const c2 = x + 2 * (tcw + t.GAP);
+    const c3 = x + 3 * (tcw + t.GAP);
     if (t.checkbox(.{ .x = c0, .y = gy, .width = tcw, .height = 30 }, t.z("full autonomy", .{}), ui.d_autonomy_full)) ui.d_autonomy_full = !ui.d_autonomy_full;
     if (t.checkbox(.{ .x = c1, .y = gy, .width = tcw, .height = 30 }, t.z("internet research", .{}), ui.d_internet)) ui.d_internet = !ui.d_internet;
     if (t.checkbox(.{ .x = c2, .y = gy, .width = tcw, .height = 30 }, t.z("gap audit", .{}), ui.d_gap)) ui.d_gap = !ui.d_gap;
     if (t.checkbox(.{ .x = c3, .y = gy, .width = tcw, .height = 30 }, t.z("breakout", .{}), ui.d_breakout)) ui.d_breakout = !ui.d_breakout;
-    gy += 34;
+    gy += 36;
     if (t.checkbox(.{ .x = c0, .y = gy, .width = tcw, .height = 30 }, t.z("living hive", .{}), ui.d_population)) ui.d_population = !ui.d_population;
     if (t.checkbox(.{ .x = c1, .y = gy, .width = tcw, .height = 30 }, t.z("observe psyche", .{}), ui.d_psyche)) ui.d_psyche = !ui.d_psyche;
     if (t.checkbox(.{ .x = c2, .y = gy, .width = tcw, .height = 30 }, t.z("encrypt memory", .{}), ui.d_encrypt)) ui.d_encrypt = !ui.d_encrypt;
-    gy += 42;
+    gy += 30 + t.PAD;
 
     // deploy button
     const online = blk: {
@@ -2728,12 +2829,13 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
         break :blk store.server_online;
     };
     const ready = ui.d_goal.len > 0 and online;
-    const db = t.Rect{ .x = x, .y = gy, .width = 200, .height = 40 };
-    if (t.button(db, t.z("Deploy swarm", .{}), t.blue, ready)) {
+    const db_label = t.z("Deploy swarm", .{});
+    const db = t.Rect{ .x = x, .y = gy, .width = @max(160, t.btnW(db_label, t.BTN_LG)), .height = t.BTN_LG };
+    if (t.buttonSolid(db, db_label, t.blue, ready)) {
         submitDeploy(store, prov);
     }
     const hint = if (!online) t.z("server offline - start it to deploy", .{}) else if (ui.d_goal.len == 0) t.z("enter a goal", .{}) else t.z("posts to /api/v1/swarms on :{d}", .{portOf(store)});
-    t.text(hint, @intFromFloat(x + 214), @intFromFloat(gy + 13), 12, if (ready) t.comment else t.orange);
+    t.text(hint, @intFromFloat(db.x + db.width + 14), @intFromFloat(gy + (t.BTN_LG - 12) / 2), 12, if (ready) t.comment else t.orange);
 
     // draw the open dropdown LAST so its list sits on top of the fields below it (unblock so options click).
     t.setBlockClicks(false);
@@ -2744,14 +2846,16 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
 /// drawn on top by flushDropdown() after the whole form. `value` is the current selection's display text.
 fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) void {
     const open = ui.open_dd == kind;
-    t.panelBordered(r, t.bg, if (open) t.blue else t.border);
-    t.text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 6), 11, t.comment);
-    t.textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 20), 14, t.fg, @intFromFloat(r.width - 30));
-    t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 20), @intFromFloat(r.y + 18), 13, if (open) t.blue else t.comment);
+    const hot = t.hovering(r);
+    t.panelBordered(r, if (hot and !open) t.bg_hl else t.bg, if (open) t.blue else if (hot) t.fg_dim else t.border);
+    t.text(label, @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 11, t.comment);
+    t.textClip(value, @intFromFloat(r.x + 12), @intFromFloat(r.y + 22), 14, t.fg, @intFromFloat(r.width - 34));
+    t.text(t.z("v", .{}), @intFromFloat(r.x + r.width - 22), @intFromFloat(r.y + (r.height - 13) / 2), 13, if (open or hot) t.blue else t.comment);
     // While any dropdown list is open, only its own anchor may toggle; this prevents list clicks from
     // leaking through to a selector drawn underneath the list in the same frame.
     const can_toggle = ui.open_dd == .none or open;
-    if (can_toggle and t.hovering(r) and rl.isMouseButtonPressed(.left)) {
+    if (can_toggle and hot) t.wantCursor(.pointing_hand);
+    if (can_toggle and hot and rl.isMouseButtonPressed(.left)) {
         ui.open_dd = if (open) .none else kind;
         ui.dd_rect = r;
         ui.dd_scroll = 0;
@@ -2836,11 +2940,11 @@ fn flushDropdown() void {
 /// Draw a dropdown option list under `anchor`; returns the clicked ABSOLUTE index, or null. Wheel-scrolls
 /// when there are more options than fit (so e.g. all installed Ollama models are reachable, not just 9).
 fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
-    const ih: f32 = 30;
+    const ih: f32 = 32;
     const max_vis: usize = 9;
     const total = labels.len;
     const vis = @min(total, max_vis);
-    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 2, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(vis)) + 8 };
+    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 4, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(vis)) + 8 };
     t.panelBordered(lr, t.bg_dark, t.blue);
 
     var start: usize = 0;
@@ -2860,7 +2964,8 @@ fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
         const ir = t.Rect{ .x = lr.x + 4, .y = yy, .width = lr.width - 8, .height = ih };
         const hot = t.hovering(ir);
         if (i == current) t.panel(ir, t.bg_sel) else if (hot) t.panel(ir, t.bg_hl);
-        t.textClip(labels[i], @intFromFloat(ir.x + 10), @intFromFloat(ir.y + 8), 13, t.fg, @intFromFloat(ir.width - 22));
+        if (hot) t.wantCursor(.pointing_hand);
+        t.textClip(labels[i], @intFromFloat(ir.x + 12), @intFromFloat(ir.y + (ih - 13) / 2), 13, t.fg, @intFromFloat(ir.width - 24));
         if (hot and rl.isMouseButtonPressed(.left)) clicked = i;
         yy += ih;
     }
@@ -2991,15 +3096,22 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     }
 
     var y = body.y + pad;
-    t.textClip(title[0..title_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - 296));
-    // inner tabs (Files / Console / Details) — right-aligned in the header row
-    const it_files = t.Rect{ .x = rx + rw - 288, .y = y - 2, .width = 92, .height = 24 };
-    const it_console = t.Rect{ .x = rx + rw - 192, .y = y - 2, .width = 92, .height = 24 };
-    const it_details = t.Rect{ .x = rx + rw - 96, .y = y - 2, .width = 92, .height = 24 };
-    if (t.tab(it_files, t.z("Files", .{}), ui.inner == .files)) ui.inner = .files;
-    if (t.tab(it_console, t.z("Console", .{}), ui.inner == .console)) ui.inner = .console;
-    if (t.tab(it_details, t.z("Details", .{}), ui.inner == .details)) ui.inner = .details;
-    y += 30;
+    // inner tabs (Files / Console / Details) — right-aligned in the header row, sized to their labels
+    const tl_f = t.z("Files", .{});
+    const tl_c = t.z("Console", .{});
+    const tl_d = t.z("Details", .{});
+    const w_f = t.tabW(tl_f);
+    const w_c = t.tabW(tl_c);
+    const w_d = t.tabW(tl_d);
+    const tabs_w = w_f + w_c + w_d + 12;
+    t.textClip(title[0..title_n], @intFromFloat(rx), @intFromFloat(y), 18, t.fg, @intFromFloat(rw - tabs_w - 16));
+    const it_files = t.Rect{ .x = rx + rw - tabs_w, .y = y - 2, .width = w_f, .height = 26 };
+    const it_console = t.Rect{ .x = rx + rw - tabs_w + w_f + 6, .y = y - 2, .width = w_c, .height = 26 };
+    const it_details = t.Rect{ .x = rx + rw - w_d, .y = y - 2, .width = w_d, .height = 26 };
+    if (t.tab(it_files, tl_f, ui.inner == .files)) ui.inner = .files;
+    if (t.tab(it_console, tl_c, ui.inner == .console)) ui.inner = .console;
+    if (t.tab(it_details, tl_d, ui.inner == .details)) ui.inner = .details;
+    y += 32;
 
     // controls + chat row live at the bottom for BOTH inner tabs
     const chat_h: f32 = 38;
@@ -3013,23 +3125,33 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     }
 
     var cy = panel.y + panel.height + 8;
-    const stopb = t.Rect{ .x = rx, .y = cy, .width = 84, .height = ctrl_h };
-    if (t.button(stopb, t.z("Stop", .{}), t.red, !m.stopped)) store.pushCmd(store_mod.mkCmd(.stop, sel[0..sel_n], ""));
-    const goalb = t.Rect{ .x = rx + 92, .y = cy, .width = 120, .height = ctrl_h };
-    if (t.button(goalb, t.z("Set goal->chat", .{}), t.magenta, ui.chat.len > 0)) {
+    const stop_lbl = t.z("Stop", .{});
+    const goal_lbl = t.z("Set goal->chat", .{});
+    const follow_lbl = if (ui.log_follow) t.z("following", .{}) else t.z("follow log", .{});
+    var bx = rx;
+    const stopb = t.Rect{ .x = bx, .y = cy, .width = t.btnW(stop_lbl, ctrl_h), .height = ctrl_h };
+    if (t.button(stopb, stop_lbl, t.red, !m.stopped)) store.pushCmd(store_mod.mkCmd(.stop, sel[0..sel_n], ""));
+    bx += stopb.width + 8;
+    const goalb = t.Rect{ .x = bx, .y = cy, .width = t.btnW(goal_lbl, ctrl_h), .height = ctrl_h };
+    if (t.button(goalb, goal_lbl, t.magenta, ui.chat.len > 0)) {
         store.pushCmd(store_mod.mkCmd(.set_goal, sel[0..sel_n], ui.chat.str()));
         ui.chat.clear();
     }
-    const followb = t.Rect{ .x = rx + 220, .y = cy, .width = 120, .height = ctrl_h };
-    if (t.button(followb, if (ui.log_follow) t.z("following", .{}) else t.z("follow log", .{}), t.blue, true)) ui.log_follow = !ui.log_follow;
+    bx += goalb.width + 8;
+    // fixed slot wide enough for both labels so the row doesn't shift when "follow log" <-> "following"
+    const follow_w = @max(t.btnW(t.z("follow log", .{}), ctrl_h), t.btnW(t.z("following", .{}), ctrl_h));
+    const followb = t.Rect{ .x = bx, .y = cy, .width = follow_w, .height = ctrl_h };
+    if (t.button(followb, follow_lbl, t.blue, true)) ui.log_follow = !ui.log_follow;
+    bx += followb.width + 14;
     const stlab = if (m.stopped) t.z("stopped: {s}", .{m.stop_reason[0..m.stop_reason_len]}) else t.z("round {d} - best {d}%", .{ m.round, m.best_pct });
-    t.text(stlab, @intFromFloat(rx + 350), @intFromFloat(cy + 8), 12, if (m.stopped) t.comment else t.green);
+    t.text(stlab, @intFromFloat(bx), @intFromFloat(cy + (ctrl_h - 12) / 2), 12, if (m.stopped) t.comment else t.green);
     cy += ctrl_h + 8;
 
-    const cf = t.Rect{ .x = rx, .y = cy, .width = rw - 96, .height = chat_h };
+    const send_w: f32 = 92;
+    const cf = t.Rect{ .x = rx, .y = cy, .width = rw - send_w - t.GAP, .height = chat_h };
     textField(cf, &ui.chat, ui.focus == .chat, "message the hive (say) - Enter to send", .chat);
-    const sendb = t.Rect{ .x = rx + rw - 88, .y = cy, .width = 88, .height = chat_h };
-    const send = t.button(sendb, t.z("Send", .{}), t.blue, ui.chat.len > 0);
+    const sendb = t.Rect{ .x = rx + rw - send_w, .y = cy, .width = send_w, .height = chat_h };
+    const send = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, ui.chat.len > 0);
     if (send or (ui.focus == .chat and ui.chat.len > 0 and rl.isKeyPressed(.enter))) {
         store.pushCmd(store_mod.mkCmd(.say, sel[0..sel_n], ui.chat.str()));
         ui.chat.clear();
@@ -3172,6 +3294,7 @@ fn drawFiles(store: *Store, r: t.Rect) void {
             const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
             const hot = t.hovering(rr);
             if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+            if (hot) t.wantCursor(.pointing_hand);
             t.textClip(f.pathStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 3), 13, if (is_sel) t.fg else t.fg_dim, @intFromFloat(rr.width - 62));
             t.textMono(fmtSize(f.size), @intFromFloat(rr.x + rr.width - 50), @intFromFloat(rr.y + 4), 11, t.comment);
             if (hot and rl.isMouseButtonPressed(.left)) {
@@ -3236,9 +3359,11 @@ fn fmtSize(sz: u64) [:0]const u8 {
 /// button reveals the dir in the OS file browser. The chat worker owns the IO; this only reads the Store.
 fn drawChatFiles(store: *Store, r: t.Rect) void {
     t.panelBordered(r, t.bg_dark, t.border);
-    const hdr_h: f32 = 26;
-    t.text(t.z("files built in this chat", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 13, t.comment);
-    if (t.button(.{ .x = r.x + r.width - 100, .y = r.y + 3, .width = 92, .height = 20 }, t.z("Open folder", .{}), t.blue, true)) {
+    const hdr_h: f32 = 30;
+    t.text(t.z("files built in this chat", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 9), 13, t.comment);
+    const of_label = t.z("Open folder", .{});
+    const ofw = t.btnW(of_label, t.BTN_SM);
+    if (t.button(.{ .x = r.x + r.width - ofw - 6, .y = r.y + 3, .width = ofw, .height = t.BTN_SM }, of_label, t.blue, true)) {
         store.pushChatCmd(store_mod.mkChatCmd(.chat_open_folder, "", ""));
     }
     const body = t.Rect{ .x = r.x, .y = r.y + hdr_h, .width = r.width, .height = r.height - hdr_h };
@@ -3274,6 +3399,7 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
             const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
             const hot = t.hovering(rr);
             if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
+            if (hot) t.wantCursor(.pointing_hand);
             t.textClip(f.pathStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 3), 13, if (is_sel) t.fg else t.fg_dim, @intFromFloat(rr.width - 62));
             t.textMono(fmtSize(f.size), @intFromFloat(rr.x + rr.width - 50), @intFromFloat(rr.y + 4), 11, t.comment);
             if (hot and rl.isMouseButtonPressed(.left)) {
@@ -3337,12 +3463,12 @@ fn kindColor(kind: []const u8) t.Color {
 // -------------------------------------------------------------------------------- hub
 
 fn drawHub(body: t.Rect) void {
-    const pad: f32 = 16;
+    const pad: f32 = t.PAD;
     var y: f32 = body.y + pad;
     const x: f32 = pad;
     const colw = body.width - pad * 2;
     t.text(t.z("Hub - connect hives across machines", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
-    y += 34;
+    y += 38;
     const card = t.Rect{ .x = x, .y = y, .width = colw, .height = 150 };
     t.panelBordered(card, t.bg_dark, t.border);
     t.text(t.z("The hub meshes many veil hosts into one console.", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 13, t.fg_dim);
@@ -3366,7 +3492,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
     t.setBlockClicks(ui.open_dd != .none);
     defer t.setBlockClicks(false); // never let it leak to the titlebar/tabbar of the next frame
-    const pad: f32 = 16;
+    const pad: f32 = t.PAD;
     var y: f32 = body.y + pad;
     const x: f32 = pad;
     const colw = @min(body.width - pad * 2, 720);
@@ -3408,10 +3534,12 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 40;
     flabel(x, y, "API TOKEN - an nlk_ key from the web UI (enables Deploy over the API)");
     y += 20;
-    const tf = t.Rect{ .x = x, .y = y, .width = colw - 120, .height = 34 };
+    const sv_label = t.z("Save token", .{});
+    const svw = t.btnW(sv_label, t.BTN_MD);
+    const tf = t.Rect{ .x = x, .y = y, .width = colw - svw - t.GAP, .height = t.FIELD_H };
     textField(tf, &ui.d_key, ui.focus == .d_key, "nlk_... (also used by the Deploy tab)", .d_key);
-    const savb = t.Rect{ .x = x + colw - 108, .y = y, .width = 108, .height = 34 };
-    if (t.button(savb, t.z("Save token", .{}), t.blue, ui.d_key.len > 0)) {
+    const savb = t.Rect{ .x = x + colw - svw, .y = y, .width = svw, .height = t.BTN_MD };
+    if (t.button(savb, sv_label, t.blue, ui.d_key.len > 0)) {
         store.lock();
         const n = @min(ui.d_key.len, store.settings.token.len);
         @memcpy(store.settings.token[0..n], ui.d_key.buf[0..n]);
@@ -3424,13 +3552,15 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 42; // clear the 34px field + gap (was 30 → the subtitle overlapped the input)
     if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
     y += 34;
-    const tr = t.Rect{ .x = x, .y = y, .width = 220, .height = 30 };
+    // fixed slot wide enough for both labels so the button doesn't resize when toggled
+    const ntf_w = @max(t.btnW(t.z("notifications: ON", .{}), 32), t.btnW(t.z("notifications: OFF", .{}), 32));
+    const tr = t.Rect{ .x = x, .y = y, .width = ntf_w, .height = 32 };
     if (t.button(tr, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), if (notify_on) t.green else t.comment, true)) {
         store.lock();
         store.settings.notify = !store.settings.notify;
         store.unlock();
     }
-    y += 44;
+    y += 46;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
     // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
@@ -3453,22 +3583,23 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         2 => t.z("Custom URL", .{}),
         else => t.z("Local (Ollama)", .{}),
     };
-    selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
+    selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, .chat_provider);
     // BYOK cloud-provider dropdown
     if (chat_kind == 1) {
         const p = &catalog.providers[@min(chat_byok, catalog.providers.len - 1)];
-        selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 46 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
+        selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), .chat_byok);
     }
-    y += 56;
+    y += 58;
 
     // MODEL: a populated dropdown for local/BYOK; a text field for a custom endpoint (models unknown).
     if (chat_kind == 2) {
         flabel(x, y, "MODEL");
-        textField(.{ .x = x, .y = y + 14, .width = half, .height = 32 }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
+        textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_model, ui.focus == .s_model, "model id", .s_model);
         flabel(x + half + 10, y, "ENDPOINT URL (OpenAI-compatible /v1)");
-        textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = 32 }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
-        y += 56;
-        if (t.button(.{ .x = x, .y = y, .width = 180, .height = 34 }, t.z("Save endpoint + model", .{}), t.blue, true)) {
+        textField(.{ .x = x + half + 10, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "https://host/v1", .s_url);
+        y += 58;
+        const sem_label = t.z("Save endpoint + model", .{});
+        if (t.buttonSolid(.{ .x = x, .y = y, .width = t.btnW(sem_label, t.BTN_MD), .height = t.BTN_MD }, sem_label, t.blue, true)) {
             store.lock();
             const s = &store.settings;
             const mn = @min(ui.s_model.len, s.chat_model.len);
@@ -3487,11 +3618,13 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         // Local (Ollama) defaults to 127.0.0.1:11434, but the box may run Ollama on a different port, or
         // the model may live on another machine on the LAN — let the user override the endpoint.
         const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-        selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("MODEL", .{}), model_disp, .chat_model);
+        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
         flabel(x + half + 10, y, "ENDPOINT (optional - defaults to 127.0.0.1:11434)");
-        const ew = half - 90;
-        textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = 32 }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
-        if (t.button(.{ .x = x + half + 10 + ew + 4, .y = y + 14, .width = 82, .height = 32 }, t.z("Save", .{}), t.blue, true)) {
+        const sv2_label = t.z("Save", .{});
+        const sv2w = t.btnW(sv2_label, t.FIELD_H);
+        const ew = half - sv2w - 8;
+        textField(.{ .x = x + half + 10, .y = y + 14, .width = ew, .height = t.FIELD_H }, &ui.s_url, ui.focus == .s_url, "http://127.0.0.1:11434/v1", .s_url);
+        if (t.button(.{ .x = x + half + 10 + ew + 8, .y = y + 14, .width = sv2w, .height = t.FIELD_H }, sv2_label, t.blue, true)) {
             store.lock();
             const s = &store.settings;
             const bn2 = @min(ui.s_url.len, s.chat_base.len);
@@ -3502,24 +3635,26 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             store.pushNotif("Endpoint saved", if (bn2 > 0) "custom Ollama endpoint set" else "reset to default 127.0.0.1:11434", 1);
             ui.focus = .none;
         }
-        y += 56;
+        y += 58;
         const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
         t.text(hint, @intFromFloat(x), @intFromFloat(y), 11, t.comment);
         y += 20;
     } else {
         const model_disp: []const u8 = if (cmn > 0) cmb[0..cmn] else "(pick a model)";
-        selector(.{ .x = x, .y = y, .width = half, .height = 46 }, t.z("MODEL", .{}), model_disp, .chat_model);
+        selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, .chat_model);
         const hint = t.z("models available on {s}", .{catalog.providers[@min(chat_byok, catalog.providers.len - 1)].label});
-        t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 16), 11, t.comment);
-        y += 56;
+        t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+        y += 58;
     }
 
     // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
     if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
         flabel(x, y, "CLOUDFLARE ACCOUNT ID (from your Cloudflare dashboard - not a secret)");
         y += 14;
-        textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
-        if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save id", .{}), t.blue, true)) {
+        const sid_label = t.z("Save id", .{});
+        const sidw = t.btnW(sid_label, t.BTN_MD);
+        textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_cfacct, ui.focus == .s_cfacct, "e.g. 0123456789abcdef0123456789abcdef", .s_cfacct);
+        if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = sidw, .height = t.BTN_MD }, sid_label, t.blue, true)) {
             store.lock();
             const s = &store.settings;
             const n = @min(ui.s_cfacct.len, s.cf_account.len);
@@ -3538,14 +3673,16 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         const key_hint: [:0]const u8 = if (chat_kind == 1 and std.mem.eql(u8, catalog.providers[@min(chat_byok, catalog.providers.len - 1)].key, "huggingface")) t.z("hf_... (a Hugging Face fine-grained token with Inference Providers access)", .{}) else if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) t.z("your Cloudflare API token (Workers AI)", .{}) else t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{});
         flabel(x, y, key_hint);
         y += 14;
-        textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
-        if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save key", .{}), t.blue, ui.s_ckey.len > 0)) {
+        const sk_label = t.z("Save key", .{});
+        const skw = t.btnW(sk_label, t.BTN_MD);
+        textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
+        if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, ui.s_ckey.len > 0)) {
             store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
             ui.s_ckey.clear();
             ui.focus = .none;
         }
-        if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 116), @intFromFloat(y + 9), 12, t.green);
-        y += 44;
+        if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
+        y += 48;
     }
     y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
@@ -3750,6 +3887,7 @@ var field_drag: bool = false;
 /// arrows/Home/End move it (editField owns the keys; this owns the pixels).
 fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
+    if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const line_h: f32 = 18;
@@ -3832,6 +3970,7 @@ fn hitField(f: *const Ui.Field, lines: [][]const u8, first: usize, mp: rl.Vector
 
 fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
+    if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
@@ -3902,9 +4041,9 @@ fn drawToasts(store: *Store) void {
             2 => t.orange,
             else => t.blue,
         };
-        t.panelBordered(r, t.bg_hl, accent);
-        t.fillRect(@intFromFloat(r.x), @intFromFloat(r.y + 6), 3, @intFromFloat(h - 12), accent);
-        t.textClip(tn.titleStr(), @intFromFloat(r.x + 14), @intFromFloat(r.y + 9), 13, t.fg, @intFromFloat(w - 24));
-        t.textClip(tn.bodyStr(), @intFromFloat(r.x + 14), @intFromFloat(r.y + 30), 11, t.fg_dim, @intFromFloat(w - 24));
+        t.panelBordered(r, t.bg_hl, t.withAlpha(accent, 170));
+        t.fillRect(@intFromFloat(r.x), @intFromFloat(r.y + 8), 3, @intFromFloat(h - 16), accent);
+        t.textClip(tn.titleStr(), @intFromFloat(r.x + 16), @intFromFloat(r.y + 10), 13, t.fg, @intFromFloat(w - 28));
+        t.textClip(tn.bodyStr(), @intFromFloat(r.x + 16), @intFromFloat(r.y + 31), 11, t.fg_dim, @intFromFloat(w - 28));
     }
 }

@@ -329,7 +329,38 @@ pub const Supervisor = struct {
         } else if (!self.hasDoneMarker(run_dir)) {
             self.killByPidFile(run_dir);
         }
+        // A hard TerminateProcess gives the worker no chance to run its own writeDone, so the run dir was left
+        // WITHOUT a DONE marker, WITHOUT a "stopped" event, and with a stale worker.pid — desktop watchers key
+        // off the "stopped" event and so never saw the cast finish (the user got locked in the chat). Stamp the
+        // terminal state ourselves now that the process is dead: append a "stopped" event, write DONE, drop the
+        // pid file. (No-op if the worker already exited cleanly and wrote its own DONE.)
+        if (!self.hasDoneMarker(run_dir)) self.writeKillMarker(run_dir);
         return true;
+    }
+
+    /// Stamp a run dir as terminated after a hard kill — the supervisor's replica of the worker's writeDone
+    /// (run.zig): append a terminal "stopped" event so filesystem watchers converge, write DONE so reconcile
+    /// treats a dead pid as finished (never a crash to respawn), and delete the now-stale worker.pid.
+    fn writeKillMarker(self: *Supervisor, run_dir: []const u8) void {
+        var pbuf: [1280]u8 = undefined;
+        // append a terminal "stopped" event (read whole + rewrite — the killed worker's log is frozen, so no
+        // concurrent writer; bounded by the run's own event volume)
+        if (std.fmt.bufPrint(&pbuf, "{s}/events.jsonl", .{run_dir})) |evp| {
+            const line = "{\"seq\":0,\"t\":0,\"kind\":\"stopped\",\"reason\":\"killed\"}\n";
+            const prior = std.Io.Dir.cwd().readFileAlloc(self.io, evp, self.gpa, .limited(64 << 20)) catch &[_]u8{};
+            defer if (prior.len > 0) self.gpa.free(prior);
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(self.gpa);
+            buf.appendSlice(self.gpa, prior) catch return;
+            buf.appendSlice(self.gpa, line) catch return;
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = evp, .data = buf.items }) catch {};
+        } else |_| {}
+        if (std.fmt.bufPrint(&pbuf, "{s}/DONE", .{run_dir})) |dp| {
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = dp, .data = "killed" }) catch {};
+        } else |_| {}
+        if (std.fmt.bufPrint(&pbuf, "{s}/worker.pid", .{run_dir})) |pp| {
+            std.Io.Dir.cwd().deleteFile(self.io, pp) catch {};
+        } else |_| {}
     }
 
     pub fn remove(self: *Supervisor, id: []const u8) void {
