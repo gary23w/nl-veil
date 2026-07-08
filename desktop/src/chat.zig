@@ -115,6 +115,12 @@ const SYSTEM_PROMPT =
     "If the user denies a command, don't retry it blindly — " ++
     "ask or take another approach. Never run something irreversible (deleting data, killing processes) unasked. " ++
     "For pure web/research questions use web_search or CAST, not RUN.\n" ++
+    "ACT, DON'T PROMISE — when you say you will do something ('I'll run...', 'Let me check...'), you MUST put " ++
+    "the corresponding RUN:/TOOL: line in the SAME reply. NEVER end a reply with a promise of future action: " ++
+    "every reply either performs an action or delivers the final result. After an action that CHANGES something, " ++
+    "verify the outcome with a read-only check before declaring success — command output like 'Ready' is not " ++
+    "proof the thing works. If a command fails and you then find the fix, record the general lesson in one line " ++
+    "with TOOL: observe so it is never re-derived.\n" ++
     "\n" ++
     "GROUND YOURSELF — you have NO live knowledge. Before you answer anything about current events, prices, " ++
     "versions, or the SPECIFIC steps of a task you're not sure how to do (e.g. 'how do I host this on Cloudflare', " ++
@@ -158,6 +164,16 @@ const SYSTEM_PROMPT =
 // The neuron-db scope for the chat's DURABLE cross-conversation memory (keys/logins/preferences/facts). Distinct
 // from the per-conversation convScope: memories saved in one chat are recallable from every chat. See storeMemory.
 const MEMORY_SCOPE = "veil-memory";
+// Operational lessons the veil learned from its own VERIFIED failure→fix transitions (real exit codes, never
+// model self-report — the engine's retrospective discipline). Deliberately separate from MEMORY_SCOPE: the
+// Memory tab stays the USER's; lessons are the veil's own playbook, recalled per turn and injected as binding.
+const PLAYBOOK_SCOPE = "veil-playbook";
+// The learning harness's neuron-db scopes. Each is a durable store fed only by human-accepted proposals
+// (the background judge grades TRACES — real exit codes, never the answering model's self-report — and
+// proposes into quarantine "-proposed" scopes; accepting promotes here). Kept distinct so the user's
+// Memory tab (MEMORY_SCOPE) stays theirs and each layer recalls independently:
+const SKILLS_SCOPE = "veil-skills"; //  PROCEDURAL memory: class-level "how to do this kind of task for this user"
+const USER_SCOPE = "veil-user"; //      the deepening working MODEL of the user (persona/style/expectations)
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
@@ -387,6 +403,22 @@ pub const Chat = struct {
     // this is set true when a turn dispatches a tool/shell/cast/kill, false when it settles on plain prose.
     // A conversational answer (nothing actioned) ends the loop instead of spinning on invented next-steps.
     acted: bool = false,
+    // AGENTIC FLOOR (the announced-but-never-performed death spiral + verify-before-done + lesson loop):
+    act_nudges: u8 = 0, // act-followthrough nudges fired this arc (capped — never competes with real
+    //                     dispatches for the tool budget). Live replay showed a narrating model often
+    //                     answers the FIRST nudge with another announcement; the second converts it.
+    arc_mutated: bool = false, // this arc performed a side-effecting action (shell launch / mutating tool) —
+    //                            the trigger for the one bounded post-arc verification turn
+    verify_done: bool = false, // the verification turn already ran for this arc (one per arc)
+    arc_fail_cmd: [900]u8 = undefined, // the last console command that FAILED this arc (lesson capture pairs
+    arc_fail_cmd_len: usize = 0, //       it with a later similar SUCCESS — verified transitions only)
+    arc_fail_note: [96]u8 = undefined, // that failure's note ("(exit code 2147942402)")
+    arc_fail_note_len: usize = 0,
+    playbook_hit: bool = false, // an operational lesson was injected into this turn's prompt (a later clean
+    //                             console result Hebbian-reinforces the lesson scope — once, then cleared)
+    consolidate_pending: bool = false, // an internal re-entry (act nudge / verify turn) preempted a settle that
+    //                                    WOULD have consolidated memory — the arc's eventual settle owes one
+    //                                    consolidation pass (otherwise mutating arcs silently never save facts)
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -884,6 +916,11 @@ pub const Chat = struct {
         self.console = p;
         self.console_cancel = false;
         self.setConsoleBusy(ai, true);
+        // A launched veil shell command is a side effect until proven otherwise → the arc verifies before
+        // settling on "done". Conservative: only clearly read-only probes (dir/type/Get-*...) are exempt, so
+        // pure diagnostic arcs don't buy a verification round. (Set at LAUNCH, past the approval park — a
+        // denied command never mutates.)
+        if (ai and !looksReadOnlyCommand(trimmed)) self.arc_mutated = true;
         log.info("console: {s} launched: {s}", .{ if (ai) "veil" else "you", trimmed[0..@min(trimmed.len, 120)] });
     }
 
@@ -989,6 +1026,48 @@ pub const Chat = struct {
         // The AI door hands the result back to the model. Copy what's needed off `p` BEFORE clearing the slot,
         // then clear it so foldConsoleAi (which re-enters a turn) sees a clean idle console state.
         if (ai) {
+            // LESSON LOOP (verified transitions only — the engine's retrospective discipline): a command that
+            // FAILED (real nonzero exit / timeout, never model self-report) followed in the same arc by a
+            // SIMILAR command that SUCCEEDED is a fix worth keeping. Deterministic, zero model calls; the
+            // lesson lands in the playbook scope and is recalled into future prompts (see startTurn).
+            const hard_fail = std.mem.startsWith(u8, note, "(exit code") or std.mem.startsWith(u8, note, "(command timed out");
+            // Clean means a REAL zero exit. A reaped-unknowable code (killed child, GetExitCodeProcess
+            // failure, POSIX signal death) also produces an empty note — that's absence of ground truth,
+            // not success, so it must neither mint a lesson nor reinforce the playbook.
+            const clean_ok = outcome == .exited and (exit_code orelse 1) == 0;
+            if (hard_fail) {
+                const fl = @min(p.cmd_len, self.arc_fail_cmd.len);
+                @memcpy(self.arc_fail_cmd[0..fl], p.cmd[0..fl]);
+                self.arc_fail_cmd_len = fl;
+                const nl2 = @min(note.len, self.arc_fail_note.len);
+                @memcpy(self.arc_fail_note[0..nl2], note[0..nl2]);
+                self.arc_fail_note_len = nl2;
+            } else if (clean_ok and self.arc_fail_cmd_len > 0 and
+                lessonPair(self.arc_fail_cmd[0..self.arc_fail_cmd_len], p.cmdStr()))
+            {
+                var lb2: [1100]u8 = undefined;
+                const fail_note = std.mem.trim(u8, self.arc_fail_note[0..self.arc_fail_note_len], " \r\n\t");
+                if (std.fmt.bufPrint(&lb2, "fix: `{s}` failed {s} — works as: `{s}`", .{
+                    self.arc_fail_cmd[0..@min(self.arc_fail_cmd_len, 380)],
+                    fail_note,
+                    p.cmdStr()[0..@min(p.cmd_len, 380)],
+                })) |lesson| {
+                    self.mind().observe(PLAYBOOK_SCOPE, lesson);
+                    log.info("playbook: lesson captured ({d}b) from a verified fail->fix transition", .{lesson.len});
+                } else |_| {}
+                self.arc_fail_cmd_len = 0;
+                self.arc_fail_note_len = 0;
+            }
+            // Hebbian close of the loop: a lesson was injected this turn and the command came back clean —
+            // reinforce the playbook so lessons that actually fix things out-rank stale ones. ONE reinforce
+            // per injection (cleared here): per-command repetition would inflate trust without new evidence.
+            // Keyed to the user's request — internal directives no longer clobber last_user, so the
+            // strengthened association is the one future recalls will actually hit.
+            if (self.playbook_hit and clean_ok and self.last_user_len > 3) {
+                self.mind().reinforce(PLAYBOOK_SCOPE, self.last_user[0..@min(self.last_user_len, 200)], "worked");
+                self.playbook_hit = false;
+            }
+
             var cmdb: [1024]u8 = undefined;
             const cl = @min(p.cmd_len, cmdb.len);
             @memcpy(cmdb[0..cl], p.cmd[0..cl]);
@@ -1070,6 +1149,7 @@ pub const Chat = struct {
         self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        self.resetArcFlags(); // fresh agentic-floor arc: follow-through nudge, verification, lesson capture
         // AUTO-LOOP ON by default once the user prompts (user directive): the veil drives its own next step
         // until it emits DONE or hits the iteration cap — so a task gets carried to completion, not one reply.
         // The user can switch it off with the input's auto-loop toggle; a manual send re-arms it.
@@ -1114,6 +1194,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // new conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
+        self.resetArcFlags(); // the agentic-floor arc cannot span a conversation switch
         self.refreshConvs(dd, true);
     }
 
@@ -1129,6 +1210,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // switched conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
+        self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.loadMsgs(dd, id);
     }
 
@@ -1917,6 +1999,49 @@ pub const Chat = struct {
                 log.info("chat memory: injected {d}b of durable memory", .{block.len});
             }
         }
+        // OPERATIONAL PLAYBOOK: lessons the veil captured from its own verified failure→fix transitions on
+        // THIS machine (see pumpConsole). Trust-weighted recall against the current request — only lessons
+        // that keep working keep ranking. This is what stops the same fix being re-derived every session.
+        // Acting turns only: injected into a .consolidate/.loop_infer machine pass, "treat as binding"
+        // lesson text would contaminate what those deterministic prompts extract.
+        if (kind == .user or kind == .tool_follow) {
+            var pb2: [1400]u8 = undefined;
+            const lessons = wholeLines(self.mind().recall(PLAYBOOK_SCOPE, self.last_user[0..self.last_user_len], &pb2), pb2.len);
+            self.playbook_hit = lessons.len > 0;
+            if (lessons.len > 0) {
+                msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"OPERATIONAL LESSONS (fixes learned from your own past command failures on this machine — treat them as binding; apply the working form directly instead of re-deriving it):\\n") catch return;
+                escJson(&msgs, self.gpa, lessons);
+                msgs.appendSlice(self.gpa, "\"}") catch return;
+                log.info("playbook: injected {d}b of operational lessons", .{lessons.len});
+            }
+        }
+        // SKILLS (procedural memory — how to do THIS class of task for this user). Written only by the
+        // external judge from VERIFIED arcs (never model self-report), governed by the curator. Trust-weighted
+        // recall surfaces the class-level skill relevant to the request; empty until the judge mints one.
+        if (kind == .user or kind == .tool_follow) {
+            var sk: [1600]u8 = undefined;
+            const skills = wholeLines(self.mind().recall(SKILLS_SCOPE, self.last_user[0..self.last_user_len], &sk), sk.len);
+            if (skills.len > 0) {
+                msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"RELEVANT SKILLS (procedural know-how you built from past tasks — the steps + pitfalls for this class of work. Follow them; if one proves wrong this session, note the correction so it can be patched):\\n") catch return;
+                escJson(&msgs, self.gpa, skills);
+                msgs.appendSlice(self.gpa, "\"}") catch return;
+                log.info("skills: injected {d}b of procedural memory", .{skills.len});
+            }
+        }
+        // USER MODEL (who this user is + how they want you to work). Deepened by the judge across sessions;
+        // distinct from YOUR MEMORY (their keys/prefs facts) — this is the working persona/style model.
+        // Answer-shaped turns only (.reflect polishes tone, so it needs the same grounding the draft had);
+        // machine passes (.consolidate/.loop_infer/.collect) must stay uncontaminated.
+        if (kind == .user or kind == .tool_follow or kind == .reflect) {
+            var ub: [1200]u8 = undefined;
+            const um = wholeLines(self.mind().recall(USER_SCOPE, if (self.last_user_len > 0) self.last_user[0..self.last_user_len] else "user", &ub), ub.len);
+            if (um.len > 0) {
+                msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"WHO YOU'RE TALKING TO (your working model of this user — their style, expectations, and how they want you to operate. Let it shape tone and approach, not override explicit instructions):\\n") catch return;
+                escJson(&msgs, self.gpa, um);
+                msgs.appendSlice(self.gpa, "\"}") catch return;
+                log.info("user-model: injected {d}b", .{um.len});
+            }
+        }
         {
             self.store.lock();
             defer self.store.unlock();
@@ -2127,8 +2252,18 @@ pub const Chat = struct {
             var synth_args: ?[]u8 = null;
             defer if (synth_args) |s| self.gpa.free(s); // freed AFTER runToolAndContinue dupes it (returns at 1446)
             var synthesized = false; // code-block rescue: the "prose" is the pasted file — never narrate it
+            // Reasoning-channel recovery fires when content is EMPTY — and also when content merely
+            // ANNOUNCES the action ("I'll check the task now") while the literal call sits stranded in
+            // the thinking. The announced-then-fizzle transcript showed non-empty narration was the
+            // common case, and the old full.len==0 gate made the reasoning invisible exactly then.
+            // A literal CAST: in content vetoes recovery outright — the reply DID act (cast dispatches
+            // below the reflect gate); hijacking it with a TOOL/RUN dug out of the thinking was a
+            // confirmed review finding. When the reasoning holds BOTH a TOOL: and a RUN:, the LATER one
+            // is the model's final decision (looseRunWins) — fixed TOOL-first picked the discarded option.
+            const loose_ok = reason.len > 0 and castGoal(full) == null and
+                (full.len == 0 or announcesAction(full));
             const tc_opt = toolCall(full) orelse toolCallXml(full) orelse
-                (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null) orelse blk: {
+                (if (loose_ok and !looseRunWins(reason)) toolCallLoose(reason) else null) orelse blk: {
                 if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
                     synth_args = s;
                     synthesized = true;
@@ -2162,7 +2297,10 @@ pub const Chat = struct {
             }
             // RUN: <shell command> — the AI's micro-console door. Same agentic loop as TOOL (shared iteration
             // budget), output streams into the Veil console tab and folds back so the model reads the result.
-            if (runCall(full)) |cmd| {
+            // Same reasoning-channel recovery as TOOL (this asymmetry was half the fizzle: a RUN: narrated in
+            // the thinking had NO recovery path at all, so the turn settled as prose and the app went idle).
+            const run_opt = runCall(full) orelse (if (loose_ok) runCallLoose(reason) else null);
+            if (run_opt) |cmd| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several commands in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
                     self.stream.deinit(self.gpa);
@@ -2197,15 +2335,48 @@ pub const Chat = struct {
             if (looksLikeFailedToolCall(full) and self.tool_iters < MAX_TOOL_ITERS) {
                 self.tool_iters += 1;
                 self.stream.deinit(self.gpa);
-                self.appendMsg(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)");
+                // The directive reaches the model through the history (cast_note rows re-feed as user
+                // rows) — do NOT clobber last_user with it (that mis-keyed every recall/reinforce/loop
+                // guard to machine boilerplate) and do NOT observe it (identical boilerplate as neurons
+                // poisons the conversation scope's recall).
+                self.appendMsgFull(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)", false);
                 const p = "Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call: one short why-sentence, then on its own line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.";
-                self.appendMsg(dd, .cast_note, p);
-                self.last_user_len = @min(p.len, self.last_user.len);
-                @memcpy(self.last_user[0..self.last_user_len], p[0..self.last_user_len]);
+                self.appendMsgFull(dd, .cast_note, p, false);
                 self.internal_turn = true; // corrective directive, not a real user turn — don't consolidate memory off it
                 self.setStatus("retrying in the right tool format...");
                 self.startTurn(dd, kind);
                 return;
+            }
+            // ACT FOLLOW-THROUGH: the reply ANNOUNCED an action ("I'll re-create the task with the full
+            // path...") but performed none — no TOOL:/RUN: line in content OR reasoning (the literal-line
+            // cases were recovered above). Left alone this settles as a final answer, acted stays false, the
+            // auto-loop silently disarms, and the app sits idle on a promise — the observed death spiral
+            // (narrate → fizzle → user prods → narrate again). Re-enter with a hard directive to act — up
+            // to TWICE per arc: the live replay showed a narrating model often answers the first nudge
+            // with another announcement, and the second one converts it (still bounded, still cheap).
+            // Own capped counter: narration nudges must never spend the real tool budget. Placed BEFORE
+            // the reflect gate — reflect's critique prompt forbids action lines, so it would launder the
+            // announced intent into more polished prose instead of an action.
+            if (self.act_nudges < 2 and !self.in_veil_work and !self.castPending() and
+                castGoal(full) == null and // a literal CAST: IS the performed action — it dispatches below
+                (announcesAction(full) or (full.len == 0 and announcesAction(reason))))
+            {
+                self.act_nudges += 1;
+                // The fizzled reply is what the user watched stream — commit it (unobserved: a promise is
+                // noise in recall) so it doesn't visibly vanish and the directive has its antecedent in
+                // history. And this exchange may still owe a consolidation: the re-entry is machine-authored
+                // (internal_turn), which would silently swallow shouldConsolidate — stash the debt.
+                if (self.shouldConsolidate(kind, full)) self.consolidate_pending = true;
+                if (full.len > 0) self.appendMsgFull(dd, .veil, full, false);
+                self.stream.deinit(self.gpa);
+                self.appendMsgFull(dd, .cast_note, "(the reply announced an action but didn't perform it — asking it to act now)", false);
+                const p = "Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.";
+                self.appendMsgFull(dd, .cast_note, p, false);
+                self.internal_turn = true; // machine directive, not a user exchange (last_user keeps the real goal)
+                self.setStatus("following through on the announced action...");
+                log.info("act follow-through: reply announced an action but performed none — re-entering", .{});
+                self.startTurn(dd, kind);
+                return; // startTurn's abort/llm-start failures clear busy; its alloc catch-returns share every caller's exposure
             }
         }
         if (REFLECT_PASSES > 0 and !self.in_veil_work and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
@@ -2370,8 +2541,40 @@ pub const Chat = struct {
         // `full` is a stream slice) whether to run the deterministic consolidation pass that persists durable facts
         // about the user. If it fires, its own settle does setBusy(false)+maybeLoop, so we return here.
         const consolidate = self.shouldConsolidate(kind, full);
+        // VERIFY BEFORE DONE: this arc performed side-effecting actions and the model is now settling on a
+        // prose answer (typically "done!"). "The command printed Ready" is not the same as "the thing works"
+        // — the observed failure registered a task that looked fine and silently failed later (LastTaskResult
+        // 0x80070002, found only when the user complained). One bounded verification turn: the model must
+        // check the OUTCOME with a read-only command whose result folds back through the real console (exit
+        // codes and output are ground truth — the model picks WHAT to check, never what the check returned).
+        // A failed check re-enters the normal fix loop (bounded by MAX_TOOL_ITERS). Skipped when the answer
+        // hands the turn to the user with a question, on Stop/epoch moves, and during casts/veil work.
+        const want_verify = (kind == .user or kind == .tool_follow or kind == .reflect) and self.arc_mutated and !self.verify_done and
+            !self.in_veil_work and !self.castPending() and
+            !(full.len > 0 and full[full.len - 1] == '?') and
+            self.turn_epoch == self.conv_epoch and !self.abort_turn.load(.monotonic) and
+            self.tool_iters + 1 < MAX_TOOL_ITERS; // headroom for the CHECK itself — a verify turn holding the
+        //                                           last slot would demand a RUN the budget then refuses
         self.stream.deinit(self.gpa);
-        if (consolidate) {
+        if (want_verify) {
+            self.verify_done = true;
+            self.tool_iters += 1; // the verify turn spends from the arc's real budget
+            // This settle WOULD have consolidated — the verify re-entry is machine-authored (internal_turn),
+            // which suppresses shouldConsolidate for the rest of the arc, so carry the debt to the arc's
+            // eventual settle (the confirmed swallow otherwise dropped durable facts on every mutating arc).
+            if (consolidate) self.consolidate_pending = true;
+            self.appendMsgFull(dd, .cast_note, "(verifying the outcome before calling it done)", false);
+            const p = "Before we call this done: VERIFY the outcome OBJECTIVELY. One short sentence, then exactly ONE read-only RUN: or TOOL: line that checks the thing you just changed actually exists and behaves (query the created task/file/service/state — e.g. a scheduled task's LastTaskResult, a file's content, a service's status). When the result arrives: if it proves the work, report done WITH the evidence; if it exposes a failure, FIX it now and verify again. Only if this exchange truly changed nothing, restate your final answer instead.";
+            self.appendMsgFull(dd, .cast_note, p, false);
+            self.internal_turn = true; // machine directive — never consolidated as a user exchange (last_user keeps the real goal)
+            self.setStatus("verifying the work...");
+            log.info("verify: arc acted with side effects — running the verification turn", .{});
+            self.startTurn(dd, .tool_follow);
+            if (self.turn == .tool_follow) return; // the verify turn is live; it settles later
+            // couldn't start — fall through to a normal settle so the chat never wedges busy
+        }
+        if (consolidate or self.consolidate_pending) {
+            self.consolidate_pending = false; // consumed (cleared FIRST — the consolidate settle re-enters this path)
             self.setStatus("consolidating memory...");
             self.startTurn(dd, .consolidate);
             if (self.turn == .consolidate) return; // the consolidation turn is live; it settles + goes idle later
@@ -2473,6 +2676,9 @@ pub const Chat = struct {
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0;
+        self.act_nudges = 0; // each loop step re-earns its follow-through nudges + verification
+        self.arc_mutated = false;
+        self.verify_done = false;
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -2501,6 +2707,7 @@ pub const Chat = struct {
         // TRUE and a later normal turn would write its files into the isolated {conv}-veil dir (lost work), and a
         // pending merge would fire behind the Stop. The hive's own output stays saved (viewable in the Swarm tab).
         self.resetVeilWork();
+        self.resetArcFlags(); // Stop abandons the arc — no follow-through/verify/lesson fires behind it
         if (self.awaitingShellApproval()) self.clearPendingCmd(); // Stop dismisses a parked command (unrun)
         if (self.turn != .idle) {
             llm.abort(&self.stream, self.io);
@@ -2510,6 +2717,19 @@ pub const Chat = struct {
         }
         self.setStatus("");
         self.setBusy(false);
+    }
+
+    /// Reset every agentic-floor arc field. An "arc" is one user goal within ONE conversation — anything
+    /// that abandons or leaves the arc (Stop, new/switched conversation, a fresh user message) must clear
+    /// these so a stale arc_mutated can't buy a verify turn (or a stale fail half a lesson) somewhere else.
+    fn resetArcFlags(self: *Chat) void {
+        self.act_nudges = 0;
+        self.arc_mutated = false;
+        self.verify_done = false;
+        self.arc_fail_cmd_len = 0;
+        self.arc_fail_note_len = 0;
+        self.playbook_hit = false; // a Stop-abandoned arc's still-running command must not reinforce on landing
+        self.consolidate_pending = false;
     }
 
     /// Disarm auto-loop silently — the veil just gave a plain answer, so there's nothing to narrate.
@@ -2866,6 +3086,7 @@ pub const Chat = struct {
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
         self.acted = true; // a tool ran this exchange → the veil is working → auto-loop may continue
+        if (isMutatingToolName(tc.name)) self.arc_mutated = true; // side effects → the arc must verify before "done"
         // Stop pressed while the previous stream was settling → don't fire another (blocking) tool round-trip.
         if (self.abort_turn.load(.monotonic)) {
             self.stream.deinit(self.gpa);
@@ -4107,6 +4328,180 @@ fn needsBatchPercentHint(cmd: []const u8) bool {
     return false;
 }
 
+const RunLoose = struct { cmd: []const u8, at: usize };
+
+/// Recover a RUN: command narrated inside the reasoning channel — LINE-ANCHORED: only a line that (after
+/// markdown lead-in) STARTS with "RUN:" counts, so prose mentions ("you could use RUN: x"), pseudo-labels
+/// (DRY-RUN:, OVERRUN:) and quoted discussion never dispatch a shell command. The LAST anchored line wins:
+/// reasoning walks through options, the final action line is the decision. Pure — unit-tested.
+fn runCallLooseAt(text: []const u8) ?RunLoose {
+    var best: ?RunLoose = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const lead = std.mem.trimStart(u8, raw, " \t>-*`");
+        if (!std.mem.startsWith(u8, lead, "RUN:")) continue;
+        var cmd = std.mem.trim(u8, lead["RUN:".len..], " \t\r`");
+        // a "**RUN: dir**" markdown-bold line leaves a trailing "**" — strip the pair, but KEEP a lone
+        // trailing '*' (a real wildcard: `del *` must survive recovery intact)
+        if (std.mem.endsWith(u8, cmd, "**")) cmd = std.mem.trimEnd(u8, cmd, "*");
+        if (cmd.len > 0 and cmd.len <= 900)
+            best = .{ .cmd = cmd, .at = @intFromPtr(raw.ptr) - @intFromPtr(text.ptr) };
+    }
+    return best;
+}
+
+pub fn runCallLoose(text: []const u8) ?[]const u8 {
+    return if (runCallLooseAt(text)) |r| r.cmd else null;
+}
+
+/// The reasoning holds BOTH recoverable action forms — which is the model's FINAL decision? The one that
+/// appears LATER wins (mirrors each parser's own last-match rule); fixed TOOL-before-RUN priority was a
+/// confirmed way to dispatch the option the reasoning had discarded. True = the RUN should dispatch.
+fn looseRunWins(text: []const u8) bool {
+    const r = runCallLooseAt(text) orelse return false;
+    const t = std.mem.lastIndexOf(u8, text, "TOOL:") orelse return true;
+    return r.at > t;
+}
+
+/// A recall result that exactly fills its buffer was almost certainly TRUNCATED mid-line — half a command
+/// in a prompt block labeled "binding" is worse than one lesson fewer. Cut back to the last complete line
+/// (a result that legitimately fits exactly loses at most its final line).
+fn wholeLines(s: []const u8, cap: usize) []const u8 {
+    if (s.len < cap) return s;
+    const nl = std.mem.lastIndexOfScalar(u8, s, '\n') orelse return s;
+    return s[0..nl];
+}
+
+/// Does this reply ANNOUNCE an action without performing one? The intermediate-ack shape: a
+/// future-tense commitment ("I'll ...", "Let me ...") paired with an action verb, in a SHORT reply (long
+/// analyses aren't acks) that doesn't hand the turn back with a question. The ack must sit in the reply's
+/// TAIL — announcements come as closings; an opening "I'll check X" followed by the finished work reads
+/// differently. "let me know" (the classing closing) is explicitly not an ack. Pure — unit-tested.
+pub fn announcesAction(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (t.len == 0 or t.len > 1600) return false;
+    if (t[t.len - 1] == '?') return false; // a question deliberately hands the turn to the user
+    var lb: [1600]u8 = undefined;
+    const n = @min(t.len, lb.len);
+    for (t[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const tail_from = n - @min(n, 280);
+    const tail = lb[tail_from..n];
+    // A commitment phrase must be followed CLOSELY by an action verb ("I'll check the task...") — matching
+    // verbs anywhere in the tail made the gate near-vacuous ("test" inside "latest"), so courtesy closings
+    // gated command dispatch (a confirmed review finding). Curly-apostrophe variants included: reasoning
+    // models emit typographic quotes and the ASCII-only list missed every contraction ack.
+    const acks = [_][]const u8{ "i'll ", "i\u{2019}ll ", "i will ", "i'm going to ", "i\u{2019}m going to ", "let's ", "let\u{2019}s ", "let me ", "we'll ", "we\u{2019}ll " };
+    const verbs = [_][]const u8{ "run", "execut", "check", "verif", "regist", "creat", "schedul", "install", "writ", "updat", "delet", "quer", "inspect", "fix", "test", "set ", "look", "apply", "launch", "restart", "retry", "re-run", "rerun", "re-creat", "re-regist", "start", "open", "read", "list", "search", "add ", "remove", "correct", "adjust", "do " };
+    for (acks) |a| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, tail, from, a)) |at| {
+            from = at + a.len;
+            const w = tail[from..@min(tail.len, from + 56)];
+            if (std.mem.startsWith(u8, w, "know")) continue; // "let me know" / "i'll know" — closing courtesy
+            for (verbs) |v| {
+                if (std.mem.indexOf(u8, w, v) != null) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Do a FAILED command and a later SUCCEEDING one form a fix pair worth learning? Same executable (first
+/// token) + substantial token overlap (the fix is a VARIANT of the failure, not an unrelated success), and
+/// not the identical command (a clean retry is a transient, not a lesson). Pure — unit-tested.
+fn lessonPair(fail: []const u8, ok: []const u8) bool {
+    const f = std.mem.trim(u8, fail, " \r\n\t");
+    const o = std.mem.trim(u8, ok, " \r\n\t");
+    if (f.len == 0 or o.len == 0) return false;
+    if (std.mem.eql(u8, f, o)) return false; // identical retry that worked — transient at ANY length
+    if (nearlySame(f, o)) return false; //      (nearlySame alone silently gave up past 400 chars)
+    // a read-only probe succeeding after a failed MUTATION is diagnosis, not the fix — pairing it would
+    // mint a lesson whose "working form" changes nothing (the confirmed playbook-poisoning path)
+    if (looksReadOnlyCommand(o) and !looksReadOnlyCommand(f)) return false;
+    var fi = std.mem.tokenizeAny(u8, f, " \t");
+    var oi = std.mem.tokenizeAny(u8, o, " \t");
+    const f0 = fi.next() orelse return false;
+    const o0 = oi.next() orelse return false;
+    // same executable, PATH-BLIND ("msg" == "C:\Windows\System32\msg.exe"): path-qualifying the exe IS
+    // the motivating fix class, and strict first-token equality missed exactly it
+    if (!std.ascii.eqlIgnoreCase(execBase(f0), execBase(o0))) return false;
+    // overlap: at least half of the failing command's substantial tokens reappear in the fix
+    var total: usize = 0;
+    var hit: usize = 0;
+    var it = std.mem.tokenizeAny(u8, f, " \t");
+    _ = it.next(); // skip the executable
+    while (it.next()) |tok| {
+        if (tok.len < 5) continue;
+        total += 1;
+        if (std.mem.indexOf(u8, o, tok) != null) hit += 1;
+    }
+    return total > 0 and hit * 2 >= total;
+}
+
+/// "C:\Windows\System32\msg.exe" / "./msg" / "\"msg.exe\"" → "msg": the executable's identity for lesson
+/// pairing, blind to path, quoting and the .exe suffix.
+fn execBase(tok: []const u8) []const u8 {
+    var t = std.mem.trim(u8, tok, "\"'");
+    if (std.mem.lastIndexOfAny(u8, t, "/\\")) |i| t = t[i + 1 ..];
+    if (t.len > 4 and std.ascii.eqlIgnoreCase(t[t.len - 4 ..], ".exe")) t = t[0 .. t.len - 4];
+    return t;
+}
+
+/// Mutating chat tools — the ones whose side effects make an arc worth VERIFYING before "done". Read-class
+/// tools (recall/read_file/web_search/...) never trigger a verification round on their own.
+fn isMutatingToolName(name: []const u8) bool {
+    const muts = [_][]const u8{ "write_file", "edit_file", "delete_file", "run_python", "host_command", "patch_system", "stage_delivery", "make_tool" };
+    for (muts) |m| if (std.mem.eql(u8, name, m)) return true;
+    return false;
+}
+
+/// Is this shell command CLEARLY read-only (a diagnostic probe)? Conservative allowlist — anything
+/// unrecognized counts as mutating, so the verify pass errs toward running. Covers the bare cmd probes and
+/// the `powershell -Command Get-*/Test-*/Select-*/Measure-*` diagnostic shape. Pure — unit-tested.
+fn looksReadOnlyCommand(cmd: []const u8) bool {
+    var lb: [512]u8 = undefined;
+    const t = std.mem.trim(u8, cmd, " \r\n\t");
+    if (t.len == 0 or t.len > lb.len) return false; // unclassifiably long = mutating
+    const n = t.len;
+    for (t[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const low = lb[0..n];
+    var it = std.mem.tokenizeAny(u8, low, " \t");
+    const first = it.next() orelse return false;
+    const probes = [_][]const u8{ "dir", "type", "findstr", "where", "whoami", "tasklist", "systeminfo", "ipconfig", "hostname", "ver", "echo", "more", "tree" };
+    for (probes) |pr| {
+        if (std.mem.eql(u8, first, pr))
+            // `dir > list.txt` WRITES; `type a & del b` chains a delete — any cmd.exe metachar makes a
+            // "probe" compound/redirected, so it counts as mutating
+            return std.mem.indexOfAny(u8, low, "><|&;") == null;
+    }
+    if (std.mem.eql(u8, first, "powershell") or std.mem.eql(u8, first, "pwsh")) {
+        if (std.mem.indexOf(u8, low, "-encodedcommand") != null) return false; // opaque = mutating
+        if (std.mem.indexOf(u8, low, "-command")) |at| {
+            const body = std.mem.trim(u8, low[at + "-command".len ..], " \t\"'(");
+            if (std.mem.indexOfAny(u8, body, "><;") != null) return false; // redirect / statement chain
+            // EVERY pipeline stage must start with a read-family verb: `Get-X | Remove-Item` writes
+            var seg = std.mem.splitScalar(u8, body, '|');
+            var any = false;
+            while (seg.next()) |s0| {
+                const s = std.mem.trim(u8, s0, " \t\"')}");
+                if (s.len == 0) continue;
+                any = true;
+                const ro = [_][]const u8{ "get-", "test-", "select-", "measure-", "compare-", "resolve-", "where-", "sort-", "format-" };
+                var okseg = false;
+                for (ro) |v| {
+                    if (std.mem.startsWith(u8, s, v)) {
+                        okseg = true;
+                        break;
+                    }
+                }
+                if (!okseg) return false;
+            }
+            return any;
+        }
+    }
+    return false;
+}
+
 /// A reply that is exactly a "RUN: <shell command>" line (the AI's micro-console door). Returns the command,
 /// trimmed, or null. Mirrors toolCall: only fires if RUN: leads one of the first few substantive lines so a
 /// passing mention in prose can't trigger a shell command.
@@ -5300,6 +5695,71 @@ test "buildBatchScript: echo-off prelude, CRLF normalization, chcp only for non-
     try std.testing.expectEqualStrings("@echo off\r\necho 50%%\r\n", buildBatchScript(&buf, "echo 50%").?);
     try std.testing.expectEqualStrings("@echo off\r\necho %PATH% ok\r\n", buildBatchScript(&buf, "echo %PATH% ok").?);
     try std.testing.expectEqualStrings("@echo off\r\nfor %%i in (a) do echo %%i\r\n", buildBatchScript(&buf, "for %%i in (a) do echo %%i").?);
+}
+
+test "announcesAction: catches the narrate-without-act fizzles, never final answers" {
+    // the four real fizzle replies from the death-spiral transcript
+    try std.testing.expect(announcesAction("I'll re-create the task with the full path to msg.exe so the scheduler can find it, and set it 30 seconds from now again."));
+    try std.testing.expect(announcesAction("Now I'll run the command to register it with the full path to `msg.exe`."));
+    try std.testing.expect(announcesAction("You're right — let me check right now.\n\nI'll inspect the **ping** task's status and last run time."));
+    try std.testing.expect(announcesAction("I'll register a new **ping** task with the full path to `msg.exe` and it will fire 30 seconds from now."));
+    // real final answers must never trigger
+    try std.testing.expect(!announcesAction("The output is: `2026-07-09`"));
+    try std.testing.expect(!announcesAction("Done! The **ping** scheduled task is set and will trigger a message box saying \"ping\" in about 30 seconds from now. You'll see it pop up momentarily."));
+    try std.testing.expect(!announcesAction("Done! If you ever want to change the time, cancel it, or set another reminder, just let me know. Good luck with your appointment, Gary!"));
+    try std.testing.expect(!announcesAction("Should I run the command now?")); // a question hands the turn over
+    try std.testing.expect(!announcesAction("")); // empty
+    // courtesy closings commit to nothing — the verb must FOLLOW the ack, not float in the tail
+    try std.testing.expect(!announcesAction("I'll let you know if anything changes."));
+    try std.testing.expect(!announcesAction("I'll be here if you need anything else."));
+    try std.testing.expect(announcesAction("I\u{2019}ll check the task status now.")); // typographic apostrophe
+}
+
+test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wildcards" {
+    const r = "We need to check the task status. So I should run: \nRUN: powershell -Command \"Get-ScheduledTask -TaskName 'ping'\"\nThat will tell us.";
+    try std.testing.expectEqualStrings("powershell -Command \"Get-ScheduledTask -TaskName 'ping'\"", runCallLoose(r).?);
+    try std.testing.expect(runCallLoose("no command planned here") == null);
+    try std.testing.expectEqualStrings("dir /b", runCallLoose("RUN: echo hi\nno — better:\nRUN: dir /b\ndone").?); // LAST anchored wins
+    try std.testing.expect(runCallLoose("you could use RUN: del /q x here, but don't") == null); // prose mention never dispatches
+    try std.testing.expect(runCallLoose("the DRY-RUN: output looked fine") == null); // pseudo-label is not an anchor
+    try std.testing.expectEqualStrings("del *", runCallLoose("RUN: del *").?); // a real trailing wildcard survives
+    try std.testing.expectEqualStrings("dir /b", runCallLoose("**RUN: dir /b**").?); // markdown bold unwrapped
+}
+
+test "looseRunWins: the later action line in the reasoning is the decision" {
+    try std.testing.expect(looseRunWins("TOOL: web_search {\"q\":\"x\"}\nactually simpler:\nRUN: dir /b"));
+    try std.testing.expect(!looseRunWins("RUN: dir /b\nno — better:\nTOOL: read_file {\"path\":\"x\"}"));
+    try std.testing.expect(!looseRunWins("TOOL: read_file {}")); // no RUN at all
+    try std.testing.expect(looseRunWins("RUN: dir /b")); // no TOOL at all
+}
+
+test "lessonPair: fix variants pair, unrelated/identical commands don't" {
+    const fail = "powershell -Command \"$action = New-ScheduledTaskAction -Execute 'msg' -Argument '* ping'; Register-ScheduledTask -TaskName 'ping' -Action $action -Force\"";
+    const fixed = "powershell -Command \"$action = New-ScheduledTaskAction -Execute 'C:\\Windows\\System32\\msg.exe' -Argument '* ping'; Register-ScheduledTask -TaskName 'ping' -Action $action -Force\"";
+    const probe = "powershell -Command \"Get-ScheduledTask -TaskName 'ping' | Get-ScheduledTaskInfo\"";
+    try std.testing.expect(lessonPair(fail, fixed)); // the real msg.exe full-path fix
+    try std.testing.expect(!lessonPair(fail, probe)); // a diagnostic query is not the fix
+    try std.testing.expect(!lessonPair(fail, fail)); // identical retry = transient, not a lesson
+    try std.testing.expect(!lessonPair(fail, "git status")); // different executable
+    // identical LONG retry (past nearlySame's 400-char guard) is still a transient, not a lesson
+    const longcmd = "python script.py --arg " ++ "x" ** 420;
+    try std.testing.expect(!lessonPair(longcmd, longcmd));
+    // path-qualifying the executable IS the motivating fix class (exe identity is path-blind)
+    try std.testing.expect(lessonPair("msg * \"hello there\"", "C:\\Windows\\System32\\msg.exe * \"hello there\""));
+}
+
+test "looksReadOnlyCommand: probes exempt, mutations and unknowns count as mutating" {
+    try std.testing.expect(looksReadOnlyCommand("dir /b"));
+    try std.testing.expect(looksReadOnlyCommand("tasklist"));
+    try std.testing.expect(looksReadOnlyCommand("powershell -Command \"Get-ScheduledTask -TaskName 'ping' | Get-ScheduledTaskInfo\""));
+    try std.testing.expect(looksReadOnlyCommand("powershell -Command \"Test-Path C:\\x.txt\""));
+    try std.testing.expect(!looksReadOnlyCommand("powershell -Command \"Register-ScheduledTask -TaskName 'ping'\""));
+    try std.testing.expect(!looksReadOnlyCommand("del /q important.txt"));
+    try std.testing.expect(!looksReadOnlyCommand("schtasks /create /tn x")); // unknown first token = mutating
+    try std.testing.expect(!looksReadOnlyCommand("dir > list.txt")); // a redirected "probe" writes
+    try std.testing.expect(!looksReadOnlyCommand("type a.txt & del b.txt")); // chained delete
+    try std.testing.expect(!looksReadOnlyCommand("powershell -Command \"Get-Process | Stop-Process\"")); // pipe into a write verb
+    try std.testing.expect(!looksReadOnlyCommand("powershell -EncodedCommand SQBuAHYAbwBrAGUA")); // opaque payload
 }
 
 test "needsBatchPercentHint fires only on single-% for-loop variables" {
