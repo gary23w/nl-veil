@@ -447,6 +447,23 @@ pub fn main() !void {
                                 store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "always", ""));
                             } else if (std.mem.eql(u8, cmd, "deny")) {
                                 store.pushChatCmd(store_mod.mkChatCmd(.console_deny, "veil", ""));
+                            } else if (std.mem.eql(u8, cmd, "adopt")) {
+                                // headless: accept the FIRST pending judge proposal (same path as the
+                                // Memory pane's keep button — test harness only, inert in real use)
+                                var tag = [1]u8{'0'};
+                                var txt: [420]u8 = undefined;
+                                var tl: usize = 0;
+                                {
+                                    store.lock();
+                                    defer store.unlock();
+                                    if (store.chat_prop_count > 0) {
+                                        const p0 = &store.chat_props[0];
+                                        tag[0] = '0' + p0.scope;
+                                        tl = p0.text_len;
+                                        @memcpy(txt[0..tl], p0.text[0..tl]);
+                                    }
+                                }
+                                if (tl > 0) store.pushChatCmd(store_mod.mkChatCmd(.prop_accept, tag[0..1], txt[0..tl]));
                             }
                             log.info("SIM.txt control command: {s}", .{cmd});
                         } else {
@@ -2575,19 +2592,23 @@ fn drawMemText(text: []const u8, x: f32, y0: f32, size: i32, color: t.Color, max
 /// The AI writes these via REMEMBER: (stored to neuron-db + memories.jsonl); this is the human-facing view.
 fn drawChatMemory(store: *Store, r: t.Rect) void {
     var rows: [128]store_mod.MemRow = undefined;
+    var props: [12]store_mod.PropRow = undefined;
     var n: usize = 0;
+    var np: usize = 0;
     {
         store.lock();
         defer store.unlock();
         n = @min(store.chat_mem_count, rows.len);
         @memcpy(rows[0..n], store.chat_mem[0..n]);
+        np = @min(store.chat_prop_count, props.len);
+        @memcpy(props[0..np], store.chat_props[0..np]);
     }
     var yy0: f32 = r.y + 40;
     t.textClip("keys, logins & preferences the veil keeps for you", @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 15;
     t.textClip(t.z("{d} saved  -  private to this machine", .{n}), @intFromFloat(r.x + 12), @intFromFloat(yy0), 11, t.comment, @intFromFloat(r.width - 20));
     yy0 += 22;
-    if (n == 0) {
+    if (n == 0 and np == 0) {
         t.text(t.z("nothing saved yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy0 + 6), 12, t.fg_dim);
         t.textClip("tell the veil something to keep -", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 30), 11, t.comment, @intFromFloat(r.width - 20));
         t.textClip("\"my openai key is sk-...\", a login,", @intFromFloat(r.x + 12), @intFromFloat(yy0 + 46), 11, t.comment, @intFromFloat(r.width - 20));
@@ -2596,9 +2617,11 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     }
     const view = t.Rect{ .x = r.x + 1, .y = yy0, .width = r.width - 2, .height = r.y + r.height - yy0 - 6 };
     const txtw = view.width - 16 - 24; // card padding + the delete button gutter
-    // total height for scroll clamping
+    // total height for scroll clamping (proposal cards draw first, above the saved memories)
     var total: f32 = 4;
     {
+        var pi: usize = 0;
+        while (pi < np) : (pi += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(props[pi].text_len, 12, txtw))) * 16 + 30;
         var i: usize = 0;
         while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 6;
     }
@@ -2613,7 +2636,33 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
     var forget_idx: ?usize = null; // capture a delete click; act after the draw loop (don't mutate mid-draw)
+    var accept_idx: ?usize = null; // proposal keep/drop clicks — same act-after-draw discipline
+    var reject_idx: ?usize = null;
     var y: f32 = view.y - ui.mem_scroll;
+    // PROPOSED (judge/curator) — quarantined learning entries awaiting the human's verdict. Accepting
+    // promotes into the live scope the veil actually recalls from; rejecting discards. Until then they
+    // bind nothing.
+    var pi: usize = 0;
+    while (pi < np) : (pi += 1) {
+        const p = &props[pi];
+        const lines = memLineCount(p.text_len, 12, txtw);
+        const card_h = 24 + @as(f32, @floatFromInt(lines)) * 16 + 30;
+        if (y + card_h >= view.y and y <= view.y + view.height) {
+            const card = t.Rect{ .x = view.x + 4, .y = y + 2, .width = view.width - 8, .height = card_h - 4 };
+            t.panelBordered(card, t.bg, t.blue);
+            const chip: []const u8 = switch (p.scope) {
+                1 => "skill?",
+                2 => "user?",
+                else => "lesson?",
+            };
+            t.text(t.z("[{s}] proposed - not yet binding", .{chip}), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, t.blue);
+            _ = drawMemText(p.textStr(), card.x + 8, card.y + 24, 12, t.fg, txtw);
+            const by = card.y + card_h - 30;
+            if (t.button(.{ .x = card.x + 8, .y = by, .width = t.btnW("keep", 22), .height = 22 }, t.z("keep", .{}), t.green, true)) accept_idx = pi;
+            if (t.buttonGhost(.{ .x = card.x + 8 + t.btnW("keep", 22) + 8, .y = by, .width = t.btnW("drop", 22), .height = 22 }, t.z("drop", .{}), t.red, true)) reject_idx = pi;
+        }
+        y += card_h;
+    }
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const m = &rows[i];
@@ -2636,6 +2685,14 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
         y += card_h;
     }
     if (forget_idx) |fi| store.pushChatCmd(store_mod.mkChatCmd(.forget_mem, "", rows[fi].textStr()));
+    if (accept_idx) |ai2| {
+        const tag = [1]u8{'0' + props[ai2].scope};
+        store.pushChatCmd(store_mod.mkChatCmd(.prop_accept, tag[0..1], props[ai2].textStr()));
+    }
+    if (reject_idx) |ri| {
+        const tag = [1]u8{'0' + props[ri].scope};
+        store.pushChatCmd(store_mod.mkChatCmd(.prop_reject, tag[0..1], props[ri].textStr()));
+    }
 }
 
 fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev) void {

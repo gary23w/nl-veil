@@ -79,6 +79,44 @@ pub const Db = struct {
         if (self.run(&.{ "forget", scope, m[0..@min(m.len, 120)] })) |o| self.gpa.free(o);
     }
 
+    /// Dump every fact in `scope` (the CLI's `export` — "# scope: X" header + one fact text per line,
+    /// insertion order, oldest first). Caller frees. Null when disabled/empty/error — silent no-op.
+    pub fn dump(self: Db, scope: []const u8) ?[]u8 {
+        log.trace("neuron.Db.dump scope={s}", .{scope});
+        if (scope.len == 0) return null;
+        return self.run(&.{ "export", scope });
+    }
+
+    pub const ScopeStats = struct { facts: u64 = 0, created_ms: u64 = 0, updated_ms: u64 = 0 };
+
+    /// Parse `stats <scope>` ("facts: N ... created: MS updated: MS"). Null on any failure.
+    pub fn statsScope(self: Db, scope: []const u8) ?ScopeStats {
+        log.trace("neuron.Db.statsScope scope={s}", .{scope});
+        if (scope.len == 0) return null;
+        const o = self.run(&.{ "stats", scope }) orelse return null;
+        defer self.gpa.free(o);
+        var st = ScopeStats{};
+        var it = std.mem.tokenizeAny(u8, o, " \r\n\t");
+        while (it.next()) |tok| {
+            const val = if (std.mem.eql(u8, tok, "facts:") or std.mem.eql(u8, tok, "created:") or std.mem.eql(u8, tok, "updated:"))
+                (it.next() orelse return st)
+            else
+                continue;
+            const n = std.fmt.parseInt(u64, val, 10) catch continue;
+            if (tok[0] == 'f') st.facts = n else if (tok[0] == 'c') st.created_ms = n else st.updated_ms = n;
+        }
+        return st;
+    }
+
+    /// Wipe a WHOLE scope. Deliberately separate from forget(): the empty-match guard there protects
+    /// normal deletion; this exists ONLY for the curator's export-then-forget archival, and callers must
+    /// have verified the export file landed on disk first. Never called on user-facing scopes.
+    pub fn forgetAll(self: Db, scope: []const u8) void {
+        log.trace("neuron.Db.forgetAll scope={s}", .{scope});
+        if (scope.len == 0) return;
+        if (self.run(&.{ "forget", scope })) |o| self.gpa.free(o);
+    }
+
     /// Relational multi-hop CHAIN traversal (reasoning → chain): walk `start` --relation--> … over the fact
     /// graph, recalling at each hop. Deterministic, no model round-trip — how a caller reasons over a
     /// causal/dependency chain instead of re-deriving it. Returns the endpoint value into `out`; empty on a break.

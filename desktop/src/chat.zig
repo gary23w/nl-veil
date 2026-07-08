@@ -174,6 +174,39 @@ const PLAYBOOK_SCOPE = "veil-playbook";
 // Memory tab (MEMORY_SCOPE) stays theirs and each layer recalls independently:
 const SKILLS_SCOPE = "veil-skills"; //  PROCEDURAL memory: class-level "how to do this kind of task for this user"
 const USER_SCOPE = "veil-user"; //      the deepening working MODEL of the user (persona/style/expectations)
+// QUARANTINE scopes: the background judge (and the curator's merge candidates) propose HERE; a human
+// accepts (promote into the live scope above) or rejects (discard) from the Memory pane. The judge never
+// writes a live scope directly — and NEVER writes into the conversation/session store: a judge visible in
+// chat history becomes a standing instruction the answering model starts obeying instead of doing the task.
+const PLAYBOOK_PROPOSED = PLAYBOOK_SCOPE ++ "-proposed";
+const SKILLS_PROPOSED = SKILLS_SCOPE ++ "-proposed";
+const USER_PROPOSED = USER_SCOPE ++ "-proposed";
+
+const JUDGE_EVERY_TURNS: u32 = 10; // cadence trigger: grade the trace every ~N REAL user turns...
+const JUDGE_COOLDOWN_S: i64 = 240; // ...and never more than one pass per 4 minutes (outcome trigger included)
+const JUDGE_MAX_TOKENS: u32 = 800;
+// The judge reads TRACES, never self-report — an agent asked "did you do well?" produces a confident,
+// self-flattering narrative as a structural property of the model, so grading must rest on real exit
+// codes, verify outcomes and user contradictions alone. The STRICT RULES are anti-poisoning invariants:
+// each one is a failure mode where a plausible "lesson" hardens into something the agent later cites
+// against itself.
+const JUDGE_SYSTEM =
+    "You are an EXTERNAL REVIEWER for a desktop AI agent, reading a trace of what actually happened. " ++
+    "Line meanings: 'USER:' = what the user really said. 'RESULT:' = real command/tool output with real exit codes. " ++
+    "'CLAIM:' = the agent's own statements — check them against RESULT/USER lines; never treat them as truth.\n" ++
+    "Propose durable entries ONLY where the trace PROVES a transition: a real failure followed by a real working fix, " ++
+    "a user contradicting a claimed success, a user repeatedly steering how work should be done.\n" ++
+    "Output zero or more lines, nothing else:\n" ++
+    "PLAYBOOK: <one general operational lesson> | evidence: <the trace lines that prove it>\n" ++
+    "SKILL: <one class-level procedure for this kind of task on this machine> | evidence: <proof>\n" ++
+    "USER: <one durable fact about how this user wants the agent to work> | evidence: <proof>\n" ++
+    "If nothing qualifies, output exactly: NONE\n" ++
+    "STRICT RULES:\n" ++
+    "- NEVER a negative claim about a tool or command ('X is broken', 'avoid Y') — refusals outlive the real problem;\n" ++
+    "- NEVER an environment-dependent failure (missing binary, unconfigured credential, server down) as a durable lesson — the user fixes those;\n" ++
+    "- if retrying the SAME command worked, the lesson is the retry pattern, not the failure;\n" ++
+    "- prefer PATCHING an existing entry (shown to you) into a more general class-level form over minting a narrow new one — output the full patched text as the proposal;\n" ++
+    "- every proposal must be provable from the trace alone; a proposal without concrete evidence is discarded.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
 const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
@@ -425,6 +458,13 @@ pub const Chat = struct {
     pending_directive_len: usize = 0, // for the NEXT turn's prompt ONLY — never persisted. Directives written
     //                                   into history re-fed as user rows on every later turn and poisoned the
     //                                   conversation's NEXT task (the confirmed "second task fails" report)
+    // EXTERNAL JUDGE (decoupled learning pass — its OWN stream + side dir, never the chat turn slot):
+    judge_stream: llm.Stream = .{},
+    judge_live: bool = false,
+    judge_turns: u32 = 0, //     real user turns since the last pass (cadence trigger)
+    judge_outcome: bool = false, // a verified fail→fix landed (outcome trigger — grade soon, not on a clock)
+    judge_last_s: i64 = 0,
+    curated: bool = false, // the deterministic curator pass runs once per app session
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -453,6 +493,7 @@ pub const Chat = struct {
         self.loadKey(dd0);
         self.refreshConvs(dd0, true);
         self.refreshMemory(dd0); // publish saved durable memories into the Memory tab at startup
+        self.refreshProposals(dd0); // and any judge proposals still awaiting review
         self.fetchOllamaModels();
 
         var tick: u32 = 0;
@@ -473,11 +514,15 @@ pub const Chat = struct {
             if (tick % 20 == 11) self.refreshChatFiles(dd); // ~2s: publish this chat's build files for the Files tab
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
+            if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
+            if (!self.curated and tick > 900 and tick % 50 == 21) self.curateOnce(dd); // once, ~90s after startup
             tick +%= 1;
             self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
         }
         llm.abort(&self.stream, self.io);
         self.stream.deinit(self.gpa);
+        llm.abort(&self.judge_stream, self.io);
+        self.judge_stream.deinit(self.gpa);
         if (self.console) |*p| p.child.kill(self.io); // don't leave a shell child running past shutdown
         self.console = null;
     }
@@ -666,8 +711,12 @@ pub const Chat = struct {
 
     fn ensureDirs(self: *Chat, dd: []const u8) void {
         var pbuf: [600]u8 = undefined;
-        const p = std.fmt.bufPrint(&pbuf, "{s}/.veil-desk/chats", .{dd}) catch return;
-        _ = Io.Dir.cwd().createDirPathStatus(self.io, p, .default_dir) catch {};
+        const dirs = [_][]const u8{ "chats", "judge", "archive" }; // judge = its own curl-sink dir (the chat's
+        for (dirs) |d| { //                                           sink filenames are fixed per dir); archive =
+            //                                                        the curator's export-before-forget packs
+            const p = std.fmt.bufPrint(&pbuf, "{s}/.veil-desk/{s}", .{ dd, d }) catch return;
+            _ = Io.Dir.cwd().createDirPathStatus(self.io, p, .default_dir) catch {};
+        }
     }
 
     fn sideDir(dd: []const u8, buf: []u8) []const u8 {
@@ -722,6 +771,8 @@ pub const Chat = struct {
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
                 .chat_open_folder => self.cmdChatOpenFolder(dd), // Files tab: open this chat's build folder in the OS
                 .forget_mem => self.forgetMemory(dd, c.textStr()), // Memory tab: delete-button drops one saved memory
+                .prop_accept => self.acceptProposal(dd, c.idStr(), c.textStr()), // Memory pane: promote a judge proposal
+                .prop_reject => self.rejectProposal(dd, c.idStr(), c.textStr()), // Memory pane: discard one
             }
         }
     }
@@ -1058,8 +1109,11 @@ pub const Chat = struct {
                     fail_note,
                     p.cmdStr()[0..@min(p.cmd_len, 380)],
                 })) |lesson| {
-                    self.mind().observe(PLAYBOOK_SCOPE, lesson);
+                    var ab2: [1100]u8 = undefined;
+                    self.mind().observe(PLAYBOOK_SCOPE, atomizeForObserve(&ab2, lesson));
                     log.info("playbook: lesson captured ({d}b) from a verified fail->fix transition", .{lesson.len});
+                    self.judge_outcome = true; // a verified transition is the judge's OUTCOME trigger —
+                    //                            grade the arc's trace soon, not on the turn-count clock
                 } else |_| {}
                 self.arc_fail_cmd_len = 0;
                 self.arc_fail_note_len = 0;
@@ -1129,6 +1183,305 @@ pub const Chat = struct {
         return total;
     }
 
+    // ---------------------------------------------------------------- external judge (decoupled learning)
+
+    /// The background JUDGE: on a turn-count cadence (or right after a verified fail→fix transition),
+    /// grade the active conversation's TRACE — real commands, real exit codes, user contradictions;
+    /// NEVER the model's own account of how well it did — and PROPOSE durable lessons/skills/user-model
+    /// facts into quarantine "-proposed" scopes for human review in the Memory pane. Runs on its OWN llm
+    /// stream and side dir (never the chat turn slot, never the chat's curl sinks), preferably on a
+    /// DIFFERENT model than the answering slot (a same-model judge shares the priors that make a model
+    /// grade itself kindly). Everything degrades to a silent no-op — neuron-db absent, model unreachable,
+    /// trace too thin — and the judge NEVER writes into the conversation or any live scope.
+    fn pumpJudge(self: *Chat, dd: []const u8) void {
+        const now = self.nowS();
+        if (self.judge_live) {
+            llm.poll(&self.judge_stream, self.io, self.gpa, now, false);
+            if (!self.judge_stream.done) return;
+            llm.finish(&self.judge_stream, self.io);
+            self.judge_live = false;
+            if (self.judge_stream.failed) {
+                log.info("judge: pass failed ({s}) — skipped, no proposals", .{self.judge_stream.errStr()});
+            } else {
+                const n = self.harvestProposals(self.judge_stream.content.items);
+                log.info("judge: pass done — {d} proposal(s) quarantined for review", .{n});
+                if (n > 0) self.refreshProposals(dd);
+            }
+            self.judge_stream.deinit(self.gpa);
+            return;
+        }
+        if (!self.mind().enabled()) return;
+        if (!(self.judge_outcome or self.judge_turns >= JUDGE_EVERY_TURNS)) return;
+        if (now - self.judge_last_s < JUDGE_COOLDOWN_S) return;
+        // politeness: fire only AFTER answers land (idle chat, no console, no cast/veil work) — the judge
+        // must never contend with the user's live turn for the model or the machine
+        if (self.turn != .idle or self.consoleAiBusy() or self.cast_active or self.veil_work_active) return;
+        var cb: [40]u8 = undefined;
+        const conv = self.convScope(&cb);
+        if (conv.len == 0) return;
+        // the conversation JSONL IS the trace — r:2 result rows carry the real console exit codes inline
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, conv }) catch return;
+        const jsonl = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(512 << 10)) catch return;
+        defer self.gpa.free(jsonl);
+        var tb: [6200]u8 = undefined;
+        const trace = buildTrace(self.gpa, jsonl, &tb);
+        // consume the triggers regardless of outcome: a thin trace has nothing gradeable and must not
+        // re-fire every tick
+        self.judge_turns = 0;
+        self.judge_outcome = false;
+        self.judge_last_s = now;
+        if (std.mem.indexOf(u8, trace, "RESULT:") == null) return; // no ground truth — nothing to grade
+        var msgs: std.ArrayListUnmanaged(u8) = .empty;
+        defer msgs.deinit(self.gpa);
+        msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
+        escJson(&msgs, self.gpa, JUDGE_SYSTEM);
+        msgs.appendSlice(self.gpa, "\"},{\"role\":\"user\",\"content\":\"") catch return;
+        // existing live entries (so the judge patches instead of duplicating) + pending proposals (so it
+        // never re-proposes) + the trace
+        self.appendScopeBlock(&msgs, "EXISTING LIVE LESSONS:\n", PLAYBOOK_SCOPE, 900);
+        self.appendScopeBlock(&msgs, "EXISTING LIVE SKILLS:\n", SKILLS_SCOPE, 900);
+        self.appendScopeBlock(&msgs, "PENDING PROPOSALS (never re-propose these):\n", PLAYBOOK_PROPOSED, 500);
+        self.appendScopeBlock(&msgs, "", SKILLS_PROPOSED, 500);
+        self.appendScopeBlock(&msgs, "", USER_PROPOSED, 500);
+        escJson(&msgs, self.gpa, "TRACE (ground truth):\n");
+        escJson(&msgs, self.gpa, trace);
+        msgs.appendSlice(self.gpa, "\"}") catch return;
+        var bb: [256]u8 = undefined;
+        var kb: [192]u8 = undefined;
+        var mb: [96]u8 = undefined;
+        const prov = self.judgeProvider(&bb, &kb, &mb);
+        var jb: [640]u8 = undefined;
+        const jdir = std.fmt.bufPrint(&jb, "{s}/.veil-desk/judge", .{dd}) catch return;
+        if (llm.start(&self.judge_stream, self.io, self.gpa, jdir, prov, msgs.items, JUDGE_MAX_TOKENS, now)) {
+            self.judge_live = true;
+            log.info("judge: pass started (model={s}, trace={d}b)", .{ prov.model, trace.len });
+        }
+    }
+
+    /// Append a bounded, JSON-escaped dump of a scope into a prompt being built. Silent no-op when empty.
+    fn appendScopeBlock(self: *Chat, msgs: *std.ArrayListUnmanaged(u8), header: []const u8, scope: []const u8, cap: usize) void {
+        const o = self.mind().dump(scope) orelse return;
+        defer self.gpa.free(o);
+        const t2 = std.mem.trim(u8, o, " \r\n\t");
+        const body_start = (std.mem.indexOfScalar(u8, t2, '\n') orelse return) + 1; // skip "# scope: x"
+        const body = std.mem.trim(u8, t2[body_start..], " \r\n\t");
+        if (body.len == 0) return;
+        escJson(msgs, self.gpa, header);
+        escJson(msgs, self.gpa, wholeLines(body[0..@min(body.len, cap)], cap));
+        escJson(msgs, self.gpa, "\n");
+    }
+
+    /// Parse the judge's output and quarantine each valid proposal. A proposal without an evidence tail
+    /// is exactly the ungrounded self-assessment this design exists to keep out — dropped on the floor.
+    /// Writes ONLY the "-proposed" scopes; never a live scope, never the conversation.
+    fn harvestProposals(self: *Chat, content: []const u8) usize {
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |raw| {
+            if (n >= 5) break; // bounded per pass — a flood of "lessons" is judge noise, not learning
+            const pr = parseProposal(raw) orelse continue;
+            const scope: []const u8 = switch (pr.kind) {
+                0 => PLAYBOOK_PROPOSED,
+                1 => SKILLS_PROPOSED,
+                else => USER_PROPOSED,
+            };
+            var ab: [720]u8 = undefined;
+            self.mind().observe(scope, atomizeForObserve(&ab, pr.text));
+            n += 1;
+        }
+        return n;
+    }
+
+    /// The judge's model slot — by preference a DIFFERENT model than the answering one: hosted answering
+    /// → the first locally installed Ollama model; local answering → the saved BYOK catalog slot when a
+    /// key exists. Falls back to the answering provider (worst case same model, but always a fresh,
+    /// decoupled context with the judge's own system prompt — never a continuation of the live chat).
+    fn judgeProvider(self: *Chat, base_buf: *[256]u8, key_buf: *[192]u8, model_buf: *[96]u8) llm.Provider {
+        var local_model: [96]u8 = undefined;
+        var local_n: usize = 0;
+        var kind: u8 = 0;
+        var have_key = false;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            kind = self.store.settings.chat_kind;
+            have_key = self.store.settings.chatKey().len > 0;
+            if (self.store.ollama_model_count > 0) {
+                const nm = self.store.ollama_models[0].nameStr();
+                local_n = @min(nm.len, local_model.len);
+                @memcpy(local_model[0..local_n], nm[0..local_n]);
+            }
+        }
+        if ((kind == 1 or kind == 2) and local_n > 0) {
+            const base = "http://127.0.0.1:11434/v1";
+            @memcpy(base_buf[0..base.len], base);
+            @memcpy(model_buf[0..local_n], local_model[0..local_n]);
+            return .{ .base_url = base_buf[0..base.len], .key = key_buf[0..0], .model = model_buf[0..local_n] };
+        }
+        if (kind == 0 and have_key) {
+            self.store.lock();
+            defer self.store.unlock();
+            const s = &self.store.settings;
+            var acct: [256]u8 = undefined;
+            const prov_def = &catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)];
+            const base = catalog.resolveBase(prov_def, s.cfAccount(), &acct);
+            const bn = @min(base.len, base_buf.len);
+            @memcpy(base_buf[0..bn], base[0..bn]);
+            const k = s.chatKey();
+            const kn = @min(k.len, key_buf.len);
+            @memcpy(key_buf[0..kn], k[0..kn]);
+            const m = prov_def.models[0].id;
+            const mn = @min(m.len, model_buf.len);
+            @memcpy(model_buf[0..mn], m[0..mn]);
+            return .{ .base_url = base_buf[0..bn], .key = key_buf[0..kn], .model = model_buf[0..mn] };
+        }
+        return self.resolveProvider(base_buf, key_buf, model_buf);
+    }
+
+    /// Publish the quarantined proposals into the store for the Memory pane's accept/reject cards.
+    fn refreshProposals(self: *Chat, dd: []const u8) void {
+        _ = dd;
+        var rows: [12]store_mod.PropRow = undefined;
+        var n: usize = 0;
+        const scopes = [_]struct { tag: u8, name: []const u8 }{
+            .{ .tag = 0, .name = PLAYBOOK_PROPOSED },
+            .{ .tag = 1, .name = SKILLS_PROPOSED },
+            .{ .tag = 2, .name = USER_PROPOSED },
+        };
+        for (scopes) |sc| {
+            const o = self.mind().dump(sc.name) orelse continue;
+            defer self.gpa.free(o);
+            var it = std.mem.splitScalar(u8, o, '\n');
+            while (it.next()) |raw| {
+                if (n >= rows.len) break;
+                const ln = std.mem.trim(u8, raw, " \r\t");
+                if (ln.len < 16 or ln[0] == '#') continue; // header / blank / stray fragment lines
+                var row: store_mod.PropRow = .{ .scope = sc.tag };
+                const tn = @min(ln.len, row.text.len);
+                @memcpy(row.text[0..tn], ln[0..tn]);
+                row.text_len = @intCast(tn);
+                rows[n] = row;
+                n += 1;
+            }
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.chat_props[0..n], rows[0..n]);
+        self.store.chat_prop_count = n;
+    }
+
+    /// Promote an accepted proposal: the lesson text (sans its evidence tail) enters the LIVE scope and
+    /// the quarantine entry is dropped. Human-gated by construction — only the Memory pane sends this.
+    fn acceptProposal(self: *Chat, dd: []const u8, tag: []const u8, text: []const u8) void {
+        const t2 = std.mem.trim(u8, text, " \r\n\t");
+        if (t2.len < 8) return;
+        const cut = std.mem.indexOf(u8, t2, "| evidence:") orelse t2.len;
+        const lesson = std.mem.trim(u8, t2[0..cut], " \t");
+        if (lesson.len < 8) return;
+        var ab: [420]u8 = undefined;
+        self.mind().observe(propLiveScope(tag), atomizeForObserve(&ab, lesson));
+        self.mind().forget(propQuarantineScope(tag), t2[0..@min(t2.len, 110)]);
+        log.info("proposal accepted into {s} ({d}b)", .{ propLiveScope(tag), lesson.len });
+        self.refreshProposals(dd);
+    }
+
+    fn rejectProposal(self: *Chat, dd: []const u8, tag: []const u8, text: []const u8) void {
+        const t2 = std.mem.trim(u8, text, " \r\n\t");
+        if (t2.len < 8) return;
+        self.mind().forget(propQuarantineScope(tag), t2[0..@min(t2.len, 110)]);
+        log.info("proposal rejected ({d}b)", .{t2.len});
+        self.refreshProposals(dd);
+    }
+
+    // ------------------------------------------------------------------- curator (store governance)
+
+    /// Once per app session: deterministic governance over the veil's OWN learning scopes (playbook +
+    /// skills ONLY — never the user's Memory, never the user model, never conversation scopes). Zero
+    /// model calls. (1) STALENESS: a scope untouched ~90 days (with a creation grace floor) is archived —
+    /// ALWAYS exported to a dated pack first, forgotten only after the archive verifiably landed whole;
+    /// nothing is ever bare-deleted. (2) SIZE: past 60 entries the oldest overflow is archived the same
+    /// way (export order is insertion order). (3) NEAR-DUPLICATES: high-overlap entry pairs surface as
+    /// merge-candidate proposals for the judge/human — judged on CONTENT, never on usage, never auto-merged.
+    fn curateOnce(self: *Chat, dd: []const u8) void {
+        if (self.curated) return;
+        self.curated = true;
+        if (!self.mind().enabled()) return;
+        const now_ms: u64 = @intCast(@max(0, self.nowS()) * 1000);
+        const STALE_MS: u64 = 90 * 24 * 3600 * 1000;
+        const scopes = [_][]const u8{ PLAYBOOK_SCOPE, SKILLS_SCOPE };
+        for (scopes) |scope| {
+            const st = self.mind().statsScope(scope) orelse continue;
+            if (st.facts == 0) continue;
+            const dump_out = self.mind().dump(scope) orelse continue;
+            defer self.gpa.free(dump_out);
+            const stale = st.updated_ms > 0 and now_ms > st.updated_ms + STALE_MS and
+                st.created_ms > 0 and now_ms > st.created_ms + STALE_MS; // grace floor: never a young scope
+            if (stale or st.facts > 60) {
+                var ab: [760]u8 = undefined;
+                const apath = std.fmt.bufPrint(&ab, "{s}/.veil-desk/archive/{s}-{d}.facts", .{ dd, scope, st.updated_ms }) catch continue;
+                Io.Dir.cwd().writeFile(self.io, .{ .sub_path = apath, .data = dump_out }) catch continue;
+                const wrote = (Io.Dir.cwd().statFile(self.io, apath, .{}) catch continue).size;
+                if (wrote < dump_out.len) continue; // the archive did not land whole — touch nothing
+                if (stale) {
+                    self.mind().forgetAll(scope);
+                    log.info("curator: {s} idle >90d — archived {d} fact(s), recoverable at {s}", .{ scope, st.facts, apath });
+                    continue;
+                }
+                var dropped: usize = 0;
+                const excess: usize = @intCast(st.facts - 60);
+                var it = std.mem.splitScalar(u8, dump_out, '\n');
+                while (it.next()) |raw| {
+                    if (dropped >= excess) break;
+                    const ln = std.mem.trim(u8, raw, " \r\t");
+                    if (ln.len < 16 or ln[0] == '#') continue;
+                    self.mind().forget(scope, ln[0..@min(ln.len, 110)]);
+                    dropped += 1;
+                }
+                log.info("curator: {s} over cap — archived all {d}, dropped the {d} oldest", .{ scope, st.facts, dropped });
+            }
+            if (st.facts >= 8) self.proposeMergeCandidates(scope, dump_out);
+        }
+        self.refreshProposals(dd);
+    }
+
+    /// Surface up to two high-overlap entry pairs per scope as merge-candidate proposals (the judge may
+    /// author one class-level replacement; the human decides). Skipped while a previous batch is pending.
+    fn proposeMergeCandidates(self: *Chat, scope: []const u8, dump_out: []const u8) void {
+        const pq = if (std.mem.eql(u8, scope, SKILLS_SCOPE)) SKILLS_PROPOSED else PLAYBOOK_PROPOSED;
+        if (self.mind().dump(pq)) |pd| {
+            defer self.gpa.free(pd);
+            if (std.mem.indexOf(u8, pd, "merge candidates in ") != null) return; // one batch at a time
+        }
+        var entries: [64][]const u8 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, dump_out, '\n');
+        while (it.next()) |raw| {
+            if (n >= entries.len) break;
+            const ln = std.mem.trim(u8, raw, " \r\t");
+            if (ln.len < 24 or ln[0] == '#') continue;
+            entries[n] = ln;
+            n += 1;
+        }
+        var found: usize = 0;
+        var i: usize = 0;
+        outer: while (i < n) : (i += 1) {
+            var j = i + 1;
+            while (j < n) : (j += 1) {
+                if (!contentOverlap(entries[i], entries[j])) continue;
+                var lb: [900]u8 = undefined;
+                const prop = std.fmt.bufPrint(&lb, "merge candidates in {s} (same lesson class? author ONE general entry): 1) {s} 2) {s} | evidence: near-duplicate content overlap found by the curator", .{
+                    scope, entries[i][0..@min(entries[i].len, 260)], entries[j][0..@min(entries[j].len, 260)],
+                }) catch continue;
+                var ab: [900]u8 = undefined;
+                self.mind().observe(pq, atomizeForObserve(&ab, prop));
+                found += 1;
+                if (found >= 2) break :outer;
+            }
+        }
+        if (found > 0) log.info("curator: {s} — {d} merge candidate(s) proposed", .{ scope, found });
+    }
+
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
         if (text.len == 0) return;
         if (self.turn != .idle or self.consoleAiBusy()) {
@@ -1169,6 +1522,7 @@ pub const Chat = struct {
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
         self.resetArcFlags(); // fresh agentic-floor arc: follow-through nudge, verification, lesson capture
+        self.judge_turns +%= 1; // a REAL user turn — the judge's cadence trigger counts only these
         // AUTO-LOOP ON by default once the user prompts (user directive): the veil drives its own next step
         // until it emits DONE or hits the iteration cap — so a task gets carried to completion, not one reply.
         // The user can switch it off with the input's auto-loop toggle; a manual send re-arms it.
@@ -4423,6 +4777,142 @@ fn wholeLines(s: []const u8, cap: usize) []const u8 {
     return s[0..nl];
 }
 
+/// Build the judge's TRACE from a conversation JSONL: USER rows verbatim (capped), bracketed RESULT rows
+/// (real console/tool/cast output including exit codes), and the veil's replies as SHORT "CLAIM:" heads —
+/// the judge checks claims against results, it never grades the model's self-narrative. Thought rows
+/// (r:3) never appear: pure self-report. Keeps the newest whole entries that fit `out`. Unit-tested.
+pub fn buildTrace(gpa: std.mem.Allocator, jsonl: []const u8, out: []u8) []const u8 {
+    var acc: std.ArrayListUnmanaged(u8) = .empty;
+    defer acc.deinit(gpa);
+    var starts: std.ArrayListUnmanaged(usize) = .empty;
+    defer starts.deinit(gpa);
+    var it = std.mem.splitScalar(u8, jsonl, '\n');
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \r\t");
+        if (ln.len < 12 or ln[0] != '{') continue;
+        const rpos = std.mem.indexOf(u8, ln, "\"r\":") orelse continue;
+        const rc = ln[rpos + 4 ..];
+        if (rc.len == 0 or rc[0] < '0' or rc[0] > '9') continue;
+        const role = rc[0] - '0';
+        var tag: []const u8 = "";
+        var cap: usize = 0;
+        switch (role) {
+            0 => {
+                tag = "USER: ";
+                cap = 300;
+            },
+            1 => {
+                tag = "CLAIM: ";
+                cap = 160;
+            },
+            2 => {
+                tag = "RESULT: ";
+                cap = 520;
+            },
+            else => continue, // r:3 reasoning = self-report, never part of the trace
+        }
+        const txt = llm.jsonUnescape(gpa, ln, "t") orelse continue;
+        defer gpa.free(txt);
+        const tt = std.mem.trim(u8, txt, " \r\n\t");
+        if (tt.len == 0) continue;
+        if (role == 2 and tt[0] != '[') continue; // only bracketed RESULT rows are ground truth
+        starts.append(gpa, acc.items.len) catch return out[0..0];
+        acc.appendSlice(gpa, tag) catch return out[0..0];
+        for (tt[0..@min(tt.len, cap)]) |c| // single-line each entry; results stay one row each
+            acc.append(gpa, if (c == '\n') ' ' else c) catch return out[0..0];
+        acc.append(gpa, '\n') catch return out[0..0];
+    }
+    if (acc.items.len == 0) return out[0..0];
+    // the newest suffix of WHOLE entries that fits `out`
+    var from: usize = acc.items.len;
+    var si: usize = starts.items.len;
+    while (si > 0) {
+        si -= 1;
+        if (acc.items.len - starts.items[si] > out.len) break;
+        from = starts.items[si];
+    }
+    const slice = acc.items[from..];
+    const n = @min(slice.len, out.len);
+    @memcpy(out[0..n], slice[0..n]);
+    return out[0..n];
+}
+
+pub const Proposal = struct { kind: u8, text: []const u8 }; // kind: 0 playbook, 1 skill, 2 user
+
+/// One "PLAYBOOK:/SKILL:/USER: <text> | evidence: <proof>" judge-output line → a quarantined proposal.
+/// Strict: the evidence tail is MANDATORY (an ungrounded proposal is dropped — that is the whole point),
+/// and bounds keep entries atomic. Pure — unit-tested.
+pub fn parseProposal(raw: []const u8) ?Proposal {
+    const ln = std.mem.trim(u8, raw, " \r\t-*`");
+    var kind: u8 = 255;
+    var rest: []const u8 = "";
+    if (std.mem.startsWith(u8, ln, "PLAYBOOK:")) {
+        kind = 0;
+        rest = ln["PLAYBOOK:".len..];
+    } else if (std.mem.startsWith(u8, ln, "SKILL:")) {
+        kind = 1;
+        rest = ln["SKILL:".len..];
+    } else if (std.mem.startsWith(u8, ln, "USER:")) {
+        kind = 2;
+        rest = ln["USER:".len..];
+    } else return null;
+    const text = std.mem.trim(u8, rest, " \t");
+    if (text.len < 24 or text.len > 700) return null;
+    const ev = std.mem.indexOf(u8, text, "| evidence:") orelse return null;
+    if (ev < 16) return null; // no real lesson before the evidence marker
+    if (std.mem.trim(u8, text[ev + "| evidence:".len ..], " \t.").len < 8) return null; // empty proof = ungrounded
+    return .{ .kind = kind, .text = text };
+}
+
+/// The neuron CLI splits an observed text into SENTENCE facts on ".;!?"+space boundaries — right for
+/// prose, fatal for ATOMIC machine entries (a lesson's fix half or a proposal's "| evidence:" tail
+/// separates into its own fact and the entry stops meaning anything). Soften those boundaries to commas
+/// before observing; mid-token punctuation (README.md, /c:"x") is untouched. Pure — unit-tested.
+fn atomizeForObserve(buf: []u8, text: []const u8) []const u8 {
+    const n = @min(text.len, buf.len);
+    @memcpy(buf[0..n], text[0..n]);
+    var i: usize = 0;
+    while (i + 1 < n) : (i += 1) {
+        const c = buf[i];
+        if ((c == '.' or c == ';' or c == '!' or c == '?') and buf[i + 1] == ' ') buf[i] = ',';
+    }
+    return buf[0..n];
+}
+
+fn propLiveScope(tag: []const u8) []const u8 {
+    if (tag.len > 0 and tag[0] == '1') return SKILLS_SCOPE;
+    if (tag.len > 0 and tag[0] == '2') return USER_SCOPE;
+    return PLAYBOOK_SCOPE;
+}
+
+fn propQuarantineScope(tag: []const u8) []const u8 {
+    if (tag.len > 0 and tag[0] == '1') return SKILLS_PROPOSED;
+    if (tag.len > 0 and tag[0] == '2') return USER_PROPOSED;
+    return PLAYBOOK_PROPOSED;
+}
+
+/// Are two stored entries near-duplicates by CONTENT? Substantial-token overlap in BOTH directions —
+/// one entry merely mentioning the other's topic isn't redundancy, and usage frequency plays no part.
+/// Pure — unit-tested.
+fn contentOverlap(a: []const u8, b: []const u8) bool {
+    const ca = substantialTokens(a, "");
+    const cb = substantialTokens(b, "");
+    if (ca == 0 or cb == 0) return false;
+    return substantialTokens(a, b) * 10 >= 7 * ca and substantialTokens(b, a) * 10 >= 7 * cb;
+}
+
+/// Count tokens of `s` that are >=5 chars — and, when `within` is non-empty, only those appearing in it.
+fn substantialTokens(s: []const u8, within: []const u8) usize {
+    var it = std.mem.tokenizeAny(u8, s, " \t");
+    var n: usize = 0;
+    while (it.next()) |tok| {
+        if (tok.len < 5) continue;
+        if (within.len > 0 and std.mem.indexOf(u8, within, tok) == null) continue;
+        n += 1;
+    }
+    return n;
+}
+
 /// Does this reply ANNOUNCE an action without performing one? The intermediate-ack shape: a
 /// future-tense commitment ("I'll ...", "Let me ...") paired with an action verb, in a SHORT reply (long
 /// analyses aren't acks) that doesn't hand the turn back with a question. The ack must sit in the reply's
@@ -5811,6 +6301,61 @@ test "looksReadOnlyCommand: probes exempt, mutations and unknowns count as mutat
     try std.testing.expect(!looksReadOnlyCommand("type a.txt & del b.txt")); // chained delete
     try std.testing.expect(!looksReadOnlyCommand("powershell -Command \"Get-Process | Stop-Process\"")); // pipe into a write verb
     try std.testing.expect(!looksReadOnlyCommand("powershell -EncodedCommand SQBuAHYAbwBrAGUA")); // opaque payload
+}
+
+test "buildTrace: users verbatim, only bracketed results, claims capped, thoughts never" {
+    const jsonl =
+        "{\"title\":\"t\"}\n" ++
+        "{\"r\":0,\"t\":\"set up the task\"}\n" ++
+        "{\"r\":3,\"t\":\"I am reasoning about how well I did\"}\n" ++
+        "{\"r\":1,\"t\":\"Done! It works perfectly.\"}\n" ++
+        "{\"r\":2,\"t\":\"(verifying the outcome)\"}\n" ++
+        "{\"r\":2,\"t\":\"[console]\\n$ schtasks /query\\n(exit code 1)\"}\n";
+    var buf: [2048]u8 = undefined;
+    const tr = buildTrace(std.testing.allocator, jsonl, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "USER: set up the task") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "CLAIM: Done!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "RESULT: [console] $ schtasks /query (exit code 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "reasoning") == null); // r:3 = self-report, never
+    try std.testing.expect(std.mem.indexOf(u8, tr, "verifying the outcome") == null); // unbracketed note, never
+}
+
+test "buildTrace keeps the newest whole entries when the window is small" {
+    const jsonl = "{\"r\":0,\"t\":\"first question about alpha\"}\n{\"r\":0,\"t\":\"second question about bravo\"}\n";
+    var buf: [40]u8 = undefined;
+    const tr = buildTrace(std.testing.allocator, jsonl, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "bravo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tr, "alpha") == null);
+}
+
+test "parseProposal: kinds parse, ungrounded and malformed are dropped" {
+    const p = parseProposal("PLAYBOOK: always quote powershell -Command bodies via a batch carrier | evidence: RESULT exit 1 then exit 0").?;
+    try std.testing.expect(p.kind == 0);
+    try std.testing.expect(parseProposal("SKILL: to schedule a notification, register the task with a full exe path | evidence: trace lines 4-9").?.kind == 1);
+    try std.testing.expect(parseProposal("- USER: wants evidence shown before any success claim | evidence: contradiction at line 12").?.kind == 2);
+    try std.testing.expect(parseProposal("PLAYBOOK: too short | evidence: x") == null);
+    try std.testing.expect(parseProposal("PLAYBOOK: a real looking lesson body without any grounding at all") == null);
+    try std.testing.expect(parseProposal("NONE") == null);
+    try std.testing.expect(parseProposal("USER: run a full diagnostic on this PC") == null); // trace echo, no evidence
+}
+
+test "atomizeForObserve softens sentence boundaries, leaves mid-token punctuation alone" {
+    var buf: [200]u8 = undefined;
+    try std.testing.expectEqualStrings("one, two, three, four", atomizeForObserve(&buf, "one; two. three! four"));
+    try std.testing.expectEqualStrings("findstr /c:\"veil\" README.md works, use it", atomizeForObserve(&buf, "findstr /c:\"veil\" README.md works; use it"));
+    try std.testing.expectEqualStrings("ends with a period.", atomizeForObserve(&buf, "ends with a period."));
+}
+
+test "contentOverlap: near-duplicates true, distinct or thin entries false" {
+    try std.testing.expect(contentOverlap(
+        "fix: `schtasks /create /tn ping` failed (exit code 1) — works as: `schtasks /create /tn ping /f`",
+        "fix: `schtasks /create /tn ping` failed (exit code 1) — works as: `schtasks /create /f /tn ping`",
+    ));
+    try std.testing.expect(!contentOverlap(
+        "fix: powershell quoting needs a batch carrier for nested quotes",
+        "fix: curl progress output goes to stderr, use -sS for clean captures",
+    ));
+    try std.testing.expect(!contentOverlap("a b c", "a b c")); // no substantial tokens at all
 }
 
 test "needsBatchPercentHint fires only on single-% for-loop variables" {
