@@ -61,6 +61,9 @@ const Ui = struct {
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
+    conv_scroll: f32 = 0, // scroll offset for the Chats list (left pane)
+    con_scroll: [2]f32 = .{ 0, 0 }, // micro-console scrollback per tab (You/Veil): wrapped lines back from the tail; 0 = follow
+    cast_scroll: f32 = 0, // swarm-activity live console: events back from the tail; 0 = follow
     sel_msg: ?usize = null, // chat text selection: which message (null = none), and the [anchor,cursor) flat range
     sel_anchor: usize = 0,
     sel_cursor: usize = 0,
@@ -124,8 +127,76 @@ const Ui = struct {
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
+        cur: usize = 0, // caret byte index (0..=len), kept on a UTF-8 codepoint boundary
+        sel: ?usize = null, // selection anchor; the selection is [min(cur,sel), max(cur,sel))
         fn str(f: *const Field) []const u8 {
             return f.buf[0..f.len];
+        }
+        fn clear(f: *Field) void {
+            f.len = 0;
+            f.cur = 0;
+            f.sel = null;
+        }
+        fn clampCur(f: *Field) void {
+            if (f.cur > f.len) f.cur = f.len;
+            if (f.sel) |s| if (s > f.len) {
+                f.sel = f.len;
+            };
+        }
+        /// byte index one codepoint left of i (skips UTF-8 continuation bytes so the caret never lands mid-sequence)
+        fn prevCp(f: *const Field, i: usize) usize {
+            var j = i;
+            while (j > 0) {
+                j -= 1;
+                if ((f.buf[j] & 0xC0) != 0x80) break;
+            }
+            return j;
+        }
+        fn nextCp(f: *const Field, i: usize) usize {
+            var j = i;
+            if (j < f.len) {
+                j += 1;
+                while (j < f.len and (f.buf[j] & 0xC0) == 0x80) j += 1;
+            }
+            return j;
+        }
+        /// the normalized selection [lo, hi), or null when empty
+        fn selRange(f: *const Field) ?[2]usize {
+            const s = f.sel orelse return null;
+            if (s == f.cur) return null;
+            return .{ @min(s, f.cur), @max(s, f.cur) };
+        }
+        /// delete the selection if one exists; returns whether anything was removed
+        fn delSel(f: *Field) bool {
+            const rg = f.selRange() orelse {
+                f.sel = null;
+                return false;
+            };
+            std.mem.copyForwards(u8, f.buf[rg[0] .. f.len - (rg[1] - rg[0])], f.buf[rg[1]..f.len]);
+            f.len -= rg[1] - rg[0];
+            f.cur = rg[0];
+            f.sel = null;
+            return true;
+        }
+        fn insert(f: *Field, ch: u8) void {
+            if (f.len >= f.buf.len - 1) return;
+            std.mem.copyBackwards(u8, f.buf[f.cur + 1 .. f.len + 1], f.buf[f.cur..f.len]);
+            f.buf[f.cur] = ch;
+            f.cur += 1;
+            f.len += 1;
+        }
+        fn delBack(f: *Field) void {
+            if (f.cur == 0) return;
+            const p = f.prevCp(f.cur);
+            std.mem.copyForwards(u8, f.buf[p .. f.len - (f.cur - p)], f.buf[f.cur..f.len]);
+            f.len -= f.cur - p;
+            f.cur = p;
+        }
+        fn delFwd(f: *Field) void {
+            if (f.cur >= f.len) return;
+            const nx = f.nextCp(f.cur);
+            std.mem.copyForwards(u8, f.buf[f.cur .. f.len - (nx - f.cur)], f.buf[nx..f.len]);
+            f.len -= nx - f.cur;
         }
     };
 };
@@ -215,6 +286,9 @@ pub fn main() !void {
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     defer rl.closeWindow();
     defer t.deinit();
+    // Escape is raylib's default EXIT key — but here it's the documented "unfocus the input" key
+    // (handleKeys), so left at default it QUIT THE APP the first time someone escaped a text field.
+    rl.setExitKey(.null);
     rl.setTargetFPS(60);
 
     // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
@@ -371,6 +445,8 @@ fn setField(f: *Ui.Field, s: []const u8) void {
     const n = @min(s.len, f.buf.len);
     @memcpy(f.buf[0..n], s[0..n]);
     f.len = n;
+    f.cur = n;
+    f.sel = null;
 }
 
 fn drawLogOverlay() void {
@@ -804,20 +880,26 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.four)) setTab(.swarm);
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
-        // Keyboard copy for chats (the per-message hover "copy" chip needs a precise mouse hover; these don't).
-        //   Ctrl+C        → the LAST veil answer
-        //   Ctrl+Shift+C  → the WHOLE conversation
-        // Field-scoped Ctrl+C (copy the focused input) is handled in editField, so these only run when no field
-        // owns the keyboard.
+    }
+    // Keyboard copy — ONE priority chain, NOT gated on focus. The Chat tab force-focuses the prompt
+    // input (setTab) and clicks never clear focus, so the old focus==.none gate made "select text,
+    // Ctrl+C" unreachable there: editField copied the (usually empty) input instead of the selection.
+    //   1. an active drag-selection   2. Ctrl+Shift+C → the WHOLE conversation
+    //   3. the focused field's text (when non-empty)   4. the LAST veil answer
+    {
         const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         if (ctrl and rl.isKeyPressed(.c)) {
             if (ui.tab == .chat and ui.chat_inner == .chat and sel_text_len > 0) {
-                // an active drag-selection takes precedence over the copy-last-answer shortcut
                 copyToClipboard(sel_text[0..sel_text_len]);
                 markCopied();
             } else if (shift) {
                 copyConversation(store);
+            } else if (focusedField()) |f| {
+                if (f.selRange()) |rg| {
+                    copyToClipboard(f.buf[rg[0]..rg[1]]);
+                    markCopied();
+                } else if (f.len > 0) copyToClipboard(f.str());
             } else {
                 var last: ?store_mod.ChatMsg = null;
                 store.lock();
@@ -834,22 +916,7 @@ fn handleKeys(store: *Store) void {
             }
         }
     }
-    switch (ui.focus) {
-        .none => {},
-        .chat => editField(&ui.chat),
-        .d_name => editField(&ui.d_name),
-        .d_key => editField(&ui.d_key),
-        .d_cfacct => editField(&ui.d_cfacct),
-        .d_goal => editField(&ui.d_goal),
-        .d_gateway => editField(&ui.d_gateway),
-        .c_input => editField(&ui.c_input),
-        .c_rename => editField(&ui.c_rename),
-        .s_model => editField(&ui.s_model),
-        .s_url => editField(&ui.s_url),
-        .s_ckey => editField(&ui.s_ckey),
-        .s_cfacct => editField(&ui.s_cfacct),
-        .con_input => editField(&ui.con_input),
-    }
+    if (focusedField()) |f| editField(f);
     if (rl.isKeyPressed(.escape)) {
         ui.focus = .none;
         ui.file_menu = false;
@@ -857,10 +924,34 @@ fn handleKeys(store: *Store) void {
     }
 }
 
+/// The Field owning the keyboard right now (null when no input has focus).
+fn focusedField() ?*Ui.Field {
+    return switch (ui.focus) {
+        .none => null,
+        .chat => &ui.chat,
+        .d_name => &ui.d_name,
+        .d_key => &ui.d_key,
+        .d_cfacct => &ui.d_cfacct,
+        .d_goal => &ui.d_goal,
+        .d_gateway => &ui.d_gateway,
+        .c_input => &ui.c_input,
+        .c_rename => &ui.c_rename,
+        .s_model => &ui.s_model,
+        .s_url => &ui.s_url,
+        .s_ckey => &ui.s_ckey,
+        .s_cfacct => &ui.s_cfacct,
+        .con_input => &ui.con_input,
+    };
+}
+
 fn editField(f: *Ui.Field) void {
-    // Ctrl+V paste — the fields ignored the clipboard before, so keys/goals couldn't be pasted.
+    f.clampCur(); // external writers (setField/seeds) may have moved len under the caret
     const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
+    const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+    // Ctrl+V paste — inserts at the caret (replacing any selection).
     if (ctrl and rl.isKeyPressed(.v)) {
+        ui.input_active = true;
+        _ = f.delSel();
         const clip = rl.getClipboardText();
         for (clip) |raw_ch| {
             // multi-line pastes flatten to spaces instead of being silently dropped
@@ -868,27 +959,73 @@ fn editField(f: *Ui.Field) void {
             // Accept UTF-8 (any byte >= 128) as well as printable ASCII — the old `< 127` cap silently dropped
             // every non-ASCII byte, so pasting text with smart quotes, em-dashes, or accents lost characters.
             // The renderer folds these to ASCII for display, but the field keeps the real bytes to send/copy.
-            if (ch >= 32 and ch != 127 and f.len < f.buf.len - 1) {
-                if (ch == ' ' and f.len > 0 and f.buf[f.len - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
-                f.buf[f.len] = ch;
-                f.len += 1;
+            if (ch >= 32 and ch != 127) {
+                if (ch == ' ' and f.cur > 0 and f.buf[f.cur - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
+                f.insert(ch);
             }
         }
     }
-    // Ctrl+C — copy the field's current text out (there is no selection model; whole-field copy)
-    if (ctrl and rl.isKeyPressed(.c) and f.len > 0) copyToClipboard(f.str());
+    // (Ctrl+C is owned by the one priority chain in handleKeys — selection > conversation > field > last answer.)
+    if (ctrl and rl.isKeyPressed(.a) and f.len > 0) { // select all
+        f.sel = 0;
+        f.cur = f.len;
+    }
+    if (ctrl and rl.isKeyPressed(.x)) { // cut the selection
+        if (f.selRange()) |rg| {
+            copyToClipboard(f.buf[rg[0]..rg[1]]);
+            markCopied();
+            _ = f.delSel();
+        }
+    }
     var c = rl.getCharPressed();
     while (c > 0) : (c = rl.getCharPressed()) {
         ui.input_active = true; // keep 60fps while typing
-        if (c >= 32 and c < 127 and f.len < f.buf.len - 1) {
-            f.buf[f.len] = @intCast(c);
-            f.len += 1;
+        if (c >= 32 and c < 127) {
+            _ = f.delSel();
+            f.insert(@intCast(c));
         }
+    }
+    // caret movement: arrows (Ctrl = word jump), Home/End; Shift extends a selection, plain movement drops it
+    const kleft = rl.isKeyPressed(.left) or rl.isKeyPressedRepeat(.left);
+    const kright = rl.isKeyPressed(.right) or rl.isKeyPressedRepeat(.right);
+    const khome = rl.isKeyPressed(.home);
+    const kend = rl.isKeyPressed(.end);
+    if (kleft or kright or khome or kend) {
+        ui.input_active = true;
+        const rg = f.selRange();
+        if (shift and f.sel == null) f.sel = f.cur;
+        if (kleft) {
+            if (!shift and rg != null) f.cur = rg.?[0] else if (ctrl) f.cur = wordJumpLeft(f) else f.cur = f.prevCp(f.cur);
+        }
+        if (kright) {
+            if (!shift and rg != null) f.cur = rg.?[1] else if (ctrl) f.cur = wordJumpRight(f) else f.cur = f.nextCp(f.cur);
+        }
+        if (khome) f.cur = 0;
+        if (kend) f.cur = f.len;
+        if (!shift) f.sel = null;
     }
     if ((rl.isKeyPressed(.backspace) or rl.isKeyPressedRepeat(.backspace)) and f.len > 0) {
         ui.input_active = true;
-        f.len -= 1;
+        if (!f.delSel()) f.delBack();
     }
+    if ((rl.isKeyPressed(.delete) or rl.isKeyPressedRepeat(.delete)) and f.len > 0) {
+        ui.input_active = true;
+        if (!f.delSel()) f.delFwd();
+    }
+}
+
+fn wordJumpLeft(f: *const Ui.Field) usize {
+    var i = f.cur;
+    while (i > 0 and f.buf[i - 1] == ' ') i -= 1;
+    while (i > 0 and f.buf[i - 1] != ' ') i -= 1;
+    return i;
+}
+
+fn wordJumpRight(f: *const Ui.Field) usize {
+    var i = f.cur;
+    while (i < f.len and f.buf[i] != ' ') i += 1;
+    while (i < f.len and f.buf[i] == ' ') i += 1;
+    return i;
 }
 
 // -------------------------------------------------------------------------------- tab bar
@@ -1037,11 +1174,13 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var msgs: [store_mod.MAX_CHAT_MSGS]store_mod.ChatMsg = undefined;
     const msg_n = store.msg_count;
     @memcpy(msgs[0..msg_n], store.msgs[0..msg_n]);
-    var stream_buf: [8192]u8 = undefined;
-    const stream_n = store.stream_len;
+    // sized by the store's own constant + clamped: THE crash of the first build simulation was this snapshot
+    // hardcoded at [8192] while stream_text is 16K — the first streaming reply past 8KB was an instant OOB.
+    var stream_buf: [store_mod.STREAM_CAP]u8 = undefined;
+    const stream_n = @min(store.stream_len, stream_buf.len);
     @memcpy(stream_buf[0..stream_n], store.stream_text[0..stream_n]);
     var sreason_buf: [4096]u8 = undefined;
-    const sreason_n = store.stream_reason_len;
+    const sreason_n = @min(store.stream_reason_len, sreason_buf.len);
     @memcpy(sreason_buf[0..sreason_n], store.stream_reason[0..sreason_n]);
     const busy = store.chat_busy;
     var status: [96]u8 = undefined;
@@ -1060,8 +1199,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var con_buf: [16384]u8 = undefined;
     const con_ai = ui.con_tab == 1;
     const con_src = if (con_ai) store.console_ai[0..store.console_ai_len] else store.console_you[0..store.console_you_len];
-    const con_n = con_src.len;
-    @memcpy(con_buf[0..con_n], con_src);
+    const con_n = @min(con_src.len, con_buf.len);
+    @memcpy(con_buf[0..con_n], con_src[0..con_n]);
     const con_busy = if (con_ai) store.console_busy_ai else store.console_busy_you;
     const left_open = store.settings.chat_left_open;
     const right_open = store.settings.chat_right_open;
@@ -1108,45 +1247,64 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
     if (t.tab(.{ .x = r.x + 4 + tw, .y = r.y + 2, .width = tw, .height = th }, t.z("Veil", .{}), ui.con_tab == 1)) ui.con_tab = 1;
     if (busy) t.statusDot(@intFromFloat(r.x + r.width - 12), @intFromFloat(r.y + 14), t.yellow);
 
-    // ---- scrollback (mono, tail-anchored, viewport-culled) ----
+    // ---- scrollback (mono, tail-anchored, viewport-culled, wheel-scrollable) ----
     const input_h: f32 = 26;
     const body_y: f32 = r.y + 2 + th + 4;
     const body_h: f32 = r.height - (body_y - r.y) - input_h - 6;
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(body_y), @intFromFloat(r.width - 2), @intFromFloat(body_h));
     const line_h: f32 = 15;
     const cols: usize = @intFromFloat(@max(8, (r.width - 16) / 7)); // ~7px per mono glyph at size 12
-    // wrap the scrollback into display lines, then show only the tail that fits
+    // Wrap the scrollback into display lines as a RING keeping the NEWEST slice.len lines — the old
+    // fill-from-the-start + hard-break pinned the view to STALE content once a full 16KB store ring
+    // wrapped past the array (the console looked frozen while new output landed invisibly below).
     var lines: [512][]const u8 = undefined;
-    var ln: usize = 0;
+    var ln: usize = 0; // total wrapped lines produced; the ring keeps the newest @min(ln, lines.len)
     var it = std.mem.splitScalar(u8, scroll, '\n');
     while (it.next()) |raw| {
         var seg = raw;
         while (true) {
-            if (ln >= lines.len) break;
             if (seg.len <= cols) {
-                lines[ln] = seg;
+                lines[ln % lines.len] = seg;
                 ln += 1;
                 break;
             }
-            lines[ln] = seg[0..cols];
+            lines[ln % lines.len] = seg[0..cols];
             ln += 1;
             seg = seg[cols..];
         }
-        if (ln >= lines.len) break;
     }
+    const kept = @min(ln, lines.len);
     const rows: usize = @intFromFloat(@max(1, body_h / line_h));
-    const first = if (ln > rows) ln - rows else 0;
+    // wheel: scroll back through the kept history; 0 = follow the tail as new output streams in
+    const body = t.Rect{ .x = r.x + 1, .y = body_y, .width = r.width - 2, .height = body_h };
+    const sc = &ui.con_scroll[if (ai) 1 else 0];
+    const maxback: usize = if (kept > rows) kept - rows else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(body)) sc.* += wheel * 3;
+    if (sc.* < 0) sc.* = 0;
+    if (sc.* > @as(f32, @floatFromInt(maxback))) sc.* = @floatFromInt(maxback);
+    const back: usize = @intFromFloat(sc.*);
+    const first_kept = ln - kept;
+    const endj = ln - back; // exclusive; back==0 means the live tail
+    const startj = if (endj - first_kept > rows) endj - rows else first_kept;
     var yy: f32 = body_y;
     if (ln == 0) {
         const hint = if (ai) t.z("the veil runs shell commands here (RUN: ...)", .{}) else t.z("type a shell command, Enter to run", .{});
         t.textMonoClip(hint, @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.comment, @intFromFloat(r.width - 16));
     }
-    var li = first;
-    while (li < ln) : (li += 1) {
-        t.textMonoClip(lines[li], @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.fg_dim, @intFromFloat(r.width - 14));
+    var li = startj;
+    while (li < endj) : (li += 1) {
+        t.textMonoClip(lines[li % lines.len], @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.fg_dim, @intFromFloat(r.width - 14));
         yy += line_h;
     }
     rl.endScissorMode();
+    // hover copy: the whole scrollback as plain text (standard copy for a read-only surface)
+    if (ln > 0 and t.hovering(body)) {
+        if (copyChip(r.x + r.width - 54, body_y)) {
+            copyToClipboard(scroll);
+            markCopied();
+        }
+    }
 
     // ---- input row (only the You tab is user-typable; the Veil tab is driven by the AI) ----
     const iy: f32 = r.y + r.height - input_h - 2;
@@ -1173,7 +1331,7 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
         const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
         if (can and (clicked or (ui.focus == .con_input and enter))) {
             store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
-            ui.con_input.len = 0;
+            ui.con_input.clear();
         }
     }
 }
@@ -1261,12 +1419,24 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         ui.c_renaming = false;
     }
 
-    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 34), @intFromFloat(r.width - 2), @intFromFloat(r.height - 38));
-    defer rl.endScissorMode();
-    var yy: f32 = r.y + 38;
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 34, .width = r.width - 2, .height = r.height - 38 };
     const row_h: f32 = 40;
+    // wheel-scroll the list (it had no offset at all — rows past the pane bottom were unreachable)
+    const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h;
+    const max_scroll = if (total > list.height) total - list.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(list)) ui.conv_scroll -= wheel * row_h;
+    if (ui.conv_scroll < 0) ui.conv_scroll = 0;
+    if (ui.conv_scroll > max_scroll) ui.conv_scroll = max_scroll;
+    rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
+    defer rl.endScissorMode();
+    var yy: f32 = r.y + 38 - ui.conv_scroll;
     for (convs) |*cv| {
-        if (yy > r.y + r.height - 8) break;
+        // cull rows outside the view but keep advancing yy so offsets stay stable
+        if (yy + row_h < list.y or yy > r.y + r.height - 8) {
+            yy += row_h;
+            continue;
+        }
         const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 5 };
         const is_active = std.mem.eql(u8, cv.idStr(), active);
         const hot = t.hovering(rr);
@@ -1414,7 +1584,7 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     var yy = y0;
     if (draw and inView(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
     yy += MSG_HEAD_H;
-    const dim = role == .cast_note;
+    const dim = role == .cast_note or role == .thought;
 
     // split into a line array so multi-line constructs (tables, code) can be grouped with lookahead
     var lines: [MSG_MAX_LINES][]const u8 = undefined;
@@ -1698,6 +1868,7 @@ fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
         .user => t.z("you", .{}),
         .veil => t.z("veil", .{}),
         .cast_note => t.z("cast", .{}),
+        .thought => t.z("reasoning", .{}),
     };
 }
 
@@ -1706,7 +1877,19 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
         .user => t.cyan,
         .veil => t.magenta,
         .cast_note => t.yellow,
+        .thought => t.comment,
     };
+}
+
+/// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking.
+/// Returns true on click (expand/collapse).
+fn thoughtChip(view: t.Rect, y0: f32, expanded: bool) bool {
+    const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
+    const hot = t.hovering(r) and t.hovering(view);
+    t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.comment); // dim marker dot
+    t.text(t.z("reasoning", .{}), @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.comment);
+    t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
+    return hot and rl.isMouseButtonPressed(.left);
 }
 
 /// A single clean 'the hive is working' status line in the chat flow while a cast runs, so the chat isn't dead
@@ -1750,6 +1933,8 @@ fn toolFriendly(name: []const u8) [:0]const u8 {
     if (std.mem.eql(u8, name, "deep_crawl")) return t.z("crawled the web", .{});
     if (std.mem.eql(u8, name, "list_swarms")) return t.z("checked the swarms", .{});
     if (std.mem.eql(u8, name, "stop_swarm")) return t.z("stopped the swarm", .{});
+    if (std.mem.eql(u8, name, "kill_swarm")) return t.z("killed the swarm", .{});
+    if (std.mem.eql(u8, name, "swarm_status")) return t.z("checked the swarm's status", .{});
     if (std.mem.eql(u8, name, "swarm_findings")) return t.z("read the swarm's findings", .{});
     if (std.mem.eql(u8, name, "recall_hive")) return t.z("recalled memory", .{});
     if (std.mem.eql(u8, name, "observe")) return t.z("saved a note to memory", .{});
@@ -1927,8 +2112,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
     if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
         for (msgs, 0..) |*m, i| {
-            ui.mh[i] = if (toolName(m.textStr()) != null and ui.tool_open != i)
-                TOOL_CHIP_H // collapsed tool call = a one-line chip (keeps huge JSON/results out of the layout)
+            ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and ui.tool_open != i)
+                TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
                 renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
         }
@@ -1964,6 +2149,22 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // CULL: a message fully above or below the viewport costs nothing — skip the word-wrap+draw entirely.
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
+        if (m.role == .thought) {
+            // The reasoning trace renders collapsed (a dim one-line chip); click to read the full thinking that
+            // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
+            if (ui.tool_open == i) {
+                _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+                if (copyChip(view.x + view.width - 126, y0 + 3)) {
+                    copyToClipboard(m.textStr());
+                    markCopied();
+                }
+                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
+            } else if (thoughtChip(view, y0, false)) {
+                ui.tool_open = i;
+            }
+            continue;
+        }
         if (toolName(m.textStr())) |tn| {
             // Tool calls render as a compact chip (raw JSON/result hidden). Click to expand/collapse; the full
             // text is untouched in the message, so the model still receives it and copy still grabs it.
@@ -1971,7 +2172,12 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
                 // the token cost now lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
-                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = 20 };
+                // expanded tool text is copyable like any other message
+                if (copyChip(view.x + view.width - 126, y0 + 3)) {
+                    copyToClipboard(m.textStr());
+                    markCopied();
+                }
+                const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
             } else if (toolChip(view, y0, tn, false)) {
                 ui.tool_open = i;
@@ -2059,7 +2265,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // input row — a 3-row growing/scrolling text area (a long prompt wraps + scrolls instead of running off-screen)
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - 96, .height = input_h };
     textArea(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
-    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy + input_h - 34, .width = 88, .height = 34 };
+    // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
+    // deriving y/height from input_h keeps the two aligned even if the row height changes later.
+    const sendb = t.Rect{ .x = r.x + r.width - 88, .y = sy, .width = 88, .height = input_h };
     // While a turn is generating (or auto-loop is driving), the send button becomes a red STOP that aborts the
     // in-flight turn + halts auto-loop, so the user can always take back control.
     if (busy or loop_on) {
@@ -2072,7 +2280,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
         if (can_send and (clicked or (ui.focus == .c_input and enter))) {
             store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
-            ui.c_input.len = 0;
+            ui.c_input.clear();
             ui.chat_follow = true;
         }
     }
@@ -2265,11 +2473,13 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     var total: f32 = 4;
     {
         var i: usize = 0;
-        while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 10;
+        while (i < n) : (i += 1) total += 24 + @as(f32, @floatFromInt(memLineCount(rows[i].text_len, 12, txtw))) * 16 + 6;
     }
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
-    if (wheel != 0 and t.hovering(view)) ui.mem_scroll -= wheel * 3 * 18;
+    // hover the whole pane below the tab strip, not just the card viewport — wheeling over the header
+    // strip was a dead zone that read as "can't scroll"
+    if (wheel != 0 and t.hovering(.{ .x = r.x, .y = r.y + 32, .width = r.width, .height = r.height - 32 })) ui.mem_scroll -= wheel * 3 * 18;
     if (ui.mem_scroll < 0) ui.mem_scroll = 0;
     if (ui.mem_scroll > max_scroll) ui.mem_scroll = max_scroll;
 
@@ -2289,6 +2499,11 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
             t.text(t.z("[{s}]", .{if (cat.len > 0) cat else "fact"}), @intFromFloat(card.x + 8), @intFromFloat(card.y + 6), 11, memCatColor(cat));
             const del = t.Rect{ .x = card.x + card.width - 24, .y = card.y + 4, .width = 20, .height = 18 };
             if (t.button(del, t.z("x", .{}), t.red, true)) forget_idx = i;
+            // copy the stored fact (keys/logins live here — copy is the whole point of keeping them)
+            if (copyChip(card.x + card.width - 74, card.y + 4)) {
+                copyToClipboard(m.textStr());
+                markCopied();
+            }
             _ = drawMemText(m.textStr(), card.x + 8, card.y + 24, 12, t.fg, txtw);
         }
         y += card_h;
@@ -2367,6 +2582,21 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     // ---- live console: the swarm's own event stream (this is what "shows its progress") ----
     t.hline(@intFromFloat(r.x + 8), @intFromFloat(yy + 4), @intFromFloat(r.width - 16), t.border);
     t.text(t.z("live hive console", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 10), 11, t.comment);
+    // copy the visible event tail as plain text ("r{d} mind text" lines)
+    if (tail.len > 0 and copyChip(r.x + r.width - 58, yy + 7)) {
+        var n: usize = 0;
+        for (tail) |*ev| {
+            if (ev.round >= 0) bufAppend(&conv_buf, &n, t.z("r{d} ", .{ev.round}));
+            if (ev.mindStr().len > 0) {
+                bufAppend(&conv_buf, &n, ev.mindStr());
+                bufAppend(&conv_buf, &n, " ");
+            }
+            bufAppend(&conv_buf, &n, ev.textStr());
+            bufAppend(&conv_buf, &n, "\n");
+        }
+        if (n > 0) copyToClipboard(conv_buf[0..n]);
+        markCopied();
+    }
     yy += 28;
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(yy), @intFromFloat(r.width - 2), @intFromFloat(r.y + r.height - yy - 4));
     defer rl.endScissorMode();
@@ -2383,9 +2613,18 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     }
     const line_h: f32 = 17;
     const avail: usize = if (r.y + r.height - 8 > yy) @intFromFloat((r.y + r.height - 8 - yy) / line_h) else 0;
-    const start = if (tail.len > avail) tail.len - avail else 0;
+    // wheel: scroll back through the event tail (it was hard tail-anchored with no offset); 0 = follow
+    const con = t.Rect{ .x = r.x + 1, .y = yy, .width = r.width - 2, .height = r.y + r.height - yy - 4 };
+    const maxback: usize = if (tail.len > avail) tail.len - avail else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(con)) ui.cast_scroll += wheel * 3;
+    if (ui.cast_scroll < 0) ui.cast_scroll = 0;
+    if (ui.cast_scroll > @as(f32, @floatFromInt(maxback))) ui.cast_scroll = @floatFromInt(maxback);
+    const back: usize = @intFromFloat(ui.cast_scroll);
+    const endk = tail.len - back;
+    const start = if (endk > avail) endk - avail else 0;
     var k = start;
-    while (k < tail.len) : (k += 1) {
+    while (k < endk) : (k += 1) {
         const e = &tail[k];
         if (e.round >= 0) t.textMono(t.z("r{d}", .{e.round}), @intFromFloat(r.x + 10), @intFromFloat(yy), 11, t.comment);
         const mind = e.mindStr();
@@ -2779,7 +3018,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     const goalb = t.Rect{ .x = rx + 92, .y = cy, .width = 120, .height = ctrl_h };
     if (t.button(goalb, t.z("Set goal->chat", .{}), t.magenta, ui.chat.len > 0)) {
         store.pushCmd(store_mod.mkCmd(.set_goal, sel[0..sel_n], ui.chat.str()));
-        ui.chat.len = 0;
+        ui.chat.clear();
     }
     const followb = t.Rect{ .x = rx + 220, .y = cy, .width = 120, .height = ctrl_h };
     if (t.button(followb, if (ui.log_follow) t.z("following", .{}) else t.z("follow log", .{}), t.blue, true)) ui.log_follow = !ui.log_follow;
@@ -2793,7 +3032,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     const send = t.button(sendb, t.z("Send", .{}), t.blue, ui.chat.len > 0);
     if (send or (ui.focus == .chat and ui.chat.len > 0 and rl.isKeyPressed(.enter))) {
         store.pushCmd(store_mod.mkCmd(.say, sel[0..sel_n], ui.chat.str()));
-        ui.chat.len = 0;
+        ui.chat.clear();
     }
 }
 
@@ -2875,6 +3114,23 @@ fn drawConsole(r: t.Rect, evs: []const scan.Ev, live: bool) void {
             t.text(t.z("no events yet", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 14), 13, t.comment);
         }
     }
+    // hover copy: the whole event log as plain text ("r{d} mind text" lines)
+    if (evs.len > 0 and t.hovering(r)) {
+        if (copyChip(r.x + r.width - 58, r.y + 6)) {
+            var n: usize = 0;
+            for (evs) |*ev| {
+                if (ev.round >= 0) bufAppend(&conv_buf, &n, t.z("r{d} ", .{ev.round}));
+                if (ev.mindStr().len > 0) {
+                    bufAppend(&conv_buf, &n, ev.mindStr());
+                    bufAppend(&conv_buf, &n, " ");
+                }
+                bufAppend(&conv_buf, &n, ev.textStr());
+                bufAppend(&conv_buf, &n, "\n");
+            }
+            if (n > 0) copyToClipboard(conv_buf[0..n]);
+            markCopied();
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------- files (swarm outputs)
@@ -2933,8 +3189,13 @@ fn drawFiles(store: *Store, r: t.Rect) void {
         t.text(t.z("select a file to view its contents", .{}), @intFromFloat(cx), @intFromFloat(r.y + 14), 13, t.comment);
         return;
     }
-    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(r.y + 10), 13, t.cyan, @intFromFloat(cw - 120));
+    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(r.y + 10), 13, t.cyan, @intFromFloat(cw - 170));
     if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(r.y + 11), 11, t.orange);
+    // copy the whole (loaded) file content beside its name
+    if (cl > 0 and copyChip(cx + cw - 148, r.y + 9)) {
+        copyToClipboard(content[0..cl]);
+        markCopied();
+    }
     const view = t.Rect{ .x = cx, .y = r.y + 30, .width = cw, .height = r.height - 40 };
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
@@ -3030,8 +3291,13 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
         t.text(t.z("select a file to view its contents", .{}), @intFromFloat(cx), @intFromFloat(body.y + 14), 13, t.comment);
         return;
     }
-    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(body.y + 10), 13, t.cyan, @intFromFloat(cw - 120));
+    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(body.y + 10), 13, t.cyan, @intFromFloat(cw - 170));
     if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(body.y + 11), 11, t.orange);
+    // copy the whole (loaded) file content beside its name
+    if (cl > 0 and copyChip(cx + cw - 148, body.y + 9)) {
+        copyToClipboard(content[0..cl]);
+        markCopied();
+    }
     const view = t.Rect{ .x = cx, .y = body.y + 30, .width = cw, .height = body.height - 40 };
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
@@ -3275,7 +3541,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         textField(.{ .x = x, .y = y, .width = colw - 240, .height = 32 }, &ui.s_ckey, ui.focus == .s_ckey, "sk-...", .s_ckey);
         if (t.button(.{ .x = x + colw - 232, .y = y, .width = 104, .height = 32 }, t.z("Save key", .{}), t.blue, ui.s_ckey.len > 0)) {
             store.pushChatCmd(store_mod.mkChatCmd(.save_key, "", ui.s_ckey.str()));
-            ui.s_ckey.len = 0;
+            ui.s_ckey.clear();
             ui.focus = .none;
         }
         if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 116), @intFromFloat(y + 9), 12, t.green);
@@ -3454,50 +3720,152 @@ fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
     return n;
 }
 
-/// A multi-row, tail-scrolling text input. The Field holds ONE logical line (paste flattens newlines); this
-/// wraps it across up to `rows` visible rows and keeps the tail (caret) in view — so a long prompt grows
-/// downward and scrolls instead of running off the right edge.
+/// Pixel width of a raw field slice's first `nbytes`, measured the same way the field is DRAWN (t.zs folds
+/// non-ASCII), so the caret/selection x lines up with the rendered glyphs.
+fn fieldPrefixPx(line: []const u8, nbytes: usize) f32 {
+    const n = @min(nbytes, line.len);
+    if (n == 0) return 0;
+    return @floatFromInt(t.measure(t.zs(line[0..n]), 13));
+}
+
+/// Byte column within `line` nearest to pixel offset `targetpx` (binary search over prefix widths, the
+/// selColAt pattern), snapped back onto a UTF-8 codepoint boundary.
+fn fieldColAt(line: []const u8, targetpx: f32) usize {
+    if (targetpx <= 0) return 0;
+    var lo: usize = 0;
+    var hi: usize = line.len;
+    while (lo < hi) {
+        const mid = (lo + hi + 1) / 2;
+        if (fieldPrefixPx(line, mid) <= targetpx) lo = mid else hi = mid - 1;
+    }
+    while (lo > 0 and lo < line.len and (line[lo] & 0xC0) == 0x80) lo -= 1;
+    return lo;
+}
+
+/// Is a mouse drag currently extending a selection inside the focused Field? (one field can drag at a time)
+var field_drag: bool = false;
+
+/// A multi-row text input. The Field holds ONE logical line (paste flattens newlines); this wraps it across
+/// up to `rows` visible rows and keeps the CARET's row in view. Click to place the caret, drag to select,
+/// arrows/Home/End move it (editField owns the keys; this owns the pixels).
 fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
-    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
+    f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const line_h: f32 = 18;
     if (f.len == 0 and !focused) {
+        if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
         t.text(placeholder, inner_x, @intFromFloat(r.y + 8), 13, t.comment);
         return;
     }
     var lines: [96][]const u8 = undefined;
     const nl = wrapInto(f.str(), r.width - 20, &lines);
-    const first = if (nl > rows) nl - rows else 0; // show the tail so the caret stays visible
+    // the wrapped line the caret sits on (lines are slices into f.buf, so offsets are pointer math)
+    var caret_line: usize = 0;
+    {
+        var li: usize = 0;
+        while (li < nl) : (li += 1) {
+            if (f.cur >= lineOff(f, lines[li])) caret_line = li else break;
+        }
+    }
+    const first = if (caret_line >= rows) caret_line + 1 - rows else 0; // keep the caret's row in view
+    // click to place the caret (and start a drag-selection); drag extends it
+    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) {
+        ui.focus = which;
+        const mp = rl.getMousePosition();
+        f.cur = hitField(f, lines[0..nl], first, mp, r.y + 8, line_h, @floatFromInt(inner_x));
+        f.sel = f.cur;
+        field_drag = true;
+    }
+    if (focused and field_drag) {
+        if (rl.isMouseButtonDown(.left)) {
+            const mp = rl.getMousePosition();
+            f.cur = hitField(f, lines[0..nl], first, mp, r.y + 8, line_h, @floatFromInt(inner_x));
+            ui.input_active = true;
+        } else {
+            if (f.selRange() == null) f.sel = null;
+            field_drag = false;
+        }
+    }
     var yy: f32 = r.y + 8;
     var li = first;
-    while (li < nl) : (li += 1) {
+    while (li < nl and li < first + rows) : (li += 1) {
+        // selection highlight behind the text
+        if (focused) if (f.selRange()) |rg| {
+            const off = lineOff(f, lines[li]);
+            const lo = @max(rg[0], off);
+            const hi = @min(rg[1], off + lines[li].len);
+            if (lo < hi) {
+                const x0 = fieldPrefixPx(lines[li], lo - off);
+                const x1 = fieldPrefixPx(lines[li], hi - off);
+                t.fillRect(inner_x + @as(i32, @intFromFloat(x0)), @intFromFloat(yy - 1), @intFromFloat(@max(2, x1 - x0)), 17, t.bg_sel);
+            }
+        };
         t.text(t.zs(lines[li]), inner_x, @intFromFloat(yy), 13, t.fg);
         yy += line_h;
     }
-    if (focused and @mod(rl.getTime(), 1.0) < 0.5) {
-        const lastline: []const u8 = if (nl > 0) lines[nl - 1] else "";
-        const lw = t.measure(t.zs(lastline), 13);
-        const shown: f32 = @floatFromInt(if (nl == 0) @as(usize, 0) else @min(nl, rows) - 1);
-        t.fillRect(inner_x + lw + 1, @intFromFloat(r.y + 8 + shown * line_h), 2, 15, t.blue);
+    if (focused and @mod(rl.getTime(), 1.0) < 0.5 and caret_line >= first) {
+        const cl: []const u8 = if (nl > 0) lines[caret_line] else "";
+        const cw = fieldPrefixPx(cl, f.cur -| lineOff(f, cl));
+        const shown: f32 = @floatFromInt(caret_line - first);
+        t.fillRect(inner_x + @as(i32, @intFromFloat(cw)) + 1, @intFromFloat(r.y + 8 + shown * line_h), 2, 15, t.blue);
     }
+}
+
+/// Byte offset of a wrapped-line slice within its Field's buffer.
+fn lineOff(f: *const Ui.Field, line: []const u8) usize {
+    if (line.len == 0) return f.len;
+    return @intFromPtr(line.ptr) - @intFromPtr(&f.buf);
+}
+
+/// Map a mouse position to a byte index in the field: row from y (clamped), column via prefix-measure.
+fn hitField(f: *const Ui.Field, lines: [][]const u8, first: usize, mp: rl.Vector2, top_y: f32, line_h: f32, text_x: f32) usize {
+    if (lines.len == 0) return 0;
+    var row: usize = first;
+    if (mp.y > top_y) {
+        row = first + @as(usize, @intFromFloat((mp.y - top_y) / line_h));
+    }
+    if (row >= lines.len) row = lines.len - 1;
+    const col = fieldColAt(lines[row], mp.x - text_x);
+    return @min(lineOff(f, lines[row]) + col, f.len);
 }
 
 fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
+    f.clampCur();
+    const inner_x: i32 = @intFromFloat(r.x + 10);
+    const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
     // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click
     // meant for a dropdown item would otherwise fall through and focus the input underneath (the reported bug).
     // The open dropdown owns the click; drawList closes it on an outside-click.
-    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
-    const inner_x: i32 = @intFromFloat(r.x + 10);
-    const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
+    if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) {
+        ui.focus = which;
+        // place the caret at the clicked character (and anchor a drag-selection there)
+        f.cur = fieldColAt(f.str(), rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
+        f.sel = f.cur;
+        field_drag = true;
+    }
+    if (focused and field_drag) {
+        if (rl.isMouseButtonDown(.left)) {
+            f.cur = fieldColAt(f.str(), rl.getMousePosition().x - @as(f32, @floatFromInt(inner_x)));
+            ui.input_active = true;
+        } else {
+            if (f.selRange() == null) f.sel = null;
+            field_drag = false;
+        }
+    }
     if (f.len == 0 and !focused) {
         t.text(placeholder, inner_x, inner_y, 13, t.comment);
     } else {
+        if (focused) if (f.selRange()) |rg| {
+            const x0 = fieldPrefixPx(f.str(), rg[0]);
+            const x1 = fieldPrefixPx(f.str(), rg[1]);
+            t.fillRect(inner_x + @as(i32, @intFromFloat(x0)), inner_y - 1, @intFromFloat(@max(2, x1 - x0)), 17, t.bg_sel);
+        };
         t.textClip(f.str(), inner_x, inner_y, 13, t.fg, @intFromFloat(r.width - 20));
         if (focused) {
-            const tw = t.measure(t.zs(f.str()), 13);
-            if (@mod(rl.getTime(), 1.0) < 0.5) t.fillRect(inner_x + tw + 1, inner_y, 2, 15, t.blue);
+            const cw = fieldPrefixPx(f.str(), f.cur);
+            if (@mod(rl.getTime(), 1.0) < 0.5) t.fillRect(inner_x + @as(i32, @intFromFloat(cw)) + 1, inner_y, 2, 15, t.blue);
         }
     }
 }

@@ -5,7 +5,11 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // Default ReleaseSafe, NOT Debug (standardOptimizeOption only applies its preferred mode when --release is
+    // passed, so plain `zig build` was quietly shipping Debug: unoptimized text-measure loops pinned a core just
+    // drawing a long chat message). ReleaseSafe keeps bounds checks — a snapshot-buffer overrun already crashed
+    // the client once, and Fast would have turned that into silent memory corruption. -Doptimize=Debug for dev.
+    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "optimize mode (default ReleaseSafe)") orelse .ReleaseSafe;
 
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,

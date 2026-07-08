@@ -56,6 +56,9 @@ const Manifest = struct {
     gateway_key: []const u8 = "",
     veil_population: bool = false,
     tier: []const u8 = "auto",
+    /// spawned by the CAST API (quick strike OR sustained "continuous" chat cast). mode alone can't mark a
+    /// sustained cast — it runs mode="continuous" like a Deploy-tab swarm — so deployCore writes this bool.
+    cast: bool = false,
 };
 
 pub const MindState = struct {
@@ -146,6 +149,9 @@ pub const Worker = struct {
     hyperspace_cap: usize = hyperspace.DEFAULT_MAX_FACTS, // per-mind field size (NL_HYPERSPACE_CAP) — scales to hardware
     quick: bool = false, // INTERACTIVE fast-path: one small edit in 1-2 model round-trips (skip plan scaffolding, one-shot)
     cast: bool = false, // CAST fast-path: a planCast-assigned role team (scouts SEARCH, builders build) runs ONE bounded moment, then synthesize. Shares quick's skip-scaffolding + single-round stop, but NOT quick's 3-turn edit profile.
+    cast_run: bool = false, // spawned by the CAST API (quick OR sustained/continuous): stop at completed/graduated, NEVER chain to a new self-chosen goal — a cast answers its caller and terminates; only Deploy-tab swarms free-roam
+    deadline_s: i64 = 0, // absolute wall-clock deadline (start + minutes*60; 0 = no budget) — checked INSIDE the turn loop, so one long moment can't sail past the budget to the next round boundary
+    budget_s: i64 = 0, // the same budget as RELATIVE seconds for the io-free watchdog thread (its hard wall fires at budget + grace)
     serial_minds: bool = false, // single-slot backend (local Ollama): run mind-moments ONE AT A TIME. N concurrent requests to a 1-slot Ollama just queue and thrash (reloads, timeouts); serial keeps the model hot and each mind gets full throughput.
     roster: []const u8 = "",
     last_bench: BenchResult = .{},
@@ -523,6 +529,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         defer gpa.free(s);
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pid_path, .data = s }) catch {};
     }
+    {
+        // A reused run dir (respawn, manual restart-to-resume, re-cast) must not inherit the previous run's
+        // terminal marker — a stale DONE would make the supervisor read this fresh worker as already-stopped.
+        const done_path = try std.fmt.allocPrint(gpa, "{s}/DONE", .{run_dir});
+        defer gpa.free(done_path);
+        std.Io.Dir.cwd().deleteFile(io, done_path) catch {};
+    }
 
     {
         const wd = try std.fmt.allocPrint(gpa, "{s}/work", .{run_dir});
@@ -695,6 +708,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     // cast shares quick's fast path (skip build scaffolding, stop after one round) but gets its OWN capacity
     // profile below (a 3-turn EDIT profile can't fetch/crawl — scouts need real turns).
     w.quick = w.cast or std.mem.eql(u8, std.mem.trim(u8, m.style, " \t"), "quick") or std.mem.eql(u8, trimmed_mode, "oneshot");
+    // A SUSTAINED chat cast is mode="continuous" — indistinguishable from a Deploy-tab swarm by mode alone —
+    // so the cast API marks it in the manifest ("cast":true). Either form must terminate at completed/
+    // graduated instead of evolveGoal-chaining to a fresh self-chosen goal (the caller is waiting to collect).
+    w.cast_run = w.cast or m.cast;
     {
         const tenv = dupeEnv(gpa, environ, "NL_TIER");
         defer if (tenv) |t| gpa.free(t);
@@ -954,11 +971,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.act("engine", 0, "preflight", "api key", std.fmt.allocPrint(w.a(), "FATAL: the API token is not usable — {s}", .{clip(ping.content, 200)}) catch "api token unusable");
             writeHalt(&w, "api_preflight", ping.content, 0);
             w.emit("stopped", std.fmt.allocPrint(w.a(), ",\"reason\":\"api_preflight\",\"rounds\":0", .{}) catch ",\"reason\":\"api_preflight\"");
+            writeDone(&w, "api_preflight");
             return;
         }
         w.act("engine", 0, "preflight", "api key", if (ping.ok) "API token validated — provider reachable, swarm starting" else "provider not reachable yet (transient) — starting; the runtime failsafe will halt on sustained failure");
     }
     const start = w.nowSecs();
+    if (m.minutes > 0) {
+        // HARD WALL-CLOCK: an absolute deadline the per-turn loop checks (the round-boundary check alone let
+        // one long moment sail far past the budget), plus the relative form the io-free watchdog walls on.
+        w.deadline_s = start + @as(i64, m.minutes) * 60;
+        w.budget_s = @as(i64, m.minutes) * 60;
+    }
     var round: u32 = 0;
     var total_files: u32 = 0;
     var stop_reason: []const u8 = "done";
@@ -1320,7 +1344,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.stop_why = "quick_done";
         }
         if (w.stop_now) {
-            const evolved = w.autonomous and live and (std.mem.eql(u8, w.stop_why, "completed") or std.mem.eql(u8, w.stop_why, "graduated"));
+            // !w.cast_run: a cast (quick strike OR sustained chat cast) TERMINATES at completed/graduated —
+            // chaining to a new self-chosen goal left "LONG" casts running at 100% forever with a caller
+            // waiting to collect. Deploy-tab swarms (no cast mark) keep the full autonomy chain.
+            const evolved = w.autonomous and live and !w.cast_run and (std.mem.eql(u8, w.stop_why, "completed") or std.mem.eql(u8, w.stop_why, "graduated"));
             if (evolved) agi.archiveCompletedGoal(&w, run_dir, goal, w.goals_done);
             if (evolved and agi.evolveGoal(&w, &goal)) {
                 w.goals_done += 1;
@@ -1384,6 +1411,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
     _ = w.scratch.reset(.retain_capacity);
     w.emit("stopped", std.fmt.allocPrint(w.a(), ",\"reason\":\"{s}\",\"rounds\":{d}", .{ stop_reason, round }) catch ",\"rounds\":0");
+    writeDone(&w, stop_reason);
+}
+
+/// Terminal marker, written beside the final "stopped" event on EVERY clean exit: <run_dir>/DONE holds the
+/// stop reason, and the now-stale worker.pid is removed. The supervisor keys off DONE — a dead pid WITH a
+/// DONE is a finished run (.stopped), never a crash to respawn. Without it, a finished cast whose
+/// events.jsonl outgrew the probe's read window re-classified as .crashed and got resurrected forever.
+fn writeDone(w: *Worker, reason: []const u8) void {
+    const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
+    defer w.gpa.free(dp);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = dp, .data = reason }) catch {};
+    const pp = std.fmt.allocPrint(w.gpa, "{s}/worker.pid", .{w.run_dir}) catch return;
+    defer w.gpa.free(pp);
+    std.Io.Dir.cwd().deleteFile(w.io, pp) catch {};
 }
 
 pub const Moment = struct { monologue: []u8, fact: []u8, stance: []u8, facts: u32, recalled: u32, trace: []u8, files: u32, dt: i64 = 0, skills: u32 = 0, directives: u32 = 0, tools_made: u32 = 0, llm_ok: bool = false, llm_fatal: bool = false, auto_stored: bool = false, tool_calls: u32 = 0, narrated: bool = false };
@@ -3223,6 +3264,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
     while (turn < op_turns) : (turn += 1) {
         if (w.stopRequested()) break;
+        // HARD WALL-CLOCK: the minutes budget used to be checked only at round boundaries, so one long
+        // moment (slow provider, deep tool chain) sailed far past it. Break at the deadline mid-moment.
+        if (w.deadline_s != 0 and w.nowSecs() >= w.deadline_s) break;
         if (turn >= 2 and conv.items.len > conv_limit) break;
         // NEAR-LIMIT WARNING: tell the model the window is closing instead of silently cutting the moment
         // off next turn — a weak model given one explicit "finish NOW" turn ships its file; one cut mid-plan
@@ -6372,15 +6416,30 @@ fn rawSleep1s() void {
     }
 }
 
+/// Grace past the minutes budget before the watchdog hard-exits: the run loop's own deadline checks (turn +
+/// round boundary) normally stop the run first — this wall only fires when a round is WEDGED past all of them.
+const BUDGET_GRACE_S: i64 = 90;
+
 /// Watches the emitted-event SEQ as a liveness heartbeat (std time moved under io, so no wall clock is used): if
 /// the seq doesn't advance across HANG_STALE_CHECKS consecutive ~30s checks, a subprocess has deadlocked a round,
 /// so it records the freeze and force-exits — making the hang VISIBLE while on-disk data is already preserved.
+/// Doubles as the BUDGET WALL: past minutes+grace (seconds counted off the same raw 1s sleeps) it records a
+/// final "stopped" + DONE io-free and hard-exits, so a wedged round can never outlive the budget by more than
+/// the grace.
 fn hangWatchdog(w: *Worker) void {
     var last_seq: i64 = -1;
     var stale: u32 = 0;
+    var elapsed_s: i64 = 0; // counted from the raw 1s sleeps — this thread deliberately never touches io
     while (!w.wd_stop.load(.monotonic)) {
         var i: u32 = 0;
-        while (i < HANG_CHECK_S and !w.wd_stop.load(.monotonic)) : (i += 1) rawSleep1s();
+        while (i < HANG_CHECK_S and !w.wd_stop.load(.monotonic)) : (i += 1) {
+            rawSleep1s();
+            elapsed_s += 1;
+            if (w.budget_s > 0 and elapsed_s >= w.budget_s + BUDGET_GRACE_S) {
+                writeBudgetWall(w);
+                std.process.exit(3);
+            }
+        }
         if (w.wd_stop.load(.monotonic)) break;
         const seq = w.last_progress.load(.monotonic);
         if (seq == 0) continue;
@@ -6400,6 +6459,44 @@ fn hangWatchdog(w: *Worker) void {
 extern "kernel32" fn CreateFileA(name: [*:0]const u8, access: u32, share: u32, sec: ?*anyopaque, disp: u32, flags: u32, templ: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn WriteFile(h: ?*anyopaque, buf: [*]const u8, n: u32, written: ?*u32, ov: ?*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn CloseHandle(h: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn DeleteFileA(name: [*:0]const u8) callconv(.winapi) i32;
+
+/// Raw Win32 whole-file write (CREATE_ALWAYS) — io-free, for the watchdog thread only (see writeHangHalt).
+fn rawWriteFile(path: [:0]const u8, data: []const u8) void {
+    const h = CreateFileA(path.ptr, 0x40000000, 0, null, 2, 0x80, null);
+    if (h == null or @intFromPtr(h.?) == std.math.maxInt(usize)) return;
+    var written: u32 = 0;
+    _ = WriteFile(h, data.ptr, @intCast(data.len), &written, null);
+    _ = CloseHandle(h);
+}
+
+/// Raw Win32 append (FILE_APPEND_DATA + OPEN_ALWAYS, shared) — io-free, for the watchdog thread only.
+fn rawAppendFile(path: [:0]const u8, data: []const u8) void {
+    const h = CreateFileA(path.ptr, 0x0004, 0x3, null, 4, 0x80, null);
+    if (h == null or @intFromPtr(h.?) == std.math.maxInt(usize)) return;
+    var written: u32 = 0;
+    _ = WriteFile(h, data.ptr, @intCast(data.len), &written, null);
+    _ = CloseHandle(h);
+}
+
+/// io-free terminal record for the watchdog's budget wall: append a final "stopped" event, write DONE, and
+/// drop worker.pid — all via raw Win32 (like writeHangHalt: this fires precisely when the round, and possibly
+/// the Io loop, is wedged). POSIX: best-effort nothing, matching writeHangHalt — the supervisor's pid probe
+/// still reads the exit correctly there.
+fn writeBudgetWall(w: *Worker) void {
+    if (@import("builtin").os.tag != .windows) return;
+    var pbuf: [1024]u8 = undefined;
+    var bbuf: [200]u8 = undefined;
+    // last_progress atomically mirrors seq (stored on every emit), so the raw line keeps seq monotonic
+    const seq: i64 = w.last_progress.load(.monotonic) + 1;
+    if (std.fmt.bufPrintZ(&pbuf, "{s}/events.jsonl", .{w.run_dir})) |evp| {
+        if (std.fmt.bufPrint(&bbuf, "{{\"seq\":{d},\"t\":0,\"kind\":\"stopped\",\"reason\":\"time_budget_hard\"}}\n", .{seq})) |line| rawAppendFile(evp, line) else |_| {}
+    } else |_| {}
+    if (std.fmt.bufPrintZ(&pbuf, "{s}/DONE", .{w.run_dir})) |dp| rawWriteFile(dp, "time_budget_hard") else |_| {}
+    if (std.fmt.bufPrintZ(&pbuf, "{s}/worker.pid", .{w.run_dir})) |pp| {
+        _ = DeleteFileA(pp.ptr);
+    } else |_| {}
+}
 
 /// Leave a durable HALTED.txt the moment the watchdog force-halts a frozen run, so the user finds a clear "why".
 fn writeHangHalt(w: *Worker, idle_s: u32) void {

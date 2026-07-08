@@ -40,6 +40,10 @@ const DeployReq = struct {
     gap_assess: bool = true,
     breakout: bool = false,
     observe_psyche: bool = false,
+    // CAST marker — set by the /cast path (quick strike AND sustained "continuous" casts) so the worker
+    // terminates at completed/graduated instead of evolveGoal-chaining to a new self-chosen goal. A plain
+    // /deploy or /run swarm leaves it false and keeps the full autonomy chain.
+    cast: bool = false,
     minds: []MindSpec,
 };
 
@@ -107,6 +111,13 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     else
         try std.fmt.allocPrint(res.arena, "{s}/u{d}/{s}", .{ app.data, u.id, id });
     const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{run_dir});
+
+    // RE-CAST HYGIENE: a cast into a chat conversation dir REUSES the previous cast's run_dir
+    // (`_chat/builds/{conv}`), so its lifecycle files are still on disk. A leftover STOP would stop the new
+    // worker at its first boundary check, a leftover DONE would read the fresh spawn as already-finished,
+    // and the old events.jsonl would splice two runs into one stream. Reset lifecycle metadata ONLY —
+    // never work/ or any other user file — BEFORE the manifest write + spawn.
+    if (run_dir_override.len > 0) resetCastLifecycle(app, res.arena, run_dir);
 
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     for (body.minds) |m| {
@@ -184,6 +195,8 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     try mani.appendSlice(app.gpa, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
     if (body.breakout) try mani.appendSlice(app.gpa, ",\"breakout\":true");
     if (body.observe_psyche) try mani.appendSlice(app.gpa, ",\"observe_psyche\":true");
+    // the worker's terminate-don't-chain gate (a sustained cast is mode="continuous", so mode can't carry it)
+    if (body.cast) try mani.appendSlice(app.gpa, ",\"cast\":true");
     if (body.encrypt and e.encrypted) try mani.appendSlice(app.gpa, ",\"encrypted\":true");
     try mani.appendSlice(app.gpa, ",\"minds\":[");
     for (body.minds, 0..) |m, i| {
@@ -235,6 +248,23 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
         return null;
     };
     return .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir };
+}
+
+/// Reset a reused run dir's LIFECYCLE files before a re-cast spawns into it: drop STOP/DONE/control.jsonl/
+/// worker.pid and rotate events.jsonl to events.prev.jsonl (replacing any older rotation, so exactly one
+/// previous run stays inspectable). Deliberately narrower than supervisor.cleanCastMeta — that also deletes
+/// swarm.json (fine, deploy rewrites it) but ALSO mind.sqlite, the minds/ dirs, and .usage; a re-cast should
+/// KEEP the conversation's accumulated hive memory. Never touches work/ or any other user file.
+fn resetCastLifecycle(app: *App, arena: std.mem.Allocator, run_dir: []const u8) void {
+    const drops = [_][]const u8{ "STOP", "DONE", "control.jsonl", "worker.pid" };
+    for (drops) |f| {
+        const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ run_dir, f }) catch continue;
+        std.Io.Dir.cwd().deleteFile(app.io, p) catch {};
+    }
+    const ev = std.fmt.allocPrint(arena, "{s}/events.jsonl", .{run_dir}) catch return;
+    const prev = std.fmt.allocPrint(arena, "{s}/events.prev.jsonl", .{run_dir}) catch return;
+    std.Io.Dir.cwd().deleteFile(app.io, prev) catch {};
+    std.Io.Dir.cwd().rename(ev, std.Io.Dir.cwd(), prev, app.io) catch {};
 }
 
 const RunReq = struct {
@@ -382,6 +412,9 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .gateway_model = rq.gateway_model,
         // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
+        // The cast MARK (both quick and continuous) makes the worker terminate at completed/graduated
+        // instead of chaining to a new self-chosen goal — the caller is waiting to collect.
+        .cast = true,
         .minds = minds,
     };
     // Build IN the chat's conversation dir when the caller named one, so the hive's `{run_dir}/work` is the SAME
@@ -744,8 +777,11 @@ pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 pub fn swarmDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
-    const sw = app.sup.get(id) orelse return notFound(res);
+    // resolve(), not get(): the desktop Swarm tab addresses a LIVE cast by its run-dir BASENAME while the
+    // registry keys it by the spawn-time hex id — the mismatch 404'd every delete until a server restart
+    // re-adopted the dir under its basename. Mutate via the swarm's OWN registry id.
+    const sw = app.sup.resolve(id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
-    app.sup.remove(id);
+    app.sup.remove(sw.id);
     try res.json(.{ .ok = true, .deleted = true }, .{});
 }
