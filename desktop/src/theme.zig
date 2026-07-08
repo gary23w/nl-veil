@@ -50,12 +50,14 @@ const Palette = struct {
 };
 
 // Default dark palette (Tokyo Night, mirrors web/public/styles.css).
+// fg is a soft off-white rather than pure #fff — full-blast white on a dark ground reads harsh; the
+// slightly blued white keeps the same contrast band as the web UI without the glare.
 const dark_palette = Palette{
     .bg = hex("1a1b26"),
     .bg_dark = hex("16161e"),
     .bg_hl = hex("1f2335"),
     .bg_sel = hex("283457"),
-    .fg = hex("ffffff"),
+    .fg = hex("e9edfa"),
     .fg_dim = hex("a9b1d6"),
     .comment = hex("565f89"),
     .border = hex("292e42"),
@@ -69,16 +71,18 @@ const dark_palette = Palette{
     .teal = hex("2ac3de"),
 };
 
-// Light palette tuned for readable contrast in the same visual language.
+// Light palette tuned for readable contrast in the same visual language. fg is near-black (not #000 —
+// pure black on a pale ground is the same glare problem in reverse) and the border sits closer to the
+// panel fills so the chrome reads as soft edges, not wireframe.
 const light_palette = Palette{
     .bg = hex("f5f7fb"),
     .bg_dark = hex("e9edf5"),
     .bg_hl = hex("dfe7f4"),
     .bg_sel = hex("cfdcf3"),
-    .fg = hex("000000"),
+    .fg = hex("14182b"),
     .fg_dim = hex("46557a"),
     .comment = hex("6d7a99"),
-    .border = hex("c4cee2"),
+    .border = hex("d3dbe9"),
     .blue = hex("2f6feb"),
     .cyan = hex("0b84a5"),
     .green = hex("2f8f46"),
@@ -148,6 +152,58 @@ pub fn schemeInt() u8 {
 
 pub fn withAlpha(c: Color, a: u8) Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
+}
+
+/// Linear mix of two colors (k=0 → a, k=1 → b). Buttons use it for hover/press shades so every accent
+/// gets consistent state feedback without hand-picking per-color variants.
+fn blend(a: Color, b: Color, k: f32) Color {
+    const ik = 1.0 - k;
+    return .{
+        .r = @intFromFloat(@as(f32, @floatFromInt(a.r)) * ik + @as(f32, @floatFromInt(b.r)) * k),
+        .g = @intFromFloat(@as(f32, @floatFromInt(a.g)) * ik + @as(f32, @floatFromInt(b.g)) * k),
+        .b = @intFromFloat(@as(f32, @floatFromInt(a.b)) * ik + @as(f32, @floatFromInt(b.b)) * k),
+        .a = 255,
+    };
+}
+
+fn luma(c: Color) f32 {
+    return 0.299 * @as(f32, @floatFromInt(c.r)) + 0.587 * @as(f32, @floatFromInt(c.g)) + 0.114 * @as(f32, @floatFromInt(c.b));
+}
+
+// ---- design tokens: ONE spacing/sizing scale for the whole shell ----
+// Every tab draws against these instead of sprinkling magic paddings, so the rhythm is uniform:
+// PAD around a page, PAD_IN inside a panel, GAP between siblings, and three button heights.
+pub const PAD: f32 = 16; // outer page padding
+pub const PAD_IN: f32 = 12; // padding inside a panel
+pub const GAP: f32 = 12; // gap between sibling widgets/cards
+pub const BTN_SM: f32 = 24; // inline chip-sized button
+pub const BTN_MD: f32 = 34; // standard form button (matches FIELD_H so paired rows align)
+pub const BTN_LG: f32 = 40; // page-level call to action
+pub const FIELD_H: f32 = 34; // single-line text input height
+
+// ---- mouse cursor feedback: widgets *request* a cursor while hovered; the frame applies ONE winner ----
+// Later draws win (overlays are drawn last, so their request naturally overrides covered widgets).
+// applyCursor() is called once per frame by main; it only touches the OS cursor on a change.
+var cursor_want: rl.MouseCursor = .default;
+var cursor_now: rl.MouseCursor = .default;
+pub fn wantCursor(c: rl.MouseCursor) void {
+    cursor_want = c;
+}
+pub fn applyCursor() void {
+    if (cursor_want != cursor_now) {
+        rl.setMouseCursor(cursor_want);
+        cursor_now = cursor_want;
+    }
+    cursor_want = .default;
+}
+
+/// raylib's rounded-rect "roundness" is RELATIVE to the rect's short side, so the same 0.14 gave a big
+/// button soft corners and a small chip nearly-square ones. Convert a PIXEL radius to the ratio so every
+/// widget shares one corner language.
+fn roundnessFor(r: Rect, radius_px: f32) f32 {
+    const m = @min(r.width, r.height);
+    if (m <= 1) return 0;
+    return @min(1.0, (radius_px * 2.0) / m);
 }
 
 // ---- text: a RING of scratch buffers + a loaded TTF ----
@@ -355,12 +411,13 @@ pub fn textClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) 
 }
 
 pub fn panel(r: Rect, fill: Color) void {
-    rl.drawRectangleRounded(r, 0.06, 6, fill);
+    rl.drawRectangleRounded(r, roundnessFor(r, 7), 8, fill);
 }
 
 pub fn panelBordered(r: Rect, fill: Color, line: Color) void {
-    rl.drawRectangleRounded(r, 0.06, 6, fill);
-    rl.drawRectangleRoundedLinesEx(r, 0.06, 6, 1.0, line);
+    const rn = roundnessFor(r, 7);
+    rl.drawRectangleRounded(r, rn, 8, fill);
+    rl.drawRectangleRoundedLinesEx(r, rn, 8, 1.0, line);
 }
 
 pub fn fillRect(x: i32, y: i32, w: i32, h: i32, c: Color) void {
@@ -400,32 +457,101 @@ pub fn setBlockClicks(v: bool) void {
     clicks_blocked = v;
 }
 
-/// A button; returns true on click. `accent` tints the hover fill + left edge so primary/danger/ghost
-/// buttons read differently without a separate widget per kind.
-pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
-    const hot = enabled and mouse.over(r);
-    const fill = if (!enabled) bg_hl else if (hot) withAlpha(accent, 40) else bg_hl;
-    rl.drawRectangleRounded(r, 0.14, 6, fill);
-    if (hot) rl.drawRectangleRoundedLinesEx(r, 0.14, 6, 1.0, accent);
-    const tc = if (!enabled) comment else if (hot) accent else fg;
-    const tw = measure(label, 14); // the loaded TTF — NOT raylib's blocky default (the "ugly button font")
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 14) / 2), 14, tc);
-    return enabled and mouse.over(r) and rl.isMouseButtonPressed(.left) and !clicks_blocked;
+// ---- buttons: ONE widget, three visual weights ----
+// solid = the page's primary action (filled accent, auto-contrast label)
+// tonal = everything else (soft accent wash, accent label) — the default `button`
+// ghost = quiet inline affordances (invisible until hovered)
+// All three: height-scaled label size (no more 14px text jammed in a 20px chip), pixel-radius corners,
+// press feedback (darker fill + 1px label nudge), and a pointing-hand cursor while hot.
+pub const BtnStyle = enum { solid, tonal, ghost };
+
+/// Label size that fits the button's height with sane breathing room.
+pub fn btnFont(h: f32) i32 {
+    if (h >= 38) return 15;
+    if (h >= 30) return 14;
+    if (h >= 24) return 13;
+    if (h >= 20) return 12;
+    return 11;
 }
 
-/// A tab in the tab strip: active gets a filled pill + an accent underline, the nl-veil web-UI look.
+/// The width this label WANTS at height `h` — measure + symmetric padding. Call sites size buttons with
+/// this instead of hardcoding widths, so a label can never overflow its own button.
+pub fn btnW(label: [:0]const u8, h: f32) f32 {
+    const hpad = @max(12.0, @min(20.0, h * 0.55));
+    return @as(f32, @floatFromInt(measure(label, btnFont(h)))) + hpad * 2;
+}
+
+pub fn buttonEx(r: Rect, label: [:0]const u8, accent: Color, enabled: bool, style: BtnStyle) bool {
+    const hot = enabled and mouse.over(r);
+    const down = hot and rl.isMouseButtonDown(.left) and !clicks_blocked;
+    const rad = @min(8.0, r.height * 0.32);
+    const rn = roundnessFor(r, rad);
+    var label_c = fg;
+    if (!enabled) {
+        if (style != .ghost) rl.drawRectangleRounded(r, rn, 8, withAlpha(bg_hl, 140));
+        label_c = comment;
+    } else switch (style) {
+        .solid => {
+            const fill = if (down) blend(accent, bg_dark, 0.25) else if (hot) blend(accent, fg, 0.12) else accent;
+            rl.drawRectangleRounded(r, rn, 8, fill);
+            // auto-contrast: dark-scheme accents are light pastels (dark label), light-scheme accents are
+            // saturated darks (light label) — luma picks per accent, not per scheme.
+            label_c = if (luma(accent) >= 150) Color{ .r = 0x14, .g = 0x16, .b = 0x20, .a = 255 } else Color{ .r = 0xfa, .g = 0xfb, .b = 0xff, .a = 255 };
+        },
+        .tonal => {
+            const a: u8 = if (down) 92 else if (hot) 64 else 36;
+            rl.drawRectangleRounded(r, rn, 8, withAlpha(accent, a));
+            label_c = if (hot) blend(accent, fg, 0.30) else accent;
+        },
+        .ghost => {
+            if (down) {
+                rl.drawRectangleRounded(r, rn, 8, bg_sel);
+            } else if (hot) {
+                rl.drawRectangleRounded(r, rn, 8, bg_hl);
+            }
+            label_c = if (hot) blend(accent, fg, 0.25) else fg_dim;
+        },
+    }
+    if (hot and !clicks_blocked) wantCursor(.pointing_hand);
+    const fs = btnFont(r.height);
+    const tw = measure(label, fs);
+    const nudge: f32 = if (down) 1 else 0;
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - @as(f32, @floatFromInt(fs))) / 2 + nudge), fs, label_c);
+    return hot and rl.isMouseButtonPressed(.left) and !clicks_blocked;
+}
+
+pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
+    return buttonEx(r, label, accent, enabled, .tonal);
+}
+
+pub fn buttonSolid(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
+    return buttonEx(r, label, accent, enabled, .solid);
+}
+
+pub fn buttonGhost(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
+    return buttonEx(r, label, accent, enabled, .ghost);
+}
+
+/// The width a tab label wants (tabs render at 13px).
+pub fn tabW(label: [:0]const u8) f32 {
+    return @as(f32, @floatFromInt(measure(label, 13))) + 26;
+}
+
+/// A tab in a tab strip: active = a soft accent pill (works on ANY backdrop — the old bg-fill pill
+/// vanished on same-color panels); hover = a quiet highlight. Minimal: no underline.
 pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
     const hot = mouse.over(r);
+    const rn = roundnessFor(r, @min(8.0, r.height * 0.32));
     if (active) {
-        rl.drawRectangleRounded(.{ .x = r.x, .y = r.y, .width = r.width, .height = r.height }, 0.18, 6, bg);
-        rl.drawRectangle(@intFromFloat(r.x + 8), @intFromFloat(r.y + r.height - 3), @intFromFloat(r.width - 16), 2, blue);
+        rl.drawRectangleRounded(r, rn, 8, withAlpha(blue, 36));
     } else if (hot) {
-        rl.drawRectangleRounded(r, 0.18, 6, withAlpha(bg_hl, 160));
+        rl.drawRectangleRounded(r, rn, 8, withAlpha(bg_hl, 200));
     }
     const c = if (active) fg else if (hot) fg_dim else comment;
-    const tw = measure(label, 14);
-    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 14) / 2), 14, c);
-    return mouse.over(r) and rl.isMouseButtonPressed(.left);
+    const tw = measure(label, 13);
+    text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 13) / 2), 13, c);
+    if (hot and !active and !clicks_blocked) wantCursor(.pointing_hand);
+    return hot and rl.isMouseButtonPressed(.left) and !clicks_blocked;
 }
 
 /// A titlebar glyph button (minimize / close). `danger` tints the hover red. Returns true on click.
@@ -435,6 +561,7 @@ pub fn winButton(r: Rect, glyph: [:0]const u8, danger: bool) bool {
     const c = if (hot) (if (danger) bg_dark else fg) else fg_dim;
     const tw = measure(glyph, 15);
     text(glyph, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 15) / 2), 15, c);
+    if (hot) wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
 }
 
@@ -463,13 +590,14 @@ pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
 /// option sets (provider, style, minutes, mode) without a floating list.
 pub fn cycle(r: Rect, label: [:0]const u8, value: [:0]const u8, focused: bool) i32 {
     panelBordered(r, bg, if (focused) blue else border);
-    text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 6), 11, comment);
-    textClip(value, @intFromFloat(r.x + 10), @intFromFloat(r.y + 20), 14, fg, @intFromFloat(r.width - 44));
+    text(label, @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 11, comment);
+    textClip(value, @intFromFloat(r.x + 12), @intFromFloat(r.y + 22), 14, fg, @intFromFloat(r.width - 48));
     // chevrons
     const hot = mouse.over(r);
-    text(z("<", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(r.y + 13), 14, if (hot) blue else comment);
-    text(z(">", .{}), @intFromFloat(r.x + r.width - 16), @intFromFloat(r.y + 13), 14, if (hot) blue else comment);
+    text(z("<", .{}), @intFromFloat(r.x + r.width - 36), @intFromFloat(r.y + (r.height - 14) / 2), 14, if (hot) blue else comment);
+    text(z(">", .{}), @intFromFloat(r.x + r.width - 18), @intFromFloat(r.y + (r.height - 14) / 2), 14, if (hot) blue else comment);
     if (!hot) return 0;
+    wantCursor(.pointing_hand);
     if (rl.isMouseButtonPressed(.left)) return 1;
     if (rl.isMouseButtonPressed(.right)) return -1;
     return 0;
@@ -477,20 +605,26 @@ pub fn cycle(r: Rect, label: [:0]const u8, value: [:0]const u8, focused: bool) i
 
 /// A labeled checkbox toggle. Returns true on click (caller flips the bool).
 pub fn checkbox(r: Rect, label: [:0]const u8, on: bool) bool {
+    const hot = mouse.over(r) and !clicks_blocked;
     const box = Rect{ .x = r.x, .y = r.y + (r.height - 18) / 2, .width = 18, .height = 18 };
-    panelBordered(box, if (on) withAlpha(green, 60) else bg, if (on) green else border);
+    const rn = roundnessFor(box, 5);
+    rl.drawRectangleRounded(box, rn, 8, if (on) withAlpha(green, 60) else if (hot) bg_hl else bg);
+    rl.drawRectangleRoundedLinesEx(box, rn, 8, 1.0, if (on) green else if (hot) fg_dim else border);
     if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 14, green);
-    text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, fg_dim);
-    return mouse.over(r) and rl.isMouseButtonPressed(.left) and !clicks_blocked;
+    text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, if (on) fg else if (hot) fg else fg_dim);
+    if (hot) wantCursor(.pointing_hand);
+    return hot and rl.isMouseButtonPressed(.left);
 }
 
 /// A small +/- stepper for an integer in [lo,hi]. Returns the new value.
 pub fn stepper(r: Rect, label: [:0]const u8, v: i32, lo: i32, hi: i32) i32 {
     panelBordered(r, bg, border);
-    text(label, @intFromFloat(r.x + 10), @intFromFloat(r.y + 5), 10, comment);
-    text(z("{d}", .{v}), @intFromFloat(r.x + 10), @intFromFloat(r.y + 18), 15, fg);
-    const minus = Rect{ .x = r.x + r.width - 60, .y = r.y + 6, .width = 26, .height = r.height - 12 };
-    const plus = Rect{ .x = r.x + r.width - 30, .y = r.y + 6, .width = 26, .height = r.height - 12 };
+    text(label, @intFromFloat(r.x + 12), @intFromFloat(r.y + 7), 11, comment);
+    text(z("{d}", .{v}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 22), 15, fg);
+    const bh = @min(r.height - 12, 28.0);
+    const by = r.y + (r.height - bh) / 2;
+    const minus = Rect{ .x = r.x + r.width - 64, .y = by, .width = 28, .height = bh };
+    const plus = Rect{ .x = r.x + r.width - 32, .y = by, .width = 28, .height = bh };
     var nv = v;
     if (button(minus, z("-", .{}), blue, v > lo)) nv = @max(lo, v - 1);
     if (button(plus, z("+", .{}), blue, v < hi)) nv = @min(hi, v + 1);
