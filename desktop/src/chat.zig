@@ -100,15 +100,18 @@ const SYSTEM_PROMPT =
     "Re-emitting the same file over and over never converges — one clean write, then verify or finish.\n" ++
     "\n" ++
     "SHELL — when the user asks you to run a command, work in a directory, inspect files, or drive the system, " ++
-    "you have a real terminal on their machine. Make the reply exactly one line:\n" ++
+    "you have a real terminal on their machine. Narrate one short why-sentence, then the command on its own line:\n" ++
     "RUN: <shell command>\n" ++
-    "Then STOP. I run it in the Veil console tab and reply with a [console] message containing its output; read " ++
-    "that, then either RUN another command or give your final answer. One command per reply, never RUN with prose " ++
-    "in the same reply. This is WINDOWS cmd — use the Windows commands (dir, type, cd, copy, del, findstr, " ++
-    "python), NOT unix ones (ls, cat, pwd, head, rm) which don't exist here and will error. Only use RUN when the " ++
-    "user actually wants system/terminal work — quote paths with spaces, prefer non-destructive commands, and " ++
-    "never run something irreversible (deleting data, killing processes) without the user asking. For pure " ++
-    "web/research questions use web_search or CAST, not RUN.\n" ++
+    "Then STOP. The USER MUST APPROVE each command before it runs (a prompt appears; they Approve, Deny, or " ++
+    "choose Always). So make every command COUNT: one correct, self-contained command per reply — never a probe " ++
+    "you'd immediately redo. I reply with a [console] message containing its output + exit status; read that, then " ++
+    "either RUN another command or give your final answer. This is WINDOWS cmd — use Windows commands (dir, type, " ++
+    "cd, copy, del, findstr, python), NOT unix ones (ls, cat, pwd, rm). For anything with nested quotes or a " ++
+    "multi-line body (PowerShell here-strings, a script), WRITE A FILE with write_file first and then RUN it " ++
+    "(e.g. write reminder.ps1, then RUN: powershell -ExecutionPolicy Bypass -File reminder.ps1) — do NOT try to " ++
+    "cram it into one quoted command line, which mangles. If the user denies a command, don't retry it blindly — " ++
+    "ask or take another approach. Never run something irreversible (deleting data, killing processes) unasked. " ++
+    "For pure web/research questions use web_search or CAST, not RUN.\n" ++
     "\n" ++
     "GROUND YOURSELF — you have NO live knowledge. Before you answer anything about current events, prices, " ++
     "versions, or the SPECIFIC steps of a task you're not sure how to do (e.g. 'how do I host this on Cloudflare', " ++
@@ -362,6 +365,14 @@ pub const Chat = struct {
     // micro-console: the one in-flight shell command (null = idle), polled from run() so it never blocks
     console: ?ConsoleProc = null,
     console_cancel: bool = false, // Stop button pressed → pumpConsole kills the running command next tick
+    // COMMAND APPROVAL: a veil RUN: shell command parked awaiting the user's Approve/Bypass/Deny. While set,
+    // the turn is held busy (awaitingShellApproval) and no new turn/loop/switch starts. Copied off the stream.
+    pending_cmd: [1024]u8 = undefined,
+    pending_cmd_len: usize = 0,
+    // AUTO-LOOP is ARMED by a user send (chat_loop) but only CONTINUES while the veil is actually working —
+    // this is set true when a turn dispatches a tool/shell/cast/kill, false when it settles on plain prose.
+    // A conversational answer (nothing actioned) ends the loop instead of spinning on invented next-steps.
+    acted: bool = false,
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -651,6 +662,8 @@ pub const Chat = struct {
                 .save_key => self.cmdSaveKey(dd, c.textStr()),
                 .console_run => self.cmdConsoleRun(dd, std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
                 .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
+                .console_approve => self.cmdConsoleApprove(dd, std.mem.eql(u8, c.idStr(), "always")), // Approve / Bypass a parked veil command
+                .console_deny => self.cmdConsoleDeny(dd), // Deny the parked veil command
                 .loop_kick => self.maybeLoop(dd), // user just enabled auto-loop while idle → start it now
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
@@ -669,6 +682,7 @@ pub const Chat = struct {
     /// Is the AI's RUN: door mid-command? While it awaits pumpConsole the model turn is logically in flight
     /// (busy is true, turn is idle) — new turns/loops must not start over it.
     fn consoleAiBusy(self: *Chat) bool {
+        if (self.awaitingShellApproval()) return true; // a parked command holds the turn until approved/denied
         return if (self.console) |*p| p.ai else false;
     }
 
@@ -977,6 +991,14 @@ pub const Chat = struct {
         self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        // AUTO-LOOP ON by default once the user prompts (user directive): the veil drives its own next step
+        // until it emits DONE or hits the iteration cap — so a task gets carried to completion, not one reply.
+        // The user can switch it off with the input's auto-loop toggle; a manual send re-arms it.
+        {
+            self.store.lock();
+            self.store.chat_loop = true;
+            self.store.unlock();
+        }
         self.reflect_pass = 0; // fresh iterative self-critique budget for this user turn
         self.reflect_dirty = false;
         self.reflect_msg_idx = null;
@@ -1406,6 +1428,7 @@ pub const Chat = struct {
         var theme: u8 = 0;
         var lopen = true;
         var ropen = true;
+        var shell_allow = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -1423,6 +1446,7 @@ pub const Chat = struct {
             @memcpy(cfa[0..cfa_n], s.cf_account[0..cfa_n]);
             lopen = s.chat_left_open;
             ropen = s.chat_right_open;
+            shell_allow = s.shell_always_allow;
         }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -1433,7 +1457,7 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{}}}", .{ lopen, ropen }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{}}}", .{ lopen, ropen, shell_allow }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -1472,6 +1496,7 @@ pub const Chat = struct {
         }
         s.chat_left_open = std.mem.indexOf(u8, data, "\"left\":false") == null;
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
+        s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -1947,6 +1972,9 @@ pub const Chat = struct {
         const reason = std.mem.trim(u8, self.stream.reasoningStr(), " \r\n\t");
         log.info("chat turn done in {d}s ({d} chars, {d} reasoning); cast_detected={} reply_head={s}", .{ now - self.stream.started_s, self.stream.content.items.len, self.stream.reasoning.items.len, castGoal(full) != null, full[0..@min(full.len, 90)] });
         self.recordMetric(kind, true, self.stream.content.items.len); // one perf sample per completed turn (Metrics tab)
+        // Assume this turn is a plain answer; the action dispatchers (tool/shell/cast) flip it true. maybeLoop
+        // reads it to decide whether the auto-loop keeps going (working) or stops (the veil just replied).
+        if (kind == .user or kind == .tool_follow or kind == .reflect or kind == .collect) self.acted = false;
         // A loop-infer turn produced the NEXT user message (not an assistant reply) — copy it off the stream and
         // either send it (continue the auto-loop) or stop. Handled BEFORE tool/cast/reflect detection.
         if (kind == .loop_infer) {
@@ -2046,6 +2074,17 @@ pub const Chat = struct {
                 self.runShellAndContinue(dd, cmd); // copies cmd off the stream, THEN frees it, THEN re-enters
                 return;
             }
+            // KILL RECOVERY: the user asked to kill the hive but the model narrated it as prose ("kill_swarm
+            // force=true") instead of a real TOOL: line, so nothing dispatched and the swarm kept running. If a
+            // cast is in flight and the user's message is a kill request, run kill_swarm ourselves — the exact
+            // recovery pattern userWantsCast uses for a flaked CAST. (kind==.user only; not on tool-follow loops.)
+            if (kind == .user and self.castPending() and userWantsKill(self.last_user[0..self.last_user_len])) {
+                log.info("kill recovery: user asked to kill; model emitted no tool — dispatching kill_swarm", .{});
+                if (full.len > 0 or reason.len > 0) self.appendVeil(dd, reason, stripToolTail(full));
+                self.tool_iters += 1;
+                self.runToolAndContinue(dd, .{ .name = "kill_swarm", .args = "{}" });
+                return;
+            }
             // Neither TOOL:/<tool:>/RUN: parsed, but the text still LOOKS like an attempted tool call in some
             // other dialect (DeepSeek-style "<｜tool▁calls｜>" special tokens, Claude-style <invoke name="...">,
             // etc.) — left alone, this renders as garbage and the turn "finishes" having done NOTHING, which is
@@ -2075,18 +2114,15 @@ pub const Chat = struct {
             self.reflect_trace_len = 0;
             self.traceAddPass("- drafting -", reason);
             self.stream.deinit(self.gpa);
-            // Commit the draft as THE answer slot. Self-check passes revise it IN PLACE (the old flow kept the
-            // draft AND appended the revision below it — every self-revision read as two answers). At finalize
-            // the accumulated reasoning trace lands as one collapsed .thought message above this slot.
-            const shown = self.processMemory(dd, stripToolTail(self.reflect_draft[0..self.reflect_draft_len]));
-            if (shown.len > 0) {
-                self.appendMsgFull(dd, .veil, shown, false); // observe happens at finalize, on the FINAL text
-                self.reflect_msg_idx = self.lastMsgIdxOfRole(.veil);
-            } else self.reflect_msg_idx = null;
-            self.setStatus("self-checking the answer...");
+            // NOTHING is committed while the self-check runs. The draft used to be posted here and then
+            // rewritten in place each pass — the veil visibly "deleting and replacing its own answer", which
+            // the user called out as annoying. Instead the answer stays hidden; the user watches the live
+            // reasoning stream during refinement, and revealReflect lands the FINAL answer once at the end.
+            self.reflect_msg_idx = null;
+            self.setStatus("refining the answer...");
             self.startTurn(dd, .reflect);
-            // If the self-check pass fails to start, the draft already stands as the answer — finalize now.
-            if (self.turn != .reflect) self.finishReflect(dd);
+            // If the self-check pass couldn't start, reveal the draft as the final answer now.
+            if (self.turn != .reflect) self.revealReflect(dd, self.processMemory(dd, stripToolTail(self.reflect_draft[0..self.reflect_draft_len])));
             return;
         }
         if (kind == .reflect) {
@@ -2112,15 +2148,14 @@ pub const Chat = struct {
                 const rn2 = @min(cleaned.len, self.reflect_draft.len);
                 @memcpy(self.reflect_draft[0..rn2], cleaned[0..rn2]);
                 self.reflect_draft_len = rn2;
-                // live in-place revision: the answer slot always shows the CURRENT best draft
-                if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, stripToolTail(self.reflect_draft[0..self.reflect_draft_len]));
+                // the improved draft is carried INTERNALLY only — nothing is shown until revealReflect (no churn)
                 self.stream.deinit(self.gpa);
                 var sb2: [72]u8 = undefined;
-                self.setStatus(std.fmt.bufPrint(&sb2, "self-checking (pass {d} of up to {d})...", .{ self.reflect_pass + 1, REFLECT_MAX_PASSES }) catch "self-checking...");
+                self.setStatus(std.fmt.bufPrint(&sb2, "refining (pass {d} of up to {d})...", .{ self.reflect_pass + 1, REFLECT_MAX_PASSES }) catch "refining...");
                 self.startTurn(dd, .reflect);
                 if (self.turn == .reflect) return; // another critique pass is live; it settles later
-                // couldn't start another pass → the improved draft is already in its slot; land the trace + stop
-                self.finishReflect(dd);
+                // couldn't start another pass → reveal the best draft we have as the final answer
+                self.revealReflect(dd, self.processMemory(dd, stripToolTail(self.reflect_draft[0..self.reflect_draft_len])));
                 self.setBusy(false);
                 return;
             }
@@ -2138,26 +2173,14 @@ pub const Chat = struct {
             if (self.tool_iters < MAX_TOOL_ITERS) {
                 if (toolCall(final_ans) orelse toolCallXml(final_ans)) |tc| {
                     const prose = self.processMemory(dd, stripToolTail(final_ans));
-                    if (prose.len > 0) {
-                        if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, prose) else self.appendMsgFull(dd, .veil, prose, false);
-                        self.observeFinal(prose);
-                    }
-                    self.finishReflect(dd);
+                    self.revealReflect(dd, prose); // reveal the prose (+ collapsed trace), then run the tool
                     self.tool_iters += 1;
                     self.runToolAndContinue(dd, tc); // copies tc off the stream, frees it, re-enters .tool_follow
                     return;
                 }
             }
-            // land the final text in the answer slot (in place — dirty or confirmed, the slot IS the answer)
-            const cleaned = self.processMemory(dd, stripToolTail(final_ans));
-            if (cleaned.len > 0) {
-                if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, cleaned) else self.appendMsgFull(dd, .veil, cleaned, false);
-                self.observeFinal(cleaned);
-            } else if (self.reflect_msg_idx != null) {
-                // final stripped to nothing — the committed draft stands; observe what the slot holds
-                self.observeFinal(self.reflect_draft[0..self.reflect_draft_len]);
-            }
-            self.finishReflect(dd);
+            // reveal the final answer ONCE (with the reasoning trace collapsed above it) — no in-place churn
+            self.revealReflect(dd, self.processMemory(dd, stripToolTail(final_ans)));
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (self.in_veil_work and parseCastSpec(full) != null) {
@@ -2192,11 +2215,19 @@ pub const Chat = struct {
             if (self.castPending()) {
                 self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
+            } else if (self.loop_iter > 0) {
+                // AUTO-LOOP GUARD: a loop-INFERRED turn must never launch a fresh multi-minute swarm on its own —
+                // casting is a big, resource-heavy commitment the USER makes explicitly (the observed runaway:
+                // auto-loop kept inventing steps after a kill and deployed an unprompted hive). Show the prose,
+                // stop the loop, and tell the user to ask for a cast directly if they want one.
+                if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
+                self.stopLoop(dd, "auto-loop paused: the veil wanted to cast a new swarm — say 'cast a swarm to …' yourself to start one.");
+                return;
             } else {
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, spec);
             }
-        } else if (kind == .user and !self.castPending() and userWantsCast(self.last_user[0..self.last_user_len])) {
+        } else if (kind == .user and self.loop_iter == 0 and !self.castPending() and userWantsCast(self.last_user[0..self.last_user_len])) {
             // The user EXPLICITLY asked to cast but the model didn't emit a CAST line (gpt-oss commonly
             // leaves `content` empty, putting everything in its hidden reasoning). Honor the request:
             // cast using the user's own words as the goal so an explicit "cast a swarm to X" always fires.
@@ -2248,8 +2279,13 @@ pub const Chat = struct {
         if (self.internal_turn) return false; // a machine-authored finish/nudge turn is not a user exchange
         if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
         if (full.len == 0 and self.last_user_len == 0) return false;
-        // Personal-signal gate: the user is who shares durable facts, so key off THEIR message. Skips "explain X".
-        return exchangeHasPersonalSignal(self.last_user[0..self.last_user_len]);
+        if (isSmallTalk(self.last_user[0..self.last_user_len])) return false; // "hi"/"thanks" carry nothing durable
+        // Durable-signal gate (kept as a cost guard — one model call per hit — but WIDENED per the user's report
+        // that the veil "doesn't know when to save data": it now also fires on commitments/plans/schedule the
+        // user states in passing (the missed "therapy at 12pm today" case), and scans the ANSWER too, since the
+        // veil often re-states a durable fact it just learned. Pure-technical Q&A still matches nothing → no call.
+        return exchangeHasDurableSignal(self.last_user[0..self.last_user_len]) or
+            (full.len > 0 and exchangeHasDurableSignal(full));
     }
 
     // ------------------------------------------------------------------------------ prompt loop (full-auto)
@@ -2266,6 +2302,13 @@ pub const Chat = struct {
             break :blk self.store.chat_loop;
         };
         if (!on) return;
+        // Only KEEP LOOPING while the veil is actually working (took a tool/shell/cast action this exchange). A
+        // plain conversational answer means it's done — stop instead of inventing next-steps (the observed spin,
+        // e.g. re-emitting "read the test and fix it" forever, or looping on "what's the agenda").
+        if (!self.acted) {
+            self.stopLoopQuiet();
+            return;
+        }
         {
             self.store.lock();
             defer self.store.unlock();
@@ -2299,6 +2342,13 @@ pub const Chat = struct {
         }
         if (loopIsDone(text)) {
             self.stopLoop(dd, "auto-loop complete: the goal looks achieved.");
+            return;
+        }
+        // REPEAT GUARD: a weak model in auto-loop can spin, re-emitting a near-identical next step ("check the
+        // status to confirm" twice in a row). If the inferred message basically repeats the last one, the loop
+        // isn't making progress — stop instead of churning.
+        if (nearlySame(text, self.last_user[0..self.last_user_len])) {
+            self.stopLoop(dd, "auto-loop stopped: the next step just repeated the last one (no progress).");
             return;
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
@@ -2338,6 +2388,7 @@ pub const Chat = struct {
         // TRUE and a later normal turn would write its files into the isolated {conv}-veil dir (lost work), and a
         // pending merge would fire behind the Stop. The hive's own output stays saved (viewable in the Swarm tab).
         self.resetVeilWork();
+        if (self.awaitingShellApproval()) self.clearPendingCmd(); // Stop dismisses a parked command (unrun)
         if (self.turn != .idle) {
             llm.abort(&self.stream, self.io);
             self.stream.deinit(self.gpa);
@@ -2346,6 +2397,13 @@ pub const Chat = struct {
         }
         self.setStatus("");
         self.setBusy(false);
+    }
+
+    /// Disarm auto-loop silently — the veil just gave a plain answer, so there's nothing to narrate.
+    fn stopLoopQuiet(self: *Chat) void {
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.chat_loop = false;
     }
 
     /// Turn auto-loop off and tell the user why (the verifiable stop condition fired).
@@ -2481,11 +2539,18 @@ pub const Chat = struct {
         }
     }
 
-    /// Land the accumulated reasoning trace as ONE collapsed .thought message directly above the answer slot,
-    /// then clear all reflect state. The slot itself already holds the final text (revised in place).
-    fn finishReflect(self: *Chat, dd: []const u8) void {
-        if (self.reflect_msg_idx) |mi| {
-            if (self.reflect_trace_len > 0) self.insertMsgBefore(dd, mi, .thought, self.reflect_trace[0..self.reflect_trace_len]);
+    /// REVEAL the reflected answer — ONE clean commit at the end of refinement. Nothing is shown while the
+    /// self-check passes run (the draft used to be committed then rewritten in place, which read as the veil
+    /// "deleting and replacing its answer" — the reported annoyance). During refinement the user watches the
+    /// live reasoning stream; here the final answer lands once, with the full reasoning trace collapsed above
+    /// it (the "reasoning locker" the user opens if curious). Clears all reflect state.
+    fn revealReflect(self: *Chat, dd: []const u8, answer: []const u8) void {
+        if (answer.len > 0) {
+            self.appendMsgFull(dd, .veil, answer, false);
+            self.observeFinal(answer); // hippocampus stores the FINAL text, never a superseded draft
+            if (self.reflect_trace_len > 0) {
+                if (self.lastMsgIdxOfRole(.veil)) |mi| self.insertMsgBefore(dd, mi, .thought, self.reflect_trace[0..self.reflect_trace_len]);
+            }
         }
         self.reflect_msg_idx = null;
         self.reflect_trace_len = 0;
@@ -2527,6 +2592,7 @@ pub const Chat = struct {
     /// how many minds, quick strike vs a sustained (LONG/continuous) hivemind, and the time budget — and the
     /// chat fires it on the chat's own provider. The server clamps to the plan's ceilings.
     pub fn fireCast(self: *Chat, dd: []const u8, spec: CastSpec) void {
+        self.acted = true; // a cast is a big action → the exchange is "working"
         const goal = spec.goal;
         // The conversation id doubles as the cast's build dir: the server points the hive's run_dir at this
         // chat's `_chat/builds/{conv}` folder, so the cast builds in the SAME tree the chat's own build tools
@@ -2682,6 +2748,7 @@ pub const Chat = struct {
     /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
+        self.acted = true; // a tool ran this exchange → the veil is working → auto-loop may continue
         // Stop pressed while the previous stream was settling → don't fire another (blocking) tool round-trip.
         if (self.abort_turn.load(.monotonic)) {
             self.stream.deinit(self.gpa);
@@ -2814,6 +2881,19 @@ pub const Chat = struct {
                 }
             }
             if (std.mem.eql(u8, name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
+            // KILL unlocks the user immediately. The bug: kill_swarm terminated the worker but the desktop kept
+            // cast_active=true (nothing here cleared it), and a hard kill emits no "stopped" event, so watchCast
+            // never converged — the next cast bounced with "a cast is already running" and the user was locked in
+            // the chat until the minutes-long deadline. Clear the cast trio locally now (mirrors failCast), so
+            // castPending() goes false and a new cast can fire. The run dir + findings stay on disk.
+            if (std.mem.eql(u8, name, "kill_swarm") and resp.status == 200) {
+                self.cast_active = false;
+                self.cast_stop_sent = true;
+                self.resetVeilWork();
+                self.updateCastRow(.done, 0, -1, "killed", self.cast_rel[0..self.cast_rel_len]);
+                self.setStatus("");
+                log.info("chat: kill_swarm confirmed — cast state cleared, user unlocked", .{});
+            }
         } else {
             result = "(no response from the veil server on :8787 — is it running?)";
             log.err("chat tool: {s} netcli NULL", .{name});
@@ -2847,6 +2927,7 @@ pub const Chat = struct {
     /// pumpConsole folds the [console] output back and re-enters a .tool_follow turn once it finishes. The
     /// turn stays busy (turn is idle while it awaits the console — see consoleAiBusy) the whole time.
     fn runShellAndContinue(self: *Chat, dd: []const u8, cmd: []const u8) void {
+        self.acted = true; // a shell command (or its approval prompt) means the veil is working
         // Stop pressed while the previous stream settled → don't launch the AI's next shell command.
         if (self.abort_turn.load(.monotonic)) {
             self.stream.deinit(self.gpa);
@@ -2868,6 +2949,32 @@ pub const Chat = struct {
             self.store.console_show_veil = true;
         }
 
+        // APPROVAL GATE: the veil runs commands in the USER'S real dev environment (powershell/cmd/sh). Unless
+        // the user has chosen "Bypass" (shell_always_allow), PARK the command and ask for approval instead of
+        // spawning it — the evidence was the veil firing 6 mangled powershell commands unattended. The turn is
+        // held busy (awaitingShellApproval) until the user Approves / Bypasses / Denies from the Veil tab.
+        const always = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk self.store.settings.shell_always_allow;
+        };
+        if (!always) {
+            self.pending_cmd_len = command.len;
+            @memcpy(self.pending_cmd[0..command.len], command);
+            {
+                self.store.lock();
+                defer self.store.unlock();
+                self.store.console_pending = true;
+                self.store.console_pending_len = command.len;
+                @memcpy(self.store.console_pending_cmd[0..command.len], command);
+            }
+            self.setStatus("waiting for you to approve a command...");
+            self.setBusy(true); // keep the turn busy while parked — no loop/new-turn starts over it
+            self.store.pushNotif("Approve command?", command[0..@min(command.len, 80)], 0);
+            log.info("chat RUN: parked for approval: {s}", .{command[0..@min(command.len, 120)]});
+            return;
+        }
+
         var stbuf: [96]u8 = undefined;
         self.setStatus(std.fmt.bufPrint(&stbuf, "running: {s}", .{command[0..@min(command.len, 60)]}) catch "running a command...");
         log.info("chat RUN: {s}", .{command[0..@min(command.len, 120)]});
@@ -2875,6 +2982,50 @@ pub const Chat = struct {
         // Async: consoleStart never blocks. On an immediate launch failure it folds the error back itself, so
         // the turn always continues; on success pumpConsole finalizes + folds when the command exits.
         self.consoleStart(dd, true, command);
+    }
+
+    /// True while a veil shell command is parked awaiting the user's Approve/Bypass/Deny.
+    fn awaitingShellApproval(self: *Chat) bool {
+        return self.pending_cmd_len > 0;
+    }
+
+    /// The user Approved (or Bypassed) the parked command → run it now. `always` persists the Bypass choice.
+    fn cmdConsoleApprove(self: *Chat, dd: []const u8, always: bool) void {
+        if (self.pending_cmd_len == 0) return;
+        var cmdbuf: [1024]u8 = undefined;
+        const cn = self.pending_cmd_len;
+        @memcpy(cmdbuf[0..cn], self.pending_cmd[0..cn]);
+        self.clearPendingCmd();
+        if (always) {
+            self.store.lock();
+            self.store.settings.shell_always_allow = true;
+            self.store.unlock();
+            self.saveSettings(dd);
+            self.appendMsg(dd, .cast_note, "(shell commands will now run without asking — turn this off in Settings)");
+        }
+        var stbuf: [96]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running: {s}", .{cmdbuf[0..@min(cn, 60)]}) catch "running a command...");
+        log.info("chat RUN (approved): {s}", .{cmdbuf[0..@min(cn, 120)]});
+        self.consoleStart(dd, true, cmdbuf[0..cn]);
+    }
+
+    /// The user Denied the parked command → fold a denial back so the model reads it and moves on.
+    fn cmdConsoleDeny(self: *Chat, dd: []const u8) void {
+        if (self.pending_cmd_len == 0) return;
+        var cmdbuf: [1024]u8 = undefined;
+        const cn = self.pending_cmd_len;
+        @memcpy(cmdbuf[0..cn], self.pending_cmd[0..cn]);
+        self.clearPendingCmd();
+        self.foldConsoleAi(dd, cmdbuf[0..cn], "(the user did not approve this command — it was NOT run. Ask before trying again, or take a different approach.)");
+        log.info("chat RUN denied by user", .{});
+    }
+
+    fn clearPendingCmd(self: *Chat) void {
+        self.pending_cmd_len = 0;
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.console_pending = false;
+        self.store.console_pending_len = 0;
     }
 
     /// Add a fresh "deploying" cast row (newest) to the activity panel; evicts the oldest when full.
@@ -3401,17 +3552,25 @@ fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
 /// preference, an environment detail)? Gates the consolidation pass so a purely technical exchange ("explain
 /// quicksort") doesn't spend a model call. Permissive on the personal side, since a missed consolidation is worse
 /// than an occasional NONE-returning call. Case-insensitive substring scan; cheap.
-fn exchangeHasPersonalSignal(user: []const u8) bool {
-    // ONLY unambiguous first-person / explicit-directive markers. Bare 'token'/'secret'/'account'/'email'/'@'/'our '
-    // were dropped — they matched ordinary technical questions ("explain tokenization", "the @ decorator", "four"),
-    // spending a wasted consolidation call. A durable fact the user shares reliably carries one of these instead.
+fn exchangeHasDurableSignal(text: []const u8) bool {
+    // Markers of a fact worth keeping across conversations: first-person identity/preference/setup, explicit
+    // remember/forget directives, credentials, AND commitments/schedule/plans the user states in passing (the
+    // "we have to go to therapy at 12pm today" case the narrow first-person-only gate missed). Still tight
+    // enough that ordinary technical questions ("explain tokenization", "how does X work") match nothing.
     const sigs = [_][]const u8{
-        "my ",      "i'm",      "i am",     "i use",   "i prefer", "i like",     "i always",
-        "i work",   "i deploy", "i run",    "i host",  "i keep",   "we use",     "we deploy",
-        "remember", "forget",   "password", "api key", "apikey",   "credential",
+        // identity / preference / setup (first person)
+        "my ",       "i'm",        "i am",      "i use",     "i prefer",  "i like",     "i always",
+        "i work",    "i deploy",   "i run",     "i host",    "i keep",    "i need",     "i have to",
+        "i want",    "we use",     "we deploy", "we have",   "call me",   "name is",
+        // explicit directives + credentials
+        "remember",  "forget",     "password",  "api key",   "apikey",    "credential", "token is",
+        // commitments / schedule / plans (durable for THIS user's context) — words specific enough that a
+        // technical answer won't trip them (no bare "am"/"at N" — those match "diagram"/"at 3 levels").
+        "today",       "tomorrow",  "tonight",     "next week", "appointment", "meeting",  "deadline",
+        "remind me",   "schedule",  "set an alarm", "set a reminder", "due ",     "o'clock",
     };
     for (sigs) |s| {
-        if (std.ascii.indexOfIgnoreCase(user, s) != null) return true;
+        if (std.ascii.indexOfIgnoreCase(text, s) != null) return true;
     }
     return false;
 }
@@ -3752,6 +3911,9 @@ fn composeConsoleResult(buf: []u8, out: []const u8, err: []const u8, note: []con
     var w: usize = 0;
     w += copyInto(buf[w..body_cap], out).len;
     w += copyInto(buf[w..body_cap], err).len;
+    // A clean command with no output is SUCCESS, not failure — say so explicitly. The model kept re-running the
+    // same probe because a bare "(no output)" read as "it didn't work" (the therapy-alarm evidence).
+    if (w == 0 and body_cap > 0 and note.len == 0) w += copyInto(buf[w..body_cap], "(command completed successfully — no output)").len;
     if (w == 0 and body_cap > 0) w += copyInto(buf[w..body_cap], "(no output)").len;
     if (note.len > 0 and w + note.len <= buf.len) {
         @memcpy(buf[w .. w + note.len], note);
@@ -3791,6 +3953,40 @@ pub fn userWantsCast(msg: []const u8) bool {
     const has_target = std.mem.indexOf(u8, lo, "swarm") != null or std.mem.indexOf(u8, lo, "hive") != null;
     if (!has_target) return false;
     const verbs = [_][]const u8{ "cast", "run ", "spin", "deploy", "launch", "summon", "dispatch" };
+    for (verbs) |v| {
+        if (std.mem.indexOf(u8, lo, v) != null) return true;
+    }
+    return false;
+}
+
+/// Does the user's message ask to KILL/STOP the running hive? Used to dispatch kill_swarm even when a weak
+/// model narrates "kill_swarm force=true" as prose instead of emitting a real TOOL: line (the observed miss).
+/// Two messages are "nearly the same" if, lowercased and whitespace-trimmed, one contains the other (or they
+/// match) — a cheap loop-spin detector (a model re-issuing "check the status" as "check status now").
+fn nearlySame(a_in: []const u8, b_in: []const u8) bool {
+    const a = std.mem.trim(u8, a_in, " \r\n\t.!?");
+    const b = std.mem.trim(u8, b_in, " \r\n\t.!?");
+    if (a.len == 0 or b.len == 0) return false;
+    if (a.len > 400 or b.len > 400) return false; // only guard short chatty steps, not long build instructions
+    var la: [400]u8 = undefined;
+    var lb: [400]u8 = undefined;
+    for (a, 0..) |c, i| la[i] = std.ascii.toLower(c);
+    for (b, 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const sa = la[0..a.len];
+    const sb = lb[0..b.len];
+    return std.mem.indexOf(u8, sa, sb) != null or std.mem.indexOf(u8, sb, sa) != null;
+}
+
+pub fn userWantsKill(msg: []const u8) bool {
+    if (msg.len == 0 or msg.len > 4000) return false;
+    var lower: [4000]u8 = undefined;
+    const n = @min(msg.len, lower.len);
+    for (0..n) |i| lower[i] = std.ascii.toLower(msg[i]);
+    const lo = lower[0..n];
+    const has_target = std.mem.indexOf(u8, lo, "swarm") != null or std.mem.indexOf(u8, lo, "hive") != null or
+        std.mem.indexOf(u8, lo, "cast") != null or std.mem.indexOf(u8, lo, "it") != null;
+    if (!has_target) return false;
+    const verbs = [_][]const u8{ "kill", "stop", "abort", "cancel", "halt", "terminate", "shut down", "shutdown", "end the" };
     for (verbs) |v| {
         if (std.mem.indexOf(u8, lo, v) != null) return true;
     }
@@ -3999,17 +4195,23 @@ test "personalFact mirrors personal observes but leaves general knowledge hive-o
     try std.testing.expect(personalFact("OAuth2 uses an access token and a refresh token") == null);
 }
 
-test "exchangeHasPersonalSignal fires on personal facts, not ordinary technical questions" {
-    // personal → consolidation should run
-    try std.testing.expect(exchangeHasPersonalSignal("I always deploy to us-west-2 and I use pnpm"));
-    try std.testing.expect(exchangeHasPersonalSignal("my api key is sk-123"));
-    try std.testing.expect(exchangeHasPersonalSignal("please remember my staging host"));
+test "exchangeHasDurableSignal fires on personal facts + commitments, not ordinary technical questions" {
+    // personal identity/preference/credential → consolidation should run
+    try std.testing.expect(exchangeHasDurableSignal("I always deploy to us-west-2 and I use pnpm"));
+    try std.testing.expect(exchangeHasDurableSignal("my api key is sk-123"));
+    try std.testing.expect(exchangeHasDurableSignal("please remember my staging host"));
+    try std.testing.expect(exchangeHasDurableSignal("my name is gary"));
+    // commitments / schedule the user states in passing (the previously-missed cases)
+    try std.testing.expect(exchangeHasDurableSignal("today we have to go to therapy at 12pm"));
+    try std.testing.expect(exchangeHasDurableSignal("set an alarm to remind me before the meeting"));
+    try std.testing.expect(exchangeHasDurableSignal("my dentist appointment is tomorrow"));
     // pure-technical questions must NOT fire (the dropped bare-substring false positives)
-    try std.testing.expect(!exchangeHasPersonalSignal("explain how tokenization works"));
-    try std.testing.expect(!exchangeHasPersonalSignal("what is a secret sharing scheme?"));
-    try std.testing.expect(!exchangeHasPersonalSignal("what does the @ decorator do in Python?"));
-    try std.testing.expect(!exchangeHasPersonalSignal("how many hours are in four days?"));
-    try std.testing.expect(!exchangeHasPersonalSignal("describe an account balance class"));
+    try std.testing.expect(!exchangeHasDurableSignal("explain how tokenization works"));
+    try std.testing.expect(!exchangeHasDurableSignal("what is a secret sharing scheme?"));
+    try std.testing.expect(!exchangeHasDurableSignal("what does the @ decorator do in Python?"));
+    try std.testing.expect(!exchangeHasDurableSignal("how many hours are in four days?"));
+    try std.testing.expect(!exchangeHasDurableSignal("describe an account balance class"));
+    try std.testing.expect(!exchangeHasDurableSignal("draw a diagram of the parser at each stage"));
 }
 
 test "stripDanglingMemoryIntro drops a dangling save-intro but keeps real prose" {
@@ -4696,6 +4898,20 @@ test "userWantsCast detects explicit cast requests" {
     try std.testing.expect(!userWantsCast("run to the store")); // verb but no swarm/hive
 }
 
+test "userWantsKill detects kill requests; nearlySame catches loop spin" {
+    try std.testing.expect(userWantsKill("kill the hive"));
+    try std.testing.expect(userWantsKill("stop the swarm now"));
+    try std.testing.expect(userWantsKill("abort the cast"));
+    try std.testing.expect(userWantsKill("terminate it"));
+    try std.testing.expect(!userWantsKill("what is the capital of France?"));
+    try std.testing.expect(!userWantsKill("build me a website")); // no kill verb
+    // loop-spin detector: a repeat (or containment) stops the loop; genuinely new steps don't
+    try std.testing.expect(nearlySame("check the swarm status", "Check the swarm status.")); // same after fold
+    try std.testing.expect(nearlySame("check the swarm status", "check the swarm status now")); // containment
+    try std.testing.expect(!nearlySame("write the models file", "now write the routes file"));
+    try std.testing.expect(!nearlySame("", "anything"));
+}
+
 test "castGoalFromUser strips the cast preamble" {
     var b: [1600]u8 = undefined;
     try std.testing.expectEqualStrings("research AI regulation news", castGoalFromUser("cast a swarm to research AI regulation news", &b));
@@ -4865,7 +5081,10 @@ test "jStr and jInt read the deploy response" {
 test "composeConsoleResult keeps stdout then stderr, and always the status note" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("outerr", composeConsoleResult(&buf, "out", "err", ""));
-    try std.testing.expectEqualStrings("(no output)", composeConsoleResult(&buf, "", "", ""));
+    // a clean exit with no output → an explicit success line (not a bare "(no output)" the model misreads)
+    try std.testing.expectEqualStrings("(command completed successfully — no output)", composeConsoleResult(&buf, "", "", ""));
+    // ...but a NON-clean exit (note present) with no body keeps the plain "(no output)" + its note
+    try std.testing.expectEqualStrings("(no output)(stopped)", composeConsoleResult(&buf, "", "", "(stopped)"));
     try std.testing.expectEqualStrings("hi(stopped)", composeConsoleResult(&buf, "hi", "", "(stopped)"));
     // when the body alone would overflow, room is reserved so the note (e.g. a timeout) still survives
     var small: [12]u8 = undefined;
