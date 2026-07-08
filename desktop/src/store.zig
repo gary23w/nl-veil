@@ -194,7 +194,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.
@@ -209,6 +209,17 @@ pub const MemRow = struct {
     }
     pub fn textStr(m: *const MemRow) []const u8 {
         return m.text[0..m.text_len];
+    }
+};
+
+/// A learning proposal awaiting HUMAN review (the background judge writes these into quarantine
+/// "-proposed" neuron scopes, never into the live ones; accepting promotes, rejecting discards).
+pub const PropRow = struct {
+    scope: u8 = 0, // 0 = playbook (operational lesson), 1 = skill (procedure), 2 = user (working model)
+    text: [420]u8 = [_]u8{0} ** 420, // proposal text incl. its "| evidence: ..." grounding tail
+    text_len: u16 = 0,
+    pub fn textStr(p: *const PropRow) []const u8 {
+        return p.text[0..p.text_len];
     }
 };
 
@@ -271,6 +282,10 @@ pub const Store = struct {
     // --- locally-installed Ollama models (chat thread writes from /api/tags; Settings reads) ---
     ollama_models: [MAX_OLLAMA_MODELS]OllamaModel = undefined,
     ollama_model_count: usize = 0,
+
+    // --- judge proposals awaiting review (chat thread writes; Memory pane reads) ---
+    chat_props: [12]PropRow = undefined,
+    chat_prop_count: usize = 0,
 
     // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
     convs: [MAX_CONVS]ConvRow = undefined,
