@@ -419,6 +419,12 @@ pub const Chat = struct {
     consolidate_pending: bool = false, // an internal re-entry (act nudge / verify turn) preempted a settle that
     //                                    WOULD have consolidated memory — the arc's eventual settle owes one
     //                                    consolidation pass (otherwise mutating arcs silently never save facts)
+    stream_retried: bool = false, // one transient stream-death retry per arc: a dead stream used to settle
+    //                               the whole arc as an error and the chat "stopped trying" (user report)
+    pending_directive: [640]u8 = undefined, // ephemeral machine directive (act nudge / verify / format retry)
+    pending_directive_len: usize = 0, // for the NEXT turn's prompt ONLY — never persisted. Directives written
+    //                                   into history re-fed as user rows on every later turn and poisoned the
+    //                                   conversation's NEXT task (the confirmed "second task fails" report)
 
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
@@ -1073,9 +1079,22 @@ pub const Chat = struct {
             @memcpy(cmdb[0..cl], p.cmd[0..cl]);
             var rb: [6144]u8 = undefined;
             const result = composeConsoleResult(&rb, out_slice, err_slice, note);
+            // RAG-ON-FAILURE: a failing command recalls the playbook against the COMMAND ITSELF (the
+            // user's request rarely names the executable) — if a past verified fix covers this failure
+            // family, the model reads it in the same fold as the failure instead of re-deriving it.
+            var rb2: [7000]u8 = undefined;
+            var folded: []const u8 = result;
+            if (hard_fail) {
+                var lrb: [700]u8 = undefined;
+                const lesson = self.mind().recall(PLAYBOOK_SCOPE, p.cmdStr(), &lrb);
+                if (lesson.len > 0) {
+                    folded = std.fmt.bufPrint(&rb2, "{s}\nRECALLED LESSON (a verified past fix for this command family — apply its working form):\n{s}", .{ result, wholeLines(lesson, lrb.len) }) catch result;
+                    log.info("playbook: recalled {d}b of lessons into a failure fold", .{lesson.len});
+                }
+            }
             self.console = null;
             self.console_cancel = false;
-            self.foldConsoleAi(dd, cmdb[0..cl], result);
+            self.foldConsoleAi(dd, cmdb[0..cl], folded);
         } else {
             self.console = null;
             self.console_cancel = false;
@@ -2062,6 +2081,12 @@ pub const Chat = struct {
             while (k < self.store.msg_count) : (k += 1) {
                 const m = &self.store.msgs[k];
                 if (m.role == .thought) continue; // reasoning traces are UI-only — never re-fed to the model
+                // Machine notes are UI-only breadcrumbs too: re-fed as user rows, past nudge/verify
+                // directives and "(status)" chatter read as STANDING INSTRUCTIONS the model keeps
+                // obeying on every later task in the same conversation (the confirmed second-task
+                // failure). Only bracketed RESULT rows ([console]/[tool:...]/[cast]/[build]) flow back —
+                // those are the ground truth the model genuinely needs.
+                if (m.role == .cast_note and (m.text_len == 0 or m.text[0] != '[')) continue;
                 const role = switch (m.role) {
                     .veil => "assistant",
                     else => "user",
@@ -2070,6 +2095,14 @@ pub const Chat = struct {
                 escJson(&msgs, self.gpa, m.textStr());
                 msgs.appendSlice(self.gpa, "\"}") catch return;
             }
+        }
+        // EPHEMERAL DIRECTIVE (act nudge / verify / format retry): injected into THIS re-entered turn's
+        // prompt only, then cleared — the durable conversation never carries it.
+        if (self.pending_directive_len > 0) {
+            msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"") catch return;
+            escJson(&msgs, self.gpa, self.pending_directive[0..self.pending_directive_len]);
+            msgs.appendSlice(self.gpa, "\"}") catch return;
+            self.pending_directive_len = 0;
         }
         if (kind == .reflect and self.reflect_draft_len > 0) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"assistant\",\"content\":\"") catch return;
@@ -2190,9 +2223,20 @@ pub const Chat = struct {
             const emsg = std.fmt.bufPrint(&eb, "(model error: {s})", .{self.stream.errStr()}) catch "(model error)";
             log.err("chat turn FAILED after {d}s: {s}", .{ now - self.stream.started_s, self.stream.errStr() });
             self.recordMetric(kind, false, self.stream.content.items.len);
-            self.appendMsg(dd, .veil, emsg);
-            self.store.pushNotif("Chat model error", self.stream.errStr(), 2);
             self.stream.deinit(self.gpa);
+            // TRANSIENT-DEATH RETRY: a mid-arc stream death (connection reset, provider overload) used to
+            // settle the whole arc as an error — auto-loop disarmed, the chat "stopped trying". One bounded
+            // re-entry per arc: the prompt rebuilds from the same history, so a transient failure costs one
+            // retry and a persistent one still surfaces right after it.
+            if (!self.stream_retried and !self.abort_turn.load(.monotonic) and self.turn_epoch == self.conv_epoch) {
+                self.stream_retried = true;
+                self.appendMsgFull(dd, .cast_note, "(the model stream died — retrying once)", false);
+                log.info("stream retry: transient model failure — re-entering the turn once", .{});
+                self.startTurn(dd, kind);
+                if (self.turn == kind) return; // the retry turn is live
+            }
+            self.appendMsg(dd, .veil, emsg);
+            self.store.pushNotif("Chat model error", emsg, 2);
             self.setBusy(false);
             return;
         }
@@ -2340,8 +2384,7 @@ pub const Chat = struct {
                 // guard to machine boilerplate) and do NOT observe it (identical boilerplate as neurons
                 // poisons the conversation scope's recall).
                 self.appendMsgFull(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)", false);
-                const p = "Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call: one short why-sentence, then on its own line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.";
-                self.appendMsgFull(dd, .cast_note, p, false);
+                self.setDirective("Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call: one short why-sentence, then on its own line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.");
                 self.internal_turn = true; // corrective directive, not a real user turn — don't consolidate memory off it
                 self.setStatus("retrying in the right tool format...");
                 self.startTurn(dd, kind);
@@ -2370,8 +2413,7 @@ pub const Chat = struct {
                 if (full.len > 0) self.appendMsgFull(dd, .veil, full, false);
                 self.stream.deinit(self.gpa);
                 self.appendMsgFull(dd, .cast_note, "(the reply announced an action but didn't perform it — asking it to act now)", false);
-                const p = "Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.";
-                self.appendMsgFull(dd, .cast_note, p, false);
+                self.setDirective("Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.");
                 self.internal_turn = true; // machine directive, not a user exchange (last_user keeps the real goal)
                 self.setStatus("following through on the announced action...");
                 log.info("act follow-through: reply announced an action but performed none — re-entering", .{});
@@ -2564,8 +2606,7 @@ pub const Chat = struct {
             // eventual settle (the confirmed swallow otherwise dropped durable facts on every mutating arc).
             if (consolidate) self.consolidate_pending = true;
             self.appendMsgFull(dd, .cast_note, "(verifying the outcome before calling it done)", false);
-            const p = "Before we call this done: VERIFY the outcome OBJECTIVELY. One short sentence, then exactly ONE read-only RUN: or TOOL: line that checks the thing you just changed actually exists and behaves (query the created task/file/service/state — e.g. a scheduled task's LastTaskResult, a file's content, a service's status). When the result arrives: if it proves the work, report done WITH the evidence; if it exposes a failure, FIX it now and verify again. Only if this exchange truly changed nothing, restate your final answer instead.";
-            self.appendMsgFull(dd, .cast_note, p, false);
+            self.setDirective("Before we call this done: VERIFY the outcome OBJECTIVELY. One short sentence, then exactly ONE read-only RUN: or TOOL: line that checks the thing you just changed actually exists and behaves (query the created task/file/service/state — e.g. a scheduled task's LastTaskResult, a file's content, a service's status). When the result arrives: if it proves the work, report done WITH the evidence; if it exposes a failure, FIX it now and verify again. Only if this exchange truly changed nothing, restate your final answer instead.");
             self.internal_turn = true; // machine directive — never consolidated as a user exchange (last_user keeps the real goal)
             self.setStatus("verifying the work...");
             log.info("verify: arc acted with side effects — running the verification turn", .{});
@@ -2679,6 +2720,7 @@ pub const Chat = struct {
         self.act_nudges = 0; // each loop step re-earns its follow-through nudges + verification
         self.arc_mutated = false;
         self.verify_done = false;
+        self.stream_retried = false; // and its own transient-death retry
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
     }
@@ -2730,6 +2772,15 @@ pub const Chat = struct {
         self.arc_fail_note_len = 0;
         self.playbook_hit = false; // a Stop-abandoned arc's still-running command must not reinforce on landing
         self.consolidate_pending = false;
+        self.stream_retried = false;
+        self.pending_directive_len = 0; // a stale directive must never leak into an unrelated turn's prompt
+    }
+
+    /// Queue a machine directive for the NEXT startTurn's prompt only (ephemeral — never persisted, never
+    /// re-fed on later turns; the caller appends a short parenthetical .cast_note for UI transparency).
+    fn setDirective(self: *Chat, p: []const u8) void {
+        self.pending_directive_len = @min(p.len, self.pending_directive.len);
+        @memcpy(self.pending_directive[0..self.pending_directive_len], p[0..self.pending_directive_len]);
     }
 
     /// Disarm auto-loop silently — the veil just gave a plain answer, so there's nothing to narrate.
