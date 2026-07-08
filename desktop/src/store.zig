@@ -110,6 +110,9 @@ pub const MAX_CHAT_MSGS = 64;
 pub const MAX_CONVS = 32;
 pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
+pub const STREAM_CAP = 16384; // in-flight reply buffer — UI-side snapshot buffers MUST use this same constant
+//                               (a hardcoded 8192 copy in drawChat crashed the app the first time a streaming
+//                               reply crossed 8KB: "index out of bounds: index 8194, len 8192")
 pub const MAX_OLLAMA_MODELS = 48;
 pub const METRIC_RING = 60; // per-turn performance samples for the chat Metrics tab
 
@@ -134,7 +137,9 @@ pub const OllamaModel = struct {
     }
 };
 
-pub const ChatRole = enum(u8) { user, veil, cast_note };
+/// .thought is the veil's reasoning trace — rendered collapsed in the UI and EXCLUDED from the prompt
+/// history (the model must never re-read its own prior reasoning as answer text). Persisted as "r":3.
+pub const ChatRole = enum(u8) { user, veil, cast_note, thought };
 
 /// One chat message of the ACTIVE conversation. Fixed-size like everything else in the Store; the chat
 /// thread owns the full history on disk, this is the render copy.
@@ -273,7 +278,7 @@ pub const Store = struct {
     conv_active_len: u8 = 0,
     msgs: [MAX_CHAT_MSGS]ChatMsg = undefined,
     msg_count: usize = 0,
-    stream_text: [16384]u8 = undefined, // the in-flight assistant reply, grown as deltas land (16K: don't clip long answers)
+    stream_text: [STREAM_CAP]u8 = undefined, // the in-flight assistant reply, grown as deltas land (16K: don't clip long answers)
     stream_len: usize = 0,
     stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
     stream_reason_len: usize = 0,

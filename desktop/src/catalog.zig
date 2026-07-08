@@ -57,6 +57,7 @@ pub const providers = [_]Provider{
         .{ .id = "qwen2.5-coder:7b", .label = "Qwen2.5 Coder 7B" },
         .{ .id = "qwen2.5:14b", .label = "Qwen2.5 14B" },
         .{ .id = "llama3.1:8b", .label = "Llama 3.1 8B" },
+        .{ .id = "hermes3:8b", .label = "Hermes 3 8B" },
     } },
     // Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (built into the URL)
     // and an API token. Leaving both blank sends the "cloudflare" sentinel so a server configured with

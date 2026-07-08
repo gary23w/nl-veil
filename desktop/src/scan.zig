@@ -172,12 +172,40 @@ fn jsonInt(line: []const u8, key: []const u8) ?i64 {
 /// tailing only the final window of the file — the console never needs the whole history, and a swarm's
 /// stream grows to megabytes. Returns the number of Ev written into `out`, oldest-first.
 pub fn tailEvents(io: Io, gpa: std.mem.Allocator, path: []const u8, out: []Ev, metrics: *Metrics) usize {
-    log.trace("scan.tailEvents path={s}", .{path});
-    const data = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 << 20)) catch return 0;
-    defer gpa.free(data);
+    return tailEventsFrom(io, gpa, path, 0, out, metrics);
+}
+
+/// tailEvents that folds only bytes past `from` — a cast records the file size when it detects a STALE
+/// prior run's events in a reused dir, so the old run's "stopped"/score lines can never complete the new
+/// cast. Reads a bounded window (never the whole multi-MB file — this used to be an 8MB read + full
+/// two-pass parse EVERY SECOND on the chat thread, a real slice of the local cast thrash).
+const TAIL_WINDOW: u64 = 256 << 10;
+pub fn tailEventsFrom(io: Io, gpa: std.mem.Allocator, path: []const u8, from: u64, out: []Ev, metrics: *Metrics) usize {
+    log.trace("scan.tailEvents path={s} from={d}", .{ path, from });
     metrics.* = .{};
-    // First pass over the WHOLE window: accumulate cumulative metrics (tokens, best, stop) so the numbers
-    // reflect the run, not just the visible tail.
+    const st = Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
+    const size: u64 = st.size;
+    if (size <= from) return 0;
+    var start = from;
+    var torn = false; // did the window cut land mid-line?
+    if (size - start > TAIL_WINDOW) {
+        start = size - TAIL_WINDOW;
+        torn = true;
+    }
+    const want: usize = @intCast(size - start);
+    const buf = gpa.alloc(u8, want) catch return 0;
+    defer gpa.free(buf);
+    const f = Io.Dir.cwd().openFile(io, path, .{}) catch return 0;
+    defer f.close(io);
+    const rn = f.readPositionalAll(io, buf, start) catch return 0;
+    var data: []const u8 = buf[0..rn];
+    if (torn) {
+        // skip the torn first record; `from` itself always lands on a line start (whole lines are appended)
+        const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return 0;
+        data = data[nl + 1 ..];
+    }
+    // First pass over the window: accumulate cumulative metrics (tokens, best, stop) — cost totals are
+    // cumulative per line, so the newest line in the window carries the run's true totals.
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |line| {
         if (line.len < 8) continue;
@@ -388,13 +416,26 @@ fn readSwarmName(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []co
     if (jsonStr(data, "swarm", &nb)) |nm| setBuf(&s.name, &s.name_len, nm);
 }
 
-/// Roster summary: the latest score + stopped marker. readFileAlloc with a limit ERRORS on a larger file
-/// (it won't truncate), and a swarm's events.jsonl reaches ~1MB, so a small cap silently dropped the score
-/// for exactly the busy swarms — hence the 16MB ceiling (the whole stream; OS page cache keeps the 1Hz
-/// re-read cheap for the tens-of-local-swarms this targets).
+/// Roster summary: the latest score + stopped marker. Reads only the LAST 64KB of events.jsonl — the
+/// latest score and any "stopped" sit at the end, and this runs for EVERY run dir on disk every second
+/// (the old whole-file read, up to 16MB per dir per tick, was the poller's slice of the local thrash).
 fn summarizeTail(io: Io, gpa: std.mem.Allocator, ev_path: []const u8, s: *SwarmSummary) void {
-    const data = Io.Dir.cwd().readFileAlloc(io, ev_path, gpa, .limited(16 << 20)) catch return;
-    defer gpa.free(data);
+    const CAP: u64 = 64 << 10;
+    const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return;
+    const size: u64 = st.size;
+    if (size == 0) return;
+    const start = if (size > CAP) size - CAP else 0;
+    const want: usize = @intCast(size - start);
+    const buf = gpa.alloc(u8, want) catch return;
+    defer gpa.free(buf);
+    const f = Io.Dir.cwd().openFile(io, ev_path, .{}) catch return;
+    defer f.close(io);
+    const rn = f.readPositionalAll(io, buf, start) catch return;
+    var data: []const u8 = buf[0..rn];
+    if (start > 0) {
+        const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return;
+        data = data[nl + 1 ..];
+    }
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |line| {
         if (line.len < 8) continue;
@@ -544,6 +585,17 @@ pub fn serverOnline(io: Io, port: u16) bool {
     const addr = Io.net.IpAddress{ .ip4 = Io.net.Ip4Address.loopback(port) };
     var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return false;
     stream.close(io);
+    return true;
+}
+
+/// Drop the STOP sentinel into a run dir. The worker checks it PER TURN (fast), unlike a control.jsonl
+/// {"op":"stop"} which only lands at the next ROUND boundary — this is the stop the desktop should reach
+/// for first when the user wants a cast gone now.
+pub fn writeStop(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, id: []const u8) bool {
+    log.trace("scan.writeStop id={s}", .{id});
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}/STOP", .{ data_dir, id }) catch return false;
+    defer gpa.free(path);
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "stop requested by veil-desk\n" }) catch return false;
     return true;
 }
 

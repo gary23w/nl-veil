@@ -50,15 +50,25 @@ const SYSTEM_PROMPT =
     "DO NOT cast for greetings, small talk, definitions, or timeless facts you know confidently.\n" ++
     "A cast runs for minutes; the user watches its live activity beside this chat. When it finishes you " ++
     "receive its findings in a [cast] message and must then answer the user's request from them.\n" ++
+    "WHILE A CAST RUNS you are the hive's ORCHESTRATOR: narrate its progress to the user in plain sentences, " ++
+    "and steer it when it drifts by putting a line 'STEER: <one concrete instruction>' in your reply — it is " ++
+    "delivered to every mind at their next round. Never build a rival version of what the hive is mid-way " ++
+    "through; the hive owns the project layout while it runs.\n" ++
     "\n" ++
-    "TOOLS — for a quick, single action (NOT minutes of work), you may run ONE tool. Make the reply exactly " ++
-    "one line, nothing else:\n" ++
+    "TOOLS — for a quick, single action (NOT minutes of work), you may run ONE tool per reply. ALWAYS narrate " ++
+    "first: ONE short plain sentence saying what you're about to do and why (the user reads it — 'The tests " ++
+    "failed on the import, let me check models.py.'), then the TOOL line on its own line:\n" ++
     "TOOL: <name> <compact-json-args>\n" ++
     "Then STOP. I run it and reply with a [tool:<name>] message containing the result; read that and either " ++
-    "run another TOOL or give your final answer. Never put a TOOL line and prose in the same reply.\n" ++
+    "run another TOOL (with its own why-sentence) or give your final answer. Never put MORE than one TOOL " ++
+    "line in a reply, and never put anything after the TOOL line.\n" ++
     "Available tools:\n" ++
     "- list_swarms {}  — the swarms currently running (id, name, model, state).\n" ++
-    "- stop_swarm {}  — stop the currently running cast (omit id; I target the live one) or {\"id\":\"<id>\"}.\n" ++
+    "- stop_swarm {}  — ask the current (or {\"id\":\"<id>\"}) cast to stop COOPERATIVELY (takes effect at its next turn).\n" ++
+    "- kill_swarm {}  — HARD-KILL the current (or {\"id\":\"<id>\"}) cast's worker right now. Use when the user says " ++
+    "'kill it' / 'it's still running' and a stop_swarm didn't take.\n" ++
+    "- swarm_status {}  — WHY is the cast (or {\"id\":\"<id>\"}) still running: state, live pid, round/% vs its time budget, " ++
+    "and its last goal/completion event. Answer 'what is it doing' from this, never guess.\n" ++
     "- swarm_findings {}  — what the current cast has collected so far (its synthesis / recent events); or {\"id\":\"<id>\"}.\n" ++
     "- web_search {\"query\":\"...\"}  — a quick keyless web search (top results + excerpts).\n" ++
     "- web_fetch {\"url\":\"...\"}  — fetch one page as clean text.\n" ++
@@ -292,6 +302,17 @@ pub const Chat = struct {
     reflect_draft_len: usize = 0,
     reflect_pass: u8 = 0, // how many self-check iterations have run for this answer (bounded by REFLECT_MAX_PASSES)
     reflect_dirty: bool = false, // did ANY self-check pass change the draft (so the final differs from the first)?
+    reflect_msg_idx: ?usize = null, // the visible message slot holding the live draft — revisions land IN PLACE
+    //                                 here (no draft+revision double-post); appendMsg keeps it valid across eviction
+    reflect_trace: [8192]u8 = undefined, // reasoning accumulated across the draft + every self-check pass; lands as
+    reflect_trace_len: usize = 0, //        ONE collapsed .thought message above the answer at finalize
+    // CONVERSATION EPOCH — the cancellation barrier. Bumped whenever the user moves the conversation forward
+    // (send / new conv / switch conv / Stop). Deferred continuations (cast collect, veil parallel work) capture
+    // it when SCHEDULED and refuse to mutate the chat if it has moved — a finished cast then leaves one passive
+    // note instead of hijacking a model turn to post-process an old goal into the live conversation.
+    conv_epoch: u64 = 0,
+    cast_epoch: u64 = 0, // conv_epoch when the active cast (and its concurrent-veil work) was scheduled
+    turn_epoch: u64 = 0, // conv_epoch when the current model turn started (settle chains check it)
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
@@ -304,6 +325,21 @@ pub const Chat = struct {
     cast_deadline_s: i64 = 0,
     cast_minutes: u32 = CAST_MINUTES, // the time budget of the ACTIVE cast (AI-configurable; drives deadline + progress %)
     cast_stop_sent: bool = false,
+    cast_ev_size: u64 = 0, // events.jsonl size at the last parse — unchanged size skips the read+parse entirely
+    cast_ev_start: u64 = 0, // fold events only past this offset (set when a reused dir still holds a STALE run's log)
+    cast_fired_s: i64 = 0, // when the cast was fired — an events file whose mtime predates this is a PRIOR run's
+    cast_bp: [1536]u8 = undefined, // the hive's .blueprint (its intended file layout) — the veil orchestrates WITHIN it
+    cast_bp_len: usize = 0, //        (written by the engine ~a minute into the run; loaded lazily once it appears)
+    nar_round: i64 = -1, // last round narrated into the chat ("[hive] r3 66% — ..."); one milestone line per round
+    nar_pct: i32 = -1, //    and per material score jump — the chat narrates hive progress even with zero model calls
+    nar_txt: [120]u8 = undefined, // last narrated event text — a round whose latest event just repeats it is skipped
+    nar_txt_len: usize = 0, //       (13 rounds of "depgraph: ..." must not become 13 identical chat lines)
+    layout_nudged: [128]u8 = undefined, // top-level path segment already nudged once (second attempt is allowed)
+    layout_nudged_len: usize = 0,
+    steer_scratch: [12288]u8 = undefined, // STEER:-stripped copy of a reply (mem_scratch is taken by processMemory)
+    cast_m: scan.Metrics = .{}, // last parsed metrics (reused on skipped ticks)
+    cast_ev_n: usize = 0, //       and the matching ev_scratch count
+    cast_forced: bool = false, // the collect was forced by the DESKTOP deadline (report "budget exhausted", not "finished")
     ctx_warned: bool = false, // shown the "local model loaded at a huge context (slow)" tip once
     ctx_poll_budget: u8 = 0, // watchCast re-checks the loaded ctx for the first few ticks (catches load-during-cast)
 
@@ -938,10 +974,13 @@ pub const Chat = struct {
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.internal_turn = false; // this is a REAL user message → its turn may consolidate memory
+        self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
         self.reflect_pass = 0; // fresh iterative self-critique budget for this user turn
         self.reflect_dirty = false;
+        self.reflect_msg_idx = null;
+        self.reflect_trace_len = 0;
         self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
@@ -971,6 +1010,8 @@ pub const Chat = struct {
             self.store.conv_active_len = @intCast(n);
             self.store.msg_count = 0;
         }
+        self.conv_epoch += 1; // new conversation — stale continuations must not post into it
+        self.reflect_msg_idx = null;
         self.refreshConvs(dd, true);
     }
 
@@ -984,6 +1025,8 @@ pub const Chat = struct {
             self.store.conv_active_len = @intCast(n);
             self.store.msg_count = 0;
         }
+        self.conv_epoch += 1; // switched conversation — stale continuations must not post into it
+        self.reflect_msg_idx = null;
         self.loadMsgs(dd, id);
     }
 
@@ -1330,7 +1373,8 @@ pub const Chat = struct {
 
     pub fn cmdStopCast(self: *Chat, dd: []const u8, rel: []const u8) void {
         if (rel.len == 0) return;
-        _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
+        _ = scan.writeStop(self.io, self.gpa, dd, rel); // per-TURN sentinel — takes effect fast
+        _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}"); // round-boundary fallback
         self.store.pushNotif("Stop sent", rel, 2);
         self.cast_stop_sent = true;
         self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending finish
@@ -1513,6 +1557,7 @@ pub const Chat = struct {
             var m: store_mod.ChatMsg = .{ .role = switch (r) {
                 1 => .veil,
                 2 => .cast_note,
+                3 => .thought, // must be explicit: the .user fallback would re-feed a trace to the model as a user turn
                 else => .user,
             } };
             const tn = @min(t.len, m.text.len);
@@ -1541,10 +1586,14 @@ pub const Chat = struct {
     /// Append to the ACTIVE conversation: into the Store (render copy, oldest evicted at cap) and rewrite
     /// its file (title + the retained messages — the file mirrors what the app can re-show).
     pub fn appendMsg(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8) void {
+        self.appendMsgFull(dd, role, text, true);
+    }
+
+    /// appendMsg with the hippocampus observe optional — a reflect DRAFT commits without observing (only the
+    /// FINAL text should become a neuron; a superseded draft in recall would poison future prompts).
+    fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool) void {
         var idb: [32]u8 = undefined;
         var idn: usize = 0;
-        var titleb: [64]u8 = undefined;
-        var title_n: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
@@ -1553,6 +1602,8 @@ pub const Chat = struct {
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
                 std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[0 .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[1..store_mod.MAX_CHAT_MSGS]);
                 self.store.msg_count = store_mod.MAX_CHAT_MSGS - 1;
+                // eviction shifted every index down one — keep the live draft slot pointing at its message
+                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > 0) mi - 1 else null;
             }
             var m: store_mod.ChatMsg = .{ .role = role };
             const tn = @min(text.len, m.text.len);
@@ -1560,24 +1611,91 @@ pub const Chat = struct {
             m.text_len = @intCast(tn);
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
+        }
+        if (idn == 0) return;
+        // HIPPOCAMPUS: persist this turn as a neuron under the conversation's scope so it survives the 64-message
+        // ring eviction and can be relevance-recalled into future prompts (esp. a cast's synthesis digest, which
+        // otherwise ages out as one [cast] message). No-op when neuron-db is disabled.
+        if (do_observe) self.mind().observe(idb[0..idn], text);
+        self.persistConv(dd, idb[0..idn]);
+    }
+
+    /// Replace message `idx` IN PLACE (role + text) and re-persist — the in-place revision primitive. The
+    /// store rewrites the whole conversation file per append anyway, so replacement costs the same. Never
+    /// observes (callers observe the FINAL text exactly once, at finalize).
+    fn replaceMsg(self: *Chat, dd: []const u8, idx: usize, role: store_mod.ChatRole, text: []const u8) void {
+        var idb: [32]u8 = undefined;
+        var idn: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (idx >= self.store.msg_count) return;
+            idn = self.store.conv_active_len;
+            @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
+            var m: store_mod.ChatMsg = .{ .role = role };
+            const tn = @min(text.len, m.text.len);
+            @memcpy(m.text[0..tn], text[0..tn]);
+            m.text_len = @intCast(tn);
+            self.store.msgs[idx] = m;
+        }
+        if (idn == 0) return;
+        self.persistConv(dd, idb[0..idn]);
+    }
+
+    /// Open a slot directly BEFORE `idx` and put a message there (the reasoning trace lands above the answer
+    /// it produced, without re-posting the answer). Evicts the oldest message first when at capacity.
+    fn insertMsgBefore(self: *Chat, dd: []const u8, idx_in: usize, role: store_mod.ChatRole, text: []const u8) void {
+        var idb: [32]u8 = undefined;
+        var idn: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            var idx = idx_in;
+            idn = self.store.conv_active_len;
+            @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
+            if (idx > self.store.msg_count) return;
+            if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
+                if (idx == 0) return; // inserting before the message being evicted — nothing sane to do
+                std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[0 .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[1..store_mod.MAX_CHAT_MSGS]);
+                self.store.msg_count = store_mod.MAX_CHAT_MSGS - 1;
+                idx -= 1;
+                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > 0) mi - 1 else null;
+            }
+            var k = self.store.msg_count;
+            while (k > idx) : (k -= 1) self.store.msgs[k] = self.store.msgs[k - 1];
+            var m: store_mod.ChatMsg = .{ .role = role };
+            const tn = @min(text.len, m.text.len);
+            @memcpy(m.text[0..tn], text[0..tn]);
+            m.text_len = @intCast(tn);
+            self.store.msgs[idx] = m;
+            self.store.msg_count += 1;
+            if (self.reflect_msg_idx) |mi| if (mi >= idx) {
+                self.reflect_msg_idx = mi + 1;
+            };
+        }
+        if (idn == 0) return;
+        self.persistConv(dd, idb[0..idn]);
+    }
+
+    /// Rewrite the active conversation's file from the Store copy (title line + retained messages).
+    fn persistConv(self: *Chat, dd: []const u8, conv_id: []const u8) void {
+        var titleb: [64]u8 = undefined;
+        var title_n: usize = 0;
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        {
+            self.store.lock();
+            defer self.store.unlock();
             // keep the sidebar title in sync (it lives in convs; find it)
             var i: usize = 0;
             while (i < self.store.conv_count) : (i += 1) {
-                if (std.mem.eql(u8, self.store.convs[i].idStr(), idb[0..idn])) {
+                if (std.mem.eql(u8, self.store.convs[i].idStr(), conv_id)) {
                     title_n = self.store.convs[i].title_len;
                     @memcpy(titleb[0..title_n], self.store.convs[i].title[0..title_n]);
                     break;
                 }
             }
         }
-        if (idn == 0) return;
-        // HIPPOCAMPUS: persist this turn as a neuron under the conversation's scope so it survives the 64-message
-        // ring eviction and can be relevance-recalled into future prompts (esp. a cast's synthesis digest, which
-        // otherwise ages out as one [cast] message). No-op when neuron-db is disabled.
-        self.mind().observe(idb[0..idn], text);
-        // rewrite the file from the Store copy
-        var jb: std.ArrayListUnmanaged(u8) = .empty;
-        defer jb.deinit(self.gpa);
         jb.appendSlice(self.gpa, "{\"title\":\"") catch return;
         escJson(&jb, self.gpa, if (title_n > 0) titleb[0..title_n] else "chat");
         jb.appendSlice(self.gpa, "\"}\n") catch return;
@@ -1593,7 +1711,7 @@ pub const Chat = struct {
             }
         }
         var pb: [700]u8 = undefined;
-        const path = convPath(dd, idb[0..idn], &pb) orelse return;
+        const path = convPath(dd, conv_id, &pb) orelse return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
             log.warn("chat: could not persist conversation", .{});
         };
@@ -1713,6 +1831,7 @@ pub const Chat = struct {
             var k = first;
             while (k < self.store.msg_count) : (k += 1) {
                 const m = &self.store.msgs[k];
+                if (m.role == .thought) continue; // reasoning traces are UI-only — never re-fed to the model
                 const role = switch (m.role) {
                     .veil => "assistant",
                     else => "user",
@@ -1751,6 +1870,7 @@ pub const Chat = struct {
             return;
         }
         self.turn = kind;
+        self.turn_epoch = self.conv_epoch;
         self.first_byte_logged = false;
         self.turn_start_ms = self.nowMs();
         self.turn_fb_ms = 0;
@@ -1765,11 +1885,17 @@ pub const Chat = struct {
         // While a cast runs, the chat call shares the local backend with the whole swarm — long silence
         // is queueing. The stream gets a longer first-byte leash and the status line says so honestly.
         llm.poll(&self.stream, self.io, self.gpa, now, self.cast_active);
-        // publish the partial reply AND the partial reasoning (so thinking shows live, line-by-line)
+        // publish the partial reply AND the partial reasoning (so thinking shows live, line-by-line).
+        // Strip any tool call from the live preview too — otherwise the raw TOOL:{...} blob (e.g. a whole
+        // write_file payload) is visible in the bubble while it streams, even though the settled message
+        // strips it; the dispatcher still sees the full stream content at settle.
+        // A .reflect pass does NOT preview its content: the revision lands IN PLACE in the draft's slot at
+        // settle — streaming it as a second bubble below the draft is exactly the double-post artifact.
+        // The reasoning preview still streams (that's the self-check thinking, worth watching live).
         {
             self.store.lock();
             defer self.store.unlock();
-            const src = self.stream.content.items;
+            const src = if (self.turn == .reflect) "" else stripToolTail(self.stream.content.items);
             const n = @min(src.len, self.store.stream_text.len);
             @memcpy(self.store.stream_text[0..n], src[0..n]);
             self.store.stream_len = n;
@@ -1869,10 +1995,12 @@ pub const Chat = struct {
             // recoverable from the user's request and there's a substantial code block, synthesize the write_file.
             var synth_args: ?[]u8 = null;
             defer if (synth_args) |s| self.gpa.free(s); // freed AFTER runToolAndContinue dupes it (returns at 1446)
+            var synthesized = false; // code-block rescue: the "prose" is the pasted file — never narrate it
             const tc_opt = toolCall(full) orelse toolCallXml(full) orelse
                 (if (full.len == 0 and reason.len > 0) toolCallLoose(reason) else null) orelse blk: {
                 if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
                     synth_args = s;
+                    synthesized = true;
                     log.info("build recovery: model pasted a code block instead of write_file — synthesizing the write", .{});
                     break :blk ToolCall{ .name = "write_file", .args = s };
                 }
@@ -1884,6 +2012,18 @@ pub const Chat = struct {
                     self.stream.deinit(self.gpa);
                     self.setBusy(false);
                     return;
+                }
+                // NARRATION ABOVE THE TOOL: the why-sentence the protocol asks for renders as the veil's own
+                // line above the tool chip ("this file is broken, let me inspect"); a reasoning-channel model
+                // that emitted no prose gets its thinking surfaced as a collapsed thought chip instead — the
+                // user always sees WHY a tool is about to run, and the reasoning never silently vanishes.
+                if (!synthesized) {
+                    const prose = self.processSteer(dd, std.mem.trim(u8, stripToolTail(full), " \r\n\t"));
+                    if (prose.len > 0) {
+                        self.appendVeil(dd, "", prose);
+                    } else if (reason.len > 0) {
+                        self.appendMsgFull(dd, .thought, reason[0..@min(reason.len, 1200)], false);
+                    }
                 }
                 self.tool_iters += 1;
                 self.runToolAndContinue(dd, tc); // copies tc off the stream, THEN frees it, THEN re-enters
@@ -1897,6 +2037,10 @@ pub const Chat = struct {
                     self.stream.deinit(self.gpa);
                     self.setBusy(false);
                     return;
+                }
+                { // same why-narration above the console chip as for TOOL calls
+                    const prose = self.processSteer(dd, std.mem.trim(u8, stripToolTail(full), " \r\n\t"));
+                    if (prose.len > 0) self.appendVeil(dd, "", prose);
                 }
                 self.tool_iters += 1;
                 self.runShellAndContinue(dd, cmd); // copies cmd off the stream, THEN frees it, THEN re-enters
@@ -1912,7 +2056,7 @@ pub const Chat = struct {
                 self.tool_iters += 1;
                 self.stream.deinit(self.gpa);
                 self.appendMsg(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)");
-                const p = "Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call as exactly one line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.";
+                const p = "Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call: one short why-sentence, then on its own line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.";
                 self.appendMsg(dd, .cast_note, p);
                 self.last_user_len = @min(p.len, self.last_user.len);
                 @memcpy(self.last_user[0..self.last_user_len], p[0..self.last_user_len]);
@@ -1922,23 +2066,27 @@ pub const Chat = struct {
                 return;
             }
         }
-        if (REFLECT_PASSES > 0 and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
-            var reason_fb: [1200]u8 = undefined;
-            const rn = @min(reason.len, reason_fb.len);
-            @memcpy(reason_fb[0..rn], reason[0..rn]);
+        if (REFLECT_PASSES > 0 and !self.in_veil_work and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
             self.reflect_pass = 0; // fresh iterative-critique budget for this answer
             self.reflect_dirty = false; // no pass has changed anything yet
             self.reflect_draft_len = @min(full.len, self.reflect_draft.len);
             @memcpy(self.reflect_draft[0..self.reflect_draft_len], full[0..self.reflect_draft_len]);
+            // seed the reasoning trace with the drafting pass's thinking (each self-check pass adds its own)
+            self.reflect_trace_len = 0;
+            self.traceAddPass("- drafting -", reason);
             self.stream.deinit(self.gpa);
-            // KEEP the first-pass draft visible (it used to be replaced by the revision, which read as "wrote it,
-            // deleted it, rewrote it"). Commit the draft now; the revision lands as its own message below so the
-            // user watches the recursive self-check happen.
-            self.appendVeil(dd, reason_fb[0..rn], self.reflect_draft[0..self.reflect_draft_len]);
-            self.setStatus("self-checking the draft above...");
+            // Commit the draft as THE answer slot. Self-check passes revise it IN PLACE (the old flow kept the
+            // draft AND appended the revision below it — every self-revision read as two answers). At finalize
+            // the accumulated reasoning trace lands as one collapsed .thought message above this slot.
+            const shown = self.processMemory(dd, stripToolTail(self.reflect_draft[0..self.reflect_draft_len]));
+            if (shown.len > 0) {
+                self.appendMsgFull(dd, .veil, shown, false); // observe happens at finalize, on the FINAL text
+                self.reflect_msg_idx = self.lastMsgIdxOfRole(.veil);
+            } else self.reflect_msg_idx = null;
+            self.setStatus("self-checking the answer...");
             self.startTurn(dd, .reflect);
-            // If the second pass fails to start, the draft is already shown — nothing more to do.
-            if (self.turn != .reflect) self.reflect_draft_len = 0;
+            // If the self-check pass fails to start, the draft already stands as the answer — finalize now.
+            if (self.turn != .reflect) self.finishReflect(dd);
             return;
         }
         if (kind == .reflect) {
@@ -1947,6 +2095,11 @@ pub const Chat = struct {
             const changed = revised.len > 0 and reflectChanged(prior, revised);
             if (changed) self.reflect_dirty = true; // remember that SOME pass improved the answer (cumulative)
             self.reflect_pass += 1;
+            {
+                var lb: [72]u8 = undefined;
+                const label = std.fmt.bufPrint(&lb, "- self-check pass {d}: {s} -", .{ self.reflect_pass, if (changed) "revised" else "confirmed" }) catch "- self-check -";
+                self.traceAddPass(label, reason);
+            }
             if (changed and self.reflect_pass < REFLECT_MAX_PASSES) {
                 // ITERATIVE self-critique: the pass still improved the answer, so feed the improved text back for
                 // ANOTHER critique — recursive refinement that CONVERGES (critique → fix → re-critique …) the way
@@ -1959,24 +2112,23 @@ pub const Chat = struct {
                 const rn2 = @min(cleaned.len, self.reflect_draft.len);
                 @memcpy(self.reflect_draft[0..rn2], cleaned[0..rn2]);
                 self.reflect_draft_len = rn2;
+                // live in-place revision: the answer slot always shows the CURRENT best draft
+                if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, stripToolTail(self.reflect_draft[0..self.reflect_draft_len]));
                 self.stream.deinit(self.gpa);
                 var sb2: [72]u8 = undefined;
                 self.setStatus(std.fmt.bufPrint(&sb2, "self-checking (pass {d} of up to {d})...", .{ self.reflect_pass + 1, REFLECT_MAX_PASSES }) catch "self-checking...");
                 self.startTurn(dd, .reflect);
                 if (self.turn == .reflect) return; // another critique pass is live; it settles later
-                // couldn't start another pass → show the best draft we have + stop
-                self.appendVeil(dd, "", self.reflect_draft[0..self.reflect_draft_len]);
-                self.reflect_draft_len = 0;
-                self.reflect_pass = 0;
+                // couldn't start another pass → the improved draft is already in its slot; land the trace + stop
+                self.finishReflect(dd);
                 self.setBusy(false);
                 return;
             }
             // stabilized (the answer stopped changing) or hit the cap → finalize (falls through to the settle).
             // Use the CUMULATIVE dirty flag, not just this pass: if an earlier pass revised the draft and the
-            // last pass merely confirmed it, the final answer STILL differs from the first draft, so we must show
-            // that final answer (never leave the user seeing only the superseded original). `revised` is the last
-            // pass's output (slice into the stream, valid until the settle frees it below); fall back to the
-            // carried draft if this pass returned empty content.
+            // last pass merely confirmed it, the final answer STILL differs from the first draft, so the slot
+            // must hold that final text. `revised` is the last pass's output (slice into the stream, valid until
+            // the settle frees it below); fall back to the carried draft if this pass returned empty content.
             const dirty = self.reflect_dirty;
             const final_ans = if (revised.len > 0) revised else self.reflect_draft[0..self.reflect_draft_len];
             log.info("reflect finalize: pass={d} dirty={} changed={} final_len={d}", .{ self.reflect_pass, dirty, changed, final_ans.len });
@@ -1985,30 +2137,27 @@ pub const Chat = struct {
             // dumping the raw TOOL:{content} blob as chat text.
             if (self.tool_iters < MAX_TOOL_ITERS) {
                 if (toolCall(final_ans) orelse toolCallXml(final_ans)) |tc| {
-                    const prose = stripToolTail(final_ans);
+                    const prose = self.processMemory(dd, stripToolTail(final_ans));
                     if (prose.len > 0) {
-                        if (dirty) self.appendMsg(dd, .cast_note, "revised after self-check:");
-                        self.appendVeil(dd, reason, prose);
+                        if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, prose) else self.appendMsgFull(dd, .veil, prose, false);
+                        self.observeFinal(prose);
                     }
-                    self.reflect_draft_len = 0;
-                    self.reflect_pass = 0;
-                    self.reflect_dirty = false;
+                    self.finishReflect(dd);
                     self.tool_iters += 1;
                     self.runToolAndContinue(dd, tc); // copies tc off the stream, frees it, re-enters .tool_follow
                     return;
                 }
             }
-            if (dirty) {
-                self.appendMsg(dd, .cast_note, "revised after self-check:");
-                self.appendVeil(dd, reason, final_ans);
-            } else if (final_ans.len > 0) {
-                self.appendMsg(dd, .cast_note, "self-check confirmed the answer above — no changes needed.");
-            } else {
-                self.appendMsg(dd, .cast_note, "self-check found nothing to change — the draft above stands.");
+            // land the final text in the answer slot (in place — dirty or confirmed, the slot IS the answer)
+            const cleaned = self.processMemory(dd, stripToolTail(final_ans));
+            if (cleaned.len > 0) {
+                if (self.reflect_msg_idx) |mi| self.replaceMsg(dd, mi, .veil, cleaned) else self.appendMsgFull(dd, .veil, cleaned, false);
+                self.observeFinal(cleaned);
+            } else if (self.reflect_msg_idx != null) {
+                // final stripped to nothing — the committed draft stands; observe what the slot holds
+                self.observeFinal(self.reflect_draft[0..self.reflect_draft_len]);
             }
-            self.reflect_draft_len = 0;
-            self.reflect_pass = 0;
-            self.reflect_dirty = false;
+            self.finishReflect(dd);
         } else if (kind == .collect) {
             self.appendVeil(dd, reason, full);
         } else if (self.in_veil_work and parseCastSpec(full) != null) {
@@ -2094,6 +2243,7 @@ pub const Chat = struct {
     fn shouldConsolidate(self: *Chat, kind: Turn, full: []const u8) bool {
         if (!MEMORY_CONSOLIDATE or !self.mind().enabled()) return false;
         if (self.abort_turn.load(.monotonic)) return false;
+        if (self.turn_epoch != self.conv_epoch) return false; // the exchange this would consolidate was superseded
         if (kind != .user and kind != .tool_follow and kind != .reflect) return false; // answer turns only (no self-loop)
         if (self.internal_turn) return false; // a machine-authored finish/nudge turn is not a user exchange
         if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
@@ -2172,6 +2322,7 @@ pub const Chat = struct {
         // call in flight) right now, and every re-entry seam checks this flag, so setting it first guarantees no
         // further tool round-trip or auto-loop turn can start behind the Stop.
         self.abort_turn.store(true, .monotonic);
+        self.conv_epoch += 1; // Stop means "do not post-process older work into my chat" — collect included
         {
             self.store.lock();
             defer self.store.unlock();
@@ -2181,6 +2332,8 @@ pub const Chat = struct {
         self.reflect_pass = 0; // abandon any pending self-critique iteration
         self.reflect_dirty = false;
         self.reflect_draft_len = 0;
+        self.reflect_msg_idx = null; // the committed draft simply stands as the answer
+        self.reflect_trace_len = 0;
         // Abandon any concurrent-veil parallel work + pending compare/merge. Without this, in_veil_work could stay
         // TRUE and a later normal turn would write its files into the isolated {conv}-veil dir (lost work), and a
         // pending merge would fire behind the Stop. The hive's own output stays saved (viewable in the Swarm tab).
@@ -2214,8 +2367,9 @@ pub const Chat = struct {
         // Never let a raw TOOL:/RUN:/<tool:> call (esp. write_file{"content":<whole file>}) leak into the chat as
         // visible text — that only happens when a reflect/collect turn re-emits a tool call it can't run; strip it
         // so only the prose survives (the call itself runs in the tool loop + shows as a chip, or is dropped).
-        // Then act on + strip any durable-memory directives (REMEMBER:/FORGET:) so they persist but never render.
-        const text = self.processMemory(dd, stripToolTail(text_raw));
+        // Then act on + strip STEER: hive-guidance lines and any durable-memory directives (REMEMBER:/FORGET:)
+        // so they take effect but never render as answer text.
+        const text = self.processMemory(dd, self.processSteer(dd, stripToolTail(text_raw)));
         if (text.len == 0 and reasoning.len == 0) {
             // The whole reply was memory directives (nothing left to render). Don't go silent — confirm the save so
             // the user gets feedback that their key/preference landed (it's in the Memory tab now).
@@ -2236,36 +2390,135 @@ pub const Chat = struct {
             self.appendMsg(dd, .veil, text);
             return;
         }
-        var buf: [12288]u8 = undefined; // matches ChatMsg.text — reasoning preview + full answer without clipping
+        // Reasoning lands as its OWN collapsed .thought message above the answer. It used to be baked into the
+        // answer text as "> " blockquote lines, which re-fed the model its own prior reasoning as assistant
+        // history every turn (.thought is excluded from the prompt) and cluttered the visible answer.
+        var buf: [4096]u8 = undefined;
         var w: usize = 0;
-        const cap = @min(reasoning.len, 1200);
-        // blockquote each reasoning line
+        const cap = @min(reasoning.len, 4000);
         var it = std.mem.splitScalar(u8, reasoning[0..cap], '\n');
         while (it.next()) |line| {
             const ln = std.mem.trim(u8, line, " \r\t");
             if (ln.len == 0) continue;
-            if (w + ln.len + 3 > buf.len) break;
-            buf[w] = '>';
-            buf[w + 1] = ' ';
-            w += 2;
+            if (w + ln.len + 1 > buf.len) break;
             @memcpy(buf[w .. w + ln.len], ln);
             w += ln.len;
             buf[w] = '\n';
             w += 1;
         }
-        if (reasoning.len > cap and w + 6 < buf.len) {
-            @memcpy(buf[w .. w + 6], "> ...\n");
-            w += 6;
+        if (reasoning.len > cap and w + 3 < buf.len) {
+            @memcpy(buf[w .. w + 3], "...");
+            w += 3;
         }
-        // blank line then the answer
-        if (w + 1 < buf.len) {
-            buf[w] = '\n';
+        if (w > 0) self.appendMsgFull(dd, .thought, buf[0..w], false);
+        if (text.len > 0) self.appendMsg(dd, .veil, text);
+    }
+
+    /// STEER: <instruction> — the veil's control door to a LIVE hive. Each STEER line is delivered on the
+    /// run's control bus ({"op":"say","to":"all"} — the exact bus workers drain each round), confirmed with a
+    /// small note in the chat, and stripped from the display text. With no live cast the line is dropped with
+    /// a note instead (steering nothing is a model mistake worth surfacing, not rendering). Max 2 per reply.
+    fn processSteer(self: *Chat, dd: []const u8, text: []const u8) []const u8 {
+        if (std.mem.indexOf(u8, text, "STEER:") == null) return text;
+        var w: usize = 0;
+        var sent: u8 = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| {
+            const ln = std.mem.trimStart(u8, line, " \t");
+            if (std.mem.startsWith(u8, ln, "STEER:")) {
+                const body = std.mem.trim(u8, ln["STEER:".len..], " \r\t");
+                if (body.len > 0 and sent < 2) {
+                    sent += 1;
+                    if (self.cast_active and self.cast_rel_len > 0) {
+                        var jb: std.ArrayListUnmanaged(u8) = .empty;
+                        defer jb.deinit(self.gpa);
+                        const ok = blk: {
+                            jb.appendSlice(self.gpa, "{\"op\":\"say\",\"to\":\"all\",\"text\":\"") catch break :blk false;
+                            escJson(&jb, self.gpa, body);
+                            jb.appendSlice(self.gpa, "\"}") catch break :blk false;
+                            break :blk true;
+                        };
+                        if (ok and scan.writeControl(self.io, self.gpa, dd, self.cast_rel[0..self.cast_rel_len], jb.items)) {
+                            var nb: [420]u8 = undefined;
+                            const note = std.fmt.bufPrint(&nb, "(steered the hive: {s})", .{body[0..@min(body.len, 360)]}) catch "(steered the hive)";
+                            self.appendMsg(dd, .cast_note, note);
+                            log.info("chat steer: {s}", .{body[0..@min(body.len, 120)]});
+                        } else self.appendMsg(dd, .cast_note, "(could not deliver the steer to the hive)");
+                    } else self.appendMsg(dd, .cast_note, "(no live cast to steer)");
+                }
+                continue; // stripped from the display either way
+            }
+            if (w + line.len + 1 > self.steer_scratch.len) break;
+            @memcpy(self.steer_scratch[w..][0..line.len], line);
+            w += line.len;
+            self.steer_scratch[w] = '\n';
             w += 1;
         }
-        const tn = @min(text.len, buf.len - w);
-        @memcpy(buf[w .. w + tn], text[0..tn]);
-        w += tn;
-        self.appendMsg(dd, .veil, buf[0..w]);
+        if (sent == 0) return text; // nothing acted on — hand back the original untouched
+        return std.mem.trimEnd(u8, self.steer_scratch[0..w], " \r\n\t");
+    }
+
+    // ---- reflect trace helpers (the reasoning that led to the final answer, shown instead of the old draft) ----
+
+    fn traceAppend(self: *Chat, s: []const u8) void {
+        const n = @min(s.len, self.reflect_trace.len - self.reflect_trace_len);
+        @memcpy(self.reflect_trace[self.reflect_trace_len..][0..n], s[0..n]);
+        self.reflect_trace_len += n;
+    }
+
+    /// One labeled section per pass: "- drafting -" / "- self-check pass N: revised -" + that pass's reasoning
+    /// (capped per pass so several passes fit the trace buffer). Intermediate passes' reasoning used to be
+    /// DISCARDED entirely; this is where it survives.
+    fn traceAddPass(self: *Chat, label: []const u8, reason: []const u8) void {
+        if (self.reflect_trace_len > 0) self.traceAppend("\n");
+        self.traceAppend(label);
+        const r = std.mem.trim(u8, reason, " \r\n\t");
+        if (r.len > 0) {
+            self.traceAppend("\n");
+            const cap = @min(r.len, 1500);
+            self.traceAppend(r[0..cap]);
+            if (r.len > cap) self.traceAppend(" ...");
+        }
+    }
+
+    /// Land the accumulated reasoning trace as ONE collapsed .thought message directly above the answer slot,
+    /// then clear all reflect state. The slot itself already holds the final text (revised in place).
+    fn finishReflect(self: *Chat, dd: []const u8) void {
+        if (self.reflect_msg_idx) |mi| {
+            if (self.reflect_trace_len > 0) self.insertMsgBefore(dd, mi, .thought, self.reflect_trace[0..self.reflect_trace_len]);
+        }
+        self.reflect_msg_idx = null;
+        self.reflect_trace_len = 0;
+        self.reflect_draft_len = 0;
+        self.reflect_pass = 0;
+        self.reflect_dirty = false;
+    }
+
+    /// Index of the newest message with `role` (the just-committed draft slot), or null.
+    fn lastMsgIdxOfRole(self: *Chat, role: store_mod.ChatRole) ?usize {
+        self.store.lock();
+        defer self.store.unlock();
+        var i = self.store.msg_count;
+        while (i > 0) {
+            i -= 1;
+            if (self.store.msgs[i].role == role) return i;
+        }
+        return null;
+    }
+
+    /// Hippocampus observe of the FINAL answer text — deferred from the draft commit so recall never
+    /// surfaces a superseded draft.
+    fn observeFinal(self: *Chat, text: []const u8) void {
+        if (text.len == 0) return;
+        var idb: [32]u8 = undefined;
+        var idn: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            idn = self.store.conv_active_len;
+            @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
+        }
+        if (idn > 0) self.mind().observe(idb[0..idn], text);
     }
 
     // ------------------------------------------------------------------------------ casting (the existing door)
@@ -2379,7 +2632,19 @@ pub const Chat = struct {
             return;
         }
         self.cast_active = true;
+        self.cast_epoch = self.conv_epoch; // the conversation position this cast (and its veil work) belongs to
         self.cast_stop_sent = false;
+        self.cast_ev_size = 0; // fresh watch state for this run
+        self.cast_ev_start = 0;
+        self.cast_fired_s = self.nowS();
+        self.cast_m = .{};
+        self.cast_ev_n = 0;
+        self.cast_forced = false;
+        self.cast_bp_len = 0; // this run's blueprint loads lazily once the engine writes it
+        self.nar_round = -1; // fresh milestone-narration state
+        self.nar_pct = -1;
+        self.nar_txt_len = 0;
+        self.layout_nudged_len = 0;
         self.cast_hex_len = @min(hex.len, self.cast_hex.len);
         @memcpy(self.cast_hex[0..self.cast_hex_len], hex[0..self.cast_hex_len]);
         self.cast_rel_len = 0;
@@ -2444,8 +2709,12 @@ pub const Chat = struct {
 
         var abuf: [256]u8 = undefined;
         var args = raw_args;
-        const orchestration = std.mem.eql(u8, name, "stop_swarm") or std.mem.eql(u8, name, "swarm_findings");
-        if (orchestration and self.cast_active and self.cast_hex_len > 0 and !hasRealId(raw_args)) {
+        const orchestration = std.mem.eql(u8, name, "stop_swarm") or std.mem.eql(u8, name, "swarm_findings") or
+            std.mem.eql(u8, name, "kill_swarm") or std.mem.eql(u8, name, "swarm_status");
+        // Inject the LAST cast's id whenever the model omitted one — NOT gated on cast_active: the moment users
+        // say "kill it / why is it still running" is exactly after the watcher declared the cast done (cast_active
+        // false) while the worker may still be alive. cast_hex stays valid until the next cast overwrites it.
+        if (orchestration and self.cast_hex_len > 0 and !hasRealId(raw_args)) {
             args = std.fmt.bufPrint(&abuf, "{{\"id\":\"{s}\"}}", .{self.cast_hex[0..self.cast_hex_len]}) catch raw_args;
         }
         // web_search with a missing/placeholder query — common when the call is recovered from the reasoning
@@ -2461,6 +2730,30 @@ pub const Chat = struct {
                 break :blk true;
             };
             if (okq) args = qw.buffered();
+        }
+
+        // LAYOUT GUARD while a cast runs: the hive owns the project structure — a chat write_file that would
+        // START a new top-level file/package beside it (the "rival build" failure: app.py + app/ +
+        // social_network/ in one tree) is deflected ONCE with the blueprint so the model redirects into the
+        // hive's layout (or STEERs the hive). An insistent second attempt at the same top segment runs anyway —
+        // the guard is a nudge, never a hard wall.
+        if (self.cast_active and std.mem.eql(u8, name, "write_file")) {
+            self.loadBlueprint(dd);
+            var wpb: [300]u8 = undefined;
+            if (jStr(args, "path", &wpb)) |wp| {
+                const top = topSegment(wp);
+                const nudged_before = std.mem.eql(u8, top, self.layout_nudged[0..self.layout_nudged_len]);
+                if (!nudged_before and !self.pathFitsHiveLayout(wp)) {
+                    self.layout_nudged_len = @min(top.len, self.layout_nudged.len);
+                    @memcpy(self.layout_nudged[0..self.layout_nudged_len], top[0..self.layout_nudged_len]);
+                    var fb2: [2048]u8 = undefined;
+                    const folded = std.fmt.bufPrint(&fb2, "[tool:write_file]\n(not executed: a hive cast is building this project and owns the layout — '{s}' would start a NEW top-level structure beside it. The hive's blueprint:\n{s}\nWrite WITHIN that structure, or STEER: the hive to add what's missing, or wait for its findings. Re-issuing the exact same path will run it anyway.)", .{ wp, self.cast_bp[0..self.cast_bp_len] }) catch "[tool:write_file]\n(not executed: the hive owns the layout while the cast runs — write within its blueprint or STEER: it.)";
+                    self.appendMsg(dd, .cast_note, folded);
+                    log.info("chat layout guard: deflected write to '{s}' (new top '{s}' not in blueprint/tree)", .{ wp, top });
+                    self.startTurn(dd, .tool_follow);
+                    return;
+                }
+            }
         }
 
         var stbuf: [96]u8 = undefined;
@@ -2626,17 +2919,68 @@ pub const Chat = struct {
             }
         }
         const rel = self.cast_rel[0..self.cast_rel_len];
-        var m: scan.Metrics = .{};
         var ep_buf: [700]u8 = undefined;
         const ep = std.fmt.bufPrint(&ep_buf, "{s}/{s}/events.jsonl", .{ dd, rel }) catch return;
-        const ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &m);
-        // publish tail + row
-        {
-            self.store.lock();
-            defer self.store.unlock();
-            @memcpy(self.store.cast_tail[0..ev_n], self.ev_scratch[0..ev_n]);
-            self.store.cast_tail_count = ev_n;
+        // SIZE-GUARD: skip the tail read + two-pass parse entirely when the file hasn't grown (this ran
+        // unconditionally at ~1Hz on the chat thread — with the poller's own scans, a real thrash source).
+        var ev_size: u64 = 0;
+        var ev_mtime_s: i64 = 0;
+        if (Io.Dir.cwd().statFile(self.io, ep, .{})) |st| {
+            ev_size = st.size;
+            ev_mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+        } else |_| {}
+        if (ev_size != self.cast_ev_size) {
+            self.cast_ev_size = ev_size;
+            var pm: scan.Metrics = .{};
+            const n = scan.tailEventsFrom(self.io, self.gpa, ep, self.cast_ev_start, &self.ev_scratch, &pm);
+            // STALE-RUN GUARD (first parse only): a reused _chat/builds/{conv} dir can still hold the PREVIOUS
+            // run's log — recognizable as "already stopped" AND untouched since before this cast fired. Fold
+            // from EOF instead so the old run's stopped/score lines can never complete the new cast. (A cast
+            // that genuinely finished fast has a FRESH mtime and collects normally.) The server also rotates
+            // the log on re-cast; this is the desktop's own belt-and-suspenders.
+            if (self.cast_ev_start == 0 and pm.stopped and self.cast_ev_n == 0 and n > 0 and
+                self.cast_fired_s > 0 and ev_mtime_s < self.cast_fired_s)
+            {
+                self.cast_ev_start = ev_size;
+                self.cast_m = .{};
+                self.cast_ev_n = 0;
+                log.info("cast watch: stale prior-run events detected in {s} — folding from offset {d}", .{ rel, ev_size });
+            } else {
+                self.cast_m = pm;
+                self.cast_ev_n = n;
+                {
+                    // publish tail + row
+                    self.store.lock();
+                    defer self.store.unlock();
+                    @memcpy(self.store.cast_tail[0..n], self.ev_scratch[0..n]);
+                    self.store.cast_tail_count = n;
+                }
+                // MILESTONE NARRATION: the chat itself tells the hive's story — one compact line per round (or
+                // major score move). The raw stream lives in the right pane; the conversation narrates progress
+                // even when the veil isn't mid-turn, and the model sees the same milestones as context. A round
+                // whose latest event just REPEATS the previous narration is skipped (no 13x "depgraph: ...").
+                const jump = pm.pct >= 0 and (self.nar_pct < 0 or (pm.pct - self.nar_pct >= 20) or (pm.pct >= 100 and self.nar_pct < 100));
+                const round_new = pm.round > 0 and pm.round != self.nar_round;
+                var last_txt: []const u8 = "";
+                if (n > 0) last_txt = self.ev_scratch[n - 1].textStr();
+                const trimmed = last_txt[0..@min(last_txt.len, self.nar_txt.len)];
+                const repeat = std.mem.eql(u8, trimmed, self.nar_txt[0..self.nar_txt_len]);
+                if (jump or (round_new and !repeat)) {
+                    self.nar_round = pm.round;
+                    if (pm.pct >= 0) self.nar_pct = pm.pct;
+                    self.nar_txt_len = trimmed.len;
+                    @memcpy(self.nar_txt[0..trimmed.len], trimmed);
+                    var nb2: [240]u8 = undefined;
+                    const note = if (pm.pct >= 0)
+                        std.fmt.bufPrint(&nb2, "[hive] round {d}, {d}% — {s}", .{ pm.round, pm.pct, trimmed }) catch "[hive] progress"
+                    else
+                        std.fmt.bufPrint(&nb2, "[hive] round {d} — {s}", .{ pm.round, trimmed }) catch "[hive] progress";
+                    self.appendMsg(dd, .cast_note, note);
+                } else if (round_new) self.nar_round = pm.round; // advance silently past the repeat
+            }
         }
+        const m = self.cast_m;
+        const ev_n = self.cast_ev_n;
         var last: []const u8 = "";
         if (ev_n > 0) last = self.ev_scratch[ev_n - 1].textStr();
         self.updateCastRow(if (m.stopped) .done else .running, m.round, m.pct, last, rel);
@@ -2667,13 +3011,16 @@ pub const Chat = struct {
         }
         if (now > self.cast_deadline_s) {
             if (!self.cast_stop_sent) {
+                // STOP file first — the worker honors it PER TURN; control.jsonl only lands at a round boundary
+                _ = scan.writeStop(self.io, self.gpa, dd, rel);
                 _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
                 self.cast_stop_sent = true;
-                self.cast_deadline_s = now + 90; // grace for the round boundary
+                self.cast_deadline_s = now + 90; // grace for the turn/round boundary
                 self.updateCastRow(.collecting, m.round, m.pct, last, rel);
                 self.setStatus("asking the hive to stop...");
             } else if (self.turn == .idle) {
-                // it never stopped cleanly — collect/merge what exists
+                // it never stopped cleanly — collect what exists, and say so honestly (not "finished")
+                self.cast_forced = true;
                 self.castFinished(dd, rel, &m, ev_n);
             }
         }
@@ -2683,6 +3030,19 @@ pub const Chat = struct {
     /// (writing into this SAME shared dir) has also settled, so its last edits are in the tree before the answer
     /// is composed; otherwise collect the result directly (the classic path).
     fn castFinished(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
+        if (self.cast_epoch != self.conv_epoch) {
+            // The user has moved on (newer message / switched conversation / Stop) since this cast was scheduled.
+            // Do NOT inject the digest or hijack a .collect model turn to post-process an old goal into the live
+            // chat — leave one passive note; the run stays on disk and can be summarized on request.
+            self.cast_active = false;
+            self.resetVeilWork();
+            self.updateCastRow(.done, m.round, m.pct, "", rel);
+            var nb: [256]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
+            self.appendMsg(dd, .cast_note, note);
+            self.setStatus("");
+            return;
+        }
         if (CONCURRENT_VEIL and self.veil_work_active) {
             self.cast_active = false;
             self.cast_awaiting_veil = true;
@@ -2699,6 +3059,35 @@ pub const Chat = struct {
         self.cast_active = false;
         self.resetVeilWork(); // abandon any parallel veil attempt + the pending finish
         self.setStatus("");
+    }
+
+    /// Lazily read the hive's .blueprint (its intended file layout) from the cast run dir — the engine writes
+    /// it once planning settles (~a minute in), so callers simply retry until it appears. Cached per cast.
+    fn loadBlueprint(self: *Chat, dd: []const u8) void {
+        if (self.cast_bp_len > 0 or self.cast_rel_len == 0) return;
+        var pb: [700]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "{s}/{s}/.blueprint", .{ dd, self.cast_rel[0..self.cast_rel_len] }) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(16 << 10)) catch return;
+        defer self.gpa.free(data);
+        const t = std.mem.trim(u8, data, " \r\n\t");
+        self.cast_bp_len = @min(t.len, self.cast_bp.len);
+        @memcpy(self.cast_bp[0..self.cast_bp_len], t[0..self.cast_bp_len]);
+        if (self.cast_bp_len > 0) log.info("cast blueprint loaded ({d}b)", .{self.cast_bp_len});
+    }
+
+    /// LAYOUT GUARD data check: does this write_file path fit the hive's layout — its blueprint OR the tree
+    /// that already exists on disk (an existing top segment is too late to prevent; only NEW rivals matter)?
+    fn pathFitsHiveLayout(self: *Chat, path: []const u8) bool {
+        if (self.cast_bp_len == 0) return true; // nothing to judge against yet
+        if (layoutAllows(self.cast_bp[0..self.cast_bp_len], path)) return true;
+        const top = topSegment(path);
+        self.store.lock();
+        defer self.store.unlock();
+        var i: usize = 0;
+        while (i < self.store.chat_file_count) : (i += 1) {
+            if (std.mem.eql(u8, topSegment(self.store.chat_files[i].pathStr()), top)) return true;
+        }
+        return false;
     }
 
     /// Clear all concurrent-veil state (on cast failure/stop, or after the finish completes).
@@ -2719,6 +3108,12 @@ pub const Chat = struct {
     /// so a mid-chain idle is never observed).
     fn maybeVeilWork(self: *Chat, dd: []const u8) void {
         if (!CONCURRENT_VEIL or !self.veil_work_active or self.veil_done) return;
+        if (self.cast_epoch != self.conv_epoch) {
+            // the user moved the conversation on — never start (or misread the settle of) a parallel attempt
+            // for a superseded goal; its files stay on disk with the cast's
+            self.resetVeilWork();
+            return;
+        }
         if (self.turn != .idle or self.consoleAiBusy()) return; // never contend with a live turn/console
         if (!self.veil_started) {
             self.veil_started = true;
@@ -2728,13 +3123,19 @@ pub const Chat = struct {
             self.reflect_pass = 0;
             self.reflect_dirty = false;
             self.abort_turn.store(false, .monotonic);
-            var pb: [1900]u8 = undefined;
-            const prompt = std.fmt.bufPrint(&pb, "[parallel] You are the primary Veil, working alongside a background hive on this SAME goal, in the SAME shared build files — you are not keeping a separate copy, so read what's already there (list_dir/read_file) before writing, and extend/fix it rather than starting a rival build from scratch; the swarm's own concurrent-edit safety merges disjoint edits automatically. You do NOT have a cast/swarm tool here and you must NEVER output 'CAST:' — casting is disabled for you. Do the ACTUAL work with your own tools: for research, call web_search then web_fetch on the best results; for a build, use write_file/edit_file/run_python. If you emit CAST: it is ignored and you fail this task. Goal: {s}", .{self.veil_goal[0..self.veil_goal_len]}) catch "[parallel] Work the cast goal yourself, in the hive's shared build files, with your own tools (never CAST).";
+            // THE VEIL IS THE HIVE'S ORCHESTRATOR while a cast runs — never a rival builder. The old [parallel]
+            // prompt had it build the same goal blind in the same dir, which produced competing top-level
+            // structures beside the hive's (the "chat went off and did its own thing" report). Now it gets the
+            // hive's OWN blueprint and a narrate / steer / gap-fill-within-the-layout job description.
+            self.loadBlueprint(dd);
+            const bp: []const u8 = if (self.cast_bp_len > 0) self.cast_bp[0..self.cast_bp_len] else "(not planned yet — inspect with list_dir before touching anything)";
+            var pb: [4096]u8 = undefined;
+            const prompt = std.fmt.bufPrint(&pb, "[orchestrator] A hive swarm is building this goal RIGHT NOW in your shared workdir, and YOU are its orchestrator — never a rival builder. The hive owns the project layout while it runs. Its blueprint (the intended files):\n{s}\nYour job, in order: (1) INSPECT what it has produced so far (list_dir, read_file) and NARRATE to the user in one or two plain sentences what the hive is building and how it is going; (2) if you see drift, duplication, or a missing piece the hive should handle, STEER it — output a line 'STEER: <one concrete instruction>' and it reaches every mind at their next round; (3) you may fix a SMALL gap yourself (write_file/edit_file/run_python) but ONLY inside the blueprint's structure — NEVER create a new top-level file or package the blueprint does not have; (4) never duplicate work the hive is mid-way through — when in doubt, narrate and stop; the full findings come to you when the cast finishes. You have no cast tool here; never output CAST:. The hive's goal: {s}", .{ bp, self.veil_goal[0..self.veil_goal_len] }) catch "[orchestrator] Inspect the hive's build, narrate its progress to the user, STEER: it if it drifts, and only fill small gaps inside ITS layout (never a new top-level structure, never CAST:).";
             self.last_user_len = @min(prompt.len, self.last_user.len);
             @memcpy(self.last_user[0..self.last_user_len], prompt[0..self.last_user_len]);
             // a cast_note renders dim/distinct (not a fake user bubble) but still maps to a user turn in the prompt
             self.appendMsg(dd, .cast_note, prompt);
-            self.setStatus("veil working the goal in parallel...");
+            self.setStatus("veil orchestrating the hive...");
             self.startTurn(dd, .user);
             return;
         }
@@ -2749,6 +3150,16 @@ pub const Chat = struct {
     fn maybeFinishAfterVeil(self: *Chat, dd: []const u8) void {
         if (!self.cast_awaiting_veil or !self.veil_done) return;
         if (self.turn != .idle or self.consoleAiBusy()) return;
+        if (self.cast_epoch != self.conv_epoch) {
+            // user moved on between the hive finishing and the merge — passive note, no hijacked collect turn
+            const rel0 = self.cast_rel[0..self.cast_rel_len];
+            self.resetVeilWork();
+            var nb: [256]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel0}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
+            self.appendMsg(dd, .cast_note, note);
+            self.setStatus("");
+            return;
+        }
         self.cast_awaiting_veil = false;
         self.veil_work_active = false;
         const rel = self.cast_rel[0..self.cast_rel_len];
@@ -2765,12 +3176,18 @@ pub const Chat = struct {
     /// answer from it.
     fn collectCast(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         self.cast_active = false;
-        self.abort_turn.store(false, .monotonic); // the collect is a fresh deliberate turn — a stale Stop (from the
-        // input's Stop button during the cast) must not abort composing the cast's answer.
+        // NOTE: a pending Stop is deliberately NOT cleared here anymore — Stop during a cast now means "do not
+        // post-process this into my chat" (it also bumps conv_epoch, so castFinished already refuses the collect).
         self.updateCastRow(.done, m.round, m.pct, "", rel);
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
-        jb.print(self.gpa, "[cast] finished run {s}: rounds {d}, score {d}% (best {d}%)", .{ rel, m.round, if (m.pct < 0) 0 else m.pct, m.best_pct }) catch return;
+        if (self.cast_forced) {
+            // the DESKTOP deadline forced this collect — the swarm did not finish; don't claim it did
+            jb.print(self.gpa, "[cast] time budget exhausted (run {s}): rounds {d}, best {d}% — the worker was told to stop; collecting what exists", .{ rel, m.round, m.best_pct }) catch return;
+        } else {
+            jb.print(self.gpa, "[cast] finished run {s}: rounds {d}, score {d}% (best {d}%)", .{ rel, m.round, if (m.pct < 0) 0 else m.pct, m.best_pct }) catch return;
+        }
+        self.cast_forced = false;
         if (m.stop_reason_len > 0) jb.print(self.gpa, ", stopped: {s}", .{m.stop_reason[0..m.stop_reason_len]}) catch {};
         // FULL inventory of EVERY file the hive produced (any name, nested, manifest or not — listWorkFiles now
         // unions the manifest with a recursive work/ walk). The hive often writes oddly-named files that don't
@@ -3039,17 +3456,90 @@ fn isSmallTalk(msg: []const u8) bool {
 
 pub const ToolCall = struct { name: []const u8, args: []const u8 };
 
+/// The tools the chat prompt advertises. A "TOOL:" buried mid-sentence only counts as a call when the
+/// name is one of these, so a prose mention ("use the TOOL: menu") is never dispatched or clipped; a
+/// call at a line start (the taught form) accepts any name — the server rejects unknowns.
+fn knownChatTool(name: []const u8) bool {
+    const names = [_][]const u8{
+        "list_swarms",  "stop_swarm", "kill_swarm",     "swarm_status", "swarm_findings", "web_search",
+        "web_fetch",    "fetch_json", "recall_hive",    "observe",      "write_file",     "edit_file",
+        "read_file",    "list_dir",   "run_tests",      "run_python",   "delete_file",
+    };
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+fn substantiveLinesBefore(text: []const u8, pos: usize) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text[0..pos], '\n');
+    while (it.next()) |raw| {
+        if (std.mem.trim(u8, raw, " \r\t").len > 0) n += 1;
+    }
+    return n;
+}
+
+const FoundCall = struct { name: []const u8, args: []const u8, at: usize };
+
+/// THE one TOOL: predicate — dispatch (toolCall), the display stripper (stripToolTail) and the reflect
+/// gate all use this same scan, so a call can never be hidden-but-not-run or run-but-shown (the old
+/// dispatcher was line-start-only while the stripper matched mid-line; anything between the two anchors
+/// was silently dropped or leaked verbatim into the chat). Finds the FIRST "TOOL:" that is a real call:
+/// - at a line start (markdown wrappers like `**` tolerated): any name within the first few substantive
+///   lines, a known chat tool below them (a deep line-start mention of an unknown name is narration);
+/// - mid-line ("...let me stop it. TOOL: stop_swarm"): only a known chat tool name.
+/// Args are the balanced {...} blob after the name ("{}" when omitted — no-arg tools like stop_swarm
+/// are legal without braces), passed to the server verbatim.
+fn findToolCall(text: []const u8) ?FoundCall {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, "TOOL:")) |p| {
+        search = p + "TOOL:".len;
+        var i = p + "TOOL:".len;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        const nstart = i;
+        while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
+        const name = std.mem.trim(u8, text[nstart..i], " \t:`*\".,;)!?");
+        if (name.len == 0 or name.len > 40) continue;
+        const line_start = blk: {
+            var j = p;
+            while (j > 0) {
+                const c = text[j - 1];
+                if (c == '\n') break;
+                if (c != ' ' and c != '\t' and c != '`' and c != '*' and c != '#' and c != '>' and c != '-') break :blk false;
+                j -= 1;
+            }
+            break :blk true;
+        };
+        if (!line_start and !knownChatTool(name)) continue;
+        if (line_start and !knownChatTool(name) and substantiveLinesBefore(text, p) >= 5) continue;
+        var args: []const u8 = "{}";
+        var k = i;
+        while (k < text.len and (text[k] == ' ' or text[k] == '\t')) k += 1;
+        if (k < text.len and text[k] == '{') {
+            const astart = k;
+            var depth: i32 = 0;
+            while (k < text.len) : (k += 1) {
+                if (text[k] == '{') depth += 1 else if (text[k] == '}') {
+                    depth -= 1;
+                    if (depth == 0) {
+                        k += 1;
+                        break;
+                    }
+                }
+            }
+            if (depth == 0 and k > astart + 1) args = text[astart..k];
+        }
+        return .{ .name = name, .args = args, .at = p };
+    }
+    return null;
+}
+
 /// Cut a trailing TOOL:/RUN:/<tool:...> call out of DISPLAYED text and return only the prose before it. A tool
 /// call reaching a displayed answer means a reflect/collect turn re-emitted it as text (those turns can't run
-/// tools), so the huge write_file{"content":<file>} blob would otherwise dump into the chat. Conservative: a
-/// "TOOL:" line only counts as a call if a '{' follows it (real args), so a prose mention isn't clipped.
+/// tools), so the huge write_file{"content":<file>} blob would otherwise dump into the chat. Uses the SAME
+/// findToolCall predicate as the dispatcher, so display and dispatch can never disagree about what is a call.
 pub fn stripToolTail(text: []const u8) []const u8 {
     var cut = text.len;
-    // TOOL: <name> {args} may appear MID-LINE ("...let me write it now.TOOL: write_file {...}"), so search the
-    // whole text, not just line starts. Require a '{' after the tag so a prose mention of "TOOL:" isn't clipped.
-    if (std.mem.indexOf(u8, text, "TOOL:")) |p| {
-        if (std.mem.indexOfScalarPos(u8, text, p, '{') != null) cut = @min(cut, p);
-    }
+    if (findToolCall(text)) |f| cut = @min(cut, f.at);
     if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
     // RUN: <shell command> — only at a line start (a prose "RUN:" mid-sentence isn't a shell call).
     {
@@ -3068,33 +3558,12 @@ pub fn stripToolTail(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, text[0..cut], " \r\n\t");
 }
 
-/// If a "TOOL: <name> <json-args>" line appears within the reply's first few substantive lines, return
-/// the tool name + its raw JSON args ("{}" when the model omits them). Same tolerance as castGoal: a short
-/// preamble above the tag is fine; a TOOL mention buried deep in prose is narration, not an action. The
-/// args are passed to the server verbatim, so a malformed blob is the server's problem to reject, not ours.
+/// The dispatcher's view of findToolCall: first real "TOOL: <name> <json-args>" call in the reply,
+/// mid-line included ("{}" when the model omits args). The args are passed to the server verbatim,
+/// so a malformed blob is the server's problem to reject, not ours.
 pub fn toolCall(full: []const u8) ?ToolCall {
-    var it = std.mem.splitScalar(u8, full, '\n');
-    var seen: usize = 0;
-    while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \r\t");
-        if (line.len == 0) continue;
-        if (std.mem.startsWith(u8, line, "TOOL:")) {
-            const rest = std.mem.trim(u8, line[5..], " \r\t");
-            if (rest.len == 0) return null;
-            var name = rest;
-            var args: []const u8 = "{}";
-            if (std.mem.indexOfAny(u8, rest, " \t{")) |sp| {
-                name = std.mem.trim(u8, rest[0..sp], " \t:");
-                const a = std.mem.trim(u8, rest[sp..], " \r\t");
-                if (a.len > 0) args = a;
-            }
-            if (name.len == 0) return null;
-            return .{ .name = name, .args = args };
-        }
-        seen += 1;
-        if (seen >= 5) return null;
-    }
-    return null;
+    const f = findToolCall(full) orelse return null;
+    return .{ .name = f.name, .args = f.args };
 }
 
 /// Many models emit tool calls as `<tool:NAME>{json-args}</tool:NAME>` (or just `<tool:NAME>{...}`) instead of
@@ -3127,6 +3596,30 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
         if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
+}
+
+/// First path segment ("app/models.py" -> "app", "app.py" -> "app.py"); leading "./" and "/" tolerated.
+fn topSegment(path: []const u8) []const u8 {
+    var p = path;
+    if (std.mem.startsWith(u8, p, "./")) p = p[2..];
+    p = std.mem.trimStart(u8, p, "/");
+    const sl = std.mem.indexOfScalar(u8, p, '/') orelse return p;
+    return p[0..sl];
+}
+
+/// Does `path`'s TOP segment appear as a top segment of any blueprint line? Dotfiles/dot-dirs are always
+/// allowed (tool sidecars, caches); an empty top never matches. Pure — the tree fallback lives in
+/// pathFitsHiveLayout (it needs the store).
+fn layoutAllows(blueprint: []const u8, path: []const u8) bool {
+    const top = topSegment(path);
+    if (top.len == 0 or top[0] == '.') return true;
+    var it = std.mem.splitScalar(u8, blueprint, '\n');
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \r\t");
+        if (ln.len == 0) continue;
+        if (std.mem.eql(u8, topSegment(ln), top)) return true;
+    }
+    return false;
 }
 
 /// Recover a filename token (foo.html, src/game.js) from a build request — used to rescue a pasted file.
@@ -3463,6 +3956,10 @@ test "stripToolTail removes a tool call (incl. mid-line) but keeps prose + prose
     try std.testing.expectEqualStrings("run this", stripToolTail("run this\nRUN: python a.py"));
     // a prose mention of TOOL: with no args is NOT clipped
     try std.testing.expectEqualStrings("use the TOOL: menu to pick one", stripToolTail("use the TOOL: menu to pick one"));
+    // ...even when an unrelated brace appears later (the old '{'-anywhere guard destroyed this answer)
+    try std.testing.expectEqualStrings("use the TOOL: menu, e.g. {\"a\":1}", stripToolTail("use the TOOL: menu, e.g. {\"a\":1}"));
+    // a mid-line no-args call to a KNOWN tool IS clipped (and toolCall dispatches the same thing)
+    try std.testing.expectEqualStrings("Let me stop it.", stripToolTail("Let me stop it. TOOL: stop_swarm"));
     // a plain answer is untouched
     try std.testing.expectEqualStrings("just a normal answer", stripToolTail("just a normal answer"));
 }
@@ -3747,6 +4244,7 @@ test "cast watch resolves the run dir, tails it, and collects on stop (no server
     chat.cmdNewConv(dd);
     // pretend a cast was fired: hex known, rel not yet resolved, one right-pane row
     chat.cast_active = true;
+    chat.cast_epoch = chat.conv_epoch; // what fireCast stamps — the cast belongs to the CURRENT conversation position
     const hex = "cafe01";
     @memcpy(chat.cast_hex[0..hex.len], hex);
     chat.cast_hex_len = hex.len;
@@ -3770,6 +4268,57 @@ test "cast watch resolves the run dir, tails it, and collects on stop (no server
     try std.testing.expect(chat.turn == .collect or chat.turn == .idle);
     llm.abort(&chat.stream, io);
     chat.stream.deinit(std.testing.allocator);
+}
+
+test "epoch barrier: a cast finishing AFTER the user moved on leaves a passive note, no hijacked collect turn" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-tmp2";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/u1/cafe02/work", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/u1/cafe02/events.jsonl", .data = "{\"seq\":1,\"kind\":\"score\",\"round\":2,\"passed\":2,\"total\":3,\"pct\":66}\n" ++
+        "{\"seq\":2,\"kind\":\"stopped\",\"reason\":\"complete\"}\n" }) catch unreachable;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = dd ++ "/u1/cafe02/swarm.json", .data = "{\"swarm\":\"chat-test\"}" }) catch unreachable;
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+    chat.cast_active = true;
+    chat.cast_epoch = chat.conv_epoch;
+    const hex = "cafe02";
+    @memcpy(chat.cast_hex[0..hex.len], hex);
+    chat.cast_hex_len = hex.len;
+    chat.cast_deadline_s = chat.nowS() + 600;
+    store.casts[0] = .{ .status = .deploying };
+    store.cast_count = 1;
+
+    chat.conv_epoch += 1; // the user moved on (a newer send / conv switch / Stop) before the cast finished
+
+    chat.watchCast(dd); // sees `stopped` — but the epoch moved, so it must NOT inject the digest or start .collect
+    try std.testing.expect(!chat.cast_active);
+    try std.testing.expect(chat.turn == .idle); // no hijacked model turn
+    var saw_note = false;
+    var saw_digest = false;
+    {
+        store.lock();
+        defer store.unlock();
+        var i: usize = 0;
+        while (i < store.msg_count) : (i += 1) {
+            const txt = store.msgs[i].textStr();
+            if (std.mem.indexOf(u8, txt, "finished in the background") != null) saw_note = true;
+            if (std.mem.indexOf(u8, txt, "score 66%") != null) saw_digest = true;
+        }
+    }
+    try std.testing.expect(saw_note);
+    try std.testing.expect(!saw_digest);
 }
 
 test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips if down)" {
@@ -4006,6 +4555,19 @@ test "toolCall parses name + raw json args" {
     try std.testing.expect(toolCall("just chatting") == null);
     try std.testing.expect(toolCall("TOOL:") == null);
     try std.testing.expect(toolCall("a\nb\nc\nd\ne\nf\nTOOL: too_deep {}") == null);
+    // MID-LINE calls now dispatch (same predicate as stripToolTail — the old dispatcher missed these
+    // while the stripper hid them, so the call was neither executed nor shown):
+    const m = toolCall("I compared both. Let me write it now.TOOL: write_file {\"path\":\"x.md\",\"content\":\"# X\"}").?;
+    try std.testing.expectEqualStrings("write_file", m.name);
+    try std.testing.expectEqualStrings("{\"path\":\"x.md\",\"content\":\"# X\"}", m.args);
+    // mid-line no-args known tool (trailing punctuation tolerated)
+    try std.testing.expectEqualStrings("stop_swarm", toolCall("Let me stop it. TOOL: stop_swarm.").?.name);
+    // a KNOWN tool call deep in prose still dispatches (only unknown names are narration there)
+    try std.testing.expectEqualStrings("web_search", toolCall("a\nb\nc\nd\ne\nf\nTOOL: web_search {\"query\":\"x\"}").?.name);
+    // markdown-wrapped line start is tolerated
+    try std.testing.expectEqualStrings("read_file", toolCall("**TOOL: read_file** {\"path\":\"a\"}").?.name);
+    // a mid-line prose mention of an unknown name is NOT a call
+    try std.testing.expect(toolCall("use the TOOL: menu to pick one") == null);
 }
 
 test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames" {
@@ -4024,6 +4586,22 @@ test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames
     try std.testing.expect(codeBlockWrite(gpa, "improve game.js", expl) == null);
     try std.testing.expectEqualStrings("game.js", recoverFilename("please edit game.js now").?);
     try std.testing.expect(recoverFilename("no file mentioned") == null);
+}
+
+test "layout guard: topSegment + layoutAllows judge new top-level paths against the hive blueprint" {
+    try std.testing.expectEqualStrings("app", topSegment("app/models.py"));
+    try std.testing.expectEqualStrings("app.py", topSegment("app.py"));
+    try std.testing.expectEqualStrings("app", topSegment("./app/__init__.py"));
+    const bp = "app.py\nbase.html\napp/models.py\nconfig.py\nrequirements.txt";
+    // inside the blueprint's structure -> allowed
+    try std.testing.expect(layoutAllows(bp, "app/routes.py"));
+    try std.testing.expect(layoutAllows(bp, "app.py"));
+    try std.testing.expect(layoutAllows(bp, "config.py"));
+    // a NEW top-level package beside the hive's layout (the rival-build failure) -> rejected
+    try std.testing.expect(!layoutAllows(bp, "social_network/app/__init__.py"));
+    try std.testing.expect(!layoutAllows(bp, "main.py"));
+    // dotfiles/tool sidecars always pass
+    try std.testing.expect(layoutAllows(bp, ".tool-chat.py"));
 }
 
 test "toolCallLoose recovers a call narrated inside reasoning" {

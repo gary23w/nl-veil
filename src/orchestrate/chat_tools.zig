@@ -1,15 +1,18 @@
 //! Shared tool endpoint — ONE HTTP surface that both the desktop chat and any external client
 //! call to run a SINGLE tool exactly the way a hive mind would. Mind tools (web_search, web_fetch,
 //! recall_hive, observe, …) dispatch straight to the worker's `tools.execute()` through a minimal
-//! ToolCtx; orchestration verbs (list_swarms / stop_swarm / swarm_findings) wrap the supervisor +
-//! run-dir so a chat can drive its own swarms. Hive and chat share this ONE registry — as the tool
-//! set grows, both surfaces grow with it (the user's ask: "add a single chat endpoint api to the
-//! server side tools … then as we scale tools both hive and chat share the same").
+//! ToolCtx; orchestration verbs (list_swarms / stop_swarm / kill_swarm / swarm_status / swarm_findings)
+//! wrap the supervisor + run-dir so a chat can drive its own swarms. Hive and chat share this ONE
+//! registry — as the tool set grows, both surfaces grow with it (the user's ask: "add a single chat
+//! endpoint api to the server side tools … then as we scale tools both hive and chat share the same").
 //!
 //!   POST /api/v1/chat/tool
 //!     { "tool":"web_search",     "args":"{\"query\":\"...\"}" }   // args = JSON string, tool-call style
-//!     { "tool":"stop_swarm",     "id":"<swarm-id>" }
+//!     { "tool":"stop_swarm",     "id":"<swarm-id>" }              // cooperative (next turn boundary)
+//!     { "tool":"kill_swarm",     "id":"<swarm-id>" }              // hard-kill; run dir kept
+//!     { "tool":"swarm_status",   "id":"<swarm-id>" }              // state/pid/round/phase/budget
 //!     { "tool":"swarm_findings", "id":"<swarm-id>" }
+//!   (swarm ids resolve as EITHER the registry key or the run-dir basename)
 //!   -> { "ok":true, "tool":"...", "result":"..." }               // mind tool
 //!   -> { "ok":true, "tool":"list_swarms", "swarms":[ … ] }       // orchestration
 
@@ -18,6 +21,7 @@ const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
+const sup_mod = @import("supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -105,6 +109,8 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // --- orchestration tools (wrap the supervisor + run dir) -------------------------------
     if (std.mem.eql(u8, tool, "list_swarms")) return listSwarms(app, u.id, res);
     if (std.mem.eql(u8, tool, "stop_swarm")) return stopSwarm(app, u.id, argId(body), res);
+    if (std.mem.eql(u8, tool, "kill_swarm")) return killSwarm(app, u.id, argId(body), res);
+    if (std.mem.eql(u8, tool, "swarm_status")) return swarmStatus(app, u.id, argId(body), res);
     if (std.mem.eql(u8, tool, "swarm_findings")) return findings(app, u.id, argId(body), res);
 
     // --- the full hive-mind tool surface (the same executor the hive uses) -----------------
@@ -148,15 +154,106 @@ fn listSwarms(app: *App, uid: u64, res: *httpz.Response) !void {
 
 fn stopSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "stop_swarm needs an id");
-    const sw = app.sup.get(id) orelse return notFound(res);
+    const sw = app.sup.resolve(id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
-    app.sup.stop(id);
-    try res.json(.{ .ok = true, .tool = "stop_swarm", .stopped = true, .id = id }, .{});
+    app.sup.stop(sw.id);
+    // Honest response: the STOP file is COOPERATIVE — the worker acts on it at its next turn/round
+    // boundary, so the state is "stopping" until the supervisor confirms the process is gone.
+    try res.json(.{ .ok = true, .tool = "stop_swarm", .requested = true, .id = id, .state = "stopping", .note = "stop requested (cooperative; takes effect at the next turn boundary) — check swarm_status to confirm, or kill_swarm to force" }, .{});
+}
+
+fn killSwarm(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
+    if (id.len == 0) return badReq(res, "kill_swarm needs an id");
+    const sw = app.sup.resolve(id) orelse return notFound(res);
+    if (sw.uid != uid) return unauth(res);
+    _ = app.sup.kill(sw.id);
+    try res.json(.{ .ok = true, .tool = "kill_swarm", .requested = true, .id = id, .state = "stopping", .note = "hard-kill requested (STOP written + worker process terminated); the run dir and its findings are kept — the supervisor confirms the death shortly" }, .{});
+}
+
+/// swarm_status — everything a chat model needs to answer "why is it still running": supervisor state,
+/// the live-pid verdict, round/phase/pct parsed from a BOUNDED tail of events.jsonl (last 64KB — never a
+/// whole multi-MB log), elapsed seconds vs the manifest's minutes budget, and the last lifecycle event.
+fn swarmStatus(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
+    if (id.len == 0) return badReq(res, "swarm_status needs an id");
+    const sw = app.sup.resolve(id) orelse return notFound(res);
+    if (sw.uid != uid) return unauth(res);
+    const pid_st = app.sup.pidStatus(sw.run_dir);
+
+    // minutes budget straight from the manifest; elapsed from the supervisor's created stamp (spawn time
+    // for a live cast; adoption time for a re-adopted dir — approximate there, exact where it matters)
+    var minutes: u32 = 0;
+    {
+        const mp = try std.fmt.allocPrint(res.arena, "{s}/swarm.json", .{sw.run_dir});
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, mp, res.arena, .limited(256 << 10))) |mtxt| {
+            const M = struct { minutes: u32 = 0 };
+            if (std.json.parseFromSliceLeaky(M, res.arena, mtxt, .{ .ignore_unknown_fields = true })) |mv| minutes = mv.minutes else |_| {}
+        } else |_| {}
+    }
+    const now = std.Io.Timestamp.now(app.io, .real).toSeconds();
+    const elapsed: i64 = @max(0, now - sw.created);
+
+    // bounded tail of the event log — round / phase / pct + the last lifecycle event (goal/complete/stopped)
+    var round: i64 = 0;
+    var phase: []const u8 = "";
+    var pct_now: i64 = -1;
+    var pct_best: i64 = -1;
+    var last_kind: []const u8 = "";
+    var last_text: []const u8 = "";
+    {
+        const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{sw.run_dir});
+        const tail_buf = try res.arena.alloc(u8, 64 << 10);
+        var tail: []const u8 = sup_mod.readTail(app.io, ev_path, tail_buf) orelse "";
+        if (tail.len == tail_buf.len) {
+            // clipped mid-line: drop the partial first line so field parses never read torn JSON
+            if (std.mem.indexOfScalar(u8, tail, '\n')) |nl| tail = tail[nl + 1 ..];
+        }
+        var it = std.mem.splitScalar(u8, tail, '\n');
+        while (it.next()) |raw| {
+            const ln = std.mem.trim(u8, raw, " \r\t");
+            if (ln.len < 8) continue;
+            const kind = jsonField(ln, "kind");
+            if (kind.len == 0) continue;
+            if (jsonNumField(ln, "round")) |r| {
+                if (r > round) round = r;
+            }
+            if (std.mem.eql(u8, kind, "phase")) {
+                phase = jsonField(ln, "phase");
+                if (jsonNumField(ln, "now")) |v| pct_now = v;
+                if (jsonNumField(ln, "best")) |v| pct_best = v;
+            } else if (std.mem.eql(u8, kind, "started") or std.mem.eql(u8, kind, "goal") or std.mem.eql(u8, kind, "resumed")) {
+                last_kind = kind;
+                last_text = jsonField(ln, "goal");
+            } else if (std.mem.eql(u8, kind, "complete") or std.mem.eql(u8, kind, "stopped")) {
+                last_kind = kind;
+                last_text = jsonField(ln, "reason");
+            }
+        }
+    }
+    const lt = try res.arena.dupe(u8, clip(last_text, 300));
+    scrubUtf8(lt); // event text may clip mid-multibyte; res.json requires valid UTF-8
+
+    try res.json(.{
+        .ok = true,
+        .tool = "swarm_status",
+        .id = id,
+        .state = @tagName(sw.state),
+        .pid = pid_st.pid,
+        .pid_alive = pid_st.alive,
+        .round = round,
+        .phase = phase,
+        .pct_now = pct_now,
+        .pct_best = pct_best,
+        .elapsed_s = elapsed,
+        .budget_minutes = minutes,
+        .over_budget = minutes > 0 and elapsed > @as(i64, minutes) * 60,
+        .last_event = last_kind,
+        .last_event_text = lt,
+    }, .{});
 }
 
 fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
     if (id.len == 0) return badReq(res, "swarm_findings needs an id");
-    const sw = app.sup.get(id) orelse return notFound(res);
+    const sw = app.sup.resolve(id) orelse return notFound(res);
     if (sw.uid != uid) return unauth(res);
     // Prefer the lead synthesis; fall back to the tail of the raw event log.
     const syn_path = try std.fmt.allocPrint(res.arena, "{s}/work/synthesis.md", .{sw.run_dir});
@@ -371,6 +468,21 @@ fn jsonField(s: []const u8, key: []const u8) []const u8 {
     const start = i;
     while (i < s.len and s[i] != '"') : (i += 1) {}
     return s[start..i];
+}
+
+/// Integer value of a top-level "key" in a flat JSON object (e.g. `"round":12`). Returns null if absent
+/// or not a plain integer. Companion to jsonField for the numeric event fields swarm_status reads.
+fn jsonNumField(s: []const u8, key: []const u8) ?i64 {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const kidx = std.mem.indexOf(u8, s, pat) orelse return null;
+    var i = kidx + pat.len;
+    while (i < s.len and (s[i] == ' ' or s[i] == ':' or s[i] == '\t')) : (i += 1) {}
+    const start = i;
+    if (i < s.len and s[i] == '-') i += 1;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    if (i == start) return null;
+    return std.fmt.parseInt(i64, s[start..i], 10) catch null;
 }
 
 /// Last `max` bytes of `s`, snapped forward to the next line boundary so we never emit a half line.

@@ -78,7 +78,10 @@ fn terminateVeilPid(pid: u32) void {
     _ = winproc.TerminateProcess(h, 1);
 }
 
-pub const State = enum { starting, running, stopped, crashed };
+/// .stopping = a stop/kill was REQUESTED but the worker process hasn't been confirmed dead yet (the STOP
+/// file is cooperative — the worker acts on it at its next turn/round boundary). reconcile() flips it to
+/// .stopped once the pid is actually gone or the worker wrote its DONE marker.
+pub const State = enum { starting, running, stopping, stopped, crashed };
 
 pub const Swarm = struct {
     id: []const u8,
@@ -258,6 +261,21 @@ pub const Supervisor = struct {
         return self.swarms.get(id);
     }
 
+    /// get(), but tolerant of the two id forms in the wild: the registry key (the spawn-time hex id for a
+    /// live swarm) OR the run-dir BASENAME (what a server restart re-adopts a dir as, and what the desktop
+    /// Swarm tab shows/sends for a chat cast building in `_chat/builds/{conv}`). Callers that mutate must
+    /// use the returned swarm's own `.id` — it may differ from the id they passed.
+    pub fn resolve(self: *Supervisor, id: []const u8) ?*Swarm {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.swarms.get(id)) |s| return s;
+        var it = self.swarms.valueIterator();
+        while (it.next()) |sp| {
+            if (idMatchesRunDir(sp.*.run_dir, id)) return sp.*;
+        }
+        return null;
+    }
+
     pub fn stop(self: *Supervisor, id: []const u8) void {
         // Read run_dir + set state UNDER the lock (respawn/meter/reconcile touch the same Swarm concurrently
         // on other httpz threads); the STOP-file IO runs after on a local copy of the path.
@@ -268,9 +286,50 @@ pub const Supervisor = struct {
             defer self.mu.unlock(self.io);
             const sw = self.swarms.get(id) orelse return;
             stop_path = std.fmt.bufPrint(&buf, "{s}/STOP", .{sw.run_dir}) catch return;
-            sw.state = .stopped;
+            // Truthful state: the STOP file is a cooperative REQUEST the worker acts on at its next turn/
+            // round boundary. Report .stopping; reconcile flips it to .stopped once the pid is confirmed
+            // dead (or DONE appears). A .crashed worker is already dead — that one IS stopped now.
+            if (sw.state == .running or sw.state == .starting) {
+                sw.state = .stopping;
+            } else if (sw.state == .crashed) {
+                sw.state = .stopped;
+            }
         }
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = stop_path, .data = "" }) catch {};
+    }
+
+    /// Hard-kill a swarm's worker WITHOUT touching its run dir (unlike remove(), nothing is deleted): write
+    /// the STOP file (so a worker that somehow survives the kill still stops cooperatively), then terminate
+    /// the process — the owned Child handle if we hold one, else via the pid file. killByPidFile routes
+    /// through terminateVeilPid, which refuses our own pid and any pid that isn't a LIVE veil worker — a
+    /// stale/recycled worker.pid once taskkilled the server itself, so that check is load-bearing. A run dir
+    /// whose worker already wrote DONE skips the pid-file path entirely (clean exit; nothing left to kill).
+    /// State goes to .stopping; reconcile confirms the death and flips it to .stopped. False = unknown id.
+    pub fn kill(self: *Supervisor, id: []const u8) bool {
+        var rd_buf: [1024]u8 = undefined;
+        var run_dir: []const u8 = "";
+        var child_copy: ?std.process.Child = null;
+        {
+            self.mu.lockUncancelable(self.io);
+            defer self.mu.unlock(self.io);
+            const sw = self.swarms.get(id) orelse return false;
+            const n = @min(sw.run_dir.len, rd_buf.len);
+            @memcpy(rd_buf[0..n], sw.run_dir[0..n]);
+            run_dir = rd_buf[0..n];
+            child_copy = sw.child;
+            sw.child = null;
+            if (sw.state != .stopped) sw.state = .stopping;
+        }
+        var pbuf: [1200]u8 = undefined;
+        if (std.fmt.bufPrint(&pbuf, "{s}/STOP", .{run_dir})) |sp| {
+            std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = sp, .data = "" }) catch {};
+        } else |_| {}
+        if (child_copy) |*c| {
+            c.kill(self.io); // blocks until dead + reaps the handle
+        } else if (!self.hasDoneMarker(run_dir)) {
+            self.killByPidFile(run_dir);
+        }
+        return true;
     }
 
     pub fn remove(self: *Supervisor, id: []const u8) void {
@@ -329,7 +388,7 @@ pub const Supervisor = struct {
     /// line, so a normal swarm's full-tree wipe scrubs it — for a chat dir we must scrub it explicitly or the
     /// key would be stranded on disk. `.build_manifest` and DELIVERY/ are deliberately kept (the chat reads them).
     fn cleanCastMeta(self: *Supervisor, run_dir: []const u8) void {
-        const meta = [_][]const u8{ "swarm.json", "worker.pid", "STOP", "events.jsonl", "control.jsonl", "mind.sqlite", ".usage", ".round_writes", ".explore_seen", "keys.env", "keys.env.enc" };
+        const meta = [_][]const u8{ "swarm.json", "worker.pid", "STOP", "DONE", "events.jsonl", "events.prev.jsonl", "control.jsonl", "mind.sqlite", ".usage", ".round_writes", ".explore_seen", "keys.env", "keys.env.enc" };
         var buf: [1200]u8 = undefined;
         for (meta) |f| {
             const p = std.fmt.bufPrint(&buf, "{s}/{s}", .{ run_dir, f }) catch continue;
@@ -573,7 +632,7 @@ pub const Supervisor = struct {
 
     pub fn reconcile(self: *Supervisor) void {
         const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
-        const Cand = struct { id: []const u8, run_dir: []const u8 };
+        const Cand = struct { id: []const u8, run_dir: []const u8, st: State };
         var cands: std.ArrayList(Cand) = .empty;
         defer {
             for (cands.items) |c| {
@@ -593,7 +652,7 @@ pub const Supervisor = struct {
             var it = self.swarms.valueIterator();
             while (it.next()) |sp| {
                 const s = sp.*;
-                if (s.state != .running and s.state != .starting) continue;
+                if (s.state != .running and s.state != .starting and s.state != .stopping) continue;
                 if (now - s.last_check < RECHECK_SECS) continue;
                 s.last_check = now;
                 const id = self.gpa.dupe(u8, s.id) catch continue;
@@ -601,26 +660,45 @@ pub const Supervisor = struct {
                     self.gpa.free(id);
                     continue;
                 };
-                cands.append(self.gpa, .{ .id = id, .run_dir = rd }) catch {
+                cands.append(self.gpa, .{ .id = id, .run_dir = rd, .st = s.state }) catch {
                     self.gpa.free(id);
                     self.gpa.free(rd);
                 };
             }
         }
         for (cands.items) |c| {
-            const new_state = self.probeState(c.run_dir);
-            self.mu.lockUncancelable(self.io);
-            defer self.mu.unlock(self.io);
-            if (self.swarms.get(c.id)) |s| {
-                if (s.state == .running or s.state == .starting) {
-                    s.state = new_state;
-                    if (new_state == .crashed and self.shouldRestart(s, now)) {
-                        if (self.gpa.dupe(u8, c.id)) |rid|
-                            restart_ids.append(self.gpa, rid) catch self.gpa.free(rid)
-                        else |_| {}
+            // a .stopping swarm is confirmed by pid-death/DONE, not by probeState's STOP-file heuristic
+            // (STOP is the stop REQUEST itself — it would flip .stopping to .stopped instantly and lie)
+            const new_state = if (c.st == .stopping) self.probeStopping(c.run_dir) else self.probeState(c.run_dir);
+            const done = new_state == .stopped and self.hasDoneMarker(c.run_dir);
+            var reap: ?std.process.Child = null;
+            {
+                self.mu.lockUncancelable(self.io);
+                defer self.mu.unlock(self.io);
+                if (self.swarms.get(c.id)) |s| {
+                    if (s.state == .running or s.state == .starting) {
+                        s.state = new_state;
+                        if (new_state == .crashed and self.shouldRestart(s, now)) {
+                            if (self.gpa.dupe(u8, c.id)) |rid|
+                                restart_ids.append(self.gpa, rid) catch self.gpa.free(rid)
+                            else |_| {}
+                        }
+                        // a finished worker (clean exit wrote DONE) whose Child handle we still hold: reap it
+                        if (done) {
+                            reap = s.child;
+                            s.child = null;
+                        }
+                    } else if (s.state == .stopping and new_state == .stopped) {
+                        // stop/kill confirmed: the pid is actually gone (or the worker wrote DONE) — NOW
+                        // it's truthfully stopped. Never respawn a swarm the operator asked to stop.
+                        s.state = .stopped;
+                        reap = s.child;
+                        s.child = null;
                     }
                 }
             }
+            // outside the lock: kill() on an already-dead child returns at once and frees the handle
+            if (reap) |*ch| ch.kill(self.io);
         }
         for (restart_ids.items) |rid| self.respawn(rid);
     }
@@ -642,14 +720,43 @@ pub const Supervisor = struct {
         return if (self.pidAlive(pid)) .running else .crashed;
     }
 
+    /// Probe for a swarm already in .stopping: only pid-death or the worker's DONE marker confirms the stop.
+    /// The STOP file must NOT count here — it's the stop REQUEST (written by stop()/kill()), not evidence
+    /// the process exited. A missing worker.pid also reads as gone: the clean-exit path deletes it.
+    fn probeStopping(self: *Supervisor, run_dir: []const u8) State {
+        if (self.hasDoneMarker(run_dir)) return .stopped;
+        const pid = self.workerPid(run_dir) orelse return .stopped;
+        return if (self.pidAlive(pid)) .stopping else .stopped;
+    }
+
+    /// The worker's clean-exit marker (<run_dir>/DONE, written beside the final "stopped" event).
+    fn hasDoneMarker(self: *Supervisor, run_dir: []const u8) bool {
+        var buf: [1280]u8 = undefined;
+        const p = std.fmt.bufPrint(&buf, "{s}/DONE", .{run_dir}) catch return false;
+        if (std.Io.Dir.cwd().access(self.io, p, .{})) |_| return true else |_| return false;
+    }
+
     fn hasTerminalMarker(self: *Supervisor, run_dir: []const u8) bool {
+        // Marker FILES first — cheap, and immune to events.jsonl size.
+        if (self.hasDoneMarker(run_dir)) return true;
         var buf: [1280]u8 = undefined;
         const stop_path = std.fmt.bufPrint(&buf, "{s}/STOP", .{run_dir}) catch return false;
         if (std.Io.Dir.cwd().access(self.io, stop_path, .{})) |_| return true else |_| {}
+        // Fallback for pre-DONE run dirs: the terminal record only lives inside events.jsonl. Read ONLY the
+        // last 64KB — readFileAlloc(.limited) ERRORS (not truncates) past its cap, and that error read as
+        // "no marker", which classified every long finished run as .crashed and made reconcile respawn
+        // finished workers forever. Any read failure is just "no marker", never a crash signal by itself.
         const ev_path = std.fmt.bufPrint(&buf, "{s}/events.jsonl", .{run_dir}) catch return false;
-        const ev = std.Io.Dir.cwd().readFileAlloc(self.io, ev_path, self.gpa, .limited(1 << 20)) catch return false;
-        defer self.gpa.free(ev);
-        return std.mem.indexOf(u8, ev, "\"kind\":\"stopped\"") != null;
+        var tail_buf: [64 << 10]u8 = undefined;
+        const tail = readTail(self.io, ev_path, &tail_buf) orelse return false;
+        return std.mem.indexOf(u8, tail, "\"kind\":\"stopped\"") != null;
+    }
+
+    /// Native pid verdict for a run dir: the recorded worker.pid and whether it is a LIVE veil worker right
+    /// now (a dead or recycled pid reads as not alive). pid 0 = no readable pid file.
+    pub fn pidStatus(self: *Supervisor, run_dir: []const u8) struct { pid: u32, alive: bool } {
+        const pid = self.workerPid(run_dir) orelse return .{ .pid = 0, .alive = false };
+        return .{ .pid = pid, .alive = self.pidAlive(pid) };
     }
 
     fn workerPid(self: *Supervisor, run_dir: []const u8) ?u32 {
@@ -724,3 +831,52 @@ pub const Supervisor = struct {
         return list.toOwnedSlice(self.gpa);
     }
 };
+
+/// True when `id` names this run dir by its BASENAME (either slash form) — the alternate swarm-id form a
+/// re-adopted dir gets and the desktop Swarm tab sends for chat casts.
+fn idMatchesRunDir(run_dir: []const u8, id: []const u8) bool {
+    if (id.len == 0) return false;
+    return std.mem.eql(u8, std.fs.path.basename(run_dir), id);
+}
+
+/// Read at most `buf.len` bytes from the END of the file at `path` (positional read at size-buf.len).
+/// Returns the bytes read, or null on any error — callers treat null as "no data", never as a crash signal.
+/// The slice may begin mid-line when the file was longer than the buffer.
+pub fn readTail(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    const size = f.length(io) catch return null;
+    const off: u64 = if (size > buf.len) size - buf.len else 0;
+    const n = f.readPositionalAll(io, buf, off) catch return null;
+    return buf[0..n];
+}
+
+// ---------------------------------------------------------------------------------------------------- tests
+
+test "idMatchesRunDir: basename hits on both slash forms, misses on substrings and the empty id" {
+    try std.testing.expect(idMatchesRunDir("data/u1/_chat/builds/conv42", "conv42"));
+    try std.testing.expect(idMatchesRunDir("data\\u1\\_chat\\builds\\conv42", "conv42"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", "conv4"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", "builds"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", ""));
+}
+
+test "readTail: whole small file; only the last bytes of a big one; null for a missing path" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "zig-supervisor-tail-tmp.jsonl";
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expect(readTail(io, path, &buf) == null); // missing file -> null, not an error
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "short" });
+    try std.testing.expectEqualStrings("short", readTail(io, path, &buf).?);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "0123456789abcdefghij" }); // 20 > 16
+    try std.testing.expectEqualStrings("456789abcdefghij", readTail(io, path, &buf).?);
+}
