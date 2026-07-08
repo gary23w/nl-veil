@@ -1237,6 +1237,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var sreason_buf: [4096]u8 = undefined;
     const sreason_n = @min(store.stream_reason_len, sreason_buf.len);
     @memcpy(sreason_buf[0..sreason_n], store.stream_reason[0..sreason_n]);
+    const stream_draft = store.stream_draft;
     const busy = store.chat_busy;
     var status: [96]u8 = undefined;
     const status_n: usize = store.chat_status_len;
@@ -1274,8 +1275,10 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = right.x - (left.x + left_w) - pad * 2, .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
-    var inflight_buf: [13312]u8 = undefined;
-    const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n]);
+    // Sized for the draft-mode worst case: quoted reasoning (4096 + "> " per line) + separator + "— drafting —"
+    // header + the quoted 12288-cap reflect draft; quoteInto ellipsizes gracefully if this still overflows.
+    var inflight_buf: [18432]u8 = undefined;
+    const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
 
     var cast_live = false;
     for (casts[0..cast_n]) |*c| {
@@ -1450,22 +1453,44 @@ fn streamToolLabel(content: []const u8, buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s} {s}...", .{ verb, target }) catch null;
 }
 
-fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8) []const u8 {
+/// Append `text` line-by-line as a `> ` blockquote (the thinking style). Returns the new write offset.
+/// A line that doesn't fit is partially emitted with a trailing ellipsis (never silently dropped).
+fn quoteInto(buf: []u8, at: usize, text: []const u8) usize {
+    var w = at;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \r\t");
+        if (ln.len == 0) continue;
+        if (w + ln.len + 3 > buf.len) {
+            if (buf.len - w > 16) { // room for "> " + a meaningful head + "…\n" (… is 3 bytes)
+                buf[w] = '>';
+                buf[w + 1] = ' ';
+                w += 2;
+                const take = buf.len - w - 4;
+                @memcpy(buf[w .. w + take], ln[0..take]);
+                w += take;
+                @memcpy(buf[w .. w + 3], "…");
+                w += 3;
+                buf[w] = '\n';
+                w += 1;
+            }
+            break;
+        }
+        buf[w] = '>';
+        buf[w + 1] = ' ';
+        w += 2;
+        @memcpy(buf[w .. w + ln.len], ln);
+        w += ln.len;
+        buf[w] = '\n';
+        w += 1;
+    }
+    return w;
+}
+
+fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8, draft: bool) []const u8 {
     var w: usize = 0;
     if (reasoning.len > 0) {
-        var it = std.mem.splitScalar(u8, reasoning, '\n');
-        while (it.next()) |line| {
-            const ln = std.mem.trim(u8, line, " \r\t");
-            if (ln.len == 0) continue;
-            if (w + ln.len + 3 > buf.len) break;
-            buf[w] = '>';
-            buf[w + 1] = ' ';
-            w += 2;
-            @memcpy(buf[w .. w + ln.len], ln);
-            w += ln.len;
-            buf[w] = '\n';
-            w += 1;
-        }
+        w = quoteInto(buf, w, reasoning);
         if (w + 1 < buf.len) {
             buf[w] = '\n';
             w += 1;
@@ -1475,6 +1500,13 @@ fn buildInflight(buf: []u8, reasoning: []const u8, content: []const u8) []const 
     // JSON body (which is a wall of text until the turn settles and collapses to a chip).
     var tbuf: [160]u8 = undefined;
     const shown = streamToolLabel(content, &tbuf) orelse content;
+    if (draft and shown.len > 0) {
+        // PRE-FINAL draft: render it as thinking (quoted, under a drafting header), never as answer body —
+        // a self-check pass will revise it, and only the final committed message should read as the reply.
+        w = quoteInto(buf, w, "— drafting —");
+        w = quoteInto(buf, w, shown);
+        return buf[0..w];
+    }
     const cn = @min(shown.len, buf.len - w);
     @memcpy(buf[w .. w + cn], shown[0..cn]);
     w += cn;
