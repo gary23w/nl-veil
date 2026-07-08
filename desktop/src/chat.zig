@@ -106,10 +106,13 @@ const SYSTEM_PROMPT =
     "choose Always). So make every command COUNT: one correct, self-contained command per reply — never a probe " ++
     "you'd immediately redo. I reply with a [console] message containing its output + exit status; read that, then " ++
     "either RUN another command or give your final answer. This is WINDOWS cmd — use Windows commands (dir, type, " ++
-    "cd, copy, del, findstr, python), NOT unix ones (ls, cat, pwd, rm). For anything with nested quotes or a " ++
-    "multi-line body (PowerShell here-strings, a script), WRITE A FILE with write_file first and then RUN it " ++
-    "(e.g. write reminder.ps1, then RUN: powershell -ExecutionPolicy Bypass -File reminder.ps1) — do NOT try to " ++
-    "cram it into one quoted command line, which mangles. If the user denies a command, don't retry it blindly — " ++
+    "cd, copy, del, findstr, python), NOT unix ones (ls, cat, pwd, rm). Quoting works as in a real terminal " ++
+    "(e.g. RUN: powershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\" is fine). Commands execute via a " ++
+    "batch script, so in for-loops double the percent sign (for %%i in ...), not %i, and write a literal percent " ++
+    "before a letter as %% (findstr \"100%%\") — %VAR% environment expansion still works normally. For a multi-line body " ++
+    "(PowerShell here-strings, a script), WRITE A FILE with write_file first and then RUN it " ++
+    "(e.g. write reminder.ps1, then RUN: powershell -ExecutionPolicy Bypass -File reminder.ps1). " ++
+    "If the user denies a command, don't retry it blindly — " ++
     "ask or take another approach. Never run something irreversible (deleting data, killing processes) unasked. " ++
     "For pure web/research questions use web_search or CAST, not RUN.\n" ++
     "\n" ++
@@ -245,17 +248,24 @@ const winproc = if (builtin.os.tag == .windows) struct {
 
 /// Non-blocking: has `child` exited? Windows peeks the exit code off the process handle (the caller still
 /// reaps via Child.wait); POSIX reaps with waitpid(WNOHANG) and nulls child.id so the caller must NOT wait.
-fn procExited(child: *std.process.Child) bool {
+/// On a natural exit `exit_code` receives the FULL exit status where the OS makes it available — the u32
+/// matters on Windows: Child.wait's Term truncates to u8, which reads NTSTATUS crashes (0xC0000135 = DLL
+/// not found) as small numbers and any multiple of 256 as a clean 0.
+fn procExited(child: *std.process.Child, exit_code: *?u32) bool {
     const id = child.id orelse return true; // already reaped / killed
     if (builtin.os.tag == .windows) {
         var code: u32 = 0;
         if (winproc.GetExitCodeProcess(id, &code) == 0) return true; // handle unusable → treat as done
-        return code != winproc.STILL_ACTIVE;
+        if (code == winproc.STILL_ACTIVE) return false;
+        exit_code.* = code;
+        return true;
     } else {
         var status: c_int = undefined;
         const r = std.c.waitpid(id, &status, 1); // 1 = WNOHANG
         if (r == 0) return false; // still running
         child.id = null; // reaped here — don't Child.wait again
+        const st: u32 = @bitCast(status);
+        if (st & 0x7f == 0) exit_code.* = (st >> 8) & 0xff; // WIFEXITED → WEXITSTATUS (signal deaths stay null)
         return true;
     }
 }
@@ -309,6 +319,10 @@ pub const Chat = struct {
     //                                 here (no draft+revision double-post); appendMsg keeps it valid across eviction
     reflect_trace: [8192]u8 = undefined, // reasoning accumulated across the draft + every self-check pass; lands as
     reflect_trace_len: usize = 0, //        ONE collapsed .thought message above the answer at finalize
+    reflect_trace_has_reason: bool = false, // did ANY pass contribute real reasoning (not just its label)? A
+    //                                         labels-only trace is noise — no .thought chip is inserted for it
+    draft_latched: bool = false, // this turn's stream crossed REFLECT_MIN_ANSWER (drafting presentation is
+    //                              sticky per turn — see pumpStream); reset at every startTurn
     // CONVERSATION EPOCH — the cancellation barrier. Bumped whenever the user moves the conversation forward
     // (send / new conv / switch conv / Stop). Deferred continuations (cast collect, veil parallel work) capture
     // it when SCHEDULED and refuse to mutate the chat if it has moved — a finished cast then leaves one passive
@@ -638,6 +652,7 @@ pub const Chat = struct {
         if (!v) {
             self.store.stream_len = 0;
             self.store.stream_reason_len = 0;
+            self.store.stream_draft = false;
             self.store.chat_status_len = 0;
         }
     }
@@ -744,6 +759,10 @@ pub const Chat = struct {
         self.store.consoleAppend(ai, "\n> ");
         self.store.consoleAppend(ai, trimmed);
         self.store.consoleAppend(ai, "\n");
+        // The AI door learns the batch %-rules from its system prompt; the HUMAN typing into the You tab
+        // gets a one-line hint when their command is about to hit the classic trap ("%i was unexpected").
+        if (builtin.os.tag == .windows and !ai and needsBatchPercentHint(trimmed))
+            self.store.consoleAppend(ai, "(note: this console runs commands via a batch script — write for-loop variables as %%i, not %i)\n");
 
         // Sink files: <dd>/.veil-desk/console_{ai|you}.{out,err}. createFile truncates, so a prior run's bytes
         // never bleed in. Two files (not one) because Windows reopens each inherited handle independently, so a
@@ -783,13 +802,50 @@ pub const Chat = struct {
         else
             null;
         defer if (cwd_dir) |*d| d.close(self.io); // valid through the spawn call; closed after
-        // Windows: run through cmd /c so the user gets the shell they expect (dir, echo, git, python, …).
-        const argv = if (builtin.os.tag == .windows)
-            [_][]const u8{ "cmd", "/c", trimmed }
-        else
-            [_][]const u8{ "sh", "-c", trimmed };
+        // Windows: the command runs from a .cmd BATCH FILE, never as `cmd /c <argv element>`. spawn
+        // serializes argv with C-runtime quoting (an embedded " becomes \") but cmd.exe parses its command
+        // line under its OWN rules and never un-escapes \" — so any quoted command reached its child with
+        // literal backslash-quote bytes (observed: powershell -Command "(Get-Date)..." degraded into a
+        // quoted string literal that PowerShell just echoed). With a script file, spawn hands cmd.exe only
+        // the (quoted) script path and the command INSIDE the file is parsed exactly as if typed in a
+        // terminal: quotes, &&, pipes and redirects all keep their meaning. The path must be absolute
+        // (a relative argv[0] resolves against .cwd — the BUILD dir — not where the script lives).
+        var win_argv: [1][]const u8 = undefined;
+        var apb: [520]u8 = undefined;
+        const posix_argv = [_][]const u8{ "sh", "-c", trimmed };
+        const argv: []const []const u8 = if (builtin.os.tag == .windows) blk: {
+            var cpb: [332]u8 = undefined;
+            const cmdp = std.fmt.bufPrint(&cpb, "{s}.cmd", .{base}) catch {
+                of.close(self.io);
+                ef.close(self.io);
+                self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
+                return;
+            };
+            var script: [8192]u8 = undefined;
+            const body = buildBatchScript(&script, trimmed) orelse {
+                of.close(self.io);
+                ef.close(self.io);
+                self.consoleLaunchFailed(dd, ai, "(the command is too long or contains bytes the console cannot carry)");
+                return;
+            };
+            Io.Dir.cwd().writeFile(self.io, .{ .sub_path = cmdp, .data = body }) catch {
+                of.close(self.io);
+                ef.close(self.io);
+                self.consoleLaunchFailed(dd, ai, "(failed to write the command script)");
+                return;
+            };
+            const an = Io.Dir.cwd().realPathFile(self.io, cmdp, &apb) catch {
+                of.close(self.io);
+                ef.close(self.io);
+                Io.Dir.cwd().deleteFile(self.io, cmdp) catch {};
+                self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
+                return;
+            };
+            win_argv[0] = apb[0..an];
+            break :blk &win_argv;
+        } else &posix_argv;
         const child = std.process.spawn(self.io, .{
-            .argv = &argv,
+            .argv = argv,
             .cwd = if (cwd_dir) |d| .{ .dir = d } else .inherit,
             .stdin = .ignore,
             .stdout = .{ .file = of },
@@ -798,6 +854,12 @@ pub const Chat = struct {
         }) catch {
             of.close(self.io);
             ef.close(self.io);
+            if (builtin.os.tag == .windows) {
+                var cpb2: [332]u8 = undefined;
+                if (std.fmt.bufPrint(&cpb2, "{s}.cmd", .{base})) |cmdp| {
+                    Io.Dir.cwd().deleteFile(self.io, cmdp) catch {};
+                } else |_| {}
+            }
             self.consoleLaunchFailed(dd, ai, "(failed to launch the command)");
             return;
         };
@@ -852,7 +914,8 @@ pub const Chat = struct {
 
         const Outcome = enum { running, exited, timed_out, canceled, flooded };
         var outcome: Outcome = .running;
-        if (procExited(&p.child)) {
+        var exit_code: ?u32 = null; // full u32 from the exit peek/reap (null = unknowable, e.g. killed)
+        if (procExited(&p.child, &exit_code)) {
             outcome = .exited;
         } else if (self.console_cancel) {
             outcome = .canceled;
@@ -869,7 +932,7 @@ pub const Chat = struct {
         // already reaped and nulled id, so wait would trip the id!=null assert — the null guard skips it there.
         if (outcome == .exited) {
             if (p.child.id != null) {
-                if (p.child.wait(self.io)) |_| {} else |_| {}
+                if (p.child.wait(self.io)) |_| {} else |_| {} // reap only — the code came from the peek
             }
         } else {
             p.child.kill(self.io);
@@ -889,11 +952,27 @@ pub const Chat = struct {
         const err_slice = if (scratch) |s| self.readSink(errp, s[40 << 10 ..]) else "";
         Io.Dir.cwd().deleteFile(self.io, outp) catch {}; // data is in scratch now — clean up the sinks
         Io.Dir.cwd().deleteFile(self.io, errp) catch {};
+        if (builtin.os.tag == .windows) { // the batch carrier (only safe to delete once the child is dead)
+            var cpb: [332]u8 = undefined;
+            if (std.fmt.bufPrint(&cpb, "{s}.cmd", .{p.baseStr()})) |cmdp| {
+                Io.Dir.cwd().deleteFile(self.io, cmdp) catch {};
+            } else |_| {}
+        }
 
         // Status note for the non-clean exits — the required "(command timed out after Ns)" lives here.
+        // A nonzero exit code is surfaced too: the RUN: contract promises "output + exit status", and the
+        // model needs the failure signal to react instead of treating garbage output as success. Codes
+        // above 16 bits are printed in hex — that's the NTSTATUS crash range (0xC0000135 = DLL not found),
+        // unrecognizable once shown in decimal.
         var nb: [64]u8 = undefined;
         const note: []const u8 = switch (outcome) {
-            .running, .exited => "",
+            .running => "",
+            .exited => if (exit_code) |c| (if (c == 0)
+                ""
+            else if (c > 0xFFFF)
+                std.fmt.bufPrint(&nb, "(exit code 0x{X})\n", .{c}) catch "(nonzero exit code)\n"
+            else
+                std.fmt.bufPrint(&nb, "(exit code {d})\n", .{c}) catch "(nonzero exit code)\n") else "",
             .timed_out => std.fmt.bufPrint(&nb, "(command timed out after {d}s)\n", .{timeout_s}) catch "(command timed out)\n",
             .canceled => "(command stopped)\n",
             .flooded => "(command produced too much output — stopped)\n",
@@ -1003,6 +1082,7 @@ pub const Chat = struct {
         self.reflect_dirty = false;
         self.reflect_msg_idx = null;
         self.reflect_trace_len = 0;
+        self.reflect_trace_has_reason = false;
         self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
         self.appendMsg(dd, .user, text);
         self.startTurn(dd, .user);
@@ -1897,6 +1977,7 @@ pub const Chat = struct {
         self.turn = kind;
         self.turn_epoch = self.conv_epoch;
         self.first_byte_logged = false;
+        self.draft_latched = false; // each turn re-earns its drafting presentation
         self.turn_start_ms = self.nowMs();
         self.turn_fb_ms = 0;
         self.setBusy(true);
@@ -1914,16 +1995,38 @@ pub const Chat = struct {
         // Strip any tool call from the live preview too — otherwise the raw TOOL:{...} blob (e.g. a whole
         // write_file payload) is visible in the bubble while it streams, even though the settled message
         // strips it; the dispatcher still sees the full stream content at settle.
-        // A .reflect pass does NOT preview its content: the revision lands IN PLACE in the draft's slot at
-        // settle — streaming it as a second bubble below the draft is exactly the double-post artifact.
+        // A .reflect pass does NOT preview its content (streaming the in-flight revision below the draft is
+        // exactly the double-post artifact) — it shows the CARRIED DRAFT instead, so the bubble never goes
+        // blank mid-refinement. .consolidate/.loop_infer are machine turns whose raw output (REMEMBER:/NONE,
+        // the next loop message) must never stream into the bubble at all.
         // The reasoning preview still streams (that's the self-check thinking, worth watching live).
         {
             self.store.lock();
             defer self.store.unlock();
-            const src = if (self.turn == .reflect) "" else stripToolTail(self.stream.content.items);
+            const src = switch (self.turn) {
+                .reflect => stripToolTail(self.reflect_draft[0..self.reflect_draft_len]),
+                .consolidate, .loop_infer => "",
+                else => stripToolTail(self.stream.content.items),
+            };
             const n = @min(src.len, self.store.stream_text.len);
             @memcpy(self.store.stream_text[0..n], src[0..n]);
             self.store.stream_len = n;
+            // DRAFT MODE: while the answer is still pre-final it must read as the veil THINKING, not as a
+            // delivered answer that later vanishes and re-lands ("output > revise > correct" — the reported
+            // annoyance). Approximate mirror of the settle-time reflect gate: once a plain answer's stream
+            // crosses REFLECT_MIN_ANSWER a self-check will follow UNLESS the reply turns out to be an
+            // action (TOOL:/RUN:/CAST: dispatch precedes the reflect gate at settle) — so drafting mode is
+            // LATCHED once crossed (no flicker if a tool tail is momentarily stripped mid-delta) and dropped
+            // again the moment an action tail is visible. The UI renders draft-mode content as a quote
+            // block, so the committed final answer is the only thing that ever looks like the reply.
+            const gate = REFLECT_PASSES > 0 and (self.turn == .user or self.turn == .tool_follow) and
+                !self.in_veil_work and src.len >= REFLECT_MIN_ANSWER and
+                !isSmallTalk(self.last_user[0..self.last_user_len]);
+            if (gate) self.draft_latched = true;
+            const action_tail = toolCall(self.stream.content.items) != null or
+                castGoal(self.stream.content.items) != null or runCall(self.stream.content.items) != null;
+            if (action_tail) self.draft_latched = false;
+            self.store.stream_draft = self.turn == .reflect or self.draft_latched;
             // show the TAIL of the reasoning if it exceeds the buffer (the newest thinking matters most)
             const rsrc = self.stream.reasoning.items;
             const rn = @min(rsrc.len, self.store.stream_reason.len);
@@ -2110,9 +2213,13 @@ pub const Chat = struct {
             self.reflect_dirty = false; // no pass has changed anything yet
             self.reflect_draft_len = @min(full.len, self.reflect_draft.len);
             @memcpy(self.reflect_draft[0..self.reflect_draft_len], full[0..self.reflect_draft_len]);
-            // seed the reasoning trace with the drafting pass's thinking (each self-check pass adds its own)
+            // seed the reasoning trace with the drafting pass's thinking (each self-check pass adds its own).
+            // TRACE HYGIENE: only if it IS thinking — a "reasoning" that just restates the answer (gpt-oss
+            // drafts in its thinking channel) is an answer copy; dumping it under the reasoning chip is the
+            // reported "doubles of the context" artifact. reflectChanged==false means near-identical text.
             self.reflect_trace_len = 0;
-            self.traceAddPass("- drafting -", reason);
+            self.reflect_trace_has_reason = false;
+            self.traceAddPass("- drafting -", if (reason.len > 0 and reflectChanged(full, reason)) reason else "");
             self.stream.deinit(self.gpa);
             // NOTHING is committed while the self-check runs. The draft used to be posted here and then
             // rewritten in place each pass — the veil visibly "deleting and replacing its own answer", which
@@ -2134,7 +2241,13 @@ pub const Chat = struct {
             {
                 var lb: [72]u8 = undefined;
                 const label = std.fmt.bufPrint(&lb, "- self-check pass {d}: {s} -", .{ self.reflect_pass, if (changed) "revised" else "confirmed" }) catch "- self-check -";
-                self.traceAddPass(label, reason);
+                // TRACE HYGIENE: when content came back empty the reasoning channel was consumed AS the
+                // revision (2129) — tracing it too would put the full answer under the reasoning chip. And
+                // even with clean channels, thinking that merely restates the draft/revision is an answer
+                // copy, not reasoning (the reported "doubles"): trace only genuinely distinct thinking.
+                const pass_reason = if (full.len > 0 and reason.len > 0 and
+                    reflectChanged(revised, reason) and reflectChanged(prior, reason)) reason else "";
+                self.traceAddPass(label, pass_reason);
             }
             if (changed and self.reflect_pass < REFLECT_MAX_PASSES) {
                 // ITERATIVE self-critique: the pass still improved the answer, so feed the improved text back for
@@ -2532,6 +2645,7 @@ pub const Chat = struct {
         self.traceAppend(label);
         const r = std.mem.trim(u8, reason, " \r\n\t");
         if (r.len > 0) {
+            self.reflect_trace_has_reason = true; // real thinking landed — the chip is worth showing
             self.traceAppend("\n");
             const cap = @min(r.len, 1500);
             self.traceAppend(r[0..cap]);
@@ -2548,12 +2662,15 @@ pub const Chat = struct {
         if (answer.len > 0) {
             self.appendMsgFull(dd, .veil, answer, false);
             self.observeFinal(answer); // hippocampus stores the FINAL text, never a superseded draft
-            if (self.reflect_trace_len > 0) {
+            // Only when some pass contributed REAL thinking — a labels-only trace ("- drafting -" +
+            // "- self-check pass 1: ... -" with nothing under them) is noise, not a reasoning locker.
+            if (self.reflect_trace_len > 0 and self.reflect_trace_has_reason) {
                 if (self.lastMsgIdxOfRole(.veil)) |mi| self.insertMsgBefore(dd, mi, .thought, self.reflect_trace[0..self.reflect_trace_len]);
             }
         }
         self.reflect_msg_idx = null;
         self.reflect_trace_len = 0;
+        self.reflect_trace_has_reason = false;
         self.reflect_draft_len = 0;
         self.reflect_pass = 0;
         self.reflect_dirty = false;
@@ -3922,6 +4039,74 @@ fn composeConsoleResult(buf: []u8, out: []const u8, err: []const u8, note: []con
     return buf[0..w];
 }
 
+/// Compose the Windows batch script that carries ONE console command (see consoleStart for why a file:
+/// `cmd /c <argv>` mangles embedded quotes). @echo off keeps batch line-echo out of the sinks; a command
+/// with non-ASCII bytes gets a UTF-8 codepage prelude (batch lines are otherwise read in the OEM codepage);
+/// every line break is normalized to CRLF (LF-only batch parsing is unreliable). Percent signs that a batch
+/// file would EAT are doubled back to literals: %<digit>/%* are script-parameter references (the script runs
+/// with zero args, so `curl .../a%20b` would silently fetch "a0b") and a line-trailing lone % is dropped by
+/// the batch parser — both worked literally under the old cmd /c. %NAME% env expansion is left alone.
+/// Returns null when the command can't be carried (a NUL byte, or it overflows buf). Pure — unit-tested.
+fn buildBatchScript(buf: []u8, cmd: []const u8) ?[]const u8 {
+    const H = struct {
+        fn put(b: []u8, at: usize, s: []const u8) ?usize {
+            if (at + s.len > b.len) return null;
+            @memcpy(b[at .. at + s.len], s);
+            return at + s.len;
+        }
+    };
+    var non_ascii = false;
+    for (cmd) |c| {
+        if (c == 0) return null;
+        if (c >= 0x80) non_ascii = true;
+    }
+    var w = H.put(buf, 0, "@echo off\r\n") orelse return null;
+    if (non_ascii) w = H.put(buf, w, "chcp 65001>nul\r\n") orelse return null;
+    var i: usize = 0;
+    while (i < cmd.len) : (i += 1) {
+        const c = cmd[i];
+        if (c == '\r') continue; // dropped; the matching \n below re-emits the full CRLF
+        if (c == '\n') {
+            w = H.put(buf, w, "\r\n") orelse return null;
+        } else if (c == '%') {
+            const next: u8 = if (i + 1 < cmd.len) cmd[i + 1] else '\n';
+            if (next == '%') { // already batch-escaped (%%i in a for-loop, %%2 literal) — pass the pair through
+                w = H.put(buf, w, "%%") orelse return null;
+                i += 1;
+            } else {
+                const eaten = std.ascii.isDigit(next) or next == '*' or next == '\n' or next == '\r';
+                w = H.put(buf, w, if (eaten) "%%" else "%") orelse return null;
+            }
+        } else {
+            if (w >= buf.len) return null;
+            buf[w] = c;
+            w += 1;
+        }
+    }
+    w = H.put(buf, w, "\r\n") orelse return null;
+    return buf[0..w];
+}
+
+/// Would this command trip the batch-vs-interactive FOR-variable trap (`for %i ...` errors in a batch
+/// script; it needs %%i)? True when a "for" token appears and a SINGLE-letter %x variable (not %%x, not a
+/// %NAME% env pair) follows. Drives the one-line You-tab hint in consoleStart. Pure — unit-tested.
+fn needsBatchPercentHint(cmd: []const u8) bool {
+    var lb: [1024]u8 = undefined;
+    const n = @min(cmd.len, lb.len);
+    for (cmd[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const low = lb[0..n];
+    const at = std.mem.indexOf(u8, low, "for ") orelse return false;
+    var j = at + 4;
+    while (j + 1 < n) : (j += 1) {
+        if (low[j] != '%') continue;
+        if (j > 0 and low[j - 1] == '%') continue; // %%x — already batch-escaped
+        if (!std.ascii.isAlphabetic(low[j + 1])) continue; // %2/%* are handled by buildBatchScript itself
+        if (j + 2 < n and (std.ascii.isAlphanumeric(low[j + 2]) or low[j + 2] == '%')) continue; // %NAME(%) env ref
+        return true; // single-letter %x after a for — the trap
+    }
+    return false;
+}
+
 /// A reply that is exactly a "RUN: <shell command>" line (the AI's micro-console door). Returns the command,
 /// trimmed, or null. Mirrors toolCall: only fires if RUN: leads one of the first few substantive lines so a
 /// passing mention in prose can't trigger a shell command.
@@ -5094,6 +5279,38 @@ test "composeConsoleResult keeps stdout then stderr, and always the status note"
     try std.testing.expect(r.len <= small.len);
 }
 
+test "buildBatchScript: echo-off prelude, CRLF normalization, chcp only for non-ASCII, NUL/overflow rejected" {
+    var buf: [256]u8 = undefined;
+    // quotes pass through VERBATIM — the whole point of the batch carrier (cmd /c argv mangled them)
+    try std.testing.expectEqualStrings("@echo off\r\npowershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"\r\n", buildBatchScript(&buf, "powershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"").?);
+    // lone \n and pre-normalized \r\n both land as CRLF
+    try std.testing.expectEqualStrings("@echo off\r\necho a\r\necho b\r\n", buildBatchScript(&buf, "echo a\necho b").?);
+    try std.testing.expectEqualStrings("@echo off\r\necho a\r\necho b\r\n", buildBatchScript(&buf, "echo a\r\necho b").?);
+    // a non-ASCII byte pulls in the UTF-8 codepage prelude; pure ASCII must not
+    try std.testing.expect(std.mem.indexOf(u8, buildBatchScript(&buf, "echo caf\xc3\xa9").?, "chcp 65001>nul\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buildBatchScript(&buf, "echo cafe").?, "chcp") == null);
+    // uncarryable commands: an embedded NUL, or a command that overflows the script buffer
+    try std.testing.expect(buildBatchScript(&buf, "echo a\x00b") == null);
+    var tiny: [8]u8 = undefined;
+    try std.testing.expect(buildBatchScript(&tiny, "dir") == null);
+    // percent rules: batch parameter refs (%digit/%*) and a line-trailing lone % are doubled back to
+    // literals (they worked literally under cmd /c); %VAR% env pairs and pre-escaped %% pass through
+    try std.testing.expectEqualStrings("@echo off\r\ncurl https://x/a%%20b\r\n", buildBatchScript(&buf, "curl https://x/a%20b").?);
+    try std.testing.expectEqualStrings("@echo off\r\necho %%* stays\r\n", buildBatchScript(&buf, "echo %* stays").?);
+    try std.testing.expectEqualStrings("@echo off\r\necho 50%%\r\n", buildBatchScript(&buf, "echo 50%").?);
+    try std.testing.expectEqualStrings("@echo off\r\necho %PATH% ok\r\n", buildBatchScript(&buf, "echo %PATH% ok").?);
+    try std.testing.expectEqualStrings("@echo off\r\nfor %%i in (a) do echo %%i\r\n", buildBatchScript(&buf, "for %%i in (a) do echo %%i").?);
+}
+
+test "needsBatchPercentHint fires only on single-% for-loop variables" {
+    try std.testing.expect(needsBatchPercentHint("for %i in (*.txt) do @echo %i"));
+    try std.testing.expect(needsBatchPercentHint("FOR /f %a in ('dir /b') do echo %a"));
+    try std.testing.expect(!needsBatchPercentHint("for %%i in (*.txt) do @echo %%i")); // already escaped
+    try std.testing.expect(!needsBatchPercentHint("echo %PATH% for the record")); // env pair, not a loop var
+    try std.testing.expect(!needsBatchPercentHint("curl https://x/a%20b")); // no for-loop at all
+    try std.testing.expect(!needsBatchPercentHint("dir"));
+}
+
 // A tiny harness for the async-console tests: a Chat wired to a throwaway data dir. Caller owns teardown.
 const ConsoleTestCtx = struct {
     threaded: *std.Io.Threaded,
@@ -5161,6 +5378,23 @@ test "micro-console: a You command runs async (non-blocking), streams its output
     try std.testing.expect(ctx.chat.console == null); // finalized
     try std.testing.expect(!ctx.store.console_busy_you); // busy cleared
     try std.testing.expect(consoleScrollHas(ctx.store, false, "neuron-db-console-probe"));
+}
+
+test "micro-console: a nonzero exit surfaces '(exit code N)' and the batch carrier is cleaned up" {
+    if (builtin.os.tag != .windows) return; // the .cmd carrier + full-u32 exit peek are the Windows path
+    const dd = "zig-console-exit-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    ctx.chat.consoleStart(dd, false, "exit 3");
+    try std.testing.expect(ctx.chat.console != null);
+    const carrier = dd ++ "/.veil-desk/console_you.cmd";
+    // the carrier exists while the command is registered...
+    if (Io.Dir.cwd().statFile(ctx.io(), carrier, .{})) |_| {} else |_| return error.CarrierMissingWhileRunning;
+    ctx.drain(dd);
+    try std.testing.expect(ctx.chat.console == null);
+    // ...the exit status reached the scrollback, and the carrier is gone after finalize
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "(exit code 3)"));
+    if (Io.Dir.cwd().statFile(ctx.io(), carrier, .{})) |_| return error.CarrierNotCleanedUp else |_| {}
 }
 
 test "micro-console: a command that overruns its wall-clock deadline is killed and reported" {

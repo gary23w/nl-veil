@@ -327,6 +327,12 @@ fn finishBySentinel(s: *Stream, io: Io, gpa: std.mem.Allocator, code: []const u8
             s.content.appendSlice(gpa, piece) catch {};
         }
     }
+    if (s.reasoning.items.len == 0) {
+        if (jsonUnescape(gpa, body, "reasoning_content") orelse jsonUnescape(gpa, body, "reasoning")) |th| {
+            defer gpa.free(th);
+            s.reasoning.appendSlice(gpa, th) catch {};
+        }
+    }
     if ((code.len > 0 and code[0] == '2') or s.content.items.len > 0) {
         if (s.content.items.len > 0) {
             s.done = true;
@@ -445,6 +451,16 @@ fn handleStreamLine(s: *Stream, gpa: std.mem.Allocator, line: []const u8) void {
     if (jsonUnescape(gpa, payload, "thinking")) |th| {
         defer gpa.free(th);
         s.reasoning.appendSlice(gpa, th) catch {};
+    } else if (jsonUnescape(gpa, payload, "reasoning_content")) |th| {
+        // SSE reasoning deltas: {"delta":{"reasoning_content":"..."}} (DeepSeek-style) or
+        // {"delta":{"reasoning":"..."}} (OpenRouter/HF-style). Same channel as NDJSON "thinking" — without
+        // this, every non-Ollama backend silently DROPPED its reasoning stream (empty thinking preview,
+        // empty reflect trace). The exact-key match ("reasoning":) can't false-fire on "reasoning_content".
+        defer gpa.free(th);
+        s.reasoning.appendSlice(gpa, th) catch {};
+    } else if (jsonUnescape(gpa, payload, "reasoning")) |th| {
+        defer gpa.free(th);
+        s.reasoning.appendSlice(gpa, th) catch {};
     }
     // SSE: {"choices":[{"delta":{"content":"..."}}]} — role-only/finish chunks carry no content key.
     // NDJSON: {"message":{"role":"assistant","content":"..."},"done":false} … {"done":true,...} last.
@@ -471,6 +487,11 @@ fn tryWholeJson(s: *Stream, gpa: std.mem.Allocator, data: []const u8) void {
         @memcpy(mb[0..n], msg[0..n]);
         setErr(s, mb[0..n]);
         return;
+    }
+    if (jsonUnescape(gpa, t, "reasoning_content") orelse jsonUnescape(gpa, t, "reasoning")) |th| {
+        defer gpa.free(th);
+        s.reasoning.clearRetainingCapacity();
+        s.reasoning.appendSlice(gpa, th) catch {};
     }
     if (jsonUnescape(gpa, t, "content")) |piece| {
         defer gpa.free(piece);

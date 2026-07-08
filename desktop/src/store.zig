@@ -283,6 +283,8 @@ pub const Store = struct {
     stream_len: usize = 0,
     stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
     stream_reason_len: usize = 0,
+    stream_draft: bool = false, // the in-flight content is a PRE-FINAL draft (a self-check will follow / is
+    //                             running) — the UI renders it as thinking, never as a delivered answer
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
     chat_loop: bool = false, // full-auto: the AI writes + sends its own next message until DONE or the cap (runtime only)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
