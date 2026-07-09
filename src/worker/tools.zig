@@ -910,6 +910,43 @@ fn sanitizeModelText(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return out.toOwnedSlice(gpa) catch dupe(gpa, s);
 }
 
+/// Case-insensitive LAST index of `needle` in `hay` (closing tags live at the very end of a doc). null if absent.
+fn ciLastIndexOf(hay: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > hay.len) return null;
+    var i: usize = hay.len - needle.len + 1;
+    while (i > 0) {
+        i -= 1;
+        if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return i;
+    }
+    return null;
+}
+
+/// The byte offset to splice appended BODY content in FRONT of, for a file that already closed an HTML/XML
+/// document: before the last </body> (else the last </html>). null when there is no such closing tag (a code
+/// file → tail-append as usual). A naive tail-append onto an already-closed page lands the next chunk AFTER
+/// </html>, outside the document (the observed "second chunk injected outside the html context" bug). Only the
+/// tail is scanned — closers live at the end.
+fn htmlCloseInsert(prior: []const u8) ?usize {
+    const from = if (prior.len > 8192) prior.len - 8192 else 0;
+    const tail = prior[from..];
+    if (ciLastIndexOf(tail, "</body>")) |r| return from + r;
+    if (ciLastIndexOf(tail, "</html>")) |r| return from + r;
+    return null;
+}
+
+test "htmlCloseInsert: body fragments splice before </body>; code files append at the end" {
+    // an already-closed HTML doc → splice point is right at </body> (fragment lands inside the page)
+    const html = "<!DOCTYPE html><html><body><h1>hi</h1></body></html>";
+    try std.testing.expectEqualStrings("</body></html>", html[htmlCloseInsert(html).?..]);
+    // chunk 1 left the doc OPEN (no </body>/</html> yet) → tail-append (null)
+    try std.testing.expect(htmlCloseInsert("<!DOCTYPE html><html><body><h1>hi</h1>") == null);
+    // a code file has no closing tag → tail-append (null)
+    try std.testing.expect(htmlCloseInsert("def f():\n    return 1\n") == null);
+    // </html> present without </body> → splice before </html>
+    const x = "<svg>...</svg></HTML>";
+    try std.testing.expectEqualStrings("</HTML>", x[htmlCloseInsert(x).?..]);
+}
+
 fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { path: []const u8 = "", content: []const u8 = "", mode: []const u8 = "overwrite" };
@@ -999,9 +1036,22 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         } else {
             var joined: std.ArrayListUnmanaged(u8) = .empty;
             defer joined.deinit(gpa);
-            joined.appendSlice(gpa, prior) catch {};
-            if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n\n") catch {};
-            joined.appendSlice(gpa, clean) catch {};
+            // STRUCTURED APPEND: if the prior chunk already CLOSED an HTML/XML document, splice the new body
+            // content in BEFORE the closing </body> (else </html>) so a chunked page assembles into ONE valid
+            // document — a naive tail-append lands the next section AFTER </html>, outside the page (the
+            // observed bug: "the second chunk injected outside the html context"). Code files (no closing tag)
+            // append at the end as before.
+            if (htmlCloseInsert(prior)) |ins| {
+                joined.appendSlice(gpa, prior[0..ins]) catch {};
+                if (ins > 0 and prior[ins - 1] != '\n') joined.append(gpa, '\n') catch {};
+                joined.appendSlice(gpa, clean) catch {};
+                if (clean.len > 0 and clean[clean.len - 1] != '\n') joined.append(gpa, '\n') catch {};
+                joined.appendSlice(gpa, prior[ins..]) catch {};
+            } else {
+                joined.appendSlice(gpa, prior) catch {};
+                if (prior.len > 0 and prior[prior.len - 1] != '\n') joined.appendSlice(gpa, "\n\n") catch {};
+                joined.appendSlice(gpa, clean) catch {};
+            }
             if (!writeWorkFileAtomic(ctx, full, joined.items)) return dupe(gpa, "could not write file");
             final_bytes = joined.items.len;
         }
@@ -1137,7 +1187,11 @@ fn editRejectMsg(gpa: std.mem.Allocator, npath: []const u8, perr: []const u8) ?[
 
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", text: []const u8 = "", at: usize = 0 };
+    // Accept BOTH edit dialects: the hive prompt teaches {op, anchor, text}; the chat prompt teaches
+    // {search, replace} (no op). Parsing only anchor/text silently DROPPED search/replace → every chat
+    // edit ran with an EMPTY anchor and failed as a phantom "edit conflict" (the file never changed while
+    // the model declared DONE). `search`/`replace` are aliases; `op` defaults to "replace".
+    const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", search: []const u8 = "", text: []const u8 = "", replace: []const u8 = "", at: usize = 0 };
     const A = struct { path: []const u8 = "", ops: []const OpJson = &.{} };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
         return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
@@ -1165,9 +1219,12 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     var ops: std.ArrayListUnmanaged(bufedit.EditOp) = .empty;
     defer ops.deinit(gpa);
     for (p.value.ops) |o| {
+        const opname = if (o.op.len > 0) o.op else "replace"; // the {search,replace} form omits op → replace
         const kind: bufedit.OpKind =
-            if (std.mem.eql(u8, o.op, "replace")) .replace else if (std.mem.eql(u8, o.op, "insert_before")) .insert_before else if (std.mem.eql(u8, o.op, "insert_after")) .insert_after else if (std.mem.eql(u8, o.op, "insert_at")) .insert_at else if (std.mem.eql(u8, o.op, "delete")) .delete else return std.fmt.allocPrint(gpa, "unknown op '{s}' — use replace | insert_before | insert_after | insert_at | delete", .{o.op}) catch dupe(gpa, "unknown op");
-        ops.append(gpa, .{ .kind = kind, .anchor = o.anchor, .text = o.text, .at = o.at }) catch {};
+            if (std.mem.eql(u8, opname, "replace")) .replace else if (std.mem.eql(u8, opname, "insert_before")) .insert_before else if (std.mem.eql(u8, opname, "insert_after")) .insert_after else if (std.mem.eql(u8, opname, "insert_at")) .insert_at else if (std.mem.eql(u8, opname, "delete")) .delete else return std.fmt.allocPrint(gpa, "unknown op '{s}' — use replace | insert_before | insert_after | insert_at | delete", .{o.op}) catch dupe(gpa, "unknown op");
+        const anchor = if (o.anchor.len > 0) o.anchor else o.search; // hive: anchor · chat: search
+        const text = if (o.text.len > 0) o.text else o.replace; //       hive: text   · chat: replace
+        ops.append(gpa, .{ .kind = kind, .anchor = anchor, .text = text, .at = o.at }) catch {};
     }
     // When minds run concurrently, route through the micro-VCS: it reads HEAD in-lock and re-applies these ops
     // against it, so two minds editing one file merge instead of clobbering. `original` is this mind's base.
