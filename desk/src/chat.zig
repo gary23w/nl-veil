@@ -281,9 +281,16 @@ const CONSOLIDATE_SYSTEM =
 const MAX_TOOL_ITERS: u32 = 20;
 
 // Prompt-loop (full-auto mode): after a turn settles, the AI writes the NEXT user message itself and sends it,
-// continuing the conversation toward the goal until it emits DONE or hits the iteration cap. LOOP_MAX_ITERS is
-// the verifiable stop condition that prevents an endless/costly loop.
-const LOOP_MAX_ITERS: u32 = 12;
+// continuing the conversation toward the goal. The auto-loop is the inference FAIL-SAFE — it must STAY ON and
+// keep the veil working unless the AI genuinely needs to ASK the user something (user directive). The real stop
+// conditions are DONE, a question ('?'), and the no-progress repeat-guard; the iteration cap is only a runaway
+// backstop, set high enough that a long task (documenting a whole repo file by file) doesn't hit it prematurely.
+const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task needs many steps
+/// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
+/// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
+/// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
+/// hives unattended (the original post-kill runaway). A manual message resets the count.
+const MAX_LOOP_CASTS: u32 = 4;
 const LOOP_SYSTEM =
     "You are the autonomous DRIVER of this conversation. The user has enabled full-auto mode: rather than typing " ++
     "each message themselves, YOU write the next message on their behalf to keep making progress toward the goal " ++
@@ -405,6 +412,7 @@ pub const Chat = struct {
     last_user_len: usize = 0,
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
+    loop_casts: u32 = 0, // swarms this auto-loop session has fired (bounded by MAX_LOOP_CASTS — runaway guard)
     build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
     build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
     reflect_draft: [12288]u8 = undefined, // the current draft being iteratively self-critiqued
@@ -1606,6 +1614,7 @@ pub const Chat = struct {
         self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        self.loop_casts = 0; // ...and its swarm budget — a fresh steer earns fresh loop-casts
         self.resetArcFlags(); // fresh agentic-floor arc: follow-through nudge, verification, lesson capture
         self.judge_turns +%= 1; // a REAL user turn — the judge's cadence trigger counts only these
         // AUTO-LOOP ON by default once the user prompts (user directive): the veil drives its own next step
@@ -2949,7 +2958,7 @@ pub const Chat = struct {
                 if (self.shouldConsolidate(kind, full)) self.consolidate_pending = true;
                 if (full.len > 0) self.appendMsgFull(dd, .veil, full, false);
                 self.stream.deinit(self.gpa);
-                self.appendMsgFull(dd, .cast_note, "(the reply announced an action but didn't perform it — asking it to act now)", false);
+                self.appendMsgFull(dd, .cast_note, "continue", false);
                 self.setDirective("Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.");
                 self.internal_turn = true; // machine directive, not a user exchange (last_user keeps the real goal)
                 self.setStatus("following through on the announced action...");
@@ -3114,16 +3123,20 @@ pub const Chat = struct {
             if (self.castPending()) {
                 self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
-            } else if (self.loop_iter > 0) {
-                // AUTO-LOOP GUARD: a loop-INFERRED turn must never launch a fresh multi-minute swarm on its own —
-                // casting is a big, resource-heavy commitment the USER makes explicitly (the observed runaway:
-                // auto-loop kept inventing steps after a kill and deployed an unprompted hive). Show the prose,
-                // stop the loop, and tell the user to ask for a cast directly if they want one.
+            } else if (self.loop_iter > 0 and self.loop_casts >= MAX_LOOP_CASTS) {
+                // The auto-loop MAY cast — delegating a scoped sub-task to a hive is the veil doing its job, and the
+                // loop is the inference fail-safe that must STAY ON (user directive). But it's bounded: after several
+                // swarms in one loop session, pause for the user so a weak model can't runaway-deploy hives unattended
+                // (the original post-kill runaway). castPending above already refuses a *concurrent* second cast.
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.stream.deinit(self.gpa); // this early return skipped the shared settle deinit — confirmed leak
-                self.stopLoop(dd, "auto-loop paused: the veil wanted to cast a new swarm — say 'cast a swarm to …' yourself to start one.");
+                self.stopLoop(dd, "auto-loop paused: the veil cast several swarms in a row — say 'continue' to keep going.");
                 return;
             } else {
+                // Fire the cast and KEEP THE LOOP ARMED: after the hive's result folds back in, the loop resumes and
+                // the veil keeps working the goal (this is what fixes the "second swarm never fired" bug — the old
+                // guard stopped the loop the instant the veil wanted to delegate). Count it toward the runaway bound.
+                if (self.loop_iter > 0) self.loop_casts += 1;
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, spec);
             }
@@ -3381,6 +3394,7 @@ pub const Chat = struct {
             self.store.chat_loop = false;
         }
         self.loop_iter = 0;
+        self.loop_casts = 0;
         self.reflect_pass = 0; // abandon any pending self-critique iteration
         self.reflect_dirty = false;
         self.reflect_draft_len = 0;
@@ -3442,6 +3456,7 @@ pub const Chat = struct {
             self.store.chat_loop = false;
         }
         self.loop_iter = 0;
+        self.loop_casts = 0;
         self.appendMsg(dd, .cast_note, why);
         self.setStatus("");
         self.setBusy(false);
@@ -3939,6 +3954,10 @@ pub const Chat = struct {
                 self.resetVeilWork();
                 self.updateCastRow(.done, 0, -1, "killed", self.cast_rel[0..self.cast_rel_len]);
                 self.setStatus("");
+                // A kill is the user saying "stop that swarm". Spend the loop's cast budget so an auto-loop that's
+                // still armed can keep working DIRECTLY but won't immediately re-deploy another hive (the original
+                // post-kill runaway). A manual message resets loop_casts and re-earns casting.
+                self.loop_casts = MAX_LOOP_CASTS;
                 log.info("chat: kill_swarm confirmed — cast state cleared, user unlocked", .{});
             }
         } else {
@@ -6589,8 +6608,7 @@ test "explicit cast request: a pasted-file reply falls through to the CAST recov
     chat.last_user_len = ask.len;
     @memcpy(chat.last_user[0..ask.len], ask);
     chat.stream = .{ .done = true };
-    chat.stream.content.appendSlice(std.testing.allocator,
-        "index.html\n```html\n<!DOCTYPE html>\n<html>\n<head><title>The Leaf & Kettle</title></head>\n" ++
+    chat.stream.content.appendSlice(std.testing.allocator, "index.html\n```html\n<!DOCTYPE html>\n<html>\n<head><title>The Leaf & Kettle</title></head>\n" ++
         "<body>\n<h1>Tea</h1>\n<p>green black oolong white herbal pu-erh</p>\n" ++
         "<a href=\"varieties.html\">varieties</a>\n</body>\n</html>\n```\n") catch unreachable;
     chat.turn = .user;
