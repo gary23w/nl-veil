@@ -374,7 +374,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"patch_system","description":"RSI engine edit tool. Read/write/replace/apply_patch under NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT). Mutating edits are gated: provide proposal + measurable success_criterion; high-impact edits also require simulate_change; privileged zones require explicit operator approval.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative file path under the configured patch-system root (required for read/write/replace)"},"mode":{"type":"string","enum":["read","write","replace","patch"],"description":"operation (default: read)"},"content":{"type":"string","description":"new file content for write mode"},"find":{"type":"string","description":"exact text to replace (replace mode)"},"replace":{"type":"string","description":"replacement text (replace mode)"},"patch":{"type":"string","description":"apply_patch payload with *** Begin Patch / *** End Patch markers (patch mode)"},"proposal":{"type":"string","description":"proposal title/id from propose_change (required for mutating edits)"},"success_criterion":{"type":"string","description":"measurable success criterion tied to the proposal (required for mutating edits)"},"limit":{"type":"integer","description":"max bytes to read (default 12000, max 262144)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -418,7 +418,7 @@ pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"osint_scan","description":"Public-source OSINT scan for one URL: extract high-signal leads (emails, phones, domains, docs, socials, and notable outbound links).","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"deep_crawl","description":"Recursive public-web crawl from a seed URL with bounded depth/pages, extracting lead-rich links across hops.","parameters":{"type":"object","properties":{"url":{"type":"string"},"depth":{"type":"integer"},"max_pages":{"type":"integer"},"same_host":{"type":"boolean"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body. Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir — use it to see what the team is building and what to research.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir — use it to see what the team is building and what to research. For a big file, pass start_line/end_line (1-indexed) to read a window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Spreading-activation recall across the hive's shared collective memory — check what the team already knows before researching.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only when the swarm has a spatial substrate). probe(x,y) reads column x, row y (0-based) and records it to the hive's shared map. As the scout you can sweep an UNCLAIMED region of the grid for the team.","parameters":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]}}},
@@ -442,7 +442,7 @@ pub const SCOUT_SCHEMA =
 pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"When filling your slot taught you a REUSABLE technique (a pattern, snippet, or recipe a teammate will need again), save it to the swarm's shared skill library: a short name + the concrete how-to. Do this AFTER your file work, and do NOT re-save a skill you were already shown.","parameters":{"type":"object","properties":{"name":{"type":"string"},"skill":{"type":"string"}},"required":["name","skill"]}}},
@@ -454,7 +454,7 @@ pub const OPERATE_SCHEMA =
     \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine — do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
     \\{"type":"function","function":{"name":"host_explore","description":"EXPLORE the device READ-ONLY to discover structure the live telemetry does not show. verb: enumerate <node> (list a container's direct members), expand <node> (fan out a node's typed neighbors — this GROWS your map), describe <node> (read one entity's attributes). Discoveries map into your memory; recall/chain over them next round to find the real structure and the root. It never changes the device.","parameters":{"type":"object","properties":{"verb":{"type":"string","description":"enumerate | expand | describe"},"node":{"type":"string","description":"a node shown in your map or telemetry (a pid, path, handle, principal)"},"rel":{"type":"string","description":"optional relation for a targeted walk"}},"required":["verb","node"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the workdir — use it to inspect a config/log/source before you change it.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the workdir — use it to inspect a config/log/source before you change it. For a big file, pass start_line/end_line (1-indexed) to read a window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the workdir (creates parent dirs) — use it to PATCH a config you read (write back the fixed version) or to record a written report/debrief. mode:\"append\" concatenates only the new text; mode:\"overwrite\" (default) replaces the file.","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory — surfaces the chained neighborhood of what ANY teammate (or the baked intel) knows, even facts that share no words with your query. Use it to GROUND a decision (e.g. is this identifier known-bad, who is the actor) before you act.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
@@ -934,6 +934,32 @@ fn htmlCloseInsert(prior: []const u8) ?usize {
     return null;
 }
 
+test "readLineWindow returns the requested 1-indexed inclusive line window past the byte-clip head" {
+    const gpa = std.testing.allocator;
+    const text = "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10";
+    {
+        const w = readLineWindow(gpa, text, 3, 5);
+        defer gpa.free(w);
+        try std.testing.expect(std.mem.startsWith(u8, w, "[lines 3-5 of 10]\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w, "L3\nL4\nL5\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w, "L2") == null); // before the window
+        try std.testing.expect(std.mem.indexOf(u8, w, "L6") == null); // after the window
+    }
+    {
+        // end past EOF clamps to the last line
+        const w = readLineWindow(gpa, text, 9, 999);
+        defer gpa.free(w);
+        try std.testing.expect(std.mem.startsWith(u8, w, "[lines 9-10 of 10]\n"));
+        try std.testing.expect(std.mem.indexOf(u8, w, "L10") != null);
+    }
+    {
+        // start past EOF explains instead of returning nothing
+        const w = readLineWindow(gpa, text, 50, 60);
+        defer gpa.free(w);
+        try std.testing.expect(std.mem.indexOf(u8, w, "past the end") != null);
+    }
+}
+
 test "htmlCloseInsert: body fragments splice before </body>; code files append at the end" {
     // an already-closed HTML doc → splice point is right at </body> (fragment lands inside the page)
     const html = "<!DOCTYPE html><html><body><h1>hi</h1></body></html>";
@@ -1192,12 +1218,14 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // edit ran with an EMPTY anchor and failed as a phantom "edit conflict" (the file never changed while
     // the model declared DONE). `search`/`replace` are aliases; `op` defaults to "replace".
     const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", search: []const u8 = "", text: []const u8 = "", replace: []const u8 = "", at: usize = 0 };
-    const A = struct { path: []const u8 = "", ops: []const OpJson = &.{} };
+    // Top-level `search`/`replace` too: a FLAT {path, search, replace} call (no ops array) is what an XML-shaped
+    // tool call converts to, and some models emit it directly — treat it as a single replace op.
+    const A = struct { path: []const u8 = "", ops: []const OpJson = &.{}, search: []const u8 = "", replace: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
         return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
-    if (p.value.ops.len == 0) return dupe(gpa, "edit_file needs an ops array — each op is replace/insert_before/insert_after/delete with an exact anchor snippet.");
+    if (p.value.ops.len == 0 and p.value.search.len == 0) return dupe(gpa, "edit_file needs either an ops array (each op replace/insert_before/insert_after/delete with an exact anchor) OR a top-level search+replace.");
     const npath = blk_np: {
         const wb = std.fs.path.basename(ctx.workdir);
         if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
@@ -1226,6 +1254,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         const text = if (o.text.len > 0) o.text else o.replace; //       hive: text   · chat: replace
         ops.append(gpa, .{ .kind = kind, .anchor = anchor, .text = text, .at = o.at }) catch {};
     }
+    if (ops.items.len == 0 and p.value.search.len > 0) // flat {path, search, replace} → one replace op
+        ops.append(gpa, .{ .kind = .replace, .anchor = p.value.search, .text = p.value.replace, .at = 0 }) catch {};
     // When minds run concurrently, route through the micro-VCS: it reads HEAD in-lock and re-applies these ops
     // against it, so two minds editing one file merge instead of clobbering. `original` is this mind's base.
     // The validator runs the SAME .py gate (compile + duplicate-definition) on the rebased result, in-lock,
@@ -1302,9 +1332,47 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "edited {s} — {d} op(s) applied, file is now {d} bytes", .{ npath, ops.items.len, res.bytes.len }) catch dupe(gpa, "edited");
 }
 
+/// Return lines `start`..`end` (1-indexed, inclusive) of `text` with a `[lines A-B of N]` header, so the reader
+/// can target a specific WINDOW of a big file instead of only ever seeing the byte-clipped head. Clamps to the
+/// file's real bounds; the window itself is capped so a huge range can't blow the response.
+fn readLineWindow(gpa: std.mem.Allocator, text: []const u8, start_in: usize, end_in: usize) []u8 {
+    var total: usize = 0;
+    {
+        var cit = std.mem.splitScalar(u8, text, '\n');
+        while (cit.next()) |_| total += 1;
+    }
+    if (total == 0) total = 1;
+    const s: usize = if (start_in == 0) 1 else start_in;
+    var e: usize = if (end_in == 0) total else end_in;
+    if (e > total) e = total;
+    if (s > total or s > e)
+        return std.fmt.allocPrint(gpa, "[the file has {d} lines — requested start_line {d} is past the end; read a lower range]", .{ total, s }) catch dupe(gpa, "line range past end of file");
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var hb: [72]u8 = undefined;
+    out.appendSlice(gpa, std.fmt.bufPrint(&hb, "[lines {d}-{d} of {d}]\n", .{ s, e, total }) catch "") catch {};
+    var line: usize = 1;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |ln| : (line += 1) {
+        if (line < s) continue;
+        if (line > e) break;
+        out.appendSlice(gpa, ln) catch {};
+        out.append(gpa, '\n') catch {};
+        if (out.items.len > 32000) {
+            out.appendSlice(gpa, "[...window clipped at 32000 bytes — narrow your line range]\n") catch {};
+            break;
+        }
+    }
+    return out.toOwnedSlice(gpa) catch dupe(gpa, "oom");
+}
+
 fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    const A = struct { path: []const u8 = "" };
+    // start_line/end_line (1-indexed, inclusive) let the reader window a big file — without them the read is
+    // clipped to the HEAD, so a model asking for lines near the end of a >8KB file got the top forever and
+    // spiralled (observed live: a chat re-reading the top 8KB of a 17KB shooter.html it needed to fix at
+    // ~line 300). `offset`/`limit` are accepted as line-based aliases (offset = first line, limit = count).
+    const A = struct { path: []const u8 = "", start_line: usize = 0, end_line: usize = 0, offset: usize = 0, limit: usize = 0 };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
@@ -1320,13 +1388,19 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(data);
     const clean = sanitizeModelText(gpa, data);
     defer gpa.free(clean);
+    // A requested line window (start_line/end_line, or offset+limit) returns exactly those lines — this is how
+    // you read the back half of a big file.
+    const start_line = if (p.value.start_line > 0) p.value.start_line else p.value.offset;
+    const end_line = if (p.value.end_line > 0) p.value.end_line else if (p.value.limit > 0 and start_line > 0) start_line + p.value.limit - 1 else 0;
+    if (start_line > 0 or end_line > 0) return readLineWindow(gpa, clean, start_line, end_line);
     const owned = ctx.my_files.len > 0 and fileOwnedBy(ctx.my_files, p.value.path);
     const cap: usize = if (owned) 32000 else 8000;
     if (clean.len <= cap) return dupe(gpa, clean);
     // A silently-cut read looks EXACTLY like a truncated file — the reader then "fixes" a healthy file or
     // spirals on tail-verification (observed live: the chat veil burned its whole follow-through budget
-    // re-reading a complete index.html because the view ended mid-markup). Name the cut and the real size.
-    return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing {d} of {d} bytes. The file on disk is WHOLE — this cut is only the reading window, so do NOT rewrite or re-verify the file because the view ends here.]", .{ clean[0..cap], cap, clean.len }) catch dupe(gpa, clean[0..cap]);
+    // re-reading a complete index.html because the view ended mid-markup). Name the cut, the real size, AND
+    // how to see the rest (a line range), so the reader windows the tail instead of re-reading the head.
+    return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ clean[0..cap], cap, clean.len, p.value.path }) catch dupe(gpa, clean[0..cap]);
 }
 
 fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {

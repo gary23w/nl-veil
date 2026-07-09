@@ -116,7 +116,9 @@ const SYSTEM_REST =
     "file into the chat. Use the TOOL: protocol (one tool per reply):\n" ++
     "- write_file {\"path\":\"app.py\",\"content\":\"...\"}  — write/overwrite a file (relative path, in your workdir).\n" ++
     "- edit_file {\"path\":\"app.py\",\"ops\":[{\"search\":\"old\",\"replace\":\"new\"}]}  — patch an existing file in place.\n" ++
-    "- read_file {\"path\":\"app.py\"}  — read a file back before you change it.\n" ++
+    "- read_file {\"path\":\"app.py\"}  — read a file back before you change it. For a BIG file, read a window with " ++
+    "start_line/end_line (1-indexed): read_file {\"path\":\"app.py\",\"start_line\":200,\"end_line\":320} — a plain read " ++
+    "is clipped to the head, so use a line range to see the middle/end of a large file instead of re-reading the top.\n" ++
     "- list_dir {\"path\":\".\"}  — see what's already in the workdir.\n" ++
     "- run_tests {}  — run the project's tests (pytest / test_*.py) and get pass/fail.\n" ++
     "- run_python {\"code\":\"...\"}  — run a short Python script in the workdir.\n" ++
@@ -2773,7 +2775,16 @@ pub const Chat = struct {
             // is the model's final decision (looseRunWins) — fixed TOOL-first picked the discarded option.
             const loose_ok = reason.len > 0 and castGoal(full) == null and
                 (full.len == 0 or announcesAction(full));
-            var tc_opt = toolCall(full) orelse toolCallXml(full) orelse
+            var tc_opt = toolCall(full) orelse toolCallXml(full) orelse toolCallTagXml(full) orelse blk_xn: {
+                // nested-XML call: <read_file><path>..</path><start_line>..</start_line></read_file>. Builds OWNED
+                // JSON args from the XML children (freed via synth_args); NOT `synthesized`, so the prose is still
+                // stripped + narrated and the call renders as a normal in-chat tool chip like any other.
+                if (toolCallXmlNested(self.gpa, full)) |xc| {
+                    synth_args = @constCast(xc.args); // args are heap-owned by toolCallXmlNested; freed via synth_args
+                    break :blk_xn ToolCall{ .name = xc.name, .args = xc.args };
+                }
+                break :blk_xn null;
+            } orelse
                 (if (loose_ok and !looseRunWins(reason)) blk_loose: {
                     const lt = toolCallLoose(reason) orelse break :blk_loose null;
                     // A DESTRUCTIVE call may never dispatch off the hidden reasoning channel — musing
@@ -3015,7 +3026,16 @@ pub const Chat = struct {
             // turns are excluded from tool execution — so RUN it now (showing only the prose part) instead of
             // dumping the raw TOOL:{content} blob as chat text.
             if (self.tool_iters < MAX_TOOL_ITERS) {
-                if (toolCall(final_ans) orelse toolCallXml(final_ans)) |tc| {
+                var xml_args: ?[]u8 = null;
+                defer if (xml_args) |s| self.gpa.free(s); // runToolAndContinue dupes args first; safe to free after
+                const tcr = toolCall(final_ans) orelse toolCallXml(final_ans) orelse toolCallTagXml(final_ans) orelse blk_r: {
+                    if (toolCallXmlNested(self.gpa, final_ans)) |xc| {
+                        xml_args = @constCast(xc.args);
+                        break :blk_r ToolCall{ .name = xc.name, .args = xc.args };
+                    }
+                    break :blk_r null;
+                };
+                if (tcr) |tc| {
                     const prose = self.processMemory(dd, stripToolTail(final_ans));
                     self.revealReflect(dd, prose); // reveal the prose (+ collapsed trace), then run the tool
                     self.tool_iters += 1;
@@ -4780,6 +4800,7 @@ pub fn stripToolTail(text: []const u8) []const u8 {
     var cut = text.len;
     if (findToolCall(text)) |f| cut = @min(cut, f.at);
     if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
+    if (bareToolTagAt(text)) |p| cut = @min(cut, p); // bare `<edit_file>{...}` XML tool tag
     // RUN: <shell command> — only at a line start (a prose "RUN:" mid-sentence isn't a shell call).
     {
         var i: usize = 0;
@@ -4835,6 +4856,138 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
         if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
+}
+
+/// deepseek (and others) ALSO emit a call as a BARE tool-named XML tag — `<edit_file>{json}</edit_file>`,
+/// `<read_file>{json}</read_file>` — with NO `tool:` prefix, so toolCallXml misses it. Dropped, it reads as a
+/// hallucinated tool call and the model loops re-issuing it (observed live: the chat "couldn't make edits" while
+/// spraying `<edit_file>` blocks that never ran). Find the FIRST `<name>` whose name is a KNOWN chat tool and is
+/// followed by a balanced {...}. The known-tool gate is what stops a built page's own `<section>`/`<div>`/`<html>`
+/// markup from ever matching.
+pub fn toolCallTagXml(text: []const u8) ?ToolCall {
+    var search: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, search, '<')) |lt| {
+        search = lt + 1;
+        var i = lt + 1;
+        if (i < text.len and text[i] == '/') continue; // a closing tag </name>
+        const nstart = i;
+        while (i < text.len and text[i] != '>' and text[i] != ' ' and text[i] != '\n' and text[i] != '\r' and text[i] != '\t' and text[i] != '/') i += 1;
+        const name = text[nstart..i];
+        if (!knownChatTool(name)) continue;
+        while (i < text.len and text[i] != '>') i += 1; // skip to the tag close
+        if (i < text.len) i += 1; // past '>'
+        const astart = findArgsBrace(text, i) orelse continue;
+        var depth: i32 = 0;
+        var k = astart;
+        while (k < text.len) : (k += 1) {
+            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    k += 1;
+                    break;
+                }
+            }
+        }
+        if (depth == 0 and k > astart + 1) return .{ .name = name, .args = text[astart..k] };
+    }
+    return null;
+}
+
+/// Byte offset of the first `<knowntool>…` XML tool call (bare `{json}` OR nested `<arg>…</arg>` form), or null —
+/// lets stripToolTail cut it out of a displayed answer so a re-emitted `<write_file>…` blob never dumps into the chat.
+fn bareToolTagAt(text: []const u8) ?usize {
+    var search: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, search, '<')) |lt| {
+        search = lt + 1;
+        var i = lt + 1;
+        if (i < text.len and text[i] == '/') continue;
+        const nstart = i;
+        while (i < text.len and text[i] != '>' and text[i] != ' ' and text[i] != '\n' and text[i] != '\r' and text[i] != '\t' and text[i] != '/') i += 1;
+        if (!knownChatTool(text[nstart..i])) continue;
+        while (i < text.len and text[i] != '>') i += 1;
+        if (i < text.len) i += 1;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) i += 1;
+        if (i < text.len and (text[i] == '{' or text[i] == '<')) return lt; // {json} or nested-XML args
+    }
+    return null;
+}
+
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0 or s.len > 18) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
+}
+
+/// Parse a NESTED-XML tool call — `<read_file><path>index.html</path><start_line>100</start_line></read_file>` —
+/// where the tool NAME and its ARGUMENTS are both XML elements (Hermes/Anthropic style), not a JSON blob. deepseek
+/// emits this and it HUNG (toolCallTagXml expects `{json}` after the tag, hits `<path>`, gives up). Convert the
+/// child `<key>value</key>` elements into a JSON args object — OWNED by the caller (free it). An all-digit value
+/// becomes a JSON number (start_line:100); everything else a JSON-escaped string. Gated to known tool names so a
+/// built page's own `<section>`/`<div>` markup can never match. Returns null if there are no XML child args
+/// (that's the bare-tag `{json}` form, which toolCallTagXml owns).
+pub fn toolCallXmlNested(gpa: std.mem.Allocator, text: []const u8) ?ToolCall {
+    var search: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, search, '<')) |lt| {
+        search = lt + 1;
+        if (lt + 1 < text.len and text[lt + 1] == '/') continue;
+        var i = lt + 1;
+        const nstart = i;
+        while (i < text.len and text[i] != '>' and text[i] != ' ' and text[i] != '\n' and text[i] != '\r' and text[i] != '\t' and text[i] != '/') i += 1;
+        const name = text[nstart..i];
+        if (!knownChatTool(name)) continue;
+        while (i < text.len and text[i] != '>') i += 1;
+        if (i >= text.len) continue;
+        i += 1; // past '>'
+        var j = i; // args must be XML children (next non-ws is '<'); else the {json} bare-tag form owns it
+        while (j < text.len and (text[j] == ' ' or text[j] == '\t' or text[j] == '\n' or text[j] == '\r')) j += 1;
+        if (j >= text.len or text[j] != '<') continue;
+        var cb: [72]u8 = undefined;
+        const closing = std.fmt.bufPrint(&cb, "</{s}>", .{name}) catch continue;
+        const body_end = std.mem.indexOfPos(u8, text, i, closing) orelse text.len;
+        const body = text[i..body_end];
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(gpa);
+        out.append(gpa, '{') catch return null;
+        var first = true;
+        var k: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, body, k, '<')) |clt| {
+            if (clt + 1 < body.len and body[clt + 1] == '/') {
+                k = clt + 1;
+                continue;
+            }
+            var m = clt + 1;
+            const kstart = m;
+            while (m < body.len and body[m] != '>' and body[m] != ' ' and body[m] != '/') m += 1;
+            const key = body[kstart..m];
+            while (m < body.len and body[m] != '>') m += 1;
+            if (m >= body.len or key.len == 0) break;
+            m += 1; // past '>'
+            var kcb: [80]u8 = undefined;
+            const kclose = std.fmt.bufPrint(&kcb, "</{s}>", .{key}) catch break;
+            const vend = std.mem.indexOfPos(u8, body, m, kclose) orelse break;
+            const val = std.mem.trim(u8, body[m..vend], " \r\n\t");
+            if (!first) out.append(gpa, ',') catch return null;
+            first = false;
+            out.append(gpa, '"') catch return null;
+            escJson(&out, gpa, key);
+            out.appendSlice(gpa, "\":") catch return null;
+            if (isAllDigits(val)) {
+                out.appendSlice(gpa, val) catch return null;
+            } else {
+                out.append(gpa, '"') catch return null;
+                escJson(&out, gpa, val);
+                out.append(gpa, '"') catch return null;
+            }
+            k = vend + kclose.len;
+        }
+        out.append(gpa, '}') catch return null;
+        if (first) { // no children parsed — not really the nested form
+            out.deinit(gpa);
+            continue;
+        }
+        return .{ .name = name, .args = out.toOwnedSlice(gpa) catch return null };
+    }
+    return null;
 }
 
 /// First path segment ("app/models.py" -> "app", "app.py" -> "app.py"); leading "./" and "/" tolerated.
@@ -7108,6 +7261,52 @@ test "looksTruncatedWrite: a big write_file cut off mid-content (the token-cap b
     try std.testing.expect(!looksTruncatedWrite("TOOL: stop_swarm\nThen I'll check."));
     // a tiny unclosed blob is below the substantial-body threshold — not a big-file truncation
     try std.testing.expect(!looksTruncatedWrite("TOOL: write_file {\"path\":\"x\""));
+}
+
+test "toolCallTagXml parses a bare <edit_file>{...} tag; a built page's own markup never matches" {
+    // deepseek's bare tool-named XML tag (no `tool:` prefix) — the "hallucinated tool call" the chat couldn't run
+    {
+        const tc = toolCallTagXml("I'll fix it.\n<edit_file>\n{\"path\":\"index.html\",\"ops\":[{\"search\":\"a\",\"replace\":\"b\"}]}\n</edit_file>").?;
+        try std.testing.expectEqualStrings("edit_file", tc.name);
+        try std.testing.expect(argsHasPath(tc.args));
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"search\":\"a\"") != null);
+    }
+    // <read_file> bare tag carrying a line range
+    {
+        const tc = toolCallTagXml("<read_file>{\"path\":\"index.html\",\"start_line\":228,\"end_line\":245}</read_file>").?;
+        try std.testing.expectEqualStrings("read_file", tc.name);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "228") != null);
+    }
+    // a built page's own HTML markup is NEVER a call (tag name is not a known tool)
+    try std.testing.expect(toolCallTagXml("<section class=\"hero\"><div>{x:1}</div></section>") == null);
+    try std.testing.expect(toolCallTagXml("<html><head><title>hi</title></head></html>") == null);
+    // a bare mention with no following {args} is not a call
+    try std.testing.expect(toolCallTagXml("use <read_file> to inspect the file") == null);
+}
+
+test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read_file><path>..</path> form)" {
+    const gpa = std.testing.allocator;
+    // the ACTUAL hanging form: name AND args are XML elements, digits become JSON numbers
+    {
+        const tc = toolCallXmlNested(gpa, "Let me read it.\n<read_file>\n<path>index.html</path>\n<start_line>100</start_line>\n<end_line>200</end_line>\n</read_file>").?;
+        defer gpa.free(@constCast(tc.args));
+        try std.testing.expectEqualStrings("read_file", tc.name);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"path\":\"index.html\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"start_line\":100") != null); // number, not "100"
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"end_line\":200") != null);
+    }
+    // a flat edit_file (search/replace as elements; braces in the value are fine)
+    {
+        const tc = toolCallXmlNested(gpa, "<edit_file><path>a.html</path><search>x{y}</search><replace>z</replace></edit_file>").?;
+        defer gpa.free(@constCast(tc.args));
+        try std.testing.expectEqualStrings("edit_file", tc.name);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"search\":\"x{y}\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "\"replace\":\"z\"") != null);
+    }
+    // a built page's own markup is NOT a call (no known tool name)
+    try std.testing.expect(toolCallXmlNested(gpa, "<section><div>hello</div></section>") == null);
+    // the bare `<name>{json}` form belongs to toolCallTagXml, not this one
+    try std.testing.expect(toolCallXmlNested(gpa, "<read_file>{\"path\":\"a\"}</read_file>") == null);
 }
 
 test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wildcards" {
