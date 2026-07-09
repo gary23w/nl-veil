@@ -449,6 +449,13 @@ pub fn main() !void {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
                                 if (std.mem.eql(u8, rn, "memory")) ui.right_tab = .memory else if (std.mem.eql(u8, rn, "activity")) ui.right_tab = .activity;
+                            } else if (std.mem.startsWith(u8, cmd, "speed ")) {
+                                // headless speed-mode toggle for automated verification
+                                const v = std.mem.trim(u8, cmd[6..], " \r\n\t");
+                                store.lock();
+                                store.settings.speed_mode = std.mem.eql(u8, v, "on");
+                                store.unlock();
+                                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
                             } else if (std.mem.eql(u8, cmd, "newconv")) {
                                 // start a FRESH conversation headlessly (clean build dir, no prior history)
                                 setTab(.chat);
@@ -3615,6 +3622,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const portv = store.settings.port;
     const tok_n = store.settings.token_len;
     const notify_on = store.settings.notify;
+    const speed_on = store.settings.speed_mode;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -3669,6 +3677,18 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.settings.notify = !store.settings.notify;
         store.unlock();
     }
+    y += 46;
+    // SPEED MODE: the chat builds projects itself; casts become 2-minute research sub-agents. OFF restores
+    // the autonomy posture (the chat may deploy long set-and-forget hiveminds). Persisted with the settings.
+    const spd_w = @max(t.btnW(t.z("speed mode: ON", .{}), 32), t.btnW(t.z("speed mode: OFF", .{}), 32));
+    const spr = t.Rect{ .x = x, .y = y, .width = spd_w, .height = 32 };
+    if (t.button(spr, if (speed_on) t.z("speed mode: ON", .{}) else t.z("speed mode: OFF", .{}), if (speed_on) t.green else t.comment, true)) {
+        store.lock();
+        store.settings.speed_mode = !store.settings.speed_mode;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    t.text(t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}), @intFromFloat(x + spd_w + 14), @intFromFloat(y + 9), 12, t.comment);
     y += 46;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----

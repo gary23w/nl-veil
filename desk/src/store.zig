@@ -84,6 +84,10 @@ pub const Settings = struct {
     chat_left_open: bool = true,
     chat_right_open: bool = true,
     shell_always_allow: bool = false, // "Bypass" chosen once → the veil's RUN: shell commands skip the approval prompt
+    // SPEED MODE (default ON): the chat BUILDS projects itself with its file tools, and casts are quick
+    // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long
+    // set-and-forget hiveminds (the original swarm design) for builds and deep work.
+    speed_mode: bool = true,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
