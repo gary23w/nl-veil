@@ -845,7 +845,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.act("veil", 0, "originate", "chose its own purpose (no human prompt)", goal);
         }
     }
-    if (live and !w.quick) { // quick: the raw task IS the instruction — skip the goal-rewrite round-trip
+    // Skip the LLM goal-rewrite ("intent brief") for quick AND every cast-originated run (w.cast_run): a cast
+    // goal is composed by the caller (the chat mind, or an explicit CAST: line) and is ALREADY the precise
+    // instruction — re-interpreting it through the gateway model DRIFTS a specific request into a paraphrase the
+    // swarm then chases instead of the actual ask (user: "the swarm is incapable of following basic prompts …
+    // maybe the intuition feature … especially inside a casting event"). Only free-roam Deploy-tab swarms, which
+    // get a raw human goal that may be vague, still get the brief.
+    if (live and !w.quick and !w.cast_run) {
         w.goal_brief = rsi.interpretGoal(&w, goal);
         if (w.goal_brief.len > 0) {
             w.emit("intent", std.fmt.allocPrint(w.a(), ",\"goal\":\"{s}\",\"brief\":\"{s}\"", .{ w.esc(clip(goal, 200)), w.esc(clip(w.goal_brief, 1200)) }) catch ",\"brief\":\"\"");

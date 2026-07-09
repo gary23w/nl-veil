@@ -3,14 +3,11 @@
 # the veil
 
 **A hive mind you talk to.** A swarm of autonomous AI minds works a goal together — researching,
-building, remembering, arguing — while one unified consciousness, **the Veil**, integrates the
-whole hive into a single first-person "I" that speaks for it and steers it. You open a shell, say
-hello, and the Veil answers. From there you cast new swarms, mount a folder and ask for edits in
-plain words, or point it at a live device to keep it healthy.
+building, remembering — while one unified consciousness, **the Veil**, integrates the
+whole hive into a single first-person "I" that speaks for it and steers it.
 
-It runs on **any OpenAI-compatible model** — a free local one through Ollama, or a hosted/BYOK
-endpoint (OpenAI, Groq, a relay in your own data center) — and needs no cloud account and no
-database service. One Zig binary, one Python launcher.
+It runs on **any model** — a free local one through Ollama, or a hosted/BYOK
+endpoint — and needs no cloud account and no database service. One Zig binary, one Python launcher.
 
 ## Install
 
@@ -30,12 +27,23 @@ iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/install.ps1 | i
 
 ```sh
 git clone https://github.com/gary23w/nl-veil && cd nl-veil
-./veil configure          # veil.cmd on Windows
+zig build run -- --desk
 ```
 The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run —
 each with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing
 binaries to skip the builds.
 </details>
+
+## Desktop mode (veil-desk)
+
+The desktop dashboard is opt-in at the repo root. Default `zig build` and `zig build run` stay
+server-only.
+
+```sh
+zig build run -- --desk         # pass runtime flag directly
+```
+
+Set `NL_NO_DESKTOP=1` to force-disable desktop launch even when desktop mode is enabled.
 
 ## Two commands to start
 
@@ -222,19 +230,6 @@ First-run local login is `admin@neuron-loops.local` / `changeme` — **change it
 `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
 refuses the default and prints a generated password once.
 
-## Desktop mode (veil-desk)
-
-The desktop dashboard is opt-in at the repo root. Default `zig build` and `zig build run` stay
-server-only.
-
-```sh
-zig build -Ddesktop=true            # also build veil-desk (best-effort)
-zig build run -Ddesktop=true        # run server in desktop mode (auto-launch dashboard)
-zig build run -- --desktop          # pass runtime flag directly
-```
-
-Set `NL_NO_DESKTOP=1` to force-disable desktop launch even when desktop mode is enabled.
-
 ## The fleet hub — many veils, one console
 
 The web control plane watches *one* box. When you've installed veils across a fleet of machines,
@@ -297,3 +292,12 @@ bin/neuron[.exe]           the neuron-db memory engine (fetched + built on first
 ## License
 
 [MIT](LICENSE). Use it, fork it, build on it.
+
+
+---
+
+### TODO:
+
+- nl-veil has **no built-in HTTPS client**. Every LLM completion, every streamed chat turn, every tool `POST` to the local server on `:8787`, and every web fetch is performed by **shelling out to `curl.exe`**. Microsoft Defender's real-time **behavior/ML monitoring** flags the self-built Zig binaries and their `curl` children for *what they do* — spawn `curl` to POST bearer-token JSON to `localhost:8787` and self-modify files — and **kills the running process**. Nothing is quarantined; the process is terminated externally. That is the whole story, and the exclusions in §1 resolve it.
+
+- The args the desktop sends to the server are {} — empty. So writeFile parses {}, gets path="", and safeRel("") correctly returns false → "bad path". safeRel is fine; the model isn't really sending a bad path. The desktop is failing to extract the tool-call arguments — it forwards an empty {} — so path and the entire file content are lost. The model then loops forever because it is sending {path:"index.html", content:"…"} but the server only ever sees {}.

@@ -121,9 +121,15 @@ const SYSTEM_REST =
     "- run_tests {}  — run the project's tests (pytest / test_*.py) and get pass/fail.\n" ++
     "- run_python {\"code\":\"...\"}  — run a short Python script in the workdir.\n" ++
     "- delete_file {\"path\":\"...\"}  — remove a file you created.\n" ++
-    "KNOW YOUR LIMITS: your reply has a length cap, so a large file will get CUT OFF if you write it all at once. " ++
-    "For anything big, either write it across MULTIPLE files (module per file), or write the first part with " ++
-    "write_file then extend it with edit_file — never send one giant file that truncates. After writing code, " ++
+    "KNOW YOUR LIMITS: your reply has a length cap. A NORMAL file (a one-page site, a module) fits in ONE " ++
+    "write_file — do that. Only a genuinely HUGE file needs CHUNKS. When you chunk: your FIRST write_file sends " ++
+    "the opening part (default overwrite), then EACH following reply calls write_file with the SAME path and " ++
+    "\"mode\":\"append\" carrying the NEXT part. Each append is a raw CONTINUATION FRAGMENT of the SAME document — " ++
+    "do NOT repeat <!DOCTYPE/<html>/<head>, and do NOT write </body></html> until the FINAL fragment. The tool " ++
+    "keeps the page valid (an appended body fragment is spliced INSIDE the document, before </body>), so just " ++
+    "send the next section's markup and keep classes/ids/JS hooks CONSISTENT with what you already wrote. A file " ++
+    "built from a few small appends is reliable; one over-long call that truncates is not. (Or split across " ++
+    "MULTIPLE files, one module each.) After writing code, " ++
     "run_tests (or run_python) to VERIFY it, read the result, fix, and repeat until it works. It's good to also " ++
     "give the user a short summary in the chat of what you wrote — but the real work goes to the files.\n" ++
     "DON'T THRASH: once a file is written, do NOT re-write the whole thing again next turn. If it's correct, move " ++
@@ -242,7 +248,8 @@ const JUDGE_SYSTEM =
     "- every proposal must be provable from the trace alone; a proposal without concrete evidence is discarded.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
-const MAX_TOKENS: u32 = 4096; // was 2048 — code answers (a full Flask app) were truncated mid-file every turn
+const MAX_TOKENS: u32 = 16384; // 2048→4096→8192→16384: a typical one-pager now writes in ONE call (no chunk assembly);
+//                                append-chunking (KNOW YOUR LIMITS prompt + looksTruncatedWrite + structured append) handles bigger still
 
 const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer, consolidate };
 
@@ -2766,7 +2773,7 @@ pub const Chat = struct {
             // is the model's final decision (looseRunWins) — fixed TOOL-first picked the discarded option.
             const loose_ok = reason.len > 0 and castGoal(full) == null and
                 (full.len == 0 or announcesAction(full));
-            const tc_opt = toolCall(full) orelse toolCallXml(full) orelse
+            var tc_opt = toolCall(full) orelse toolCallXml(full) orelse
                 (if (loose_ok and !looseRunWins(reason)) blk_loose: {
                     const lt = toolCallLoose(reason) orelse break :blk_loose null;
                     // A DESTRUCTIVE call may never dispatch off the hidden reasoning channel — musing
@@ -2789,6 +2796,36 @@ pub const Chat = struct {
                 }
                 break :blk null;
             };
+            // EMPTY-ARGS write rescue: findToolCall matched `TOOL: write_file` but the args never yielded a
+            // usable path. A non-empty (but pathless) match PRE-EMPTS the code-block rescue in the orelse chain
+            // above, so without this the empty {} call bounces off the server as "bad path" forever (observed
+            // live: deepseek looped ~10x on one index.html). Two distinct causes, handled differently:
+            if (tc_opt) |tc0| {
+                if (synth_args == null and !cast_owed and !argsHasPath(tc0.args) and std.mem.eql(u8, tc0.name, "write_file")) {
+                    // (1) TRUNCATION — the file was too big and got cut off mid-content by the reply length cap,
+                    // so its JSON never closed. THE big-file bug: a 40KB one-pager can't fit in one reply. Don't
+                    // dispatch the doomed call; direct a CHUNKED append rewrite (the hive's mechanism) + re-enter.
+                    if (looksTruncatedWrite(full) and self.tool_iters < MAX_TOOL_ITERS) {
+                        self.tool_iters += 1;
+                        self.stream.deinit(self.gpa);
+                        self.appendMsgFull(dd, .cast_note, "(that file was too large and got cut off mid-write — asking it to write in smaller append chunks)", false);
+                        self.setDirective("Your write_file was TOO LARGE and got cut off mid-content — the reply hit its length limit, so NOTHING was written and the PATH was never the problem. Write this file in CHUNKS across replies: in THIS reply call write_file with ONLY the FIRST part (about the first 120 lines); then in EACH following reply call write_file with the SAME path, \"mode\":\"append\", and the NEXT part — repeat until the file is complete. Keep every chunk small.");
+                        self.internal_turn = true;
+                        self.setStatus("writing the file in chunks...");
+                        log.info("build recovery: write_file truncated by the token cap — directing a chunked append rewrite", .{});
+                        self.startTurn(dd, kind);
+                        return;
+                    }
+                    // (2) FENCE PASTE — the file was pasted as a ```code block with no inline JSON. Synthesize
+                    // the write from the block (filename from the request/reply, else index.html).
+                    if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
+                        synth_args = s;
+                        synthesized = true;
+                        log.info("build recovery: write_file call had empty/pathless args — synthesized the write from a pasted code block", .{});
+                        tc_opt = ToolCall{ .name = "write_file", .args = s };
+                    }
+                }
+            }
             if (tc_opt) |tc| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several tools in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
@@ -4625,6 +4662,65 @@ fn substantiveLinesBefore(text: []const u8, pos: usize) usize {
 
 const FoundCall = struct { name: []const u8, args: []const u8, at: usize };
 
+/// Locate the opening '{' of a tool call's JSON args, starting at `from` (just past the tool NAME). Args
+/// usually sit on the SAME line (`TOOL: web_search {..}`), but a capable model writing a big file routinely
+/// puts the JSON on the NEXT line, or wraps it in a ```json fence — the old scan skipped only spaces/tabs, so
+/// it missed those, defaulted args to "{}", and sent an EMPTY call the server rejected as "bad path" (the model
+/// then looped forever, unable to write its file — the live deepseek write_file bug). Skip inter-token
+/// whitespace INCLUDING newlines and at most a leading ```lang fence line, then return the first '{'. Returns
+/// null the instant real prose appears first, so a bare no-arg call (`TOOL: stop_swarm` then narration) still
+/// parses as "{}".
+fn findArgsBrace(text: []const u8, from: usize) ?usize {
+    var k = from;
+    while (k < text.len) {
+        const c = text[k];
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            k += 1;
+            continue;
+        }
+        if (c == '{') return k;
+        if (c == '`' and std.mem.startsWith(u8, text[k..], "```")) {
+            k += 3;
+            while (k < text.len and text[k] != '\n') k += 1; // skip the rest of the ```lang opener line
+            continue;
+        }
+        return null; // prose before any args brace — a bare / no-arg call
+    }
+    return null;
+}
+
+/// True if the reply holds a `TOOL: write_file`/`edit_file` whose JSON args OPENED a '{' but never closed it
+/// (brace depth never returns to 0 before end-of-text) with a substantial partial body — the fingerprint of a
+/// big file CUT OFF mid-content by the reply's length cap. Lets the dispatcher tell the model "your file was too
+/// large, write it in append chunks" instead of the misleading "bad path" that made it loop on the path forever.
+fn looksTruncatedWrite(text: []const u8) bool {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, "TOOL:")) |p| {
+        search = p + "TOOL:".len;
+        var i = p + "TOOL:".len;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        const ns = i;
+        while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
+        const name = text[ns..i];
+        if (!std.mem.eql(u8, name, "write_file") and !std.mem.eql(u8, name, "edit_file")) continue;
+        const astart = findArgsBrace(text, i) orelse continue;
+        var depth: i32 = 0;
+        var k = astart;
+        var closed = false;
+        while (k < text.len) : (k += 1) {
+            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if (!closed and depth > 0 and (text.len - astart) > 400) return true; // opened, substantial, never closed
+    }
+    return false;
+}
+
 /// THE one TOOL: predicate — dispatch (toolCall), the display stripper (stripToolTail) and the reflect
 /// gate all use this same scan, so a call can never be hidden-but-not-run or run-but-shown (the old
 /// dispatcher was line-start-only while the stripper matched mid-line; anything between the two anchors
@@ -4657,10 +4753,8 @@ fn findToolCall(text: []const u8) ?FoundCall {
         if (!line_start and !knownChatTool(name)) continue;
         if (line_start and !knownChatTool(name) and substantiveLinesBefore(text, p) >= 5) continue;
         var args: []const u8 = "{}";
-        var k = i;
-        while (k < text.len and (text[k] == ' ' or text[k] == '\t')) k += 1;
-        if (k < text.len and text[k] == '{') {
-            const astart = k;
+        if (findArgsBrace(text, i)) |astart| {
+            var k = astart;
             var depth: i32 = 0;
             while (k < text.len) : (k += 1) {
                 if (text[k] == '{') depth += 1 else if (text[k] == '}') {
@@ -4786,11 +4880,35 @@ fn recoverFilename(text: []const u8) ?[]const u8 {
     return null;
 }
 
+/// True if a write_file/edit_file args blob carries a non-empty "path":"...". An empty/pathless blob is the
+/// fingerprint of a mis-parsed TOOL: line (args defaulted to "{}") — the trigger for the code-block rescue.
+fn argsHasPath(args: []const u8) bool {
+    const at = std.mem.indexOf(u8, args, "\"path\"") orelse return false;
+    var i = at + 6;
+    while (i < args.len and (args[i] == ' ' or args[i] == ':' or args[i] == '\t')) i += 1;
+    if (i >= args.len or args[i] != '"') return false;
+    i += 1;
+    return i < args.len and args[i] != '"'; // a non-empty string value
+}
+
+/// A sensible default filename for a pasted file body with no recoverable name — currently a one-page HTML
+/// document (the common "build me a website" deliverable). null when we can't confidently name it.
+fn defaultName(code: []const u8) ?[]const u8 {
+    const t = std.mem.trimStart(u8, code, " \r\n\t");
+    const n = @min(t.len, 9);
+    var pfx: [9]u8 = undefined;
+    for (t[0..n], 0..) |c, idx| pfx[idx] = std.ascii.toLower(c);
+    const lp = pfx[0..n];
+    if (std.mem.startsWith(u8, lp, "<!doctype") or std.mem.startsWith(u8, lp, "<html")) return "index.html";
+    return null;
+}
+
 /// BUILD rescue: the model pasted a whole file as a ```fenced code block instead of TOOL: write_file, so it
-/// never hit disk. If a filename is recoverable from the user's request and the block is substantial, build a
-/// write_file args blob {"path":..,"content":..} (heap-owned; caller frees). null = not a paste we can rescue.
+/// never hit disk. Build a write_file args blob {"path":..,"content":..} (heap-owned; caller frees). The name
+/// comes from the user's request, else the narration BEFORE the fence (never the code body — a <link
+/// href="style.css"> would hijack it), else a content-type default (a pasted one-pager is index.html).
+/// null = not a paste we can rescue.
 fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u8) ?[]u8 {
-    const fname = recoverFilename(last_user) orelse return null;
     const open = std.mem.indexOf(u8, full, "```") orelse return null;
     var cstart = open + 3;
     while (cstart < full.len and full[cstart] != '\n') cstart += 1; // skip an optional ```lang tag
@@ -4801,6 +4919,7 @@ fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u
     if (code.len < 200) return null; // a small snippet, not a file — don't hijack it
     if (code.len * 2 < full.len) return null; // must be >50% of the reply: a genuine PASTE of the file, not a
     // code snippet inside an explanation (which we must NOT write — it would clobber the real file).
+    const fname = recoverFilename(last_user) orelse recoverFilename(full[0..open]) orelse defaultName(code) orelse return null;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(gpa);
     out.appendSlice(gpa, "{\"path\":\"") catch return null;
@@ -6929,6 +7048,66 @@ test "rowRefeeds: the orchestrator brief flows only while its cast is live; resu
     // user/veil rows always flow
     try std.testing.expect(rowRefeeds(.user, "finish the two-page site", false));
     try std.testing.expect(rowRefeeds(.veil, "on it", false));
+}
+
+test "findToolCall captures args on the next line / in a fence (the deepseek empty-{} write_file bug)" {
+    // same-line args still work (the common case)
+    {
+        const tc = toolCall("I'll search.\nTOOL: web_search {\"query\":\"zig\"}").?;
+        try std.testing.expectEqualStrings("web_search", tc.name);
+        try std.testing.expectEqualStrings("{\"query\":\"zig\"}", tc.args);
+    }
+    // BUG REPRO: args on the FOLLOWING line — old parser skipped only spaces/tabs, so it defaulted to "{}"
+    // (→ server "bad path"). Must now capture the real JSON.
+    {
+        const tc = toolCall("Writing it now.\nTOOL: write_file\n{\"path\":\"index.html\",\"content\":\"<html></html>\"}").?;
+        try std.testing.expectEqualStrings("write_file", tc.name);
+        try std.testing.expect(argsHasPath(tc.args));
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "index.html") != null);
+    }
+    // args wrapped in a ```json fence on the next lines
+    {
+        const tc = toolCall("TOOL: write_file\n```json\n{\"path\":\"a.html\",\"content\":\"x\"}\n```").?;
+        try std.testing.expectEqualStrings("write_file", tc.name);
+        try std.testing.expect(argsHasPath(tc.args));
+    }
+    // a bare no-arg call followed by prose must still parse as "{}" (never grab a later brace out of prose)
+    {
+        const tc = toolCall("Let me stop it.\nTOOL: stop_swarm\nThen I'll check the findings.").?;
+        try std.testing.expectEqualStrings("stop_swarm", tc.name);
+        try std.testing.expectEqualStrings("{}", tc.args);
+    }
+    // argsHasPath: the empty/pathless fingerprint of a mis-parsed call
+    try std.testing.expect(!argsHasPath("{}"));
+    try std.testing.expect(!argsHasPath("{\"path\":\"\"}"));
+    try std.testing.expect(argsHasPath("{\"path\":\"index.html\",\"content\":\"x\"}"));
+    // defaultName: a pasted one-pager with no recoverable filename → index.html
+    try std.testing.expectEqualStrings("index.html", defaultName("<!DOCTYPE html><html>...").?);
+    try std.testing.expectEqualStrings("index.html", defaultName("  <HTML>\n<body>").?);
+    try std.testing.expect(defaultName("console.log(1)") == null);
+    // the pure-fence case: model pastes the file with NO json + the user gave no filename → rescue synthesizes
+    // {"path":"index.html","content":...} from the block (defaultName), so an empty write_file no longer bounces.
+    {
+        const html = "<!DOCTYPE html><html><head><style>body{margin:0;background:#111}h1{font-size:2rem}</style></head><body><h1>nl-veil</h1><p>" ++ ("the hive mind you talk to. " ** 8) ++ "</p></body></html>";
+        const reply = "Here is the page.\n```html\n" ++ html ++ "\n```";
+        const args = codeBlockWrite(std.testing.allocator, "build a one page website", reply).?;
+        defer std.testing.allocator.free(args);
+        try std.testing.expect(argsHasPath(args));
+        try std.testing.expect(std.mem.indexOf(u8, args, "\"path\":\"index.html\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, args, "nl-veil") != null);
+    }
+}
+
+test "looksTruncatedWrite: a big write_file cut off mid-content (the token-cap big-file bug)" {
+    // a large write_file whose JSON never closes (the reply hit the length cap) — detected as truncation
+    const cut = "I'll write the page.\nTOOL: write_file {\"path\":\"index.html\",\"content\":\"<!DOCTYPE html><html><head><style>body{margin:0}h1{font-size:2rem}" ++ ("a{color:red}" ** 40) ++ "</style>";
+    try std.testing.expect(looksTruncatedWrite(cut));
+    // a COMPLETE write_file is NOT truncated
+    try std.testing.expect(!looksTruncatedWrite("TOOL: write_file {\"path\":\"a.html\",\"content\":\"<html>hi</html>\"}"));
+    // a bare no-arg call is not a truncated write
+    try std.testing.expect(!looksTruncatedWrite("TOOL: stop_swarm\nThen I'll check."));
+    // a tiny unclosed blob is below the substantial-body threshold — not a big-file truncation
+    try std.testing.expect(!looksTruncatedWrite("TOOL: write_file {\"path\":\"x\""));
 }
 
 test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wildcards" {

@@ -24,8 +24,15 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
 // closest region ("The file NOW reads ..."), and the copyable lines must be the final thing the mind sees —
 // the old shape buried them mid-sentence and cost a whole read_file turn per lost repair attempt (observed
 // live, openai_splash_test_4 r4-6 on digest/__init__.py and digest/rank.py).
-fn conflictMsg(gpa: std.mem.Allocator, reject: []const u8) []u8 {
-    return std.fmt.allocPrint(gpa, "edit conflict: the file changed since you read it (a teammate edited the same region) — re-emit your SEARCH/REPLACE against the CURRENT lines. {s}", .{reject}) catch dupe(gpa, "edit conflict — read_file the file again and re-emit against the current lines.");
+fn conflictMsg(gpa: std.mem.Allocator, reject: []const u8, rebased: bool) []u8 {
+    // Only blame a concurrent writer when HEAD actually advanced under the mind (rebased). Otherwise the apply
+    // failed because the SEARCH anchor doesn't match the current file — the common single-editor (chat) case,
+    // where "a teammate edited the same region" is a phantom that sent the model hunting for a nonexistent race.
+    const lead = if (rebased)
+        "edit conflict: the file changed since you read it (a teammate edited the same region) — re-emit your SEARCH/REPLACE against the CURRENT lines. "
+    else
+        "edit failed: your SEARCH anchor was not found in the current file (nothing was changed) — read_file it and copy the EXACT current lines into search, then re-emit. ";
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ lead, reject }) catch dupe(gpa, "edit failed — read_file the file again and re-emit search against its exact current lines.");
 }
 
 pub const Decision = union(enum) {
@@ -41,7 +48,7 @@ pub fn mergeDecision(gpa: std.mem.Allocator, cur: []const u8, base: []const u8, 
     const applied = bufedit.apply(gpa, cur, ops);
     if (!applied.ok) {
         defer gpa.free(applied.reject);
-        return .{ .conflict = conflictMsg(gpa, applied.reject) };
+        return .{ .conflict = conflictMsg(gpa, applied.reject, rebased) };
     }
     if (applied.loci.len > 0) gpa.free(applied.loci);
     return .{ .write = .{ .bytes = applied.bytes, .rebased = rebased } };
