@@ -278,6 +278,19 @@ fn mirrorSkill(ctx: *ToolCtx, name: []const u8, skill: []const u8) void {
 /// (recursive self-improvement of strategy — the engine/harness stays fixed and human-controlled).
 pub const PLAYBOOK_SCOPE = "playbook";
 
+/// VERIFIED operational lessons — minted ONLY by the engine from a real failure-then-success transition
+/// on the same tool (real exit codes / error markers, never a mind's self-report). Contrast
+/// PLAYBOOK_SCOPE: the playbook is what the swarm BELIEVES about its process (self-authored); lessons are
+/// what the run PROVED. Recalled into every mind's prompt and folded into failing tool results.
+pub const LESSON_SCOPE = "lessons";
+
+/// QUARANTINE for the end-of-run judge's proposals. Nothing recalls these scopes into prompts — they wait
+/// for review/promotion. The judge (a trace reader on the gateway model) never writes a live scope: an
+/// ungrounded "lesson" written straight into binding context is the documented round-8 phantom-directive
+/// failure this split exists to prevent.
+pub const LESSON_PROPOSED_SCOPE = "lessons-proposed";
+pub const SKILL_PROPOSED_SCOPE = "skills-proposed";
+
 /// The swarm's FITNESS history — one "round N: P/T (pct%)" line per round, written by the engine's benchmark.
 /// This is the measurable spine of recursive self-improvement: improvement is a NUMBER that must climb, not a
 /// vibe. The deliverable is scored each round (real tests > compiles > artifact-presence) and that score is fed

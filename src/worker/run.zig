@@ -227,6 +227,13 @@ pub const Worker = struct {
     operating: bool = false,
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
+    // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
+    // SIMILAR success by ANY mind mints a verified lesson (one hive mind — a fix is a fix no matter who
+    // found it). Touched ONLY in the single-threaded between-rounds section; moments carry their own
+    // records out via Moment.fails/oks instead of writing here from parallel threads.
+    lfail: LessonRec = .{},
+    lfail_set: bool = false,
+    judged: bool = false, // the end-of-run judge fires exactly once, whatever stop path lands first
     now_str: []const u8 = "",
     doc_files: u32 = 0,
     doc_target: u32 = 0,
@@ -901,6 +908,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             establishPlan(&w, goal);
             deriveDependencies(&w, goal);
         }
+    } else if (live and !w.discourse and !w.operating and w.cast) {
+        // A quick CAST gets no PLANNED blueprint (by design — no scaffolding over --embed), but when the
+        // GOAL ITSELF names the deliverable files, adopt exactly those, verbatim, as the blueprint.
+        // Without it the assembler one-slot pin sends EVERY mind to the first goal-named file — the
+        // observed cast failure: three minds all assigned index.html, varieties.html never owned by
+        // anyone, while the coverage benchmark demanded it. Zero model calls; goal-named files only.
+        w.blueprint = goalNamedFiles(gpa, goal);
+        if (w.blueprint.len > 0) {
+            w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
+            w.act("engine", 0, "blueprint", "goal-named deliverables", w.blueprint);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+        }
     }
     defer if (w.blueprint.len > 0) gpa.free(@constCast(w.blueprint));
     if (live) {
@@ -1088,6 +1107,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             } else |_| {}
             if (mi.scout and moment.skills == 0 and moment.files == 0)
                 _ = w.mem.observe(mi.scope, "scout: found no new external technique this round; team proceeds with current knowledge");
+            applyLessonRecords(&w, round, &moment); // cross-mind/cross-round fail→fix pairing (single-threaded here)
             mi.facts = moment.facts;
             total_files += moment.files;
             if (gpa.dupe(u8, moment.stance)) |st| (mi.stances.append(gpa, st) catch gpa.free(st)) else |_| {}
@@ -1336,12 +1356,23 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         // INTERACTIVE one-shot: after the single edit moment ran, stop — do not loop continuous.
         if (w.quick and live and any_llm_ok and !w.stop_now) {
-            // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
-            // research-only) wrote no files. Compose the final answer from those findings before stopping,
-            // so the chat/Deploy tab has an artifact to surface instead of an empty run.
-            if (w.cast) castSynthesize(&w, goal);
-            w.stop_now = true;
-            w.stop_why = "quick_done";
+            // A CAST strike that produced an INCOMPLETE multi-file deliverable keeps working while its
+            // minutes budget lasts — finalizing quick_done at 50% coverage with minutes still on the
+            // clock was the observed cast failure (the missing file's round never came). The bound is
+            // unchanged: the deadline/budget wall still ends the run; this only spends time the caller
+            // already granted. Research casts (no scored file deliverable) stop after one moment as before.
+            const budget_left = w.deadline_s == 0 or w.nowSecs() < w.deadline_s;
+            const incomplete = w.deliverable_missing or (w.last_bench.status == .ok and w.last_bench.pct < 100);
+            if (!(w.cast and budget_left and incomplete)) {
+                // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
+                // research-only) wrote no files. Compose the final answer from those findings before stopping,
+                // so the chat/Deploy tab has an artifact to surface instead of an empty run.
+                if (w.cast) castSynthesize(&w, goal);
+                w.stop_now = true;
+                w.stop_why = "quick_done";
+            } else {
+                w.act("engine", round, "continue", "quick cast", std.fmt.allocPrint(w.a(), "deliverable incomplete ({d}% best) with budget remaining — running another round instead of finalizing", .{w.best_pct}) catch "continuing");
+            }
         }
         if (w.stop_now) {
             // !w.cast_run: a cast (quick strike OR sustained chat cast) TERMINATES at completed/graduated —
@@ -1419,6 +1450,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 /// DONE is a finished run (.stopped), never a crash to respawn. Without it, a finished cast whose
 /// events.jsonl outgrew the probe's read window re-classified as .crashed and got resurrected forever.
 fn writeDone(w: *Worker, reason: []const u8) void {
+    // END-OF-RUN JUDGE (one-shot, whichever stop path lands first): grade the run's trace and quarantine
+    // any durable proposals BEFORE the DONE marker; a failed/unreachable judge is a silent no-op.
+    if (!w.judged) {
+        w.judged = true;
+        rsi.runJudge(w);
+    }
     const dp = std.fmt.allocPrint(w.gpa, "{s}/DONE", .{w.run_dir}) catch return;
     defer w.gpa.free(dp);
     std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = dp, .data = reason }) catch {};
@@ -1427,7 +1464,36 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     std.Io.Dir.cwd().deleteFile(w.io, pp) catch {};
 }
 
-pub const Moment = struct { monologue: []u8, fact: []u8, stance: []u8, facts: u32, recalled: u32, trace: []u8, files: u32, dt: i64 = 0, skills: u32 = 0, directives: u32 = 0, tools_made: u32 = 0, llm_ok: bool = false, llm_fatal: bool = false, auto_stored: bool = false, tool_calls: u32 = 0, narrated: bool = false };
+/// One real tool execution, recorded for lesson pairing: fails carry the failure note, oks don't. Fixed
+/// buffers so Moments cross the parallel/aggregation boundary by value with no shared-state writes.
+pub const LessonRec = struct {
+    tool: [28]u8 = [_]u8{0} ** 28,
+    tool_len: u8 = 0,
+    args: [200]u8 = [_]u8{0} ** 200,
+    args_len: u8 = 0,
+    note: [56]u8 = [_]u8{0} ** 56,
+    note_len: u8 = 0,
+
+    pub fn set(r: *LessonRec, tool_name: []const u8, args: []const u8, note: []const u8) void {
+        r.tool_len = @intCast(@min(tool_name.len, r.tool.len));
+        @memcpy(r.tool[0..r.tool_len], tool_name[0..r.tool_len]);
+        r.args_len = @intCast(@min(args.len, r.args.len));
+        @memcpy(r.args[0..r.args_len], args[0..r.args_len]);
+        r.note_len = @intCast(@min(note.len, r.note.len));
+        @memcpy(r.note[0..r.note_len], note[0..r.note_len]);
+    }
+    pub fn toolStr(r: *const LessonRec) []const u8 {
+        return r.tool[0..r.tool_len];
+    }
+    pub fn argsStr(r: *const LessonRec) []const u8 {
+        return r.args[0..r.args_len];
+    }
+    pub fn noteStr(r: *const LessonRec) []const u8 {
+        return r.note[0..r.note_len];
+    }
+};
+
+pub const Moment = struct { monologue: []u8, fact: []u8, stance: []u8, facts: u32, recalled: u32, trace: []u8, files: u32, dt: i64 = 0, skills: u32 = 0, directives: u32 = 0, tools_made: u32 = 0, llm_ok: bool = false, llm_fatal: bool = false, auto_stored: bool = false, tool_calls: u32 = 0, narrated: bool = false, fails: [3]LessonRec = @splat(.{}), fail_n: u8 = 0, oks: [4]LessonRec = @splat(.{}), ok_n: u8 = 0 };
 
 /// One round's measured fitness. Written ONLY in the single-threaded between-rounds section, then read by the
 /// next round's parallel moments — so a plain value + a gpa-owned failures string (no concurrent writer) is safe.
@@ -1835,6 +1901,193 @@ fn retriableToolFail(name: []const u8, result: []const u8) bool {
     const marks = [_][]const u8{ "error", "failed", "could not", "timed out", "timeout", "curl", "unreachable", "no response", "connection", "temporar" };
     for (marks) |mk| if (std.mem.indexOf(u8, low, mk) != null) return true;
     return false;
+}
+
+// ------------------------------------------------------------------------------- mind floor (per-mind discipline)
+
+/// Is a tool eligible for the LESSON loop at all? Memory/coordination tools never mint lessons — their
+/// "failures" are bookkeeping, not operational ground truth.
+pub fn lessonEligible(name: []const u8) bool {
+    const skip = [_][]const u8{ "observe", "share", "recall", "recall_hive", "note_stance", "journal", "think", "set_directive", "save_skill", "add_task", "complete_task", "send_message", "propose_plan_change", "probe" };
+    for (skip) |s| if (std.mem.eql(u8, name, s)) return false;
+    return true;
+}
+
+/// Did this tool execution REALLY fail? Ground truth only: an "exit=N" prefix with N != 0 (python/tests/
+/// authored tools), or the transient-failure markers in the result head — including "bad args", which IS
+/// the fixable-lesson class (the fix pair is exactly bad-args → corrected-args). Never keyed on prose.
+pub fn toolHardFail(name: []const u8, result: []const u8) bool {
+    if (!lessonEligible(name)) return false;
+    const t = std.mem.trim(u8, result, " \r\n\t");
+    if (t.len == 0) return false; // empty is a transport hiccup, not a graded failure
+    if (std.mem.startsWith(u8, t, "exit=")) {
+        const rest = t["exit=".len..];
+        var i: usize = 0;
+        while (i < rest.len and rest[i] >= '0' and rest[i] <= '9') i += 1;
+        if (i > 0) return !std.mem.eql(u8, rest[0..i], "0");
+    }
+    var buf: [96]u8 = undefined;
+    const n = @min(t.len, buf.len);
+    for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    const marks = [_][]const u8{ "error", "failed", "could not", "bad args", "timed out", "timeout", "unreachable", "refused", "denied", "rejected" };
+    for (marks) |mk| if (std.mem.indexOf(u8, low, mk) != null) return true;
+    return false;
+}
+
+/// Tools whose execution CHANGES real state (files, host, the engine itself). An unknown name is an
+/// AUTHORED tool — python that can do anything — so unknown counts as mutating, same rule as the chat.
+pub fn isMutatingEngineTool(name: []const u8) bool {
+    const reads = [_][]const u8{ "read_file", "list_dir", "run_tests", "host_status", "host_explore", "web_fetch", "web_search", "read_url", "fetch_json", "osint_scan", "deep_crawl", "recall", "recall_hive", "observe", "share", "note_stance", "journal", "think", "set_directive", "save_skill", "add_task", "complete_task", "send_message", "propose_plan_change", "probe", "simulate_change", "propose_change" };
+    for (reads) |r| if (std.mem.eql(u8, name, r)) return false;
+    return true;
+}
+
+/// Does a prose reply ANNOUNCE an action without performing one? A commitment phrase ("I'll…", "let me…",
+/// "next I will…") followed CLOSELY by an action verb, in the reply's tail, not a question. Ported from
+/// the desktop chat's proven heuristic (its false-positive traps — "let me know", verb-anywhere matching —
+/// are already closed here). Pure — unit-tested.
+pub fn announcesAction(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (t.len == 0 or t.len > 1600) return false;
+    if (t[t.len - 1] == '?') return false;
+    var lb: [1600]u8 = undefined;
+    const n = @min(t.len, lb.len);
+    for (t[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const tail_from = n - @min(n, 280);
+    const tail = lb[tail_from..n];
+    const acks = [_][]const u8{ "i'll ", "i\u{2019}ll ", "i will ", "i'm going to ", "i\u{2019}m going to ", "let's ", "let\u{2019}s ", "let me ", "we'll ", "we\u{2019}ll ", "next i " };
+    const verbs = [_][]const u8{ "run", "execut", "check", "verif", "regist", "creat", "schedul", "install", "writ", "updat", "delet", "quer", "inspect", "fix", "test", "set ", "look", "apply", "launch", "restart", "retry", "re-run", "rerun", "start", "open", "read", "list", "search", "add ", "remove", "correct", "adjust", "do ", "build", "implement", "call ", "issue", "share", "observe", "save" };
+    for (acks) |a| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, tail, from, a)) |at| {
+            from = at + a.len;
+            const w2 = tail[from..@min(tail.len, from + 56)];
+            if (std.mem.startsWith(u8, w2, "know")) continue; // "let me know" — closing courtesy
+            for (verbs) |v| {
+                if (std.mem.indexOf(u8, w2, v) != null) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Does a prose reply CLAIM the work succeeded? Completion words in the reply's TAIL (claims close a
+/// reply), short prose only, not a question. Used to demand one read-only verification before a mind's
+/// success narrative feeds affect/retro as if it were ground truth. Pure — unit-tested.
+pub fn claimsSuccess(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (t.len < 12 or t.len > 1600) return false;
+    if (t[t.len - 1] == '?') return false;
+    var lb: [1600]u8 = undefined;
+    const n = @min(t.len, lb.len);
+    for (t[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const tail_from = n - @min(n, 220);
+    const tail = lb[tail_from..n];
+    const claims = [_][]const u8{ "done", "complete", "completed", "successfully", " works", "working now", "finished", "is now ", "fixed", "implemented", "in place", "ready" };
+    for (claims) |c2| if (std.mem.indexOf(u8, tail, c2) != null) return true;
+    return false;
+}
+
+/// Do a FAILED tool call and a later SUCCEEDING one (same tool) form a fix pair worth learning? The fix is
+/// a VARIANT of the failure (>=half of the failing args' substantial tokens reappear), never the identical
+/// retry (that's a transient, not a lesson). Pure — unit-tested.
+pub fn lessonPair(fail_args: []const u8, ok_args: []const u8) bool {
+    const f = std.mem.trim(u8, fail_args, " \r\n\t");
+    const o = std.mem.trim(u8, ok_args, " \r\n\t");
+    if (f.len == 0 or o.len == 0) return false;
+    if (std.mem.eql(u8, f, o)) return false;
+    var total: usize = 0;
+    var hit: usize = 0;
+    var it = std.mem.tokenizeAny(u8, f, " \t,{}\":");
+    while (it.next()) |tok| {
+        if (tok.len < 5) continue;
+        total += 1;
+        if (std.mem.indexOf(u8, o, tok) != null) hit += 1;
+    }
+    return total > 0 and hit * 2 >= total;
+}
+
+/// The neuron CLI splits an observed text into SENTENCE facts on ".;!?"+space boundaries and DROPS any
+/// sentence containing '?' — right for prose, fatal for ATOMIC machine entries (a lesson's fix half would
+/// separate into its own fact, or vanish). Soften boundaries to commas and neutralize '?' before
+/// observing; mid-token punctuation (index.html, /c:"x") is untouched. Pure — unit-tested.
+pub fn atomizeForObserve(buf: []u8, text: []const u8) []const u8 {
+    const n = @min(text.len, buf.len);
+    @memcpy(buf[0..n], text[0..n]);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (buf[i] == '?') {
+            buf[i] = ','; // the CLI drops '?'-bearing sentences entirely — a mangled '?' beats a lost lesson
+            continue;
+        }
+        if (i + 1 < n and (buf[i] == '.' or buf[i] == ';' or buf[i] == '!') and buf[i + 1] == ' ') buf[i] = ',';
+    }
+    return buf[0..n];
+}
+
+/// Between-rounds lesson pairing (single-threaded by design): pair this moment's clean executions against
+/// the swarm's stashed failure — ANY mind's later similar success closes ANY mind's earlier failure (one
+/// hive mind) — then stash this moment's newest unpaired failure for the rounds ahead. In-moment pairs
+/// (fail and fix inside one mind's own moment) were already minted directly in doMoment.
+fn applyLessonRecords(w: *Worker, round: u32, moment: *const Moment) void {
+    var oi: usize = 0;
+    while (oi < moment.ok_n) : (oi += 1) {
+        const ok = &moment.oks[oi];
+        if (!w.lfail_set) break;
+        if (!std.mem.eql(u8, w.lfail.toolStr(), ok.toolStr())) continue;
+        if (!lessonPair(w.lfail.argsStr(), ok.argsStr())) continue;
+        mintLesson(w, round, &w.lfail, ok);
+        w.lfail_set = false;
+    }
+    var fi: usize = 0;
+    while (fi < moment.fail_n) : (fi += 1) { // newest failure wins the single stash slot
+        w.lfail = moment.fails[fi];
+        w.lfail_set = true;
+    }
+}
+
+/// The first non-empty line of a result string — the failure note carried on a lesson record.
+fn firstLine(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " \r\n\t");
+    const eol = std.mem.indexOfScalar(u8, t, '\n') orelse t.len;
+    return t[0..eol];
+}
+
+pub const Proposal = struct { kind: u8, text: []const u8 }; // 0 = lesson, 1 = skill
+
+/// One "LESSON:/SKILL: <text> | evidence: <proof>" judge-output line → a quarantined proposal. The
+/// evidence tail is MANDATORY — an ungrounded proposal is precisely the self-assessment this gate keeps
+/// out — and bounds keep entries atomic. Pure — unit-tested.
+pub fn parseProposal(raw: []const u8) ?Proposal {
+    const ln = std.mem.trim(u8, raw, " \r\t-*`");
+    var kind: u8 = 255;
+    var rest: []const u8 = "";
+    if (std.mem.startsWith(u8, ln, "LESSON:")) {
+        kind = 0;
+        rest = ln["LESSON:".len..];
+    } else if (std.mem.startsWith(u8, ln, "SKILL:")) {
+        kind = 1;
+        rest = ln["SKILL:".len..];
+    } else return null;
+    const text = std.mem.trim(u8, rest, " \t");
+    if (text.len < 24 or text.len > 600) return null;
+    const ev = std.mem.indexOf(u8, text, "| evidence:") orelse return null;
+    if (ev < 16) return null; // no real lesson before the marker
+    if (std.mem.trim(u8, text[ev + "| evidence:".len ..], " \t.").len < 8) return null; // empty proof
+    return .{ .kind = kind, .text = text };
+}
+
+/// Mint one VERIFIED lesson from a real fail→fix transition. Deterministic — zero model calls; the only
+/// path allowed to write LESSON_SCOPE directly (it needs no judgment: the transition already happened).
+fn mintLesson(w: *Worker, round: u32, fail: *const LessonRec, ok: *const LessonRec) void {
+    var lb: [560]u8 = undefined;
+    const lesson = std.fmt.bufPrint(&lb, "fix: {s} {s} failed ({s}) — works as: {s}", .{
+        fail.toolStr(), fail.argsStr(), fail.noteStr(), ok.argsStr(),
+    }) catch return;
+    var ab: [560]u8 = undefined;
+    _ = w.mem.observe(tools.LESSON_SCOPE, atomizeForObserve(&ab, lesson));
+    w.act("engine", round, "lesson", fail.toolStr(), lesson);
 }
 
 /// RSI CAPACITY — the model-capacity self-tuner (DEMOTE-ONLY). The engine does NOT trust the model's name; each
@@ -2852,8 +3105,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     // idle) mind's slot. Never for a scout (no write tools ⇒ would only starve the file).
     const lane_slot = if (!w.quick and w.cap.one_slot and !mi.scout and mi.lane.len > 0 and !frontier_has_unbuilt) laneSlotOverride(w, mi.lane, others_files) else "";
     defer if (lane_slot.len > 0) gpa.free(@constCast(lane_slot));
-    const assembler_slot = if (w.quick) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else frontier_slot;
-    defer if (w.quick and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // quick slot is gpa-owned
+    // Quick runs WITHOUT a blueprint keep the goal-derived pin (the interactive one-shot --embed path).
+    // Quick runs WITH one (a cast whose goal names its files) use the same rank-spread frontier as every
+    // other build — the goal-derived pin sent EVERY mind to the first goal file (three minds, one
+    // index.html, varieties.html unowned every round: the observed cast failure).
+    const assembler_slot = if (w.quick and w.blueprint.len == 0) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else frontier_slot;
+    defer if (w.quick and w.blueprint.len == 0 and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // the goal-derived quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
     const dg_block = if (w.depgraph_str.len > 0)
         std.fmt.allocPrint(gpa, "\nIMPORT GRAPH (who imports what — when you change a file, update the files that import it so they stay consistent):\n{s}", .{clip(w.depgraph_str, 1400)}) catch (gpa.dupe(u8, "") catch @constCast(""))
@@ -2880,10 +3137,22 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(scout_clause);
-    const playbook_clause = if (playbook.len > 0)
+    const pb_part = if (playbook.len > 0)
         std.fmt.allocPrint(gpa, " YOUR SWARM'S OPERATING PLAYBOOK — process rules your swarm authored for ITSELF; treat them as binding and FOLLOW them:\n{s}\n", .{clipTail(playbook, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(pb_part);
+    // VERIFIED LESSONS ride the same prompt slot as the playbook but are labeled by PROVENANCE: the
+    // playbook is what the swarm BELIEVES about its process (self-authored); lessons are what this run
+    // PROVED from real failure-then-success transitions. Minds see both, told apart.
+    const lessons_raw = w.mem.assoc(tools.LESSON_SCOPE, if (goal.len > 0) clipWords(goal, 40) else "lessons", 2, 4);
+    defer gpa.free(lessons_raw);
+    const ls_part = if (lessons_raw.len > 0)
+        std.fmt.allocPrint(gpa, " VERIFIED LESSONS — fixes PROVEN by a real failure-then-success transition on this run's own tools (ground truth, not opinion; apply the working form instead of re-deriving it):\n{s}\n", .{clipTail(lessons_raw, 900)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        gpa.dupe(u8, "") catch @constCast("");
+    defer gpa.free(ls_part);
+    const playbook_clause = std.fmt.allocPrint(gpa, "{s}{s}", .{ pb_part, ls_part }) catch (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(playbook_clause);
     const space_clause = if (w.space.len > 0 and w.space_h > 0) blk: {
         const bands = @max(@as(u32, 1), mi.team);
@@ -3260,6 +3529,17 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var llm_fatal = false;
     var turn: u32 = 0;
     var cap_warned = false;
+    // MIND FLOOR state (all mind-local — moments run in parallel threads, so nothing here touches the
+    // shared Worker; records ride out on the Moment for the single-threaded pairing pass):
+    var act_nudged = false; //   one "you announced but didn't act" corrective turn per moment
+    var verify_nudged = false; // one "verify your success claim read-only" corrective turn per moment
+    var mutated_unverified = false; // a mutating tool ran and nothing read real state back afterwards
+    var mfails: [3]LessonRec = @splat(.{});
+    var mfail_n: u8 = 0;
+    var moks: [4]LessonRec = @splat(.{});
+    var mok_n: u8 = 0;
+    var mstash: LessonRec = .{}; // this mind's newest unpaired failure (in-moment pairing)
+    var mstash_set = false;
     const conv_limit = scaledClip(w, w.cap.conv_cap);
     const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
     while (turn < op_turns) : (turn += 1) {
@@ -3355,6 +3635,38 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     continue;
                 }
             }
+            // MIND FLOOR — two one-shot corrective turns before a prose settle is accepted. Both append the
+            // model's own reply then an EPHEMERAL directive into this moment's conv (in-memory, dies with
+            // the moment — never a standing instruction), mirroring the parse-failure retry idiom above.
+            // (a) VERIFY-BEFORE-DONE (per-mind): the moment mutated real state, nothing read it back, and
+            //     the reply claims success. Unchecked, that narrative feeds affect and the retrospective as
+            //     if it were ground truth — the documented round-8 phantom-directive class. Demand ONE
+            //     read-only check; its REAL result lands in conv before the moment settles.
+            if (!verify_nudged and mutated_unverified and turn + 1 < op_turns and
+                conv.items.len < conv_limit and claimsSuccess(step.content))
+            {
+                verify_nudged = true;
+                w.act(mi.name, round, "verify_nudge", "", "success claimed after side effects with no read-back — demanding one read-only check");
+                conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                llm.jstr(gpa, &conv, step.content) catch {};
+                conv.append(gpa, '}') catch {};
+                conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"Before settling: VERIFY your claim OBJECTIVELY with exactly ONE read-only tool call (read_file / list_dir / run_tests / host_status — whichever checks the thing you just changed). If the result proves the work, settle WITH that evidence; if it exposes a failure, fix it now. Output like 'Ready' or 'saved' is not proof the thing works.\"}") catch {};
+                continue;
+            }
+            // (b) ACT FOLLOW-THROUGH: the reply PROMISES an action but issued no tool call — left alone the
+            //     moment settles on the promise, nothing lands, and the round reads as progress (the
+            //     narrate-then-fizzle death spiral). One corrective turn: act, or name the blocker.
+            if (!act_nudged and turn + 1 < op_turns and conv.items.len < conv_limit and
+                announcesAction(step.content))
+            {
+                act_nudged = true;
+                w.act(mi.name, round, "act_nudge", "", "reply announced an action but issued no tool call — demanding the action now");
+                conv.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch {};
+                llm.jstr(gpa, &conv, step.content) catch {};
+                conv.append(gpa, '}') catch {};
+                conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"You announced an action but issued NO tool call. Do it NOW, in this turn — make the tool call you promised, or state plainly what is blocking you. Never end a moment on a promise of future action.\"}") catch {};
+                continue;
+            }
             gpa.free(monologue);
             monologue = gpa.dupe(u8, step.content) catch @constCast("");
             break;
@@ -3405,6 +3717,35 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             defer gpa.free(result);
             tool_calls += 1;
             if (std.mem.eql(u8, c.name, "host_command")) acted = true;
+            // MIND FLOOR — grade this execution on ground truth and feed the lesson loop. All state here
+            // is mind-local; only w.mem calls (internally locked) and w.act (seq-locked) touch shared ground.
+            const hard_fail = toolHardFail(c.name, result);
+            if (lessonEligible(c.name)) {
+                if (hard_fail) {
+                    mstash.set(c.name, clip(c.args, 200), clip(firstLine(result), 56));
+                    mstash_set = true;
+                    if (mfail_n < mfails.len) {
+                        mfails[mfail_n] = mstash;
+                        mfail_n += 1;
+                    }
+                } else if (mstash_set and std.mem.eql(u8, mstash.toolStr(), c.name) and
+                    lessonPair(mstash.argsStr(), clip(c.args, 200)))
+                {
+                    // fail→fix INSIDE one moment — the dominant case; mint immediately (Mem locks writes)
+                    var okr: LessonRec = .{};
+                    okr.set(c.name, clip(c.args, 200), "");
+                    mintLesson(w, round, &mstash, &okr);
+                    mstash_set = false;
+                } else if (mok_n < moks.len) {
+                    moks[mok_n].set(c.name, clip(c.args, 200), "");
+                    mok_n += 1;
+                }
+            }
+            if (isMutatingEngineTool(c.name)) {
+                if (!hard_fail) mutated_unverified = true;
+            } else if (!hard_fail and lessonEligible(c.name)) {
+                mutated_unverified = false; // a clean read of real state after the mutation counts as verification
+            }
             if (normalize_mem and evidence_buf.items.len < 3000 and
                 !std.mem.eql(u8, c.name, "observe") and !std.mem.eql(u8, c.name, "share") and
                 !std.mem.eql(u8, c.name, "note_stance") and !std.mem.eql(u8, c.name, "recall") and
@@ -3433,6 +3774,22 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 }
             }
             w.act(mi.name, round, c.name, c.args, result);
+            // RAG-ON-FAILURE: a failing execution recalls the verified-lesson scope keyed on the CALL
+            // ITSELF (the goal rarely names the tool) and folds any past proven fix into the SAME result
+            // the mind reads — the lesson arrives exactly when it's needed, not as ambient context.
+            var lesson_rec: ?[]u8 = null;
+            defer if (lesson_rec) |lr| gpa.free(lr);
+            if (hard_fail) {
+                var lqb: [280]u8 = undefined;
+                const lq = std.fmt.bufPrint(&lqb, "{s} {s}", .{ c.name, clip(c.args, 200) }) catch c.name;
+                lesson_rec = w.mem.assoc(tools.LESSON_SCOPE, lq, 2, 3);
+            }
+            const lr_slice: []const u8 = if (lesson_rec) |lr| lr else "";
+            const folded: []const u8 = if (lr_slice.len > 0)
+                std.fmt.allocPrint(gpa, "{s}\nRECALLED LESSON (a verified past fix for this tool — apply its working form): {s}", .{ result, clip(lr_slice, 500) }) catch result
+            else
+                result;
+            defer if (folded.ptr != result.ptr) gpa.free(@constCast(folded));
             if (w.fence_writes) {
                 // plain user message on the Ollama gpt-oss path (see the assistant-echo note above)
                 var tr: std.ArrayListUnmanaged(u8) = .empty;
@@ -3440,7 +3797,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 tr.appendSlice(gpa, "[result of ") catch {};
                 tr.appendSlice(gpa, c.name) catch {};
                 tr.appendSlice(gpa, "]\n") catch {};
-                tr.appendSlice(gpa, result) catch {};
+                tr.appendSlice(gpa, folded) catch {};
                 conv.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch {};
                 llm.jstr(gpa, &conv, tr.items) catch {};
                 conv.append(gpa, '}') catch {};
@@ -3448,7 +3805,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 conv.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {};
                 llm.jstr(gpa, &conv, c.id) catch {};
                 conv.appendSlice(gpa, ",\"content\":") catch {};
-                llm.jstr(gpa, &conv, result) catch {};
+                llm.jstr(gpa, &conv, folded) catch {};
                 conv.append(gpa, '}') catch {};
             }
         }
@@ -3763,7 +4120,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     }
     const trace_json = std.fmt.allocPrint(gpa, "[{s}]", .{trace.items}) catch (gpa.dupe(u8, "[]") catch unreachable);
     const narrated = (tool_calls == 0 or (operate and !acted)) and files == 0 and (std.mem.indexOf(u8, monologue, "```") != null or monologue.len > 240);
-    return .{ .monologue = monologue, .fact = fact, .stance = std.fmt.allocPrint(gpa, "{s} (moment {d})", .{ topic, round }) catch (gpa.dupe(u8, "exploration") catch unreachable), .facts = if (facts > 0) facts else round, .recalled = recalled_n, .trace = trace_json, .files = files, .dt = w.nowSecs() - t0, .skills = w.mem.factCount(tools.SKILL_SCOPE), .directives = w.mem.factCount(tools.PLAYBOOK_SCOPE), .tools_made = w.mem.factCount(tools.TOOL_SCOPE), .llm_ok = llm_ok, .llm_fatal = llm_fatal, .auto_stored = auto_stored, .tool_calls = tool_calls, .narrated = narrated };
+    return .{ .monologue = monologue, .fact = fact, .stance = std.fmt.allocPrint(gpa, "{s} (moment {d})", .{ topic, round }) catch (gpa.dupe(u8, "exploration") catch unreachable), .facts = if (facts > 0) facts else round, .recalled = recalled_n, .trace = trace_json, .files = files, .dt = w.nowSecs() - t0, .skills = w.mem.factCount(tools.SKILL_SCOPE), .directives = w.mem.factCount(tools.PLAYBOOK_SCOPE), .tools_made = w.mem.factCount(tools.TOOL_SCOPE), .llm_ok = llm_ok, .llm_fatal = llm_fatal, .auto_stored = auto_stored, .tool_calls = tool_calls, .narrated = narrated, .fails = mfails, .fail_n = mfail_n, .oks = moks, .ok_n = mok_n };
 }
 
 /// Index of the end of the first real sentence: a '.'/'!'/'?' FOLLOWED by whitespace or end-of-string, so a
@@ -7418,6 +7775,39 @@ fn fileNeedsMore(content: []const u8) bool {
     return false;
 }
 
+/// The file-shaped tokens the GOAL itself names ("build X (index.html and varieties.html)") as a
+/// verbatim blueprint — one path per line, deduped, goal order, each vetted by the same parser the slot
+/// assigner uses. Quick casts skip the planned blueprint but still need DISTINCT slot ownership whenever
+/// the deliverable is explicitly multi-file; without this, the one-slot pin sent every mind to file #1.
+fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var seen: [12][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, goal, " \t\r\n,;:()[]{}<>\"'`");
+    while (it.next()) |tok0| {
+        if (n >= seen.len) break;
+        const tok = std.mem.trim(u8, tok0, ".!?*");
+        if (tok.len < 3 or tok.len > 120) continue;
+        if (!fileShapedToken(tok)) continue;
+        if (bpPath(tok) == null) continue; // must survive the blueprint parser or the slot never assigns
+        var dup = false;
+        for (seen[0..n]) |s| {
+            if (std.ascii.eqlIgnoreCase(s, tok)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        seen[n] = tok;
+        n += 1;
+        out.appendSlice(gpa, tok) catch return "";
+        out.append(gpa, '\n') catch return "";
+    }
+    if (out.items.len == 0) return "";
+    return gpa.dupe(u8, out.items) catch "";
+}
+
 fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
     const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(mpath);
@@ -8302,4 +8692,59 @@ test "fileShapedToken: extension or path-shape marks a real slot (app/Makefile s
     try std.testing.expect(!fileShapedToken("Overview")); // prose word: never a slot
     try std.testing.expect(!fileShapedToken("Makefile")); // root dotless: bpPath rejects it too — invisible, not stalled
     try std.testing.expect(!fileShapedToken(""));
+}
+
+test "mind floor: toolHardFail keys on real exit codes and error markers, never memory tools" {
+    try std.testing.expect(toolHardFail("run_python", "exit=1\nstdout:\n\nstderr:\nboom"));
+    try std.testing.expect(!toolHardFail("run_python", "exit=0\nstdout:\nok\nstderr:\n"));
+    try std.testing.expect(toolHardFail("write_file", "bad args: missing path"));
+    try std.testing.expect(!toolHardFail("observe", "error: memory tools never mint lessons"));
+    try std.testing.expect(!toolHardFail("web_search", "")); // empty = transport hiccup, not a graded failure
+    try std.testing.expect(toolHardFail("host_command", "target rejected: not present in live telemetry"));
+}
+
+test "mind floor: lessonPair pairs a fixed variant, never the identical retry or an unrelated call" {
+    try std.testing.expect(lessonPair("{\"path\":\"app/main.py\",\"code\":\"import x\"}", "{\"path\":\"app/main.py\",\"code\":\"import os\"}"));
+    try std.testing.expect(!lessonPair("{\"path\":\"app/main.py\"}", "{\"path\":\"app/main.py\"}"));
+    try std.testing.expect(!lessonPair("{\"path\":\"app/main.py\"}", "{\"query\":\"weather tomorrow\"}"));
+}
+
+test "mind floor: announcesAction and claimsSuccess catch the engine shapes, skip courtesies and questions" {
+    try std.testing.expect(announcesAction("The scaffold looks right. I'll write app/models.py with the schema next."));
+    try std.testing.expect(!announcesAction("Should I write the schema now?"));
+    try std.testing.expect(!announcesAction("I'll be around if the team needs anything."));
+    try std.testing.expect(claimsSuccess("Wrote the endpoints and wired the tests - the feature is complete."));
+    try std.testing.expect(!claimsSuccess("Is the feature complete?"));
+}
+
+test "mind floor: atomizeForObserve keeps machine entries atomic for the sentence-splitting CLI" {
+    var buf: [200]u8 = undefined;
+    try std.testing.expectEqualStrings("fix: run_python x failed, works as: y", atomizeForObserve(&buf, "fix: run_python x failed; works as: y"));
+    try std.testing.expectEqualStrings("what,, index.html stays", atomizeForObserve(&buf, "what?; index.html stays"));
+}
+
+test "mind floor: parseProposal demands the evidence tail" {
+    try std.testing.expect(parseProposal("LESSON: always pass a full path to write_file targets under app/ | evidence: act rows 12-14, exit=1 then exit=0").?.kind == 0);
+    try std.testing.expect(parseProposal("SKILL: boot the server then curl the probe url before declaring the build live | evidence: score row r7").?.kind == 1);
+    try std.testing.expect(parseProposal("LESSON: a plausible narrow rule with no grounding at all") == null);
+    try std.testing.expect(parseProposal("NONE") == null);
+}
+
+test "mind floor: isMutatingEngineTool errs toward mutating (authored/unknown tools count)" {
+    try std.testing.expect(isMutatingEngineTool("write_file"));
+    try std.testing.expect(isMutatingEngineTool("host_command"));
+    try std.testing.expect(isMutatingEngineTool("my_authored_helper")); // unknown = python that can do anything
+    try std.testing.expect(!isMutatingEngineTool("read_file"));
+    try std.testing.expect(!isMutatingEngineTool("run_tests"));
+    try std.testing.expect(!isMutatingEngineTool("recall_hive"));
+}
+
+test "goalNamedFiles adopts the goal's explicit files as a verbatim blueprint" {
+    const gpa = std.testing.allocator;
+    const bp = goalNamedFiles(gpa, "build a tiny two-page static website about tea varieties (index.html and varieties.html, plain css). keep it simple.");
+    defer if (bp.len > 0) gpa.free(@constCast(bp));
+    try std.testing.expectEqualStrings("index.html\nvarieties.html\n", bp);
+    const none = goalNamedFiles(gpa, "research the history of tea and report the findings");
+    defer if (none.len > 0) gpa.free(@constCast(none));
+    try std.testing.expectEqualStrings("", none);
 }

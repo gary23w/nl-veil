@@ -427,6 +427,107 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     w.emit("growth", std.fmt.bufPrint(&gbuf, ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
 }
 
+/// END-OF-RUN JUDGE — the learning gate for durable promotion. Reads the run's TRACE (events.jsonl act
+/// rows: real tool executions with their real results, plus the engine's measured score rows — never the
+/// minds' monologues or "thinking" rows, which are self-report, and never the retrospective's own
+/// set_directive writes) on the GATEWAY model (already the engine's judging slot, distinct from the minds'
+/// primary) and PROPOSES durable lessons/skills into QUARANTINE scopes only. Nothing recalls those scopes
+/// into prompts — promotion is a separate, reviewed step. This is the counterweight to roundRetrospective:
+/// the retro steers the live run from self-report (useful, but it once wrote a phantom syntax-error
+/// "lesson" into binding directives for 8 rounds); anything that would OUTLIVE steering must survive a
+/// trace-grounded judge instead. Silent no-op when the trace is thin or the model unreachable.
+pub fn runJudge(w: *Worker) void {
+    const gpa = w.gpa;
+    const ev = std.Io.Dir.cwd().readFileAlloc(w.io, w.ev_path, gpa, .limited(1 << 20)) catch return;
+    defer gpa.free(ev);
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, ev, '\n');
+    while (it.next()) |ln| {
+        if (ln.len < 20) continue;
+        const is_act = std.mem.indexOf(u8, ln, "\"kind\":\"act\"") != null;
+        const is_score = std.mem.indexOf(u8, ln, "\"kind\":\"score\"") != null;
+        if (!is_act and !is_score) continue;
+        if (std.mem.indexOf(u8, ln, "\"tool\":\"thinking\"") != null) continue; // self-report — never grounds
+        if (std.mem.indexOf(u8, ln, "\"tool\":\"set_directive\"") != null) continue; // self-authored — never grounds
+        if (std.mem.indexOf(u8, ln, "\"tool\":\"stance\"") != null) continue; // affect — never grounds
+        lines.append(gpa, ln) catch return;
+    }
+    if (lines.items.len < 3) return; // nothing gradeable
+    // the newest whole rows that fit the trace window
+    var st: usize = lines.items.len;
+    var used: usize = 0;
+    while (st > 0) {
+        const take = @min(lines.items[st - 1].len, 380) + 1;
+        if (used + take > 6000) break;
+        used += take;
+        st -= 1;
+    }
+    var tr: std.ArrayListUnmanaged(u8) = .empty;
+    defer tr.deinit(gpa);
+    var k = st;
+    while (k < lines.items.len) : (k += 1) {
+        tr.appendSlice(gpa, lines.items[k][0..@min(lines.items[k].len, 380)]) catch return;
+        tr.append(gpa, '\n') catch return;
+    }
+    const lessons = w.mem.list(tools.LESSON_SCOPE);
+    defer gpa.free(lessons);
+    const pend_l = w.mem.list(tools.LESSON_PROPOSED_SCOPE);
+    defer gpa.free(pend_l);
+    const pend_s = w.mem.list(tools.SKILL_PROPOSED_SCOPE);
+    defer gpa.free(pend_s);
+    const sys =
+        "You are an EXTERNAL REVIEWER for a multi-mind agent run, reading a TRACE of what actually happened. " ++
+        "act rows are REAL tool executions with their REAL results (exit codes and error text live inside the result strings); score rows are the engine's measured benchmark. " ++
+        "Never trust narration — grade only what the trace proves.\n" ++
+        "Propose durable entries ONLY where the trace PROVES a transition: a real failure followed by a real working fix, or a technique that measurably raised the score.\n" ++
+        "Output zero or more lines, nothing else:\n" ++
+        "LESSON: <one general operational lesson> | evidence: <the trace rows that prove it>\n" ++
+        "SKILL: <one class-level reusable procedure> | evidence: <proof>\n" ++
+        "If nothing qualifies, output exactly: NONE\n" ++
+        "STRICT RULES:\n" ++
+        "- NEVER a negative claim about a tool ('X is broken', 'avoid Y') — refusals outlive the real problem;\n" ++
+        "- NEVER an environment-dependent failure (missing binary, unconfigured credential, server down) as a durable lesson;\n" ++
+        "- if retrying the SAME call worked, the lesson is the retry pattern, not the failure;\n" ++
+        "- prefer PATCHING an existing lesson into a more general form over minting a narrow new one — output the full patched text;\n" ++
+        "- every proposal must be provable from the trace alone; no proposal without concrete evidence.";
+    const user = std.fmt.allocPrint(gpa,
+        \\Goal: {s}
+        \\
+        \\EXISTING VERIFIED LESSONS (patch/generalize rather than duplicate):
+        \\{s}
+        \\
+        \\PENDING PROPOSALS (never re-propose these):
+        \\{s}
+        \\{s}
+        \\
+        \\TRACE (newest last):
+        \\{s}
+    , .{
+        if (w.goal_brief.len > 0) clip(w.goal_brief, 240) else "explore",
+        if (lessons.len > 0) clipTail(lessons, 700) else "(none)",
+        if (pend_l.len > 0) clipTail(pend_l, 400) else "(none)",
+        if (pend_s.len > 0) clipTail(pend_s, 400) else "",
+        tr.items,
+    }) catch return;
+    defer gpa.free(user);
+    const reply = llm.chat(gpa, w.io, w.run_dir, "judge", w.gw_base, w.gw_key, w.gateway_model, sys, user, 400);
+    defer gpa.free(reply.content);
+    if (!reply.ok) return;
+    var n: usize = 0;
+    var rit = std.mem.splitScalar(u8, reply.content, '\n');
+    while (rit.next()) |raw| {
+        if (n >= 4) break; // bounded — a flood of "lessons" is judge noise, not learning
+        const pr = run.parseProposal(raw) orelse continue;
+        const scope = if (pr.kind == 1) tools.SKILL_PROPOSED_SCOPE else tools.LESSON_PROPOSED_SCOPE;
+        var ab: [640]u8 = undefined;
+        _ = w.mem.observe(scope, run.atomizeForObserve(&ab, pr.text));
+        w.act("judge", 0, "propose", scope, pr.text);
+        n += 1;
+    }
+    w.act("judge", 0, "judge_done", "", if (n > 0) "proposals quarantined for review — nothing binds until promoted" else "no durable transition proven by the trace — nothing proposed");
+}
+
 /// The string value of `"<key>": "<value>"` inside possibly-malformed JSON text — a last-resort extractor for
 /// when the whole document does not parse (weak-model truncation). Backslash-escaped quotes are skipped.
 fn textField(s: []const u8, key: []const u8) ?[]const u8 {
