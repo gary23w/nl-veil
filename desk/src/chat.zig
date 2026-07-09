@@ -37,7 +37,12 @@ const CAST_POLICY_SPEED =
     "following action — never stop to summarize or ask until every file exists and is verified.\n" ++
     "CAST a swarm ONLY as a research sub-agent, for jobs where parallel readers beat one mind: web research and " ++
     "current events, scouting unfamiliar tech before you build, analyzing a large amount of material, gathering " ++
-    "references into the hive. A speed-mode cast is a QUICK STRIKE hard-capped at 2 minutes; never request LONG.\n" ++
+    "references into the hive. A quick research strike runs ~2 minutes by default. But for a GENUINELY BIG, " ++
+    "long-running job the user asks the hive to take on — deep-dive + document a whole codebase, a long " ++
+    "investigation, analyzing many files — do NOT try to grind through it yourself one step at a time; CAST a " ++
+    "SUSTAINED hive and add LONG (optionally MINUTES <n>) so it has the time to actually finish, and compose a " ++
+    "CONCRETE goal for it (the real task, e.g. 'read every source file in the repo and write per-module docs to " ++
+    "details/'), never a vague 'automate this'. While it runs you orchestrate and steer it.\n" ++
     "To cast, make the FIRST line of your reply exactly:\n" ++
     "CAST: <one-line goal for the hive>\n" ++
     "  MINDS <n>   — optional, how many minds (2-8; default 3), on its own line right after.\n" ++
@@ -1624,10 +1629,17 @@ pub const Chat = struct {
         // N minutes / long|sustained|continuous); everything downstream is unchanged — the orchestrator
         // brief follows on the next ticks and the collect composes the answer when the hive finishes.
         // The settle-time cast recovery stays as the safety net for any path that still reaches a model turn.
-        if (!self.castPending() and userWantsCast(text)) {
+        // The mechanical fast-path deploys a cast straight from the user's words ONLY for an imperative COMMAND
+        // ("cast a swarm to build X"). A question or musing ("couldn't you cast a swarm to automate this?") is the
+        // MODEL's to reason about — it has the conversation context to resolve what the real goal is and to
+        // compose a concrete CAST: (mechanically stripping it yields garbage like "automate this???"). Rather than
+        // pattern-match the goal in the engine, hand the ambiguous case to the model.
+        const q = std.mem.trimEnd(u8, text, " \t\r\n");
+        const is_question = q.len > 0 and q[q.len - 1] == '?';
+        if (!self.castPending() and userWantsCast(text) and !is_question) {
             var gb: [1600]u8 = undefined;
             const goal = castGoalFromUser(text, &gb);
-            log.info("cast fast-path: explicit user cast request — deploying without a deciding turn", .{});
+            log.info("cast fast-path: explicit user cast command — deploying without a deciding turn", .{});
             self.fireCast(dd, castSpecFromUser(text, goal));
             return;
         }
@@ -5715,12 +5727,16 @@ pub fn userWantsKill(msg: []const u8) bool {
 
 /// Strip a leading cast-request preamble ("cast a swarm to ", "have the hive ", "run a swarm that ")
 /// from the user's message to get a clean one-line goal. Returns a slice into `buf`.
-/// The cast's time budget under the mode ceiling: SPEED MODE hard-caps every chat cast at 2 minutes (a
-/// research sub-agent strike — the observed failure was 10-100 minute hiveminds dispatched for 3-5 minute
-/// jobs); autonomy mode keeps the original range (default quick strike, LONG up to 120). Pure — unit-tested.
+/// The cast's time budget under the mode ceiling: SPEED MODE caps the chat's DEFAULT/auto cast at 2 minutes (a
+/// research sub-agent strike — the observed failure was 10-100 minute hiveminds dispatched for 3-5 minute jobs),
+/// BUT an EXPLICIT sustained request (LONG, or a specific minutes count) is honored up to 120: a genuinely big
+/// job the user asked the hive to commit to (deep-dive + document a whole repo) can't be done in a 2-minute
+/// strike, and forcing it there was the "delve-deep task fails" report. Autonomy mode keeps the full range.
+/// The distinction is EXPLICIT vs default — not a hardcoded use case. Pure — unit-tested.
 pub fn castMinutes(spec_minutes: u32, long: bool, speed: bool) u32 {
-    const max: u32 = if (speed) 2 else 120;
-    const want: u32 = if (spec_minutes > 0) spec_minutes else if (speed) 2 else if (long) 20 else CAST_MINUTES;
+    const explicit = spec_minutes > 0 or long; // the user/veil asked for a specific / sustained duration
+    const max: u32 = if (speed and !explicit) 2 else 120;
+    const want: u32 = if (spec_minutes > 0) spec_minutes else if (long) 20 else if (speed) 2 else CAST_MINUTES;
     return std.math.clamp(want, 1, max);
 }
 
@@ -6434,14 +6450,16 @@ test "terminal verify: a build that reaches DONE gets one whole-build check; a n
     try std.testing.expect(!store.chat_loop);
 }
 
-test "castMinutes: speed mode caps every chat cast at 2 minutes; autonomy keeps the range" {
-    try std.testing.expectEqual(@as(u32, 2), castMinutes(30, true, true)); // "LONG MINUTES 30" in speed → 2
-    try std.testing.expectEqual(@as(u32, 2), castMinutes(0, false, true)); // speed default = 2
-    try std.testing.expectEqual(@as(u32, 1), castMinutes(1, false, true)); // an even shorter ask survives
+test "castMinutes: speed caps the DEFAULT to 2 min but honors an EXPLICIT LONG/minutes request" {
+    try std.testing.expectEqual(@as(u32, 2), castMinutes(0, false, true)); // speed default = 2-min quick strike
+    try std.testing.expectEqual(@as(u32, 30), castMinutes(30, true, true)); // EXPLICIT "LONG MINUTES 30" in speed → honored (a big job can't finish in 2 min)
+    try std.testing.expectEqual(@as(u32, 20), castMinutes(0, true, true)); // EXPLICIT LONG in speed → sustained default
+    try std.testing.expectEqual(@as(u32, 1), castMinutes(1, false, true)); // an even shorter explicit ask survives
+    try std.testing.expectEqual(@as(u32, 120), castMinutes(400, true, true)); // still ceilinged at 120
     try std.testing.expectEqual(@as(u32, 30), castMinutes(30, true, false)); // autonomy honors LONG MINUTES 30
     try std.testing.expectEqual(@as(u32, 20), castMinutes(0, true, false)); // autonomy LONG default
     try std.testing.expectEqual(CAST_MINUTES, castMinutes(0, false, false)); // autonomy quick default
-    try std.testing.expectEqual(@as(u32, 120), castMinutes(400, true, false)); // autonomy still has a ceiling
+    try std.testing.expectEqual(@as(u32, 120), castMinutes(400, true, false)); // autonomy ceiling
 }
 
 test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settle; a workless step ends it; a question yields" {
