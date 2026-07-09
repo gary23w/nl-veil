@@ -2948,13 +2948,52 @@ fn gatherBuiltFiles(w: *Worker, cap: usize) []u8 {
         if (out.items.len >= cap) break;
         const fpath = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, p }) catch continue;
         defer gpa.free(fpath);
-        const content = std.Io.Dir.cwd().readFileAlloc(w.io, fpath, gpa, .limited(8 << 10)) catch continue;
+        // .limited ERRORS past the cap (it never truncates) — the old 8KB limit made every larger
+        // deliverable VANISH from the synthesis prompt entirely, so the lead reported it "not built"
+        // (observed live: a complete 15.9KB recipes.html). Read generously, excerpt below.
+        const content = std.Io.Dir.cwd().readFileAlloc(w.io, fpath, gpa, .limited(256 << 10)) catch continue;
         defer gpa.free(content);
-        const hdr = std.fmt.allocPrint(gpa, "=== FILE: {s} ({d} bytes) ===\n", .{ p, content.len }) catch continue;
+        const shown = @min(content.len, 1800);
+        // A silently-cut excerpt reads EXACTLY like a truncated file, and the synthesis prompt demands
+        // honesty — so the lead kept reporting complete files as "cut off mid-declaration". Name the view.
+        const hdr = if (content.len > shown)
+            (std.fmt.allocPrint(gpa, "=== FILE: {s} ({d} bytes — EXCERPT: first {d} shown; the file on disk is longer, judge completeness ONLY by the ENGINE VERIFICATION) ===\n", .{ p, content.len, shown }) catch continue)
+        else
+            (std.fmt.allocPrint(gpa, "=== FILE: {s} ({d} bytes, shown whole) ===\n", .{ p, content.len }) catch continue);
         defer gpa.free(hdr);
         out.appendSlice(gpa, hdr) catch {};
-        out.appendSlice(gpa, clip(content, 1800)) catch {};
+        out.appendSlice(gpa, content[0..shown]) catch {};
         out.appendSlice(gpa, "\n\n") catch {};
+    }
+    return out.toOwnedSlice(gpa) catch &.{};
+}
+
+/// The engine's MEASURED verdict on the run's deliverables — benchmark score, goal-file coverage, and any
+/// still-pending truncated emissions — composed deterministically (zero model calls). This block heads the
+/// synthesis so completeness claims come from ground truth, never from the model re-judging clipped views
+/// (the observed failure: a 100% run whose synthesis called every complete file "truncated/not built",
+/// which then sent the chat's collect turn on a whole re-verification spiral).
+fn buildEngineVerification(w: *Worker, goal: []const u8) []u8 {
+    const gpa = w.gpa;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(gpa, "## ENGINE VERIFICATION (measured ground truth — the benchmark parses every file's format and tracks cut-off emissions; trust THIS over any impression from clipped excerpts)\n") catch return out.toOwnedSlice(gpa) catch &.{};
+    const b = w.last_bench;
+    if (b.total > 0) {
+        out.print(gpa, "- benchmark: {d}/{d} ({d}%, tier {d})", .{ b.passed, b.total, b.pct, b.tier }) catch {};
+        if (b.failures.len > 0) out.print(gpa, " — FAILING: {s}", .{clip(b.failures, 400)}) catch {};
+        out.append(gpa, '\n') catch {};
+    }
+    const cov = goalCoverage(w, goal);
+    defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
+    if (cov.total > 0) {
+        out.print(gpa, "- goal deliverables: {d}/{d} present and whole", .{ cov.present, cov.total }) catch {};
+        if (cov.missing.len > 0) out.print(gpa, " — MISSING/INCOMPLETE: {s}", .{clip(cov.missing, 300)}) catch {};
+        out.append(gpa, '\n') catch {};
+    }
+    if (anyTruncPending(w)) {
+        out.appendSlice(gpa, "- WARNING: at least one file landed from a CUT emission and was never finished\n") catch {};
+    } else {
+        out.appendSlice(gpa, "- no truncated emissions pending\n") catch {};
     }
     return out.toOwnedSlice(gpa) catch &.{};
 }
@@ -2976,8 +3015,10 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
     // Build-aware: if the team wrote files, the report must describe the DELIVERED code (grounded in its real
     // content), not an abstract plan — the old research-only prompt made a good build's synthesis read as
     // "here's what you should implement" and even offer to "provide code" it had already written.
-    const sys = "You are the LEAD of a strike team reporting the FINAL result of this run to the user. Ground your report ONLY in the material below: the FILES YOUR TEAM ACTUALLY BUILT (their real contents are shown), plus anything the scouts retrieved and the team notes. Report WHAT WAS DELIVERED — describe each built file by what the code ACTUALLY does (you can SEE the code, so state it plainly — never hedge with 'likely'/'should'), how to run it, and HONESTLY name anything the goal asked for that is missing or incomplete. NEVER claim a file exists that is not in the list, and NEVER offer to 'provide code' or 'example snippets' — the code is already built and shown above. If the run was research-only (no files), report the findings + name the sources instead. This report is exactly what the user receives.";
-    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n=== FILES YOUR TEAM BUILT (actual contents) ===\n{s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above: describe what was built (and what's missing vs the goal).", .{ clip(goal, 300), if (has_built) built else "(no files were built this run — this was research-only)", if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 1500) }) catch return;
+    const verif = buildEngineVerification(w, goal);
+    defer gpa.free(verif);
+    const sys = "You are the LEAD of a strike team reporting the FINAL result of this run to the user. Ground your report ONLY in the material below: the FILES YOUR TEAM ACTUALLY BUILT (their real contents are shown), plus anything the scouts retrieved and the team notes. The ENGINE VERIFICATION block is MEASURED ground truth — file excerpts below may be CLIPPED VIEWS, so NEVER judge a file complete or truncated from where its excerpt ends; completeness comes from the ENGINE VERIFICATION alone. Report WHAT WAS DELIVERED — describe each built file by what the code ACTUALLY does (you can SEE the code, so state it plainly — never hedge with 'likely'/'should'), how to run it, and HONESTLY name anything the ENGINE VERIFICATION lists as missing or failing. NEVER claim a file exists that is not in the list, and NEVER offer to 'provide code' or 'example snippets' — the code is already built and shown above. If the run was research-only (no files), report the findings + name the sources instead. This report is exactly what the user receives.";
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n{s}\n=== FILES YOUR TEAM BUILT (actual contents) ===\n{s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above: describe what was built; completeness verdicts come from the ENGINE VERIFICATION block only.", .{ clip(goal, 300), verif, if (has_built) built else "(no files were built this run — this was research-only)", if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 1500) }) catch return;
     defer gpa.free(user);
     const reply = llm.chat(gpa, w.io, w.run_dir, "synthesis", w.base_url, w.key, w.model, sys, user, 2048);
     defer gpa.free(reply.content);
@@ -2987,7 +3028,11 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
     _ = std.Io.Dir.cwd().createDirPathStatus(w.io, wdir, .default_dir) catch {};
     const path = std.fmt.allocPrint(gpa, "{s}/synthesis.md", .{wdir}) catch return;
     defer gpa.free(path);
-    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = reply.content }) catch {};
+    // the verification header travels WITH the report — the chat's collect digest embeds synthesis.md
+    // verbatim, and the measured verdict must outrank any prose impression downstream too
+    const stamped = std.fmt.allocPrint(gpa, "{s}\n{s}", .{ verif, reply.content }) catch reply.content;
+    defer if (stamped.ptr != reply.content.ptr) gpa.free(stamped);
+    std.Io.Dir.cwd().writeFile(w.io, .{ .sub_path = path, .data = stamped }) catch {};
     w.act("veil", 1, "synthesis", if (has_built) "composed the final report from the team's BUILT files + findings" else "composed the final answer from the team's retrieved findings", clip(reply.content, 500));
     w.emit("synthesis", std.fmt.allocPrint(w.a(), ",\"chars\":{d}", .{reply.content.len}) catch ",\"chars\":0");
 }
