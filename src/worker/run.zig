@@ -211,6 +211,7 @@ pub const Worker = struct {
     last_src_str: []const u8 = "", // the atlas CANONICAL SOURCES block for the current gaps — held SEPARATE from last_gap_str so no consumer's clip() can silently drop the tail
     short_rejects: [16]ShortReject = [_]ShortReject{.{}} ** 16, // per-slot count of too-short salvage refusals — the escalation signal that opens the length-floor valve
     reject_notes: std.ArrayListUnmanaged(u8) = .empty, // this round's write-path refusals (path — why), folded into the fitness block so the lead can fix the CAUSE instead of watching coverage stall
+    trunc_notes: [16]TruncNote = [_]TruncNote{.{}} ** 16, // committed-but-CUT emissions (partial files on disk) awaiting completion — while one is unresolved the file is NOT a complete deliverable and the run must not self-finalize on it
     phase_str: []const u8 = "",
     best_pct: u32 = 0,
     best_tier: u8 = 0,
@@ -1168,6 +1169,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 defer if (sp.len > 0) gpa.free(sp);
                 if (sp.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = w.bench_fixed }) catch {};
             }
+            reconcileTruncated(&w); // resolve cut-emission ledger entries whose file changed since the partial landed
             var bench = runBenchmark(&w, run_dir);
             w.deliverable_missing = false;
             if (bench.status == .ok and !bench.host and !w.operating) {
@@ -1188,7 +1190,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                         defer gpa.free(gfp);
                         const gdata = std.Io.Dir.cwd().readFileAlloc(io, gfp, gpa, .limited(64 << 10)) catch "";
                         defer if (gdata.len > 0) gpa.free(gdata);
-                        if (std.mem.trim(u8, gdata, " \r\n\t").len <= 40) {
+                        // a file whose landing was CUT mid-emission is on disk but NOT a deliverable yet
+                        if (std.mem.trim(u8, gdata, " \r\n\t").len <= 40 or truncPending(&w, gbp)) {
                             any_missing = true;
                             break;
                         }
@@ -1362,7 +1365,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             // unchanged: the deadline/budget wall still ends the run; this only spends time the caller
             // already granted. Research casts (no scored file deliverable) stop after one moment as before.
             const budget_left = w.deadline_s == 0 or w.nowSecs() < w.deadline_s;
-            const incomplete = w.deliverable_missing or (w.last_bench.status == .ok and w.last_bench.pct < 100);
+            // anyTruncPending: a file landed from a CUT emission reads complete to every byte-count check —
+            // finalizing on it is how a mid-CSS varieties.html shipped as a 100% "quick_done" cast
+            const incomplete = w.deliverable_missing or anyTruncPending(&w) or (w.last_bench.status == .ok and w.last_bench.pct < 100);
             if (!(w.cast and budget_left and incomplete)) {
                 // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
                 // research-only) wrote no files. Compose the final answer from those findings before stopping,
@@ -3498,6 +3503,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer trace.deinit(gpa);
     trace.appendSlice(gpa, "\"recall\"") catch {};
     var monologue: []u8 = gpa.dupe(u8, "") catch @constCast("");
+    var emission_truncated = false; // the reply that BECAME the monologue was length-cut by the provider
 
     w.act(mi.name, round, "thinking", "starting", if (mi.lane.len > 0) clip(mi.lane, 240) else "begins the round");
     // A discourse/research run needs web tools, but the lean ASSEMBLER_SCHEMA is build-only — route lean-tier
@@ -3578,6 +3584,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 if (rep.ok and rep.content.len > 0) {
                     gpa.free(monologue);
                     monologue = gpa.dupe(u8, rep.content) catch @constCast("");
+                    emission_truncated = rep.truncated;
                 }
             }
             if (operate and isToolParseError(step.content)) {
@@ -3669,6 +3676,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             }
             gpa.free(monologue);
             monologue = gpa.dupe(u8, step.content) catch @constCast("");
+            emission_truncated = step.truncated;
             break;
         }
         if (w.fence_writes) {
@@ -3958,6 +3966,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         }
         if (salvage_slot.len > 0 and fileShapedToken(salvage_slot)) {
             var body = salvageFileBody(gpa, monologue);
+            var salvage_cut = emissionLooksCut(monologue, emission_truncated);
             var reject = salvageRejectReason(w, salvage_slot, body);
             if (reject) |why| {
                 had_reject = true;
@@ -4026,6 +4035,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             } else {
                                 if (body.len > 0) gpa.free(@constCast(body));
                                 body = body2;
+                                salvage_cut = emissionLooksCut(rep.content, rep.truncated); // the retry's emission owns the cut verdict now
                                 reject = null;
                                 w.act(mi.name, round, "salvage_retry", salvage_slot, "corrective feedback produced a valid file body on the second attempt");
                             }
@@ -4050,6 +4060,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     if (body.len < 80) {
                         markValveBuilt(w, salvage_slot, body.len);
                         w.act(mi.name, round, "salvage", salvage_slot, "rescued a SHORT narrated file body via the length-floor valve (slot floor-rejected twice, file still missing)");
+                    } else if (salvage_cut) {
+                        // The emission was CUT (unclosed fence / provider length stop) — the partial body is
+                        // real work so it COMMITS, but it must never read as a finished deliverable: ledger it
+                        // so coverage counts the file missing, a quick cast keeps working instead of
+                        // finalizing on it, and the fitness block tells its owner to finish the tail.
+                        noteTruncated(w, salvage_slot, body.len);
+                        var tb: [220]u8 = undefined;
+                        const tmsg = std.fmt.bufPrint(&tb, "the emission was CUT OFF mid-file — committed the {d}-byte partial; the file is INCOMPLETE and its owner must extend its tail (SEARCH/REPLACE continuation) until it ends properly", .{body.len}) catch "committed a CUT partial file — it is incomplete; extend its tail";
+                        w.act(mi.name, round, "salvage_truncated", salvage_slot, tmsg);
                     } else {
                         w.act(mi.name, round, "salvage", salvage_slot, "rescued a narrated file body from the reply into the assigned slot");
                     }
@@ -4195,6 +4214,11 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
 
 const ShortReject = struct { key: u64 = 0, n: u16 = 0 };
 
+/// One committed-but-truncated emission: the partial file's path + the size it landed at. Resolution is by
+/// INSPECTION between rounds (size changed or file gone = someone worked on it), so no write site anywhere
+/// in the engine has to remember to clear it.
+const TruncNote = struct { path: [200]u8 = undefined, path_len: u8 = 0, size: u64 = 0 };
+
 // The ring is shared Worker state and both helpers run inside the CONCURRENT moment phase (one per mind),
 // so each takes the files mutex — the free-slot search would otherwise let two minds claim one slot. The
 // count is a heuristic; a benign check-then-act gap across the two calls only shifts the valve by a round.
@@ -4218,6 +4242,92 @@ fn bumpShortReject(w: *Worker, path: []const u8) void {
         return;
     };
     w.short_rejects[0] = .{ .key = h, .n = 1 }; // full ring: recycle a slot rather than lose the signal entirely
+}
+
+/// Fence bookkeeping over a whole reply, same depth rules as salvageFileBody's extractor: an info-string
+/// fence always OPENS, a bare fence closes the innermost block (or opens an anonymous one at depth 0).
+/// `closed_any` = at least one top-level block closed cleanly (a complete file emission exists);
+/// `unclosed` = the text ends INSIDE a block (the stream was cut mid-file). Pure — unit-tested.
+const FenceState = struct { closed_any: bool = false, unclosed: bool = false };
+fn fenceState(text: []const u8) FenceState {
+    var scan: usize = 0;
+    var depth: u32 = 0;
+    var closed_any = false;
+    while (std.mem.indexOfPos(u8, text, scan, "```")) |mark| {
+        var eol = mark + 3;
+        while (eol < text.len and text[eol] != '\n') eol += 1;
+        const info = std.mem.trim(u8, text[mark + 3 .. eol], " \t\r");
+        if (info.len > 0 or depth == 0) {
+            depth += 1;
+        } else {
+            depth -= 1;
+            if (depth == 0) closed_any = true;
+        }
+        scan = eol;
+    }
+    return .{ .closed_any = closed_any, .unclosed = depth > 0 };
+}
+
+/// Was the narrated file body extracted from a CUT emission? True when the reply ends inside an unclosed
+/// fence (the body necessarily came from the partial block / whole-reply fallback), or when the provider
+/// reported a length cut AND no fenced block ever closed (the fallback committed a clean-looking prefix).
+/// A closed fence inside a length-cut reply stays trusted — the FILE finished; only trailing prose was cut.
+fn emissionLooksCut(monologue: []const u8, provider_truncated: bool) bool {
+    const fs = fenceState(monologue);
+    return fs.unclosed or (provider_truncated and !fs.closed_any);
+}
+
+/// Ledger a partial file that a CUT emission landed on disk (under files_mtx — moments are concurrent).
+/// Committing the partial is deliberate: the work is real and the engine's tail-extension path finishes it;
+/// the ledger is what keeps the run HONEST about it (coverage counts the file missing, quick casts keep
+/// working, and the fitness block names it) until a later write changes the file.
+fn noteTruncated(w: *Worker, path: []const u8, size: usize) void {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    for (&w.trunc_notes) |*e| if (e.path_len > 0 and std.mem.eql(u8, e.path[0..e.path_len], path)) {
+        e.size = size; // re-truncated at a new size — track the latest landing
+        return;
+    };
+    for (&w.trunc_notes) |*e| if (e.path_len == 0) {
+        e.path_len = @intCast(@min(path.len, e.path.len));
+        @memcpy(e.path[0..e.path_len], path[0..e.path_len]);
+        e.size = size;
+        return;
+    };
+}
+
+/// Does this path have an unresolved truncated emission? (files_mtx — callers run in both phases)
+fn truncPending(w: *Worker, path: []const u8) bool {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    for (&w.trunc_notes) |*e| if (e.path_len > 0 and std.mem.eql(u8, e.path[0..e.path_len], path)) return true;
+    return false;
+}
+
+/// Any unresolved truncated emission at all — the quick-cast completion gate reads this.
+fn anyTruncPending(w: *Worker) bool {
+    w.files_mtx.lockUncancelable(w.io);
+    defer w.files_mtx.unlock(w.io);
+    for (&w.trunc_notes) |*e| if (e.path_len > 0) return true;
+    return false;
+}
+
+/// Between rounds (single-threaded): resolve ledger entries whose file CHANGED since the partial landing —
+/// a different size (or a deleted file) means a mind worked on it; if that work was itself cut, the salvage
+/// re-ledgers it in the same round, so resolution can never mask a still-broken file.
+fn reconcileTruncated(w: *Worker) void {
+    const gpa = w.gpa;
+    for (&w.trunc_notes) |*e| {
+        if (e.path_len == 0) continue;
+        const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, e.path[0..e.path_len] }) catch continue;
+        defer gpa.free(fp);
+        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(4 << 20)) catch {
+            e.* = .{}; // file gone — nothing left to finish
+            continue;
+        };
+        defer gpa.free(data);
+        if (data.len != e.size) e.* = .{}; // the file moved since the cut landing — resolved
+    }
 }
 
 /// Record a write-path refusal for this round's fitness block — the lead can only route around a stall it
@@ -4299,8 +4409,8 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
     defer if (existing.len > 0) gpa.free(existing);
     const cur = std.mem.trim(u8, existing, " \r\n\t");
-    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !bufedit.editMarkerCorruption(cur))
-        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a marker-corrupted file is KNOWN broken — any clean full body may replace it
+    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !bufedit.editMarkerCorruption(cur) and !truncPending(w, salvage_slot))
+        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a marker-corrupted or KNOWN-TRUNCATED file is broken — any clean full body may replace it
     return null;
 }
 
@@ -5606,13 +5716,15 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
         defer gpa.free(fp);
         const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
         defer if (data.len > 0) gpa.free(data);
-        if (std.mem.trim(u8, data, " \r\n\t").len > 40) {
+        const cut = truncPending(w, bp); // on disk but landed from a CUT emission — not complete
+        if (std.mem.trim(u8, data, " \r\n\t").len > 40 and !cut) {
             present += 1;
         } else {
             if (miss.items.len > 0) miss.appendSlice(gpa, ", ") catch {};
             // FULL path, not basename: "create __init__.py, __init__.py, __init__.py" names no directory
             // and the minds cannot act on it (observed live, sim_forum6)
             miss.appendSlice(gpa, bp) catch {};
+            if (cut) miss.appendSlice(gpa, " (on disk but CUT OFF mid-emission — finish its tail, do not restart it)") catch {};
         }
     }
     return .{ .present = present, .total = total, .missing = miss.toOwnedSlice(gpa) catch "" };
@@ -6084,7 +6196,7 @@ fn markDeliverableGaps(w: *Worker, goal: []const u8, round: u32) void {
         const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
         defer if (data.len > 0) gpa.free(data);
         const t = std.mem.trim(u8, data, " \r\n\t");
-        if (t.len > 40) continue;
+        if (t.len > 40 and !truncPending(w, bp)) continue; // a CUT landing is on disk but not delivered
         if (miss_n > 0) missing.appendSlice(gpa, ", ") catch {};
         missing.appendSlice(gpa, bp) catch {}; // full path — a bare basename names no directory
         miss_n += 1;
@@ -8650,6 +8762,44 @@ test "salvageFileBody returns a TINY fenced body whole — length policy belongs
     const b2 = salvageFileBody(gpa, mixed);
     defer if (b2.len > 0) gpa.free(b2);
     try std.testing.expectEqualStrings("[]", b2);
+}
+
+test "fenceState + emissionLooksCut: a stream cut mid-file is CUT; a closed fence in a length-cut reply is not (the 3486b mid-CSS varieties.html that scored 100%)" {
+    // the observed failure shape: path line, opening fence, file content, stream dies mid-CSS — no close
+    const cut =
+        \\varieties.html
+        \\```html
+        \\<!DOCTYPE html>
+        \\<html><head><style>
+        \\.section-title:first-of-type { margin-
+    ;
+    try std.testing.expect(fenceState(cut).unclosed);
+    try std.testing.expect(!fenceState(cut).closed_any);
+    try std.testing.expect(emissionLooksCut(cut, false)); // the unclosed fence alone convicts it
+    try std.testing.expect(emissionLooksCut(cut, true));
+
+    // a CLEANLY CLOSED emission stays trusted even when the provider cut the trailing prose after it
+    const closed =
+        \\varieties.html
+        \\```html
+        \\<!DOCTYPE html>
+        \\<html><body>tea</body></html>
+        \\```
+        \\And with that the page is co
+    ;
+    try std.testing.expect(!fenceState(closed).unclosed);
+    try std.testing.expect(fenceState(closed).closed_any);
+    try std.testing.expect(!emissionLooksCut(closed, true));
+
+    // no fences at all: only the provider's own length verdict convicts the whole-reply fallback
+    const bare = "<!DOCTYPE html>\n<html><body>a page narrated without fences\nline\nline\nline\nline</body></html>";
+    try std.testing.expect(!emissionLooksCut(bare, false));
+    try std.testing.expect(emissionLooksCut(bare, true));
+
+    // a markdown doc whose EMBEDDED example fences all pair up is closed, not cut (depth-aware)
+    const md = "README.md\n```markdown\n# T\n```bash\nx\n```\ndone\n```\n";
+    try std.testing.expect(!fenceState(md).unclosed);
+    try std.testing.expect(fenceState(md).closed_any);
 }
 
 test "salvageFileBody: a markdown file's EMBEDDED example fences don't cut it — depth-aware pairing keeps the whole doc (four straight sims truncated every README at its first code sample)" {
