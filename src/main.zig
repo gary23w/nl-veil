@@ -121,9 +121,9 @@ pub fn main(init: std.process.Init) !void {
                 const model = try gpa.dupe(u8, it.next() orelse "mock");
                 return worker.run(gpa, io, init.environ_map, run_dir, nbin, model);
             }
-            if (std.mem.eql(u8, sub, "--desktop")) desktop_mode = true;
+            if (std.mem.eql(u8, sub, "--desk")) desktop_mode = true;
             while (it.next()) |arg| {
-                if (std.mem.eql(u8, arg, "--desktop")) desktop_mode = true;
+                if (std.mem.eql(u8, arg, "--desk")) desktop_mode = true;
             }
         }
     } else |_| {}
@@ -299,14 +299,14 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
 const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
 
 /// "Host the desktop": when desktop mode is requested (`--desktop`), launch the veil-desk dashboard if it
-/// was built (desktop/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached
-/// and best-effort — a headless box either has no binary (built with -Ddesktop=false) or no display, and
+/// was built (desk/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached
+/// and best-effort — a headless box either has no binary (built with -Ddesk=false) or no display, and
 /// the spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
 fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) void {
     if (environ.get("NL_NO_DESKTOP")) |v| {
         if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;
     }
-    const bin = std.fmt.allocPrint(gpa, "{s}/desktop/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
+    const bin = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
     defer gpa.free(bin);
     std.Io.Dir.cwd().access(io, bin, .{}) catch return; // not built → nothing to host
     // Spawn and forget — it's an independent same-machine companion, not a child we manage.

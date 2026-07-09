@@ -3031,7 +3031,7 @@ def main():
         return cmd_list()
     if argv[0] in ("doctor", "deps", "check"):
         return deps_doctor()
-    if argv[0] in ("desktop", "ui", "dashboard"):
+    if argv[0] in ("desktop", "ui", "dashboard", "desk"):
         return cmd_desktop(argv[1:])
     if argv[0] == "stop":
         if len(argv) < 2:

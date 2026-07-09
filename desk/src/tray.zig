@@ -312,9 +312,9 @@ const WindowsTray = struct {
         _ = self;
         const candidates = [_][:0]const u8{
             "assets/icon.png",
-            "desktop/assets/icon.png",
+            "desk/assets/icon.png",
             "../assets/icon.png",
-            "../desktop/assets/icon.png",
+            "../desk/assets/icon.png",
         };
         for (candidates) |path| {
             if (rl.loadImage(path)) |loaded| {
