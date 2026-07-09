@@ -30,7 +30,7 @@ pub const Ev = struct {
     kind_len: u8 = 0,
     mind: [24]u8 = [_]u8{0} ** 24,
     mind_len: u8 = 0,
-    text: [220]u8 = [_]u8{0} ** 220, // a human line: tool+result, or monologue, or the score summary
+    text: [300]u8 = [_]u8{0} ** 300, // a human line: tool + arg gist + result, or the moment trace, or a summary
     text_len: u16 = 0,
 
     pub fn kindStr(e: *const Ev) []const u8 {
@@ -294,38 +294,148 @@ fn parseEv(line: []const u8, ev: *Ev) bool {
     if (jsonStr(line, "mind", &mb)) |mn| setBuf(&ev.mind, &ev.mind_len, mn);
 
     // Compose a readable line per event kind so the console reads like a narrated log, not raw JSON.
+    // Each kind surfaces its SPECIFICS (the user asked for more than bare tool names): an act carries the
+    // tool + the argument gist (path/query/fact) + the result; a tick shows the mind's actual tool trace.
     if (std.mem.eql(u8, kind, "act")) {
         var tb: [256]u8 = undefined;
+        var ab: [256]u8 = undefined;
         var rb: [256]u8 = undefined;
         const tool = jsonStr(line, "tool", &tb) orelse "";
+        const args = jsonStr(line, "args", &ab) orelse "";
         const res = jsonStr(line, "result", &rb) orelse "";
-        composeText(ev, tool, res);
+        composeAct(ev, tool, argGist(args), res);
     } else if (std.mem.eql(u8, kind, "tick")) {
+        // A mind's moment: no monologue field in the stream anymore — narrate the TRACE (the tools it
+        // actually ran) + its cadence, so a "thinking" round is visible as real work, not a blank line.
         var rb: [256]u8 = undefined;
-        const mono = jsonStr(line, "monologue", &rb) orelse "";
-        composeText(ev, "think", mono);
+        if (jsonStr(line, "monologue", &rb)) |mono| {
+            composeAct(ev, "think", "", mono);
+        } else {
+            var trace: [160]u8 = undefined;
+            const tl = jsonStrList(line, "trace", &trace);
+            var buf: [300]u8 = undefined;
+            const dt = jsonInt(line, "dt") orelse 0;
+            const s = std.fmt.bufPrint(&buf, "moment {d}s: {s}", .{ dt, if (tl > 0) trace[0..tl] else "(no tools)" }) catch "moment";
+            setBuf16(&ev.text, &ev.text_len, s);
+        }
     } else if (std.mem.eql(u8, kind, "score")) {
-        var buf: [220]u8 = undefined;
+        var buf: [300]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "score {d}/{d} ({d}%)", .{ jsonInt(line, "passed") orelse 0, jsonInt(line, "total") orelse 0, jsonInt(line, "pct") orelse 0 }) catch "score";
         setBuf16(&ev.text, &ev.text_len, s);
     } else if (std.mem.eql(u8, kind, "cost")) {
-        var buf: [220]u8 = undefined;
+        var buf: [300]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "cost +{d} in / +{d} out ({d} calls)", .{ jsonInt(line, "in") orelse 0, jsonInt(line, "out") orelse 0, jsonInt(line, "calls") orelse 0 }) catch "cost";
         setBuf16(&ev.text, &ev.text_len, s);
-    } else if (std.mem.eql(u8, kind, "goal") or std.mem.eql(u8, kind, "complete") or std.mem.eql(u8, kind, "stopped") or std.mem.eql(u8, kind, "board") or std.mem.eql(u8, kind, "files") or std.mem.eql(u8, kind, "growth")) {
+    } else if (std.mem.eql(u8, kind, "board")) {
+        var buf: [300]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "board: {d} files, {d} done / {d} open tasks", .{ jsonInt(line, "files") orelse 0, jsonInt(line, "done") orelse 0, jsonInt(line, "open") orelse 0 }) catch "board";
+        setBuf16(&ev.text, &ev.text_len, s);
+    } else if (std.mem.eql(u8, kind, "phase")) {
+        var pb: [256]u8 = undefined;
+        var buf: [300]u8 = undefined;
+        const ph = jsonStr(line, "phase", &pb) orelse "";
+        const s = std.fmt.bufPrint(&buf, "phase: {s} — {d}% now, best {d}%", .{ ph, jsonInt(line, "now") orelse 0, jsonInt(line, "best") orelse 0 }) catch "phase";
+        setBuf16(&ev.text, &ev.text_len, s);
+    } else if (std.mem.eql(u8, kind, "round")) {
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "── round {d} ──", .{jsonInt(line, "round") orelse 0}) catch "round";
+        setBuf16(&ev.text, &ev.text_len, s);
+    } else if (std.mem.eql(u8, kind, "synthesis")) {
+        var buf: [64]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "synthesis written ({d} chars)", .{jsonInt(line, "chars") orelse 0}) catch "synthesis";
+        setBuf16(&ev.text, &ev.text_len, s);
+    } else if (std.mem.eql(u8, kind, "goal") or std.mem.eql(u8, kind, "complete") or std.mem.eql(u8, kind, "stopped") or std.mem.eql(u8, kind, "files") or std.mem.eql(u8, kind, "growth")) {
         var rb: [256]u8 = undefined;
         const g = jsonStr(line, "goal", &rb) orelse (jsonStr(line, "reason", &rb) orelse "");
         setBuf16(&ev.text, &ev.text_len, g);
     } else {
-        return false; // psyche/flare/etc — not surfaced in the base console
+        return false; // psyche/flare/trust/etc — not surfaced in the base console
     }
     return true;
 }
 
-fn composeText(ev: *Ev, a: []const u8, b: []const u8) void {
-    var buf: [220]u8 = undefined;
-    const s = if (b.len > 0) std.fmt.bufPrint(&buf, "{s}: {s}", .{ a, b }) catch a else a;
+/// "tool arg-gist: result" — the console line for an act. The gist is what makes "read_file" readable as
+/// "read_file catalog.zig".
+fn composeAct(ev: *Ev, tool: []const u8, gist: []const u8, res: []const u8) void {
+    var buf: [300]u8 = undefined;
+    const s = blk: {
+        if (gist.len > 0 and res.len > 0) break :blk std.fmt.bufPrint(&buf, "{s} {s}: {s}", .{ tool, gist, res }) catch tool;
+        if (gist.len > 0) break :blk std.fmt.bufPrint(&buf, "{s} {s}", .{ tool, gist }) catch tool;
+        if (res.len > 0) break :blk std.fmt.bufPrint(&buf, "{s}: {s}", .{ tool, res }) catch tool;
+        break :blk tool;
+    };
     setBuf16(&ev.text, &ev.text_len, s);
+}
+
+/// The useful kernel of an act's args: for a JSON object take the FIRST string value (the path / query /
+/// fact — key-agnostic, so no per-tool special cases); for a short plain string use it verbatim.
+fn argGist(args: []const u8) []const u8 {
+    const a = std.mem.trim(u8, args, " \r\n\t");
+    if (a.len == 0) return "";
+    if (a[0] != '{') return if (a.len <= 80) a else a[0..80];
+    // first "key": "value" — return the value slice (points into the caller's buffer, used immediately)
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        if (a[i] != ':') continue;
+        var j = i + 1;
+        while (j < a.len and (a[j] == ' ' or a[j] == '\t')) j += 1;
+        if (j >= a.len or a[j] != '"') continue;
+        j += 1;
+        const start = j;
+        while (j < a.len and a[j] != '"') : (j += 1) {
+            if (a[j] == '\\') j += 1; // skip the escaped char
+        }
+        const v = a[start..@min(j, a.len)];
+        return if (v.len <= 80) v else v[0..80];
+    }
+    return "";
+}
+
+/// Join a JSON string-array field ("trace":["recall","read_file",...]) into "recall, read_file, …" in `out`.
+/// Returns the composed length (0 if the field is missing/empty). Caps at the buffer; appends "…" when full.
+fn jsonStrList(line: []const u8, key: []const u8, out: []u8) usize {
+    var kbuf: [40]u8 = undefined;
+    if (key.len + 3 > kbuf.len) return 0;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    kbuf[2 + key.len] = ':';
+    const at = std.mem.indexOf(u8, line, kbuf[0 .. 3 + key.len]) orelse return 0;
+    var i = at + key.len + 3;
+    while (i < line.len and line[i] == ' ') i += 1;
+    if (i >= line.len or line[i] != '[') return 0;
+    i += 1;
+    var w: usize = 0;
+    var first = true;
+    while (i < line.len and line[i] != ']') {
+        if (line[i] == '"') {
+            i += 1;
+            const start = i;
+            while (i < line.len and line[i] != '"') : (i += 1) {
+                if (line[i] == '\\') i += 1;
+            }
+            const item = line[start..@min(i, line.len)];
+            const sep: usize = if (first) 0 else 2;
+            if (w + sep + item.len >= out.len) {
+                // out of room — mark the cut with a trailing '+' and stop
+                if (w + 1 < out.len) {
+                    out[w] = '+';
+                    w += 1;
+                }
+                break;
+            }
+            if (!first) {
+                out[w] = ',';
+                out[w + 1] = ' ';
+                w += 2;
+            }
+            @memcpy(out[w .. w + item.len], item);
+            w += item.len;
+            first = false;
+        }
+        i += 1;
+    }
+    return w;
 }
 
 /// Enumerate swarm run dirs under `data_dir`. A swarm is any dir with an events.jsonl — and crucially the
@@ -617,6 +727,263 @@ pub fn writeControl(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, id: []
     return true;
 }
 
+// --- console-fold parse: the chat renders a folded shell result "[console]\n$ cmd\n<output>" (chat.zig
+//     foldConsoleAi) as a styled terminal CARD. This PURE parse is the parity-critical half — the renderer's
+//     measure AND draw passes both call it, so the output-line count it returns (which sets the card height)
+//     must be deterministic from the message text alone. No theme/raylib deps → lives here, tested here.
+
+pub const ConsoleStatus = enum { ok, exit_fail, timeout, truncated, stopped };
+
+pub const ConsoleParse = struct {
+    cmd: []const u8 = "", // the command, after stripping the "$ " prompt
+    out_n: usize = 0, // TRUE output line count (trailing blanks + the status note removed). May exceed the
+    //                   slots actually filled — the fill caps at out.len, the count does not, so a renderer's
+    //                   "+K more lines" footer stays honest on a huge dump.
+    status: ConsoleStatus = .ok,
+    label_buf: [24]u8 = undefined, // "exit 1" / "exit 0xC0000135" / "timeout" / ... — empty on .ok
+    label_len: usize = 0,
+
+    pub fn isFail(self: *const ConsoleParse) bool {
+        return self.status != .ok;
+    }
+    pub fn labelStr(self: *const ConsoleParse) []const u8 {
+        return self.label_buf[0..self.label_len];
+    }
+    fn setLabel(self: *ConsoleParse, comptime fmt: []const u8, args: anytype) void {
+        if (std.fmt.bufPrint(&self.label_buf, fmt, args)) |s| {
+            self.label_len = s.len;
+        } else |_| {
+            self.label_len = 0; // buffer too small (unreachable for these short labels) → no label
+        }
+    }
+};
+
+/// Parse a folded shell result "[console]\n$ cmd\n<output>". Fills `out` with the output lines (slices into
+/// `text_`) after dropping trailing blank lines and popping a recognized trailing status note ("(exit code N)",
+/// "(command timed out ...)", "(no output)", ...). The note is detected on the RAW text tail — never through
+/// the line buffer — so a dump longer than `out` can't hide a failure behind the cap; and a note GLUED to the
+/// final output line (a command whose last write lacked a trailing newline: "boom(exit code 2)") still splits
+/// off correctly. Pure + deterministic so a renderer's measure and draw passes agree on the count (== height).
+pub fn parseConsole(text_: []const u8, out: [][]const u8) ConsoleParse {
+    var p: ConsoleParse = .{};
+    const pfx = "[console]\n";
+    if (!std.mem.startsWith(u8, text_, pfx)) return p;
+    const body = text_[pfx.len..];
+    const nl0 = std.mem.indexOfScalar(u8, body, '\n') orelse body.len;
+    const line0 = body[0..nl0];
+    p.cmd = if (std.mem.startsWith(u8, line0, "$ "))
+        line0[2..]
+    else if (std.mem.startsWith(u8, line0, "$"))
+        std.mem.trimStart(u8, line0[1..], " ")
+    else
+        line0;
+    var rest: []const u8 = if (nl0 < body.len) body[nl0 + 1 ..] else "";
+    rest = trimTrailingBlankLines(rest);
+    // pop a recognized trailing status note off the raw tail
+    if (rest.len > 0) {
+        const last_start = if (std.mem.lastIndexOfScalar(u8, rest, '\n')) |c| c + 1 else 0;
+        const raw_last = rest[last_start..];
+        if (classifyNote(&p, std.mem.trim(u8, raw_last, " \r\t"))) {
+            rest = trimTrailingBlankLines(rest[0..last_start]); // blanks BEFORE the note aren't phantom rows
+        } else if (std.mem.lastIndexOfScalar(u8, raw_last, '(')) |paren| {
+            if (paren > 0 and classifyNote(&p, std.mem.trimEnd(u8, raw_last[paren..], " \r\t"))) {
+                rest = rest[0 .. last_start + paren]; // glued note: the prefix stays as the final output line
+            }
+        }
+    }
+    // count EVERY line (the truth), fill slices up to the caller's buffer
+    if (rest.len > 0) {
+        var it = std.mem.splitScalar(u8, rest, '\n');
+        var total: usize = 0;
+        while (it.next()) |l| {
+            if (total < out.len) out[total] = l;
+            total += 1;
+        }
+        p.out_n = total;
+    }
+    return p;
+}
+
+/// Classify a candidate status-note line (trimmed). On a match, stamps status + label into `p` and returns
+/// true. "(no output)" matches but leaves status .ok — a clean exit that printed nothing.
+fn classifyNote(p: *ConsoleParse, last: []const u8) bool {
+    if (std.mem.startsWith(u8, last, "(exit code ")) {
+        const inner = last["(exit code ".len..];
+        const close = std.mem.indexOfScalar(u8, inner, ')') orelse inner.len;
+        const code = inner[0..@min(close, 16)]; // cap so "exit <code>" always fits label_buf[24]
+        p.status = .exit_fail;
+        p.setLabel("exit {s}", .{code});
+        return true;
+    }
+    if (std.mem.startsWith(u8, last, "(command timed out")) {
+        p.status = .timeout;
+        p.setLabel("timeout", .{});
+        return true;
+    }
+    if (std.mem.startsWith(u8, last, "(command produced too much output")) {
+        p.status = .truncated;
+        p.setLabel("truncated", .{});
+        return true;
+    }
+    if (std.mem.startsWith(u8, last, "(command stopped")) {
+        p.status = .stopped;
+        p.setLabel("stopped", .{});
+        return true;
+    }
+    return std.mem.eql(u8, last, "(no output)");
+}
+
+/// Strip trailing blank lines (and the newline that precedes each) from raw text.
+fn trimTrailingBlankLines(s: []const u8) []const u8 {
+    var r = s;
+    while (r.len > 0) {
+        const cut = std.mem.lastIndexOfScalar(u8, r, '\n') orelse {
+            return if (std.mem.trim(u8, r, " \r\t").len == 0) r[0..0] else r;
+        };
+        if (std.mem.trim(u8, r[cut + 1 ..], " \r\t").len == 0) r = r[0..cut] else break;
+    }
+    return r;
+}
+
+// --- swarm config: everything that was PASSED to a swarm (swarm.json manifest + the engine's .blueprint),
+//     for the Details tab — the user must be able to see the exact prompt + configuration a run got.
+
+pub const SwarmConfig = struct {
+    goal: [1200]u8 = [_]u8{0} ** 1200, // the full goal/prompt verbatim (not the roster's 160-byte teaser)
+    goal_len: u16 = 0,
+    provider: [32]u8 = [_]u8{0} ** 32,
+    provider_len: u8 = 0,
+    model: [64]u8 = [_]u8{0} ** 64,
+    model_len: u8 = 0,
+    style: [24]u8 = [_]u8{0} ** 24,
+    style_len: u8 = 0,
+    mode: [24]u8 = [_]u8{0} ** 24,
+    mode_len: u8 = 0,
+    autonomy: [24]u8 = [_]u8{0} ** 24,
+    autonomy_len: u8 = 0,
+    minutes: i64 = 0,
+    internet: bool = false,
+    gap_assess: bool = false,
+    minds: [220]u8 = [_]u8{0} ** 220, // composed "nova (Lead), ada, rex, lux" — names + the lead marked
+    minds_len: u8 = 0,
+    blueprint: [640]u8 = [_]u8{0} ** 640, // the engine's deliverable rows, newline-joined verbatim
+    blueprint_len: u16 = 0,
+    loaded: bool = false, // swarm.json was actually read (distinguishes "no config" from "not loaded yet")
+
+    pub fn goalStr(c: *const SwarmConfig) []const u8 {
+        return c.goal[0..c.goal_len];
+    }
+    pub fn mindsStr(c: *const SwarmConfig) []const u8 {
+        return c.minds[0..c.minds_len];
+    }
+    pub fn blueprintStr(c: *const SwarmConfig) []const u8 {
+        return c.blueprint[0..c.blueprint_len];
+    }
+};
+
+/// Read `<data>/<rel>/swarm.json` + `<data>/<rel>/.blueprint` into a SwarmConfig. Best-effort: missing
+/// files/fields leave zero-length slots (the UI shows "-"). Flat jsonStr/jsonInt scans, same as the events.
+pub fn readSwarmConfig(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []const u8, cfg: *SwarmConfig) void {
+    cfg.* = .{};
+    var pb: [512]u8 = undefined;
+    const mp = std.fmt.bufPrint(&pb, "{s}/{s}/swarm.json", .{ data_dir, rel }) catch return;
+    const raw = Io.Dir.cwd().readFileAlloc(io, mp, gpa, .limited(64 << 10)) catch return;
+    defer gpa.free(raw);
+    cfg.loaded = true;
+    var sb: [256]u8 = undefined;
+    // The goal can exceed jsonStr's 256-byte scratch — extract it with a dedicated unescape into the big slot.
+    cfg.goal_len = @intCast(jsonStrBig(raw, "goal", &cfg.goal));
+    if (jsonStr(raw, "provider", &sb)) |v| setBuf(&cfg.provider, &cfg.provider_len, v);
+    if (jsonStr(raw, "model", &sb)) |v| setBuf(&cfg.model, &cfg.model_len, v);
+    if (jsonStr(raw, "style", &sb)) |v| setBuf(&cfg.style, &cfg.style_len, v);
+    if (jsonStr(raw, "mode", &sb)) |v| setBuf(&cfg.mode, &cfg.mode_len, v);
+    if (jsonStr(raw, "autonomy", &sb)) |v| setBuf(&cfg.autonomy, &cfg.autonomy_len, v);
+    if (jsonInt(raw, "minutes")) |m| cfg.minutes = m;
+    cfg.internet = std.mem.indexOf(u8, raw, "\"internet\":true") != null or std.mem.indexOf(u8, raw, "\"internet\": true") != null;
+    cfg.gap_assess = std.mem.indexOf(u8, raw, "\"gap_assess\":true") != null or std.mem.indexOf(u8, raw, "\"gap_assess\": true") != null;
+    // minds: walk the "minds" array's {"name":..,"role":..} pairs into a compact roster line
+    if (std.mem.indexOf(u8, raw, "\"minds\"")) |mstart| {
+        var i = mstart;
+        var w: usize = 0;
+        var first = true;
+        while (std.mem.indexOfPos(u8, raw, i, "\"name\":\"")) |nat| {
+            var j = nat + 8;
+            const ns = j;
+            while (j < raw.len and raw[j] != '"') j += 1;
+            const nm = raw[ns..j];
+            // role, if it follows within this object (before the next name)
+            var role: []const u8 = "";
+            if (std.mem.indexOfPos(u8, raw, j, "\"role\":\"")) |rat| {
+                const next_name = std.mem.indexOfPos(u8, raw, j, "\"name\":\"") orelse raw.len;
+                if (rat < next_name) {
+                    var k = rat + 8;
+                    const rs = k;
+                    while (k < raw.len and raw[k] != '"') k += 1;
+                    role = raw[rs..k];
+                }
+            }
+            var ib: [64]u8 = undefined;
+            const item = if (role.len > 0)
+                std.fmt.bufPrint(&ib, "{s} ({s})", .{ nm, role }) catch nm
+            else
+                nm;
+            const sep: usize = if (first) 0 else 2;
+            if (w + sep + item.len >= cfg.minds.len) break;
+            if (!first) {
+                cfg.minds[w] = ',';
+                cfg.minds[w + 1] = ' ';
+                w += 2;
+            }
+            @memcpy(cfg.minds[w .. w + item.len], item);
+            w += item.len;
+            first = false;
+            i = j;
+        }
+        cfg.minds_len = @intCast(w);
+    }
+    // the engine's planned deliverables (one path per line) — ground truth for "what is being graded"
+    const bp = std.fmt.bufPrint(&pb, "{s}/{s}/.blueprint", .{ data_dir, rel }) catch return;
+    const braw = Io.Dir.cwd().readFileAlloc(io, bp, gpa, .limited(16 << 10)) catch return;
+    defer gpa.free(braw);
+    const bn = @min(braw.len, cfg.blueprint.len);
+    @memcpy(cfg.blueprint[0..bn], braw[0..bn]);
+    cfg.blueprint_len = @intCast(bn);
+}
+
+/// jsonStr for values longer than its 256-byte scratch: unescape "key":"..." directly into `out`.
+fn jsonStrBig(line: []const u8, key: []const u8, out: []u8) usize {
+    var kbuf: [40]u8 = undefined;
+    if (key.len + 3 > kbuf.len) return 0;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    kbuf[2 + key.len] = ':';
+    const at = std.mem.indexOf(u8, line, kbuf[0 .. 3 + key.len]) orelse return 0;
+    var i = at + key.len + 3;
+    while (i < line.len and line[i] == ' ') i += 1;
+    if (i >= line.len or line[i] != '"') return 0;
+    i += 1;
+    var w: usize = 0;
+    while (i < line.len and w < out.len) : (i += 1) {
+        const c = line[i];
+        if (c == '"') break;
+        if (c == '\\' and i + 1 < line.len) {
+            i += 1;
+            out[w] = switch (line[i]) {
+                'n' => '\n',
+                't' => ' ',
+                'r' => ' ',
+                else => line[i],
+            };
+            w += 1;
+            continue;
+        }
+        out[w] = c;
+        w += 1;
+    }
+    return w;
+}
+
 // --- tests: exercise the parsers on synthetic events, and (best-effort) the real repo data dir ---
 
 test "parseEv composes readable lines and foldMetrics accumulates" {
@@ -685,4 +1052,129 @@ test "listSwarms over the real repo data dir (best-effort)" {
         std.debug.print("  - {s}  r{d} {d}%  live={}\n", .{ out[i].idStr(), out[i].round, out[i].pct, out[i].live });
     }
     now = 0;
+}
+
+test "parseEv surfaces act args, tick traces, and board/phase detail" {
+    var ev: Ev = .{};
+    // act: the arg gist (first JSON string value, key-agnostic) lands between tool and result
+    const act = "{\"seq\":46,\"kind\":\"act\",\"mind\":\"rex\",\"round\":1,\"tool\":\"read_file\",\"args\":\"{\\\"path\\\": \\\"catalog.zig\\\"}\",\"result\":\"//! catalog.zig — embedded catalog\"}";
+    try std.testing.expect(parseEv(act, &ev));
+    try std.testing.expect(std.mem.startsWith(u8, ev.textStr(), "read_file catalog.zig: //! catalog.zig"));
+    // act with a plain (non-JSON) args string
+    const act2 = "{\"kind\":\"act\",\"mind\":\"nova\",\"tool\":\"salvage_reject\",\"args\":\"catalog.zig\",\"result\":\"too short (<80 chars)\"}";
+    try std.testing.expect(parseEv(act2, &ev));
+    try std.testing.expectEqualStrings("salvage_reject catalog.zig: too short (<80 chars)", ev.textStr());
+    // tick without monologue: narrated from the trace + dt
+    const tick = "{\"kind\":\"tick\",\"mind\":\"nova\",\"round\":1,\"dt\":24,\"trace\":[\"recall\",\"read_file\",\"observe\"],\"stance\":\"docs\"}";
+    try std.testing.expect(parseEv(tick, &ev));
+    try std.testing.expectEqualStrings("moment 24s: recall, read_file, observe", ev.textStr());
+    // board + phase now carry their numbers
+    try std.testing.expect(parseEv("{\"kind\":\"board\",\"done\":2,\"open\":1,\"files\":6,\"round\":2}", &ev));
+    try std.testing.expectEqualStrings("board: 6 files, 2 done / 1 open tasks", ev.textStr());
+    try std.testing.expect(parseEv("{\"kind\":\"phase\",\"round\":1,\"phase\":\"progressing\",\"now\":50,\"best\":50}", &ev));
+    try std.testing.expectEqualStrings("phase: progressing — 50% now, best 50%", ev.textStr());
+    try std.testing.expect(parseEv("{\"kind\":\"round\",\"round\":3}", &ev));
+    try std.testing.expectEqualStrings("── round 3 ──", ev.textStr());
+}
+
+test "readSwarmConfig loads the manifest + blueprint the run was given" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const rel = "zig-scan-cfg-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, rel, .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, rel) catch {};
+    const mani = "{\"swarm\":\"cast-x\",\"provider\":\"deepseek\",\"model\":\"deepseek-v4-flash\",\"style\":\"auto\",\"mode\":\"cast\",\"goal\":\"Write docs for every file into docs/desktop/ with full coverage.\",\"minutes\":4,\"autonomy\":\"full\",\"internet\":true,\"gap_assess\":true,\"minds\":[{\"name\":\"nova\",\"role\":\"Lead\",\"duty\":\"build\",\"lead\":true},{\"name\":\"ada\",\"role\":\"Maker\",\"duty\":\"build\"}]}";
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-scan-cfg-tmp/swarm.json", .data = mani }) catch {};
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = "zig-scan-cfg-tmp/.blueprint", .data = "docs/desktop/a.md\ndocs/desktop/b.md\n" }) catch {};
+    var cfg: SwarmConfig = .{};
+    readSwarmConfig(io, std.testing.allocator, ".", rel, &cfg);
+    try std.testing.expect(cfg.loaded);
+    try std.testing.expectEqualStrings("Write docs for every file into docs/desktop/ with full coverage.", cfg.goalStr());
+    try std.testing.expectEqualStrings("deepseek", cfg.provider[0..cfg.provider_len]);
+    try std.testing.expectEqualStrings("deepseek-v4-flash", cfg.model[0..cfg.model_len]);
+    try std.testing.expectEqual(@as(i64, 4), cfg.minutes);
+    try std.testing.expect(cfg.internet);
+    try std.testing.expect(cfg.gap_assess);
+    try std.testing.expectEqualStrings("nova (Lead), ada (Maker)", cfg.mindsStr());
+    try std.testing.expect(std.mem.startsWith(u8, cfg.blueprintStr(), "docs/desktop/a.md"));
+    // missing dir → loaded stays false, everything zero-length
+    var cfg2: SwarmConfig = .{};
+    readSwarmConfig(io, std.testing.allocator, ".", "zig-no-such-dir", &cfg2);
+    try std.testing.expect(!cfg2.loaded);
+    try std.testing.expectEqual(@as(u16, 0), cfg2.goal_len);
+}
+
+test "parseConsole extracts command, output, and status note (parity-critical line count)" {
+    var out: [64][]const u8 = undefined;
+    // clean success WITH output (no trailing note) → both output lines count, status ok
+    var p = parseConsole("[console]\n$ ls -la\nfile1\nfile2\n", &out);
+    try std.testing.expectEqualStrings("ls -la", p.cmd);
+    try std.testing.expectEqual(@as(usize, 2), p.out_n);
+    try std.testing.expect(!p.isFail());
+    try std.testing.expectEqual(ConsoleStatus.ok, p.status);
+    // nonzero exit → the note is POPPED (not counted as an output row) and becomes the label
+    p = parseConsole("[console]\n$ false\nboom\n(exit code 1)\n", &out);
+    try std.testing.expectEqual(@as(usize, 1), p.out_n); // "boom" only
+    try std.testing.expectEqual(ConsoleStatus.exit_fail, p.status);
+    try std.testing.expectEqualStrings("exit 1", p.labelStr());
+    // "(no output)" → zero output rows, still a clean success
+    p = parseConsole("[console]\n$ true\n(no output)\n", &out);
+    try std.testing.expectEqual(@as(usize, 0), p.out_n);
+    try std.testing.expect(!p.isFail());
+    // timeout / stopped / truncated map to their labels
+    p = parseConsole("[console]\n$ sleep 99\n(command timed out after 60s)\n", &out);
+    try std.testing.expectEqual(ConsoleStatus.timeout, p.status);
+    try std.testing.expectEqualStrings("timeout", p.labelStr());
+    // hex exit code preserved verbatim (NTSTATUS crash range)
+    p = parseConsole("[console]\n$ crash\n(exit code 0xC0000135)\n", &out);
+    try std.testing.expectEqualStrings("exit 0xC0000135", p.labelStr());
+    // a "(...)"-shaped line in the MIDDLE of output is NOT a note — only the LAST line is tested
+    p = parseConsole("[console]\n$ echo\n(hi)\nreal last line\n", &out);
+    try std.testing.expectEqual(@as(usize, 2), p.out_n);
+    try std.testing.expect(!p.isFail());
+    // malformed (no "$" prompt) → the whole first line is the command; the rest is output
+    p = parseConsole("[console]\nweird\nout\n", &out);
+    try std.testing.expectEqualStrings("weird", p.cmd);
+    try std.testing.expectEqual(@as(usize, 1), p.out_n);
+    // trailing blank lines are dropped before counting → no phantom rows (height stability)
+    p = parseConsole("[console]\n$ x\nonly\n\n\n", &out);
+    try std.testing.expectEqual(@as(usize, 1), p.out_n);
+    // not a console message → empty parse
+    p = parseConsole("just some prose", &out);
+    try std.testing.expectEqual(@as(usize, 0), p.out_n);
+    try std.testing.expectEqualStrings("", p.cmd);
+    // GLUED note (last write had no trailing newline): the failure must still be detected and the
+    // prefix must survive as the final output line — a failed command must never show as success
+    p = parseConsole("[console]\n$ printf boom\nboom(exit code 2)\n", &out);
+    try std.testing.expectEqual(ConsoleStatus.exit_fail, p.status);
+    try std.testing.expectEqualStrings("exit 2", p.labelStr());
+    try std.testing.expectEqual(@as(usize, 1), p.out_n);
+    try std.testing.expectEqualStrings("boom", out[0]);
+    // blank lines between the output and the note are NOT phantom rows
+    p = parseConsole("[console]\n$ x\nreal\n\n\n(exit code 1)\n", &out);
+    try std.testing.expectEqual(@as(usize, 1), p.out_n);
+    try std.testing.expectEqual(ConsoleStatus.exit_fail, p.status);
+    // a dump longer than the caller's buffer: the TRUE count survives and the trailing note is still
+    // seen (it is parsed on the raw tail, never through the capped buffer)
+    var small: [8][]const u8 = undefined;
+    var big: [512]u8 = undefined;
+    var w: usize = 0;
+    const head = "[console]\n$ seq 12\n";
+    @memcpy(big[0..head.len], head);
+    w = head.len;
+    var ln: usize = 1;
+    while (ln <= 12) : (ln += 1) {
+        const seg = std.fmt.bufPrint(big[w..], "line{d}\n", .{ln}) catch unreachable;
+        w += seg.len;
+    }
+    const tail_note = "(exit code 3)\n";
+    @memcpy(big[w .. w + tail_note.len], tail_note);
+    w += tail_note.len;
+    p = parseConsole(big[0..w], &small);
+    try std.testing.expectEqual(@as(usize, 12), p.out_n); // true count, beyond the 8-slot buffer
+    try std.testing.expectEqual(ConsoleStatus.exit_fail, p.status); // the note was NOT hidden by the cap
+    try std.testing.expectEqualStrings("exit 3", p.labelStr());
+    try std.testing.expectEqualStrings("line1", small[0]); // fill capped at the buffer, slices correct
+    try std.testing.expectEqualStrings("line8", small[7]);
 }

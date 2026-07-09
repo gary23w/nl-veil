@@ -5245,15 +5245,26 @@ fn copyInto(dst: []u8, src: []const u8) []const u8 {
 /// status note. The note is ALWAYS kept (room is reserved for it) so a "(command timed out …)"/stop note
 /// survives even when the output alone would fill `buf`. Pure — unit-tested.
 fn composeConsoleResult(buf: []u8, out: []const u8, err: []const u8, note: []const u8) []const u8 {
-    const body_cap = if (buf.len > note.len) buf.len - note.len else 0; // reserve room for the note
+    const body_cap = if (buf.len > note.len + 1) buf.len - note.len - 1 else 0; // reserve room for the note (+ its newline guard)
     var w: usize = 0;
     w += copyInto(buf[w..body_cap], out).len;
+    // stderr and the status note must start on their OWN lines: a command whose last write lacks a trailing
+    // newline would otherwise glue them onto its final output line ("boom(exit code 2)") — which both reads
+    // wrong and hides the failure from the console-card status parser.
+    if (err.len > 0 and w > 0 and w < body_cap and buf[w - 1] != '\n') {
+        buf[w] = '\n';
+        w += 1;
+    }
     w += copyInto(buf[w..body_cap], err).len;
     // A clean command with no output is SUCCESS, not failure — say so explicitly. The model kept re-running the
     // same probe because a bare "(no output)" read as "it didn't work" (the therapy-alarm evidence).
     if (w == 0 and body_cap > 0 and note.len == 0) w += copyInto(buf[w..body_cap], "(command completed successfully — no output)").len;
     if (w == 0 and body_cap > 0) w += copyInto(buf[w..body_cap], "(no output)").len;
-    if (note.len > 0 and w + note.len <= buf.len) {
+    if (note.len > 0 and w + note.len < buf.len) {
+        if (w > 0 and buf[w - 1] != '\n') {
+            buf[w] = '\n';
+            w += 1;
+        }
         @memcpy(buf[w .. w + note.len], note);
         w += note.len;
     }
@@ -7211,16 +7222,20 @@ test "jStr and jInt read the deploy response" {
     try std.testing.expectEqual(@as(i64, 3), jInt(body, "minds").?);
 }
 
-test "composeConsoleResult keeps stdout then stderr, and always the status note" {
+test "composeConsoleResult keeps stdout then stderr, and always the status note on its own line" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("outerr", composeConsoleResult(&buf, "out", "err", ""));
+    // stderr starts on its OWN line when stdout didn't end with one — glued "outerr" hid where one stream
+    // ended and the other began (and a glued status note hid failures from the console-card parser)
+    try std.testing.expectEqualStrings("out\nerr", composeConsoleResult(&buf, "out", "err", ""));
+    try std.testing.expectEqualStrings("out\nerr", composeConsoleResult(&buf, "out\n", "err", ""));
     // a clean exit with no output → an explicit success line (not a bare "(no output)" the model misreads)
     try std.testing.expectEqualStrings("(command completed successfully — no output)", composeConsoleResult(&buf, "", "", ""));
     // ...but a NON-clean exit (note present) with no body keeps the plain "(no output)" + its note
-    try std.testing.expectEqualStrings("(no output)(stopped)", composeConsoleResult(&buf, "", "", "(stopped)"));
-    try std.testing.expectEqualStrings("hi(stopped)", composeConsoleResult(&buf, "hi", "", "(stopped)"));
+    try std.testing.expectEqualStrings("(no output)\n(stopped)", composeConsoleResult(&buf, "", "", "(stopped)"));
+    try std.testing.expectEqualStrings("hi\n(stopped)", composeConsoleResult(&buf, "hi", "", "(stopped)"));
+    try std.testing.expectEqualStrings("hi\n(stopped)", composeConsoleResult(&buf, "hi\n", "", "(stopped)"));
     // when the body alone would overflow, room is reserved so the note (e.g. a timeout) still survives
-    var small: [12]u8 = undefined;
+    var small: [16]u8 = undefined;
     const note = "(timed out)"; // 11 bytes
     const r = composeConsoleResult(&small, "xxxxxxxxxxxxxxxxxxxx", "", note);
     try std.testing.expect(std.mem.endsWith(u8, r, note));

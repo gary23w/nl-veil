@@ -279,6 +279,8 @@ pub const Store = struct {
     file_content: [1 << 14]u8 = undefined, // up to 16KB of the selected file, for the viewer
     file_content_len: usize = 0,
     file_content_trunc: bool = false,
+    sel_config: scan.SwarmConfig = .{}, // the selected swarm's manifest + blueprint (Details tab: the exact
+    //                                     prompt + configuration the run was given)
 
     // --- settings (UI writes, poller reads) ---
     settings: Settings = .{},
