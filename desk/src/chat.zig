@@ -2794,7 +2794,7 @@ pub const Chat = struct {
                     // for an action it never chose). A kill still recovers when the USER asked for one.
                     if (std.mem.eql(u8, lt.name, "kill_swarm") and !userWantsKill(self.last_user[0..self.last_user_len])) break :blk_loose null;
                     break :blk_loose lt;
-                } else null) orelse blk: {
+                } else null) orelse toolCallJsonInferred(full) orelse blk: {
                 // observed live: "cast a swarm to finish the two-page site" answered with a pasted
                 // index.html, this rescue synthesized a write_file, and the veil silently self-built
                 // for the rest of the arc while the hive never existed — the cast recovery owns this
@@ -3033,7 +3033,7 @@ pub const Chat = struct {
                         xml_args = @constCast(xc.args);
                         break :blk_r ToolCall{ .name = xc.name, .args = xc.args };
                     }
-                    break :blk_r null;
+                    break :blk_r toolCallJsonInferred(final_ans);
                 };
                 if (tcr) |tc| {
                     const prose = self.processMemory(dd, stripToolTail(final_ans));
@@ -4801,6 +4801,14 @@ pub fn stripToolTail(text: []const u8) []const u8 {
     if (findToolCall(text)) |f| cut = @min(cut, f.at);
     if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
     if (bareToolTagAt(text)) |p| cut = @min(cut, p); // bare `<edit_file>{...}` XML tool tag
+    if (toolCallJsonInferred(text)) |jc| { // bare ```json {...}``` tool-args block (deepseek) — strip it + its fence
+        const at = @intFromPtr(jc.args.ptr) - @intFromPtr(text.ptr);
+        var c = at;
+        if (std.mem.lastIndexOf(u8, text[0..at], "```")) |f| {
+            if (at - f <= 12) c = f; // a ```json fence right before the block
+        }
+        cut = @min(cut, c);
+    }
     // RUN: <shell command> — only at a line start (a prose "RUN:" mid-sentence isn't a shell call).
     {
         var i: usize = 0;
@@ -4986,6 +4994,47 @@ pub fn toolCallXmlNested(gpa: std.mem.Allocator, text: []const u8) ?ToolCall {
             continue;
         }
         return .{ .name = name, .args = out.toOwnedSlice(gpa) catch return null };
+    }
+    return null;
+}
+
+fn jsonHasKey(a: []const u8, key: []const u8) bool {
+    var buf: [40]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return false;
+    return std.mem.indexOf(u8, a, needle) != null;
+}
+
+/// A bare JSON args block with NO tool name — ```json {"path":..,"content":..} ``` — is how deepseek emits its
+/// tool CALLS, expecting the harness to infer the tool. Dropped, the model "announces" an action that never runs
+/// and the act-nudge loops forever (observed live: a chat burned its whole budget emitting json blocks to write
+/// details/main.md, none dispatching → the chat "stopped responding"). Infer the tool from the arg KEYS. This is
+/// the LAST-resort parser — reached only when no named form (TOOL:/<tool:>/<name>/nested-XML) matched, so it can't
+/// steal a real call. `content`+`path`⇒write_file, `ops`/`search`+`replace`⇒edit_file, `code`⇒run_python,
+/// `query`⇒web_search, a lone/`start_line` `path`⇒read_file. Args are a slice into `text` (no allocation).
+pub fn toolCallJsonInferred(text: []const u8) ?ToolCall {
+    var search: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, search, '{')) |astart| { // scan every { for a balanced tool-args object
+        search = astart + 1;
+        var depth: i32 = 0;
+        var k = astart;
+        var closed = false;
+        while (k < text.len) : (k += 1) {
+            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
+                depth -= 1;
+                if (depth == 0) {
+                    k += 1;
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        if (!closed or k <= astart + 1) continue;
+        const args = text[astart..k];
+        if (!jsonHasKey(args, "path") and !jsonHasKey(args, "code") and !jsonHasKey(args, "query")) continue; // not tool args
+        const name: []const u8 =
+            if (jsonHasKey(args, "content") and jsonHasKey(args, "path")) "write_file" else if (jsonHasKey(args, "path") and (jsonHasKey(args, "ops") or (jsonHasKey(args, "search") and jsonHasKey(args, "replace")))) "edit_file" else if (jsonHasKey(args, "code")) "run_python" else if (jsonHasKey(args, "query")) "web_search" else if (jsonHasKey(args, "path")) "read_file" // lone path (± start_line) — a read
+            else continue;
+        return .{ .name = name, .args = args };
     }
     return null;
 }
@@ -7307,6 +7356,23 @@ test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read
     try std.testing.expect(toolCallXmlNested(gpa, "<section><div>hello</div></section>") == null);
     // the bare `<name>{json}` form belongs to toolCallTagXml, not this one
     try std.testing.expect(toolCallXmlNested(gpa, "<read_file>{\"path\":\"a\"}</read_file>") == null);
+}
+
+test "toolCallJsonInferred infers the tool from a bare json args block (deepseek's nameless tool-call form)" {
+    // the doc-write hang: a fenced json block with content+path is a write_file
+    {
+        const tc = toolCallJsonInferred("Now I'll write it.\n```json\n{\"path\":\"details/main.md\",\"content\":\"# Doc\\ntext\"}\n```").?;
+        try std.testing.expectEqualStrings("write_file", tc.name);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "details/main.md") != null);
+    }
+    try std.testing.expectEqualStrings("read_file", toolCallJsonInferred("{\"path\":\"index.html\",\"start_line\":1,\"end_line\":10}").?.name);
+    try std.testing.expectEqualStrings("read_file", toolCallJsonInferred("{\"path\":\"a.py\"}").?.name); // lone path → read
+    try std.testing.expectEqualStrings("edit_file", toolCallJsonInferred("{\"path\":\"a.py\",\"ops\":[{\"search\":\"x\",\"replace\":\"y\"}]}").?.name);
+    try std.testing.expectEqualStrings("run_python", toolCallJsonInferred("{\"code\":\"print(1)\"}").?.name);
+    try std.testing.expectEqualStrings("web_search", toolCallJsonInferred("{\"query\":\"zig comptime\"}").?.name);
+    // a non-tool object or plain prose is NOT a call
+    try std.testing.expect(toolCallJsonInferred("{\"foo\":1,\"bar\":2}") == null);
+    try std.testing.expect(toolCallJsonInferred("here is my final answer, no json at all") == null);
 }
 
 test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wildcards" {

@@ -8002,6 +8002,12 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
         const tok = std.mem.trim(u8, tok0, ".!?*");
         if (tok.len < 3 or tok.len > 120) continue;
         if (!fileShapedToken(tok)) continue;
+        // A DELIVERABLE is a FILE — not a directory and not a repo/URL reference. `fileShapedToken` accepts any
+        // token with a '/', so a goal's SUBJECT ("gary23w/nl-veil", the repo to explore) and its OUTPUT DIR
+        // ("details/") got adopted as files to CREATE — every mind was pinned to a phantom deliverable and built
+        // nothing (observed live). A real file has a filename with an extension; a directory ends in '/'.
+        if (tok[tok.len - 1] == '/' or tok[tok.len - 1] == '\\') continue; // a directory, not a file
+        if (std.mem.indexOfScalar(u8, std.fs.path.basename(tok), '.') == null) continue; // no extension → repo/namespace/dir, not a file
         // a JS token used as a dependency ("a three.js game", "using d3.js") is a library, not a file to create —
         // adopting it as the blueprint pinned every mind to a phantom "Three.js" deliverable (observed live)
         if (jsFamilyExt(tok) and jsTokenIsDependency(toks.items, i)) continue;
@@ -8044,6 +8050,20 @@ test "goalNamedFiles adopts real deliverables but never a library named like a f
         defer if (bp.len > 0) gpa.free(@constCast(bp));
         try std.testing.expect(std.ascii.indexOfIgnoreCase(bp, "react.js") == null);
         try std.testing.expect(std.mem.indexOf(u8, bp, "App.jsx") != null);
+    }
+    // the repo-doc cast failure: a repo reference (owner/repo, no extension) and an output DIRECTORY are not files
+    {
+        const bp = goalNamedFiles(gpa, "deep-dive explore every file in gary23w/nl-veil for documenting into details/ folder");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(bp, "gary23w/nl-veil") == null);
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(bp, "details/") == null);
+    }
+    // a real file UNDER a directory is still adopted
+    {
+        const bp = goalNamedFiles(gpa, "write the docs to details/architecture.md and details/api.md");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.mem.indexOf(u8, bp, "details/architecture.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "details/api.md") != null);
     }
 }
 
