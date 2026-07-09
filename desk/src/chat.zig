@@ -22,7 +22,36 @@ const neurondb = @import("neuron.zig");
 
 const Store = store_mod.Store;
 
-const SYSTEM_PROMPT =
+// The CASTING POLICY is mode-dependent; everything from TOOLS on (SYSTEM_REST) is shared.
+// SPEED MODE (default ON): building an app from a chat-cast proved a HARD orchestration (observed live:
+// a 5-game suite where the swarm "graduated" at 100% with three games missing, then the chat's own
+// per-file ceremony died on announcements) — while swarms excel at what they were designed for:
+// autonomous set-and-forget runs and parallel RESEARCH. So in speed mode the VEIL is the builder and a
+// cast is a short research sub-agent; autonomy mode keeps the original long-hivemind posture.
+const CAST_POLICY_SPEED =
+    "You are the Veil, the chat mind of this nl-veil host — a hands-on BUILDER with a real workdir, file " ++
+    "tools, a terminal, and a hive-mind swarm engine you can cast as a research SUB-AGENT.\n" ++
+    "SPEED MODE is ON. YOU do the building: when the user wants code, files, an app, or a fix, write it " ++
+    "YOURSELF with write_file/edit_file/RUN — do NOT cast a swarm to build; you are faster and more reliable " ++
+    "hands-on. A multi-file project is ONE continuous job: land a file, then IMMEDIATELY land the next in your " ++
+    "following action — never stop to summarize or ask until every file exists and is verified.\n" ++
+    "CAST a swarm ONLY as a research sub-agent, for jobs where parallel readers beat one mind: web research and " ++
+    "current events, scouting unfamiliar tech before you build, analyzing a large amount of material, gathering " ++
+    "references into the hive. A speed-mode cast is a QUICK STRIKE hard-capped at 2 minutes; never request LONG.\n" ++
+    "To cast, make the FIRST line of your reply exactly:\n" ++
+    "CAST: <one-line goal for the hive>\n" ++
+    "  MINDS <n>   — optional, how many minds (2-8; default 3), on its own line right after.\n" ++
+    "After the config you may add a short note to the user. Only one cast runs at a time.\n" ++
+    "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'spin up a swarm': an " ++
+    "explicit request is a command, even for a build (it will be time-capped).\n" ++
+    "NEVER fabricate current events, dates, statistics, or news — for a quick fact use TOOL: web_search; for " ++
+    "broad or many-source questions, cast. DO NOT cast for greetings, small talk, or timeless facts.\n" ++
+    "WHILE A CAST RUNS you are the hive's ORCHESTRATOR: narrate its progress to the user in plain sentences, " ++
+    "and steer it when it drifts by putting a line 'STEER: <one concrete instruction>' in your reply — it is " ++
+    "delivered to every mind at their next round. Never build a rival version of what the hive is mid-way " ++
+    "through; when it finishes you receive its findings in a [cast] message and answer from them.\n" ++
+    "\n";
+const CAST_POLICY_AUTONOMY =
     "You are the Veil, the chat mind of this nl-veil host. You command a hive-mind swarm engine; " ++
     "casting a swarm is your primary reasoning tool for real work.\n" ++
     "To cast, make the FIRST line of your reply exactly:\n" ++
@@ -54,7 +83,8 @@ const SYSTEM_PROMPT =
     "and steer it when it drifts by putting a line 'STEER: <one concrete instruction>' in your reply — it is " ++
     "delivered to every mind at their next round. Never build a rival version of what the hive is mid-way " ++
     "through; the hive owns the project layout while it runs.\n" ++
-    "\n" ++
+    "\n";
+const SYSTEM_REST =
     "TOOLS — for a quick, single action (NOT minutes of work), you may run ONE tool per reply. ALWAYS narrate " ++
     "first: ONE short plain sentence saying what you're about to do and why (the user reads it — 'The tests " ++
     "failed on the import, let me check models.py.'), then the TOOL line on its own line:\n" ++
@@ -77,8 +107,9 @@ const SYSTEM_PROMPT =
     "- observe {\"fact\":\"...\"}  — add a GENERAL fact to the shared hive knowledge (NOT the user's private memory — " ++
     "for anything personal to this user, keys, logins, or preferences, use a REMEMBER: line instead; see MEMORY below).\n" ++
     "Use a TOOL for a one-shot lookup or to inspect/steer a running cast (e.g. the user says 'kill the swarm " ++
-    "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Use CAST for open-ended " ++
-    "research or building. For a brand-new web question, a single web_search TOOL is often faster than a cast.\n" ++
+    "and tell me what it found' -> TOOL: stop_swarm {} , then TOOL: swarm_findings {}). Follow the CASTING rules " ++
+    "at the top of this prompt for when to cast vs. work directly. For a brand-new web question, a single " ++
+    "web_search TOOL is often faster than a cast.\n" ++
     "\n" ++
     "BUILD — you have your own persistent build workdir on this machine (the SAME file tools a hive mind uses). " ++
     "When the user asks you to build/create/fix code or files, WRITE them to disk — don't just paste the whole " ++
@@ -160,6 +191,8 @@ const SYSTEM_PROMPT =
     "waiting to be told (e.g. the user mentions in passing they deploy to us-west-2 → REMEMBER: [preference] ...). " ++
     "Don't nag; never reveal a stored secret to anyone but this user.\n" ++
     "Otherwise reply normally in plain text.";
+const SYSTEM_PROMPT_SPEED = CAST_POLICY_SPEED ++ SYSTEM_REST;
+const SYSTEM_PROMPT_AUTONOMY = CAST_POLICY_AUTONOMY ++ SYSTEM_REST;
 
 // The neuron-db scope for the chat's DURABLE cross-conversation memory (keys/logins/preferences/facts). Distinct
 // from the per-conversation convScope: memories saved in one chat are recallable from every chat. See storeMemory.
@@ -436,6 +469,12 @@ pub const Chat = struct {
     // this is set true when a turn dispatches a tool/shell/cast/kill, false when it settles on plain prose.
     // A conversational answer (nothing actioned) ends the loop instead of spinning on invented next-steps.
     acted: bool = false,
+    // Did ANY dispatch fire since this loop step / user message began? `acted` is reset at EVERY settle, so
+    // a build chain that wrote three files and then ANNOUNCED the fourth read as "just replied" and the
+    // auto-loop disarmed — the observed game-suite death: one file per user prod ("did you do it?"),
+    // twelve prods for twelve files. The loop must keep driving while the ARC is working; each loop step
+    // re-earns continuation by acting (reset in loopContinue), so an announce-only step still ends it.
+    arc_acted: bool = false,
     // AGENTIC FLOOR (the announced-but-never-performed death spiral + verify-before-done + lesson loop):
     act_nudges: u8 = 0, // act-followthrough nudges fired this arc (capped — never competes with real
     //                     dispatches for the tool budget). Live replay showed a narrating model often
@@ -443,6 +482,14 @@ pub const Chat = struct {
     arc_mutated: bool = false, // this arc performed a side-effecting action (shell launch / mutating tool) —
     //                            the trigger for the one bounded post-arc verification turn
     verify_done: bool = false, // the verification turn already ran for this arc (one per arc)
+    // WHOLE-ARC build debt (survives loop steps; arc_mutated/verify_done are per-step and reset in
+    // loopContinue). The auto-loop can end via loop_infer emitting DONE right after a settle that ANNOUNCED
+    // more work (or falsely claimed a write) — the per-step verify was skipped and the loop finished with
+    // files missing (observed live: a 3-file game suite declared "complete" with only 1 file on disk).
+    // arc_built stays true from the first real write/edit to the arc's end; when the loop tries to finish,
+    // fireTerminalVerify runs ONE whole-build check (list_dir + write anything missing) before it stops.
+    arc_built: bool = false, // this arc wrote/edited at least one file (sticky across loop steps)
+    arc_final_verified: bool = false, // the one terminal whole-build verify already fired for this arc
     arc_fail_cmd: [900]u8 = undefined, // the last console command that FAILED this arc (lesson capture pairs
     arc_fail_cmd_len: usize = 0, //       it with a later similar SUCCESS — verified transitions only)
     arc_fail_note: [96]u8 = undefined, // that failure's note ("(exit code 2147942402)")
@@ -998,7 +1045,10 @@ pub const Chat = struct {
         // settling on "done". Conservative: only clearly read-only probes (dir/type/Get-*...) are exempt, so
         // pure diagnostic arcs don't buy a verification round. (Set at LAUNCH, past the approval park — a
         // denied command never mutates.)
-        if (ai and !looksReadOnlyCommand(trimmed)) self.arc_mutated = true;
+        if (ai and !looksReadOnlyCommand(trimmed)) {
+            self.arc_mutated = true;
+            self.arc_built = true; // a mutating shell command may have created files → owe a whole-build verify
+        }
         log.info("console: {s} launched: {s}", .{ if (ai) "veil" else "you", trimmed[0..@min(trimmed.len, 120)] });
     }
 
@@ -2002,6 +2052,7 @@ pub const Chat = struct {
         var lopen = true;
         var ropen = true;
         var shell_allow = false;
+        var speed = true;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -2020,6 +2071,7 @@ pub const Chat = struct {
             lopen = s.chat_left_open;
             ropen = s.chat_right_open;
             shell_allow = s.shell_always_allow;
+            speed = s.speed_mode;
         }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -2030,7 +2082,7 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{}}}", .{ lopen, ropen, shell_allow }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{}}}", .{ lopen, ropen, shell_allow, speed }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -2070,6 +2122,7 @@ pub const Chat = struct {
         s.chat_left_open = std.mem.indexOf(u8, data, "\"left\":false") == null;
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
+        s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -2377,8 +2430,14 @@ pub const Chat = struct {
         var dbuf: [96]u8 = undefined;
         msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
         // A loop-infer turn wears the DRIVER hat (write the user's next message); a consolidate turn is the memory
-        // step (not an answer); every other turn is the assistant.
-        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else SYSTEM_PROMPT);
+        // step (not an answer); every other turn is the assistant — with the casting policy picked by mode
+        // (speed = the veil builds, casts are 2-minute research sub-agents; autonomy = long hiveminds allowed).
+        const speed_now = blk_sp: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_sp self.store.settings.speed_mode;
+        };
+        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else if (speed_now) SYSTEM_PROMPT_SPEED else SYSTEM_PROMPT_AUTONOMY);
         escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
         // HIPPOCAMPUS: draw the facts most relevant to THIS query in from the chat's own neuron-db — earlier
@@ -3037,13 +3096,26 @@ pub const Chat = struct {
         // codes and output are ground truth — the model picks WHAT to check, never what the check returned).
         // A failed check re-enters the normal fix loop (bounded by MAX_TOOL_ITERS). Skipped when the answer
         // hands the turn to the user with a question, on Stop/epoch moves, and during casts/veil work.
+        // The reply hands the turn to the user with a question. Read the text ACTUALLY COMMITTED as the
+        // reply: gpt-oss commonly leaves content empty and answers in the reasoning channel (shown AS the
+        // reply below), so a content-only check missed the common local-model case — a "…add a dark theme?"
+        // in the reasoning would let the auto-loop answer the user's question on their behalf.
+        const committed_reply = if (full.len > 0) full else reason;
+        const asks_user = committed_reply.len > 0 and committed_reply[committed_reply.len - 1] == '?';
+        // !announcesAction: a reply that says MORE work is coming is not claiming done — verifying after
+        // every landed file inserted a whole ceremony turn mid-build (the game-suite arcs burned their
+        // budgets on it); the auto-loop carries the work forward and the TRUE final settle verifies once.
         const want_verify = (kind == .user or kind == .tool_follow or kind == .reflect) and self.arc_mutated and !self.verify_done and
+            !self.arc_final_verified and // the whole-build check already ran; a write it prompted must not re-trigger per-step verify (the observed post-fix thrash)
             !self.in_veil_work and !self.castPending() and
-            !(full.len > 0 and full[full.len - 1] == '?') and
+            !asks_user and !announcesAction(committed_reply) and
             self.turn_epoch == self.conv_epoch and !self.abort_turn.load(.monotonic) and
             self.tool_iters + 1 < MAX_TOOL_ITERS; // headroom for the CHECK itself — a verify turn holding the
         //                                           last slot would demand a RUN the budget then refuses
         self.stream.deinit(self.gpa);
+        // A question is the veil YIELDING to the user — the auto-loop must not answer it on their behalf
+        // (checked here, before the verify/consolidate re-entries, so every path to maybeLoop inherits it).
+        if (asks_user) self.stopLoopQuiet();
         if (want_verify) {
             self.verify_done = true;
             self.tool_iters += 1; // the verify turn spends from the arc's real budget
@@ -3105,10 +3177,14 @@ pub const Chat = struct {
             break :blk self.store.chat_loop;
         };
         if (!on) return;
-        // Only KEEP LOOPING while the veil is actually working (took a tool/shell/cast action this exchange). A
-        // plain conversational answer means it's done — stop instead of inventing next-steps (the observed spin,
-        // e.g. re-emitting "read the test and fix it" forever, or looping on "what's the agenda").
-        if (!self.acted) {
+        // Only KEEP LOOPING while the veil is actually working. `acted` reflects just the FINAL reply of a
+        // chain (every settle resets it), so a build chain that wrote files and then ANNOUNCED the next one
+        // read as "just replied" and the loop disarmed mid-build — the game-suite death (one file per user
+        // prod). arc_acted carries "this loop step DID work"; a step with zero dispatches (a plain
+        // conversational answer, or announce-only after both nudges) still ends the loop — that is the
+        // anti-spin bound (re-earned per step in loopContinue), alongside nearlySame + LOOP_MAX_ITERS.
+        if (!self.acted and !self.arc_acted) {
+            if (self.fireTerminalVerify(dd)) return; // a build that stalled on a no-work step still gets checked
             self.stopLoopQuiet();
             return;
         }
@@ -3118,6 +3194,7 @@ pub const Chat = struct {
             if (self.store.msg_count == 0) return; // nothing to continue from yet — wait for the first message
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
+            if (self.fireTerminalVerify(dd)) return;
             self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
             return;
         }
@@ -3125,6 +3202,47 @@ pub const Chat = struct {
         var sb: [64]u8 = undefined;
         self.setStatus(std.fmt.bufPrint(&sb, "auto-loop {d}/{d}: planning next step...", .{ self.loop_iter + 1, LOOP_MAX_ITERS }) catch "auto-loop: planning...");
         self.startTurn(dd, .loop_infer);
+    }
+
+    /// The auto-loop (or a non-loop mutating arc) is about to FINISH — if this arc built files and hasn't
+    /// had its one whole-build check, fire it now: a read-only inventory that WRITES anything the goal asked
+    /// for but is missing, before we declare done. Returns true if it started the verify turn (the caller
+    /// must then return without stopping the loop — the turn re-enters the settle path and, once the build
+    /// is confirmed whole, the loop's next DONE really ends it). Guarded so it fires at most once per arc.
+    fn fireTerminalVerify(self: *Chat, dd: []const u8) bool {
+        if (!self.arc_built or self.arc_final_verified) return false;
+        if (self.abort_turn.load(.monotonic) or self.turn_epoch != self.conv_epoch) return false;
+        if (self.in_veil_work or self.castPending()) return false;
+        if (self.tool_iters + 1 >= MAX_TOOL_ITERS) return false; // headroom for the check itself
+        self.arc_final_verified = true;
+        self.tool_iters += 1;
+        // The ENGINE lists the build tree deterministically and hands the model GROUND TRUTH — a weak model
+        // asked to "run list_dir" tends to ANNOUNCE the check without emitting the tool call, which spins the
+        // act-nudge loop and reads as thrashing (observed live). With the real listing in hand the model
+        // needs no read-only tool: it either WRITES a file the inventory shows missing (a real action) or
+        // gives its final summary. Same discipline as the swarm's engine-stamped verification.
+        var listing: std.ArrayListUnmanaged(u8) = .empty;
+        defer listing.deinit(self.gpa);
+        var rb: [700]u8 = undefined;
+        const rel = self.chatBuildRel(&rb);
+        if (rel.len > 0) {
+            const fn_ = scan.listWorkFiles(self.io, self.gpa, dd, rel, &self.file_scratch);
+            var i: usize = 0;
+            while (i < fn_) : (i += 1) {
+                listing.print(self.gpa, "  - {s} ({d} bytes)\n", .{ self.file_scratch[i].pathStr(), self.file_scratch[i].size }) catch break;
+            }
+        }
+        const files_full = if (listing.items.len > 0) listing.items else "  (the build workdir is EMPTY — nothing was actually written)\n";
+        const files_block = files_full[0..@min(files_full.len, 2000)];
+        self.appendMsgFull(dd, .cast_note, "(before finishing: checking every file the build needs is actually on disk)", false);
+        var db: [2600]u8 = undefined;
+        const directive = std.fmt.bufPrint(&db, "Before we call this build done, here is EXACTLY what is on disk right now (the engine listed it — this is ground truth, do NOT run a tool to re-list it):\n{s}\nCompare this against everything the user asked you to build. If a required file is MISSING or shows 0/near-0 bytes, WRITE it NOW this turn (one write_file — a missing file is not done). If every required file is present with real content, give your FINAL summary to the user (no tool call) — do not re-write files that are already there.", .{files_block}) catch "Compare the on-disk files above against the user's request; write any that are missing, else give your final summary.";
+        self.setDirective(directive);
+        self.internal_turn = true;
+        self.setStatus("checking the build is complete...");
+        log.info("terminal verify: arc built files — engine listed {d}b of tree, folding into one completeness turn", .{listing.items.len});
+        self.startTurn(dd, .tool_follow);
+        return self.turn == .tool_follow;
     }
 
     /// Handle the message a loop-infer turn produced: stop on DONE / empty / user-toggled-off / cap, else send it.
@@ -3140,10 +3258,15 @@ pub const Chat = struct {
             return;
         }
         if (text.len == 0) {
+            if (self.fireTerminalVerify(dd)) return;
             self.stopLoop(dd, "auto-loop ended: no next step was inferred.");
             return;
         }
         if (loopIsDone(text)) {
+            // Don't take the model's word for "done" on a build it may have only ANNOUNCED — run the
+            // whole-build check first (it writes anything still missing). Only if that's already done (or
+            // this wasn't a build) do we actually finish.
+            if (self.fireTerminalVerify(dd)) return;
             self.stopLoop(dd, "auto-loop complete: the goal looks achieved.");
             return;
         }
@@ -3151,10 +3274,12 @@ pub const Chat = struct {
         // status to confirm" twice in a row). If the inferred message basically repeats the last one, the loop
         // isn't making progress — stop instead of churning.
         if (nearlySame(text, self.last_user[0..self.last_user_len])) {
+            if (self.fireTerminalVerify(dd)) return; // a stalled build still gets its completeness check
             self.stopLoop(dd, "auto-loop stopped: the next step just repeated the last one (no progress).");
             return;
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
+            if (self.fireTerminalVerify(dd)) return;
             self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
             return;
         }
@@ -3164,6 +3289,7 @@ pub const Chat = struct {
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
         self.tool_iters = 0;
         self.act_nudges = 0; // each loop step re-earns its follow-through nudges + verification
+        self.arc_acted = false; // ...and re-earns loop continuation by ACTING (announce-only steps end it)
         self.arc_mutated = false;
         self.verify_done = false;
         self.stream_retried = false; // and its own transient-death retry
@@ -3212,7 +3338,10 @@ pub const Chat = struct {
     /// these so a stale arc_mutated can't buy a verify turn (or a stale fail half a lesson) somewhere else.
     fn resetArcFlags(self: *Chat) void {
         self.act_nudges = 0;
+        self.arc_acted = false;
         self.arc_mutated = false;
+        self.arc_built = false; // the whole-build debt belongs to ONE user goal — a new/switched/stopped arc clears it
+        self.arc_final_verified = false;
         self.verify_done = false;
         self.arc_fail_cmd_len = 0;
         self.arc_fail_note_len = 0;
@@ -3427,6 +3556,7 @@ pub const Chat = struct {
     /// chat fires it on the chat's own provider. The server clamps to the plan's ceilings.
     pub fn fireCast(self: *Chat, dd: []const u8, spec: CastSpec) void {
         self.acted = true; // a cast is a big action → the exchange is "working"
+        self.arc_acted = true;
         const goal = spec.goal;
         // The conversation id doubles as the cast's build dir: the server points the hive's run_dir at this
         // chat's `_chat/builds/{conv}` folder, so the cast builds in the SAME tree the chat's own build tools
@@ -3439,7 +3569,16 @@ pub const Chat = struct {
         const veil_join = CONCURRENT_VEIL and conv.len > 0 and conv.len <= self.cast_conv.len;
         const hive_dir = conv;
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
-        const minutes: u32 = if (spec.minutes > 0) std.math.clamp(spec.minutes, 1, 120) else if (spec.long) 20 else CAST_MINUTES;
+        // SPEED MODE ceiling: a chat cast is a 2-minute research sub-agent — the observed failure was the
+        // model dispatching 10-100 minute hiveminds for 3-5 minute jobs. Autonomy mode keeps the full range.
+        const speed = blk_sm: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_sm self.store.settings.speed_mode;
+        };
+        const minutes = castMinutes(spec.minutes, spec.long, speed);
+        if (speed and (spec.long or spec.minutes > minutes))
+            self.appendMsg(dd, .cast_note, "(speed mode: swarm time-capped at 2 minutes — turn speed mode off in Settings for long autonomous hiveminds)");
         const mode: []const u8 = if (spec.long) "continuous" else "cast";
         self.cast_minutes = minutes;
         var bb: [256]u8 = undefined;
@@ -3583,7 +3722,11 @@ pub const Chat = struct {
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
         self.acted = true; // a tool ran this exchange → the veil is working → auto-loop may continue
-        if (isMutatingToolName(tc.name)) self.arc_mutated = true; // side effects → the arc must verify before "done"
+        self.arc_acted = true;
+        if (isMutatingToolName(tc.name)) {
+            self.arc_mutated = true; // side effects → the arc must verify before "done"
+            if (writesAFile(tc.name)) self.arc_built = true; // a file landed → whole-build verify owed at arc end
+        }
         // Stop pressed while the previous stream was settling → don't fire another (blocking) tool round-trip.
         if (self.abort_turn.load(.monotonic)) {
             self.stream.deinit(self.gpa);
@@ -3763,6 +3906,7 @@ pub const Chat = struct {
     /// turn stays busy (turn is idle while it awaits the console — see consoleAiBusy) the whole time.
     fn runShellAndContinue(self: *Chat, dd: []const u8, cmd: []const u8) void {
         self.acted = true; // a shell command (or its approval prompt) means the veil is working
+        self.arc_acted = true;
         // Stop pressed while the previous stream settled → don't launch the AI's next shell command.
         if (self.abort_turn.load(.monotonic)) {
             self.stream.deinit(self.gpa);
@@ -5112,6 +5256,14 @@ fn isMutatingToolName(name: []const u8) bool {
     return false;
 }
 
+/// Did this tool put a FILE on disk (vs. a general side effect like run_python)? A build arc's terminal
+/// whole-build verify keys on this — the point is "the user asked for files; confirm they all exist."
+fn writesAFile(name: []const u8) bool {
+    const b = [_][]const u8{ "write_file", "edit_file", "delete_file", "stage_delivery" };
+    for (b) |m| if (std.mem.eql(u8, name, m)) return true;
+    return false;
+}
+
 /// Is this shell command CLEARLY read-only (a diagnostic probe)? Conservative allowlist — anything
 /// unrecognized counts as mutating, so the verify pass errs toward running. Covers the bare cmd probes and
 /// the `powershell -Command Get-*/Test-*/Select-*/Measure-*` diagnostic shape. Pure — unit-tested.
@@ -5242,6 +5394,15 @@ pub fn userWantsKill(msg: []const u8) bool {
 
 /// Strip a leading cast-request preamble ("cast a swarm to ", "have the hive ", "run a swarm that ")
 /// from the user's message to get a clean one-line goal. Returns a slice into `buf`.
+/// The cast's time budget under the mode ceiling: SPEED MODE hard-caps every chat cast at 2 minutes (a
+/// research sub-agent strike — the observed failure was 10-100 minute hiveminds dispatched for 3-5 minute
+/// jobs); autonomy mode keeps the original range (default quick strike, LONG up to 120). Pure — unit-tested.
+pub fn castMinutes(spec_minutes: u32, long: bool, speed: bool) u32 {
+    const max: u32 = if (speed) 2 else 120;
+    const want: u32 = if (spec_minutes > 0) spec_minutes else if (speed) 2 else if (long) 20 else CAST_MINUTES;
+    return std.math.clamp(want, 1, max);
+}
+
 /// Word-bounded contains over an already-lowercased haystack ("along"/"belongs" must not read as "long").
 fn hasWord(lo: []const u8, w: []const u8) bool {
     var from: usize = 0;
@@ -5890,6 +6051,132 @@ test "collect fizzle: a post-cast answer that only announces the repair re-enter
     try std.testing.expect(saw_nudge);
     // the re-entered turn is a kind that CAN act (.idle only if llm.start couldn't spawn curl here)
     try std.testing.expect(chat.turn == .tool_follow or chat.turn == .idle);
+    llm.abort(&chat.stream, io);
+    chat.stream.deinit(std.testing.allocator);
+}
+
+test "terminal verify: a build that reaches DONE gets one whole-build check; a non-build DONE finishes clean" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-tmp7";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+    const ask = "build a 3-file site: dashboard + two games";
+    chat.last_user_len = ask.len;
+    @memcpy(chat.last_user[0..ask.len], ask);
+    store.msg_count = 1;
+    store.chat_loop = true;
+
+    // the live game-suite death: the arc BUILT a file earlier (arc_built sticky), then loop_infer emits DONE
+    // — the model may have only ANNOUNCED the remaining files. loopContinue must run ONE terminal verify.
+    chat.arc_built = true;
+    chat.turn_epoch = chat.conv_epoch;
+    chat.loopContinue(dd, "DONE");
+    try std.testing.expect(chat.arc_final_verified); // the whole-build check fired instead of a bare finish
+    var saw_verify_note = false;
+    {
+        store.lock();
+        defer store.unlock();
+        var i: usize = 0;
+        while (i < store.msg_count) : (i += 1) {
+            if (std.mem.indexOf(u8, store.msgs[i].textStr(), "checking every file the build needs") != null) saw_verify_note = true;
+        }
+    }
+    try std.testing.expect(saw_verify_note);
+    try std.testing.expect(chat.turn == .tool_follow or chat.turn == .idle); // the verify turn is live (or curl absent)
+    if (chat.turn != .idle) {
+        llm.abort(&chat.stream, io);
+        chat.stream.deinit(std.testing.allocator);
+        chat.turn = .idle;
+    }
+    // a SECOND DONE now really finishes — the terminal verify fires at most once per arc
+    store.chat_loop = true;
+    chat.loopContinue(dd, "DONE");
+    try std.testing.expect(!store.chat_loop); // stopped for real
+
+    // a NON-build arc (nothing written) skips the check and finishes immediately
+    chat.resetArcFlags();
+    store.chat_loop = true;
+    chat.arc_built = false;
+    chat.loopContinue(dd, "DONE");
+    try std.testing.expect(!chat.arc_final_verified);
+    try std.testing.expect(!store.chat_loop);
+}
+
+test "castMinutes: speed mode caps every chat cast at 2 minutes; autonomy keeps the range" {
+    try std.testing.expectEqual(@as(u32, 2), castMinutes(30, true, true)); // "LONG MINUTES 30" in speed → 2
+    try std.testing.expectEqual(@as(u32, 2), castMinutes(0, false, true)); // speed default = 2
+    try std.testing.expectEqual(@as(u32, 1), castMinutes(1, false, true)); // an even shorter ask survives
+    try std.testing.expectEqual(@as(u32, 30), castMinutes(30, true, false)); // autonomy honors LONG MINUTES 30
+    try std.testing.expectEqual(@as(u32, 20), castMinutes(0, true, false)); // autonomy LONG default
+    try std.testing.expectEqual(CAST_MINUTES, castMinutes(0, false, false)); // autonomy quick default
+    try std.testing.expectEqual(@as(u32, 120), castMinutes(400, true, false)); // autonomy still has a ceiling
+}
+
+test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settle; a workless step ends it; a question yields" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-tmp6";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+    const ask = "build a tiny two-page site: index.html and about.html";
+    chat.last_user_len = ask.len;
+    @memcpy(chat.last_user[0..ask.len], ask);
+    store.msg_count = 1; // maybeLoop needs something to continue from
+
+    // (1) the game-suite death shape: the chain WROTE a file earlier (arc_acted), then settled on prose
+    // announcing the next one (acted=false after the settle reset) — the loop must KEEP DRIVING
+    store.chat_loop = true;
+    chat.acted = false;
+    chat.arc_acted = true;
+    chat.maybeLoop(dd);
+    try std.testing.expect(store.chat_loop); // never stopLoopQuiet'd — the arc is working
+    if (chat.turn == .loop_infer) { // the loop-infer turn may be live (model call against the default endpoint)
+        llm.abort(&chat.stream, io);
+        chat.stream.deinit(std.testing.allocator);
+        chat.turn = .idle;
+    }
+
+    // (2) a loop step that performed NOTHING ends the loop (the anti-spin bound)
+    store.chat_loop = true;
+    chat.acted = false;
+    chat.arc_acted = false;
+    chat.maybeLoop(dd);
+    try std.testing.expect(!store.chat_loop);
+
+    // (3) a settle whose reply ENDS WITH A QUESTION yields to the user even though the arc acted
+    store.chat_loop = true;
+    chat.acted = false;
+    chat.arc_acted = true;
+    chat.stream = .{ .done = true };
+    chat.stream.content.appendSlice(std.testing.allocator, "index.html is written. Want me to add a dark theme next?") catch unreachable;
+    chat.turn = .user;
+    chat.turn_epoch = chat.conv_epoch;
+    chat.turn_start_ms = chat.nowMs();
+    chat.stream.started_s = chat.nowS();
+    chat.pumpStream(dd);
+    try std.testing.expect(!store.chat_loop); // the question handed the turn to the user
     llm.abort(&chat.stream, io);
     chat.stream.deinit(std.testing.allocator);
 }
