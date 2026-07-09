@@ -352,7 +352,15 @@ pub fn main() !void {
     var sim_mode = false;
 
     var auto_selected = false;
-    while (!rl.windowShouldClose() and !ui.close_req) {
+    while (true) {
+        if (rl.windowShouldClose()) {
+            _ = rl.saveFileText("data/desk-exit-reason.txt", "windowShouldClose (OS WM_CLOSE / no interactive desktop)");
+            break;
+        }
+        if (ui.close_req) {
+            _ = rl.saveFileText("data/desk-exit-reason.txt", "ui.close_req (X button / File>quit / tray quit)");
+            break;
+        }
         store.lock();
         const online0 = store.server_online;
         const busy0 = store.chat_busy;
@@ -441,6 +449,18 @@ pub fn main() !void {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
                                 if (std.mem.eql(u8, rn, "memory")) ui.right_tab = .memory else if (std.mem.eql(u8, rn, "activity")) ui.right_tab = .activity;
+                            } else if (std.mem.eql(u8, cmd, "newconv")) {
+                                // start a FRESH conversation headlessly (clean build dir, no prior history)
+                                setTab(.chat);
+                                store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
+                            } else if (std.mem.startsWith(u8, cmd, "conv ")) {
+                                // select a conversation by id (headless verification of OLD chats — e.g.
+                                // re-driving a post-cast conversation; same path as clicking it in the list)
+                                const cid = std.mem.trim(u8, cmd[5..], " \r\n\t");
+                                if (cid.len > 0) {
+                                    setTab(.chat);
+                                    store.pushChatCmd(store_mod.mkChatCmd(.select_conv, cid, ""));
+                                }
                             } else if (std.mem.eql(u8, cmd, "approve")) {
                                 store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "once", "")); // headless: approve a parked command
                             } else if (std.mem.eql(u8, cmd, "bypass")) {
@@ -769,9 +789,9 @@ fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
 fn makeIcon() rl.Image {
     const candidates = [_][:0]const u8{
         "assets/icon.png",
-        "desktop/assets/icon.png",
+        "desk/assets/icon.png",
         "../assets/icon.png",
-        "../desktop/assets/icon.png",
+        "../desk/assets/icon.png",
     };
     for (candidates) |path| {
         if (rl.loadImage(path)) |img| return img else |_| {}

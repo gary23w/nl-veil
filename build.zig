@@ -45,17 +45,17 @@ pub fn build(b: *std.Build) void {
         b.addSystemCommand(&.{ "cmd", "/C", b.fmt("{s} build & exit /b 0", .{zig_exe}) })
     else
         b.addSystemCommand(&.{ "sh", "-c", b.fmt("'{s}' build || true", .{zig_exe}) });
-    desk_cmd.setCwd(b.path("desktop"));
+    desk_cmd.setCwd(b.path("desk"));
     desk_cmd.setName("build veil-desk (best-effort)");
-    const desktop_step = b.step("desktop", "Build the veil-desk desktop dashboard");
-    desktop_step.dependOn(&desk_cmd.step);
+    const desk_step = b.step("desk", "Build the veil-desk desktop dashboard");
+    desk_step.dependOn(&desk_cmd.step);
 
-    const with_desktop = b.option(bool, "desktop", "also build veil-desk + run server with --desktop (default false)") orelse false;
-    if (with_desktop) b.getInstallStep().dependOn(&desk_cmd.step);
+    const with_desk = b.option(bool, "desk", "also build veil-desk + run server with --desk (default false)") orelse false;
+    if (with_desk) b.getInstallStep().dependOn(&desk_cmd.step);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (with_desktop) run_cmd.addArg("--desktop");
+    if (with_desk) run_cmd.addArg("--desk");
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the veil hive-mind control plane");
     run_step.dependOn(&run_cmd.step);
