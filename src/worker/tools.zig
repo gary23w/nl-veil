@@ -1264,7 +1264,12 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const clean = sanitizeModelText(gpa, data);
     defer gpa.free(clean);
     const owned = ctx.my_files.len > 0 and fileOwnedBy(ctx.my_files, p.value.path);
-    return dupe(gpa, clip(clean, if (owned) 32000 else 8000));
+    const cap: usize = if (owned) 32000 else 8000;
+    if (clean.len <= cap) return dupe(gpa, clean);
+    // A silently-cut read looks EXACTLY like a truncated file — the reader then "fixes" a healthy file or
+    // spirals on tail-verification (observed live: the chat veil burned its whole follow-through budget
+    // re-reading a complete index.html because the view ended mid-markup). Name the cut and the real size.
+    return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing {d} of {d} bytes. The file on disk is WHOLE — this cut is only the reading window, so do NOT rewrite or re-verify the file because the view ends here.]", .{ clean[0..cap], cap, clean.len }) catch dupe(gpa, clean[0..cap]);
 }
 
 fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
@@ -2884,7 +2889,8 @@ const PATCH_SYSTEM_PATCH_PY =
 /// every stage of a build: TIER 1 = real tests (pytest if present, else `unittest discover`; pass/total), with
 /// a hard subprocess timeout so a runaway test can't hang the round; TIER 2 = no tests yet, score = how many
 /// .py files compile (nudges the swarm toward authoring tests); TIER 3 = non-code artifacts scored by each
-/// format's OWN parser (json/xml/toml well-formedness, non-empty otherwise — no content opinions; the
+/// format's OWN parser (json/xml/toml well-formedness, html structural-tag balance + css brace balance
+/// [truncation-shaped breakage], non-empty otherwise — no content opinions; the
 /// goal-parameterized word-coverage path applies only when NL_DOC_TARGET_WORDS is set). The failure extractor
 /// ff() reads BOTH runners' native formats — unittest `FAIL:`/`ERROR:` blocks AND pytest's
 /// `FAILED node - reason` summary lines (a 0/7 round once reported "FAILING: (none)" because only the
@@ -2902,6 +2908,26 @@ pub const BENCH_PY =
     \\    # personal journals, not the build)
     \\    segs=f.replace(os.sep,"/").split("/")
     \\    return any(s.startswith((".","_")) or s in ("node_modules","venv") for s in segs) or segs[0] in ("skills","journal")
+    \\def hchk(t):
+    \\    # structural completeness via the stdlib parser: a page CUT mid-emission ends with <style>/<body>/
+    \\    # <html>... still open. Only STRUCTURAL tags are enforced (unclosed <p>/<li> is legal HTML) so a
+    \\    # sloppy-but-complete page passes and a truncated one fails. This is format well-formedness, not a
+    \\    # content opinion — the exact check that would have caught a mid-CSS varieties.html scoring 100%.
+    \\    from html.parser import HTMLParser
+    \\    VOID={"area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr"}
+    \\    class P(HTMLParser):
+    \\        def __init__(s):
+    \\            HTMLParser.__init__(s); s.stack=[]
+    \\        def handle_starttag(s,tag,at):
+    \\            if tag not in VOID: s.stack.append(tag)
+    \\        def handle_endtag(s,tag):
+    \\            for i in range(len(s.stack)-1,-1,-1):
+    \\                if s.stack[i]==tag: del s.stack[i:]; break
+    \\    p=P(); p.feed(t); p.close()
+    \\    bad=[x for x in p.stack if x in ("html","head","body","style","script","title","table","ul","ol","div","section","main","header","footer","nav")]
+    \\    if bad: raise ValueError("unclosed <"+bad[-1]+"> tag - the page looks truncated/incomplete")
+    \\def cchk(t):
+    \\    if t.count("{")!=t.count("}"): raise ValueError("unbalanced braces - the stylesheet looks truncated/incomplete")
     \\def ff(txt):
     \\    r=[]
     \\    body=re.split(r"-{3,}[\r\n]+Ran \d",txt)[0]
@@ -2942,6 +2968,8 @@ pub const BENCH_PY =
     \\            elif lf.endswith(".toml"):
     \\                try: import tomllib; tomllib.loads(t)
     \\                except ImportError: pass
+    \\            elif lf.endswith((".html",".htm")): hchk(t)
+    \\            elif lf.endswith(".css"): cchk(t)
     \\            ok+=1
     \\        except Exception as ex: fails.append((f+": "+str(ex).splitlines()[0])[:90])
     \\    return ok,tot,fails

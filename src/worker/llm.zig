@@ -61,6 +61,11 @@ pub const Step = struct {
     reasoning: []u8,
     calls: []ToolCall,
     ok: bool,
+    // The provider CUT this reply at the output-token limit (done_reason/finish_reason == "length").
+    // Load-bearing for the narrated-write salvage: a fenced file body inside a cut reply is INCOMPLETE
+    // even though it reads as a clean prefix — committing it silently was the truncated-deliverable bug
+    // (a mid-CSS varieties.html scored 100% and finalized the cast).
+    truncated: bool = false,
 
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
         gpa.free(self.content);
@@ -297,7 +302,8 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
     }
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
     const reasoning = gpa.dupe(u8, msg.thinking orelse "") catch return stepErr(gpa, "oom");
-    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
+    const trunc = if (parsed.value.done_reason) |dr| std.mem.eql(u8, dr, "length") else false;
+    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
 }
 
 fn parseOllamaVersion(raw: []const u8) bool {
@@ -572,6 +578,7 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
                     function: struct { name: []const u8 = "", arguments: []const u8 = "" },
                 } = null,
             },
+            finish_reason: ?[]const u8 = null,
         } = &.{},
         usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0, prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
@@ -606,7 +613,8 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     }
     const content = gpa.dupe(u8, msg.content orelse "") catch return stepErr(gpa, "oom");
     const reasoning = gpa.dupe(u8, msg.reasoning orelse msg.reasoning_content orelse "") catch return stepErr(gpa, "oom");
-    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true };
+    const trunc = if (parsed.value.choices[0].finish_reason) |fr| std.mem.eql(u8, fr, "length") else false;
+    return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
 }
 
 fn trimSlash(s: []const u8) []const u8 {
@@ -713,6 +721,19 @@ test "parseOllamaNative content-only (no tool call) returns text and no calls" {
     try std.testing.expectEqual(@as(usize, 0), step.calls.len);
     try std.testing.expectEqualStrings("the answer is 391", step.content);
     try std.testing.expectEqualStrings("", step.reasoning);
+    try std.testing.expect(!step.truncated); // done_reason "stop" = a complete emission
+}
+
+test "parseOllamaNative flags a length-cut reply as truncated (the committed-partial-file signal)" {
+    const gpa = std.testing.allocator;
+    const raw =
+        \\{"model":"gpt-oss:20b","message":{"role":"assistant","content":"index.html\n```html\n<!DOCTYPE html>\n<style>.page { margin-"},
+        \\"done_reason":"length","eval_count":8192,"prompt_eval_count":900}
+    ;
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    defer step.deinit(gpa);
+    try std.testing.expect(step.ok);
+    try std.testing.expect(step.truncated);
 }
 
 test "parseOllamaVersion: an Ollama /api/version shape -> true, a hosted 404/error -> false" {
