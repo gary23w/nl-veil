@@ -43,6 +43,7 @@ pub const Poller = struct {
     ev_scratch: [scan.MAX_LOG]scan.Ev = undefined,
     file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
     fc_scratch: [1 << 14]u8 = undefined, // selected-file content read buffer
+    cfg_scratch: scan.SwarmConfig = .{}, // selected swarm's manifest+blueprint (Details tab)
 
     // server-poll throttle: the roster/tail are read from the FILESYSTEM every ~1s (free), but the
     // server-hitting checks (serverOnline + GET /fleet) only need to run every few seconds — a fresh
@@ -412,6 +413,9 @@ pub const Poller = struct {
                     self.ev_cache_metrics = metrics;
                 }
             }
+            // Details tab: the manifest + blueprint the run was given (cheap flat reads, refreshed each tick
+            // so a late-written .blueprint still appears).
+            scan.readSwarmConfig(self.io, self.gpa, dd, selbuf[0..sel_len], &self.cfg_scratch);
             // Files tab: list built files, and (if one is open) re-read its content.
             file_n = scan.listWorkFiles(self.io, self.gpa, dd, selbuf[0..sel_len], &self.file_scratch);
             var selfile: [128]u8 = undefined;
@@ -449,6 +453,7 @@ pub const Poller = struct {
                 @memcpy(self.store.file_content[0..fc_len], self.fc_scratch[0..fc_len]);
                 self.store.file_content_len = fc_len;
                 self.store.file_content_trunc = fc_trunc;
+                self.store.sel_config = self.cfg_scratch;
             }
             self.store.last_refresh_s = now_s;
             self.store.unlock();

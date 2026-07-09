@@ -132,6 +132,7 @@ const Ui = struct {
     // log console
     log_scroll: f32 = 0,
     log_follow: bool = true,
+    details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
     const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, con_input };
     const Field = struct {
@@ -1737,14 +1738,98 @@ fn inView(v: t.Rect, y: f32, h: f32) bool {
     return y + h >= v.y and y <= v.y + v.height;
 }
 
+fn isConsoleMsg(text_: []const u8) bool {
+    return std.mem.startsWith(u8, text_, "[console]\n");
+}
+
+const CONSOLE_CAP: usize = 24; // output rows a console card shows before a "+K more lines" footer (bounds a dump)
+
+/// Draw (or, with draw=false, just measure) a folded shell result "[console]\n$ cmd\n<output>" as a styled
+/// terminal CARD — the counterpart to the fenced-code panel, but for the AI's RUN: door (it replaces the ugly
+/// plain-prose "[console]" line). Reuses the code-panel shell (rounded, bordered, bg_hl@170 fill, mono rows) so
+/// it belongs to the same family, and adds traffic-light dots + a "console" header, a status-colored left accent
+/// bar, a green "$" prompt + bright command, then dim mono output (capped, with a "+K more lines" footer), and a
+/// quiet green dot on success / a labeled colored pill on failure. `card_top` is the y after renderMsg's reserved
+/// MSG_HEAD_H row. Height derives PURELY from the text (scan.parseConsole), so measure and draw never disagree.
+fn renderConsole(view: t.Rect, card_top: f32, text_: []const u8, fsz: i32, draw: bool) f32 {
+    var out: [MSG_MAX_LINES][]const u8 = undefined;
+    const p = scan.parseConsole(text_, &out);
+    const shown: usize = if (p.out_n == 0) 1 else @min(p.out_n, CONSOLE_CAP);
+    const foot: f32 = if (p.out_n > CONSOLE_CAP) 18 else 0;
+    // HDR(24)+PAD(8)+CMD_H(22)+DIV_GAP(8)+PAD_BOT(8) = 70 constant, plus the output rows + optional footer.
+    const card_h = 70 + @as(f32, @floatFromInt(shown)) * MSG_LINE_H + foot;
+    const advance = card_top + card_h + MSG_GAP_H;
+    if (!draw or !inView(view, card_top, card_h)) return advance; // measure-only, or culled off-screen
+
+    const bx = view.x + 8;
+    const bw = @max(60, view.width - 16); // floor so a pathologically narrow view can't go negative-width
+    const status_col: t.Color = switch (p.status) {
+        .ok => t.green,
+        .exit_fail => t.red,
+        .timeout, .truncated => t.orange,
+        .stopped => t.yellow,
+    };
+    // the code-family panel + a status-colored left accent bar (inset 7px top/bottom to clear the rounded corners)
+    t.panelBordered(.{ .x = bx, .y = card_top, .width = bw, .height = card_h }, t.withAlpha(t.bg_hl, 170), t.border);
+    t.fillRect(@intFromFloat(bx + 1), @intFromFloat(card_top + 7), 3, @intFromFloat(card_h - 14), t.withAlpha(status_col, 200));
+    // header: traffic-light dots (always tri-color — the "this is a terminal" signifier) + a muted "console" label
+    const cy: i32 = @intFromFloat(card_top + 12);
+    rl.drawCircle(@intFromFloat(bx + 14), cy, 3.0, t.red);
+    rl.drawCircle(@intFromFloat(bx + 26), cy, 3.0, t.yellow);
+    rl.drawCircle(@intFromFloat(bx + 38), cy, 3.0, t.green);
+    t.text(t.z("console", .{}), @intFromFloat(bx + 52), @intFromFloat(card_top + 7), 11, t.comment);
+    t.hline(@intFromFloat(bx + 4), @intFromFloat(card_top + 24), @intFromFloat(bw - 8), t.withAlpha(t.border, 140));
+    // header-right status: a quiet green dot on success, a labeled colored pill on failure. The pill is
+    // clamped to stay right of the "console" header label — a long hex exit code (exit 0xC0000135) on a
+    // narrow pane clips inside the pill instead of sliding over the header.
+    const pill_max = bw - 114;
+    if (p.isFail() and pill_max >= 34) {
+        var pill_w: f32 = @floatFromInt(t.measure(t.zs(p.labelStr()), 10) + 26);
+        if (pill_w > pill_max) pill_w = pill_max;
+        const pill_x = bx + bw - 10 - pill_w;
+        t.panel(.{ .x = pill_x, .y = card_top + 4, .width = pill_w, .height = 16 }, t.withAlpha(status_col, 40));
+        rl.drawCircle(@intFromFloat(pill_x + 9), @intFromFloat(card_top + 12), 3.0, status_col);
+        t.textClip(p.labelStr(), @intFromFloat(pill_x + 16), @intFromFloat(card_top + 6), 10, status_col, @intFromFloat(pill_w - 20));
+    } else {
+        // success — or a pane too narrow for any pill: the status dot alone (still status-colored)
+        rl.drawCircle(@intFromFloat(bx + bw - 14), @intFromFloat(card_top + 12), 3.5, if (p.isFail()) status_col else t.green);
+    }
+    // command row: green "$" prompt + the bright command (single clipped mono line, the visual focus)
+    const cmd_y: i32 = @intFromFloat(card_top + 32);
+    t.textMono(t.z("$", .{}), @intFromFloat(bx + 14), cmd_y, fsz, t.green);
+    t.textMonoClip(p.cmd, @intFromFloat(bx + 30), cmd_y, fsz, t.fg, @intFromFloat(bw - 44));
+    t.hline(@intFromFloat(bx + 10), @intFromFloat(card_top + 58), @intFromFloat(bw - 20), t.withAlpha(t.border, 90));
+    // output rows (dim mono, one clipped source-line each), or a "(no output)" placeholder
+    const out_top = card_top + 62;
+    if (p.out_n == 0) {
+        t.textMonoClip("(no output)", @intFromFloat(bx + 14), @intFromFloat(out_top), fsz, t.comment, @intFromFloat(bw - 28));
+    } else {
+        var k: usize = 0;
+        while (k < shown) : (k += 1) {
+            t.textMonoClip(std.mem.trimEnd(u8, out[k], "\r"), @intFromFloat(bx + 14), @intFromFloat(out_top + @as(f32, @floatFromInt(k)) * MSG_LINE_H), fsz, t.fg_dim, @intFromFloat(bw - 28));
+        }
+    }
+    if (foot > 0) {
+        t.text(t.z("+{d} more lines", .{p.out_n - CONSOLE_CAP}), @intFromFloat(bx + 14), @intFromFloat(out_top + @as(f32, @floatFromInt(CONSOLE_CAP)) * MSG_LINE_H), 11, t.comment);
+    }
+    return advance;
+}
+
 /// Render (or just measure, draw=false) one message with lightweight markdown: fenced code blocks
 /// (backdrop + copy chip), GFM tables (aligned columns), headings, horizontal rules, bullets, and inline
 /// **bold** / `code` / <br> handled. ONE function measures AND draws (draw flag) so scroll math and pixels
 /// can never disagree. Returns the y after the message.
 fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, draw: bool, cursor: bool) f32 {
     var yy = y0;
-    if (draw and inView(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
+    // A folded shell result ("[console]\n$ cmd\n…") renders as a styled terminal CARD instead of plain prose.
+    // renderConsole is reached HERE in BOTH the height-cache/measure pass and the draw pass (renderMsg is called
+    // in each), so its height can't diverge. The card carries its own "console" header, so the outer role label
+    // is suppressed for it — but the MSG_HEAD_H row is still reserved so the on-hover whole-message copy chip
+    // (drawn by the caller at y0) sits clear of the card's status pill.
+    const is_console = role == .cast_note and isConsoleMsg(text_);
+    if (draw and !is_console and inView(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
     yy += MSG_HEAD_H;
+    if (is_console) return renderConsole(view, yy, text_, fsz, draw);
     const dim = role == .cast_note or role == .thought;
 
     // split into a line array so multi-line constructs (tables, code) can be grouped with lookahead
@@ -2780,18 +2865,44 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     if (c.run_len > 0 and t.button(ob, ob_label, t.blue, true)) {
         store.pushCmd(store_mod.mkCmd(.select, c.runStr(), ""));
         ui.tab = .swarm;
+        ui.inner = .details;
+    }
+    // ...and the card BODY is the same link (the whole card reads as "this swarm" — clicking it should go
+    // there, not just the small button). The Stop + open-swarm buttons keep their own clicks.
+    if (c.run_len > 0 and t.hovering(card) and !t.hovering(ob)) {
+        const stop_w = t.btnW(t.z("Stop", .{}), 22);
+        const stop_rect = t.Rect{ .x = card.x + card.width - stop_w - 8, .y = card.y + 7, .width = stop_w, .height = 22 };
+        if (!(live and t.hovering(stop_rect))) {
+            t.wantCursor(.pointing_hand);
+            if (rl.isMouseButtonPressed(.left)) {
+                store.pushCmd(store_mod.mkCmd(.select, c.runStr(), ""));
+                ui.tab = .swarm;
+                ui.inner = .details;
+            }
+        }
     }
     yy += 104;
 
-    // older casts, one compact line each (up to 2)
+    // older casts, one compact line each (up to 2) — each row is a LINK to that swarm's detail page
     var shown_old: usize = 0;
     var i: usize = casts.len - 1;
     while (i > 0 and shown_old < 2) {
         i -= 1;
         const oc = &casts[i];
+        const row = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = 17 };
+        const row_hot = oc.run_len > 0 and t.hovering(row);
+        if (row_hot) t.panel(row, t.bg_hl);
         t.statusDot(@intFromFloat(r.x + 14), @intFromFloat(yy + 8), castStatusColor(oc.status));
-        t.textClip(oc.goalStr(), @intFromFloat(r.x + 24), @intFromFloat(yy + 2), 11, t.fg_dim, @intFromFloat(r.width - 70));
+        t.textClip(oc.goalStr(), @intFromFloat(r.x + 24), @intFromFloat(yy + 2), 11, if (row_hot) t.fg else t.fg_dim, @intFromFloat(r.width - 70));
         t.text(t.z("r{d}", .{oc.round}), @intFromFloat(r.x + r.width - 40), @intFromFloat(yy + 2), 11, t.comment);
+        if (row_hot) {
+            t.wantCursor(.pointing_hand);
+            if (rl.isMouseButtonPressed(.left)) {
+                store.pushCmd(store_mod.mkCmd(.select, oc.runStr(), ""));
+                ui.tab = .swarm;
+                ui.inner = .details;
+            }
+        }
         yy += 18;
         shown_old += 1;
     }
@@ -3179,6 +3290,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     var sel: [96]u8 = undefined;
     @memcpy(sel[0..sel_n], store.selected[0..sel_n]);
     const m = store.metrics;
+    const cfg = store.sel_config; // manifest + blueprint for the Details tab
     const ev_n = store.event_count;
     var evs: [scan.MAX_LOG]scan.Ev = undefined;
     @memcpy(evs[0..ev_n], store.events[0..ev_n]);
@@ -3236,7 +3348,7 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     const panel = t.Rect{ .x = rx, .y = y, .width = rw, .height = panel_bottom - y };
     switch (ui.inner) {
         .console => drawConsole(panel, evs[0..ev_n], sel_live),
-        .details => drawDetails(panel, m),
+        .details => drawDetails(panel, m, &cfg),
         .files => drawFiles(store, panel),
     }
 
@@ -3274,10 +3386,17 @@ fn drawSwarm(store: *Store, body: t.Rect) void {
     }
 }
 
-fn drawDetails(r: t.Rect, m: scan.Metrics) void {
+fn drawDetails(r: t.Rect, m: scan.Metrics, cfg: *const scan.SwarmConfig) void {
     t.panelBordered(r, t.bg_dark, t.border);
+    rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(r.width - 2), @intFromFloat(r.height - 2));
+    defer rl.endScissorMode();
     const x = r.x + 16;
-    var y = r.y + 16;
+    var y = r.y + 16 - ui.details_scroll;
+    const bottom = r.y + r.height - 8;
+    // wheel: the goal + config + blueprint can outgrow the panel — scroll like the console does
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(r)) ui.details_scroll -= wheel * 3 * 19;
+    if (ui.details_scroll < 0) ui.details_scroll = 0;
     const cw = (r.width - 48) / 3;
     metricCell(x + 0 * cw, y, "SCORE", t.z("{d}/{d}", .{ m.passed, m.total }), scoreColor(m.pct));
     metricCell(x + 1 * cw, y, "PCT", if (m.pct >= 0) t.z("{d}%", .{m.pct}) else t.z("-", .{}), scoreColor(m.pct));
@@ -3291,10 +3410,80 @@ fn drawDetails(r: t.Rect, m: scan.Metrics) void {
     metricCell(x + 0 * cw, y, "TOKENS IN", t.z("{d}k", .{@divTrunc(m.tokens_in, 1000)}), t.yellow);
     metricCell(x + 1 * cw, y, "TOKENS OUT", t.z("{d}k", .{@divTrunc(m.tokens_out, 1000)}), t.yellow);
     metricCell(x + 2 * cw, y, "CACHED", t.z("{d}k", .{@divTrunc(m.tokens_cached, 1000)}), t.magenta);
-    y += 70;
+    y += 58;
     if (m.gradient_warn) {
-        t.fillRect(@intFromFloat(x), @intFromFloat(y), @intFromFloat(r.width - 32), 1, t.border);
-        t.text(t.z("! zero-gradient warning - edits aren't reaching the failing check", .{}), @intFromFloat(x), @intFromFloat(y + 10), 12, t.orange);
+        t.text(t.z("! zero-gradient warning - edits aren't reaching the failing check", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.orange);
+        y += 22;
+    }
+    // ---- everything the run was GIVEN: the exact prompt + configuration (user ask: full transparency) ----
+    if (!cfg.loaded) {
+        t.hline(@intFromFloat(x), @intFromFloat(y + 4), @intFromFloat(r.width - 32), t.border);
+        t.text(t.z("(no swarm.json in this run dir - config unknown)", .{}), @intFromFloat(x), @intFromFloat(y + 14), 12, t.comment);
+        return;
+    }
+    const line_h: f32 = 19;
+    const wrap_w: f32 = r.width - 48;
+    t.hline(@intFromFloat(x), @intFromFloat(y + 2), @intFromFloat(r.width - 32), t.border);
+    y += 12;
+    // CONFIGURATION — one compact chips line + the mind roster
+    t.text(t.z("CONFIGURATION", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    y += 20;
+    const conf1 = t.z("{s} · {s}", .{ cfg.provider[0..cfg.provider_len], cfg.model[0..cfg.model_len] });
+    t.textClip(conf1, @intFromFloat(x), @intFromFloat(y), 13, t.fg, @intFromFloat(wrap_w));
+    y += line_h;
+    const conf2 = t.z("mode {s} · style {s} · {d} min · autonomy {s} · internet {s} · gap {s}", .{
+        cfg.mode[0..cfg.mode_len],
+        cfg.style[0..cfg.style_len],
+        cfg.minutes,
+        cfg.autonomy[0..cfg.autonomy_len],
+        if (cfg.internet) "on" else "off",
+        if (cfg.gap_assess) "on" else "off",
+    });
+    t.textClip(conf2, @intFromFloat(x), @intFromFloat(y), 13, t.fg_dim, @intFromFloat(wrap_w));
+    y += line_h;
+    if (cfg.minds_len > 0) {
+        t.textClip(t.z("minds: {s}", .{cfg.mindsStr()}), @intFromFloat(x), @intFromFloat(y), 13, t.fg_dim, @intFromFloat(wrap_w));
+        y += line_h;
+    }
+    y += 10;
+    // GOAL — the full prompt, word-wrapped (mono so the byte-wrap matches the glyphs)
+    if (y < bottom) {
+        t.text(t.z("GOAL (the exact prompt the swarm was given)", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+        y += 20;
+        const cols = monoCols(wrap_w, 13);
+        var rest = cfg.goalStr();
+        while (rest.len > 0 and y < bottom) {
+            var take = @min(rest.len, cols);
+            if (take < rest.len) {
+                // break at the last space inside the window so words stay whole
+                if (std.mem.lastIndexOfScalar(u8, rest[0..take], ' ')) |sp| {
+                    if (sp > cols / 2) take = sp;
+                }
+            }
+            // newlines inside the goal hard-break the line
+            if (std.mem.indexOfScalar(u8, rest[0..take], '\n')) |nl| take = nl;
+            t.textMonoClip(rest[0..take], @intFromFloat(x), @intFromFloat(y), 13, t.fg, @intFromFloat(wrap_w));
+            y += line_h;
+            rest = rest[@min(take + 1, rest.len)..];
+        }
+        if (cfg.goal_len == 0) {
+            t.text(t.z("(no goal recorded)", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+            y += line_h;
+        }
+        y += 10;
+    }
+    // DELIVERABLES — the engine's .blueprint rows: the ground truth of what the run is being GRADED on
+    if (y < bottom and cfg.blueprint_len > 0) {
+        t.text(t.z("DELIVERABLES (the engine's blueprint - what gets graded)", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+        y += 20;
+        var it = std.mem.splitScalar(u8, cfg.blueprintStr(), '\n');
+        while (it.next()) |row| {
+            if (y >= bottom) break;
+            const tr = std.mem.trim(u8, row, " \r\t");
+            if (tr.len == 0) continue;
+            t.textMonoClip(tr, @intFromFloat(x + 4), @intFromFloat(y), 13, t.cyan, @intFromFloat(wrap_w - 4));
+            y += line_h;
+        }
     }
 }
 
