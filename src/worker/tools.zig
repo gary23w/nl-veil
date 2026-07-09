@@ -916,7 +916,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
         return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
     defer p.deinit();
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const npath = blk_np: {
         const wb = std.fs.path.basename(ctx.workdir);
         if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
@@ -1142,7 +1142,7 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
         return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
     defer p.deinit();
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     if (p.value.ops.len == 0) return dupe(gpa, "edit_file needs an ops array — each op is replace/insert_before/insert_after/delete with an exact anchor snippet.");
     const npath = blk_np: {
         const wb = std.fs.path.basename(ctx.workdir);
@@ -1250,7 +1250,7 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const A = struct { path: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const rpath = blk_rp: {
         const wb = std.fs.path.basename(ctx.workdir);
         if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
@@ -1327,7 +1327,7 @@ fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
         return patchSystemPatch(ctx, root, p.value.patch);
     }
 
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     if (!patchSystemPathAllowed(p.value.path)) return dupe(gpa, "blocked path for patch_system");
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, p.value.path }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
@@ -1384,7 +1384,7 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer p.deinit();
     const base = if (std.mem.eql(u8, p.value.root, "system")) (patchSystemRoot(ctx) orelse return dupe(gpa, "root=system needs NL_PATCH_SYSTEM_ROOT set")) else ctx.workdir;
     const rel = if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".")) "" else p.value.path;
-    if (rel.len > 0 and !safeRel(rel)) return dupe(gpa, "bad path");
+    if (rel.len > 0 and !safeRel(rel)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const full = if (rel.len > 0) (std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, rel }) catch return dupe(gpa, "oom")) else (gpa.dupe(u8, base) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
@@ -1781,7 +1781,7 @@ fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const A = struct { path: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path");
+    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
     std.Io.Dir.cwd().deleteFile(ctx.io, full) catch return dupe(gpa, "could not delete (not found?)");
