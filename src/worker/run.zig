@@ -7942,17 +7942,69 @@ fn fileNeedsMore(content: []const u8) bool {
 /// verbatim blueprint — one path per line, deduped, goal order, each vetted by the same parser the slot
 /// assigner uses. Quick casts skip the planned blueprint but still need DISTINCT slot ownership whenever
 /// the deliverable is explicitly multi-file; without this, the one-slot pin sent every mind to file #1.
+/// A `*.js`/`.mjs`/`.cjs` token is the ONLY file shape a library/runtime is conventionally named after
+/// (three.js, d3.js, node.js) vs a source file (game.js). Every other extension (.html/.css/.py/.md/.json/…)
+/// a swarm CREATES and is never a library name — a general property of the file shape, not a framework list.
+fn jsFamilyExt(tok: []const u8) bool {
+    const base = std.fs.path.basename(tok);
+    return std.mem.endsWith(u8, base, ".js") or std.mem.endsWith(u8, base, ".mjs") or std.mem.endsWith(u8, base, ".cjs");
+}
+
+fn isPlainWord(w: []const u8) bool {
+    if (w.len == 0) return false;
+    for (w) |c| if (!std.ascii.isAlphabetic(c) and c != '-') return false;
+    return true;
+}
+
+/// A closed class of English FUNCTION words (articles, conjunctions, prepositions, common auxiliaries). General
+/// grammar, not domain knowledge: when one of these FOLLOWS a file token it is not a content noun the token
+/// modifies ("game.js FOR the shooter", "util.js AND main.js"), so the token stays a deliverable.
+fn isStopWord(w: []const u8) bool {
+    const sw = [_][]const u8{
+        "the", "a",  "an",  "and",  "or",  "nor",  "but",  "for", "in",   "to",  "with",
+        "of",  "on", "at",  "from", "into", "onto", "as",   "that","this", "it",  "its",
+        "is",  "are","be",  "then", "plus", "also", "by",   "that","which","who",
+    };
+    for (sw) |s| if (std.ascii.eqlIgnoreCase(w, s)) return true;
+    return false;
+}
+
+/// Is the `.js` token at index `i` used as a DEPENDENCY (a named library) rather than a file to create? Decided
+/// by GRAMMAR, name-agnostic: it's a modifier when the previous word is a dependency preposition
+/// (using/with/via/powered) or the next word is a CONTENT word it qualifies — "three.js game", "react.js
+/// dashboard". A standalone or list/prepositional-phrase JS token ("game.js", "main.js and util.js", "game.js
+/// for the shooter") is a deliverable. This generalizes to ANY library with no baked-in framework list (the
+/// earlier fix hardcoded one, which is exactly what the engine's general-floor / RSI design forbids).
+fn jsTokenIsDependency(toks: []const []const u8, i: usize) bool {
+    if (i > 0) {
+        const deps = [_][]const u8{ "using", "with", "via", "powered" };
+        for (deps) |d| if (std.ascii.eqlIgnoreCase(toks[i - 1], d)) return true;
+    }
+    if (i + 1 < toks.len) {
+        const nxt = std.mem.trim(u8, toks[i + 1], ".,;:!?)*\"'`");
+        if (isPlainWord(nxt) and !fileShapedToken(nxt) and !isStopWord(nxt)) return true;
+    }
+    return false;
+}
+
 fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
+    // collect tokens up front so a JS token can see its neighbours (modifier "three.js game" vs deliverable "game.js")
+    var toks: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer toks.deinit(gpa);
+    var tit = std.mem.tokenizeAny(u8, goal, " \t\r\n,;:()[]{}<>\"'`");
+    while (tit.next()) |t| (toks.append(gpa, t) catch {});
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
     var seen: [12][]const u8 = undefined;
     var n: usize = 0;
-    var it = std.mem.tokenizeAny(u8, goal, " \t\r\n,;:()[]{}<>\"'`");
-    while (it.next()) |tok0| {
+    for (toks.items, 0..) |tok0, i| {
         if (n >= seen.len) break;
         const tok = std.mem.trim(u8, tok0, ".!?*");
         if (tok.len < 3 or tok.len > 120) continue;
         if (!fileShapedToken(tok)) continue;
+        // a JS token used as a dependency ("a three.js game", "using d3.js") is a library, not a file to create —
+        // adopting it as the blueprint pinned every mind to a phantom "Three.js" deliverable (observed live)
+        if (jsFamilyExt(tok) and jsTokenIsDependency(toks.items, i)) continue;
         if (bpPath(tok) == null) continue; // must survive the blueprint parser or the slot never assigns
         var dup = false;
         for (seen[0..n]) |s| {
@@ -7969,6 +8021,30 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
     }
     if (out.items.len == 0) return "";
     return gpa.dupe(u8, out.items) catch "";
+}
+
+test "goalNamedFiles adopts real deliverables but never a library named like a file (the three.js cast failure)" {
+    const gpa = std.testing.allocator;
+    // the FPS-game cast: "a three.js game" names a LIBRARY (dependency), not a file to create
+    {
+        const bp = goalNamedFiles(gpa, "build an fps shooter three.js game with a boss fight");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(bp, "three.js") == null);
+    }
+    // real named deliverables ARE still adopted
+    {
+        const bp = goalNamedFiles(gpa, "create index.html and game.js for the shooter");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.mem.indexOf(u8, bp, "index.html") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "game.js") != null);
+    }
+    // library excluded, an explicit source file alongside it kept
+    {
+        const bp = goalNamedFiles(gpa, "build a react.js dashboard in App.jsx");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(bp, "react.js") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "App.jsx") != null);
+    }
 }
 
 fn mindFiles(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, blueprint: []const u8, deps: []const u8, incomplete: []const u8, idx: u32, team: u32) []u8 {
