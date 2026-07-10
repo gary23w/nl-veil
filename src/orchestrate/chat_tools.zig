@@ -102,7 +102,9 @@ fn argId(body: ToolReq) []const u8 {
 
 pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const body = (try req.json(ToolReq)) orelse return badReq(res, "bad body");
+    // a malformed body must come back as a readable 400 the calling model can react to — propagating the
+    // parse error turned one bad byte into an opaque 500 (the live `{"tool":"line"."…}` turn)
+    const body = (req.json(ToolReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const tool = std.mem.trim(u8, body.tool, " \r\n\t");
     if (tool.len == 0) return badReq(res, "missing tool");
 
