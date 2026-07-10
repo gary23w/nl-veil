@@ -2,6 +2,8 @@
 
 # the veil
 
+<sub>NEURON-LOOPS · ENGINEERING ARCHIVE · FILE NL-VEIL · **THE CASE STAYS OPEN** — read the whole thing twice, then browse the annotated source as a case file at [the docs site](https://gary23w.github.io/nl-veil/).</sub>
+
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
   <img alt="version" src="https://img.shields.io/badge/release-v1.0.0-A8241B">
