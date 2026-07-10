@@ -64,6 +64,10 @@ const Manifest = struct {
     files: []const u8 = "",
 };
 
+/// One tracked tool-call signature for the per-mind loop guard (hermes-agent port): sig = hash(name+args),
+/// res = hash of the last result, count = consecutive identical call+result repeats.
+pub const GuardRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0 };
+
 pub const MindState = struct {
     name: []const u8,
     scope: []const u8,
@@ -71,6 +75,11 @@ pub const MindState = struct {
     persona: [6]f32 = .{ 0.5, 0.5, 0.5, 0.5, 0.5, 1.0 },
     lane: []const u8 = "",
     lane_owned: bool = false,
+    // TOOL-LOOP GUARD (ported from hermes-agent's ToolCallGuardrailController): identical calls that keep
+    // returning identical results are a loop, not work — the dominant waste in observed runs (12 recall_hive
+    // echoes returning one irrelevant fact; repeated dead read probes). Mind-local (moments for one mind are
+    // sequential), survives rounds so a cross-round echo is caught too.
+    guard: [24]GuardRec = @splat(.{}),
     scout: bool = false,
     stances: std.ArrayListUnmanaged([]const u8) = .empty,
     idx: u32 = 0,
@@ -3303,6 +3312,12 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         if (mi.lane.len > 0) break :blk_slot gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast("");
         const ff = firstPath(my_files);
         if (ff.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose", .{ff}) catch (gpa.dupe(u8, "") catch @constCast(""));
+        // SLOTLESS mind (fewer unbuilt files than minds). The old generic "create or extend ONE next
+        // unbuilt file" sent every surplus mind to the same obvious file — five full drafts authored in
+        // parallel, four discarded by last-writer-wins (observed live, c6a5037b6: ~4/5 of round-1 output
+        // thrown away). A surplus mind's job is DEPTH on what exists, never a rival copy of an owned slot.
+        if (others_files.len > 0)
+            break :blk_slot std.fmt.allocPrint(gpa, "every unbuilt file is already OWNED by a teammate this round ({s}) — do NOT write any of those (a rival copy gets discarded). Instead: pick the WEAKEST existing file in the tree above, read_file it, and write back a meaningfully DEEPER version (more complete sections, real content, fixes); or run the checks and repair what actually fails.", .{clip(others_files, 200)}) catch (gpa.dupe(u8, "deepen the weakest existing file — never a rival copy of a teammate's slot") catch @constCast(""));
         break :blk_slot (gpa.dupe(u8, "create or extend ONE next unbuilt file from the project tree above (just one)") catch @constCast(""));
     } else (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(slot);
@@ -3780,21 +3795,71 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         for (step.calls) |c| {
             trace.append(gpa, ',') catch {};
             llm.jstr(gpa, &trace, c.name) catch {};
-            var result = tools.execute(&ctx, c.name, c.args);
-            if (retriableToolFail(c.name, result)) {
-                w.act(mi.name, round, "retry", c.name, clip(result, 160));
-                const r2 = tools.execute(&ctx, c.name, c.args);
-                if (!retriableToolFail(c.name, r2)) {
-                    gpa.free(result);
-                    result = r2;
-                } else gpa.free(r2);
+            // TOOL-LOOP GUARD (hermes port): a call whose (name, args) signature has already returned the
+            // IDENTICAL result multiple times is refused before it burns another round-trip; the 2nd
+            // identical repeat gets an in-band warning appended to its result so the model self-corrects
+            // with context. This kills the observed recall-echo/dead-probe class of waste.
+            var sigh = std.hash.Wyhash.init(0);
+            sigh.update(c.name);
+            sigh.update(c.args);
+            const sig = sigh.final();
+            var gslot: ?*GuardRec = null;
+            for (&mi.guard) |*g| {
+                if (g.count > 0 and g.sig == sig) {
+                    gslot = g;
+                    break;
+                }
+            }
+            var result: []u8 = undefined;
+            var guard_blocked = false;
+            if (gslot != null and gslot.?.count >= 3) {
+                gslot.?.count +|= 1;
+                guard_blocked = true;
+                w.act(mi.name, round, "loop_guard", c.name, "identical call repeated 4+ times with the identical result — refused without executing");
+                result = gpa.dupe(u8, "[loop guard] REFUSED: you have made this exact call at least 4 times and it returned the same thing every time. It will not return anything different. Use the result you already have, or take a DIFFERENT action — different arguments, a different tool, or write your deliverable now.") catch @constCast("");
+            } else {
+                result = tools.execute(&ctx, c.name, c.args);
+                if (retriableToolFail(c.name, result)) {
+                    w.act(mi.name, round, "retry", c.name, clip(result, 160));
+                    const r2 = tools.execute(&ctx, c.name, c.args);
+                    if (!retriableToolFail(c.name, r2)) {
+                        gpa.free(result);
+                        result = r2;
+                    } else gpa.free(r2);
+                }
+                const rh = std.hash.Wyhash.hash(1, result[0..@min(result.len, 4096)]);
+                if (gslot) |g| {
+                    if (g.res == rh) {
+                        g.count +|= 1; // identical call AND identical result — a loop forming
+                        const warned = std.fmt.allocPrint(gpa, "{s}\n[loop warning: you have now made this exact call {d} times and received the IDENTICAL result each time. Do not repeat it — use what you already have, or change the query/approach.]", .{ result, g.count }) catch result;
+                        if (warned.ptr != result.ptr) {
+                            gpa.free(result);
+                            result = warned;
+                        }
+                    } else {
+                        g.res = rh; // same call, DIFFERENT result (state moved) — not a loop; restart the count
+                        g.count = 1;
+                    }
+                } else {
+                    // claim a slot for this new signature (evict the stalest = lowest count)
+                    var victim: *GuardRec = &mi.guard[0];
+                    for (&mi.guard) |*g| {
+                        if (g.count == 0) {
+                            victim = g;
+                            break;
+                        }
+                        if (g.count < victim.count) victim = g;
+                    }
+                    victim.* = .{ .sig = sig, .res = rh, .count = 1 };
+                }
             }
             defer gpa.free(result);
             tool_calls += 1;
             if (std.mem.eql(u8, c.name, "host_command")) acted = true;
             // MIND FLOOR — grade this execution on ground truth and feed the lesson loop. All state here
             // is mind-local; only w.mem calls (internally locked) and w.act (seq-locked) touch shared ground.
-            const hard_fail = toolHardFail(c.name, result);
+            // A guard-refused call never executed — it is not a tool failure and must not mint lessons.
+            const hard_fail = !guard_blocked and toolHardFail(c.name, result);
             if (lessonEligible(c.name)) {
                 if (hard_fail) {
                     mstash.set(c.name, clip(c.args, 200), clip(firstLine(result), 56));
@@ -5784,7 +5849,23 @@ const Coverage = struct { present: u32 = 0, total: u32 = 0, missing: []const u8 
 fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
     const gpa = w.gpa;
     var n: u32 = 0;
-    var tree = extractGoalPaths(gpa, goal, &n);
+    // THE BLUEPRINT IS THE REQUIRED SET. Coverage used to re-extract paths from the goal PROSE, so
+    // caller-DECLARED deliverables (the FILES: list) never gated the score — a cast with 19 declared docs
+    // and 2 on disk quick_done'd at "100%" (observed live, c6a503995). When a blueprint exists (declared
+    // verbatim, goal-named, or planned), IT is what "required" means; prose extraction is the fallback.
+    var tree: []const u8 = "";
+    if (w.blueprint.len > 0) {
+        var rows: u32 = 0;
+        var bit = std.mem.splitScalar(u8, w.blueprint, '\n');
+        while (bit.next()) |ln| {
+            if (bpPath(ln) != null) rows += 1;
+        }
+        if (rows > 0) {
+            tree = gpa.dupe(u8, w.blueprint) catch "";
+            n = rows;
+        }
+    }
+    if (n == 0) tree = extractGoalPaths(gpa, goal, &n);
     // An ORIGINATED goal states its purpose in prose; the REQUIRED DELIVERABLES the intent
     // interpreter minted live in the brief. Without this fallback a free-roam run has no
     // deliverable floor at all (observed live, open_ai_test_3: 1 of 7 required files existed
