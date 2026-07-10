@@ -95,13 +95,17 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
             return null;
         };
     }
-    {
-        const lb = body.base_url;
-        const local_model = std.mem.eql(u8, body.provider, "ollama") or std.mem.indexOf(u8, lb, "localhost") != null or std.mem.indexOf(u8, lb, "127.0.0.1") != null;
-        if (local_model and !app.auth.isAdmin(u)) {
-            try capErr(res, "local models (Ollama) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
-            return null;
-        }
+    // A cast targets a LOCAL model when the provider is ollama OR the base_url names a loopback host. This set
+    // MUST match the worker's isLocal() (src/worker/llm.zig): a host the worker treats as local but the gate
+    // misses is a privilege gap — a non-admin reaching the host's loopback. 0.0.0.0 and [::1] were the gap.
+    const local_model = std.mem.eql(u8, body.provider, "ollama") or
+        std.mem.indexOf(u8, body.base_url, "localhost") != null or
+        std.mem.indexOf(u8, body.base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, body.base_url, "0.0.0.0") != null or
+        std.mem.indexOf(u8, body.base_url, "[::1]") != null;
+    if (local_model and !app.auth.isAdmin(u)) {
+        try capErr(res, "local models (Ollama) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
+        return null;
     }
 
     var rnd: [8]u8 = undefined;
@@ -149,12 +153,21 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
         eff_base = try std.fmt.allocPrint(res.arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id});
         eff_key = app.workers_ai_token;
         if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
-    } else if (eff_key.len == 0) {
+    } else if (eff_key.len == 0 and body.base_url.len == 0) {
+        // Fall back to a stored BYOK key ONLY when the caller gave no explicit endpoint (the deploy-wizard
+        // flow: pick a provider, no base, no key). A custom OpenAI-compatible endpoint always carries its own
+        // base_url — pulling the user's real "openai" vault key/base for it would silently redirect the cast
+        // to OpenAI with the wrong credentials.
         if (app.vault.resolve(u.id, body.provider, res.arena)) |rk| {
             eff_key = rk.key;
             if (rk.base_url.len > 0) eff_base = rk.base_url;
         }
     }
+    // A local-provider cast with no explicit base_url must resolve to the local Ollama, NEVER the worker's
+    // OpenAI fallback (run.zig defaults an empty base to api.openai.com — and with a server-env OPENAI/ANTHROPIC
+    // key the worker inherits, that becomes real egress). The desk always sends a base; a direct /cast API
+    // caller may not.
+    if (local_model and eff_base.len == 0) eff_base = "http://127.0.0.1:11434/v1";
 
     var mani: std.ArrayListUnmanaged(u8) = .empty;
     defer mani.deinit(app.gpa);

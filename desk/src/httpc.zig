@@ -244,7 +244,12 @@ pub fn parseLoopbackUrl(url: []const u8) ?LoopbackUrl {
         host = hostport[0..colon];
         port = std.fmt.parseInt(u16, hostport[colon + 1 ..], 10) catch return null;
     }
-    const loop = std.mem.eql(u8, host, "127.0.0.1") or cont.eqlIgnoreCase(host, "localhost");
+    // Only hosts this client can actually REACH: request() always dials IPv4 127.0.0.1, and a server on
+    // 0.0.0.0 (INADDR_ANY) also listens there, so 0.0.0.0 is safe to serve in-process. [::1] is IPv6-only —
+    // dialing IPv4 loopback would mis-reach it, so it is deliberately NOT loopback here and falls back to
+    // curl (which dials it correctly). The admin gate in deploy_service treats [::1] as local independently.
+    const loop = std.mem.eql(u8, host, "127.0.0.1") or cont.eqlIgnoreCase(host, "localhost") or
+        std.mem.eql(u8, host, "0.0.0.0");
     if (!loop) return null;
     return .{ .port = port, .path = path };
 }
@@ -323,6 +328,11 @@ test "parseLoopbackUrl accepts local http and rejects everything else" {
     try std.testing.expect(parseLoopbackUrl("https://127.0.0.1:11434") == null); // no TLS here
     try std.testing.expect(parseLoopbackUrl("http://example.com:11434") == null); // not loopback
     try std.testing.expect(parseLoopbackUrl("http://127.0.0.1:notaport") == null);
+    // 0.0.0.0 is served in-process (dialed via 127.0.0.1); [::1] is IPv6-only so it stays on curl (null)
+    const p4 = parseLoopbackUrl("http://0.0.0.0:11434/v1").?;
+    try std.testing.expectEqual(@as(u16, 11434), p4.port);
+    try std.testing.expectEqualStrings("/v1", p4.path);
+    try std.testing.expect(parseLoopbackUrl("http://[::1]:11434") == null);
 }
 
 test "buildRequest carries auth and body in-process (framing exact)" {
