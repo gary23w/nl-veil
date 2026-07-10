@@ -1,0 +1,95 @@
+name: release
+
+# On main pushes: a fast build check (the badge signal). On a version tag or a
+# manual run: full, self-contained bundles built natively per-OS — the only
+# reliable way to ship veil-desk (raylib) and neuron (Rust) for every platform.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # fast signal on every main push: does the server still build?
+  check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with: { version: 0.16.0 }
+      - name: zig build (server)
+        run: zig build
+      - name: zig test (engine)
+        run: zig test src/worker/run.zig
+
+  # full bundles: only on a tag or a manual dispatch
+  bundle:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: windows-x86_64, script: pwsh }
+          - { os: ubuntu-latest,  name: linux-x86_64,   script: sh }
+          - { os: macos-latest,   name: macos-arm64,    script: sh }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout nl-veil
+        uses: actions/checkout@v4
+
+      - name: Checkout neuron-db (the memory engine)
+        uses: actions/checkout@v4
+        with:
+          repository: gary23w/neuron-db
+          path: ../neuron-db
+
+      - name: Linux desktop deps (raylib GL/X11/wayland)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
+
+      - name: Install Zig 0.16
+        uses: mlugg/setup-zig@v1
+        with: { version: 0.16.0 }
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the neuron memory engine
+        working-directory: ../neuron-db/rust/neuron-core
+        run: cargo build --release --features "sqlite secure server trust"
+
+      - name: Build bundle (unix)
+        if: matrix.script == 'sh'
+        env:
+          NEURON: ${{ github.workspace }}/../neuron-db/rust/neuron-core/target/release/neuron
+        run: sh scripts/build-release.sh
+
+      - name: Build bundle (windows)
+        if: matrix.script == 'pwsh'
+        env:
+          NEURON: ${{ github.workspace }}\..\neuron-db\rust\neuron-core\target\release\neuron.exe
+        run: pwsh scripts/build-release.ps1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: veil-${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz

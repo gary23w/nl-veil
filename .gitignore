@@ -43,3 +43,9 @@ SWARM_VCS_BLUEPRINT.md
 
 # raylib F12 default screenshots (veil-desk uses F12 for the log overlay)
 screenshot*.png
+
+# release bundles produced by scripts/build-release.* (build output, not source)
+dist/
+
+# stray local agent/editor dirs
+.codex/
