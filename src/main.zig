@@ -70,12 +70,17 @@ fn runQuiet(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) void {
 fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) void {
     if (builtin.os.tag != .windows) return; // setx/taskkill path is Windows-specific for now
     if (environ.get("NL_NO_OLLAMA_TUNE")) |v| if (v.len > 0) return;
-    // only act if a local Ollama is actually up
+    // only act if a local Ollama is actually up (in-process probe — no curl child at startup)
     {
-        const r = std.process.run(gpa, io, .{ .argv = &.{ "curl", "-sS", "--max-time", "3", "http://127.0.0.1:11434/api/version" }, .stdout_limit = .limited(4 << 10), .stderr_limit = .limited(2 << 10) }) catch return;
-        defer gpa.free(r.stdout);
-        defer gpa.free(r.stderr);
-        if (r.term != .exited or r.term.exited != 0 or r.stdout.len < 2) return;
+        const httpc = @import("worker/httpc.zig");
+        switch (httpc.request(io, gpa, .{ .method = "GET", .port = 11434, .path = "/api/version", .timeout_s = 3, .cap = 4 << 10 })) {
+            .ok => |resp| {
+                const up = resp.status == 200 and resp.body.len >= 2;
+                if (resp.body.len > 0) gpa.free(resp.body);
+                if (!up) return;
+            },
+            else => return,
+        }
     }
     const cur_par = std.mem.trim(u8, environ.get("OLLAMA_NUM_PARALLEL") orelse "", " \r\n\t");
     const cur_ctx = std.mem.trim(u8, environ.get("OLLAMA_CONTEXT_LENGTH") orelse "", " \r\n\t");
