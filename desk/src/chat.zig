@@ -1258,11 +1258,20 @@ pub const Chat = struct {
                     sig_part,
                     p.cmdStr()[0..@min(p.cmd_len, 380)],
                 })) |lesson| {
-                    var ab2: [1400]u8 = undefined;
-                    self.mind().observe(PLAYBOOK_SCOPE, atomizeForObserve(&ab2, lesson));
-                    log.info("playbook: lesson captured ({d}b) from a verified fail->fix transition", .{lesson.len});
-                    self.judge_outcome = true; // a verified transition is the judge's OUTCOME trigger —
-                    //                            grade the arc's trace soon, not on the turn-count clock
+                    // Store the TRANSFERABLE form — strip the one-time build-dir `cd` prefix NOW, before it
+                    // enters the store. Recall strips it too, so storing it clean keeps the stored fact byte-
+                    // equal to the recalled/injected/strengthen-key text; otherwise the Hebbian strengthen key
+                    // (cd-stripped at recall) never substring-matches a cd-full stored fact and the outcome-
+                    // confirmed reinforcement silently no-ops. Also drop a lesson the strip collapses to fail==fix.
+                    var clb: [1400]u8 = undefined;
+                    const clean_lesson = std.mem.trim(u8, stripWorkdirChdir(lesson, &clb), " \t");
+                    if (clean_lesson.len > 0 and !fixSpansCollapsed(clean_lesson)) {
+                        var ab2: [1400]u8 = undefined;
+                        self.mind().observe(PLAYBOOK_SCOPE, atomizeForObserve(&ab2, clean_lesson));
+                        log.info("playbook: lesson captured ({d}b) from a verified fail->fix transition", .{clean_lesson.len});
+                        self.judge_outcome = true; // a verified transition is the judge's OUTCOME trigger —
+                        //                            grade the arc's trace soon, not on the turn-count clock
+                    }
                 } else |_| {}
                 self.arc_fail_cmd_len = 0;
                 self.arc_fail_note_len = 0;
