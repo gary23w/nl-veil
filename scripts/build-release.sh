@@ -12,7 +12,12 @@
 #                                        only — raylib + the Rust engine build
 #                                        per-OS in CI; see .github/workflows).
 #
-# Env: ZIG=<zig>  NEURON=<path to a prebuilt neuron>  VERSION=<override>
+# It bootstraps its own toolchain: if zig, rust, a C compiler, or (on Linux)
+# raylib's dev libraries are missing, it fetches/installs them (pinned zig into
+# ./.zig, rust via rustup, libs via the OS package manager). Opt out with
+# NO_BOOTSTRAP=1 (then provide ZIG=/NEURON= yourself). Unattended: ASSUME_YES=1.
+#
+# Env: ZIG=<zig>  NEURON=<prebuilt neuron>  VERSION=<override>  NO_BOOTSTRAP=1  ASSUME_YES=1
 # ============================================================================
 set -eu
 
@@ -36,6 +41,18 @@ EXE=""
 [ "$OS" = windows ] && EXE=".exe"
 
 say() { printf '\033[1;31m▌\033[0m %s\n' "$*"; }
+
+# ---- 0. bootstrap the toolchain (unless the caller opted out) ----
+# shellcheck source=lib-deps.sh
+DEP_ROOT="$ROOT" . "$ROOT/scripts/lib-deps.sh"
+if [ "${NO_BOOTSTRAP:-0}" != 1 ]; then
+  ZIG=$(dep_zig) || { say "no zig — set ZIG=<path> or install from ziglang.org"; exit 1; }
+  dep_cc || true
+  [ "$OS" = linux ] && { dep_desk_libs || true; }
+  # neuron needs rust only when we don't already have a prebuilt one to bundle
+  if [ -z "${NEURON:-}" ] && [ ! -f "$ROOT/bin/neuron$EXE" ]; then dep_cargo || true; fi
+fi
+ZIG=${ZIG:-zig}
 
 # ---- 1. build server + desktop (one graph: -Ddesk=true also builds veil-desk) ----
 say "building the server + desktop (zig build -Ddesk=true)"

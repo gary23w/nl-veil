@@ -66,15 +66,18 @@ jobs:
         working-directory: ../neuron-db/rust/neuron-core
         run: cargo build --release --features "sqlite secure server trust"
 
+      # the runner already installed zig/rust/raylib above, so skip the script's own bootstrap
       - name: Build bundle (unix)
         if: matrix.script == 'sh'
         env:
+          NO_BOOTSTRAP: '1'
           NEURON: ${{ github.workspace }}/../neuron-db/rust/neuron-core/target/release/neuron
         run: sh scripts/build-release.sh
 
       - name: Build bundle (windows)
         if: matrix.script == 'pwsh'
         env:
+          NO_BOOTSTRAP: '1'
           NEURON: ${{ github.workspace }}\..\neuron-db\rust\neuron-core\target\release\neuron.exe
         run: pwsh scripts/build-release.ps1
 

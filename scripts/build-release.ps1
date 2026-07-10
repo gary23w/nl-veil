@@ -1,5 +1,5 @@
 # ============================================================================
-# build-release.ps1 — package a self-contained veil release bundle (Windows).
+# build-release.ps1 - package a self-contained veil release bundle (Windows).
 #
 # Produces dist\veil-v<ver>-windows-x86_64.zip containing the server (veil.exe),
 # the desktop (veil-desk.exe), the memory engine (bin\neuron.exe), and a
@@ -12,11 +12,22 @@
 $ErrorActionPreference = 'Stop'
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $Version = if ($env:VERSION) { $env:VERSION } else { '1.0.0' }
-$Zig = if ($env:ZIG) { $env:ZIG } else { 'zig' }
 $Dist = Join-Path $Root 'dist'
 $Os = 'windows'; $Arch = 'x86_64'
 
 function Say($m) { Write-Host "> $m" -ForegroundColor Red }
+
+# ---- 0. bootstrap the toolchain (unless opted out) ----
+. (Join-Path $PSScriptRoot 'lib-deps.ps1')
+if ($env:NO_BOOTSTRAP -ne '1') {
+  $Zig = Ensure-Zig
+  if (-not $env:NEURON -and -not (Test-Path (Join-Path $Root 'bin\neuron.exe'))) {
+    Assert-CC | Out-Null
+    Ensure-Cargo | Out-Null
+  }
+} else {
+  $Zig = if ($env:ZIG) { $env:ZIG } else { 'zig' }
+}
 
 # ---- 1. build server + desktop ----
 Say 'building the server + desktop (zig build -Ddesk=true)'
@@ -26,7 +37,7 @@ Pop-Location
 $Server = Join-Path $Root 'zig-out\bin\veil.exe'
 $Desk   = Join-Path $Root 'desk\zig-out\bin\veil-desk.exe'
 if (-not (Test-Path $Server)) { throw "server binary not found at $Server" }
-if (-not (Test-Path $Desk)) { Say '! veil-desk not built — bundling server only' }
+if (-not (Test-Path $Desk)) { Say '! veil-desk not built - bundling server only' }
 
 # ---- 2. locate or build the neuron memory engine ----
 $Neuron = $null
@@ -43,7 +54,7 @@ else {
     if (Test-Path $cand) { $Neuron = $cand }
   }
 }
-if (-not $Neuron) { Say '! no neuron binary found — bundle will fetch/build it on first run (needs deploy.py)' }
+if (-not $Neuron) { Say '! no neuron binary found - bundle will fetch/build it on first run (needs deploy.py)' }
 
 # ---- 3. assemble the bundle ----
 $Name = "veil-v$Version-$Os-$Arch"

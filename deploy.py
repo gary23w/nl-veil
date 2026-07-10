@@ -278,6 +278,65 @@ def ensure_rust(assume_yes=False):
           "    or install Rust from https://rustup.rs.")
     return False
 
+def _pkg_install(apt, dnf, pac, assume_yes=False, why=""):
+    """Install OS packages via whatever manager is present. apt/dnf/pac are space-separated name lists for
+    Debian, Fedora/RHEL, and Arch respectively. Uses sudo when not root. Best-effort — returns True on a
+    zero exit. Prints the manual command if there's no supported manager."""
+    def sudo(cmd):
+        if os.name != "nt" and os.geteuid() != 0 and _have("sudo"):
+            return ["sudo"] + cmd
+        return cmd
+    mgr = None
+    if _have("apt-get"): mgr = (["apt-get", "update", "-qq"], ["apt-get", "install", "-y"] + apt.split())
+    elif _have("dnf"):   mgr = (None, ["dnf", "install", "-y"] + dnf.split())
+    elif _have("yum"):   mgr = (None, ["yum", "install", "-y"] + dnf.split())
+    elif _have("pacman"):mgr = (None, ["pacman", "-Sy", "--needed", "--noconfirm"] + pac.split())
+    elif _have("zypper"):mgr = (None, ["zypper", "--non-interactive", "install"] + dnf.split())
+    elif _have("apk"):   mgr = (None, ["apk", "add"] + apt.split())
+    elif _have("brew"):  mgr = (None, ["brew", "install"] + apt.split())
+    if not mgr:
+        print(f"  ! no supported package manager found — install manually: {apt}")
+        return False
+    if why:
+        print(f"\n- {why}")
+        if not (assume_yes or not sys.stdin.isatty() or ask_yes("install them now?", True)):
+            return False
+    try:
+        pre, inst = mgr
+        if pre: subprocess.run(sudo(pre))
+        return subprocess.run(sudo(inst)).returncode == 0
+    except Exception as e:
+        print(f"  ! package install failed: {e}")
+        return False
+
+def ensure_cc(assume_yes=False):
+    """Make sure a C compiler is present — cargo's sqlite build (the neuron engine) needs one. Best-effort
+    install on Linux/macOS; on Windows we can only point at the MSVC/mingw toolchain."""
+    if _have_cc():
+        return True
+    if MAC:
+        if assume_yes or not sys.stdin.isatty() or ask_yes("install the Xcode command-line tools (C compiler)?", True):
+            subprocess.run(["xcode-select", "--install"])
+        return _have_cc()
+    if WIN:
+        print("  ! no C compiler found — install the MSVC 'Desktop development with C++' workload (Visual Studio\n"
+              "    Build Tools) or a mingw-w64 gcc, then re-run.")
+        return False
+    _pkg_install("build-essential", "gcc", "base-devel", assume_yes,
+                 why="a C compiler is needed to build the neuron memory engine, and wasn't found.")
+    return _have_cc()
+
+def ensure_desk_libs(assume_yes=False):
+    """Linux only: install raylib's GL/X11/wayland dev libraries so veil-desk links. No-op elsewhere
+    (Windows/macOS raylib uses libraries already present). Returns True when nothing is needed or it succeeded."""
+    if not (platform.system() == "Linux"):
+        return True
+    return _pkg_install(
+        "libgl1-mesa-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev",
+        "mesa-libGL-devel libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel libXi-devel wayland-devel libxkbcommon-devel",
+        "mesa libx11 libxrandr libxinerama libxcursor libxi wayland libxkbcommon",
+        assume_yes, why="the desktop (veil-desk) needs raylib's GL/X11/wayland dev libraries to build on Linux.")
+
 def ensure_zig(assume_yes=False):
     """Make sure the `zig` compiler is available (needed to build the veil binary). If missing, download the pinned
     release into ./.zig and use it. Returns the zig executable path, or None if it couldn't be obtained."""
@@ -335,18 +394,24 @@ def deps_doctor():
     """Print a one-shot readiness report of every build/runtime dependency, so a user can see at a glance what's
     present and what `deploy.py` will auto-install. Invoked by `deploy.py doctor`."""
     local_zig = os.path.isfile(os.path.join(ROOT, ".zig", "zig" + (".exe" if WIN else "")))
+    is_linux = platform.system() == "Linux"
+    cc_note = ("auto: xcode-select --install" if MAC else
+               "manual: MSVC build tools / mingw gcc" if WIN else "auto: build-essential (pkg mgr)")
     rows = [
         ("python3", True, "(running this)"),
         ("zig (build the veil engine)", _have("zig") or local_zig, "auto: downloaded into ./.zig"),
         ("cargo / rust (build neuron memory)", _have("cargo") or os.path.isfile(os.path.join(_cargo_bin(), "cargo" + (".exe" if WIN else ""))), "auto: rustup"),
-        ("C compiler (neuron's sqlite build)", _have_cc(), "manual: " + ("xcode-select --install" if MAC else "build-essential / clang" if not WIN else "MSVC build tools or mingw gcc")),
+        ("C compiler (neuron's sqlite build)", _have_cc(), cc_note),
         ("git (source fallback)", _have("git"), "optional: tarball used if absent"),
         ("curl (web tools + installers)", _have("curl"), "manual: usually preinstalled"),
         ("ollama (local model, optional)", _have("ollama"), "auto: installed on first local run"),
     ]
+    if is_linux:  # only Linux needs raylib's dev libs to link the desktop
+        has_gl = os.path.isfile("/usr/include/GL/gl.h") or os.path.isfile("/usr/include/X11/Xlib.h")
+        rows.insert(4, ("raylib dev libs (build the desktop, Linux)", has_gl, "auto: GL/X11/wayland -dev (pkg mgr)"))
     print("\n  dependency readiness:")
     for name, ok, note in rows:
-        print(f"    [{'OK ' if ok else ' . '}] {name:<36} {'' if ok else note}")
+        print(f"    [{'OK ' if ok else ' . '}] {name:<44} {'' if ok else note}")
     missing_cc = not _have_cc()
     if missing_cc:
         print("\n  ! No C compiler found — cargo's sqlite build will fail until one is installed:")
@@ -418,11 +483,8 @@ def ensure_neuron(override, assume_yes=False, force=False):
     if not ensure_rust(assume_yes):
         sys.exit("ERROR: building neuron needs the Rust toolchain (cargo). Install it from https://rustup.rs and\n"
                  "       re-run, or pass --neuron-bin <path> to an existing binary. Source: " + NEURON_REPO)
-    if not _have_cc():
-        print("\n  ! heads-up: no C compiler was found — neuron's bundled SQLite compiles C, so the cargo build may fail.")
-        print("    " + ("xcode-select --install" if MAC else
-                        "Windows: install the MSVC 'Desktop development with C++' workload (or mingw-w64)" if WIN else
-                        "Debian/Ubuntu: sudo apt install build-essential   |   Fedora: sudo dnf install gcc"))
+    if not ensure_cc(assume_yes):  # neuron's bundled SQLite compiles C — try to install a compiler, else warn
+        print("  ! continuing without a C compiler — the cargo build below may fail.")
     if not assume_yes and sys.stdin.isatty():
         if not ask_yes(f"fetch + build it now from {NEURON_REPO} (needs cargo; ~a few minutes)?", True):
             sys.exit("aborted. Build neuron yourself from " + NEURON_REPO + " and place it at bin/" + NEU)
@@ -2898,7 +2960,7 @@ def wizard():
 
 # ------------------------------------------------------------------ veil-desk (desktop dashboard)
 
-DESKTOP_DIR = os.path.join(ROOT, "desktop")
+DESKTOP_DIR = os.path.join(ROOT, "desk")
 DESKTOP_EXE = "veil-desk.exe" if WIN else "veil-desk"
 
 def desktop_binary():
@@ -2912,7 +2974,8 @@ def build_desktop(assume_yes=False):
     zig = ensure_zig(assume_yes)
     if not zig:
         return None
-    print("  building veil-desk (`zig build` in desktop/) — the first build fetches raylib, ~1 min...")
+    ensure_desk_libs(assume_yes)  # Linux: raylib's GL/X11/wayland dev libs, up front (no-op on win/mac)
+    print("  building veil-desk (`zig build` in desk/) — the first build fetches raylib, ~1 min...")
     r = subprocess.run([zig, "build"], cwd=DESKTOP_DIR)
     b = desktop_binary()
     if r.returncode == 0 and os.path.exists(b):
@@ -2920,9 +2983,9 @@ def build_desktop(assume_yes=False):
         return b
     print("  ! veil-desk build failed.")
     if platform.system() == "Linux":
-        print("    Linux needs raylib's dev libraries present to link. On Debian/Ubuntu:")
+        print("    If it's a missing-library link error, install raylib's dev libs and retry:")
         print("      sudo apt install libgl1-mesa-dev libx11-dev libxrandr-dev \\")
-        print("                       libxinerama-dev libxi-dev libxcursor-dev")
+        print("                       libxinerama-dev libxi-dev libxcursor-dev libwayland-dev libxkbcommon-dev")
     return None
 
 def _spawn_detached(binary):
