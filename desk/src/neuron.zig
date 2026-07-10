@@ -70,6 +70,21 @@ pub const Db = struct {
         if (self.run(&.{ "reinforce", scope, t[0..@min(t.len, 200)], f })) |o| self.gpa.free(o);
     }
 
+    /// STRENGTHEN-ONLY plasticity (the positive mirror of forget): bump the strength of the facts under `scope`
+    /// whose text CONTAINS `match` (substring), so an outcome-confirmed fact out-ranks its neighbours in later
+    /// recall. Unlike reinforce()/note_stance it NEVER mints a new fact and never rewrites text — outcome
+    /// feedback keyed on arbitrary text (a recalled lesson, a user prompt) can only re-rank what was actually
+    /// learned, never invent a memory from its own key. This is the fix for the recalled-lesson pollution:
+    /// reinforce() on a raw prompt minted "<prompt>: worked" straight into the lesson scope. No-op on any failure.
+    pub fn strengthen(self: Db, scope: []const u8, match: []const u8) void {
+        log.trace("neuron.Db.strengthen scope={s} match_len={d}", .{ scope, match.len });
+        const m = std.mem.trim(u8, match, " \r\n\t");
+        if (m.len < 3) return; // too short to identify a fact — never strengthen on a stopword-length key
+        var cut: usize = @min(m.len, 300);
+        while (cut > 0 and cut < m.len and (m[cut] & 0xC0) == 0x80) cut -= 1; // never split a codepoint — a half-char key matches nothing
+        if (self.run(&.{ "strengthen", scope, m[0..cut] })) |o| self.gpa.free(o);
+    }
+
     /// Drop the facts under `scope` that contain `match` (substring). Used to delete one durable memory when the
     /// user (or the AI, via FORGET:) retires a stale key/preference. No-op on any failure or empty match.
     pub fn forget(self: Db, scope: []const u8, match: []const u8) void {
