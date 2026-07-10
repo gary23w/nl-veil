@@ -2379,10 +2379,15 @@ pub const Chat = struct {
             idn = self.store.conv_active_len;
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
-                std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[0 .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[1..store_mod.MAX_CHAT_MSGS]);
+                // PIN THE GOAL: slot 0 is the conversation's original user request — evicting it erased the
+                // assignment from both the model's context and the persisted file mid-build (the live neuronet
+                // drift: twenty tool rounds in, the model no longer knew which web framework it was asked
+                // for). Keep it; evict the second-oldest instead.
+                const lo: usize = if (self.store.msgs[0].role == .user) 1 else 0;
+                std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[lo .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[lo + 1 .. store_mod.MAX_CHAT_MSGS]);
                 self.store.msg_count = store_mod.MAX_CHAT_MSGS - 1;
-                // eviction shifted every index down one — keep the live draft slot pointing at its message
-                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > 0) mi - 1 else null;
+                // eviction shifted the indexes above `lo` down one — keep the live draft slot pointing at its message
+                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > lo) mi - 1 else if (mi == lo) null else mi;
             }
             var m: store_mod.ChatMsg = .{ .role = role };
             const tn = @min(text.len, m.text.len);
@@ -2434,11 +2439,12 @@ pub const Chat = struct {
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             if (idx > self.store.msg_count) return;
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
-                if (idx == 0) return; // inserting before the message being evicted — nothing sane to do
-                std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[0 .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[1..store_mod.MAX_CHAT_MSGS]);
+                const lo: usize = if (self.store.msgs[0].role == .user) 1 else 0; // the pinned goal never evicts
+                if (idx <= lo) return; // inserting before the message being evicted — nothing sane to do
+                std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[lo .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[lo + 1 .. store_mod.MAX_CHAT_MSGS]);
                 self.store.msg_count = store_mod.MAX_CHAT_MSGS - 1;
                 idx -= 1;
-                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > 0) mi - 1 else null;
+                if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > lo) mi - 1 else if (mi == lo) null else mi;
             }
             var k = self.store.msg_count;
             while (k > idx) : (k -= 1) self.store.msgs[k] = self.store.msgs[k - 1];
@@ -2658,11 +2664,17 @@ pub const Chat = struct {
         {
             self.store.lock();
             defer self.store.unlock();
-            // include from the tail while the budget lasts (the newest matter most)
+            // include from the tail while the budget lasts (the newest matter most) — but PIN the goal:
+            // msgs[0] is the user's assignment, and once a long tool arc pushed it out of the tail window the
+            // model worked from tool chatter alone (the live neuronet drift to a different web framework).
+            // Reserve its cost up front and always emit it first when the window would otherwise drop it.
             var budget: usize = 24 * 1024;
-            var first: usize = 0;
+            const pin_goal = self.store.msg_count > 0 and self.store.msgs[0].role == .user;
+            const floor: usize = if (pin_goal) 1 else 0;
+            if (pin_goal) budget -= @min(budget, self.store.msgs[0].text_len);
+            var first: usize = floor;
             var i: usize = self.store.msg_count;
-            while (i > 0) {
+            while (i > floor) {
                 i -= 1;
                 const l = self.store.msgs[i].text_len;
                 if (budget < l) {
@@ -2670,6 +2682,11 @@ pub const Chat = struct {
                     break;
                 }
                 budget -= l;
+            }
+            if (pin_goal) {
+                msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"") catch return;
+                escJson(&msgs, self.gpa, self.store.msgs[0].textStr());
+                msgs.appendSlice(self.gpa, "\"}") catch return;
             }
             var k = first;
             while (k < self.store.msg_count) : (k += 1) {
@@ -4153,7 +4170,7 @@ pub const Chat = struct {
         // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
         // fixed [2048] used to reject any write_file over ~1.5KB ("arguments were too long to send"). netcli
         // sends the body in-process over a socket (no cap), and a reply is bounded by MAX_TOKENS.
-        const body = self.gpa.alloc(u8, args.len * 2 + name.len + conv.len + 64) catch {
+        const body = self.gpa.alloc(u8, args.len * 2 + name.len * 2 + conv.len + 64) catch {
             self.appendMsg(dd, .cast_note, "[tool] out of memory building the request");
             self.setBusy(false);
             return;
@@ -4161,7 +4178,12 @@ pub const Chat = struct {
         defer self.gpa.free(body);
         var w = Io.Writer.fixed(body);
         const bok = blk: {
-            w.print("{{\"tool\":\"{s}\",\"args\":\"", .{name}) catch break :blk false;
+            // the NAME is escaped too: a recovered name carrying a quote shipped as malformed JSON the
+            // server could only 500 on (the live `line".` turn) — escaping keeps the envelope well-formed
+            // no matter what the parsers let through
+            w.writeAll("{\"tool\":\"") catch break :blk false;
+            wesc(&w, name);
+            w.writeAll("\",\"args\":\"") catch break :blk false;
             wesc(&w, args);
             w.print("\",\"dir\":\"{s}\"}}", .{conv}) catch break :blk false;
             break :blk true;
@@ -5089,7 +5111,7 @@ fn findToolCall(text: []const u8) ?FoundCall {
         const nstart = i;
         while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
         const name = std.mem.trim(u8, text[nstart..i], " \t:`*\".,;)!?");
-        if (name.len == 0 or name.len > 40) continue;
+        if (!plausibleToolName(name)) continue; // punctuation inside the token is quoted prose, not a call
         const line_start = blk: {
             var j = p;
             while (j > 0) {
@@ -5165,7 +5187,7 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
     const nstart = i;
     while (i < text.len and text[i] != '>' and text[i] != ' ' and text[i] != '\n' and text[i] != '\r' and text[i] != '\t') i += 1;
     const name = std.mem.trim(u8, text[nstart..i], " \t:`*\"/");
-    if (name.len == 0 or name.len > 40) return null;
+    if (!plausibleToolName(name)) return null;
     while (i < text.len and text[i] != '>') i += 1; // skip to the tag close
     if (i < text.len) i += 1; // skip '>'
     var args: []const u8 = "{}";
@@ -5354,23 +5376,129 @@ fn layoutAllows(blueprint: []const u8, path: []const u8) bool {
     return false;
 }
 
-/// Recover a filename token (foo.html, src/game.js) from a build request — used to rescue a pasted file.
+/// The filename extensions every build-rescue scan recognizes. (.toml matters: the old list couldn't name a
+/// pasted Cargo.toml at all, so Rust builds lost their manifest to the fallback path.)
+const FILE_EXTS = [_][]const u8{ ".html", ".js", ".py", ".css", ".json", ".ts", ".tsx", ".md", ".txt", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".java", ".rb", ".php", ".sh", ".toml", ".yml", ".yaml", ".zig", ".sql", ".xml", ".jsx", ".svg", ".ini", ".cfg" };
+
+/// The filename token around an extension hit at `at`, or null when the hit isn't a real filename
+/// (mid-word, an extension that continues into a longer one, dotted-out path).
+fn filenameAt(text: []const u8, at: usize, ext: []const u8) ?[]const u8 {
+    // the char after the ext must not continue the extension (so ".js" in ".json" isn't a false hit)
+    const after = at + ext.len;
+    if (after < text.len and (std.ascii.isAlphanumeric(text[after]))) return null;
+    var s = at;
+    while (s > 0) {
+        const ch = text[s - 1];
+        if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == '/') s -= 1 else break;
+    }
+    const name = std.mem.trimStart(u8, text[s..after], "/."); // never absolute / dotfile-leading (safeRel would reject)
+    if (name.len > ext.len and name.len < 100 and std.mem.indexOf(u8, name, "..") == null) return name;
+    return null;
+}
+
+/// Recover a filename token (foo.html, src/game.js) from a build request — the EARLIEST one in the text.
+/// The old scan was extension-priority (.html first), so ANY .html mention anywhere beat the file the text
+/// was actually about.
 fn recoverFilename(text: []const u8) ?[]const u8 {
-    const exts = [_][]const u8{ ".html", ".js", ".py", ".css", ".json", ".ts", ".tsx", ".md", ".txt", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".java", ".rb", ".php", ".sh" };
-    for (exts) |ext| {
-        const at = std.mem.indexOf(u8, text, ext) orelse continue;
-        // the char after the ext must not continue the extension (so ".js" in ".json" isn't a false hit)
-        const after = at + ext.len;
-        if (after < text.len and (std.ascii.isAlphanumeric(text[after]))) continue;
-        var s = at;
-        while (s > 0) {
-            const ch = text[s - 1];
-            if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-' or ch == '.' or ch == '/') s -= 1 else break;
+    var best: ?[]const u8 = null;
+    var best_at: usize = text.len;
+    for (FILE_EXTS) |ext| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, ext)) |at| {
+            from = at + 1;
+            if (at >= best_at) break; // a later hit can't win
+            if (filenameAt(text, at, ext)) |name| {
+                best = name;
+                best_at = at;
+                break;
+            }
         }
-        const name = std.mem.trimStart(u8, text[s..after], "/."); // never absolute / dotfile-leading (safeRel would reject)
-        if (name.len > ext.len and name.len < 100 and std.mem.indexOf(u8, name, "..") == null) return name;
+    }
+    return best;
+}
+
+/// The LAST filename token in the text — for the model's narration right before a pasted block, where the
+/// name nearest the fence is the file it says it's writing ("Based on index.html, here is app.js:").
+fn recoverFilenameLast(text: []const u8) ?[]const u8 {
+    var best: ?[]const u8 = null;
+    var best_at: usize = 0;
+    for (FILE_EXTS) |ext| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, text, from, ext)) |at| {
+            from = at + 1;
+            if (filenameAt(text, at, ext)) |name| {
+                if (best == null or at > best_at) {
+                    best = name;
+                    best_at = at;
+                }
+            }
+        }
+    }
+    return best;
+}
+
+/// The filename declared by a FILE-HEADER comment on the code block's FIRST line ("// src/routes.rs",
+/// "# app.py", "/* style.css */", "<!-- index.html -->") — the strongest signal of what a pasted file IS.
+/// Only line 1 is consulted: a path deep in the body (a <link href="style.css">) must never hijack the write.
+fn headerCommentFilename(code: []const u8) ?[]const u8 {
+    const nl = std.mem.indexOfScalar(u8, code, '\n') orelse code.len;
+    const line = std.mem.trim(u8, code[0..nl], " \r\t");
+    const markers = [_][]const u8{ "//", "#", "/*", "<!--", "--", ";", "%" };
+    for (markers) |m| {
+        if (std.mem.startsWith(u8, line, m)) return recoverFilename(line[m.len..]);
     }
     return null;
+}
+
+/// The ```lang tag of the fence opening at `open`, lowercased into `buf` ("" = absent/unusable).
+fn fenceLangTag(buf: []u8, full: []const u8, open: usize) []const u8 {
+    const nl = std.mem.indexOfScalarPos(u8, full, open + 3, '\n') orelse full.len;
+    const tag = std.mem.trim(u8, full[open + 3 .. nl], " \r\t`");
+    if (tag.len == 0 or tag.len > buf.len) return "";
+    for (tag, 0..) |c, k| buf[k] = std.ascii.toLower(c);
+    return buf[0..tag.len];
+}
+
+/// Does the fence's language tag agree with the candidate filename's extension? Absent/unknown tags
+/// constrain nothing. This is the guard that keeps a ```rust paste out of static/index.html.
+fn langAllowsExt(lang: []const u8, name: []const u8) bool {
+    if (lang.len == 0) return true;
+    const Map = struct { lang: []const u8, exts: []const []const u8 };
+    const maps = [_]Map{
+        .{ .lang = "rust", .exts = &.{".rs"} },
+        .{ .lang = "python", .exts = &.{".py"} },
+        .{ .lang = "py", .exts = &.{".py"} },
+        .{ .lang = "javascript", .exts = &.{ ".js", ".jsx", ".mjs" } },
+        .{ .lang = "js", .exts = &.{ ".js", ".jsx", ".mjs" } },
+        .{ .lang = "typescript", .exts = &.{ ".ts", ".tsx" } },
+        .{ .lang = "ts", .exts = &.{ ".ts", ".tsx" } },
+        .{ .lang = "html", .exts = &.{".html"} },
+        .{ .lang = "css", .exts = &.{".css"} },
+        .{ .lang = "json", .exts = &.{".json"} },
+        .{ .lang = "toml", .exts = &.{".toml"} },
+        .{ .lang = "yaml", .exts = &.{ ".yml", ".yaml" } },
+        .{ .lang = "yml", .exts = &.{ ".yml", ".yaml" } },
+        .{ .lang = "markdown", .exts = &.{".md"} },
+        .{ .lang = "md", .exts = &.{".md"} },
+        .{ .lang = "sql", .exts = &.{".sql"} },
+        .{ .lang = "zig", .exts = &.{".zig"} },
+        .{ .lang = "sh", .exts = &.{".sh"} },
+        .{ .lang = "bash", .exts = &.{".sh"} },
+        .{ .lang = "shell", .exts = &.{".sh"} },
+        .{ .lang = "c", .exts = &.{ ".c", ".h" } },
+        .{ .lang = "cpp", .exts = &.{ ".cpp", ".hpp", ".h" } },
+        .{ .lang = "go", .exts = &.{".go"} },
+        .{ .lang = "java", .exts = &.{".java"} },
+        .{ .lang = "ruby", .exts = &.{".rb"} },
+        .{ .lang = "php", .exts = &.{".php"} },
+    };
+    for (maps) |m| {
+        if (std.mem.eql(u8, lang, m.lang)) {
+            for (m.exts) |e| if (std.mem.endsWith(u8, name, e)) return true;
+            return false;
+        }
+    }
+    return true; // unknown tag — constrain nothing
 }
 
 /// True if a write_file/edit_file args blob carries a non-empty "path":"...". An empty/pathless blob is the
@@ -5398,8 +5526,9 @@ fn defaultName(code: []const u8) ?[]const u8 {
 
 /// BUILD rescue: the model pasted a whole file as a ```fenced code block instead of TOOL: write_file, so it
 /// never hit disk. Build a write_file args blob {"path":..,"content":..} (heap-owned; caller frees). The name
-/// comes from the user's request, else the narration BEFORE the fence (never the code body — a <link
-/// href="style.css"> would hijack it), else a content-type default (a pasted one-pager is index.html).
+/// comes from the paste's own header comment, else the narration BEFORE the fence (nearest name last; never
+/// the code body — a <link href="style.css"> would hijack it), else the user's request, else a content-type
+/// default (a pasted one-pager is index.html) — every candidate gated on the fence's language tag.
 /// null = not a paste we can rescue.
 fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u8) ?[]u8 {
     const open = std.mem.indexOf(u8, full, "```") orelse return null;
@@ -5412,7 +5541,28 @@ fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u
     if (code.len < 200) return null; // a small snippet, not a file — don't hijack it
     if (code.len * 2 < full.len) return null; // must be >50% of the reply: a genuine PASTE of the file, not a
     // code snippet inside an explanation (which we must NOT write — it would clobber the real file).
-    const fname = recoverFilename(last_user) orelse recoverFilename(full[0..open]) orelse defaultName(code) orelse return null;
+    // Name the paste by the STRONGEST signal first: (1) a file-header comment on the block's first line
+    // ("// src/routes.rs" is the file stating its own name); (2) the narration right before the fence,
+    // nearest name last ("Writing src/routes.rs: ```rust…"); (3) the user's request; (4) the content-type
+    // default. Each candidate must agree with the fence's language tag. The old order consulted the REQUEST
+    // first, so a multi-file build task that mentioned static/index.html sent every pasted Rust module into
+    // index.html (the live neuronet corruption: eight routes.rs attempts, all clobbering the page).
+    var lb: [24]u8 = undefined;
+    const lang = fenceLangTag(&lb, full, open);
+    const cands = [_]?[]const u8{
+        headerCommentFilename(code),
+        recoverFilenameLast(full[0..open]),
+        recoverFilename(last_user),
+        defaultName(code),
+    };
+    var picked: ?[]const u8 = null;
+    for (cands) |cand| {
+        const c = cand orelse continue;
+        if (!langAllowsExt(lang, c)) continue;
+        picked = c;
+        break;
+    }
+    const fname = picked orelse return null;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(gpa);
     out.appendSlice(gpa, "{\"path\":\"") catch return null;
@@ -5421,6 +5571,29 @@ fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u
     escJson(&out, gpa, code);
     out.appendSlice(gpa, "\"}") catch return null;
     return out.toOwnedSlice(gpa) catch null;
+}
+
+/// A name every parser agrees could be a tool: an identifier ([A-Za-z0-9_-], 1..40). Quotes, dots, or
+/// brackets inside the token mean quoted prose, not a call (the live `line".` dispatch that 500'd).
+fn plausibleToolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 40) return false;
+    for (name) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// The loose-recovery gate is STRICTER: a dispatchable tool name is lowercase snake_case ([a-z0-9_], 2..40).
+/// The reasoning channel gets to RECOVER a call the model decided on, never to mint one out of protocol
+/// prose it happens to be quoting ("…emit TOOL: <name> on one line".).
+fn snakeToolName(name: []const u8) bool {
+    if (name.len < 2 or name.len > 40) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// Loose recovery: find the LAST "TOOL:" ANYWHERE in text (not just line-start) and parse a tool name +
@@ -5440,7 +5613,7 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
     const nstart = i;
     while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
     const name = std.mem.trim(u8, text[nstart..i], " \t:`*\"");
-    if (name.len == 0 or name.len > 40) return null;
+    if (!snakeToolName(name)) return null;
     var args: []const u8 = "{}";
     while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
     if (i < text.len and text[i] == '{') {
@@ -7067,6 +7240,39 @@ test "selecting a chat re-binds the console to ITS build dir; a chat without one
     try std.testing.expect(chat.build_dir_len == 0);
 }
 
+test "the 64-message eviction pins the conversation's original goal (slot 0 stays)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-pin-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+    // a long build arc: the goal, then a flood of tool-result rows well past the ring's capacity —
+    // before the pin, row 0 (the assignment itself) was the FIRST thing evicted and the model spent
+    // the rest of the arc working from tool chatter alone
+    chat.appendMsgFull(dd, .user, "GOAL: build the neuronet app with axum 0.7", false);
+    var i: usize = 0;
+    while (i < store_mod.MAX_CHAT_MSGS + 20) : (i += 1) {
+        chat.appendMsgFull(dd, .cast_note, "[tool:write_file]\nwrote a file", false);
+    }
+    {
+        store.lock();
+        defer store.unlock();
+        try std.testing.expect(store.msg_count == store_mod.MAX_CHAT_MSGS);
+        try std.testing.expect(store.msgs[0].role == .user);
+        try std.testing.expect(std.mem.startsWith(u8, store.msgs[0].textStr(), "GOAL: build the neuronet"));
+    }
+}
+
 test "cast watch resolves the run dir, tails it, and collects on stop (no server needed)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
     defer threaded.deinit();
@@ -7866,6 +8072,38 @@ test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames
     try std.testing.expect(recoverFilename("no file mentioned") == null);
 }
 
+test "codeBlockWrite names a paste from its own header/narration, never the request's stray filename" {
+    const gpa = std.testing.allocator;
+    // THE live neuronet corruption: the build task mentions static/index.html; the model pastes
+    // src/routes.rs as a ```rust block. The old request-first order wrote the Rust into index.html.
+    const task = "Build the app: Cargo.toml, then src/routes.rs, static/index.html, README.md - write every file";
+    const body = "use actix_web::{web, HttpResponse};\n" ++ ("pub async fn feed() -> HttpResponse { HttpResponse::Ok().finish() }\n" ** 4);
+    const reply = "Writing src/routes.rs — the web routes.\n\n```rust\n" ++ body ++ "```";
+    const s = codeBlockWrite(gpa, task, reply).?;
+    defer gpa.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "\"path\":\"src/routes.rs\"") != null);
+    // the block's own first-line header comment beats everything (no narration needed)
+    const reply2 = "Here you go.\n\n```rust\n// src/models.rs\n" ++ body ++ "```";
+    const s2 = codeBlockWrite(gpa, task, reply2).?;
+    defer gpa.free(s2);
+    try std.testing.expect(std.mem.indexOf(u8, s2, "\"path\":\"src/models.rs\"") != null);
+    // a ```toml paste recovers Cargo.toml (the old extension list didn't know .toml at all)
+    const toml_body = "[package]\nname = \"neuronet\"\nedition = \"2021\"\n" ++ ("# dependency pins follow\n" ** 12);
+    const reply3 = "Writing Cargo.toml now:\n```toml\n" ++ toml_body ++ "```";
+    const s3 = codeBlockWrite(gpa, task, reply3).?;
+    defer gpa.free(s3);
+    try std.testing.expect(std.mem.indexOf(u8, s3, "\"path\":\"Cargo.toml\"") != null);
+    // the language gate refuses a mismatched rescue outright: a rust paste with only .html names in
+    // scope must NOT be written anywhere (better no rescue than a corrupted page)
+    const reply4 = "Here you go:\n\n```rust\n" ++ body ++ "```";
+    try std.testing.expect(codeBlockWrite(gpa, "update static/index.html", reply4) == null);
+    // narration nearest the fence wins over an earlier mention
+    const reply5 = "Based on index.html, here is app.js:\n```js\n" ++ ("const post = () => { render(feed); };\n" ** 10) ++ "```";
+    const s5 = codeBlockWrite(gpa, "", reply5).?;
+    defer gpa.free(s5);
+    try std.testing.expect(std.mem.indexOf(u8, s5, "\"path\":\"app.js\"") != null);
+}
+
 test "layout guard: topSegment + layoutAllows judge new top-level paths against the hive blueprint" {
     try std.testing.expectEqualStrings("app", topSegment("app/models.py"));
     try std.testing.expectEqualStrings("app.py", topSegment("app.py"));
@@ -7895,6 +8133,18 @@ test "toolCallLoose recovers a call narrated inside reasoning" {
     // bare name, no args -> {}
     try std.testing.expectEqualStrings("{}", toolCallLoose("so I will run TOOL: list_swarms now").?.args);
     try std.testing.expect(toolCallLoose("no tool mentioned here") == null);
+}
+
+test "toolCallLoose never mints a call from quoted protocol prose (the live `line\".` 500)" {
+    // reasoning QUOTING the protocol — the last TOOL: is part of a quoted sentence; the old parser
+    // dispatched a tool literally named `line".` and the server 500'd on the malformed envelope
+    try std.testing.expect(toolCallLoose("the protocol says to emit TOOL: line\". then we stop") == null);
+    try std.testing.expect(toolCallLoose("we could use \"TOOL: <name> {json}\" as documented") == null);
+    // the loose channel is recovery, not invention: non-snake names are prose
+    try std.testing.expect(toolCallLoose("so we issue TOOL: WebSearch {\"query\":\"x\"}") == null);
+    // a real narrated decision still recovers
+    const ok = toolCallLoose("so we issue TOOL: web_search {\"query\":\"x\"}").?;
+    try std.testing.expectEqualStrings("web_search", ok.name);
 }
 
 test "toolCallXml parses the <tool:NAME>{...}</tool:NAME> form that broke the Mario walkthrough" {
