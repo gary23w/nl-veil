@@ -1366,6 +1366,41 @@ fn readLineWindow(gpa: std.mem.Allocator, text: []const u8, start_in: usize, end
     return out.toOwnedSlice(gpa) catch dupe(gpa, "oom");
 }
 
+/// A directory listing for read_file-on-a-directory (names, sizes, subdirs marked with '/'). Returns null
+/// when `full` isn't an openable directory (the caller falls through to its file handling). Capped so a
+/// giant tree can't flood a reply; the cap is NAMED so the model knows the view is partial.
+fn dirListing(ctx: *ToolCtx, full: []const u8, rpath: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    var d = std.Io.Dir.cwd().openDir(ctx.io, full, .{ .iterate = true }) catch return null;
+    defer d.close(ctx.io);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    buf.print(gpa, "{s} is a DIRECTORY — contents:\n", .{rpath}) catch return null;
+    var it = d.iterate();
+    var n: usize = 0;
+    while (true) {
+        const e = (it.next(ctx.io) catch break) orelse break;
+        if (n >= 200) {
+            buf.appendSlice(gpa, "  ... (listing capped at 200 entries)\n") catch {};
+            break;
+        }
+        if (e.kind == .directory) {
+            buf.print(gpa, "  {s}/\n", .{e.name}) catch break;
+        } else {
+            var pb: [640]u8 = undefined;
+            if (std.fmt.bufPrint(&pb, "{s}/{s}", .{ full, e.name })) |fp| {
+                const sz: u64 = if (std.Io.Dir.cwd().statFile(ctx.io, fp, .{})) |st| st.size else |_| 0;
+                buf.print(gpa, "  {s} ({d} bytes)\n", .{ e.name, sz }) catch break;
+            } else |_| {
+                buf.print(gpa, "  {s}\n", .{e.name}) catch break;
+            }
+        }
+        n += 1;
+    }
+    if (n == 0) buf.appendSlice(gpa, "  (empty)\n") catch {};
+    return gpa.dupe(u8, buf.items) catch null;
+}
+
 fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // start_line/end_line (1-indexed, inclusive) let the reader window a big file — without them the read is
@@ -1375,6 +1410,12 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const A = struct { path: []const u8 = "", start_line: usize = 0, end_line: usize = 0, offset: usize = 0, limit: usize = 0 };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
+    // "look around" floor: reading the workdir root (or any directory) returns a LISTING instead of "not
+    // found" — without it minds have no way to see what exists and write _ls.py scripts they can't run
+    // (observed live, c6a50258c: 7 rewrites of a listing script, zero executions, zero real work).
+    if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".") or std.mem.eql(u8, p.value.path, "./")) {
+        return dirListing(ctx, ctx.workdir, ".") orelse dupe(gpa, "the workdir is empty");
+    }
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const rpath = blk_rp: {
         const wb = std.fs.path.basename(ctx.workdir);
@@ -1384,7 +1425,15 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, rpath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
-    const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch return dupe(gpa, "not found");
+    const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch blk_big: {
+        // Not a plain small file. A DIRECTORY gets its listing; a file BIGGER than the slurp cap gets read
+        // with a raised ceiling — the old bare "not found" was a LIE for both (a 469KB source read as
+        // nonexistent, so the one file that mattered most was reported missing — observed live, c6a50258c).
+        if (dirListing(ctx, full, rpath)) |listing| return listing;
+        const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch return dupe(gpa, "not found");
+        if (st.size > (4 << 20)) return std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large to read whole — read it in pieces with a line range: {{\"path\":\"{s}\",\"start_line\":1,\"end_line\":400}}", .{ rpath, st.size, p.value.path }) catch dupe(gpa, "file too large");
+        break :blk_big std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(@intCast(st.size + 1))) catch return dupe(gpa, "not found");
+    };
     defer gpa.free(data);
     const clean = sanitizeModelText(gpa, data);
     defer gpa.free(clean);

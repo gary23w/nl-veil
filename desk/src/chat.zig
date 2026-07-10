@@ -46,6 +46,10 @@ const CAST_POLICY_SPEED =
     "To cast, make the FIRST line of your reply exactly:\n" ++
     "CAST: <one-line goal for the hive>\n" ++
     "  MINDS <n>   — optional, how many minds (2-8; default 3), on its own line right after.\n" ++
+    "  FILES: <p1>, <p2>, ... — when the job PRODUCES files, DECLARE every output path (relative to the " ++
+    "workdir, e.g. FILES: docs/desk/chat.zig.md, docs/desk/main.zig.md). YOU reason out the exact list from " ++
+    "the user's ask — the swarm is assigned and graded on precisely these files, so a declared list is the " ++
+    "difference between a hive that ships the deliverables and one that wanders. Omit for pure research.\n" ++
     "After the config you may add a short note to the user. Only one cast runs at a time.\n" ++
     "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'spin up a swarm': an " ++
     "explicit request is a command, even for a build (it will be time-capped).\n" ++
@@ -68,8 +72,12 @@ const CAST_POLICY_AUTONOMY =
     "  LONG        — a SUSTAINED hivemind (continuous mode) for a big multi-step task that one quick strike can't " ++
     "finish (a whole app, a deep investigation). Omit it for the default fast one-shot strike (~1-4 min).\n" ++
     "  MINUTES <n> — the time budget (only meaningful with LONG; e.g. 20, 40).\n" ++
+    "  FILES: <p1>, <p2>, ... — when the job PRODUCES files, DECLARE every output path (relative to the " ++
+    "workdir). YOU reason out the exact list from the user's ask — the swarm is assigned and graded on " ++
+    "precisely these files. Omit it only for pure research with no file deliverables.\n" ++
     "Example — a real build:  CAST: build a complete Flask REST API with auth, 5 endpoints, tests, and a README\\n" ++
-    "MINDS 8\\nLONG\\nMINUTES 30 .  Match the size + posture to the target; a cast is you loading a swarm and " ++
+    "MINDS 8\\nLONG\\nMINUTES 30\\nFILES: app.py, auth.py, routes.py, tests/test_api.py, README.md .  Match the " ++
+    "size + posture to the target; a cast is you loading a swarm and " ++
     "firing it. After the config lines you may add a short note to the user. Only one cast runs at a time.\n" ++
     "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'have the hive research/build X', 'spin up a swarm'. An explicit request is a command: emit the CAST line, never answer it from memory instead.\n" ++
     "OTHERWISE, cast whenever real work would help (do NOT answer from memory):\n" ++
@@ -3698,13 +3706,20 @@ pub const Chat = struct {
         self.setStatus(if (spec.long) "casting a long-term hive..." else "casting the hive...");
         log.info("cast: start provider={s} model={s} minds={d} mode={s} minutes={d} goal={s}", .{ prov_key, prov.model, minds, mode, minutes, goal[0..@min(goal.len, 60)] });
 
-        var body: [3072]u8 = undefined;
+        var body: [4096]u8 = undefined;
         var w = Io.Writer.fixed(&body);
         const bok = blk: {
             w.print("{{\"provider\":\"{s}\",\"model\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"minds\":{d},\"mode\":\"{s}\",\"dir\":\"", .{ prov_key, prov.model, prov.base_url, minutes, minds, mode }) catch break :blk false;
             wesc(&w, hive_dir); // the hive builds in {conv} — the SAME dir the veil's parallel attempt joins
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
+            if (spec.files.len > 0) {
+                // DECLARED deliverables ride with the cast: the engine adopts them verbatim as the blueprint,
+                // so the swarm is assigned + graded on the exact outputs the veil reasoned out — not on
+                // whatever file-shaped tokens the goal prose happens to contain.
+                w.writeAll("\",\"files\":\"") catch break :blk false;
+                wesc(&w, spec.files);
+            }
             w.writeAll("\",\"goal\":\"") catch break :blk false;
             wesc(&w, goal);
             w.writeAll("\"}") catch break :blk false;
@@ -4459,7 +4474,7 @@ pub const Chat = struct {
             jb.print(self.gpa, "\n\n--- {s} ({d}b) ---\n{s}{s}", .{ path, self.file_scratch[fi].size, buf[0..cn], if (trunc) "\n[...truncated; full file in the run dir]" else "" }) catch {};
             used += cn;
         }
-        jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab)", .{rel}) catch {};
+        jb.print(self.gpa, "\n\n(full swarm output saved at {s}; open it in the Swarm tab. The files listed above are in YOUR OWN workdir RIGHT NOW at exactly those relative paths — read_file any of them directly, e.g. read_file {{\"path\":\"{s}\"}}. Do NOT go looking for them elsewhere on disk, and NEVER rebuild something the list already shows exists — verify by reading, then fill only real gaps.)", .{ rel, if (fn_ > 0) self.file_scratch[0].pathStr() else "index.html" }) catch {};
         // Keep as much of the digest as the ChatMsg buffer (12288b) holds — the synthesis IS the answer, so
         // we want it whole, not clipped. appendMsg truncates to the buffer anyway.
         const digest = jb.items[0..@min(jb.items.len, 12200)];
@@ -4518,7 +4533,7 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
 
 /// The AI's full cast "payload": the goal + how many minds to line up + quick-strike vs a sustained
 /// (continuous) hivemind + a time budget. This is the AI loading + configuring its swarm before it fires.
-pub const CastSpec = struct { goal: []const u8, minds: u32 = 0, long: bool = false, minutes: u32 = 0 };
+pub const CastSpec = struct { goal: []const u8, minds: u32 = 0, long: bool = false, minutes: u32 = 0, files: []const u8 = "" };
 
 fn uintAfter(line: []const u8, key: []const u8) ?u32 {
     const rest = std.mem.trim(u8, line[key.len..], " :\t=");
@@ -4530,8 +4545,10 @@ fn uintAfter(line: []const u8, key: []const u8) ?u32 {
 
 /// Parse the AI's cast directive: a `CAST: <goal>` line, optionally followed (within the reply's first lines)
 /// by `MINDS <n>` (swarm size, 2-30), `LONG` (a sustained continuous hivemind vs the default quick strike),
-/// and `MINUTES <n>` (time budget). Returns null if there's no CAST line. Config lines must ride near the top,
-/// not buried in prose.
+/// `MINUTES <n>` (time budget), and `FILES: a, b, c` (the DECLARED deliverables — the veil reasons out the
+/// exact output paths and the engine adopts them verbatim as the blueprint, so the swarm is graded on the
+/// right files instead of goal-prose guesses). Returns null if there's no CAST line. Config lines must ride
+/// near the top, not buried in prose.
 pub fn parseCastSpec(full: []const u8) ?CastSpec {
     const g = castGoal(full) orelse return null;
     var spec = CastSpec{ .goal = g };
@@ -4545,6 +4562,9 @@ pub fn parseCastSpec(full: []const u8) ?CastSpec {
             if (uintAfter(line, "MINDS")) |v| spec.minds = v;
         } else if (std.mem.startsWith(u8, line, "MINUTES")) {
             if (uintAfter(line, "MINUTES")) |v| spec.minutes = v;
+        } else if (std.mem.startsWith(u8, line, "FILES")) {
+            const v = std.mem.trim(u8, line["FILES".len..], " :\t=");
+            if (v.len > 0) spec.files = v;
         } else if (std.mem.eql(u8, line, "LONG") or std.mem.startsWith(u8, line, "LONG ") or std.mem.eql(u8, line, "CONTINUOUS")) {
             spec.long = true;
         }
@@ -6855,6 +6875,13 @@ test "parseCastSpec reads the AI's swarm config (minds / LONG / minutes)" {
     try std.testing.expect(c.long);
     // no CAST line → null
     try std.testing.expect(parseCastSpec("MINDS 5\nno cast here") == null);
+    // FILES: — the veil DECLARES the deliverables; they ride to the engine as the blueprint
+    const d = parseCastSpec("CAST: document every source file\nLONG\nFILES: docs/desk/chat.zig.md, docs/desk/main.zig.md\nMINUTES 20").?;
+    try std.testing.expectEqualStrings("docs/desk/chat.zig.md, docs/desk/main.zig.md", d.files);
+    try std.testing.expect(d.long);
+    try std.testing.expectEqual(@as(u32, 20), d.minutes);
+    // no FILES line → empty (pure research cast)
+    try std.testing.expectEqualStrings("", a.files);
 }
 
 test "shouldReflectPass: only substantive answers to real requests reflect (hello never recurses)" {

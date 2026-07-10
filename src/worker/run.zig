@@ -59,6 +59,9 @@ const Manifest = struct {
     /// spawned by the CAST API (quick strike OR sustained "continuous" chat cast). mode alone can't mark a
     /// sustained cast — it runs mode="continuous" like a Deploy-tab swarm — so deployCore writes this bool.
     cast: bool = false,
+    /// DECLARED deliverables from the caller (the chat's veil reasons out the output paths and names them;
+    /// comma/newline separated). Adopted verbatim as the blueprint — the model declares, the engine carries.
+    files: []const u8 = "",
 };
 
 pub const MindState = struct {
@@ -897,7 +900,20 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.discourse = discourseMode(&w, goal);
         }
     }
-    if (live and !w.discourse and !w.operating and !w.quick) { // quick: no blueprint -> never scaffolds a file tree over --embed
+    // DECLARED DELIVERABLES: the caller named the exact output files (the chat's veil REASONS them out of
+    // the user's ask and sends them with the cast — model-declared, engine-carried). Adopt them verbatim
+    // and skip every guessing path: goal-prose extraction misread inputs as outputs (observed live,
+    // c6a50258c — the blueprint graded the 12 source files the goal said to READ).
+    if (live and !w.operating and m.files.len > 0) {
+        w.blueprint = normalizeDeclaredFiles(gpa, m.files);
+        if (w.blueprint.len > 0) {
+            w.discourse = false; // named deliverables = a build — research alone can't satisfy them
+            w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
+            w.act("engine", 0, "blueprint", "declared deliverables (caller-named, adopted verbatim)", w.blueprint);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.fmt.allocPrint(gpa, "{s}/.blueprint", .{run_dir}) catch "", .data = w.blueprint }) catch {};
+        }
+    }
+    if (live and !w.discourse and !w.operating and !w.quick and w.blueprint.len == 0) { // quick: no blueprint -> never scaffolds a file tree over --embed
         w.blueprint = planProject(&w, goal, w.goal_brief);
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
@@ -915,7 +931,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             establishPlan(&w, goal);
             deriveDependencies(&w, goal);
         }
-    } else if (live and !w.discourse and !w.operating and w.cast) {
+    } else if (live and !w.discourse and !w.operating and w.cast and w.blueprint.len == 0) {
         // A quick CAST gets no PLANNED blueprint (by design — no scaffolding over --embed), but when the
         // GOAL ITSELF names the deliverable files, adopt exactly those, verbatim, as the blueprint.
         // Without it the assembler one-slot pin sends EVERY mind to the first goal-named file — the
@@ -3386,7 +3402,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const leansys = if (assembler and fence_build)
         std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, recall_hive, save_skill, journal, and send_message — write_file is NOT available this session. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) BEFORE you emit your file. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then EXACTLY ONE fenced code block (```lang … ```) containing the COMPLETE file. NO prose, NO \"Note:\" commentary, NO second code block — just the one block with the whole file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch unreachable)
     else if (assembler)
-        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, recall_hive, save_skill, journal, and send_message. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) after your file work. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch unreachable)
+        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work. Your inner voice: {s} — let it color your writing.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, recall_hive, save_skill, journal, and send_message. read_file on a directory lists it ({{\"path\":\".\"}} shows your whole workdir) — LOOK instead of writing listing scripts you cannot run. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) after your file work. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary.", .{ mi.name, w.roster, voice, constitution_clause }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leansys);
@@ -4422,8 +4438,10 @@ fn markValveBuilt(w: *Worker, slot: []const u8, n: usize) void {
 fn slotFileMissing(w: *Worker, slot: []const u8) bool {
     const fp = std.fmt.allocPrint(w.gpa, "{s}/work/{s}", .{ w.run_dir, slot }) catch return false;
     defer w.gpa.free(fp);
-    const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, w.gpa, .limited(1 << 20)) catch return true;
-    w.gpa.free(data);
+    // stat, not read: the old read-based probe treated ANY read error (file bigger than the cap, a
+    // transient AV/sync lock) as "missing" — a fail-open that let salvage overwrite real files. Only a
+    // confirmed not-found counts as missing; an unverifiable file is treated as present (fail closed).
+    _ = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch |e| return e == error.FileNotFound;
     return false;
 }
 
@@ -4457,9 +4475,18 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     };
     const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch return null;
     defer gpa.free(full);
-    const existing = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch "";
-    defer if (existing.len > 0) gpa.free(existing);
-    const cur = std.mem.trim(u8, existing, " \r\n\t");
+    const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch null;
+    defer if (existing) |e| if (e.len > 0) gpa.free(e);
+    if (existing == null) {
+        // The slot could not be READ (bigger than the cap, or a transient AV/sync lock). If it EXISTS on
+        // disk we cannot verify what a commit would destroy — refuse (fail CLOSED). The old `catch ""`
+        // fail-open is how 393 bytes of unparsed tool markup overwrote a real 7.6KB source file
+        // (observed live, c6a50258c r6: catalog.zig).
+        if (std.Io.Dir.cwd().statFile(w.io, full, .{})) |st| {
+            if (st.size > 0) return "slot exists on disk but could not be read/verified — refusing to overwrite it";
+        } else |_| {}
+    }
+    const cur = std.mem.trim(u8, existing orelse "", " \r\n\t");
     if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !bufedit.editMarkerCorruption(cur) and !truncPending(w, salvage_slot))
         return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a marker-corrupted or KNOWN-TRUNCATED file is broken — any clean full body may replace it
     return null;
@@ -4670,6 +4697,18 @@ fn salvageHasToolFragment(body: []const u8) bool {
         if (containsKeyValue(t, "name", "write_file")) return true;
         if (std.mem.indexOf(u8, t, "\"tool_call\":") != null) return true;
     }
+    // INVOCATION MARKUP of ANY dialect: a file body must never begin with tool-call syntax. The old
+    // JSON-only prefixes let a provider's native markup emitted as TEXT pass as a "valid file body" and
+    // get committed over real source files (observed live, c6a50258c: unparsed tool_calls markup salvaged
+    // into chat.zig + catalog.zig). General signals, no provider list:
+    const nl = std.mem.indexOfScalar(u8, t, '\n') orelse t.len;
+    const first_line = t[0..nl];
+    // an invoke/tool-call tag with a named parameter on the opening line (XML-ish, Hermes, or vendor forms)
+    if (std.mem.indexOf(u8, first_line, "invoke name=") != null) return true;
+    if (std.mem.indexOf(u8, first_line, "<tool_call") != null or std.mem.indexOf(u8, first_line, "tool_calls>") != null or std.mem.indexOf(u8, first_line, "<function_call") != null) return true;
+    // a special-token delimiter rune near the head (fullwidth bar U+FF5C, the "<|...|>" family rendered
+    // as text) — these appear only in provider control tokens, never in a real source/document body
+    if (std.mem.indexOf(u8, t[0..@min(t.len, 200)], "\xef\xbd\x9c") != null) return true;
     return false;
 }
 
@@ -5765,10 +5804,19 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
         total += 1;
         const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
         defer gpa.free(fp);
-        const data = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch "";
-        defer if (data.len > 0) gpa.free(data);
+        // Presence must never depend on slurping the file: readFileAlloc(.limited) ERRORS on a file larger
+        // than the cap, and `catch ""` turned "too big to read" into "missing" — a >64KB required file
+        // pinned the score at 50% forever AND told every mind to re-CREATE a file that exists (observed
+        // live, c6a50258c: main.zig 209KB read as MISSING all 7 rounds). Read for the substance check when
+        // it fits; fall back to stat for size when it doesn't.
+        const data: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch null;
+        defer if (data) |d| if (d.len > 0) gpa.free(d);
+        const substantive = if (data) |d| std.mem.trim(u8, d, " \r\n\t").len > 40 else blk: {
+            const st = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch break :blk false;
+            break :blk st.size > 40; // on disk and big — present by definition, whatever its bytes
+        };
         const cut = truncPending(w, bp); // on disk but landed from a CUT emission — not complete
-        if (std.mem.trim(u8, data, " \r\n\t").len > 40 and !cut) {
+        if (substantive and !cut) {
             present += 1;
         } else {
             if (miss.items.len > 0) miss.appendSlice(gpa, ", ") catch {};
@@ -7987,6 +8035,76 @@ fn jsTokenIsDependency(toks: []const []const u8, i: usize) bool {
     return false;
 }
 
+/// Is the file token at index `i` governed by a READ/CONSUME clause ("Read all the .zig files (a.zig, b.zig)",
+/// "generate docs from main.c") rather than a produce clause? Decided by GRAMMAR, name-agnostic — the nearest
+/// governing verb wins: walk BACKWARD within the sentence for the closest read- or make-shaped verb; if none
+/// precedes it (a fronted phrase: "For the larger files (a.zig) read them in chunks"), the nearest verb AHEAD
+/// decides. No verb found either way → NOT consumed (the token stays a deliverable, today's behavior). This is
+/// the symmetric twin of jsTokenIsDependency: closed-class grammatical machinery, no use-case conditions —
+/// without it the c6a50258c cast adopted its 14 INPUT sources as the blueprint and graded the wrong files.
+fn tokenIsConsumed(toks: []const []const u8, i: usize) bool {
+    const verdict = struct {
+        // true = consumed (input), false = produced (deliverable), null = this word decides nothing
+        fn of(w: []const u8) ?bool {
+            for (readv) |v| if (std.ascii.eqlIgnoreCase(w, v)) return true;
+            for (makev) |v| if (std.ascii.eqlIgnoreCase(w, v)) return false;
+            return null;
+        }
+        const readv = [_][]const u8{ "read", "reads", "reading", "open", "opens", "scan", "scans", "parse", "parses", "explore", "explores", "analyze", "analyzes", "review", "reviews", "inspect", "inspects", "examine", "examines", "study", "studies", "browse", "crawl", "crawls", "ingest", "consume", "load", "loads", "from" };
+        const makev = [_][]const u8{ "write", "writes", "create", "creates", "generate", "generates", "produce", "produces", "build", "builds", "make", "makes", "output", "outputs", "save", "saves", "emit", "emits", "add", "adds", "deliver", "delivers", "into", "to" };
+    };
+    var j = i;
+    while (j > 0) {
+        j -= 1;
+        const raw = toks[j];
+        if (raw.len > 0 and (raw[raw.len - 1] == '.' or raw[raw.len - 1] == '!' or raw[raw.len - 1] == '?')) {
+            if (!fileShapedToken(std.mem.trim(u8, raw, ".!?*"))) break; // previous sentence — stop (a filename's own dot doesn't end one)
+        }
+        if (verdict.of(std.mem.trim(u8, raw, ".,!?*"))) |consumed| return consumed;
+    }
+    var k = i + 1;
+    while (k < toks.len) : (k += 1) {
+        const raw = toks[k];
+        if (verdict.of(std.mem.trim(u8, raw, ".,!?*"))) |consumed| return consumed;
+        if (raw.len > 0 and (raw[raw.len - 1] == '.' or raw[raw.len - 1] == '!' or raw[raw.len - 1] == '?')) {
+            if (!fileShapedToken(std.mem.trim(u8, raw, ".!?*"))) break;
+        }
+    }
+    return false;
+}
+
+/// Normalize a caller-DECLARED deliverables list (comma or newline separated, possibly quoted/backticked)
+/// into blueprint rows: one clean relative path per line. Minimal sanitation only — the caller's model already
+/// reasoned about WHAT the files are; the engine just refuses paths that could escape the workdir.
+fn normalizeDeclaredFiles(gpa: std.mem.Allocator, raw: []const u8) []const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var it = std.mem.tokenizeAny(u8, raw, ",\n\r");
+    var n: usize = 0;
+    while (it.next()) |t0| {
+        if (n >= 64) break; // sanity bound, far above any real declaration
+        const t = std.mem.trim(u8, t0, " \t`'\"");
+        if (t.len < 2 or t.len > 200) continue;
+        if (t[0] == '/' or t[0] == '\\' or (t.len > 1 and t[1] == ':')) continue; // absolute → out
+        if (std.mem.indexOf(u8, t, "..") != null) continue; // traversal → out
+        if (t[t.len - 1] == '/' or t[t.len - 1] == '\\') continue; // a directory is not a deliverable
+        out.appendSlice(gpa, t) catch return "";
+        out.append(gpa, '\n') catch return "";
+        n += 1;
+    }
+    if (out.items.len == 0) return "";
+    return gpa.dupe(u8, out.items) catch "";
+}
+
+test "normalizeDeclaredFiles cleans a model-declared list into blueprint rows" {
+    const gpa = std.testing.allocator;
+    const bp = normalizeDeclaredFiles(gpa, "docs/desktop/main.zig.md, `docs/desktop/chat.zig.md`,\n \"docs/x.md\" , /etc/passwd, ../up.md, dir/,");
+    defer if (bp.len > 0) gpa.free(@constCast(bp));
+    try std.testing.expectEqualStrings("docs/desktop/main.zig.md\ndocs/desktop/chat.zig.md\ndocs/x.md\n", bp);
+    const empty = normalizeDeclaredFiles(gpa, " , /abs.md");
+    try std.testing.expectEqualStrings("", empty);
+}
+
 fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
     // collect tokens up front so a JS token can see its neighbours (modifier "three.js game" vs deliverable "game.js")
     var toks: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -7995,7 +8113,9 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
     while (tit.next()) |t| (toks.append(gpa, t) catch {});
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
-    var seen: [12][]const u8 = undefined;
+    // 32, not 12: the old cap silently dropped the tail of a long goal's file list — in the c6a50258c cast
+    // the first 12 tokens were all INPUT sources, so the real output paths never entered the blueprint.
+    var seen: [32][]const u8 = undefined;
     var n: usize = 0;
     for (toks.items, 0..) |tok0, i| {
         if (n >= seen.len) break;
@@ -8011,6 +8131,9 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
         // a JS token used as a dependency ("a three.js game", "using d3.js") is a library, not a file to create —
         // adopting it as the blueprint pinned every mind to a phantom "Three.js" deliverable (observed live)
         if (jsFamilyExt(tok) and jsTokenIsDependency(toks.items, i)) continue;
+        // a file in a READ/CONSUME clause is an INPUT, not a deliverable — adopting the sources pinned every
+        // mind to files that already exist and graded the run on the wrong tree (observed live, c6a50258c)
+        if (tokenIsConsumed(toks.items, i)) continue;
         if (bpPath(tok) == null) continue; // must survive the blueprint parser or the slot never assigns
         var dup = false;
         for (seen[0..n]) |s| {
@@ -8064,6 +8187,30 @@ test "goalNamedFiles adopts real deliverables but never a library named like a f
         defer if (bp.len > 0) gpa.free(@constCast(bp));
         try std.testing.expect(std.mem.indexOf(u8, bp, "details/architecture.md") != null);
         try std.testing.expect(std.mem.indexOf(u8, bp, "details/api.md") != null);
+    }
+    // the c6a50258c docs cast: files in a READ clause are INPUTS — the blueprint must adopt the OUTPUT
+    // paths, never the sources (the old behavior graded the run on files that already existed)
+    {
+        const bp = goalNamedFiles(gpa, "Read all 14 .zig files in the workdir (catalog.zig, chat.zig, tray.zig) and for each one write a detailed Markdown documentation file into docs/desktop/ with signatures. For the larger files (main.zig, store.zig) read them in chunks of 200-300 lines. The final output should be 14 markdown files at paths like docs/desktop/main.zig.md, docs/desktop/chat.zig.md, etc., each covering one source file completely.");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.mem.indexOf(u8, bp, "docs/desktop/main.zig.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "docs/desktop/chat.zig.md") != null);
+        // no bare input source may appear as a blueprint row ("catalog.zig\n" = a whole row; the .md
+        // paths above legitimately CONTAIN source names, so match rows, not substrings)
+        try std.testing.expect(std.mem.indexOf(u8, bp, "catalog.zig\n") == null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "tray.zig\n") == null);
+        var rows = std.mem.splitScalar(u8, bp, '\n');
+        while (rows.next()) |row| {
+            if (row.len == 0) continue;
+            try std.testing.expect(std.mem.startsWith(u8, row, "docs/desktop/")); // outputs only
+        }
+    }
+    // "generate X from Y": the source after "from" is consumed, the target is the deliverable
+    {
+        const bp = goalNamedFiles(gpa, "generate api.md from openapi.yaml");
+        defer if (bp.len > 0) gpa.free(@constCast(bp));
+        try std.testing.expect(std.mem.indexOf(u8, bp, "api.md") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bp, "openapi.yaml") == null);
     }
 }
 
