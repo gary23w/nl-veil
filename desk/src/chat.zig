@@ -529,6 +529,8 @@ pub const Chat = struct {
     arc_fail_cmd_len: usize = 0, //       it with a later similar SUCCESS — verified transitions only)
     arc_fail_note: [96]u8 = undefined, // that failure's note ("(exit code 2147942402)")
     arc_fail_note_len: usize = 0,
+    arc_fail_sig: [160]u8 = undefined, // that failure's salient error line (last non-empty stderr/stdout line) —
+    arc_fail_sig_len: usize = 0, //       minted into the lesson so recall can rank by failure MODE, not just cmd
     playbook_hit: bool = false, // an operational lesson was injected into this turn's prompt (a later clean
     //                             console result Hebbian-strengthens THOSE lessons — once, then cleared)
     playbook_hit_lesson: [1400]u8 = undefined, // the exact lesson text injected this turn (recalled from
@@ -1227,17 +1229,29 @@ pub const Chat = struct {
                 const nl2 = @min(note.len, self.arc_fail_note.len);
                 @memcpy(self.arc_fail_note[0..nl2], note[0..nl2]);
                 self.arc_fail_note_len = nl2;
+                // the failure's own words (exception line / last error line) ride into the minted lesson —
+                // without them a lesson is only a command, and commands alone are not a failure family
+                self.arc_fail_sig_len = salientFailLine(out_slice, err_slice, &self.arc_fail_sig).len;
             } else if (clean_ok and self.arc_fail_cmd_len > 0 and
                 lessonPair(self.arc_fail_cmd[0..self.arc_fail_cmd_len], p.cmdStr()))
             {
-                var lb2: [1100]u8 = undefined;
+                var lb2: [1400]u8 = undefined;
                 const fail_note = std.mem.trim(u8, self.arc_fail_note[0..self.arc_fail_note_len], " \r\n\t");
-                if (std.fmt.bufPrint(&lb2, "fix: `{s}` failed {s} — works as: `{s}`", .{
+                // the captured failure signature travels inside the lesson: future recalls that share the
+                // failure MODE (not merely the executable) rank this lesson up, everything else ranks it out
+                const fail_sig = std.mem.trim(u8, self.arc_fail_sig[0..self.arc_fail_sig_len], " \r\n\t");
+                var sb3: [180]u8 = undefined;
+                const sig_part = if (fail_sig.len > 0)
+                    std.fmt.bufPrint(&sb3, " [{s}]", .{fail_sig}) catch ""
+                else
+                    "";
+                if (std.fmt.bufPrint(&lb2, "fix: `{s}` failed {s}{s} — works as: `{s}`", .{
                     self.arc_fail_cmd[0..@min(self.arc_fail_cmd_len, 380)],
                     fail_note,
+                    sig_part,
                     p.cmdStr()[0..@min(p.cmd_len, 380)],
                 })) |lesson| {
-                    var ab2: [1100]u8 = undefined;
+                    var ab2: [1400]u8 = undefined;
                     self.mind().observe(PLAYBOOK_SCOPE, atomizeForObserve(&ab2, lesson));
                     log.info("playbook: lesson captured ({d}b) from a verified fail->fix transition", .{lesson.len});
                     self.judge_outcome = true; // a verified transition is the judge's OUTCOME trigger —
@@ -1245,6 +1259,7 @@ pub const Chat = struct {
                 } else |_| {}
                 self.arc_fail_cmd_len = 0;
                 self.arc_fail_note_len = 0;
+                self.arc_fail_sig_len = 0;
             }
             // Hebbian close of the loop: a lesson was injected this turn and the command came back clean —
             // STRENGTHEN the precise lessons that were injected so the ones that keep fixing things out-rank
@@ -1270,12 +1285,20 @@ pub const Chat = struct {
             var rb2: [7000]u8 = undefined;
             var folded: []const u8 = result;
             if (hard_fail) {
+                // recall against command + the failure's own salient line: ranking sees HOW it failed, so a
+                // lesson about this failure MODE out-ranks one that merely shares the executable or a path
+                var sgb: [160]u8 = undefined;
+                const cur_sig = salientFailLine(out_slice, err_slice, &sgb);
+                var qb: [1200]u8 = undefined;
+                const query = std.fmt.bufPrint(&qb, "{s} {s}", .{ p.cmdStr(), cur_sig }) catch p.cmdStr();
                 var lrb: [700]u8 = undefined;
-                const recalled = self.mind().recall(PLAYBOOK_SCOPE, p.cmdStr(), &lrb);
-                // Only fold in genuinely playbook-shaped lines — the screenshot bug was raw user prompts
-                // surfacing here as "RECALLED LESSON". filterLessonLines drops anything that isn't a fix.
+                const recalled = self.mind().recall(PLAYBOOK_SCOPE, query, &lrb);
+                // Read-time guards, both required: playbook-SHAPED (the mint contract — raw prompts never
+                // surface as lessons) and RELEVANT to this failure (executable family + shared evidence —
+                // a `cd`-into-the-repo fix must never ride in on an HTTP 403 just because both commands
+                // said `python` under the same long path).
                 var lrf: [700]u8 = undefined;
-                const lesson = filterLessonLines(wholeLines(recalled, lrb.len), &lrf);
+                const lesson = filterRelevantLessons(wholeLines(recalled, lrb.len), p.cmdStr(), cur_sig, &lrf);
                 if (lesson.len > 0) {
                     folded = std.fmt.bufPrint(&rb2, "{s}\nRECALLED LESSON (a verified past fix for this command family — apply its working form):\n{s}", .{ result, lesson }) catch result;
                     log.info("playbook: recalled {d}b of lessons into a failure fold", .{lesson.len});
@@ -3543,6 +3566,7 @@ pub const Chat = struct {
         self.verify_done = false;
         self.arc_fail_cmd_len = 0;
         self.arc_fail_note_len = 0;
+        self.arc_fail_sig_len = 0; // a stale failure signature must not ride into an unrelated arc's lesson
         self.playbook_hit = false; // a Stop-abandoned arc's still-running command must not strengthen on landing
         self.playbook_hit_lesson_len = 0; // and its stashed lessons must not carry into an unrelated arc
         self.consolidate_pending = false;
@@ -5558,6 +5582,84 @@ fn isLessonLine(line: []const u8) bool {
         std.ascii.startsWithIgnoreCase(t, "lesson:"); // the judge-promotion stamp (acceptProposal)
 }
 
+/// The failure's salient line: the LAST non-empty line of stderr (or of stdout when stderr is silent —
+/// plenty of CLIs report errors there). For a traceback that is the exception itself; for most tools it is
+/// the error message. Caps into `out` without splitting a UTF-8 codepoint. Pure — unit-tested.
+fn salientFailLine(out_s: []const u8, err_s: []const u8, out: []u8) []const u8 {
+    const src = if (std.mem.trim(u8, err_s, " \r\n\t").len > 0) err_s else out_s;
+    var last: []const u8 = "";
+    var it = std.mem.tokenizeScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len > 0) last = t;
+    }
+    var n = @min(last.len, out.len);
+    while (n > 0 and n < last.len and (last[n] & 0xC0) == 0x80) n -= 1; // never cut mid-codepoint
+    @memcpy(out[0..n], last[0..n]);
+    return out[0..n];
+}
+
+/// Words that appear in nearly every lesson and every failure — worthless as relevance evidence.
+fn isGenericFailToken(t: []const u8) bool {
+    const stop = [_][]const u8{ "exit", "code", "codes", "failed", "error", "errors", "works", "with", "file", "line", "lines", "command", "cannot", "could", "there", "output", "lesson", "traceback", "recent", "call", "last", "most" };
+    for (stop) |s| if (std.ascii.eqlIgnoreCase(t, s)) return true;
+    return false;
+}
+
+/// Read-time relevance gate for a recalled playbook lesson against the CURRENT failure (command + salient
+/// error line). The mint pairs fail->fix inside one executable family with real token overlap; recall must
+/// honor the same contract, or a cd-into-the-repo fix surfaces on an HTTP 403 purely because both commands
+/// said `python` under one long path. Scoring: executable-family presence = 2, each distinct informative
+/// token from the live failure found in the lesson = 1; relevant at >= 3. So the executable alone is never
+/// enough, and a lesson for a different executable needs overwhelming shared evidence. Tokens are judged by
+/// their path BASENAME (paths never count as evidence wholesale), pure numbers only from 3 digits up (403
+/// counts, exit code 1 does not), and stop-words never count. Pure — unit-tested.
+fn lessonRelevant(lesson: []const u8, cmd: []const u8, sig: []const u8) bool {
+    var cit = std.mem.tokenizeAny(u8, cmd, " \t");
+    const exe = execBase(cit.next() orelse return false);
+    var score: usize = 0;
+    if (exe.len >= 2 and std.ascii.indexOfIgnoreCase(lesson, exe) != null) score += 2;
+    var seen: [8][]const u8 = undefined; // counted-token dedup — relevance needs at most a few hits
+    var seen_n: usize = 0;
+    const sources = [2][]const u8{ cmd, sig };
+    for (sources, 0..) |src, si| {
+        var it = std.mem.tokenizeAny(u8, src, " \t\"'`()[]{}<>,;=");
+        if (si == 0) _ = it.next(); // the executable is already scored — never double-counted
+        while (it.next()) |tok| {
+            var t = std.mem.trim(u8, tok, ":.,;!?-");
+            if (std.mem.lastIndexOfAny(u8, t, "/\\")) |i| t = t[i + 1 ..]; // a path's basename is its identity
+            var all_digit = t.len > 0;
+            for (t) |c| {
+                if (c < '0' or c > '9') {
+                    all_digit = false;
+                    break;
+                }
+            }
+            if (all_digit) {
+                if (t.len < 3) continue; // small numbers (exit code 1, arg counts) are noise
+            } else if (t.len < 4) continue;
+            if (isGenericFailToken(t)) continue;
+            var dup = false;
+            for (seen[0..seen_n]) |s| {
+                if (std.ascii.eqlIgnoreCase(s, t)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (std.ascii.indexOfIgnoreCase(lesson, t) != null) {
+                score += 1;
+                if (seen_n < seen.len) {
+                    seen[seen_n] = t;
+                    seen_n += 1;
+                }
+                if (score >= 3) return true;
+            }
+        }
+    }
+    return score >= 3;
+}
+
 /// Keep only the PLAYBOOK-shaped lines of a recalled block (see isLessonLine), joined by '\n' into `out`.
 /// Empty slice when nothing qualifies — so an all-noise recall injects nothing rather than garbage.
 fn filterLessonLines(block: []const u8, out: []u8) []const u8 {
@@ -5565,6 +5667,29 @@ fn filterLessonLines(block: []const u8, out: []u8) []const u8 {
     var it = std.mem.tokenizeScalar(u8, block, '\n');
     while (it.next()) |line| {
         if (!isLessonLine(line)) continue;
+        const t = std.mem.trim(u8, line, " \r\n\t");
+        if (w != 0) {
+            if (w >= out.len) break;
+            out[w] = '\n';
+            w += 1;
+        }
+        const n = @min(t.len, out.len - w);
+        @memcpy(out[w .. w + n], t[0..n]);
+        w += n;
+        if (w >= out.len) break;
+    }
+    return out[0..w];
+}
+
+/// filterLessonLines PLUS the lessonRelevant gate: only lines that are playbook-shaped AND actually about
+/// THIS failure survive into the "RECALLED LESSON" fold. Empty when nothing qualifies — a weak recall
+/// injects nothing rather than an authoritative-sounding non sequitur.
+fn filterRelevantLessons(block: []const u8, cmd: []const u8, sig: []const u8, out: []u8) []const u8 {
+    var w: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, block, '\n');
+    while (it.next()) |line| {
+        if (!isLessonLine(line)) continue;
+        if (!lessonRelevant(line, cmd, sig)) continue;
         const t = std.mem.trim(u8, line, " \r\n\t");
         if (w != 0) {
             if (w >= out.len) break;
@@ -6238,6 +6363,57 @@ test "filterLessonLines keeps only playbook-shaped lines, drops raw-prompt pollu
     // the judge-promotion stamp (acceptProposal prepends it to free-form lessons) qualifies too —
     // without it, human-accepted playbook knowledge was silently filtered out of every injection
     try std.testing.expect(isLessonLine("lesson: prefer msg.exe's full System32 path under restricted shells"));
+}
+
+test "salientFailLine picks the exception off a traceback, falls back to stdout, respects UTF-8" {
+    var buf: [160]u8 = undefined;
+    // a python traceback: the LAST stderr line is the exception itself
+    const tb =
+        "Traceback (most recent call last):\n" ++
+        "  File \"probe.py\", line 9, in <module>\n" ++
+        "    with urllib.request.urlopen(req) as response:\n" ++
+        "urllib.error.HTTPError: HTTP Error 403: Forbidden\n";
+    try std.testing.expectEqualStrings("urllib.error.HTTPError: HTTP Error 403: Forbidden", salientFailLine("", tb, &buf));
+    // stderr silent -> the last non-empty stdout line carries the error (plenty of CLIs do this)
+    try std.testing.expectEqualStrings("FATAL: port 8787 already in use", salientFailLine("starting...\nFATAL: port 8787 already in use\n\n", "", &buf));
+    // nothing anywhere -> empty (mint and recall both treat that as "no signature")
+    try std.testing.expectEqualStrings("", salientFailLine("", "   \n \n", &buf));
+    // the byte cap never splits a UTF-8 codepoint
+    var tiny: [5]u8 = undefined;
+    const cut = salientFailLine("", "abc — def", &tiny);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+}
+
+test "lessonRelevant: an executable match alone never surfaces a lesson (the 403-vs-cd false positive)" {
+    // The live incident: an HTTP 403 auth failure recalled a cd-into-the-repo fix because both commands
+    // said `python` under one long OneDrive path. Executable + path fragments must never be enough.
+    const cd_lesson = "fix: `python probe.py` failed (exit code 1) — works as: `cd /d \"C:\\Users\\garys\\OneDrive\\Documents\\Claude\\Projects\\Garrett\\nl-veil\"`";
+    const cmd_403 = "python discourse_check.py --topics";
+    const sig_403 = "urllib.error.HTTPError: HTTP Error 403: Forbidden";
+    try std.testing.expect(!lessonRelevant(cd_lesson, cmd_403, sig_403));
+    // ...while the SAME failing command recalling ITS OWN family still passes (exec + shared arg token)
+    const findstr_lesson = "fix: `findstr features full-path` failed (exit code 1) — works as: `findstr features index.html`";
+    try std.testing.expect(lessonRelevant(findstr_lesson, "findstr features full-path", "(exit code 1)"));
+    // failure-MODE evidence carries a lesson even when args differ: the minted [signature] matches the live one
+    const curl_lesson = "fix: `curl -s http://host/api` failed (exit code 22) [The requested URL returned error: 403] — works as: `curl -s -H \"Api-Key: k\" http://host/api`";
+    try std.testing.expect(lessonRelevant(curl_lesson, "curl -s http://host/other", "The requested URL returned error: 403"));
+    // a different executable with no shared evidence never qualifies
+    try std.testing.expect(!lessonRelevant(findstr_lesson, "python build.py", "SyntaxError: invalid syntax"));
+    // generic tokens (exit/code/error/failed) and small numbers are not evidence
+    try std.testing.expect(!lessonRelevant(cd_lesson, "python other.py", "(exit code 1) error failed"));
+}
+
+test "filterRelevantLessons folds only same-family lessons; a weak recall injects nothing" {
+    const block =
+        "fix: `python probe.py` failed (exit code 1) — works as: `cd /d \"C:\\Projects\\Garrett\\nl-veil\"`\n" ++
+        "fix: `findstr features full-path` failed (exit code 1) — works as: `findstr features index.html`";
+    var out: [700]u8 = undefined;
+    // the findstr failure keeps its own lesson, drops the python/cd one
+    const kept = filterRelevantLessons(block, "findstr features full-path", "(exit code 1)", &out);
+    try std.testing.expectEqualStrings("fix: `findstr features full-path` failed (exit code 1) — works as: `findstr features index.html`", kept);
+    // the 403 python failure matches NEITHER -> empty fold, no authoritative non sequitur
+    const none = filterRelevantLessons(block, "python discourse_check.py --topics", "urllib.error.HTTPError: HTTP Error 403: Forbidden", &out);
+    try std.testing.expectEqualStrings("", none);
 }
 
 test "firstStoredSentence keys what observe actually stored" {
