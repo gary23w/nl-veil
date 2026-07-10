@@ -2596,11 +2596,13 @@ pub const Chat = struct {
         if (kind == .user or kind == .tool_follow) {
             var pb2: [1400]u8 = undefined;
             const recalled = wholeLines(self.mind().recall(PLAYBOOK_SCOPE, self.last_user[0..self.last_user_len], &pb2), pb2.len);
-            // Read-time schema guard: present ONLY playbook-shaped lines as binding lessons, so any non-lesson
-            // fact lingering in the scope (a legacy db, a since-fixed mint bug) can never surface as a verified
-            // "RECALLED LESSON". filterLessonLines writes into pbf; recalled aliases pb2, so use a separate buffer.
+            // Read-time guards: playbook-SHAPED (schema — a legacy/non-lesson fact never surfaces as binding)
+            // AND about THIS request (relevance — recall ranks a top match even when nothing truly matches, and
+            // a path-specific fix bound to an off-topic turn is how the model gets talked into a stray cd). The
+            // reactive fold still surfaces a fix later if a matching command actually fails. Separate buffer:
+            // filterRequestRelevantLessons writes pbf; recalled aliases pb2.
             var pbf: [1400]u8 = undefined;
-            const lessons = filterLessonLines(recalled, &pbf);
+            const lessons = filterRequestRelevantLessons(recalled, self.last_user[0..self.last_user_len], &pbf);
             // MERGE into the per-arc stash (dedup): a failure fold may already have stashed the
             // cmd-keyed lesson that actually fixes this arc — this last_user-keyed re-recall must
             // ADD to the Hebbian credit target, not clobber it (fold lesson != prompt lesson).
@@ -5734,22 +5736,137 @@ fn lessonRelevant(lesson: []const u8, cmd: []const u8, sig: []const u8) bool {
     return score >= 3;
 }
 
-/// Keep only the PLAYBOOK-shaped lines of a recalled block (see isLessonLine), joined by '\n' into `out`.
-/// Empty slice when nothing qualifies — so an all-noise recall injects nothing rather than garbage.
+/// Is a stored lesson about the CURRENT request? The pre-emptive playbook injection ("OPERATIONAL LESSONS
+/// ... treat as binding") recalls by ranking against the request text, which — like any similarity search —
+/// surfaces a top-ranked non-match when nothing truly matches. Binding a path-specific command fix onto an
+/// unrelated request is exactly how the model gets talked into cd-ing somewhere it shouldn't. Require real
+/// shared vocabulary: >= 2 distinct informative tokens the request and the lesson genuinely have in common.
+/// (No executable bonus here — a request is prose and rarely names the command.) Pure — unit-tested.
+fn lessonRelevantToRequest(lesson: []const u8, request: []const u8) bool {
+    var hits: usize = 0;
+    var seen: [8][]const u8 = undefined;
+    var seen_n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, request, " \t\r\n\"'`()[]{}<>,;=");
+    while (it.next()) |tok| {
+        var t = std.mem.trim(u8, tok, ":.,;!?-");
+        if (std.mem.lastIndexOfAny(u8, t, "/\\")) |i| t = t[i + 1 ..]; // path basename is the identity
+        var all_digit = t.len > 0;
+        for (t) |c| {
+            if (c < '0' or c > '9') {
+                all_digit = false;
+                break;
+            }
+        }
+        if (all_digit) continue; // a bare number in prose is not topic evidence
+        if (t.len < 4) continue;
+        if (isGenericFailToken(t)) continue;
+        var dup = false;
+        for (seen[0..seen_n]) |s| {
+            if (std.ascii.eqlIgnoreCase(s, t)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (std.ascii.indexOfIgnoreCase(lesson, t) != null) {
+            hits += 1;
+            if (seen_n < seen.len) {
+                seen[seen_n] = t;
+                seen_n += 1;
+            }
+            if (hits >= 2) return true;
+        }
+    }
+    return hits >= 2;
+}
+
+/// Length of a `cd`/`cd /d`/`pushd` INTO-A-SPECIFIC-PATH prefix at the start of `s` (verb + path arg + `&&`
+/// + surrounding spaces), or 0 if `s` does not begin with one. A change into an absolute/nested directory is
+/// never a transferable fix — it pins a one-time build workdir a later turn must not reuse — so surfaced
+/// lessons drop it, keeping only the command that actually carries the lesson. Only strips when the path is
+/// quoted or contains a separator (a bare `cd build` might be meaningful; an absolute path never is). Pure.
+fn chdirPrefixLen(s: []const u8) usize {
+    var i: usize = 0;
+    // verb: cd | cd /d | pushd
+    if (std.ascii.startsWithIgnoreCase(s, "cd ")) {
+        i = 3;
+        if (std.ascii.startsWithIgnoreCase(s[i..], "/d ")) i += 3;
+    } else if (std.ascii.startsWithIgnoreCase(s, "pushd ")) {
+        i = 6;
+    } else return 0;
+    while (i < s.len and s[i] == ' ') i += 1;
+    if (i >= s.len) return 0;
+    var had_sep = false;
+    if (s[i] == '"') { // quoted path — always treat as specific
+        had_sep = true;
+        i += 1;
+        while (i < s.len and s[i] != '"') i += 1;
+        if (i >= s.len) return 0; // unterminated quote — do not strip
+        i += 1;
+    } else {
+        const path_start = i;
+        while (i < s.len and s[i] != ' ') i += 1;
+        for (s[path_start..i]) |c| {
+            if (c == '/' or c == '\\' or c == ':') had_sep = true;
+        }
+    }
+    if (!had_sep) return 0; // a bare relative cd may be meaningful — leave it
+    while (i < s.len and s[i] == ' ') i += 1;
+    if (!std.mem.startsWith(u8, s[i..], "&&")) return 0; // only a chained `cd ... && cmd` prefixes a command
+    i += 2;
+    while (i < s.len and s[i] == ' ') i += 1;
+    return i;
+}
+
+/// Strip every `cd/pushd <specific path> &&` prefix from a lesson line (they can appear inside both the
+/// failing and the working command span). A prefix is only recognized at a word boundary. Writes into `out`;
+/// returns the cleaned slice. Cleans pollution already in the store, not just newly-minted lessons. Pure.
+fn stripWorkdirChdir(line: []const u8, out: []u8) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < line.len and w < out.len) {
+        const at_boundary = i == 0 or line[i - 1] == ' ' or line[i - 1] == '`' or line[i - 1] == '\t';
+        if (at_boundary) {
+            const skip = chdirPrefixLen(line[i..]);
+            if (skip > 0) {
+                i += skip;
+                continue;
+            }
+        }
+        out[w] = line[i];
+        w += 1;
+        i += 1;
+    }
+    return out[0..w];
+}
+
+/// Emit one cleaned lesson line into `out` at write cursor `w` (newline-separated), returning the new cursor.
+fn emitLesson(line: []const u8, out: []u8, w: usize) usize {
+    var ww = w;
+    const t = std.mem.trim(u8, line, " \r\n\t");
+    if (t.len == 0) return ww;
+    var cb: [1500]u8 = undefined; // lessons run ~two 380-char commands + note + signature; hold a whole one
+    const cleaned = if (t.len <= cb.len) stripWorkdirChdir(t, &cb) else t;
+    const c = std.mem.trim(u8, cleaned, " \t");
+    if (c.len == 0) return ww;
+    if (ww != 0) {
+        if (ww >= out.len) return ww;
+        out[ww] = '\n';
+        ww += 1;
+    }
+    const n = @min(c.len, out.len - ww);
+    @memcpy(out[ww .. ww + n], c[0..n]);
+    return ww + n;
+}
+
+/// Keep only the PLAYBOOK-shaped lines of a recalled block (see isLessonLine), stale-workdir-cd stripped,
+/// joined by '\n' into `out`. Empty slice when nothing qualifies — an all-noise recall injects nothing.
 fn filterLessonLines(block: []const u8, out: []u8) []const u8 {
     var w: usize = 0;
     var it = std.mem.tokenizeScalar(u8, block, '\n');
     while (it.next()) |line| {
         if (!isLessonLine(line)) continue;
-        const t = std.mem.trim(u8, line, " \r\n\t");
-        if (w != 0) {
-            if (w >= out.len) break;
-            out[w] = '\n';
-            w += 1;
-        }
-        const n = @min(t.len, out.len - w);
-        @memcpy(out[w .. w + n], t[0..n]);
-        w += n;
+        w = emitLesson(line, out, w);
         if (w >= out.len) break;
     }
     return out[0..w];
@@ -5764,15 +5881,23 @@ fn filterRelevantLessons(block: []const u8, cmd: []const u8, sig: []const u8, ou
     while (it.next()) |line| {
         if (!isLessonLine(line)) continue;
         if (!lessonRelevant(line, cmd, sig)) continue;
-        const t = std.mem.trim(u8, line, " \r\n\t");
-        if (w != 0) {
-            if (w >= out.len) break;
-            out[w] = '\n';
-            w += 1;
-        }
-        const n = @min(t.len, out.len - w);
-        @memcpy(out[w .. w + n], t[0..n]);
-        w += n;
+        w = emitLesson(line, out, w);
+        if (w >= out.len) break;
+    }
+    return out[0..w];
+}
+
+/// filterLessonLines PLUS the request-relevance gate (see lessonRelevantToRequest): the pre-emptive
+/// "OPERATIONAL LESSONS" injection surfaces only lessons that actually share vocabulary with the request,
+/// so a top-ranked-but-unrelated command fix never rides into an off-topic turn as binding. Empty when
+/// nothing qualifies — the reactive fold still surfaces a fix if a matching command later fails.
+fn filterRequestRelevantLessons(block: []const u8, request: []const u8, out: []u8) []const u8 {
+    var w: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, block, '\n');
+    while (it.next()) |line| {
+        if (!isLessonLine(line)) continue;
+        if (!lessonRelevantToRequest(line, request)) continue;
+        w = emitLesson(line, out, w);
         if (w >= out.len) break;
     }
     return out[0..w];
@@ -6484,6 +6609,50 @@ test "lessonRelevant: an executable match alone never surfaces a lesson (the 403
     // ...but a real shared token (the same script name in the error) still carries it over the bar
     try std.testing.expect(lessonRelevant(pytest_lesson, "python -m pytest minimal_test.py",
         "python: error collecting minimal_test.py"));
+}
+
+test "stripWorkdirChdir removes stale build-dir cd prefixes, keeps the transferable command" {
+    var out: [700]u8 = undefined;
+    // the live pollution: a lesson whose working form cd's into a one-time build workdir
+    const polluted = "fix: `cd /d \"C:\\Users\\g\\...\\builds\\c6a505cb1\\work\" && findstr swarm docs\\zzz.html` failed (exit code 1) — works as: `cd /d \"C:\\Users\\g\\...\\builds\\c6a505cb1\\work\" && findstr swarm docs\\index.html`";
+    const cleaned = stripWorkdirChdir(polluted, &out);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned, "cd /d") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned, "c6a505cb1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned, "findstr swarm docs\\zzz.html") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cleaned, "findstr swarm docs\\index.html") != null);
+    // pushd form, and a chained non-cd `&&` command is preserved intact
+    try std.testing.expectEqualStrings("python build.py", stripWorkdirChdir("pushd \"C:\\a\\b\" && python build.py", &out));
+    try std.testing.expectEqualStrings("make && ./run", stripWorkdirChdir("make && ./run", &out));
+    // a bare relative cd (no separator) is meaningful — left alone; a mid-word "cd" is never a prefix
+    try std.testing.expectEqualStrings("cd build && test", stripWorkdirChdir("cd build && test", &out));
+    try std.testing.expectEqualStrings("procd x && y", stripWorkdirChdir("procd x && y", &out));
+    // nothing to strip -> byte-identical
+    try std.testing.expectEqualStrings("findstr a b", stripWorkdirChdir("findstr a b", &out));
+}
+
+test "lessonRelevantToRequest needs real shared vocabulary, not generic words" {
+    const pytest_lesson = "fix: `pytest suite_x` failed (exit code 1) — works as: `python -m pytest suite_x`";
+    // an off-topic request that shares only generic words with the lesson -> NOT injected (the live bug:
+    // "run these two console commands and report exit codes" pulled in a cd-pytest fix)
+    try std.testing.expect(!lessonRelevantToRequest(pytest_lesson, "run these two console commands and report each exit code, nothing else"));
+    // a request that genuinely names the thing (two shared informative tokens) -> injected
+    try std.testing.expect(lessonRelevantToRequest(pytest_lesson, "the pytest run on suite_x keeps failing, help"));
+    // one shared token is not enough (pre-emptive binding needs more evidence than the reactive fold)
+    try std.testing.expect(!lessonRelevantToRequest(pytest_lesson, "how do I run pytest here"));
+}
+
+test "filterRequestRelevantLessons gates the pre-emptive channel; stale cd is stripped from what survives" {
+    const block =
+        "fix: `cd /d \"C:\\builds\\c6a505cb1\\work\" && findstr swarm docs\\zzz.html` failed (exit code 1) — works as: `cd /d \"C:\\builds\\c6a505cb1\\work\" && findstr swarm docs\\index.html`\n" ++
+        "fix: `pytest suite_x` failed (exit code 1) — works as: `python -m pytest suite_x`";
+    var out: [900]u8 = undefined;
+    // a request about findstr+docs surfaces THAT lesson (>=2 shared) with the stale cd stripped away
+    const kept = filterRequestRelevantLessons(block, "the findstr search over docs\\index.html returns nothing", &out);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "findstr swarm docs\\index.html") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "cd /d") == null); // stale workdir gone
+    try std.testing.expect(std.mem.indexOf(u8, kept, "pytest") == null); // off-topic lesson not injected
+    // a wholly unrelated request injects nothing at all
+    try std.testing.expectEqualStrings("", filterRequestRelevantLessons(block, "please summarize the meeting notes from yesterday", &out));
 }
 
 test "filterRelevantLessons folds only same-family lessons; a weak recall injects nothing" {
