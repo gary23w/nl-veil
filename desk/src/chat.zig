@@ -4998,6 +4998,43 @@ fn findArgsBrace(text: []const u8, from: usize) ?usize {
     return null;
 }
 
+/// Scan a JSON object beginning at `open` (which MUST index the opening '{'), returning the index JUST
+/// PAST its matching '}'. STRING-AWARE: a '{'/'}' inside a JSON string value (respecting \" and \\ escapes)
+/// does NOT count toward brace depth. A raw byte counter truncated a `write_file` whose `content` held an
+/// unbalanced '}' — a code chunk closing a block ("  return x;\n}\n", every CSS/JS/JSON tail, and exactly
+/// what the chunked-append recovery asks the model to emit) — shipping invalid JSON the server rejected as
+/// a bad path, and the model looped. Returns null if the object never closes before end-of-text (a reply
+/// cut off mid-args — which is also the truncated-write signal looksTruncatedWrite wants).
+fn jsonObjEnd(text: []const u8, open: usize) ?usize {
+    var depth: i32 = 0;
+    var in_str = false;
+    var esc = false;
+    var k = open;
+    while (k < text.len) : (k += 1) {
+        const c = text[k];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return k + 1;
+            },
+            else => {},
+        }
+    }
+    return null; // opened but never closed — truncated
+}
+
 /// True if the reply holds a `TOOL: write_file`/`edit_file` whose JSON args OPENED a '{' but never closed it
 /// (brace depth never returns to 0 before end-of-text) with a substantial partial body — the fingerprint of a
 /// big file CUT OFF mid-content by the reply's length cap. Lets the dispatcher tell the model "your file was too
@@ -5013,19 +5050,8 @@ fn looksTruncatedWrite(text: []const u8) bool {
         const name = text[ns..i];
         if (!std.mem.eql(u8, name, "write_file") and !std.mem.eql(u8, name, "edit_file")) continue;
         const astart = findArgsBrace(text, i) orelse continue;
-        var depth: i32 = 0;
-        var k = astart;
-        var closed = false;
-        while (k < text.len) : (k += 1) {
-            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    closed = true;
-                    break;
-                }
-            }
-        }
-        if (!closed and depth > 0 and (text.len - astart) > 400) return true; // opened, substantial, never closed
+        // never closed (string-aware) + substantial = a big write cut off mid-content
+        if (jsonObjEnd(text, astart) == null and (text.len - astart) > 400) return true;
     }
     return false;
 }
@@ -5063,18 +5089,9 @@ fn findToolCall(text: []const u8) ?FoundCall {
         if (line_start and !knownChatTool(name) and substantiveLinesBefore(text, p) >= 5) continue;
         var args: []const u8 = "{}";
         if (findArgsBrace(text, i)) |astart| {
-            var k = astart;
-            var depth: i32 = 0;
-            while (k < text.len) : (k += 1) {
-                if (text[k] == '{') depth += 1 else if (text[k] == '}') {
-                    depth -= 1;
-                    if (depth == 0) {
-                        k += 1;
-                        break;
-                    }
-                }
+            if (jsonObjEnd(text, astart)) |end| {
+                if (end > astart + 1) args = text[astart..end];
             }
-            if (depth == 0 and k > astart + 1) args = text[astart..k];
         }
         return .{ .name = name, .args = args, .at = p };
     }
@@ -5140,17 +5157,9 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
     while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '\n' or text[i] == '\r')) i += 1;
     if (i < text.len and text[i] == '{') { // a balanced {...} blob after the tag
         const astart = i;
-        var depth: i32 = 0;
-        while (i < text.len) : (i += 1) {
-            if (text[i] == '{') depth += 1 else if (text[i] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    i += 1;
-                    break;
-                }
-            }
+        if (jsonObjEnd(text, astart)) |end| {
+            if (end > astart + 1) args = text[astart..end];
         }
-        if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
 }
@@ -5174,18 +5183,8 @@ pub fn toolCallTagXml(text: []const u8) ?ToolCall {
         while (i < text.len and text[i] != '>') i += 1; // skip to the tag close
         if (i < text.len) i += 1; // past '>'
         const astart = findArgsBrace(text, i) orelse continue;
-        var depth: i32 = 0;
-        var k = astart;
-        while (k < text.len) : (k += 1) {
-            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    k += 1;
-                    break;
-                }
-            }
-        }
-        if (depth == 0 and k > astart + 1) return .{ .name = name, .args = text[astart..k] };
+        const end = jsonObjEnd(text, astart) orelse continue; // unclosed here — try the next '<'
+        if (end > astart + 1) return .{ .name = name, .args = text[astart..end] };
     }
     return null;
 }
@@ -5304,21 +5303,9 @@ pub fn toolCallJsonInferred(text: []const u8) ?ToolCall {
     var search: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, search, '{')) |astart| { // scan every { for a balanced tool-args object
         search = astart + 1;
-        var depth: i32 = 0;
-        var k = astart;
-        var closed = false;
-        while (k < text.len) : (k += 1) {
-            if (text[k] == '{') depth += 1 else if (text[k] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    k += 1;
-                    closed = true;
-                    break;
-                }
-            }
-        }
-        if (!closed or k <= astart + 1) continue;
-        const args = text[astart..k];
+        const end = jsonObjEnd(text, astart) orelse continue;
+        if (end <= astart + 1) continue;
+        const args = text[astart..end];
         if (!jsonHasKey(args, "path") and !jsonHasKey(args, "code") and !jsonHasKey(args, "query")) continue; // not tool args
         const name: []const u8 =
             if (jsonHasKey(args, "content") and jsonHasKey(args, "path")) "write_file" else if (jsonHasKey(args, "path") and (jsonHasKey(args, "ops") or (jsonHasKey(args, "search") and jsonHasKey(args, "replace")))) "edit_file" else if (jsonHasKey(args, "code")) "run_python" else if (jsonHasKey(args, "query")) "web_search" else if (jsonHasKey(args, "path")) "read_file" // lone path (± start_line) — a read
@@ -5443,17 +5430,9 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
     while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
     if (i < text.len and text[i] == '{') {
         const astart = i;
-        var depth: i32 = 0;
-        while (i < text.len) : (i += 1) {
-            if (text[i] == '{') depth += 1 else if (text[i] == '}') {
-                depth -= 1;
-                if (depth == 0) {
-                    i += 1;
-                    break;
-                }
-            }
+        if (jsonObjEnd(text, astart)) |end| {
+            if (end > astart + 1) args = text[astart..end];
         }
-        if (depth == 0 and i > astart + 1) args = text[astart..i];
     }
     return .{ .name = name, .args = args };
 }
@@ -7795,6 +7774,32 @@ test "toolCall parses name + raw json args" {
     try std.testing.expectEqualStrings("read_file", toolCall("**TOOL: read_file** {\"path\":\"a\"}").?.name);
     // a mid-line prose mention of an unknown name is NOT a call
     try std.testing.expect(toolCall("use the TOOL: menu to pick one") == null);
+}
+
+test "toolCall: braces inside a content string never truncate the args (jsonObjEnd)" {
+    // THE regression: a raw byte counter closed the args at the first '}' inside content, shipping invalid
+    // JSON the server rejected as a bad path. A JS/CSS/code tail closing a block is the common trigger.
+    const unbalanced = "TOOL: write_file {\"path\":\"a.js\",\"content\":\"  return x;\\n}\\n\"}";
+    const a = toolCall(unbalanced).?;
+    try std.testing.expectEqualStrings("write_file", a.name);
+    try std.testing.expectEqualStrings("{\"path\":\"a.js\",\"content\":\"  return x;\\n}\\n\"}", a.args);
+
+    // a full function body (nested + trailing braces, quotes, escapes) survives intact
+    const css = "TOOL: write_file {\"path\":\"s.css\",\"content\":\".a{color:red}\\n.b{margin:0}\"}";
+    const b = toolCall(css).?;
+    try std.testing.expectEqualStrings("{\"path\":\"s.css\",\"content\":\".a{color:red}\\n.b{margin:0}\"}", b.args);
+
+    // an escaped quote inside content must NOT prematurely end the string (so a following '}' still counts as literal)
+    const esc = "TOOL: write_file {\"path\":\"q.txt\",\"content\":\"say \\\"hi\\\" }\"}";
+    const c = toolCall(esc).?;
+    try std.testing.expectEqualStrings("{\"path\":\"q.txt\",\"content\":\"say \\\"hi\\\" }\"}", c.args);
+
+    // a genuinely truncated big write (opened, never closed) still yields "{}" here AND trips looksTruncatedWrite
+    const cut = "TOOL: write_file {\"path\":\"big.html\",\"content\":\"" ++ ("<div>x</div>" ** 40);
+    try std.testing.expectEqualStrings("{}", toolCall(cut).?.args);
+    try std.testing.expect(looksTruncatedWrite(cut));
+    // ...but a CLOSED write whose content merely contains '}' is NOT flagged truncated
+    try std.testing.expect(!looksTruncatedWrite(unbalanced));
 }
 
 test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames" {
