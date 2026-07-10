@@ -8,6 +8,27 @@
   const hintVerb = document.getElementById('hintVerb');
   if (hintVerb && window.matchMedia('(pointer: coarse)').matches) hintVerb.textContent = 'TAP';
 
+  // ---- the veil persona: pull the cord to darken the reading room ----
+  const cord = document.getElementById('veilCord');
+  const cordLabel = document.getElementById('veilCordLabel');
+  const root = document.documentElement;
+  function paintCord() {
+    const on = root.hasAttribute('data-veil');
+    if (cord) {
+      cord.setAttribute('aria-pressed', String(on));
+      cord.setAttribute('aria-label', on ? 'Leave the veil — back to the reading room' : 'Enter the veil — a darker reading room');
+    }
+    if (cordLabel) cordLabel.textContent = on ? 'LEAVE THE VEIL' : 'ENTER THE VEIL';
+  }
+  paintCord();
+  if (cord) {
+    cord.addEventListener('click', () => {
+      const on = root.toggleAttribute('data-veil');
+      try { localStorage.setItem('nl-veil-persona', on ? 'veil' : 'file'); } catch (e) {}
+      paintCord();
+    });
+  }
+
   // load sequence
   requestAnimationFrame(() => {
     requestAnimationFrame(() => document.body.classList.add('loaded'));

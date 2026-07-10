@@ -18,8 +18,20 @@
 <link rel="stylesheet" href="fonts/Caveat.css">
 <link rel="stylesheet" href="css/main.css">
 <link rel="stylesheet" href="css/file.css">
+<script>
+  /* apply the saved persona before first paint — no flash of the wrong reading room */
+  try { if (localStorage.getItem('nl-veil-persona') === 'veil') document.documentElement.setAttribute('data-veil', ''); } catch (e) {}
+</script>
 </head>
 <body>
+
+<div class="veil-vapor" aria-hidden="true"></div>
+
+<button class="veil-cord" id="veilCord" type="button" aria-pressed="false" aria-label="Enter the veil — a darker reading room" title="pull the cord">
+  <span class="cord-line" aria-hidden="true"></span>
+  <span class="cord-pull" aria-hidden="true"></span>
+  <span class="cord-label" id="veilCordLabel" aria-hidden="true">ENTER THE VEIL</span>
+</button>
 
 <header class="cover" id="top">
   <div class="cover-inner">
@@ -81,7 +93,7 @@
 <section class="inventory" id="documents" aria-labelledby="invHead">
   <div class="section-head">
     <h2 class="stamp stamp-header" id="invHead">DOCUMENT INVENTORY</h2>
-    <p class="section-sub">Contents sheet: 33 documents covering 32 source files across 8 modules. Generated from source; amended as the source moves.</p>
+    <p class="section-sub">Contents sheet: 48 documents covering 47 source files across 9 modules — the server and the native desktop, veil-desk. Generated from source; amended as the source moves.</p>
   </div>
 
   <div class="inv-sheet reveal">
