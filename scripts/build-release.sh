@@ -46,11 +46,17 @@ say() { printf '\033[1;31m▌\033[0m %s\n' "$*"; }
 # shellcheck source=lib-deps.sh
 DEP_ROOT="$ROOT" . "$ROOT/scripts/lib-deps.sh"
 if [ "${NO_BOOTSTRAP:-0}" != 1 ]; then
+  # zig is the whole toolchain for the server + desktop — it bundles its own C compiler, so it builds
+  # raylib's C itself. No external cc needed for those.
   ZIG=$(dep_zig) || { say "no zig — set ZIG=<path> or install from ziglang.org"; exit 1; }
-  dep_cc || true
+  # the desktop links raylib against the platform GL/X11 libs (Linux only).
   [ "$OS" = linux ] && { dep_desk_libs || true; }
-  # neuron needs rust only when we don't already have a prebuilt one to bundle
-  if [ -z "${NEURON:-}" ] && [ ! -f "$ROOT/bin/neuron$EXE" ]; then dep_cargo || true; fi
+  # rust + a C compiler are needed ONLY to build neuron from source (cargo compiles its bundled SQLite,
+  # which is C) — skip both when a prebuilt neuron is already available to bundle.
+  if [ -z "${NEURON:-}" ] && [ ! -f "$ROOT/bin/neuron$EXE" ]; then
+    dep_cargo || true
+    dep_cc || true
+  fi
 fi
 ZIG=${ZIG:-zig}
 
