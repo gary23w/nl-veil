@@ -64,7 +64,7 @@ const Manifest = struct {
     files: []const u8 = "",
 };
 
-/// One tracked tool-call signature for the per-mind loop guard (hermes-agent port): sig = hash(name+args),
+/// One tracked tool-call signature for the per-mind loop guard: sig = hash(name+args),
 /// res = hash of the last result, count = consecutive identical call+result repeats.
 pub const GuardRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0 };
 
@@ -75,10 +75,10 @@ pub const MindState = struct {
     persona: [6]f32 = .{ 0.5, 0.5, 0.5, 0.5, 0.5, 1.0 },
     lane: []const u8 = "",
     lane_owned: bool = false,
-    // TOOL-LOOP GUARD (ported from hermes-agent's ToolCallGuardrailController): identical calls that keep
-    // returning identical results are a loop, not work — the dominant waste in observed runs (12 recall_hive
-    // echoes returning one irrelevant fact; repeated dead read probes). Mind-local (moments for one mind are
-    // sequential), survives rounds so a cross-round echo is caught too.
+    // TOOL-LOOP GUARD: identical calls that keep returning identical results are a loop, not work — the
+    // dominant waste in observed runs (12 recall_hive echoes returning one irrelevant fact; repeated dead
+    // read probes). Mind-local (moments for one mind are sequential), survives rounds so a cross-round echo
+    // is caught too.
     guard: [24]GuardRec = @splat(.{}),
     scout: bool = false,
     stances: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -2171,9 +2171,9 @@ pub fn parseProposal(raw: []const u8) ?Proposal {
 }
 
 /// STRUCTURED PROGRESS CHECKPOINT (deterministic — zero model calls). Rebuilt every round from the
-/// moments' OWN tool records, this is the hermes-style compaction: instead of a vague model summary, a
-/// fixed-shape ground-truth ledger the next round's minds read — what tool actions LANDED, what is still
-/// BLOCKED with its real error, and which blueprint files are still PENDING. Grounded (nothing here is a
+/// moments' OWN tool records: instead of a vague model summary, a fixed-shape ground-truth ledger the next
+/// round's minds read — what tool actions LANDED, what is still BLOCKED with its real error, and which
+/// blueprint files are still PENDING. Grounded (nothing here is a
 /// mind's self-report), general (no use-case branch — it just reflects the recorded fails/oks), and free.
 /// A failure whose tool a later ok this round re-ran is treated as RESOLVED and omitted, so the block
 /// carries only still-open work. Writes w.checkpoint_str; caller injects it in the volatile prompt tail.
@@ -2184,7 +2184,7 @@ fn buildCheckpoint(w: *Worker, results: []const Moment, round: u32, total_files:
     cp.appendSlice(gpa, "PROGRESS CHECKPOINT — engine-recorded ground truth from the last round (trust this over any summary):\n") catch return;
 
     // COMPLETED — distinct tool actions that succeeded, deduped by tool+args so N minds writing the same
-    // file collapse to one line. A bounded numbered list in the hermes [tool:name] shape.
+    // file collapse to one line. A bounded numbered [tool:name] list.
     var done: std.ArrayListUnmanaged(u8) = .empty;
     defer done.deinit(gpa);
     var done_n: u32 = 0;
@@ -3964,7 +3964,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         for (step.calls) |c| {
             trace.append(gpa, ',') catch {};
             llm.jstr(gpa, &trace, c.name) catch {};
-            // TOOL-LOOP GUARD (hermes port): a call whose (name, args) signature has already returned the
+            // TOOL-LOOP GUARD: a call whose (name, args) signature has already returned the
             // IDENTICAL result multiple times is refused before it burns another round-trip; the 2nd
             // identical repeat gets an in-band warning appended to its result so the model self-corrects
             // with context. This kills the observed recall-echo/dead-probe class of waste.
