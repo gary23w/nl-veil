@@ -646,9 +646,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     if (live) {
         const c = llm.capsSnapshot();
-        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
+        w.act("engine", 0, "caps", if (c.probed) "probed" else "heuristic", std.fmt.allocPrint(gpa, "ollama_native={} reasoning={} tools={} thinking={} tools_native_ok={} ctx={d} fence_writes={} ({s})", .{ c.ollama_native, c.reasoning, c.tools, c.thinking, c.tools_native_ok, c.ctx_tokens, w.fence_writes, if (c.probed and c.caps_listed) "backend handshake: /api/version + /api/show (capabilities[] + context_length are the model's own record)" else if (c.probed and !c.ollama_native) "backend handshake: OpenAI-style — a real tools-array completion measured whether tool_calls come back structured" else if (c.probed) "backend handshake: GET /api/version + a tiny reasoning probe (/api/show gave no capability list)" else "backend unreachable at startup — using the port/model-name heuristics" }) catch "caps");
     }
-    if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)");
+    if (live and w.fence_writes) w.act("engine", 0, "fence_writes", "on", if (llm.capsSnapshot().ollama_native)
+        "LOCAL OLLAMA + THINKING model: write_file is STRIPPED from the build schema; the minds emit each file as a fenced code block and the narrated-write salvage commits it (works around Ollama's large-tool-call parser failure)"
+    else
+        "the startup probe saw this HOSTED backend emit tool calls as TEXT instead of structured tool_calls — write_file is STRIPPED from the build schema; files ride fenced blocks and the narrated-write salvage commits them (no more per-file salvage roulette)");
     {
         // BUDGET COHERENCE: the per-turn completion budget and every prompt-section byte budget derive from
         // the PROBED window instead of fixed literals — a genuinely small-ctx model must not be handed a

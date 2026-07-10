@@ -43,6 +43,11 @@ pub const Caps = struct {
     /// would be lost. Defaults to trusted; only clear parse-failure evidence flips it (the runtime adaptive
     /// fence flip remains the safety net for anything the probe misses).
     tools_ok_large: bool = true,
+    /// HOSTED (OpenAI-style) backends: does a chat completion carrying a tools array come back as STRUCTURED
+    /// tool_calls, or does the model emit the call as text markup (DeepSeek's ｜DSML｜ emission — observed
+    /// live as tool_writes=0 with every file riding the narrated-write salvage)? Measured by a real startup
+    /// completion, cached per model. Defaults to trusted; only clear text-emission evidence flips it.
+    tools_native_ok: bool = true,
 };
 var caps: Caps = .{};
 
@@ -118,7 +123,12 @@ fn isThinking(model: []const u8) bool {
 }
 
 pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
-    if (!isOllama(base_url)) return false;
+    if (!isOllama(base_url)) {
+        // hosted OpenAI-style backend: fence ONLY on measured text-emission evidence from the startup
+        // probe (structured tool_calls confirmed or unprobed → trust the native channel; the runtime
+        // adaptive flip still covers whatever the probe misses)
+        return caps.probed and !caps.tools_native_ok;
+    }
     if (isThinking(model)) return true;
     // a probed backend that cannot parse file-sized tool calls gets fenced writes from round 1
     return caps.probed and caps.caps_listed and !caps.tools_ok_large;
@@ -387,6 +397,22 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
         }
     }
 
+    if (!caps.ollama_native) {
+        // OpenAI-style hosted backend: measure whether a tools-array completion comes back as
+        // STRUCTURED tool_calls or as text markup (DeepSeek-style emission). The fence decision must
+        // ride measured transport behavior, never the provider's name. Cached per model (a model
+        // property), same trust bias as the large-call probe: only clear text-emission flips it.
+        var kb: [160]u8 = undefined;
+        const nkey = std.fmt.bufPrint(&kb, "native:{s}", .{model}) catch model;
+        if (cachedLargeVerdict(gpa, io, run_dir, nkey)) |v| {
+            caps.tools_native_ok = v;
+        } else {
+            caps.tools_native_ok = probeHostedToolCall(gpa, io, run_dir, base_url, key, model);
+            storeLargeVerdict(gpa, io, run_dir, nkey, caps.tools_native_ok);
+        }
+        return;
+    }
+
     if (caps.ollama_native and caps.caps_listed) {
         caps.reasoning = caps.thinking; // authoritative record — no need to load the model just to ask it
     } else if (caps.ollama_native) {
@@ -491,9 +517,72 @@ fn storeLargeVerdict(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mo
 
 /// The RUNTIME fence flip observed a real large-tool-call wall the startup probe missed. Persist the verdict —
 /// it is a model property — so every FUTURE run of this model fences from round 1 instead of re-learning it.
+/// The native-transport verdict is flipped + persisted too: on a hosted backend the wall IS the evidence that
+/// structured tool_calls cannot be trusted, and fenceWrites' hosted branch reads tools_native_ok.
 pub fn recordLargeToolWall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, model: []const u8) void {
     caps.tools_ok_large = false;
+    caps.tools_native_ok = false;
     storeLargeVerdict(gpa, io, run_dir, model, false);
+    var kb: [160]u8 = undefined;
+    if (std.fmt.bufPrint(&kb, "native:{s}", .{model})) |nkey| {
+        storeLargeVerdict(gpa, io, run_dir, nkey, false);
+    } else |_| {}
+}
+
+/// One real chat completion against a HOSTED OpenAI-style backend carrying a minimal tools array:
+/// does the call come back as structured tool_calls? Trust-biased like probeLargeToolCall — a network
+/// flake, an unrelated provider error, or a model that just answers in prose stays trusted; ONLY the
+/// clear failure signature (the tool call emitted as text/markup in `content`) reports false.
+fn probeHostedToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, base_url: []const u8, key: []const u8, model: []const u8) bool {
+    var msg: std.ArrayListUnmanaged(u8) = .empty;
+    defer msg.deinit(gpa);
+    msg.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return true;
+    jstr(gpa, &msg, "Call the write_file tool exactly once: path=\"probe.txt\", content=\"probe ok\". Do not reply with prose.") catch return true;
+    msg.appendSlice(gpa, "}") catch return true;
+    const tool_def = "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"write a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}";
+    // temperature 0: measure the backend's MODAL behavior, not a sampling coin-flip. max_tokens leaves
+    // room for a hosted reasoning model to think before the call (hidden reasoning eats the budget).
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"temperature\":0,\"max_tokens\":2048}}", .{ model, msg.items, tool_def }) catch return true;
+    defer gpa.free(body);
+    const r = post(gpa, io, run_dir, "probe-native", base_url, key, body);
+    defer gpa.free(r.content);
+    if (!r.ok) return true; // transport flake ≠ text-emission evidence
+    return hostedToolCallVerdict(r.content);
+}
+
+fn hostedToolCallVerdict(raw: []const u8) bool {
+    const Resp = struct {
+        choices: []const struct {
+            message: struct {
+                content: ?[]const u8 = null,
+                tool_calls: ?[]const struct {
+                    function: struct { name: []const u8 = "", arguments: []const u8 = "" },
+                } = null,
+            },
+        } = &.{},
+        @"error": ?struct { message: []const u8 = "" } = null,
+    };
+    const parsed = std.json.parseFromSlice(Resp, std.heap.page_allocator, raw, .{ .ignore_unknown_fields = true }) catch return true;
+    defer parsed.deinit();
+    if (parsed.value.@"error") |e| {
+        var buf: [300]u8 = undefined;
+        const n = @min(e.message.len, buf.len);
+        for (e.message[0..n], 0..) |c, j| buf[j] = std.ascii.toLower(c);
+        const low = buf[0..n];
+        // an error naming the tool-call machinery is transport evidence; busy/billing/quota is not
+        if (std.mem.indexOf(u8, low, "tool") != null or std.mem.indexOf(u8, low, "pars") != null) return false;
+        return true;
+    }
+    if (parsed.value.choices.len == 0) return true;
+    const m = parsed.value.choices[0].message;
+    if (m.tool_calls) |tcs| {
+        if (tcs.len > 0) return true; // structured — the native channel works
+    }
+    const c = m.content orelse return true;
+    // the failure signature: the CALL itself emitted as text/markup instead of a tool_calls entry
+    if (std.mem.indexOf(u8, c, "write_file") != null and
+        (std.mem.indexOfScalar(u8, c, '{') != null or std.mem.indexOf(u8, c, "<invoke") != null or std.mem.indexOf(u8, c, "tool_calls>") != null)) return false;
+    return true;
 }
 
 /// Ask the model to echo a file-sized payload through ONE write_file call, and judge whether the backend
@@ -856,4 +945,30 @@ test "fenceWrites: probed non-thinking model with a broken large-tool-call trans
     try std.testing.expect(!fenceWrites("http://localhost:9999/v1", "llama3.1:8b"));
     caps.thinking = true; // a thinking model is fenced regardless of the transport probe
     try std.testing.expect(fenceWrites("http://localhost:9999/v1", "whatever-model"));
+}
+
+test "hostedToolCallVerdict: structured call trusts; text-emitted markup fences; unrelated error trusts" {
+    // the hosted backend returned a real structured tool_calls entry — the native channel works
+    try std.testing.expect(hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"\",\"tool_calls\":[{\"id\":\"1\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"probe.txt\\\"}\"}}]}}]}"));
+    // the observed DeepSeek failure signature: the call emitted as DSML text markup in content
+    try std.testing.expect(!hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls><invoke name=\\\"write_file\\\"><parameter name=\\\"path\\\">probe.txt</parameter></invoke>\"}}]}"));
+    // ...and the plain-JSON-in-prose shape
+    try std.testing.expect(!hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"{\\\"name\\\": \\\"write_file\\\", \\\"arguments\\\": {\\\"path\\\": \\\"probe.txt\\\"}}\"}}]}"));
+    // inconclusive shapes stay trusted — an uncooperative model or a billing error is not transport evidence
+    try std.testing.expect(hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"I cannot write files.\"}}]}"));
+    try std.testing.expect(hostedToolCallVerdict("{\"error\":{\"message\":\"insufficient balance\"}}"));
+    try std.testing.expect(!hostedToolCallVerdict("{\"error\":{\"message\":\"tool call arguments failed to parse\"}}"));
+    try std.testing.expect(hostedToolCallVerdict("not json at all"));
+}
+
+test "fenceWrites: hosted backend fences only on measured text-emission evidence" {
+    const saved = caps;
+    defer caps = saved;
+
+    caps = .{}; // unprobed hosted backend → trust the native channel (today's behavior)
+    try std.testing.expect(!fenceWrites("https://api.example.com/v1", "some-hosted-model"));
+    caps = .{ .probed = true, .ollama_native = false, .tools_native_ok = false };
+    try std.testing.expect(fenceWrites("https://api.example.com/v1", "some-hosted-model"));
+    caps = .{ .probed = true, .ollama_native = false, .tools_native_ok = true };
+    try std.testing.expect(!fenceWrites("https://api.example.com/v1", "some-hosted-model"));
 }
