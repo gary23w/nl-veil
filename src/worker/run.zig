@@ -5870,7 +5870,11 @@ fn curlCode(w: *Worker, url: []const u8) u32 {
                 if (resp.body.len > 0) gpa.free(resp.body);
                 return resp.status;
             },
-            else => return 0,
+            .refused, .timed_out => return 0, // nothing listening / wedged — a true no-answer
+            // .failed = a reply we couldn't frame (e.g. a probe body over the 4MB cap). The status is all
+            // this probe wants, so fall through to curl (-o NUL) which reports the real code regardless of
+            // body size — otherwise a big inlined-asset index would read as 0 and fail the smoke gate.
+            .failed => {},
         }
     }
     const nul = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
