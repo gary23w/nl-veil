@@ -3684,7 +3684,21 @@ pub const Chat = struct {
             defer self.store.unlock();
             break :blk_sm self.store.settings.speed_mode;
         };
-        const minutes = castMinutes(spec.minutes, spec.long, speed);
+        const minutes = blk_wf: {
+            const base = castMinutes(spec.minutes, spec.long, speed);
+            // WORKLOAD FLOOR: when the veil DECLARED the deliverables, the time budget must fit them —
+            // a 2-minute speed cap against 14 declared files just kills the run at 4/14 (observed live).
+            // ~1 min per 3 declared files, floor 2, ceiling 20. Mirrors the server's identical floor so
+            // the desktop's own deadline watchdog doesn't kill a cast the server granted more time.
+            if (spec.files.len == 0) break :blk_wf base;
+            var nf: u32 = 0;
+            var fit = std.mem.tokenizeAny(u8, spec.files, ",\n\r");
+            while (fit.next()) |t| {
+                if (std.mem.trim(u8, t, " \t`'\"").len >= 2) nf += 1;
+            }
+            if (nf == 0) break :blk_wf base;
+            break :blk_wf @max(base, @min(20, @max(2, (nf + 2) / 3)));
+        };
         if (speed and (spec.long or spec.minutes > minutes))
             self.appendMsg(dd, .cast_note, "(speed mode: swarm time-capped at 2 minutes — turn speed mode off in Settings for long autonomous hiveminds)");
         const mode: []const u8 = if (spec.long) "continuous" else "cast";
