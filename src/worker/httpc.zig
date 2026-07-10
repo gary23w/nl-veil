@@ -178,7 +178,10 @@ fn readChunked(r: *Io.Reader, gpa: std.mem.Allocator, cap: usize, status: u16) e
             }
             break;
         }
-        if (list.items.len + n > cap) return error.BadResponse;
+        // overflow-safe: `list.items.len + n` would wrap usize on a hostile hex chunk size (up to 2^64-1),
+        // which under ReleaseSafe traps and crashes the poller/chat thread — the exact frozen-thread failure
+        // this client exists to avoid. Compare via subtraction so a huge n is a clean BadResponse.
+        if (n > cap or list.items.len > cap - n) return error.BadResponse;
         list.ensureUnusedCapacity(gpa, n) catch return error.BadResponse;
         const dst = list.unusedCapacitySlice()[0..n];
         r.readSliceAll(dst) catch return error.BadResponse;
@@ -294,6 +297,10 @@ test "readResponse: oversized and malformed replies are errors, never unbounded 
     // chunked body over cap
     var r5 = Io.Reader.fixed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nff\r\n");
     try std.testing.expectError(error.BadResponse, readResponse(&r5, std.testing.allocator, 8));
+    // hostile chunk size after a real chunk: `list.items.len + n` would overflow usize and, under
+    // ReleaseSafe, panic. Must be a clean BadResponse, not a crash.
+    var r6 = Io.Reader.fixed("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nX\r\nffffffffffffffff\r\n");
+    try std.testing.expectError(error.BadResponse, readResponse(&r6, std.testing.allocator, 1 << 20));
 }
 
 test "readResponse: header names match case-insensitively and chunked beats Content-Length" {

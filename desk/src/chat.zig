@@ -5047,7 +5047,10 @@ fn looksTruncatedWrite(text: []const u8) bool {
         while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
         const ns = i;
         while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
-        const name = text[ns..i];
+        // trim markdown/punctuation EXACTLY as findToolCall does — otherwise a bolded `**TOOL: write_file**`
+        // yields "write_file**" here and fails the eql check, so the two parsers disagree and this
+        // truncation branch is skipped for a call findToolCall accepts (chunked-append recovery never fires)
+        const name = std.mem.trim(u8, text[ns..i], " \t:`*\".,;)!?");
         if (!std.mem.eql(u8, name, "write_file") and !std.mem.eql(u8, name, "edit_file")) continue;
         const astart = findArgsBrace(text, i) orelse continue;
         // never closed (string-aware) + substantial = a big write cut off mid-content
