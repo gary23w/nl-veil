@@ -4344,6 +4344,42 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
     return jsonUnescape(gpa, raw);
 }
 
+/// Extract the content PAYLOAD from a text-emitted tool-call markup of an XML-parameter dialect
+/// (`<invoke name="write_file"> <parameter name="content"> <the raw file> …`). The JSON-args form is
+/// handled by embeddedWriteContent; this covers providers whose native markup carries parameters as
+/// tagged blocks emitted as TEXT (the transport hiccup class). RECOVER the file instead of rejecting the
+/// whole reply — a round where all three minds' docs bounced as "raw tool-call fragment" produced zero
+/// output (observed live, c6a503e07 r3). Dialect-blind: find the content parameter marker, take the
+/// payload up to the next tag/special-token delimiter. Returned slice is gpa-owned.
+fn markupWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
+    if (std.mem.indexOf(u8, monologue, "write_file") == null) return null;
+    const at = std.mem.indexOf(u8, monologue, "name=\"content\"") orelse return null;
+    var i = at + "name=\"content\"".len;
+    while (i < monologue.len and monologue[i] != '>' and monologue[i] != '\n') i += 1;
+    if (i < monologue.len) i += 1;
+    const start = i;
+    var end = monologue.len;
+    if (std.mem.indexOfPos(u8, monologue, start, "\xef\xbd\x9c")) |d| end = @min(end, d); // fullwidth-bar special token
+    if (std.mem.indexOfPos(u8, monologue, start, "</")) |d| end = @min(end, d); // closing tag of any dialect
+    while (end > start and monologue[end - 1] == '<') end -= 1; // a dangling opener before the delimiter
+    const raw = std.mem.trim(u8, monologue[start..end], " \r\n\t");
+    if (raw.len < 40) return null;
+    return gpa.dupe(u8, raw) catch null;
+}
+
+test "markupWriteContent recovers a file body from text-emitted XML-parameter tool markup" {
+    const gpa = std.testing.allocator;
+    const dsml = "\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls><invoke name=\"write_file\"><parameter name=\"path\">docs/x.md</parameter><parameter name=\"content\">\n# X module\n\nThis documents the X module in detail, covering every export.\n</parameter></invoke>";
+    const got = markupWriteContent(gpa, dsml) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    try std.testing.expect(std.mem.startsWith(u8, got, "# X module"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "every export") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "\xef\xbd\x9c") == null); // no special tokens leak into the file
+    // no write_file mention → null; no content marker → null
+    try std.testing.expect(markupWriteContent(gpa, "just prose about name=\"content\" here with plenty of length to pass the floor") == null);
+    try std.testing.expect(markupWriteContent(gpa, "write_file but no parameter markers at all in this reply") == null);
+}
+
 const ShortReject = struct { key: u64 = 0, n: u16 = 0 };
 
 /// One committed-but-truncated emission: the partial file's path + the size it landed at. Resolution is by
@@ -4806,6 +4842,9 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
         }
         gpa.free(c);
     }
+    // a write_file emitted as XML-parameter tool MARKUP (text transport hiccup) — recover its content
+    // payload instead of letting the markup body bounce off the tool-fragment gate
+    if (markupWriteContent(gpa, monologue)) |c| return c;
     {
         // DEPTH-AWARE fence pairing: a ``` carrying an info string (```python, ```bash) always OPENS a
         // block; a bare ``` closes the innermost open block (or opens an anonymous one at depth 0). A

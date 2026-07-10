@@ -363,6 +363,16 @@ const CastReq = struct {
     files: []const u8 = "", // DECLARED deliverables (comma/newline separated) — adopted verbatim as the blueprint
 };
 
+/// Count the entries in a comma/newline-separated declared-deliverables list (the workload-floor input).
+fn declCount(files: []const u8) u32 {
+    var n: u32 = 0;
+    var it = std.mem.tokenizeAny(u8, files, ",\n\r");
+    while (it.next()) |t| {
+        if (std.mem.trim(u8, t, " \t`'\"").len >= 2) n += 1;
+    }
+    return n;
+}
+
 /// Sanitize a chat conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
 /// bounded). Empty / unsafe → "" and the caller keeps the default throwaway run_dir. Mirrors chat_tools.safeSeg
 /// so the cast's `{data}/u{uid}/_chat/builds/{seg}/work` matches the chat build tools' workdir exactly.
@@ -413,11 +423,20 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .api_key = rq.api_key,
         .base_url = rq.base_url,
         // Quick strike: hard-capped short so it finishes fast. Sustained hivemind: a real budget (default 20,
-        // capped at 60) for work that genuinely needs the time.
-        .minutes = if (std.mem.eql(u8, rq.mode, "continuous"))
-            (if (rq.minutes == 0) 20 else @min(rq.minutes, 60))
-        else
-            (if (rq.minutes == 0) 4 else @min(rq.minutes, 4)),
+        // capped at 60) for work that genuinely needs the time. WORKLOAD FLOOR: when the caller DECLARED the
+        // deliverables, the time budget must fit the declared workload — a 2-minute strike against 14 declared
+        // files is structurally impossible (observed live: budget expired at 4/14 docs). ~1 minute per 3
+        // deliverables (a round lands ~3 files and takes ~1 min), floor 2, ceiling 20. The MODEL declares the
+        // workload; the engine grants time proportional to it — a capacity fact, not a use-case condition.
+        .minutes = blk_min: {
+            const declared: u32 = if (rq.files.len > 0) declCount(rq.files) else 0;
+            const wfloor: u32 = if (declared > 0) @min(20, @max(2, (declared + 2) / 3)) else 0;
+            const base: u32 = if (std.mem.eql(u8, rq.mode, "continuous"))
+                (if (rq.minutes == 0) 20 else @min(rq.minutes, 60))
+            else
+                (if (rq.minutes == 0) 4 else @min(rq.minutes, 4));
+            break :blk_min @max(base, wfloor);
+        },
         .gateway_model = rq.gateway_model,
         // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
