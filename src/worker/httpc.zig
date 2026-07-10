@@ -1,9 +1,10 @@
-//! httpc.zig — a bounded raw-socket HTTP/1.1 client for PLAIN-HTTP loopback endpoints: the local veil
-//! server on :8787 and a local Ollama on :11434. Replaces the `curl` subprocess for that traffic.
+//! httpc.zig — a bounded raw-socket HTTP/1.1 client for PLAIN-HTTP loopback endpoints: here, a local
+//! Ollama on :11434 and the smoke gate's declared 127.0.0.1 probes. Replaces the `curl` subprocess for
+//! that traffic; anything non-loopback (hosted TLS providers, web fetches) stays on curl.
 //!
-//! TWIN FILE: src/worker/httpc.zig is a byte-for-byte twin below this header (the desk and the server
-//! are separate Zig packages by design, so they can't share a module without cross-package build
-//! wiring). Fix a bug in one → apply it to the other.
+//! TWIN FILE: desk/src/httpc.zig is a byte-for-byte twin below this header (the desk and the server are
+//! separate Zig packages by design, so they can't share a module without cross-package build wiring).
+//! Fix a bug in one → apply it to the other.
 //!
 //! WHY not curl: every request used to spawn curl.exe with the bearer token and the full JSON body on
 //! the command line. Process command lines are readable by any same-user process on Windows, and the

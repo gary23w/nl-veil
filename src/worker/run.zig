@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const llm = @import("llm.zig");
+const httpc = @import("httpc.zig");
 const tools = @import("tools.zig");
 const commons = @import("commons.zig");
 const oscillation = @import("oscillation.zig");
@@ -5852,10 +5853,26 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
     return res;
 }
 
-/// GET `url` via curl, returning just the HTTP status code (0 = nothing answered). Local-probe shaped:
-/// tight per-request timeouts; the retry cadence lives in the caller's boot window.
+/// GET `url`, returning just the HTTP status code (0 = nothing answered). Local-probe shaped: tight
+/// per-request timeouts; the retry cadence lives in the caller's boot window. A loopback url (the
+/// normal declared-PROBE shape) goes in-process; anything else still rides curl for TLS/remote.
 fn curlCode(w: *Worker, url: []const u8) u32 {
     const gpa = w.gpa;
+    if (httpc.parseLoopbackUrl(url)) |t| {
+        switch (httpc.request(w.io, gpa, .{
+            .method = "GET",
+            .port = t.port,
+            .path = if (t.path.len > 0) t.path else "/",
+            .timeout_s = 3,
+            .cap = 4 << 20, // status is all we want, but the body must drain; smoke pages are small
+        })) {
+            .ok => |resp| {
+                if (resp.body.len > 0) gpa.free(resp.body);
+                return resp.status;
+            },
+            else => return 0,
+        }
+    }
     const nul = if (builtin.os.tag == .windows) "NUL" else "/dev/null";
     const argv = [_][]const u8{ "curl", "-s", "-o", nul, "-w", "%{http_code}", "--max-time", "3", url };
     const r = std.process.run(gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(64), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(8), .clock = .awake } } }) catch return 0;

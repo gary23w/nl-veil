@@ -1,10 +1,14 @@
-//! The worker's LLM client. The Zig control plane has no HTTPS client, and an LLM call is network-bound
-//! (seconds), so we shell out to curl — its overhead is noise next to the model latency. The API key is
-//! passed via a curl config file (-K), so it never appears on the process argv.
+//! The worker's LLM client. Transport is split by destination: a LOOPBACK plain-http backend (a local
+//! Ollama) goes through the in-process raw-socket client (httpc.zig) — no curl child for Defender's
+//! behavior/ML models to kill, no scratch files, no per-call process cost. A hosted backend needs TLS,
+//! which the Zig control plane doesn't have in-process yet, so those calls still shell out to curl —
+//! its overhead is noise next to the model latency, and the API key rides a curl config file (-K), so
+//! it never appears on the process argv.
 //!
 //! Two entry points: chat() for a one-shot system+user completion, and complete() for the agentic tool loop
 //! (a pre-built messages array + a tools array → content OR parsed tool_calls).
 const std = @import("std");
+const httpc = @import("httpc.zig");
 
 pub const Reply = struct {
     content: []u8,
@@ -150,6 +154,26 @@ fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8
 }
 
 fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, url: []const u8, key: []const u8, body: []const u8, local: bool) Reply {
+    // Loopback plain-http (a local Ollama): in-process socket. No curl child, and none of the scratch
+    // files below — the key and body never touch disk or an argv on this path. Mirrors curl semantics:
+    // any HTTP status with a body is returned ok=true (callers parse {"error":...} out of the JSON),
+    // and the timeout matches the curl --max-time this path used.
+    if (httpc.parseLoopbackUrl(url)) |t| {
+        switch (httpc.request(io, gpa, .{
+            .method = "POST",
+            .port = t.port,
+            .path = if (t.path.len > 0) t.path else "/",
+            .bearer = key,
+            .body = body,
+            .timeout_s = if (local) 240 else 90,
+            .cap = 8 << 20,
+        })) {
+            .ok => |resp| return .{ .content = resp.body, .ok = true },
+            .refused => return err(gpa, "connect refused — is the local model server running?"),
+            .timed_out => return err(gpa, "local model call timed out"),
+            .failed => return err(gpa, "local model call failed (connection dropped mid-reply)"),
+        }
+    }
     const reqpath = std.fmt.allocPrint(gpa, "{s}/.llmreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
     defer gpa.free(reqpath);
     const cfgpath = std.fmt.allocPrint(gpa, "{s}/.curlcfg{s}{s}", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return oom(gpa);
@@ -348,7 +372,21 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
 
     const ver_url = std.fmt.allocPrint(gpa, "{s}/api/version", .{host}) catch return;
     defer gpa.free(ver_url);
-    const ver = blk: {
+    const ver: ?[]u8 = blk: {
+        // loopback (the common local-Ollama case): in-process socket, no curl child
+        if (httpc.parseLoopbackUrl(ver_url)) |t| {
+            switch (httpc.request(io, gpa, .{
+                .method = "GET",
+                .port = t.port,
+                .path = if (t.path.len > 0) t.path else "/",
+                .timeout_s = 5,
+                .cap = 64 << 10,
+            })) {
+                .ok => |resp| break :blk resp.body,
+                else => break :blk null,
+            }
+        }
+        // non-loopback base (hosted/remote): curl still carries the TLS
         const run = std.process.run(gpa, io, .{
             .argv = &.{ "curl", "-sS", "--max-time", "5", ver_url },
             .stdout_limit = .limited(64 << 10),
