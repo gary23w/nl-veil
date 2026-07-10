@@ -824,13 +824,24 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 continue;
             }
             mi.lane = if (ri.lead == ii)
-                "LEAD/coordinator — set the plan, break it into concrete tasks and assign them to teammates with add_task, integrate their work into the final artifact, and keep everyone aligned (don't build it all yourself)"
+                (if (w.discourse)
+                    "LEAD/editor — set the research questions, assign each teammate a distinct facet of the topic, and integrate their FETCHED findings into the hive's shared understanding; keep the desk converging on a grounded, balanced view (don't research it all yourself)"
+                else
+                    "LEAD/coordinator — set the plan, break it into concrete tasks and assign them to teammates with add_task, integrate their work into the final artifact, and keep everyone aligned (don't build it all yourself)")
             else if (ri.qa == ii)
-                "REVIEW & QA — verify teammates' facts and files, fill gaps, and assemble/polish the final deliverable; OWN the test suite (write/expand real test_*.py with assertions about INTENDED behavior, never trivial asserts that game the score), and each round fix the deliverable's single biggest failing test"
+                (if (w.discourse)
+                    "FACT-CHECK & QA — for the desk's claims, verify each against a PRIMARY source you fetch yourself (read_url/fetch_json), flag anything uncited or thinly sourced, and surface where the evidence disagrees; your output is verified citations, not files"
+                else
+                    "REVIEW & QA — verify teammates' facts and files, fill gaps, and assemble/polish the final deliverable; OWN the test suite (write/expand real test_*.py with assertions about INTENDED behavior, never trivial asserts that game the score), and each round fix the deliverable's single biggest failing test")
             else if (ri.scout == ii and w.internet) blk: {
                 mi.scout = true;
                 break :blk SCOUT_LANE;
-            } else LANES[i % LANES.len];
+            } else if (w.discourse and w.internet)
+                // a discourse/news-desk cast has no files to build — every mind is a researcher. Owning a facet
+                // AND being required to fetch a real primary source each round is what lets a publish cast clear
+                // the independent-source gate on its own, instead of leaning on the engine's seed retrieval.
+                "RESEARCH — take a distinct facet of the topic and go OUT to the live web: web_search to find leads, then read_url/fetch_json the ACTUAL pages (papers, journal/press sites, primary docs) to gather concrete facts, data, and quotes WITH their URLs. Every round fetch at least one NEW real source; form a view and note where you AGREE or DISAGREE with the hive. Your output is grounded, cited KNOWLEDGE — never files."
+            else LANES[i % LANES.len];
         }
     }
 
@@ -1405,7 +1416,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 mgrp.concurrent(io, agi.detectEmotionalFlare, .{ &w, minds.items, goal, round, retro_in.items, prev_pct }) catch agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items, prev_pct);
             if (live and w.psyche_on and govReflective(w.gov_lvl, round))
                 mgrp.concurrent(io, emitPsyche, .{ &w, minds.items, round, retro_in.items }) catch emitPsyche(&w, minds.items, round, retro_in.items);
-            if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
+            // The digest/briefing cadence. gov_lvl>=2 (metabolic crunch) normally trims this to round 1 + stop —
+            // fine for a BUILD digest (working-memory housekeeping), but for a NEWS-DESK publish cast the briefing
+            // IS the deliverable (each one is a candidate edition to post), so throttling it to twice a run defeats
+            // the purpose. Exempt a discourse+publish cast from the governor trim so it briefs every DIGEST_EVERY
+            // rounds and can post as soon as it clears the grounding gate, not only at shutdown.
+            const news_desk = w.discourse and w.publish_on;
+            if (live and !w.quick and (w.gov_lvl < 2 or round == 1 or w.stop_now or news_desk) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now)) {
                 if (w.discourse) {
                     mgrp.concurrent(io, consolidateBriefing, .{ &w, goal, round, retro_in.items }) catch consolidateBriefing(&w, goal, round, retro_in.items);
                 } else {
@@ -4094,6 +4111,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     if (fetched_url.len > 0) gpa.free(@constCast(fetched_url));
                     fetched_url = gpa.dupe(u8, clip(u, 200)) catch "";
                     if (urlDomain(u)) |dom| _ = w.mem.observe(tools.SOURCES_SCOPE, dom);
+                    // INDEPENDENT SOURCE (the publish gate's load-bearing signal): a mind fetched a real URL
+                    // ITSELF (read_url/fetch_json/web_fetch — NOT web_search, which serves the local seed RAG).
+                    // round_independent_sources was declared + read by publishArtifact but NEVER incremented, so
+                    // the NEWS DESK gate was unsatisfiable (independent 0 < 1, seed_dependency pinned at 100%) —
+                    // every edition held "seed_only" and nothing could ever post. Count only a fetch that
+                    // returned real content, so a blocked/empty/error result doesn't inflate the tally.
+                    if (fetchSucceeded(result)) w.round_independent_sources += 1;
                 }
             }
             w.act(mi.name, round, c.name, c.args, result);
@@ -5150,6 +5174,21 @@ test "provenance-gate helpers: balanced object, span overlap, vacuity, span dedu
     try std.testing.expect(spanNormHash("foo bar") != spanNormHash("foo baz"));
 }
 
+test "fetchSucceeded counts a real page fetch, rejects blocked/empty/error results (publish-gate signal)" {
+    // real extracted page text -> counts as an independent source
+    const page = "Building Qubits from Neutral Atoms. " ++ ("Researchers demonstrated a logical qubit with improved fidelity across arrays of trapped neutral atoms. " ** 4);
+    try std.testing.expect(fetchSucceeded(page));
+    // every failure signature the fetch tools emit -> not a source
+    try std.testing.expect(!fetchSucceeded("blocked url (only public http/https; no local/internal hosts)"));
+    try std.testing.expect(!fetchSucceeded("blocked: host not on the egress allowlist (NL_EGRESS_ALLOWLIST)"));
+    try std.testing.expect(!fetchSucceeded("(fetch returned nothing or timed out — try another source)"));
+    try std.testing.expect(!fetchSucceeded("(reader returned nothing or timed out)"));
+    try std.testing.expect(!fetchSucceeded("read_url is disabled under an egress allowlist"));
+    try std.testing.expect(!fetchSucceeded("bad args"));
+    // a too-short body (even if not an error) isn't a substantive source
+    try std.testing.expect(!fetchSucceeded("ok"));
+}
+
 test "extractConcreteTokens keeps API-shaped fingerprints, skips prose" {
     var buf: [220]u8 = undefined;
     const n = extractConcreteTokens("Use ctx.fillText(text, x, y) and call requestAnimationFrame each frame", &buf);
@@ -5173,6 +5212,20 @@ fn urlDomain(url: []const u8) ?[]const u8 {
     if (std.mem.indexOfScalar(u8, s, ':')) |i| s = s[0..i];
     if (s.len == 0 or s.len > 100) return null;
     return s;
+}
+
+/// Did a read_url/web_fetch/fetch_json call return REAL page content, versus an error/blocked/empty result?
+/// Used to count independent sources for the publish gate without letting a failed fetch inflate the tally.
+/// The fetch tools signal failure with a short message that is either parenthesized ("(fetch returned
+/// nothing …)"), starts with "blocked"/"bad "/"oom", or notes the tool is disabled — real page text is
+/// substantial and starts with none of those. Pure — unit-tested.
+fn fetchSucceeded(result: []const u8) bool {
+    const t = std.mem.trim(u8, result, " \r\n\t");
+    if (t.len < 160) return false; // real extracted text is substantial; an error string is short
+    if (t[0] == '(') return false; // "(fetch returned nothing or timed out …)" / "(reader returned nothing …)"
+    const fail_prefixes = [_][]const u8{ "blocked", "bad ", "oom", "read_url is disabled", "osint_scan is disabled" };
+    for (fail_prefixes) |p| if (std.mem.startsWith(u8, t, p)) return false;
+    return true;
 }
 
 fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, round: u32) []u8 {
@@ -6405,11 +6458,20 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
     }
 }
 
+/// The safety screen's token budget. A REASONING gateway model (deepseek-v4-flash, o-series, etc.) spends its
+/// completion budget on hidden reasoning FIRST, then the answer — at the old 120 the reasoning alone hit the cap
+/// (finish_reason "length"), the `content` verdict came back EMPTY, jsonSlice found no JSON, and screenPass
+/// fail-closed on EVERY publish: the first edition to ever clear the grounding gate was held "screen" purely
+/// because the verdict never fit. The screen is a rare (per-publish) call, so a generous budget that comfortably
+/// holds reasoning + the one-line JSON verdict is the right trade. Verified live: 120 -> empty content; 2048 ->
+/// {"ok":true,"reason":"…"} for the same post.
+const SCREEN_MAX_TOKENS: u32 = 2048;
+
 /// One safety-screen pass: ask the gateway model the `ssys` review about `suser`; returns ok. Logs the verdict.
 fn screenPass(w: *Worker, ssys: []const u8, suser: []const u8, round: u32) bool {
     const gpa = w.gpa;
     const S = struct { ok: bool = false, reason: []const u8 = "" };
-    const r = llm.chat(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, ssys, suser, 120);
+    const r = llm.chat(gpa, w.io, w.run_dir, "screen", w.gw_base, w.gw_key, w.gateway_model, ssys, suser, SCREEN_MAX_TOKENS);
     defer gpa.free(r.content);
     if (!r.ok) {
         w.act("engine", round, "screen", "screen: error", "review call failed — holding the edition");
