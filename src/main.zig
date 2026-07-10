@@ -27,7 +27,7 @@ const worker = @import("worker/run.zig");
 
 pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
-const VERSION = "0.2.0";
+const VERSION = "1.0.0";
 
 const ASSET_HTML = @embedFile("index.html");
 const ASSET_JS = @embedFile("app.js");
@@ -311,9 +311,18 @@ fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: 
     if (environ.get("NL_NO_DESKTOP")) |v| {
         if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;
     }
-    const bin = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
-    defer gpa.free(bin);
-    std.Io.Dir.cwd().access(io, bin, .{}) catch return; // not built → nothing to host
+    // Two layouts host the desktop: a release BUNDLE puts veil-desk right next to the server, and a
+    // dev CHECKOUT builds it under desk/zig-out/bin. Try the bundle path first, then the checkout path.
+    const bundle = std.fmt.allocPrint(gpa, "{s}/{s}", .{ home, DESK_EXE }) catch return;
+    defer gpa.free(bundle);
+    const checkout = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
+    defer gpa.free(checkout);
+    const bin = if (std.Io.Dir.cwd().access(io, bundle, .{})) |_|
+        bundle
+    else |_| if (std.Io.Dir.cwd().access(io, checkout, .{})) |_|
+        checkout
+    else |_|
+        return; // not built in either layout → nothing to host
     // Spawn and forget — it's an independent same-machine companion, not a child we manage.
     _ = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
     std.debug.print("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)\n", .{});

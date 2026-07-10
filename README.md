@@ -2,16 +2,41 @@
 
 # the veil
 
+<p>
+  <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
+  <img alt="version" src="https://img.shields.io/badge/release-v1.0.0-A8241B">
+  <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
+  <img alt="model" src="https://img.shields.io/badge/model-gary--neuron--emergent-6E4A27">
+  <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-31405C"></a>
+  <a href="https://github.com/gary23w/nl-veil/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/gary23w/nl-veil?style=social"></a>
+</p>
+
 **A hive mind you talk to.** A swarm of autonomous AI minds works a goal together — researching,
-building, remembering — while one unified consciousness, **the Veil**, integrates the
-whole hive into a single first-person "I" that speaks for it and steers it.
+building, remembering, **learning from its own mistakes** — while one unified consciousness, **the
+Veil**, integrates the whole hive into a single first-person "I" that speaks for it and steers it.
 
 It runs on **any model** — a free local one through Ollama, or a hosted/BYOK
-endpoint — and needs no cloud account and no database service. One Zig binary, one Python launcher.
+endpoint — and needs no cloud account and no database service. One Zig binary, one Python launcher,
+one optional native desktop.
+
+> ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
+> solo project — a star genuinely helps it reach the next person who'd get something out of it.
+
+**New in v1** — a native desktop dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that
+**keeps a playbook** and stops re-deriving fixes it already learned ([it learns](#it-learns)), and
+one-command **prebuilt binaries** for Windows, Linux, and macOS that launch the engine and the
+desktop together. Browse the annotated source as a case file at
+**[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
 
 ## Install
 
-One line. Python 3.9+ is the only thing you need first — the installer fetches the rest.
+**The easy way (v1):** grab the bundle for your OS from the
+[Releases page](https://github.com/gary23w/nl-veil/releases), unzip, and run the launcher — it starts
+the server and the desktop together. No Python, no toolchain, nothing to build. (Details in
+[Release — v1](#release--v1).)
+
+**Or one line from the network.** Python 3.9+ is the only thing you need first — the installer
+fetches and builds the rest.
 
 **macOS / Linux**
 ```sh
@@ -34,16 +59,52 @@ each with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` 
 binaries to skip the builds.
 </details>
 
-## Desktop mode (veil-desk)
+## The desktop — veil-desk
 
-The desktop dashboard is opt-in at the repo root. Default `zig build` and `zig build run` stay
-server-only.
+`veil-desk` is a native desktop dashboard (Zig + raylib, one window, no browser) that talks to the
+local server. It's where most people actually live: a **chat pane** with the Veil, a **swarm board**
+that shows every running hive round-by-round, and a **build console** you can drive by voice.
+
+- **Talk and it acts.** Ask a question, get a streamed answer. Ask it to *build* something and it
+  casts a hive, watches it, and folds the deliverables back into the conversation — with an
+  **auto-loop** that keeps a long build moving without you re-prompting each round.
+- **You see everything.** Live per-round fitness, the files each mind is writing, the tool calls, the
+  shared-memory writes — swarm work is transparent, not a spinner.
+- **It sits in the tray.** A system-tray icon and native toasts on Windows; it lights up the moment
+  the server has something to show.
+
+The prebuilt bundles (see [Releases](#release--v1)) launch the server **and** the desktop together —
+double-click and you're in. From source it's opt-in at the repo root (default `zig build` /
+`zig build run` stay server-only, so headless and CI boxes never touch raylib):
 
 ```sh
-zig build run -- --desk         # pass runtime flag directly
+zig build -Ddesk=true            # build the server AND veil-desk
+zig build run -- --desk          # run the server in desktop-host mode (spawns veil-desk)
 ```
 
-Set `NL_NO_DESKTOP=1` to force-disable desktop launch even when desktop mode is enabled.
+Set `NL_NO_DESKTOP=1` to force-disable the desktop launch even when desktop mode is enabled.
+
+## It learns
+
+The engine keeps a **playbook**: fixes it discovered by actually running commands on *this* machine.
+When a command fails and a later command in the same arc succeeds, that verified fail→fix transition
+is captured — *never* from the model's self-report, only from real exit codes — and recalled into
+future prompts, gated so only a lesson genuinely relevant to the current failure surfaces. The same
+fix stops being re-derived every session.
+
+That's one thread of a broader self-improvement loop, all built on verified traces rather than the
+model's own claims:
+
+- **A progress checkpoint**, rebuilt every round from the run's own tool records — what completed,
+  what's blocked, what's still pending — injected back into each mind's prompt with zero model calls.
+- **A background review pass** that reads the round's real tool trace out-of-band and mints
+  trace-grounded lessons and skills into the live hive.
+- **A smoke gate** that boots the deliverable and probes it, because passing tests are not a working
+  app — and a **judge** that grades the arc's ground-truth trace, not its self-narrative.
+- **Strengthen-only plasticity**: outcome feedback can reinforce a memory that keeps working, but it
+  can never *mint* one from a reward alone — so a finished goal can't be resurrected by its own signal.
+
+The engine stays a fixed floor. What it learns lives in memory, never in an `if` branch.
 
 ## Two commands to start
 
@@ -278,26 +339,46 @@ is hardcoded — the hub is transport + console; the behaviour still lives in ea
 deploy.py                  the launcher + the veil shell (configure / cast / list / stop / ...)
 hub.py                     the fleet hub: serve (receiver) / agent (callback) / console (operator)
 install.sh  install.ps1    one-command installers
+scripts/                   the release build scripts (build-release.sh / build-release.ps1)
 veil  veil.cmd             the `veil` front-door shim
-build.zig                  the Zig build
+build.zig                  the Zig build (server; -Ddesk=true also builds veil-desk)
 src/
   main.zig                 entry point + control plane (auth, supervisor, http)
   worker/                  the hive: the moment loop, the Veil, tools, memory bridge
+  worker/rsi.zig           the self-improvement faculties (review pass, lessons, skills)
   worker/locs/atlas.zig    the source atlas — points scouts at nl-rag packs
+desk/                      veil-desk, the native desktop dashboard (its own build.zig + raylib)
+docs/                      the annotated-source case file (a static site, home-built md parser)
 examples/embedded/         the device-operator worked example
 web/public/                the bundled control-plane UI
 bin/neuron[.exe]           the neuron-db memory engine (fetched + built on first run)
 ```
 
+## Release — v1
+
+Prebuilt bundles ship on the [Releases page](https://github.com/gary23w/nl-veil/releases) — one
+archive per platform, each containing the `veil` server **and** the `veil-desk` desktop, plus a
+launcher that starts both at once:
+
+| platform | archive | launch (starts server + desktop) |
+|---|---|---|
+| Windows x86-64 | `veil-v1.0.0-windows-x86_64.zip` | double-click `start.cmd` |
+| Linux x86-64 | `veil-v1.0.0-linux-x86_64.tar.gz` | `./start` |
+| macOS arm64 | `veil-v1.0.0-macos-arm64.tar.gz` | `./start` |
+
+No Python, no toolchain, no first-run build — the memory engine is bundled too. To roll your own
+(or cross-build every target at once), the release scripts wrap the whole thing:
+
+```sh
+scripts/build-release.sh            # this host's platform → dist/
+scripts/build-release.sh --all      # cross-compile win + linux + mac → dist/ (needs zig only)
+```
+```powershell
+scripts\build-release.ps1           # Windows bundle → dist\
+```
+
+Each run produces the platform archive in `dist/` with the two binaries, the launcher, and a README.
+
 ## License
 
 [MIT](LICENSE). Use it, fork it, build on it.
-
-
----
-
-### TODO:
-
-- nl-veil has **no built-in HTTPS client**. Every LLM completion, every streamed chat turn, every tool `POST` to the local server on `:8787`, and every web fetch is performed by **shelling out to `curl.exe`**. Microsoft Defender's real-time **behavior/ML monitoring** flags the self-built Zig binaries and their `curl` children for *what they do* — spawn `curl` to POST bearer-token JSON to `localhost:8787` and self-modify files — and **kills the running process**. Nothing is quarantined; the process is terminated externally. That is the whole story, and the exclusions in §1 resolve it.
-
-- The args the desktop sends to the server are {} — empty. So writeFile parses {}, gets path="", and safeRel("") correctly returns false → "bad path". safeRel is fine; the model isn't really sending a bad path. The desktop is failing to extract the tool-call arguments — it forwards an empty {} — so path and the entire file content are lost. The model then loops forever because it is sending {path:"index.html", content:"…"} but the server only ever sees {}.
