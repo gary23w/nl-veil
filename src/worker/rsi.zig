@@ -427,6 +427,88 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     w.emit("growth", std.fmt.bufPrint(&gbuf, ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
 }
 
+/// BACKGROUND REVIEW FORK — a per-round learning pass that runs OUT-OF-BAND from the building minds (its
+/// own gateway-model stream, inside the concurrent meta group) and is WHITELISTED to exactly two hive
+/// stores: verified LESSONS and reusable SKILLS. It reads THIS round's real tool TRACE (act executions
+/// with their real results — never a mind's self-report) and mints/patches trace-grounded lessons + skills
+/// into the LIVE scopes so the NEXT round's minds recall them. It is the counterpart to two neighbours:
+/// `roundRetrospective` steers from self-report (one playbook rule); `runJudge` grades the WHOLE run into
+/// QUARANTINE at the end. This fork fills the gap between them — trace-grounded learning that lands DURING
+/// the run and can outrank the deterministic `mintLesson` pairer's blind spots (a fix across different
+/// tools, or a SKILL a rising score proves). Safety is the same discipline runJudge uses: only where the
+/// trace PROVES a transition, never a negative/environment claim, dedup against what's already learned,
+/// and a hard cap so a chatty model can't flood the hive. Cost-bounded by the caller's cadence gate.
+/// Silent no-op when the trace is thin or the model is unreachable. General — no use-case branch.
+pub fn reviewFork(w: *Worker, goal: []const u8, round: u32, round_trace: []const u8) void {
+    const gpa = w.gpa;
+    if (round_trace.len < 120) { // nothing substantial happened to review
+        var sbuf: [64]u8 = undefined;
+        w.emit("review", std.fmt.bufPrint(&sbuf, ",\"round\":{d},\"minted\":0,\"trace\":{d}", .{ round, round_trace.len }) catch ",\"round\":0");
+        return;
+    }
+    const lessons = w.mem.list(tools.LESSON_SCOPE);
+    defer gpa.free(lessons);
+    const skills = w.mem.list(tools.SKILL_SCOPE);
+    defer gpa.free(skills);
+    const sys =
+        "You are the swarm's BACKGROUND REVIEWER, reading a TRACE of the tool actions a team of minds just took this round " ++
+        "(each row is a REAL execution with its REAL result — exit codes and error text live inside the result strings). " ++
+        "Never trust narration; extract learning ONLY where the trace itself proves it.\n" ++
+        "Output zero or more lines, nothing else:\n" ++
+        "LESSON: <one general operational lesson> | evidence: <the trace rows that prove it>\n" ++
+        "SKILL: <one class-level reusable procedure> | evidence: <proof>\n" ++
+        "If nothing qualifies, output exactly: NONE\n" ++
+        "STRICT RULES:\n" ++
+        "- propose ONLY where the trace shows a real failure fixed by a real change, or a technique that measurably worked;\n" ++
+        "- NEVER a negative claim about a tool ('X is broken', 'avoid Y') — refusals outlive the real problem;\n" ++
+        "- NEVER an environment-dependent failure (missing binary, unconfigured credential, server down) as a durable lesson;\n" ++
+        "- if retrying the SAME call worked, the learning is the retry pattern, not the failure;\n" ++
+        "- prefer PATCHING an existing lesson/skill into a more general form over minting a narrow duplicate;\n" ++
+        "- every proposal must be provable from the trace alone. Keep each to one line.";
+    const user = std.fmt.allocPrint(gpa,
+        \\Goal: {s}
+        \\
+        \\LESSONS ALREADY VERIFIED (patch/generalize rather than duplicate):
+        \\{s}
+        \\
+        \\SKILLS ALREADY KNOWN (do not restate):
+        \\{s}
+        \\
+        \\THIS ROUND'S TOOL TRACE (newest last):
+        \\{s}
+    , .{
+        if (goal.len > 0) clip(goal, 240) else "explore",
+        if (lessons.len > 0) clipTail(lessons, 700) else "(none yet)",
+        if (skills.len > 0) clipTail(skills, 500) else "(none yet)",
+        clip(round_trace, 5000),
+    }) catch return;
+    defer gpa.free(user);
+    const reply = llm.chat(gpa, w.io, w.run_dir, "review", w.gw_base, w.gw_key, w.gateway_model, sys, user, 360);
+    defer gpa.free(reply.content);
+    if (!reply.ok) return;
+    var minted: u32 = 0;
+    var rit = std.mem.splitScalar(u8, reply.content, '\n');
+    while (rit.next()) |raw| {
+        if (minted >= 2) break; // hard cap — a flood is noise, not learning
+        const pr = run.parseProposal(raw) orelse continue;
+        // LIVE scope: strip the "| evidence:" tail so the recalled entry is the clean lesson/skill only
+        // (the evidence proved it to the reviewer; the minds just need the rule). Mirrors acceptProposal.
+        const clean = run.proposalBody(pr.text);
+        if (clean.len < 12) continue;
+        const scope = if (pr.kind == 1) tools.SKILL_SCOPE else tools.LESSON_SCOPE;
+        const existing = if (pr.kind == 1) skills else lessons;
+        // dedup: skip if the head of this entry is already present in its live scope (prevents re-minting
+        // the same lesson every round it recurs in the trace — the desk's playbook-pollution failure class)
+        if (existing.len > 0 and std.mem.indexOf(u8, existing, clean[0..@min(clean.len, 28)]) != null) continue;
+        var ab: [640]u8 = undefined;
+        _ = w.mem.observe(scope, run.atomizeForObserve(&ab, clean));
+        w.act("review", round, if (pr.kind == 1) "skill" else "lesson", "", clean);
+        minted += 1;
+    }
+    var rbuf: [96]u8 = undefined;
+    w.emit("review", std.fmt.bufPrint(&rbuf, ",\"round\":{d},\"minted\":{d}", .{ round, minted }) catch ",\"round\":0");
+}
+
 /// END-OF-RUN JUDGE — the learning gate for durable promotion. Reads the run's TRACE (events.jsonl act
 /// rows: real tool executions with their real results, plus the engine's measured score rows — never the
 /// minds' monologues or "thinking" rows, which are self-report, and never the retrospective's own

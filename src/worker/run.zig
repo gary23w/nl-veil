@@ -255,6 +255,12 @@ pub const Worker = struct {
     gw_key: []const u8 = "",
     digest_str: []const u8 = "",
     state_str: []const u8 = "",
+    // STRUCTURED PROGRESS CHECKPOINT — a compact, engine-tracked ground-truth record of the LAST round
+    // (what tools succeeded, what is still blocked with its real error, what blueprint work is pending),
+    // rebuilt every round from the moments' own fail/ok records (never a model self-summary). Written in
+    // the single-threaded between-rounds section, read by the next round's parallel moments (same
+    // lifetime as state_str/digest_str). Injected in the VOLATILE tail of the user prompt.
+    checkpoint_str: []const u8 = "",
     plan_str: []const u8 = "",
     deps_str: []const u8 = "",
     incomplete_str: []const u8 = "",
@@ -626,6 +632,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     defer if (w.kindex_str.len > 0) gpa.free(@constCast(w.kindex_str));
     defer if (w.digest_str.len > 0) gpa.free(@constCast(w.digest_str));
     defer if (w.state_str.len > 0) gpa.free(@constCast(w.state_str));
+    defer if (w.checkpoint_str.len > 0) gpa.free(@constCast(w.checkpoint_str));
     defer if (w.plan_str.len > 0) gpa.free(@constCast(w.plan_str));
     defer if (w.deps_str.len > 0) gpa.free(@constCast(w.deps_str));
     defer if (w.incomplete_str.len > 0) gpa.free(@constCast(w.incomplete_str));
@@ -1126,6 +1133,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         const round_posture = dominantPosture(results[0..minds.items.len]);
 
         var retro_in: std.ArrayListUnmanaged(u8) = .empty;
+        // The round's real TOOL TRACE (not self-report), captured before the per-moment trace frees below —
+        // fed to the background review fork (#4) so its learning is grounded in what actually executed.
+        var trace_in: std.ArrayListUnmanaged(u8) = .empty;
         var any_llm_ok = false;
         var any_llm_fatal = false;
         for (minds.items, 0..) |*mi, i| {
@@ -1140,6 +1150,29 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 defer gpa.free(ln);
                 retro_in.appendSlice(gpa, ln) catch {};
             } else |_| {}
+            // Build the review trace from the moment's OWN fail/ok records — they carry the tool, the args,
+            // and (for fails) the real error NOTE, which the bare tool-name list in moment.trace does not.
+            // This is the grounded transition signal reviewFork learns from (a fail's error → a later fix).
+            if (trace_in.items.len < 10000) {
+                var fi: usize = 0;
+                while (fi < moment.fail_n) : (fi += 1) {
+                    const f = &moment.fails[fi];
+                    if (f.tool_len == 0) continue;
+                    if (std.fmt.allocPrint(gpa, "[{s}] FAIL {s} {s} — {s}\n", .{ mi.name, f.toolStr(), clip(f.argsStr(), 120), if (f.note_len > 0) f.noteStr() else "failed" })) |tl| {
+                        defer gpa.free(tl);
+                        trace_in.appendSlice(gpa, tl) catch {};
+                    } else |_| {}
+                }
+                var oi: usize = 0;
+                while (oi < moment.ok_n) : (oi += 1) {
+                    const ok = &moment.oks[oi];
+                    if (ok.tool_len == 0) continue;
+                    if (std.fmt.allocPrint(gpa, "[{s}] OK {s} {s}\n", .{ mi.name, ok.toolStr(), clip(ok.argsStr(), 120) })) |tl| {
+                        defer gpa.free(tl);
+                        trace_in.appendSlice(gpa, tl) catch {};
+                    } else |_| {}
+                }
+            }
             if (mi.scout and moment.skills == 0 and moment.files == 0)
                 _ = w.mem.observe(mi.scope, "scout: found no new external technique this round; team proceeds with current knowledge");
             applyLessonRecords(&w, round, &moment); // cross-mind/cross-round fail→fix pairing (single-threaded here)
@@ -1165,6 +1198,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.emit("growth", growth);
         }
 
+        // STRUCTURED CHECKPOINT (#3): rebuild the ground-truth ledger from this round's moments (their
+        // fixed-buffer oks/fails survive the trace frees above). Read by next round's minds in the tail.
+        if (live and !w.discourse) buildCheckpoint(&w, results[0..minds.items.len], round, total_files);
         w.drainMessages();
         const bd = commons.board(gpa, io, run_dir);
         w.emit("board", std.fmt.allocPrint(w.a(), ",\"done\":{d},\"open\":{d},\"files\":{d},\"bytes\":0,\"round\":{d}", .{ bd.done, bd.open, total_files, round }) catch ",\"round\":0");
@@ -1343,6 +1379,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             var mgrp: std.Io.Group = .init;
             if (live and !w.quick and govRecovery(w.gov_lvl, round))
                 mgrp.concurrent(io, rsi.roundRetrospective, .{ &w, goal, round, retro_in.items, w.last_bench }) catch rsi.roundRetrospective(&w, goal, round, retro_in.items, w.last_bench);
+            // BACKGROUND REVIEW FORK (#4): trace-grounded lessons+skills into the LIVE hive, out-of-band from
+            // the building minds. It is RECOVERY-class meta (durable learning that lifts the swarm), the LLM
+            // counterpart to the always-on deterministic mintLesson — so it gates on govRecovery (which keeps
+            // round 1 + even rounds alive even under crunch, unlike govReflective observability), NOT on the
+            // reflective on/off. Runs on QUICK casts too (mintLesson is ungated); skipped in discourse/operate
+            // (no build trace). Cost-disciplined: DIGEST_EVERY cadence, so ~one gateway call every few rounds.
+            if (live and !w.discourse and !w.operating and govRecovery(w.gov_lvl, round) and (round == 1 or @mod(round, DIGEST_EVERY) == 0 or w.stop_now))
+                mgrp.concurrent(io, rsi.reviewFork, .{ &w, goal, round, trace_in.items }) catch rsi.reviewFork(&w, goal, round, trace_in.items);
             if (live and w.breakout_on and w.gov_lvl < 2 and (round == 1 or @mod(round, 2) == 0))
                 mgrp.concurrent(io, agi.detectEmotionalFlare, .{ &w, minds.items, goal, round, retro_in.items, prev_pct }) catch agi.detectEmotionalFlare(&w, minds.items, goal, round, retro_in.items, prev_pct);
             if (live and w.psyche_on and govReflective(w.gov_lvl, round))
@@ -1362,6 +1406,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and !w.discourse and (w.blueprint.len > 0 or w.operating) and round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) capabilityGrowth(&w, goal, round);
         if (live and !w.discourse and w.plan_str.len > 0 and ((round > 1 and @mod(round, PLAN_EVERY) == 0 and w.gov_lvl < 2) or w.stop_now)) revisePlan(&w, goal, round);
         retro_in.deinit(gpa);
+        trace_in.deinit(gpa);
 
         if (live and !w.quick and (w.gov_lvl < 2 or w.stop_now) and (round == 1 or round % VEIL_EVERY == 0 or w.stop_now)) agi.veilReflect(&w, goal, round);
 
@@ -2065,6 +2110,14 @@ pub fn atomizeForObserve(buf: []u8, text: []const u8) []const u8 {
     return buf[0..n];
 }
 
+/// A judge/review proposal's LESSON/SKILL body, stripped of its "| evidence: …" tail and trimmed — the
+/// clean rule the minds should recall, without the proof that justified it to the reviewer. Used when a
+/// proposal is promoted into a LIVE scope (reviewFork), mirroring the desk's acceptProposal. Pure.
+pub fn proposalBody(text: []const u8) []const u8 {
+    const cut = std.mem.indexOf(u8, text, "| evidence:") orelse text.len;
+    return std.mem.trim(u8, text[0..cut], " \t");
+}
+
 /// Between-rounds lesson pairing (single-threaded by design): pair this moment's clean executions against
 /// the swarm's stashed failure — ANY mind's later similar success closes ANY mind's earlier failure (one
 /// hive mind) — then stash this moment's newest unpaired failure for the rounds ahead. In-moment pairs
@@ -2115,6 +2168,103 @@ pub fn parseProposal(raw: []const u8) ?Proposal {
     if (ev < 16) return null; // no real lesson before the marker
     if (std.mem.trim(u8, text[ev + "| evidence:".len ..], " \t.").len < 8) return null; // empty proof
     return .{ .kind = kind, .text = text };
+}
+
+/// STRUCTURED PROGRESS CHECKPOINT (deterministic — zero model calls). Rebuilt every round from the
+/// moments' OWN tool records, this is the hermes-style compaction: instead of a vague model summary, a
+/// fixed-shape ground-truth ledger the next round's minds read — what tool actions LANDED, what is still
+/// BLOCKED with its real error, and which blueprint files are still PENDING. Grounded (nothing here is a
+/// mind's self-report), general (no use-case branch — it just reflects the recorded fails/oks), and free.
+/// A failure whose tool a later ok this round re-ran is treated as RESOLVED and omitted, so the block
+/// carries only still-open work. Writes w.checkpoint_str; caller injects it in the volatile prompt tail.
+fn buildCheckpoint(w: *Worker, results: []const Moment, round: u32, total_files: u32) void {
+    const gpa = w.gpa;
+    var cp: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer cp.deinit(gpa);
+    cp.appendSlice(gpa, "PROGRESS CHECKPOINT — engine-recorded ground truth from the last round (trust this over any summary):\n") catch return;
+
+    // COMPLETED — distinct tool actions that succeeded, deduped by tool+args so N minds writing the same
+    // file collapse to one line. A bounded numbered list in the hermes [tool:name] shape.
+    var done: std.ArrayListUnmanaged(u8) = .empty;
+    defer done.deinit(gpa);
+    var done_n: u32 = 0;
+    for (results) |*r| {
+        var oi: usize = 0;
+        while (oi < r.ok_n and done_n < 8) : (oi += 1) {
+            const ok = &r.oks[oi];
+            if (ok.tool_len == 0) continue;
+            var key: [80]u8 = undefined;
+            const k = std.fmt.bufPrint(&key, "{s}|{s}", .{ ok.toolStr(), clip(ok.argsStr(), 48) }) catch continue;
+            if (std.mem.indexOf(u8, done.items, k) != null) continue; // already listed (another mind)
+            done.appendSlice(gpa, k) catch break;
+            done.append(gpa, '\n') catch break;
+            done_n += 1;
+        }
+    }
+    if (done_n > 0) {
+        cp.appendSlice(gpa, "COMPLETED (tool actions that landed):\n") catch {};
+        var dit = std.mem.splitScalar(u8, std.mem.trimEnd(u8, done.items, "\n"), '\n');
+        var i: u32 = 1;
+        while (dit.next()) |ln| : (i += 1) {
+            const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
+            cp.print(gpa, "  {d}. [tool:{s}] {s}\n", .{ i, ln[0..bar], ln[bar + 1 ..] }) catch break;
+        }
+    }
+
+    // BLOCKED — failures whose tool NO ok this round re-ran (still open). Real error note included.
+    var blocked_n: u32 = 0;
+    for (results) |*r| {
+        var fi: usize = 0;
+        while (fi < r.fail_n and blocked_n < 6) : (fi += 1) {
+            const f = &r.fails[fi];
+            if (f.tool_len == 0) continue;
+            var resolved = false;
+            for (results) |*r2| {
+                var oi: usize = 0;
+                while (oi < r2.ok_n) : (oi += 1) {
+                    if (std.mem.eql(u8, r2.oks[oi].toolStr(), f.toolStr())) {
+                        resolved = true;
+                        break;
+                    }
+                }
+                if (resolved) break;
+            }
+            if (resolved) continue;
+            if (blocked_n == 0) cp.appendSlice(gpa, "BLOCKED (real errors — resolve these):\n") catch {};
+            cp.print(gpa, "  - [tool:{s}] {s} — {s}\n", .{ f.toolStr(), clip(f.argsStr(), 60), if (f.note_len > 0) f.noteStr() else "failed" }) catch break;
+            blocked_n += 1;
+        }
+    }
+
+    // PENDING — blueprint files not yet in the build manifest. STALE-labeled unbuilt work.
+    if (w.blueprint.len > 0) {
+        var pending: std.ArrayListUnmanaged(u8) = .empty;
+        defer pending.deinit(gpa);
+        var pend_n: u32 = 0;
+        var bit = std.mem.splitScalar(u8, w.blueprint, '\n');
+        while (bit.next()) |bl| {
+            if (pend_n >= 10) break;
+            const bp = bpPath(bl) orelse continue;
+            if (slotIsBuilt(w, bp)) continue;
+            if (std.mem.indexOf(u8, pending.items, bp) != null) continue;
+            if (pend_n > 0) pending.appendSlice(gpa, ", ") catch break;
+            pending.appendSlice(gpa, bp) catch break;
+            pend_n += 1;
+        }
+        if (pend_n > 0) {
+            cp.appendSlice(gpa, "PENDING (blueprint files not yet built): ") catch {};
+            cp.appendSlice(gpa, pending.items) catch {};
+            cp.append(gpa, '\n') catch {};
+        }
+    }
+
+    if (done_n == 0 and blocked_n == 0 and total_files == 0)
+        cp.appendSlice(gpa, "(no tool actions landed last round — take a concrete build/verify step this round)\n") catch {};
+
+    if (w.checkpoint_str.len > 0) gpa.free(@constCast(w.checkpoint_str));
+    w.checkpoint_str = cp.toOwnedSlice(gpa) catch "";
+    var cbuf: [64]u8 = undefined;
+    w.emit("checkpoint", std.fmt.bufPrint(&cbuf, ",\"round\":{d},\"done\":{d},\"blocked\":{d},\"bytes\":{d}", .{ round, done_n, blocked_n, w.checkpoint_str.len }) catch ",\"round\":0");
 }
 
 /// Mint one VERIFIED lesson from a real fail→fix transition. Deterministic — zero model calls; the only
@@ -3547,7 +3697,14 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(map_str);
     // Same stable-prefix discipline as fullsys: the per-run-stable goal + intent lead, and the
     // volatile blocks (veil/dream, live host telemetry, voice, clock, round counter) follow them.
-    const fulluser = std.fmt.allocPrint(gpa, "Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\n{s}{s}Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.{s}", .{ if (goal.len > 0) goal else "explore something interesting", intent_str, veil_inject, host_inject, voice, date_clause, lane_clause, scout_clause, playbook_clause, dissent_clause, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)", fence_clause }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
+    // The engine's ground-truth checkpoint (#3) rides the volatile tail, right after the file tree — it is
+    // the ACTION complement to the tree: what landed / what's blocked / what's pending, deterministically.
+    const checkpoint_block = if (w.checkpoint_str.len > 0)
+        std.fmt.allocPrint(gpa, "\n{s}", .{clip(w.checkpoint_str, scaledClip(w, 1000))}) catch (gpa.dupe(u8, "") catch @constCast(""))
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(checkpoint_block);
+    const fulluser = std.fmt.allocPrint(gpa, "Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\n{s}{s}Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.{s}", .{ if (goal.len > 0) goal else "explore something interesting", intent_str, veil_inject, host_inject, voice, date_clause, lane_clause, scout_clause, playbook_clause, dissent_clause, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, checkpoint_block, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)", fence_clause }) catch (gpa.dupe(u8, "Take a step.") catch unreachable);
     defer gpa.free(fulluser);
     const research_clause = if (fence_build)
         "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action EMITTING your file's FULL content as the fenced code block described below (read_file first ONLY if it already exists). Match any example's shape and quality."
@@ -3556,7 +3713,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}\nPROGRESS: {s}\nToday is {s}.\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, slot, know_block, exports_block, demand_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", score_str, if (w.now_str.len > 0) w.now_str else "the current date", phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}{s}\nPROGRESS: {s}\nToday is {s}.\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, slot, know_block, exports_block, demand_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", checkpoint_block, score_str, if (w.now_str.len > 0) w.now_str else "the current date", phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch unreachable)
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -9304,6 +9461,15 @@ test "mind floor: parseProposal demands the evidence tail" {
     try std.testing.expect(parseProposal("SKILL: boot the server then curl the probe url before declaring the build live | evidence: score row r7").?.kind == 1);
     try std.testing.expect(parseProposal("LESSON: a plausible narrow rule with no grounding at all") == null);
     try std.testing.expect(parseProposal("NONE") == null);
+}
+
+test "reviewFork: proposalBody strips the evidence tail into the clean rule the minds recall" {
+    // the parsed LESSON/SKILL text carries the evidence that convinced the reviewer; the LIVE hive entry
+    // must be only the rule (reviewFork promotes proposalBody, not the raw proposal).
+    const pr = parseProposal("LESSON: pass a full path to write_file under app/ | evidence: act rows 12-14, exit=1 then exit=0").?;
+    try std.testing.expectEqualStrings("pass a full path to write_file under app/", proposalBody(pr.text));
+    // a body with no evidence marker (shouldn't happen post-parse, but be robust) returns itself, trimmed
+    try std.testing.expectEqualStrings("boot then probe", proposalBody("boot then probe  "));
 }
 
 test "mind floor: isMutatingEngineTool errs toward mutating (authored/unknown tools count)" {
