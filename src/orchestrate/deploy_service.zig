@@ -40,6 +40,11 @@ const DeployReq = struct {
     gap_assess: bool = true,
     breakout: bool = false,
     observe_psyche: bool = false,
+    // NEWS DESK — when true the swarm runs in discourse mode and composes a grounded, screened briefing each
+    // round; `post` (default on) additionally publishes it to a public Telegraph page. Both were Manifest
+    // fields the worker read but no request ever wrote, so Telegraph publishing was unreachable from the API.
+    publish: bool = false,
+    post: bool = true,
     // CAST marker — set by the /cast path (quick strike AND sustained "continuous" casts) so the worker
     // terminates at completed/graduated instead of evolveGoal-chaining to a new self-chosen goal. A plain
     // /deploy or /run swarm leaves it false and keeps the full autonomy chain.
@@ -212,6 +217,12 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     try mani.appendSlice(app.gpa, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
     if (body.breakout) try mani.appendSlice(app.gpa, ",\"breakout\":true");
     if (body.observe_psyche) try mani.appendSlice(app.gpa, ",\"observe_psyche\":true");
+    // NEWS DESK dials — publish gates the discourse/briefing path; post gates the actual Telegraph egress
+    // (default on, so "publish without post" is grounded-and-screened-to-disk only). Only emit when publishing.
+    if (body.publish) {
+        try mani.appendSlice(app.gpa, ",\"publish\":true");
+        try mani.appendSlice(app.gpa, if (body.post) ",\"post\":true" else ",\"post\":false");
+    }
     // the worker's terminate-don't-chain gate (a sustained cast is mode="continuous", so mode can't carry it)
     if (body.cast) try mani.appendSlice(app.gpa, ",\"cast\":true");
     if (body.files.len > 0) {
@@ -374,6 +385,8 @@ const CastReq = struct {
     mode: []const u8 = "", // "" / "cast" = fast one-shot strike; "continuous" = a sustained long-term hivemind
     dir: []const u8 = "", // chat conversation id → build IN that chat's dir (so the cast + chat share files)
     files: []const u8 = "", // DECLARED deliverables (comma/newline separated) — adopted verbatim as the blueprint
+    publish: bool = false, // NEWS DESK: run as a research/briefing cast that posts a grounded, screened page to Telegraph
+    post: bool = true, //     when publishing, actually post to Telegraph (false = grounded-and-screened to disk only)
 };
 
 /// Count the entries in a comma/newline-separated declared-deliverables list (the workload-floor input).
@@ -457,6 +470,9 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // instead of chaining to a new self-chosen goal — the caller is waiting to collect.
         .cast = true,
         .files = rq.files,
+        // NEWS DESK: a publish cast runs discourse-mode (grounded briefing) and, with post on, posts to Telegraph.
+        .publish = rq.publish,
+        .post = rq.post,
         .minds = minds,
     };
     // Build IN the chat's conversation dir when the caller named one, so the hive's `{run_dir}/work` is the SAME

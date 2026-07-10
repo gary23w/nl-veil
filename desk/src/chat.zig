@@ -51,6 +51,9 @@ const CAST_POLICY_SPEED =
     "workdir, e.g. FILES: docs/desk/chat.zig.md, docs/desk/main.zig.md). YOU reason out the exact list from " ++
     "the user's ask — the swarm is assigned and graded on precisely these files, so a declared list is the " ++
     "difference between a hive that ships the deliverables and one that wanders. Omit for pure research.\n" ++
+    "  PUBLISH     — NEWS DESK mode: the hive researches, writes a grounded, source-cited thesis, safety-screens " ++
+    "it, and POSTS it to a public Telegraph page (URL returned). Use ONLY when the user asks to publish/post " ++
+    "publicly; it is research, so don't pair it with FILES.\n" ++
     "After the config you may add a short note to the user. Only one cast runs at a time.\n" ++
     "ALWAYS CAST when the user explicitly asks you to — 'cast a swarm', 'run the hive', 'spin up a swarm': an " ++
     "explicit request is a command, even for a build (it will be time-capped).\n" ++
@@ -76,6 +79,10 @@ const CAST_POLICY_AUTONOMY =
     "  FILES: <p1>, <p2>, ... — when the job PRODUCES files, DECLARE every output path (relative to the " ++
     "workdir). YOU reason out the exact list from the user's ask — the swarm is assigned and graded on " ++
     "precisely these files. Omit it only for pure research with no file deliverables.\n" ++
+    "  PUBLISH     — NEWS DESK mode: the hive researches on the web, composes a grounded, source-cited " ++
+    "briefing/thesis, has it safety-screened, and POSTS it to a public Telegraph page (you get the URL back). " ++
+    "Use it ONLY when the user asks to publish/post the findings publicly. It is research, so do NOT also " ++
+    "declare FILES with it.\n" ++
     "Example — a real build:  CAST: build a complete Flask REST API with auth, 5 endpoints, tests, and a README\\n" ++
     "MINDS 8\\nLONG\\nMINUTES 30\\nFILES: app.py, auth.py, routes.py, tests/test_api.py, README.md .  Match the " ++
     "size + posture to the target; a cast is you loading a swarm and " ++
@@ -2339,8 +2346,10 @@ pub const Chat = struct {
                     else => .user,
                 },
             };
-            const tn = @min(t.len, m.text.len);
-            @memcpy(m.text[0..tn], t[0..tn]);
+            // heal transcripts written by an older stripper that stranded a fenced tool-call opener
+            const tt = if (m.role == .veil) trimDanglingToolFence(t) else t;
+            const tn = @min(tt.len, m.text.len);
+            @memcpy(m.text[0..tn], tt[0..tn]);
             m.text_len = @intCast(tn);
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
@@ -2942,7 +2951,7 @@ pub const Chat = struct {
                     // for an action it never chose). A kill still recovers when the USER asked for one.
                     if (std.mem.eql(u8, lt.name, "kill_swarm") and !userWantsKill(self.last_user[0..self.last_user_len])) break :blk_loose null;
                     break :blk_loose lt;
-                } else null) orelse toolCallJsonInferred(full) orelse blk: {
+                } else null) orelse toolCallFenced(full) orelse toolCallJsonInferred(full) orelse blk: {
                 // observed live: "cast a swarm to finish the two-page site" answered with a pasted
                 // index.html, this rescue synthesized a write_file, and the veil silently self-built
                 // for the rest of the arc while the hive never existed — the cast recovery owns this
@@ -3964,7 +3973,10 @@ pub const Chat = struct {
                 w.writeAll("\",\"files\":\"") catch break :blk false;
                 wesc(&w, spec.files);
             }
-            w.writeAll("\",\"goal\":\"") catch break :blk false;
+            // Close the preceding string value, insert publish (a BARE bool, not a quoted string — so its
+            // separator differs from the string keys), then open goal. NEWS DESK: a publish cast runs as a
+            // grounded research/briefing hive that posts its screened thesis to Telegraph.
+            w.writeAll(if (spec.publish) "\",\"publish\":true,\"goal\":\"" else "\",\"goal\":\"") catch break :blk false;
             wesc(&w, goal);
             w.writeAll("\"}") catch break :blk false;
             break :blk true;
@@ -4805,7 +4817,7 @@ pub fn castGoal(full: []const u8) ?[]const u8 {
 
 /// The AI's full cast "payload": the goal + how many minds to line up + quick-strike vs a sustained
 /// (continuous) hivemind + a time budget. This is the AI loading + configuring its swarm before it fires.
-pub const CastSpec = struct { goal: []const u8, minds: u32 = 0, long: bool = false, minutes: u32 = 0, files: []const u8 = "" };
+pub const CastSpec = struct { goal: []const u8, minds: u32 = 0, long: bool = false, minutes: u32 = 0, files: []const u8 = "", publish: bool = false };
 
 fn uintAfter(line: []const u8, key: []const u8) ?u32 {
     const rest = std.mem.trim(u8, line[key.len..], " :\t=");
@@ -4837,6 +4849,8 @@ pub fn parseCastSpec(full: []const u8) ?CastSpec {
         } else if (std.mem.startsWith(u8, line, "FILES")) {
             const v = std.mem.trim(u8, line["FILES".len..], " :\t=");
             if (v.len > 0) spec.files = v;
+        } else if (std.mem.eql(u8, line, "PUBLISH") or std.mem.startsWith(u8, line, "PUBLISH ")) {
+            spec.publish = true; // NEWS DESK: the hive posts a grounded, screened briefing to Telegraph
         } else if (std.mem.eql(u8, line, "LONG") or std.mem.startsWith(u8, line, "LONG ") or std.mem.eql(u8, line, "CONTINUOUS")) {
             spec.long = true;
         }
@@ -5090,6 +5104,14 @@ fn looksTruncatedWrite(text: []const u8) bool {
         // never closed (string-aware) + substantial = a big write cut off mid-content
         if (jsonObjEnd(text, astart) == null and (text.len - astart) > 400) return true;
     }
+    // the fenced dialect truncates the same way: ```tool: write_file args that opened but never closed
+    if (toolCallFencedAt(text)) |fc| {
+        if (std.mem.eql(u8, fc.name, "write_file") or std.mem.eql(u8, fc.name, "edit_file")) {
+            if (fc.open) |astart| {
+                if (jsonObjEnd(text, astart) == null and (text.len - astart) > 400) return true;
+            }
+        }
+    }
     return false;
 }
 
@@ -5144,11 +5166,31 @@ pub fn stripToolTail(text: []const u8) []const u8 {
     if (findToolCall(text)) |f| cut = @min(cut, f.at);
     if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
     if (bareToolTagAt(text)) |p| cut = @min(cut, p); // bare `<edit_file>{...}` XML tool tag
+    // fenced dialect (```tool: write_file / write_file({...})) — cut at the FENCE so neither the opener nor
+    // the `name(` wrapper strand in the display. Matches even while the args are still streaming (open == args
+    // unclosed), same live behavior as a leading TOOL: line.
+    if (toolCallFencedAt(text)) |fc| cut = @min(cut, fc.at);
     if (toolCallJsonInferred(text)) |jc| { // bare ```json {...}``` tool-args block (deepseek) — strip it + its fence
         const at = @intFromPtr(jc.args.ptr) - @intFromPtr(text.ptr);
         var c = at;
-        if (std.mem.lastIndexOf(u8, text[0..at], "```")) |f| {
-            if (at - f <= 12) c = f; // a ```json fence right before the block
+        // back over a bare `write_file({...})` function-call wrapper so `write_file(` can't strand
+        {
+            var j = c;
+            while (j > 0 and (text[j - 1] == ' ' or text[j - 1] == '\t')) j -= 1;
+            if (j > 0 and text[j - 1] == '(') {
+                var k = j - 1;
+                while (k > 0 and (std.ascii.isAlphanumeric(text[k - 1]) or text[k - 1] == '_')) k -= 1;
+                if (k < j - 1) c = k;
+            }
+        }
+        // a TAGGED fence header line directly above (```json, ```tool: name) is the block's OPENER — eat it
+        // too. A bare ``` line stays: that's a previous block's closer.
+        {
+            var j = c;
+            while (j > 0 and (text[j - 1] == ' ' or text[j - 1] == '\t' or text[j - 1] == '\r' or text[j - 1] == '\n')) j -= 1;
+            const ls = if (std.mem.lastIndexOfScalar(u8, text[0..j], '\n')) |nl| nl + 1 else 0;
+            const line = std.mem.trim(u8, text[ls..j], " \t\r");
+            if (line.len > 3 and std.mem.startsWith(u8, line, "```")) c = ls;
         }
         cut = @min(cut, c);
     }
@@ -5350,6 +5392,96 @@ pub fn toolCallJsonInferred(text: []const u8) ?ToolCall {
         return .{ .name = name, .args = args };
     }
     return null;
+}
+
+const FencedCall = struct { name: []const u8, args: []const u8, at: usize, open: ?usize };
+
+/// Some models emit a tool call as a FENCED block whose info string names the tool —
+///     ```tool: write_file
+///     write_file({"path":"static/index.html","content":"..."})
+///     ```
+/// (the `name(` function wrapper is optional; the args may open directly with '{'; a `tool_code`-style
+/// header carries no name, the wrapper then owns it). No named parser spoke this dialect, so the call only
+/// dispatched when the args' KEYS were inferable (toolCallJsonInferred) — and the display stripper cut at
+/// the args '{', stranding the fence header + `write_file(` as a broken unclosed code block in the chat
+/// (the observed neuronet-build artifact, persisted into the transcript). Name from the fence header,
+/// falling back to the wrapper; args = the first balanced JSON object in the body. Mirrors findToolCall's
+/// truncation contract: args that OPEN but never close still return the call with "{}" (`open` says where),
+/// so the oversized-write chunked-append rescue can own it. `at` = the fence opener, for the stripper.
+fn toolCallFencedAt(text: []const u8) ?FencedCall {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, "```tool")) |p| {
+        search = p + "```tool".len;
+        if (p > 0 and text[p - 1] != '\n') continue; // a fence opens at a line start
+        var i = p + "```tool".len;
+        var name: []const u8 = "";
+        if (i < text.len and (text[i] == ':' or text[i] == ' ' or text[i] == '\t')) {
+            // `tool: <name>` header — the name is the next token
+            while (i < text.len and (text[i] == ':' or text[i] == ' ' or text[i] == '\t')) i += 1;
+            const nstart = i;
+            while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\r' and text[i] != '\n') i += 1;
+            name = std.mem.trim(u8, text[nstart..i], " \t`");
+        } // else `tool_code`/`tools` style tag — no name here, the body wrapper owns it
+        while (i < text.len and text[i] != '\n') i += 1; // to the end of the header line
+        if (i < text.len) i += 1;
+        // body: an optional `ident(` function-call wrapper, then the args object
+        var j = i;
+        while (j < text.len and (text[j] == ' ' or text[j] == '\t' or text[j] == '\r' or text[j] == '\n')) j += 1;
+        const wstart = j;
+        while (j < text.len and (std.ascii.isAlphanumeric(text[j]) or text[j] == '_')) j += 1;
+        if (j > wstart and j < text.len and text[j] == '(') {
+            if (name.len == 0) name = text[wstart..j];
+            j += 1;
+        } else j = wstart;
+        if (!snakeToolName(name)) continue; // a ```tool fence quoting prose, or no recoverable name
+        while (j < text.len and (text[j] == ' ' or text[j] == '\t' or text[j] == '\r' or text[j] == '\n')) j += 1;
+        var args: []const u8 = "{}";
+        var open: ?usize = null;
+        if (j < text.len and text[j] == '{') {
+            open = j;
+            if (jsonObjEnd(text, j)) |end| {
+                if (end > j + 1) args = text[j..end];
+            } // unclosed = a big write cut off mid-content; "{}" lets the chunked-append rescue own it
+        }
+        return .{ .name = name, .args = args, .at = p, .open = open };
+    }
+    return null;
+}
+
+/// The dispatcher's view of toolCallFencedAt: name + args of the first fenced-dialect call, or null.
+pub fn toolCallFenced(text: []const u8) ?ToolCall {
+    const f = toolCallFencedAt(text) orelse return null;
+    return .{ .name = f.name, .args = f.args };
+}
+
+/// A veil message persisted by an OLDER build can END with the stranded residue of a fenced tool call
+/// ("...\n```tool: write_file\nwrite_file(") — the pre-fix stripper cut at the args '{' and left the opener
+/// behind, so the transcript renders a broken empty code block forever. Trim that trailing residue at load
+/// (the next persist rewrites the file clean). Only an UNCLOSED trailing ```tool fence whose body is at most
+/// a dangling `ident(` wrapper is touched — a closed fence or one with real content after it stays.
+fn trimDanglingToolFence(text: []const u8) []const u8 {
+    const p = std.mem.lastIndexOf(u8, text, "```tool") orelse return text;
+    if (p > 0 and text[p - 1] != '\n') return text;
+    const rest = text[p..];
+    if (std.mem.indexOfPos(u8, rest, 3, "```") != null) return text; // the fence closes — a legit block
+    var it = std.mem.splitScalar(u8, rest, '\n');
+    _ = it.next(); // the ```tool header line itself
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \t\r");
+        if (ln.len == 0) continue;
+        if (ln.len < 48 and ln[ln.len - 1] == '(') { // a lone stranded `name(` wrapper
+            var ident = true;
+            for (ln[0 .. ln.len - 1]) |ch| {
+                if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) {
+                    ident = false;
+                    break;
+                }
+            }
+            if (ident) continue;
+        }
+        return text; // real content after the opener — not the residue
+    }
+    return std.mem.trimEnd(u8, text[0..p], " \r\n\t");
 }
 
 /// First path segment ("app/models.py" -> "app", "app.py" -> "app.py"); leading "./" and "/" tolerated.
@@ -6551,6 +6683,13 @@ pub fn castSpecFromUser(msg: []const u8, goal: []const u8) CastSpec {
     for (0..n) |i| lower[i] = std.ascii.toLower(msg[i]);
     const lo = lower[0..n];
     if (hasWord(lo, "long") or hasWord(lo, "sustained") or hasWord(lo, "continuous")) spec.long = true;
+    // NEWS DESK intent: the user asked the hive to publish/post its findings to Telegraph. The publish path
+    // is grounded + double-screened server-side, so a false positive can only surface a held (unpublished)
+    // edition, never an unvetted post — bias toward detecting the ask.
+    if (std.mem.indexOf(u8, lo, "telegraph") != null or hasWord(lo, "publish") or
+        std.mem.indexOf(u8, lo, "post it") != null or std.mem.indexOf(u8, lo, "post its") != null or
+        std.mem.indexOf(u8, lo, "post publicly") != null or std.mem.indexOf(u8, lo, "post the") != null)
+        spec.publish = true;
     spec.minds = numberBefore(lo, "mind");
     spec.minutes = numberBefore(lo, "minute");
     return spec;
@@ -6700,6 +6839,61 @@ fn wesc(w: *Io.Writer, s: []const u8) void {
             i += n;
         }
     }
+}
+
+test "fenced tool-call dialect: name from the fence header or the function wrapper, args exact" {
+    // the observed neuronet-build form: ```tool: name header + name({...}) wrapper (braces in content)
+    const a = toolCallFenced("Writing the feed UI now.\n\n```tool: write_file\nwrite_file({\"path\":\"static/index.html\",\"content\":\"body{margin:0}\"})\n```").?;
+    try std.testing.expectEqualStrings("write_file", a.name);
+    try std.testing.expectEqualStrings("{\"path\":\"static/index.html\",\"content\":\"body{margin:0}\"}", a.args);
+    // args directly after the header — no wrapper
+    const b = toolCallFenced("```tool: read_file\n{\"path\":\"src/main.rs\"}\n```").?;
+    try std.testing.expectEqualStrings("read_file", b.name);
+    try std.testing.expectEqualStrings("{\"path\":\"src/main.rs\"}", b.args);
+    // tool_code-style tag carries no name — the wrapper owns it
+    const c = toolCallFenced("```tool_code\nlist_dir({\"path\":\".\"})\n```").?;
+    try std.testing.expectEqualStrings("list_dir", c.name);
+    // quoted protocol prose in a tool fence — no recoverable name, not a call
+    try std.testing.expect(toolCallFenced("```tool\nremember to emit one call per reply\n```") == null);
+    // not at a line start (inline mention) — not a call
+    try std.testing.expect(toolCallFenced("see the ```tool: write_file example above") == null);
+}
+
+test "stripToolTail cuts a fenced call at the FENCE (streaming included) — no stranded opener or name(" {
+    // settled: the whole block goes, prose stays
+    try std.testing.expectEqualStrings("Writing static/index.html now - the dark feed UI.", stripToolTail("Writing static/index.html now - the dark feed UI.\n\n```tool: write_file\nwrite_file({\"path\":\"static/index.html\",\"content\":\"<div>{}</div>\"})\n```"));
+    // streaming: args still open — the fence is already hidden
+    try std.testing.expectEqualStrings("Writing it now.", stripToolTail("Writing it now.\n\n```tool: write_file\nwrite_file({\"path\":\"static/index.html\",\"content\":\"<!DOCTYPE h"));
+    // header only so far
+    try std.testing.expectEqualStrings("Writing it now.", stripToolTail("Writing it now.\n\n```tool: write_file"));
+}
+
+test "stripToolTail backs over a bare function wrapper + tagged fence above inferred args; keeps a closer" {
+    // bare write_file({...}) with no fence: the wrapper is cut with the args
+    try std.testing.expectEqualStrings("Now the store.", stripToolTail("Now the store.\nwrite_file({\"path\":\"src/store.rs\",\"content\":\"pub fn x(){}\"})"));
+    // a CLOSED earlier code block keeps its bare ``` closer (only a TAGGED fence line is eaten)
+    try std.testing.expectEqualStrings("look:\n```js\nlet x=1\n```", stripToolTail("look:\n```js\nlet x=1\n```\n{\"path\":\"a.md\",\"content\":\"hi\"}"));
+}
+
+test "trimDanglingToolFence heals the persisted pre-fix residue, leaves closed fences + prose alone" {
+    try std.testing.expectEqualStrings("Writing src/store.rs now.", trimDanglingToolFence("Writing src/store.rs now.\n\n```tool: write_file\nwrite_file("));
+    try std.testing.expectEqualStrings("Chaining them.", trimDanglingToolFence("Chaining them.\n\n```tool: write_file"));
+    const closed = "here's how:\n```tool: write_file\nwrite_file({})\n```\ndone";
+    try std.testing.expectEqualStrings(closed, trimDanglingToolFence(closed));
+    const plain = "no fence at all";
+    try std.testing.expectEqualStrings(plain, trimDanglingToolFence(plain));
+}
+
+test "a truncated FENCED write trips looksTruncatedWrite (chunked-append rescue)" {
+    var big: [520]u8 = undefined;
+    @memset(&big, 'x');
+    var buf: [700]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "```tool: write_file\nwrite_file({{\"path\":\"a.html\",\"content\":\"{s}", .{big}) catch unreachable;
+    try std.testing.expect(looksTruncatedWrite(text));
+    // and the dispatcher still sees the call (args default {}), so the empty-args rescue path owns it
+    const tc = toolCallFenced(text).?;
+    try std.testing.expectEqualStrings("write_file", tc.name);
+    try std.testing.expectEqualStrings("{}", tc.args);
 }
 
 test "stripToolTail removes a tool call (incl. mid-line) but keeps prose + prose mentions" {
@@ -7972,6 +8166,23 @@ test "parseCastSpec reads the AI's swarm config (minds / LONG / minutes)" {
     try std.testing.expectEqual(@as(u32, 20), d.minutes);
     // no FILES line → empty (pure research cast)
     try std.testing.expectEqualStrings("", a.files);
+    // PUBLISH — the veil opts the cast into NEWS DESK mode (Telegraph post)
+    try std.testing.expect(!a.publish); // default off
+    const e = parseCastSpec("CAST: research quantum computing and write a thesis\nMINDS 6\nLONG\nMINUTES 30\nPUBLISH\nposting it publicly").?;
+    try std.testing.expect(e.publish);
+    try std.testing.expect(e.long);
+    try std.testing.expectEqual(@as(u32, 6), e.minds);
+    // PUBLISH must be its own line, not a substring of prose ("republish"/"published")
+    try std.testing.expect(!parseCastSpec("CAST: x\nnote: this was already published last week").?.publish);
+}
+
+test "castSpecFromUser detects a Telegraph/publish ask; fireCast body stays valid JSON" {
+    // the user explicitly asks to post publicly → publish on
+    try std.testing.expect(castSpecFromUser("cast a swarm to research quantum computing and post it to telegraph", "research quantum computing").publish);
+    try std.testing.expect(castSpecFromUser("have the hive publish its findings", "x").publish);
+    // an ordinary research ask → publish stays off (no accidental posting)
+    try std.testing.expect(!castSpecFromUser("cast a swarm to research quantum computing", "x").publish);
+    try std.testing.expect(!castSpecFromUser("summarize the postgres docs", "x").publish); // "post" inside "postgres" must not trip it
 }
 
 test "shouldReflectPass: only substantive answers to real requests reflect (hello never recurses)" {

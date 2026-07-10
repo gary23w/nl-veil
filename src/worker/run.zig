@@ -919,12 +919,25 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         } else {
             w.discourse = discourseMode(&w, goal);
         }
+        // NEWS DESK is AUTHORITATIVE over every branch above: a publish run is a research/briefing hive
+        // whatever the mode/style classifier decided. This is the load-bearing line for "the hive posts its
+        // thesis to Telegraph" — without it a LONG (continuous) publish cast has w.cast=false (mode is
+        // "continuous", not "cast"), falls to discourseMode(), which answers BUILD when unsure and reads
+        // "write a thesis / publish it" as a document artifact — so the minds scaffold files and
+        // consolidateBriefing/publishArtifact (both gated on w.discourse) never fire and nothing is posted.
+        if (w.publish_on and !w.discourse) {
+            w.discourse = true;
+            w.internet = true; // a news desk with no web access can't ground a single citation → nothing passes the gate
+            w.act("engine", 0, "mode", "news-desk", "NEWS DESK — forcing research/briefing (discourse) mode so the hive scours the web, composes a grounded + double-screened thesis, and posts it to a public Telegraph page");
+        }
     }
     // DECLARED DELIVERABLES: the caller named the exact output files (the chat's veil REASONS them out of
     // the user's ask and sends them with the cast — model-declared, engine-carried). Adopt them verbatim
     // and skip every guessing path: goal-prose extraction misread inputs as outputs (observed live,
     // c6a50258c — the blueprint graded the 12 source files the goal said to READ).
-    if (live and !w.operating and m.files.len > 0) {
+    if (live and !w.operating and m.files.len > 0 and !w.publish_on) {
+        // (a PUBLISH cast is a news desk, not a file build — declared files must not flip it back to build
+        // mode and strand the briefing/publish path; such a cast should simply not declare files)
         w.blueprint = normalizeDeclaredFiles(gpa, m.files);
         if (w.blueprint.len > 0) {
             w.discourse = false; // named deliverables = a build — research alone can't satisfy them
