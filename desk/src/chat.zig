@@ -14,6 +14,7 @@ const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
 const netcli = @import("netcli.zig");
+const httpc = @import("httpc.zig");
 const llm = @import("llm.zig");
 const secrets = @import("secrets.zig");
 const catalog = @import("catalog.zig");
@@ -690,26 +691,34 @@ pub const Chat = struct {
                 root = rootbuf[0..n];
             }
         }
-        const url = std.fmt.allocPrint(self.gpa, "{s}/api/tags", .{root}) catch return;
-        defer self.gpa.free(url);
-        const res = std.process.run(self.gpa, self.io, .{
-            .argv = &.{ "curl", "-sS", "--max-time", "5", url },
-            .stdout_limit = .limited(256 << 10),
-        }) catch return;
-        defer self.gpa.free(res.stdout);
-        defer self.gpa.free(res.stderr);
-        if (res.term != .exited or res.term.exited != 0) return;
+        // in-process socket, not curl: root is guaranteed loopback by the guard above, and the probe
+        // must not feed Defender's spawn-pattern heuristics on every Settings open
+        const target = httpc.parseLoopbackUrl(root) orelse return;
+        var pathbuf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&pathbuf, "{s}/api/tags", .{target.path}) catch return;
+        const resp = switch (httpc.request(self.io, self.gpa, .{
+            .method = "GET",
+            .port = target.port,
+            .path = path,
+            .timeout_s = 5,
+            .cap = 256 << 10,
+        })) {
+            .ok => |r| r,
+            else => return,
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
         // parse the "name":"..." fields (one per installed model)
         self.store.lock();
         defer self.store.unlock();
         self.store.ollama_model_count = 0;
         var i: usize = 0;
         const needle = "\"name\":\"";
-        while (std.mem.indexOfPos(u8, res.stdout, i, needle)) |at| {
+        while (std.mem.indexOfPos(u8, resp.body, i, needle)) |at| {
             if (self.store.ollama_model_count >= store_mod.MAX_OLLAMA_MODELS) break;
             const from = at + needle.len;
-            const end = std.mem.indexOfScalarPos(u8, res.stdout, from, '"') orelse break;
-            const name = res.stdout[from..end];
+            const end = std.mem.indexOfScalarPos(u8, resp.body, from, '"') orelse break;
+            const name = resp.body[from..end];
             i = end + 1;
             if (name.len == 0 or name.len > 96) continue;
             var m: store_mod.OllamaModel = .{};
@@ -774,16 +783,23 @@ pub const Chat = struct {
                 root = rootbuf[0..n];
             }
         }
-        const url = std.fmt.allocPrint(self.gpa, "{s}/api/ps", .{root}) catch return 0;
-        defer self.gpa.free(url);
-        const res = std.process.run(self.gpa, self.io, .{
-            .argv = &.{ "curl", "-sS", "--max-time", "4", url },
-            .stdout_limit = .limited(64 << 10),
-        }) catch return 0;
-        defer self.gpa.free(res.stdout);
-        defer self.gpa.free(res.stderr);
-        if (res.term != .exited or res.term.exited != 0) return 0;
-        return parseMaxCtx(res.stdout);
+        // in-process socket, not curl (same reasoning as fetchOllamaModels)
+        const target = httpc.parseLoopbackUrl(root) orelse return 0;
+        var pathbuf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&pathbuf, "{s}/api/ps", .{target.path}) catch return 0;
+        const resp = switch (httpc.request(self.io, self.gpa, .{
+            .method = "GET",
+            .port = target.port,
+            .path = path,
+            .timeout_s = 4,
+            .cap = 64 << 10,
+        })) {
+            .ok => |r| r,
+            else => return 0,
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return 0;
+        return parseMaxCtx(resp.body);
     }
 
     /// If a local model is loaded with a runaway context (env var unset), tell the user the one-line fix
@@ -4032,7 +4048,7 @@ pub const Chat = struct {
         // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call
         // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
         // fixed [2048] used to reject any write_file over ~1.5KB ("arguments were too long to send"). netcli
-        // passes the body straight to curl --data-binary (no cap), and a reply is bounded by MAX_TOKENS.
+        // sends the body in-process over a socket (no cap), and a reply is bounded by MAX_TOKENS.
         const body = self.gpa.alloc(u8, args.len * 2 + name.len + conv.len + 64) catch {
             self.appendMsg(dd, .cast_note, "[tool] out of memory building the request");
             self.setBusy(false);
