@@ -44,6 +44,10 @@ const DeployReq = struct {
     // terminates at completed/graduated instead of evolveGoal-chaining to a new self-chosen goal. A plain
     // /deploy or /run swarm leaves it false and keeps the full autonomy chain.
     cast: bool = false,
+    // DECLARED DELIVERABLES — the caller (the chat's veil composing a cast) names the exact output files;
+    // the worker adopts them verbatim as the blueprint instead of guessing from goal prose. Comma or
+    // newline separated. The MODEL reasons about what the deliverables are; the engine just carries them.
+    files: []const u8 = "",
     minds: []MindSpec,
 };
 
@@ -197,6 +201,10 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     if (body.observe_psyche) try mani.appendSlice(app.gpa, ",\"observe_psyche\":true");
     // the worker's terminate-don't-chain gate (a sustained cast is mode="continuous", so mode can't carry it)
     if (body.cast) try mani.appendSlice(app.gpa, ",\"cast\":true");
+    if (body.files.len > 0) {
+        try mani.appendSlice(app.gpa, ",\"files\":");
+        try jstr(app.gpa, &mani, body.files);
+    }
     if (body.encrypt and e.encrypted) try mani.appendSlice(app.gpa, ",\"encrypted\":true");
     try mani.appendSlice(app.gpa, ",\"minds\":[");
     for (body.minds, 0..) |m, i| {
@@ -352,6 +360,7 @@ const CastReq = struct {
     name: []const u8 = "",
     mode: []const u8 = "", // "" / "cast" = fast one-shot strike; "continuous" = a sustained long-term hivemind
     dir: []const u8 = "", // chat conversation id → build IN that chat's dir (so the cast + chat share files)
+    files: []const u8 = "", // DECLARED deliverables (comma/newline separated) — adopted verbatim as the blueprint
 };
 
 /// Sanitize a chat conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
@@ -415,6 +424,7 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // The cast MARK (both quick and continuous) makes the worker terminate at completed/graduated
         // instead of chaining to a new self-chosen goal — the caller is waiting to collect.
         .cast = true,
+        .files = rq.files,
         .minds = minds,
     };
     // Build IN the chat's conversation dir when the caller named one, so the hive's `{run_dir}/work` is the SAME
