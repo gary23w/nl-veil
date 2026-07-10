@@ -155,3 +155,102 @@
   border-bottom:1.5px dotted rgba(140,27,18,.55);
 }
 .cover-repo a:hover,.cover-repo a:focus-visible{color:var(--red-bright);border-bottom-style:solid}
+
+/* ============================================================
+   THE VEIL — the dark persona. Pull the cord and the reading-room
+   lamp goes to one bulb: the surround falls to near-black, the
+   papers stay lamp-lit (ink contrast preserved), the evidence red
+   burns. Everything downstream reads CSS vars, so it just cascades.
+   ============================================================ */
+:root[data-veil]{
+  --manila:#141017;          /* the desk, not the folder — charcoal with a violet undertone */
+  --manila-deep:#0e0b12;
+  --manila-shadow:#080609;
+  --bond:#e7dcbe;            /* the page under the lamp — still warm, a touch dimmer */
+  --bond-aged:#d8cba6;
+  --ink:#211b12;            /* ink on lamp-lit paper stays dark: contrast unchanged */
+  --ink-faded:#4a4234;
+  --red:#C9301F;
+  --red-bright:#E8452C;
+  --red-ink:#9c2015;
+  --cork:#3a2614;          /* the board recedes into the dark */
+  --cork-deep:#241608;
+  --pen:#8AA0D0;           /* ballpoint brightened so the hand reads on black */
+  --polar-frame:#cabf9f;
+  --grain:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' seed='11'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.55 0 0 0 0 0.18 0 0 0 0 0.10 0 0 0 0.28 0'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23g)'/%3E%3C/svg%3E");
+}
+:root[data-veil] body{
+  background-color:var(--manila);
+  background-image:
+    radial-gradient(900px 620px at 50% -6%, rgba(232,120,60,.16), transparent 62%),
+    radial-gradient(1200px 900px at 112% 8%, rgba(180,40,26,.12), transparent 60%),
+    radial-gradient(1000px 1200px at -8% 108%, rgba(60,20,80,.10), transparent 62%),
+    var(--grain);
+}
+:root[data-veil] html{scrollbar-color:var(--red-ink) var(--manila-deep)}
+:root[data-veil] ::-webkit-scrollbar-track{background:var(--manila-deep)}
+:root[data-veil] ::-webkit-scrollbar-thumb{background:#3a2614;border-color:var(--manila-deep)}
+:root[data-veil] ::-webkit-scrollbar-thumb:hover{background:var(--red-ink)}
+
+/* the whole page sits under one dying bulb + a red haze that only the veil sees */
+.veil-vapor{
+  position:fixed;inset:0;z-index:0;pointer-events:none;opacity:0;
+  transition:opacity .8s ease;
+  background:
+    radial-gradient(60% 42% at 50% 8%, rgba(255,190,120,.10), transparent 60%),
+    radial-gradient(120% 90% at 50% 46%, transparent 52%, rgba(4,2,6,.62) 100%);
+  mix-blend-mode:normal;
+}
+:root[data-veil] .veil-vapor{opacity:1}
+:root[data-veil] main,:root[data-veil] .cover,:root[data-veil] .foot{position:relative;z-index:1}
+
+/* the evidence red burns in the dark; stamps throw a low glow */
+:root[data-veil] .stamp{filter:drop-shadow(0 0 10px rgba(201,48,31,.35))}
+:root[data-veil] .stamp-header{filter:none}
+:root[data-veil] .stamp-unresolved{filter:drop-shadow(0 0 16px rgba(232,69,44,.5))}
+:root[data-veil] .tl-flag::before{box-shadow:0 0 10px 2px rgba(201,48,31,.6)}
+:root[data-veil] .board-stage{box-shadow:0 22px 64px -10px rgba(0,0,0,.85), 0 0 0 1px rgba(201,48,31,.10)}
+:root[data-veil] .inv-sheet,:root[data-veil] .note-page,:root[data-veil] .docview-paper{
+  box-shadow:0 3px 8px rgba(0,0,0,.6), 0 26px 60px -14px rgba(0,0,0,.75), 0 0 46px -8px rgba(232,120,60,.12);
+}
+:root[data-veil] .cover-file{text-shadow:0 0 18px rgba(232,120,60,.18)}
+:root[data-veil] .foot{background:var(--manila-deep);border-top-color:#3a2614}
+
+/* ---------------- the pull-cord toggle ---------------- */
+.veil-cord{
+  position:fixed;top:0;right:clamp(18px,5vw,54px);z-index:60;
+  display:flex;flex-direction:column;align-items:center;
+  border:0;background:transparent;padding:0;cursor:pointer;
+  -webkit-tap-highlight-color:transparent;
+}
+.veil-cord .cord-line{
+  width:2px;height:64px;
+  background:linear-gradient(var(--ink-faded),rgba(74,66,52,.35));
+  transition:height .25s cubic-bezier(.2,1.3,.35,1);
+}
+.veil-cord .cord-pull{
+  width:16px;height:24px;border-radius:8px 8px 9px 9px;
+  background:radial-gradient(circle at 40% 32%, #d9c489, #9c7b3e 70%, #6e5527);
+  box-shadow:0 2px 5px rgba(20,10,0,.5), inset 0 1px 0 rgba(255,240,200,.4);
+  margin-top:-1px;
+}
+.veil-cord:hover .cord-line,.veil-cord:focus-visible .cord-line{height:74px}
+.veil-cord:active .cord-line{height:82px}
+.veil-cord .cord-label{
+  margin-top:8px;writing-mode:vertical-rl;
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:10px;letter-spacing:.22em;
+  color:var(--ink-faded);text-transform:uppercase;
+  opacity:0;transition:opacity .25s ease;
+}
+.veil-cord:hover .cord-label,.veil-cord:focus-visible .cord-label{opacity:1}
+:root[data-veil] .veil-cord .cord-pull{
+  background:radial-gradient(circle at 40% 32%, #e8452c, #9c2015 70%, #5a0f08);
+  box-shadow:0 0 12px rgba(232,69,44,.55), inset 0 1px 0 rgba(255,200,190,.4);
+}
+:root[data-veil] .veil-cord .cord-line{background:linear-gradient(rgba(201,48,31,.5),rgba(201,48,31,.12))}
+:root[data-veil] .veil-cord .cord-label{color:var(--red)}
+@media (prefers-reduced-motion:reduce){
+  .veil-cord .cord-line{transition:none}
+  .veil-vapor{transition:none}
+}
+@media (max-width:640px){ .veil-cord{right:10px} .veil-cord .cord-line{height:44px} }

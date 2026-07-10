@@ -57,6 +57,23 @@
       { p: 'worker/tools', c: 'WK-11', t: 'Tool system — definitions and dispatch', s: 'tools.zig' },
       { p: 'worker/vcs', c: 'WK-12', t: 'VCS — version control for concurrent minds', s: 'vcs.zig' },
       { p: 'worker/writer', c: 'WK-13', t: 'Writer — output generation and formatting', s: 'writer.zig' }
+    ]},
+    { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
+      { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },
+      { p: 'desk/chat', c: 'DK-02', t: 'The brain — chat worker: turns, casts, the learning loop, auto-loop', s: 'chat.zig' },
+      { p: 'desk/llm', c: 'DK-03', t: 'LLM client — streaming, SSE/NDJSON, tool-call recovery', s: 'llm.zig' },
+      { p: 'desk/store', c: 'DK-04', t: 'Shared state — lock-guarded records + rings across threads', s: 'store.zig' },
+      { p: 'desk/poller', c: 'DK-05', t: 'The IO thread — fleet liveness, run scan, event tail, notifications', s: 'poller.zig' },
+      { p: 'desk/scan', c: 'DK-06', t: 'Filesystem layer — reads veil run dirs for the dashboard', s: 'scan.zig' },
+      { p: 'desk/neuron', c: 'DK-07', t: 'Hippocampus client — the neuron-db bridge (fail-open)', s: 'neuron.zig' },
+      { p: 'desk/netcli', c: 'DK-08', t: 'Server client — retry/triage wrapper over httpc', s: 'netcli.zig' },
+      { p: 'desk/httpc', c: 'DK-09', t: 'HTTP client — curl-free raw-socket loopback', s: 'httpc.zig' },
+      { p: 'desk/theme', c: 'DK-10', t: 'Theme + widgets — immediate-mode raylib UI, Tokyo Night', s: 'theme.zig' },
+      { p: 'desk/mdutil', c: 'DK-11', t: 'Markdown util — block classification, math, inline cleanup', s: 'mdutil.zig' },
+      { p: 'desk/tray', c: 'DK-12', t: 'System tray — icon + native toasts (Windows), no-op on POSIX', s: 'tray.zig' },
+      { p: 'desk/catalog', c: 'DK-13', t: 'Model catalog — provider/model/option sets for the picker', s: 'catalog.zig' },
+      { p: 'desk/secrets', c: 'DK-14', t: 'Key at rest — DPAPI-sealed on Windows, plain file on POSIX', s: 'secrets.zig' },
+      { p: 'desk/log', c: 'DK-15', t: 'Logger — ring buffer to veil-desk.log + the F12 overlay', s: 'log.zig' }
     ]}
   ];
 

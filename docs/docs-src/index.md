@@ -1,8 +1,7 @@
 # nl-veil — Source Documentation
 
-> Generated: Thu 2026-07-09 21:47 UTC  
 > Repository: [gary23w/nl-veil](https://github.com/gary23w/nl-veil)  
-> 32 `.zig` source files documented across 8 modules.
+> 47 `.zig` source files documented across 9 modules — the server (8) and the native desktop, veil-desk.
 
 ---
 
@@ -71,6 +70,25 @@
 | [vcs.md](worker/vcs.md) | VCS integration — version control operations |
 | [writer.md](worker/writer.md) | Writer — output generation and formatting |
 
+### [`desk/`](desk/) — the native desktop, veil-desk (Zig + raylib)
+| File | Purpose |
+|------|---------|
+| [main.md](desk/main.md) | Entry point — borderless raylib window, render loop, tabs |
+| [chat.md](desk/chat.md) | The brain — chat worker: turns, casts, the learning loop, auto-loop |
+| [llm.md](desk/llm.md) | LLM client — streaming, SSE/NDJSON, tool-call recovery |
+| [store.md](desk/store.md) | Shared state — lock-guarded records + rings across threads |
+| [poller.md](desk/poller.md) | The IO thread — fleet liveness, run scan, event tail, notifications |
+| [scan.md](desk/scan.md) | Filesystem layer — reads veil run dirs for the dashboard |
+| [neuron.md](desk/neuron.md) | Hippocampus client — the neuron-db bridge (fail-open) |
+| [netcli.md](desk/netcli.md) | Server client — retry/triage wrapper over httpc |
+| [httpc.md](desk/httpc.md) | HTTP client — curl-free raw-socket loopback |
+| [theme.md](desk/theme.md) | Theme + widgets — immediate-mode raylib UI, Tokyo Night |
+| [mdutil.md](desk/mdutil.md) | Markdown util — block classification, math, inline cleanup |
+| [tray.md](desk/tray.md) | System tray — icon + native toasts (Windows), no-op on POSIX |
+| [catalog.md](desk/catalog.md) | Model catalog — provider/model/option sets for the picker |
+| [secrets.md](desk/secrets.md) | Key at rest — DPAPI-sealed on Windows, plain file on POSIX |
+| [log.md](desk/log.md) | Logger — ring buffer to veil-desk.log + the F12 overlay |
+
 ---
 
 ## Cross-Cutting Concerns
@@ -85,6 +103,7 @@
 | `orchestrate/` | Orchestration — deployment, supervision, inter-agent comms |
 | `plan/` | Plan & billing — entitlements, metering, resource models |
 | `worker/` | Worker runtime — LLM, tools, crawling, RSI, editing, VCS |
+| `desk/` | veil-desk — the native desktop dashboard (Zig + raylib): chat, casts, monitoring |
 
 ---
 
