@@ -2170,7 +2170,8 @@ fn toolName(text: []const u8) ?[]const u8 {
     }
     if (std.mem.startsWith(u8, text, "TOOL:")) {
         const rest = std.mem.trim(u8, text[5..], " \r\t");
-        const sp = std.mem.indexOfAny(u8, rest, " \t{\r\n") orelse rest.len;
+        // '(' delimits too: a function-style `TOOL: write_file({...})` chips as "write_file", not "write_file("
+        const sp = std.mem.indexOfAny(u8, rest, " \t{(\r\n") orelse rest.len;
         const nm = std.mem.trim(u8, rest[0..sp], " \t:");
         return if (nm.len > 0) nm else null;
     }
