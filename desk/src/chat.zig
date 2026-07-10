@@ -4426,7 +4426,10 @@ pub const Chat = struct {
                         std.fmt.bufPrint(&nb2, "[hive] round {d}, {d}% — {s}", .{ pm.round, pm.pct, trimmed }) catch "[hive] progress"
                     else
                         std.fmt.bufPrint(&nb2, "[hive] round {d} — {s}", .{ pm.round, trimmed }) catch "[hive] progress";
-                    self.appendMsg(dd, .cast_note, note);
+                    // Only narrate into the conversation that OWNS this cast. If the owning conv was deleted and
+                    // another is now on screen (delete_conv isn't blocked by busyForSwitch), appendMsg would pour
+                    // this cast's live narration into the unrelated conv's transcript + hippocampus.
+                    if (self.castIsForCurrentConv()) self.appendMsg(dd, .cast_note, note);
                 } else if (round_new) self.nar_round = pm.round; // advance silently past the repeat
             }
         }
@@ -4502,10 +4505,11 @@ pub const Chat = struct {
                 self.cast_active = false;
                 self.resetVeilWork();
                 self.updateCastRow(.done, m.round, m.pct, "", rel);
-                var nb: [256]u8 = undefined;
-                const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
-                self.appendMsg(dd, .cast_note, note);
-                self.setStatus("");
+                // The user switched to a DIFFERENT conversation. Do NOT appendMsg here — appendMsg is hardwired
+                // to conv_active (the chat they switched TO) and observes into ITS hippocampus, so the note
+                // would pollute an unrelated conversation's transcript and memory with this cast's completion.
+                // The .done Swarm-tab row above is the durable record; a transient status is the only signal.
+                self.setStatus("a background cast finished — see the Swarm tab");
                 return;
             }
         }
@@ -4622,12 +4626,11 @@ pub const Chat = struct {
             if (self.castIsForCurrentConv()) {
                 self.cast_epoch = self.conv_epoch;
             } else {
-                const rel0 = self.cast_rel[0..self.cast_rel_len];
                 self.resetVeilWork();
-                var nb: [256]u8 = undefined;
-                const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel0}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
-                self.appendMsg(dd, .cast_note, note);
-                self.setStatus("");
+                // Different conversation now on screen — see the castFinished note: appending here would
+                // pollute the wrong conversation's transcript + hippocampus. Status only.
+                self.updateCastRow(.done, 0, -1, "", self.cast_rel[0..self.cast_rel_len]);
+                self.setStatus("a background cast finished — see the Swarm tab");
                 return;
             }
         }
@@ -5822,6 +5825,21 @@ fn stripWorkdirChdir(line: []const u8, out: []u8) []const u8 {
     return out[0..w];
 }
 
+/// A cleaned "fix: `A` failed … — works as: `B`" lesson is self-CONTRADICTORY when A == B: stripWorkdirChdir
+/// removed the only difference (a `cd <path> &&` prefix — e.g. `cd C:\a && npm build` failed, `cd C:\b && npm
+/// build` worked), collapsing both spans to the same text. It then teaches nothing and can push the model to
+/// re-run the exact command that failed, presented as a "verified fix". Drop it. Returns true when the two
+/// backtick spans exist and are byte-equal. Pure.
+fn fixSpansCollapsed(c: []const u8) bool {
+    if (!std.mem.startsWith(u8, c, "fix:")) return false;
+    const a0 = std.mem.indexOfScalar(u8, c, '`') orelse return false; // failing command span
+    const a1 = std.mem.indexOfScalarPos(u8, c, a0 + 1, '`') orelse return false;
+    const wa = std.mem.indexOfPos(u8, c, a1 + 1, "works as:") orelse return false; // working command span
+    const b0 = std.mem.indexOfScalarPos(u8, c, wa + "works as:".len, '`') orelse return false;
+    const b1 = std.mem.indexOfScalarPos(u8, c, b0 + 1, '`') orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, c[a0 + 1 .. a1], " \t"), std.mem.trim(u8, c[b0 + 1 .. b1], " \t"));
+}
+
 /// Emit one cleaned lesson line into `out` at write cursor `w` (newline-separated), returning the new cursor.
 fn emitLesson(line: []const u8, out: []u8, w: usize) usize {
     var ww = w;
@@ -5831,6 +5849,7 @@ fn emitLesson(line: []const u8, out: []u8, w: usize) usize {
     const cleaned = if (t.len <= cb.len) stripWorkdirChdir(t, &cb) else t;
     const c = std.mem.trim(u8, cleaned, " \t");
     if (c.len == 0) return ww;
+    if (fixSpansCollapsed(c)) return ww; // cd-stripped fail == fix — a non-lesson, never inject it
     if (ww != 0) {
         if (ww >= out.len) return ww;
         out[ww] = '\n';
@@ -6612,6 +6631,19 @@ test "stripWorkdirChdir removes stale build-dir cd prefixes, keeps the transfera
     try std.testing.expectEqualStrings("findstr a b", stripWorkdirChdir("findstr a b", &out));
 }
 
+test "emitLesson drops a lesson that cd-stripping collapsed to fail==fix (self-contradiction)" {
+    var out: [700]u8 = undefined;
+    // fail and fix differ ONLY by the build-dir cd prefix; after stripping, both spans become `npm run build`
+    const collapse = "fix: `cd /d \"C:\\a\" && npm run build` failed (exit code 1) — works as: `cd /d \"C:\\b\" && npm run build`";
+    try std.testing.expectEqual(@as(usize, 0), emitLesson(collapse, &out, 0)); // dropped: nothing written
+    // a genuinely transferable fix (different commands after stripping) still survives
+    const keep = "fix: `cd /d \"C:\\a\" && findstr x zzz.html` failed (exit code 1) — works as: `cd /d \"C:\\a\" && findstr x index.html`";
+    try std.testing.expect(emitLesson(keep, &out, 0) > 0);
+    try std.testing.expect(fixSpansCollapsed("fix: `npm run build` failed (exit code 1) — works as: `npm run build`"));
+    try std.testing.expect(!fixSpansCollapsed("fix: `npm run build` failed — works as: `npm ci && npm run build`"));
+    try std.testing.expect(!fixSpansCollapsed("lesson: prefer full paths")); // not a fix-pair line
+}
+
 test "lessonRelevantToRequest needs real shared vocabulary, not generic words" {
     const pytest_lesson = "fix: `pytest suite_x` failed (exit code 1) — works as: `python -m pytest suite_x`";
     // an off-topic request that shares only generic words with the lesson -> NOT injected (the live bug:
@@ -7080,7 +7112,7 @@ test "cast watch resolves the run dir, tails it, and collects on stop (no server
     chat.stream.deinit(std.testing.allocator);
 }
 
-test "epoch barrier: a cast finishing AFTER the user moved on leaves a passive note, no hijacked collect turn" {
+test "epoch barrier: a cast finishing after a switch to a DIFFERENT conv injects nothing (no note, no digest)" {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
@@ -7112,7 +7144,7 @@ test "epoch barrier: a cast finishing AFTER the user moved on leaves a passive n
 
     chat.conv_epoch += 1; // the user moved on (a newer send / conv switch / Stop) before the cast finished
 
-    chat.watchCast(dd); // sees `stopped` — but the epoch moved, so it must NOT inject the digest or start .collect
+    chat.watchCast(dd); // sees `stopped` — but the epoch moved to a DIFFERENT conv, so it must NOT inject anything
     try std.testing.expect(!chat.cast_active);
     try std.testing.expect(chat.turn == .idle); // no hijacked model turn
     var saw_note = false;
@@ -7127,7 +7159,9 @@ test "epoch barrier: a cast finishing AFTER the user moved on leaves a passive n
             if (std.mem.indexOf(u8, txt, "score 66%") != null) saw_digest = true;
         }
     }
-    try std.testing.expect(saw_note);
+    // cast_conv (unset) != the on-screen conv, so this is a genuine switch: the finish must pollute NEITHER
+    // the on-screen transcript (no note, no digest) NOR its hippocampus — the .done Swarm row is the record.
+    try std.testing.expect(!saw_note);
     try std.testing.expect(!saw_digest);
 }
 
