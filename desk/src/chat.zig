@@ -297,6 +297,9 @@ const MAX_TOOL_ITERS: u32 = 20;
 // keep the veil working unless the AI genuinely needs to ASK the user something (user directive). The real stop
 // conditions are DONE, a question ('?'), and the no-progress repeat-guard; the iteration cap is only a runaway
 // backstop, set high enough that a long task (documenting a whole repo file by file) doesn't hit it prematurely.
+// THIRD TIER — auto-loop-afk (chat_loop_afk, entered by double-clicking the toggle): NONE of those stop
+// conditions end the loop. DONE folds into a fresh drive, the repeat-guard is skipped, the caps wrap, a
+// question is answered on the away user's behalf, and failures re-plan. Only the user ends it (toggle/Stop).
 const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task needs many steps
 /// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
 /// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
@@ -316,6 +319,10 @@ const LOOP_SYSTEM =
     "files and then run_tests (or run_python) to VERIFY; only treat the goal as achieved once it actually works.\n" ++
     "When the goal is fully achieved (the assistant has delivered what was asked, verified where possible, and no " ++
     "further step would add value), output EXACTLY the single word: DONE";
+/// What auto-loop-afk sends when the driver declares DONE: the afk tier never accepts an end state, so
+/// "done" becomes a re-verify + extend drive and the conversation keeps working (user directive: afk
+/// goes forever — nothing but the user stops it).
+const AFK_DRIVE_MSG = "keep going: re-verify the latest work end-to-end, then pick the most valuable next improvement or extension toward the goal and do it.";
 
 // Recursive-thought (reflect) loop: ITERATIVE self-critique — keep re-reviewing the draft while each pass still
 // meaningfully changes it (that's how a careful reasoner converges: critique → fix → re-critique → … until it's
@@ -3215,11 +3222,12 @@ pub const Chat = struct {
             if (self.castPending()) {
                 self.appendVeil(dd, reason, if (note.len > 0) note else full);
                 self.appendMsg(dd, .cast_note, "[cast] a cast is already running — new cast ignored");
-            } else if (self.loop_iter > 0 and self.loop_casts >= MAX_LOOP_CASTS) {
+            } else if (self.loop_iter > 0 and self.loop_casts >= MAX_LOOP_CASTS and !self.afkOn()) {
                 // The auto-loop MAY cast — delegating a scoped sub-task to a hive is the veil doing its job, and the
                 // loop is the inference fail-safe that must STAY ON (user directive). But it's bounded: after several
                 // swarms in one loop session, pause for the user so a weak model can't runaway-deploy hives unattended
                 // (the original post-kill runaway). castPending above already refuses a *concurrent* second cast.
+                // In afk the pause is waived — the user opted into forever, swarm runs included (user directive).
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.stream.deinit(self.gpa); // this early return skipped the shared settle deinit — confirmed leak
                 self.stopLoop(dd, "auto-loop paused: the veil cast several swarms in a row — say 'continue' to keep going.");
@@ -3295,7 +3303,9 @@ pub const Chat = struct {
         self.stream.deinit(self.gpa);
         // A question is the veil YIELDING to the user — the auto-loop must not answer it on their behalf
         // (checked here, before the verify/consolidate re-entries, so every path to maybeLoop inherits it).
-        if (asks_user) self.stopLoopQuiet();
+        // EXCEPT in afk: the user is away by definition, so the loop-infer driver answers on their behalf
+        // rather than stranding the conversation on a question nobody is there to read.
+        if (asks_user and !self.afkOn()) self.stopLoopQuiet();
         if (want_verify) {
             self.verify_done = true;
             self.tool_iters += 1; // the verify turn spends from the arc's real budget
@@ -3351,11 +3361,13 @@ pub const Chat = struct {
         // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending finish (else auto-loop
         // would grab the shared turn slot out from under the veil work / finish).
         if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil) return;
-        const on = blk: {
+        const st = blk: {
             self.store.lock();
             defer self.store.unlock();
-            break :blk self.store.chat_loop;
+            break :blk [2]bool{ self.store.chat_loop, self.store.chat_loop_afk };
         };
+        const afk = st[1];
+        const on = st[0] or afk;
         if (!on) return;
         // Only KEEP LOOPING while the veil is actually working. `acted` reflects just the FINAL reply of a
         // chain (every settle resets it), so a build chain that wrote files and then ANNOUNCED the next one
@@ -3370,8 +3382,11 @@ pub const Chat = struct {
             // settle; only a SECOND consecutive no-action step ends it (that's a conversation, not work).
             self.loop_idle += 1;
             if (self.loop_idle >= 2) {
-                self.stopLoopQuiet();
-                return;
+                if (!afk) {
+                    self.stopLoopQuiet();
+                    return;
+                }
+                self.loop_idle = 0; // afk: the anti-spin bound resets instead of ending the loop — it never stops itself
             }
         } else {
             self.loop_idle = 0;
@@ -3383,12 +3398,19 @@ pub const Chat = struct {
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
             if (self.fireTerminalVerify(dd)) return;
-            self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
-            return;
+            if (!afk) {
+                self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
+                return;
+            }
+            self.loop_iter = 0; // afk: the runaway cap wraps instead of stopping
+            self.appendMsg(dd, .cast_note, "(auto-loop-afk: iteration cap reached — counter reset, still going)");
         }
         self.abort_turn.store(false, .monotonic); // reaching here means the loop is (re)starting deliberately
         var sb: [64]u8 = undefined;
-        self.setStatus(std.fmt.bufPrint(&sb, "auto-loop {d}/{d}: planning next step...", .{ self.loop_iter + 1, LOOP_MAX_ITERS }) catch "auto-loop: planning...");
+        self.setStatus(if (afk)
+            std.fmt.bufPrint(&sb, "auto-loop-afk {d}: planning next step...", .{self.loop_iter + 1}) catch "auto-loop-afk: planning..."
+        else
+            std.fmt.bufPrint(&sb, "auto-loop {d}/{d}: planning next step...", .{ self.loop_iter + 1, LOOP_MAX_ITERS }) catch "auto-loop: planning...");
         self.startTurn(dd, .loop_infer);
     }
 
@@ -3441,11 +3463,13 @@ pub const Chat = struct {
     /// Handle the message a loop-infer turn produced: stop on DONE / empty / user-toggled-off / cap, else send it.
     fn loopContinue(self: *Chat, dd: []const u8, raw: []const u8) void {
         var text = std.mem.trim(u8, raw, " \r\n\t`*\"'");
-        const on = blk: {
+        const st = blk: {
             self.store.lock();
             defer self.store.unlock();
-            break :blk self.store.chat_loop;
+            break :blk [2]bool{ self.store.chat_loop, self.store.chat_loop_afk };
         };
+        const afk = st[1];
+        const on = st[0] or afk;
         if (!on) { // the user switched auto-loop off while it was inferring — stop quietly
             self.setBusy(false);
             return;
@@ -3464,21 +3488,31 @@ pub const Chat = struct {
             // whole-build check first (it writes anything still missing). Only if that's already done (or
             // this wasn't a build) do we actually finish.
             if (self.fireTerminalVerify(dd)) return;
-            self.stopLoop(dd, "auto-loop complete: the goal looks achieved.");
-            return;
+            if (!afk) {
+                self.stopLoop(dd, "auto-loop complete: the goal looks achieved.");
+                return;
+            }
+            // AFK: "done" is not a stop — fold the finish into a fresh drive (re-verify, then extend).
+            // The user double-clicked into the never-ending tier; only they can end it.
+            self.appendMsg(dd, .cast_note, "(auto-loop-afk: the goal looks achieved — continuing anyway)");
+            text = AFK_DRIVE_MSG;
         }
         // REPEAT GUARD: a weak model in auto-loop can spin, re-emitting a near-identical next step ("check the
         // status to confirm" twice in a row). If the inferred message basically repeats the last one, the loop
-        // isn't making progress — stop instead of churning.
-        if (nearlySame(text, self.last_user[0..self.last_user_len])) {
+        // isn't making progress — stop instead of churning. Skipped in afk: churn beats stopping there, and the
+        // DONE fold above re-sends the same drive message by design.
+        if (!afk and nearlySame(text, self.last_user[0..self.last_user_len])) {
             if (self.fireTerminalVerify(dd)) return; // a stalled build still gets its completeness check
             self.stopLoop(dd, "auto-loop stopped: the next step just repeated the last one (no progress).");
             return;
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
-            if (self.fireTerminalVerify(dd)) return;
-            self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
-            return;
+            if (!afk) {
+                if (self.fireTerminalVerify(dd)) return;
+                self.stopLoop(dd, "auto-loop stopped: reached the iteration limit. Toggle it on again to keep going.");
+                return;
+            }
+            self.loop_iter = 0; // afk: the runaway cap wraps instead of stopping
         }
         self.loop_iter += 1;
         // send the inferred message as a (visible) user turn — same path as a manual send, minus the counter reset
@@ -3507,6 +3541,7 @@ pub const Chat = struct {
             self.store.lock();
             defer self.store.unlock();
             self.store.chat_loop = false;
+            self.store.chat_loop_afk = false; // Stop ends even the never-ending afk tier — the user always wins
         }
         self.loop_iter = 0;
         self.loop_casts = 0;
@@ -3581,8 +3616,36 @@ pub const Chat = struct {
         @memcpy(self.pending_directive[0..self.pending_directive_len], p[0..self.pending_directive_len]);
     }
 
+    /// Third-tier auto-loop-afk armed? (double-click on the toggle). In afk the loop NEVER backs itself
+    /// out — every automatic stop resets its budget instead. Only the user ends it (toggle click / Stop).
+    fn afkOn(self: *Chat) bool {
+        self.store.lock();
+        defer self.store.unlock();
+        return self.store.chat_loop_afk;
+    }
+
+    /// AFK backstop: absorb an automatic stop instead of disarming — counters reset, chat_loop stays
+    /// armed, and the ~1Hz run() backstop re-fires maybeLoop. Every known stop site is afk-guarded
+    /// explicitly; this catches any path that isn't (the invariant is NEVER backs out, so enforce it at
+    /// the choke point too). Returns true when afk swallowed the stop. User-initiated stops (Stop
+    /// button, toggle, ::loop off) never route through here — they clear chat_loop_afk directly.
+    fn afkAbsorbStop(self: *Chat) bool {
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (!self.store.chat_loop_afk) return false;
+            self.store.chat_loop = true; // afk implies armed — re-assert in case a raced path cleared it
+        }
+        self.loop_iter = 0;
+        self.loop_casts = 0;
+        self.loop_idle = 0;
+        self.setStatus("auto-loop-afk: still going...");
+        return true;
+    }
+
     /// Disarm auto-loop silently — the veil just gave a plain answer, so there's nothing to narrate.
     fn stopLoopQuiet(self: *Chat) void {
+        if (self.afkAbsorbStop()) return;
         self.store.lock();
         defer self.store.unlock();
         self.store.chat_loop = false;
@@ -3590,6 +3653,12 @@ pub const Chat = struct {
 
     /// Turn auto-loop off and tell the user why (the verifiable stop condition fired).
     fn stopLoop(self: *Chat, dd: []const u8, why: []const u8) void {
+        if (self.afkAbsorbStop()) {
+            var b: [300]u8 = undefined;
+            const note = std.fmt.bufPrint(&b, "(auto-loop-afk absorbed a stop [{s}] — still going)", .{why}) catch "(auto-loop-afk absorbed a stop — still going)";
+            self.appendMsg(dd, .cast_note, note);
+            return;
+        }
         {
             self.store.lock();
             defer self.store.unlock();
@@ -5621,6 +5690,11 @@ fn lessonRelevant(lesson: []const u8, cmd: []const u8, sig: []const u8) bool {
     if (exe.len >= 2 and std.ascii.indexOfIgnoreCase(lesson, exe) != null) score += 2;
     var seen: [8][]const u8 = undefined; // counted-token dedup — relevance needs at most a few hits
     var seen_n: usize = 0;
+    // the executable's name is already scored — and it REAPPEARS in most error lines ("python: can't
+    // open...", "FINDSTR: Cannot open...", "curl: (22)..."), so seed the dedup with it or every tool
+    // that prefixes its own errors hands itself the third point and the gate never gates
+    seen[0] = exe;
+    seen_n = 1;
     const sources = [2][]const u8{ cmd, sig };
     for (sources, 0..) |src, si| {
         var it = std.mem.tokenizeAny(u8, src, " \t\"'`()[]{}<>,;=");
@@ -6401,6 +6475,15 @@ test "lessonRelevant: an executable match alone never surfaces a lesson (the 403
     try std.testing.expect(!lessonRelevant(findstr_lesson, "python build.py", "SyntaxError: invalid syntax"));
     // generic tokens (exit/code/error/failed) and small numbers are not evidence
     try std.testing.expect(!lessonRelevant(cd_lesson, "python other.py", "(exit code 1) error failed"));
+    // THE LIVE ESCAPE (2026-07-10): the executable's own name in the error line ("python: can't open
+    // file ...") must not count as a second piece of evidence on top of the executable score — that
+    // double-count let a pytest-cwd lesson ride in on an unrelated missing-file failure
+    const pytest_lesson = "fix: `cd /d \"C:\\w\" && where pytest && python -c \"import pytest\"` failed (exit code 1) — works as: `cd /d \"C:\\w\" && python -m pytest minimal_test.py -v`";
+    try std.testing.expect(!lessonRelevant(pytest_lesson, "python missing_probe_xyz.py --check-auth",
+        "python: can't open file 'C:\\x\\missing_probe_xyz.py': [Errno 2] No such file or directory"));
+    // ...but a real shared token (the same script name in the error) still carries it over the bar
+    try std.testing.expect(lessonRelevant(pytest_lesson, "python -m pytest minimal_test.py",
+        "python: error collecting minimal_test.py"));
 }
 
 test "filterRelevantLessons folds only same-family lessons; a weak recall injects nothing" {
@@ -7084,6 +7167,97 @@ test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settl
     try std.testing.expect(!store.chat_loop); // the question handed the turn to the user
     llm.abort(&chat.stream, io);
     chat.stream.deinit(std.testing.allocator);
+}
+
+test "auto-loop-afk: the third tier never backs itself out — idle settles, DONE, repeats, caps, and questions all keep it armed; only the user's Stop ends it" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-chat-tmp8";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+    const ask = "build a tiny two-page site: index.html and about.html";
+    chat.last_user_len = ask.len;
+    @memcpy(chat.last_user[0..ask.len], ask);
+    store.msg_count = 1;
+    store.chat_loop = true;
+    store.chat_loop_afk = true;
+    const drop = struct { // abort a live loop-started turn (real curl against the default endpoint)
+        fn go(c: *Chat, i: std.Io) void {
+            if (c.turn != .idle) {
+                llm.abort(&c.stream, i);
+                c.stream.deinit(std.testing.allocator);
+                c.turn = .idle;
+            }
+        }
+    }.go;
+
+    // (1) TWO consecutive workless settles quiet-disarm plain auto-loop; afk resets the bound and keeps driving
+    chat.acted = false;
+    chat.arc_acted = false;
+    chat.maybeLoop(dd);
+    drop(chat, io);
+    chat.acted = false;
+    chat.arc_acted = false;
+    chat.maybeLoop(dd);
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk); // the anti-spin bound reset instead of stopping
+    drop(chat, io);
+
+    // (2) DONE folds into a fresh drive instead of finishing
+    chat.turn_epoch = chat.conv_epoch;
+    chat.loopContinue(dd, "DONE");
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk);
+    try std.testing.expect(std.mem.eql(u8, chat.last_user[0..chat.last_user_len], AFK_DRIVE_MSG)); // the drive message went out as the next step
+    drop(chat, io);
+
+    // (3) a repeated next-step is churn, not a stop, in afk
+    chat.loopContinue(dd, AFK_DRIVE_MSG);
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk);
+    drop(chat, io);
+
+    // (4) the iteration cap wraps instead of stopping
+    chat.loop_iter = LOOP_MAX_ITERS;
+    chat.loopContinue(dd, "now add a third page: contact.html");
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk);
+    try std.testing.expectEqual(@as(u32, 1), chat.loop_iter); // wrapped to 0, then counted this step
+    drop(chat, io);
+
+    // (5) the afkAbsorbStop backstop: any stop path not explicitly afk-guarded is swallowed, budgets reset
+    chat.loop_iter = 7;
+    chat.loop_casts = 3;
+    chat.stopLoop(dd, "synthetic stop that must not land");
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk);
+    try std.testing.expectEqual(@as(u32, 0), chat.loop_iter);
+    try std.testing.expectEqual(@as(u32, 0), chat.loop_casts);
+    chat.stopLoopQuiet();
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk);
+
+    // (6) a '?' reply does NOT yield in afk — the user is away, the driver answers on their behalf
+    chat.acted = false;
+    chat.arc_acted = true;
+    chat.stream = .{ .done = true };
+    chat.stream.content.appendSlice(std.testing.allocator, "index.html is written. Want me to add a dark theme next?") catch unreachable;
+    chat.turn = .user;
+    chat.turn_epoch = chat.conv_epoch;
+    chat.turn_start_ms = chat.nowMs();
+    chat.stream.started_s = chat.nowS();
+    chat.pumpStream(dd);
+    try std.testing.expect(store.chat_loop and store.chat_loop_afk); // still armed through the question
+    drop(chat, io);
+
+    // (7) the user's Stop button DOES end it — the user always wins
+    chat.stopTurn(dd);
+    try std.testing.expect(!store.chat_loop and !store.chat_loop_afk);
 }
 
 test "castSpecFromUser: verbatim user config only (word-bounded 'long', N minds, N minutes)" {

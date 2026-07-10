@@ -308,6 +308,10 @@ pub const Store = struct {
     //                             running) — the UI renders it as thinking, never as a delivered answer
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
     chat_loop: bool = false, // full-auto: the AI writes + sends its own next message until DONE or the cap (runtime only)
+    chat_loop_afk: bool = false, // THIRD TIER (double-click the toggle): the loop NEVER backs itself out —
+    //                              DONE, failures, caps, cast pauses, and questions all reset their budget
+    //                              instead of stopping; runs until the user clicks it off or hits Stop
+    //                              (runtime only; afk implies chat_loop armed)
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,
     // Chat FILES inner tab — files produced inside THIS chat's own build dir ({conv}/work). The chat worker scans

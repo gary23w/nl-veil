@@ -439,8 +439,14 @@ pub fn main() !void {
                             if (std.mem.eql(u8, cmd, "loop on")) {
                                 store.chat_loop = true;
                                 store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
+                            } else if (std.mem.eql(u8, cmd, "loop afk")) {
+                                // third tier (UI: double-click the toggle): the loop never backs itself out
+                                store.chat_loop = true;
+                                store.chat_loop_afk = true;
+                                store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
                             } else if (std.mem.eql(u8, cmd, "loop off")) {
                                 store.chat_loop = false;
+                                store.chat_loop_afk = false;
                             } else if (std.mem.startsWith(u8, cmd, "tab ")) {
                                 const tn = std.mem.trim(u8, cmd[4..], " \r\n\t");
                                 const tv: ?Tab =
@@ -2491,36 +2497,64 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
     // 12-step cap). Plain clickable label — no button chrome; the TEXT alone turns green when engaged.
-    const loop_on = blk: {
+    // DOUBLE-CLICK escalates to the THIRD TIER, auto-loop-afk (orange): the loop NEVER backs itself out —
+    // no DONE, no failure, no cap, no cast pause ends it; it runs until the user clicks it off or hits Stop.
+    const loop_state = blk: {
         store.lock();
         defer store.unlock();
-        break :blk store.chat_loop;
+        break :blk [2]bool{ store.chat_loop, store.chat_loop_afk };
     };
-    const ltxt: [:0]const u8 = if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
+    const afk_on = loop_state[1];
+    const loop_on = loop_state[0] or afk_on;
+    const ltxt: [:0]const u8 = if (afk_on) t.z("auto-loop: afk", .{}) else if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
     const ltw: f32 = @floatFromInt(t.measure(ltxt, 12));
     const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = 17 };
     const lhot = t.hovering(ltog);
-    t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
+    t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (afk_on) t.orange else if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
     if (lhot) t.wantCursor(.pointing_hand);
     if (lhot and rl.isMouseButtonPressed(.left)) {
-        var now_on = false;
+        // Manual double-click detection (raylib has none): two presses on the label within 400ms. The first
+        // press of the pair still runs the single-click toggle — the second overrides whatever it did with afk.
+        const S = struct {
+            var last_click: f64 = -1e9;
+        };
+        const nowt = rl.getTime();
+        const dbl = (nowt - S.last_click) < 0.40;
+        S.last_click = nowt;
+        var mode: u8 = 0; // where this click landed: 0=off 1=on 2=afk
         {
             store.lock();
             defer store.unlock();
-            store.chat_loop = !store.chat_loop;
-            now_on = store.chat_loop;
+            if (dbl) { // double-click = enter afk from ANY state
+                store.chat_loop = true;
+                store.chat_loop_afk = true;
+                mode = 2;
+            } else if (store.chat_loop_afk) { // single click while afk = fully off (the way out, besides Stop)
+                store.chat_loop_afk = false;
+                store.chat_loop = false;
+                mode = 0;
+            } else {
+                store.chat_loop = !store.chat_loop;
+                mode = if (store.chat_loop) 1 else 0;
+            }
         }
         // Turning it on with an idle, non-empty conversation kicks the first iteration immediately; otherwise it
         // engages after the next turn settles. Turning it off just stops new iterations (the in-flight turn finishes).
-        if (now_on) store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
-        store.pushNotif(if (now_on) "Auto-loop on" else "Auto-loop off", if (now_on) "the veil will drive the conversation until it's done" else "stopping after the current turn", 1);
+        if (mode > 0) store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
+        if (mode == 2) {
+            store.pushNotif("Auto-loop AFK", "runs forever - no DONE, failure, or cap stops it; click the toggle (or Stop) to end it", 1);
+        } else if (mode == 1) {
+            store.pushNotif("Auto-loop on", "the veil will drive the conversation until it's done (double-click for afk: never stops)", 1);
+        } else {
+            store.pushNotif("Auto-loop off", "stopping after the current turn", 1);
+        }
     }
     sy += status_h;
 
     // input row — a 3-row growing/scrolling text area (a long prompt wraps + scrolls instead of running off-screen)
     const send_w: f32 = 92;
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
-    textArea(cf, &ui.c_input, ui.focus == .c_input, if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
+    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
     // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
     // deriving y/height from input_h keeps the two aligned even if the row height changes later.
     const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
