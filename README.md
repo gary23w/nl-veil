@@ -369,17 +369,22 @@ launcher that starts both at once:
 | macOS arm64 | `veil-v1.0.0-macos-arm64.tar.gz` | `./start` |
 
 No Python, no toolchain, no first-run build — the memory engine is bundled too. To roll your own
-(or cross-build every target at once), the release scripts wrap the whole thing:
+(or cross-build every target at once), the release scripts wrap the whole thing — and they
+**bootstrap their own toolchain**: a missing Zig, Rust, C compiler, or (on Linux) raylib dev
+library is fetched/installed for you before the build:
 
 ```sh
-scripts/build-release.sh            # this host's platform → dist/
-scripts/build-release.sh --all      # cross-compile win + linux + mac → dist/ (needs zig only)
+scripts/build-release.sh            # this host's platform → dist/  (installs any missing deps)
+scripts/build-release.sh --all      # also cross-compile the server for win + linux + mac → dist/
 ```
 ```powershell
 scripts\build-release.ps1           # Windows bundle → dist\
 ```
 
 Each run produces the platform archive in `dist/` with the two binaries, the launcher, and a README.
+Set `NO_BOOTSTRAP=1` to skip the dependency step (and provide `ZIG=` / `NEURON=` yourself);
+`ASSUME_YES=1` runs it unattended. `python deploy.py doctor` prints what's present and what will be
+auto-installed.
 
 ## License
 

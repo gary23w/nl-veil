@@ -4,6 +4,12 @@ zig-out/
 zig-cache/
 zig-pkg/
 
+# toolchains the installer / build scripts bootstrap into the tree (deploy.py, lib-deps.sh)
+.zig/
+.zig-dl/
+.neuron-src/
+rustup-init.exe
+
 # Python
 __pycache__/
 *.py[cod]
