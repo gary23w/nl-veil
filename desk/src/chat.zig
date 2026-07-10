@@ -421,6 +421,7 @@ pub const Chat = struct {
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     loop_casts: u32 = 0, // swarms this auto-loop session has fired (bounded by MAX_LOOP_CASTS — runaway guard)
+    loop_idle: u8 = 0, // consecutive no-action settles — ONE is tolerated (persistence), two end the loop
     build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
     build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
     reflect_draft: [12288]u8 = undefined, // the current draft being iteratively self-critiqued
@@ -1623,6 +1624,7 @@ pub const Chat = struct {
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
         self.loop_casts = 0; // ...and its swarm budget — a fresh steer earns fresh loop-casts
+        self.loop_idle = 0;
         self.resetArcFlags(); // fresh agentic-floor arc: follow-through nudge, verification, lesson capture
         self.judge_turns +%= 1; // a REAL user turn — the judge's cadence trigger counts only these
         // AUTO-LOOP ON by default once the user prompts (user directive): the veil drives its own next step
@@ -3275,8 +3277,16 @@ pub const Chat = struct {
         // anti-spin bound (re-earned per step in loopContinue), alongside nearlySame + LOOP_MAX_ITERS.
         if (!self.acted and !self.arc_acted) {
             if (self.fireTerminalVerify(dd)) return; // a build that stalled on a no-work step still gets checked
-            self.stopLoopQuiet();
-            return;
+            // ONE announce-only step must not silently disconnect the loop (user verdict: the quiet disarm
+            // "was a bad move" — persistence IS the feature). The loop keeps driving through a single idle
+            // settle; only a SECOND consecutive no-action step ends it (that's a conversation, not work).
+            self.loop_idle += 1;
+            if (self.loop_idle >= 2) {
+                self.stopLoopQuiet();
+                return;
+            }
+        } else {
+            self.loop_idle = 0;
         }
         {
             self.store.lock();
@@ -3337,7 +3347,7 @@ pub const Chat = struct {
 
     /// Handle the message a loop-infer turn produced: stop on DONE / empty / user-toggled-off / cap, else send it.
     fn loopContinue(self: *Chat, dd: []const u8, raw: []const u8) void {
-        const text = std.mem.trim(u8, raw, " \r\n\t`*\"'");
+        var text = std.mem.trim(u8, raw, " \r\n\t`*\"'");
         const on = blk: {
             self.store.lock();
             defer self.store.unlock();
@@ -3348,9 +3358,13 @@ pub const Chat = struct {
             return;
         }
         if (text.len == 0) {
+            // An EMPTY inference (model hiccup, dead stream, null next-step) must not disconnect the loop —
+            // the loop is the inference fail-safe (user directive: ending it here "was a bad move").
+            // Substitute a plain "continue" so the veil takes another real turn; a SECOND consecutive
+            // empty inference substitutes "continue" again and the nearlySame repeat-guard below ends the
+            // streak — so the rescue is bounded, not a spin.
             if (self.fireTerminalVerify(dd)) return;
-            self.stopLoop(dd, "auto-loop ended: no next step was inferred.");
-            return;
+            text = "continue";
         }
         if (loopIsDone(text)) {
             // Don't take the model's word for "done" on a build it may have only ANNOUNCED — run the
@@ -3403,6 +3417,7 @@ pub const Chat = struct {
         }
         self.loop_iter = 0;
         self.loop_casts = 0;
+        self.loop_idle = 0;
         self.reflect_pass = 0; // abandon any pending self-critique iteration
         self.reflect_dirty = false;
         self.reflect_draft_len = 0;
@@ -3465,6 +3480,7 @@ pub const Chat = struct {
         }
         self.loop_iter = 0;
         self.loop_casts = 0;
+        self.loop_idle = 0;
         self.appendMsg(dd, .cast_note, why);
         self.setStatus("");
         self.setBusy(false);
@@ -4259,22 +4275,37 @@ pub const Chat = struct {
         }
     }
 
+    /// Is the finished cast's conversation the one on screen right now? An epoch bump inside the SAME
+    /// conversation (a newer message, a Stop) must not strand the cast's results behind a passive note —
+    /// they belong to this chat and the auto-loop feeds on the collect.
+    fn castIsForCurrentConv(self: *Chat) bool {
+        var cb: [96]u8 = undefined;
+        const cur = self.convScope(&cb);
+        return cur.len > 0 and std.mem.eql(u8, cur, self.cast_conv[0..self.cast_conv_len]);
+    }
+
     /// The hive cast has finished. In concurrent-veil mode, defer finishing until the Veil's own parallel turn
     /// (writing into this SAME shared dir) has also settled, so its last edits are in the tree before the answer
     /// is composed; otherwise collect the result directly (the classic path).
     fn castFinished(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         if (self.cast_epoch != self.conv_epoch) {
-            // The user has moved on (newer message / switched conversation / Stop) since this cast was scheduled.
-            // Do NOT inject the digest or hijack a .collect model turn to post-process an old goal into the live
-            // chat — leave one passive note; the run stays on disk and can be summarized on request.
-            self.cast_active = false;
-            self.resetVeilWork();
-            self.updateCastRow(.done, m.round, m.pct, "", rel);
-            var nb: [256]u8 = undefined;
-            const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
-            self.appendMsg(dd, .cast_note, note);
-            self.setStatus("");
-            return;
+            // The epoch moved since this cast was scheduled. If the user is STILL IN this conversation, the
+            // results belong here — re-stamp and collect normally (the old passive "ask me to summarize"
+            // note disconnected the auto-loop at its most valuable moment: the collect is what feeds the
+            // next step; user verdict — that auto-looping was a feature). Only a genuine conversation
+            // SWITCH leaves the passive note (never hijack a DIFFERENT chat with old post-processing).
+            if (self.castIsForCurrentConv()) {
+                self.cast_epoch = self.conv_epoch;
+            } else {
+                self.cast_active = false;
+                self.resetVeilWork();
+                self.updateCastRow(.done, m.round, m.pct, "", rel);
+                var nb: [256]u8 = undefined;
+                const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
+                self.appendMsg(dd, .cast_note, note);
+                self.setStatus("");
+                return;
+            }
         }
         if (CONCURRENT_VEIL and self.veil_work_active) {
             self.cast_active = false;
@@ -4384,14 +4415,19 @@ pub const Chat = struct {
         if (!self.cast_awaiting_veil or !self.veil_done) return;
         if (self.turn != .idle or self.consoleAiBusy()) return;
         if (self.cast_epoch != self.conv_epoch) {
-            // user moved on between the hive finishing and the merge — passive note, no hijacked collect turn
-            const rel0 = self.cast_rel[0..self.cast_rel_len];
-            self.resetVeilWork();
-            var nb: [256]u8 = undefined;
-            const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel0}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
-            self.appendMsg(dd, .cast_note, note);
-            self.setStatus("");
-            return;
+            // Same-conversation rescue (mirrors castFinished): only a genuine conv SWITCH goes passive —
+            // an in-conversation epoch bump must not strand the merge behind "ask me to summarize".
+            if (self.castIsForCurrentConv()) {
+                self.cast_epoch = self.conv_epoch;
+            } else {
+                const rel0 = self.cast_rel[0..self.cast_rel_len];
+                self.resetVeilWork();
+                var nb: [256]u8 = undefined;
+                const note = std.fmt.bufPrint(&nb, "[cast] finished in the background — results saved at {s}; open the Swarm tab or ask me to summarize them.", .{rel0}) catch "[cast] finished in the background — results saved; open the Swarm tab or ask me to summarize them.";
+                self.appendMsg(dd, .cast_note, note);
+                self.setStatus("");
+                return;
+            }
         }
         self.cast_awaiting_veil = false;
         self.veil_work_active = false;
@@ -6547,12 +6583,23 @@ test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settl
         chat.turn = .idle;
     }
 
-    // (2) a loop step that performed NOTHING ends the loop (the anti-spin bound)
+    // (2) ONE workless step is TOLERATED (persistence is the feature — a single announce-only settle must
+    // not disconnect the loop); a SECOND consecutive workless settle ends it (that's a conversation, not work)
     store.chat_loop = true;
+    chat.loop_idle = 0;
     chat.acted = false;
     chat.arc_acted = false;
     chat.maybeLoop(dd);
-    try std.testing.expect(!store.chat_loop);
+    try std.testing.expect(store.chat_loop); // first idle settle: still armed
+    if (chat.turn == .loop_infer) {
+        llm.abort(&chat.stream, io);
+        chat.stream.deinit(std.testing.allocator);
+        chat.turn = .idle;
+    }
+    chat.acted = false;
+    chat.arc_acted = false;
+    chat.maybeLoop(dd);
+    try std.testing.expect(!store.chat_loop); // second idle settle: the anti-spin bound ends it
 
     // (3) a settle whose reply ENDS WITH A QUESTION yields to the user even though the arc acted
     store.chat_loop = true;
