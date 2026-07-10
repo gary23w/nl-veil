@@ -3,711 +3,175 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta name="description" content="nl-veil — a lightweight, local-first swarm intelligence framework for developers.">
-<title>nl-veil — Swarm Intelligence, Local-First</title>
-<style>
-/* ===== CSS Custom Properties / Dark Theme ===== */
-:root {
-  --primary: #6C63FF;
-  --secondary: #00D9FF;
-  --accent: #FF6B6B;
-  --bg: #0A0A1A;
-  --surface: #1A1A2E;
-  --text: #E8E8F0;
-  --text-dim: #8888AA;
-  --glass-bg: rgba(255,255,255,0.05);
-  --glass-border: rgba(255,255,255,0.1);
-  --glass-shadow: rgba(0,0,0,0.3);
-  --grad-1: #6C63FF;
-  --grad-2: #00D9FF;
-  --grad-3: #FF6B6B;
-  --font: 'Segoe UI', system-ui, -apple-system, sans-serif;
-  --max-width: 1200px;
-  --nav-height: 70px;
-}
-
-/* ===== Reset & Base ===== */
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{
-  font-family:var(--font);
-  background:var(--bg);
-  color:var(--text);
-  line-height:1.6;
-  overflow-x:hidden;
-  -webkit-font-smoothing:antialiased;
-}
-a{text-decoration:none;color:inherit}
-img{max-width:100%;display:block}
-::selection{background:var(--primary);color:#fff}
-
-/* ===== Scrollbar ===== */
-::-webkit-scrollbar{width:8px}
-::-webkit-scrollbar-track{background:var(--bg)}
-::-webkit-scrollbar-thumb{background:var(--surface);border-radius:4px}
-::-webkit-scrollbar-thumb:hover{background:var(--primary)}
-
-/* ===== Animated Gradient Background ===== */
-.nv-gradient-bg{
-  position:relative;
-  background:linear-gradient(135deg, var(--bg) 0%, var(--surface) 50%, var(--bg) 100%);
-  background-size:400% 400%;
-  animation:gradient-shift 15s ease infinite;
-}
-@keyframes gradient-shift{
-  0%{background-position:0% 50%}
-  50%{background-position:100% 50%}
-  100%{background-position:0% 50%}
-}
-
-/* ===== Gradient Text ===== */
-.nv-gradient-text{
-  background:linear-gradient(135deg,var(--grad-1),var(--grad-2),var(--grad-3),var(--grad-1));
-  background-size:300% 300%;
-  -webkit-background-clip:text;
-  -webkit-text-fill-color:transparent;
-  background-clip:text;
-  animation:gradient-shift 6s ease infinite;
-}
-
-/* ===== Navigation ===== */
-.nv-header{
-  position:fixed;
-  top:0;left:0;right:0;
-  z-index:1000;
-  height:var(--nav-height);
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:0 24px;
-  background:rgba(10,10,26,0.8);
-  backdrop-filter:blur(16px);
-  -webkit-backdrop-filter:blur(16px);
-  border-bottom:1px solid var(--glass-border);
-  transition:background 0.3s;
-}
-.nv-header.scrolled{background:rgba(10,10,26,0.95)}
-.nv-logo{
-  font-size:1.4rem;
-  font-weight:700;
-  letter-spacing:-0.02em;
-  display:flex;
-  align-items:center;
-  gap:10px;
-}
-.nv-logo-icon{
-  width:32px;height:32px;
-  background:linear-gradient(135deg,var(--grad-1),var(--grad-2));
-  border-radius:8px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  font-size:1rem;
-  color:#fff;
-}
-.nv-nav{
-  display:flex;
-  gap:8px;
-  align-items:center;
-}
-.nv-nav a{
-  padding:8px 16px;
-  border-radius:8px;
-  font-size:0.9rem;
-  color:var(--text-dim);
-  transition:color 0.3s, background 0.3s;
-  position:relative;
-}
-.nv-nav a::after{
-  content:'';
-  position:absolute;
-  bottom:4px;left:50%;
-  width:0;height:2px;
-  background:var(--primary);
-  border-radius:1px;
-  transition:width 0.3s,left 0.3s;
-}
-.nv-nav a:hover,.nv-nav a.active{color:var(--text)}
-.nv-nav a:hover::after,.nv-nav a.active::after{width:60%;left:20%}
-.nv-nav .nv-btn-ghost{
-  background:var(--glass-bg);
-  border:1px solid var(--glass-border);
-  padding:8px 18px;
-  border-radius:8px;
-  color:var(--text);
-  transition:all 0.3s;
-}
-.nv-nav .nv-btn-ghost::after{display:none}
-.nv-nav .nv-btn-ghost:hover{
-  background:var(--primary);
-  border-color:var(--primary);
-  transform:translateY(-1px);
-  box-shadow:0 4px 20px rgba(108,99,255,0.3);
-}
-.nv-hamburger{display:none;flex-direction:column;gap:5px;cursor:pointer;background:none;border:none;padding:8px}
-.nv-hamburger span{display:block;width:24px;height:2px;background:var(--text);border-radius:2px;transition:all 0.3s}
-.nv-hamburger.active span:nth-child(1){transform:rotate(45deg) translate(5px,5px)}
-.nv-hamburger.active span:nth-child(2){opacity:0}
-.nv-hamburger.active span:nth-child(3){transform:rotate(-45deg) translate(5px,-5px)}
-
-/* ===== Glassmorphism Card ===== */
-.nv-glass{
-  background:var(--glass-bg);
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
-  border:1px solid var(--glass-border);
-  border-radius:16px;
-  box-shadow:0 8px 32px var(--glass-shadow);
-  transition:transform 0.4s, box-shadow 0.4s;
-}
-.nv-glass:hover{
-  transform:translateY(-4px);
-  box-shadow:0 12px 40px rgba(108,99,255,0.15);
-}
-
-/* ===== Buttons ===== */
-.nv-btn{
-  display:inline-flex;
-  align-items:center;
-  gap:8px;
-  padding:12px 28px;
-  border-radius:12px;
-  font-size:1rem;
-  font-weight:600;
-  border:none;
-  cursor:pointer;
-  transition:all 0.3s;
-  position:relative;
-  overflow:hidden;
-}
-.nv-btn-primary{
-  background:linear-gradient(135deg,var(--grad-1),var(--grad-2));
-  color:#fff;
-}
-.nv-btn-primary:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 30px rgba(108,99,255,0.4);
-}
-.nv-btn-primary:active{transform:translateY(0)}
-.nv-btn-secondary{
-  background:var(--glass-bg);
-  border:1px solid var(--glass-border);
-  color:var(--text);
-}
-.nv-btn-secondary:hover{
-  background:rgba(255,255,255,0.1);
-  transform:translateY(-2px);
-  box-shadow:0 8px 30px rgba(0,217,255,0.2);
-}
-
-/* ===== Sections ===== */
-section{padding:100px 24px;position:relative}
-.nv-container{max-width:var(--max-width);margin:0 auto;width:100%}
-
-/* ===== Hero ===== */
-#hero{
-  min-height:100vh;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  text-align:center;
-  padding-top:calc(var(--nav-height) + 60px);
-  position:relative;
-  overflow:hidden;
-}
-#hero::before{
-  content:'';
-  position:absolute;
-  top:-50%;left:-50%;
-  width:200%;height:200%;
-  background:radial-gradient(circle at 50% 50%, rgba(108,99,255,0.08) 0%, transparent 60%);
-  animation:hero-pulse 8s ease-in-out infinite;
-  pointer-events:none;
-}
-@keyframes hero-pulse{
-  0%,100%{transform:scale(1);opacity:0.5}
-  50%{transform:scale(1.2);opacity:1}
-}
-.nv-hero-content{position:relative;z-index:1;max-width:800px}
-.nv-hero-badge{
-  display:inline-block;
-  padding:6px 16px;
-  background:rgba(108,99,255,0.15);
-  border:1px solid rgba(108,99,255,0.3);
-  border-radius:20px;
-  font-size:0.85rem;
-  color:var(--primary);
-  margin-bottom:24px;
-}
-.nv-hero-title{
-  font-size:clamp(2.4rem, 6vw, 4.2rem);
-  font-weight:800;
-  line-height:1.1;
-  margin-bottom:16px;
-  letter-spacing:-0.03em;
-}
-.nv-hero-sub{
-  font-size:clamp(1rem, 2vw, 1.25rem);
-  color:var(--text-dim);
-  max-width:600px;
-  margin:0 auto 36px;
-}
-.nv-hero-actions{display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
-.nv-cursor{display:inline-block;width:3px;height:1.2em;background:var(--primary);margin-left:4px;vertical-align:text-bottom;animation:cursor-blink 0.8s step-end infinite}
-@keyframes cursor-blink{0%,100%{opacity:1}50%{opacity:0}}
-
-/* ===== Features ===== */
-#features{background:var(--surface)}
-.nv-section-title{
-  font-size:clamp(1.8rem, 4vw, 2.8rem);
-  font-weight:700;
-  text-align:center;
-  margin-bottom:16px;
-}
-.nv-section-sub{
-  text-align:center;
-  color:var(--text-dim);
-  max-width:600px;
-  margin:0 auto 60px;
-  font-size:1.1rem;
-}
-.nv-grid{
-  display:grid;
-  grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));
-  gap:24px;
-}
-.nv-card{
-  padding:32px;
-  text-align:center;
-}
-.nv-card-icon{
-  width:56px;height:56px;
-  margin:0 auto 20px;
-  background:linear-gradient(135deg,var(--grad-1),var(--grad-2));
-  border-radius:14px;
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  font-size:1.5rem;
-  transition:transform 0.4s;
-}
-.nv-card:hover .nv-card-icon{transform:scale(1.1) rotate(-5deg)}
-.nv-card h3{font-size:1.2rem;margin-bottom:12px}
-.nv-card p{font-size:0.95rem;color:var(--text-dim);line-height:1.7}
-
-/* ===== Demo ===== */
-#demo{text-align:center}
-.nv-demo-box{
-  max-width:700px;
-  margin:0 auto;
-  padding:40px;
-  text-align:left;
-}
-.nv-demo-box pre{
-  background:rgba(0,0,0,0.3);
-  padding:20px;
-  border-radius:12px;
-  overflow-x:auto;
-  font-size:0.9rem;
-  line-height:1.7;
-  color:var(--secondary);
-  border:1px solid rgba(0,217,255,0.15);
-}
-.nv-demo-box code{font-family:'Cascadia Code','Fira Code','Consolas',monospace}
-.nv-demo-lang{
-  display:flex;
-  gap:8px;
-  margin-bottom:16px;
-}
-.nv-demo-lang span{
-  padding:4px 12px;
-  border-radius:6px;
-  font-size:0.8rem;
-  background:var(--glass-bg);
-  border:1px solid var(--glass-border);
-  color:var(--text-dim);
-  cursor:pointer;
-  transition:all 0.3s;
-}
-.nv-demo-lang span.active{
-  background:var(--primary);
-  color:#fff;
-  border-color:var(--primary);
-}
-.nv-demo-lang span:hover:not(.active){border-color:var(--primary)}
-
-/* ===== CTA ===== */
-#cta{
-  text-align:center;
-  background:linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
-}
-#cta .nv-cta-title{font-size:clamp(1.8rem,4vw,2.6rem);font-weight:700;margin-bottom:16px}
-#cta p{color:var(--text-dim);margin-bottom:36px;max-width:500px;margin-left:auto;margin-right:auto}
-
-/* ===== Footer ===== */
-.nv-footer{
-  text-align:center;
-  padding:40px 24px;
-  border-top:1px solid var(--glass-border);
-  color:var(--text-dim);
-  font-size:0.9rem;
-}
-.nv-footer-links{display:flex;gap:24px;justify-content:center;margin-bottom:16px;flex-wrap:wrap}
-.nv-footer-links a{color:var(--text-dim);transition:color 0.3s}
-.nv-footer-links a:hover{color:var(--primary)}
-
-/* ===== Scroll Animations (base hidden) ===== */
-.nv-fade-up{opacity:0;transform:translateY(40px);transition:opacity 0.7s ease,transform 0.7s ease}
-.nv-fade-left{opacity:0;transform:translateX(-40px);transition:opacity 0.7s ease,transform 0.7s ease}
-.nv-fade-right{opacity:0;transform:translateX(40px);transition:opacity 0.7s ease,transform 0.7s ease}
-.nv-fade-up.visible,.nv-fade-left.visible,.nv-fade-right.visible{opacity:1;transform:translate(0,0)}
-
-/* ===== 3D Tilt ===== */
-.nv-tilt{transform-style:preserve-3d;will-change:transform}
-.nv-tilt-content{transform:translateZ(30px)}
-
-/* ===== Responsive ===== */
-@media(max-width:768px){
-  .nv-nav{display:none;position:fixed;top:var(--nav-height);left:0;right:0;background:var(--bg);flex-direction:column;padding:16px;gap:4px;border-bottom:1px solid var(--glass-border)}
-  .nv-nav.open{display:flex}
-  .nv-hamburger{display:flex}
-  #hero{padding-top:calc(var(--nav-height) + 40px)}
-  .nv-hero-actions{flex-direction:column;align-items:center}
-  .nv-demo-box{padding:24px}
-  section{padding:70px 16px}
-}
-@media(max-width:480px){
-  .nv-card{padding:24px}
-  .nv-footer-links{gap:12px}
-}
-
-/* ===== Reduced Motion ===== */
-@media(prefers-reduced-motion:reduce){
-  *,.nv-glass,.nv-header,.nv-fade-up,.nv-fade-left,.nv-fade-right,.nv-card,.nv-btn,.nv-btn-ghost{transition:none!important;animation:none!important;transform:none!important}
-  .nv-cursor{animation:none!important;opacity:1}
-  .nv-gradient-bg{background:var(--bg)!important;animation:none!important}
-  .nv-gradient-text{-webkit-text-fill-color:var(--text);background:none}
-}
-</style>
+<title>NL-VEIL — THE FILE — neuron-loops engineering archive</title>
+<meta name="description" content="The engineering file on nl-veil: a local-first swarm intelligence engine, one binary, many minds, one shared memory. Evidence board, source documents, and a cast reconstructed round by round. The file remains open.">
+<meta property="og:title" content="NL-VEIL — THE FILE">
+<meta property="og:description" content="One goal typed at the desk. Eleven minds, one shared memory, one honest ledger. Examine the evidence board; every item opens the source docs.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#6E4A27">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='8' fill='%236E4A27'/%3E%3Cpath d='M10 22h16l4-6h24v34H10z' fill='%23DCC98F'/%3E%3Cpath d='M10 24h44v26H10z' fill='%23E8D6A0'/%3E%3Ccircle cx='45' cy='19' r='7' fill='%23A8241B'/%3E%3Ccircle cx='43' cy='17' r='2' fill='%23E9B7B2'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/SpecialElite-02.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/StardosStencil-02.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="fonts/SpecialElite.css">
+<link rel="stylesheet" href="fonts/CourierPrime.css">
+<link rel="stylesheet" href="fonts/StardosStencil.css">
+<link rel="stylesheet" href="fonts/Caveat.css">
+<link rel="stylesheet" href="css/main.css">
+<link rel="stylesheet" href="css/file.css">
 </head>
 <body>
 
-<!-- Header -->
-<header class="nv-header" role="banner">
-  <a href="#" class="nv-logo" aria-label="nl-veil home">
-    <span class="nv-logo-icon">&#9670;</span>
-    <span>nl-veil</span>
-  </a>
-  <nav class="nv-nav" role="navigation" aria-label="Main navigation">
-    <a href="#hero" class="active">Home</a>
-    <a href="#features">Features</a>
-    <a href="#demo">Demo</a>
-    <a href="#cta">Get Started</a>
-    <a href="https://github.com/gary23w/nl-veil" class="nv-btn-ghost" target="_blank" rel="noopener">
-      &#9733; GitHub
-    </a>
-  </nav>
-  <button class="nv-hamburger" aria-label="Toggle menu" aria-expanded="false">
-    <span></span>
-    <span></span>
-    <span></span>
-  </button>
+<header class="cover" id="top">
+  <div class="cover-inner">
+    <div class="punchholes" aria-hidden="true"><span></span><span></span></div>
+    <p class="cover-eyebrow">NEURON-LOOPS&nbsp;&middot;&nbsp;ENGINEERING ARCHIVE&nbsp;&middot;&nbsp;DO NOT DEPLOY WITHOUT READING THE FILE</p>
+
+    <div class="cover-tab" aria-hidden="true">NL&#8209;VEIL</div>
+
+    <h1 class="cover-title">
+      <span class="cover-file">FILE <span class="nobr">NL-VEIL</span></span>
+      <span class="cover-matter">In the matter of the local&#8209;first swarm engine<br><strong>NL&#8209;VEIL</strong></span>
+    </h1>
+    <p class="cover-meta">One binary, many minds, one shared memory &nbsp;&middot;&nbsp; written in Zig<br>Maintainer of record: gary23w &nbsp;&middot;&nbsp; case opened 2026, still open</p>
+
+    <div class="cover-stamps" aria-hidden="true">
+      <div class="stamp stamp-unresolved" id="stampUnresolved">SELF&#8209;IMPROVING</div>
+      <div class="stamp-round">
+        <span>RECEIVED</span><span class="stamp-round-date">JUL 2026</span><span>PUBLIC ARCHIVE</span>
+      </div>
+      <div class="stamp-review">
+        <span class="stamp stamp-small">REVIEW v0.1</span>
+        <span class="hand hand-note">the file keeps growing. &mdash;g.</span>
+      </div>
+    </div>
+
+    <div class="cover-abstract">
+      <p>At 9:12 on an ordinary evening, somebody sat down at the desk and typed one line: <em>cast a swarm to build it.</em> By 9:40 the gateway had checked the key at the door, the supervisor had detached a worker, and eleven minds were reading one shared memory. Every tool call, every failure, every lesson the hive kept &mdash; it all went in the file.</p>
+      <p>The board below is exactly as the engine left it after the last cast. Drag anything. Pull the string. Read everything twice.</p>
+    </div>
+    <p class="cover-repo">SOURCE OF RECORD: <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">github.com/gary23w/nl-veil</a></p>
+
+    <div class="coffee-ring" aria-hidden="true"></div>
+    <div class="paperclip" aria-hidden="true"></div>
+  </div>
 </header>
 
-<!-- Hero -->
-<section id="hero" class="nv-gradient-bg">
-  <div class="nv-hero-content">
-    <div class="nv-hero-badge" data-animate="fade-up">v0.1 &middot; Local-First</div>
-    <h1 class="nv-hero-title nv-gradient-text" data-typewriter>
-      <span id="typewriter-text"></span><span class="nv-cursor" id="typewriter-cursor"></span>
-    </h1>
-    <p class="nv-hero-sub" data-animate="fade-up">
-      A lightweight, local-first swarm intelligence framework that runs on your machine.
-      Deploy emergent hive minds for code generation, research, and automation — zero cloud dependency.
-    </p>
-    <div class="nv-hero-actions" data-animate="fade-up">
-      <a href="https://github.com/gary23w/nl-veil" class="nv-btn nv-btn-primary" target="_blank">
-        &#8595; Install Now
-      </a>
-      <a href="#demo" class="nv-btn nv-btn-secondary">
-        See It in Action &rarr;
-      </a>
-    </div>
-  </div>
-</section>
+<main>
 
-<!-- Features -->
-<section id="features">
-  <div class="nv-container">
-    <h2 class="nv-section-title nv-gradient-text" data-animate="fade-up">Why nl-veil?</h2>
-    <p class="nv-section-sub" data-animate="fade-up">Designed for developers who want intelligent automation without surrendering their data or infrastructure.</p>
-    <div class="nv-grid">
-      <div class="nv-card nv-glass nv-tilt" data-animate="fade-up" data-delay="0">
-        <div class="nv-card-icon">&#9881;</div>
-        <h3>Local-First Architecture</h3>
-        <p>Every mind runs on your hardware. No data leaves your machine unless you explicitly choose to connect an API.</p>
-      </div>
-      <div class="nv-card nv-glass nv-tilt" data-animate="fade-up" data-delay="100">
-        <div class="nv-card-icon">&#9733;</div>
-        <h3>Emergent Hive Intelligence</h3>
-        <p>Cast swarms of specialized sub-agents that collaborate and self-organize — each mind contributes unique capabilities.</p>
-      </div>
-      <div class="nv-card nv-glass nv-tilt" data-animate="fade-up" data-delay="200">
-        <div class="nv-card-icon">&#9889;</div>
-        <h3>Speed-First Execution</h3>
-        <p>Parallel task distribution, automatic time budgets, and built-in orchestration. Your swarms converge fast.</p>
-      </div>
-      <div class="nv-card nv-glass nv-tilt" data-animate="fade-up" data-delay="300">
-        <div class="nv-card-icon">&#128736;</div>
-        <h3>Tool-Integrated Builder</h3>
-        <p>Hands-on file tools, terminal access, and persistent memory. Build, test, and deploy without leaving the chat.</p>
+<!-- ============ EVIDENCE BOARD ============ -->
+<section class="board-section" id="board" aria-label="Evidence board">
+  <div class="section-head">
+    <h2 class="stamp stamp-header">THE BOARD</h2>
+    <p class="section-sub">Thirteen items, twelve lengths of red string. The string is the architecture; every item opens a source document.</p>
+  </div>
+
+  <div class="board-viewport" id="boardViewport">
+    <div class="board-scaler" id="boardScaler">
+      <div class="board-stage" id="boardStage">
+        <div class="board-frame" aria-hidden="true"></div>
+        <!-- items injected as buttons by board.js from the manifest -->
+        <canvas id="stringCanvas" aria-hidden="true"></canvas>
       </div>
     </div>
   </div>
+  <p class="board-hint" id="boardHint">DRAG ITEMS &middot; PULL THE STRING &middot; <span id="hintVerb">CLICK</span> TO READ THE DOC &nbsp;<span class="hint-kbd">(keyboard: tab to an item, arrows move it, enter examines)</span></p>
 </section>
 
-<!-- Demo -->
-<section id="demo" class="nv-gradient-bg">
-  <div class="nv-container">
-    <h2 class="nv-section-title nv-gradient-text" data-animate="fade-up">Quick Start</h2>
-    <p class="nv-section-sub" data-animate="fade-up">Get a swarm running in under a minute. Here's how.</p>
-    <div class="nv-demo-box nv-glass" data-animate="fade-up">
-      <div class="nv-demo-lang">
-        <span class="active" data-lang="zig">Zig</span>
-        <span data-lang="npm">npm</span>
-        <span data-lang="docker">Docker</span>
-      </div>
-      <pre><code id="demo-code"><span style="color:#888"># Install & run nl-veil in one command</span>
-<span style="color:var(--primary)">$</span> zig build run -- --desk
+<!-- ============ DOCUMENT INVENTORY ============ -->
+<section class="inventory" id="documents" aria-labelledby="invHead">
+  <div class="section-head">
+    <h2 class="stamp stamp-header" id="invHead">DOCUMENT INVENTORY</h2>
+    <p class="section-sub">Contents sheet: 33 documents covering 32 source files across 8 modules. Generated from source; amended as the source moves.</p>
+  </div>
 
-<span style="color:#888"># Cast a research swarm</span>
-<span style="color:var(--primary)">$</span> CAST: research quantum computing trends
-
-<span style="color:#888"># Build a complete web app with one prompt</span>
-<span style="color:var(--primary)">$</span> "Build me a dashboard with three tabs"</code></pre>
-    </div>
+  <div class="inv-sheet reveal">
+    <p class="inv-caption">NEURON&#8209;LOOPS ENGINEERING &mdash; FILE NL&#8209;VEIL &mdash; CONTENTS OF FILE</p>
+    <ol class="inv-list" id="invMount"></ol>
+    <p class="inv-footnote hand">photographs and tag examinations are pinned to the board. where else would they be. &mdash;g.</p>
   </div>
 </section>
 
-<!-- CTA -->
-<section id="cta">
-  <div class="nv-container" data-animate="fade-up">
-    <h2 class="nv-cta-title nv-gradient-text">Ready to Build with Swarms?</h2>
-    <p>nl-veil is open source, MIT licensed, and built for developers who want control and speed. Clone it, fork it, or contribute.</p>
-    <div class="nv-hero-actions">
-      <a href="https://github.com/gary23w/nl-veil" class="nv-btn nv-btn-primary" target="_blank">
-        &#9733; Star on GitHub
-      </a>
-      <a href="https://github.com/gary23w/nl-veil/fork" class="nv-btn nv-btn-secondary" target="_blank">
-        Fork the Repo
-      </a>
-    </div>
+<!-- ============ TIMELINE ============ -->
+<section class="timeline" id="cast" aria-labelledby="tlHead">
+  <div class="section-head">
+    <h2 class="stamp stamp-header" id="tlHead">A CAST, RECONSTRUCTED</h2>
+    <p class="section-sub">Round by round, from the one&#8209;line goal to the collected deliverables. Sources in brackets open the file. Three entries circled in grease pencil.</p>
+  </div>
+
+  <ol class="tl-list">
+    <li class="tl-entry reveal"><span class="tl-time">21:12</span><div class="tl-body"><p>The goal arrives: one line, typed at the desk. The gateway checks the key at the door. The audit log writes down the knock before anything answers it.</p><span class="tl-src">[<button class="src-link" data-doc="gateway/http">GW&#8209;01</button>, <button class="src-link" data-doc="obs/audit_log">OB&#8209;01</button>]</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:13</span><div class="tl-body"><p>The supervisor detaches a worker. Casts run as separate processes; a cast survives the server that started it, the way a boat survives the dock.</p><span class="tl-src">[<button class="src-link" data-doc="orchestrate/supervisor">OR&#8209;05</button>]</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:14</span><div class="tl-body"><p>The blueprint is drawn. The goal declares its file tree and every file gets an owner; no mind writes a teammate&rsquo;s slice. Eleven minds open one shared memory and begin.</p><span class="tl-src">[<button class="src-link" data-doc="worker/run">WK&#8209;10</button>, <button class="src-link" data-doc="worker/writer">WK&#8209;13</button>]</span></div></li>
+    <li class="tl-entry reveal tl-flag" data-circle><span class="tl-time">21:20</span><div class="tl-body"><p>A write misses. The failure is recorded with its exact path <strong>before</strong> anything else happens. The fix comes later; the record comes first.</p><span class="tl-src">[<button class="src-link" data-doc="worker/rsi">WK&#8209;09</button>]</span><span class="hand tl-note">the miss is written down before the fix. that order is the whole method. &mdash;g.</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:26</span><div class="tl-body"><p>Edits from eleven minds meet in one file. Disjoint regions merge on their own. The same region is a conflict, and conflicts are said out loud, never papered over.</p><span class="tl-src">[<button class="src-link" data-doc="worker/vcs">WK&#8209;12</button>, <button class="src-link" data-doc="worker/bufedit">WK&#8209;02</button>]</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:31</span><div class="tl-body"><p>The checkpoint is rebuilt from the record: what completed, what&rsquo;s blocked, what&rsquo;s pending. No model is asked for its opinion &mdash; the ledger already knows.</p><span class="tl-src">[<button class="src-link" data-doc="worker/run">WK&#8209;10</button>]</span></div></li>
+    <li class="tl-entry reveal tl-flag" data-circle><span class="tl-time">21:33</span><div class="tl-body"><p>Out of band, a reviewer reads the round&rsquo;s real tool trace and mints a lesson into the live hive &mdash; only what the trace can ground, nothing a mind merely claimed.</p><span class="tl-src">[<button class="src-link" data-doc="worker/rsi">WK&#8209;09</button>]</span><span class="hand tl-note">a lesson nobody typed. it came off the trace. &mdash;g.</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:38</span><div class="tl-body"><p>The crawler brings back the outside. A fetched fact enters the hive only with a verbatim quote from the page that said it; the rest stays outside where it belongs.</p><span class="tl-src">[<button class="src-link" data-doc="worker/crawl">WK&#8209;04</button>, <button class="src-link" data-doc="worker/hyperspace">WK&#8209;05</button>]</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">21:40</span><div class="tl-body"><p>Smoke test. The deliverable is booted and probed, not admired. Passing tests are not a working app; a working app is a working app.</p><span class="tl-src">[<button class="src-link" data-doc="worker/run">WK&#8209;10</button>]</span></div></li>
+    <li class="tl-entry reveal tl-flag" data-circle><span class="tl-time">21:55</span><div class="tl-body"><p>The judge scores the cast. The governor reads the fitness curve, trims what idles, keeps what moves. A plateau is information, not failure.</p><span class="tl-src">[<button class="src-link" data-doc="worker/oscillation">WK&#8209;08</button>]</span><span class="hand tl-note">the score is not the goal. read the curve. &mdash;g.</span></div></li>
+    <li class="tl-entry reveal"><span class="tl-time">22:05</span><div class="tl-body"><p>Collection. Files, the event stream, the metered spend, and the record of what was actually verified against what was merely assumed. All of it goes in the file.</p><span class="tl-src">[<button class="src-link" data-doc="obs/audit_log">OB&#8209;01</button>, <button class="src-link" data-doc="plan/billing_seam">PL&#8209;01</button>]</span></div></li>
+    <li class="tl-entry reveal tl-final"><span class="tl-time">&mdash;</span><div class="tl-body"><p>No cast is closed until somebody reads the file.</p></div></li>
+  </ol>
+</section>
+
+<!-- ============ ENGINEERING MEMOS ============ -->
+<section class="notes" id="notes" aria-labelledby="qnHead">
+  <div class="section-head">
+    <h2 class="stamp stamp-header" id="qnHead">WHAT THE ENGINEER KEPT</h2>
+    <p class="section-sub">Four memos from the maintainer&rsquo;s personal jacket. Not part of the generated record. Filed anyway.</p>
+  </div>
+
+  <div class="notes-stack">
+    <article class="note-page reveal" style="--tilt:-0.7deg">
+      <p class="doc-head">MEMO TO FILE &mdash; ON THE ENGINE &mdash; NEURON&#8209;LOOPS</p>
+      <p>The engine is a floor, not a script. It never learns what a goal <em>means</em>; it learns how goals <em>move</em>. The day a use case gets hardcoded into the loop is the day the loop stops deserving the name. Strategy has to emerge from live signals, or it isn&rsquo;t strategy &mdash; it&rsquo;s superstition with an if&#8209;statement.</p>
+      <p>Every mechanism in this file is general. If you find a branch in the engine that knows what it&rsquo;s building, tear it out and file the report.</p>
+    </article>
+
+    <article class="note-page reveal" style="--tilt:0.5deg">
+      <p class="doc-head">MEMO TO FILE &mdash; ON THE HIVE &mdash; NEURON&#8209;LOOPS</p>
+      <p>Separate memories made polite strangers. One shared memory made a swarm. Every observation any mind makes lands where every other mind can reach it; the crawler&rsquo;s facts, the builder&rsquo;s failures, the judge&rsquo;s scores &mdash; one hive, no private notebooks.</p>
+      <p>A mind that shares what it sees is worth six that don&rsquo;t. We counted.</p>
+    </article>
+
+    <article class="note-page reveal" style="--tilt:-0.4deg">
+      <p class="doc-head">MEMO TO FILE &mdash; ON FEEDBACK &mdash; NEURON&#8209;LOOPS</p>
+      <p>Outcome feedback strengthens what exists. It never creates what doesn&rsquo;t. A win saturates a memory; it does not invent one. We learned this the way you learn everything worth knowing: by watching <span class="redacted" data-note="a finished goal came back from the dead because a reward said it should. we don&rsquo;t talk about the arcade. &mdash;g.">a thing that should have stayed finished get resurrected by its own reward signal</span>, and then never letting it happen again.</p>
+      <p>Plasticity is a privilege of evidence. Nothing mints but the trace.</p>
+    </article>
+
+    <article class="note-page reveal" style="--tilt:0.8deg">
+      <p class="doc-head">MEMO TO FILE &mdash; ON PROOF &mdash; NEURON&#8209;LOOPS (FINAL)</p>
+      <p>Whoever reads after me: the case is one blueprint, one shared memory, one honest record of failure, and a ledger of what was verified against what was merely assumed. Put them in that order and there is only one way to build.</p>
+      <p>A benchmark says the score is high. The smoke test says the app boots. Those are different sentences. Knowing isn&rsquo;t proof &mdash; that is the whole difference between a score and the truth, and the engine pays that difference on every cast.</p>
+      <p class="hand note-ps">If you&rsquo;re reading this, the swarm is yours now.<br>Look at the events log again. &mdash;g.</p>
+    </article>
   </div>
 </section>
 
-<!-- Footer -->
-<footer class="nv-footer" role="contentinfo">
-  <div class="nv-footer-links">
-    <a href="https://github.com/gary23w/nl-veil">GitHub</a>
-    <a href="https://github.com/gary23w/nl-veil/issues">Issues</a>
-    <a href="https://github.com/gary23w/nl-veil/discussions">Discussions</a>
-    <a href="#">Documentation</a>
+</main>
+
+<footer class="foot">
+  <div class="foot-inner">
+    <p class="foot-status"><span class="stamp stamp-small stamp-open">STATUS: OPEN</span></p>
+    <p class="foot-line">File NL&#8209;VEIL remains open at <a href="https://github.com/gary23w/nl-veil" target="_blank" rel="noopener">github.com/gary23w/nl-veil</a>. Reader conclusions are welcome as pull requests.</p>
+    <p class="foot-colophon">Typed in 2026 on period equipment: Special Elite, Courier Prime, Stardos Stencil, one ballpoint. No frameworks, no trackers, no stock photographs. The markdown parser is home&#8209;built, the photographs are procedural, and the string is real physics.</p>
   </div>
-  <p>&copy; 2026 nl-veil &middot; MIT License &middot; Built with &#9829; for the developer community</p>
 </footer>
 
-<script>
-(function(){
-  'use strict';
+<!-- ============ DOCUMENT VIEWER ============ -->
+<dialog class="docview" id="docview" aria-labelledby="docviewTitle">
+  <button class="docview-close" id="docviewClose">RETURN TO FILE &times;</button>
+  <span class="docview-tag" id="docviewTag" aria-hidden="true"></span>
+  <div class="docview-paper" id="docviewPaper">
+    <div class="docview-body" id="docviewBody"><h3 id="docviewTitle" class="visually-hidden">Source document</h3></div>
+  </div>
+</dialog>
 
-  // --- Typewriter Effect ---
-  function typewriter(el, text, speed = 50, callback){
-    let i = 0;
-    el.textContent = '';
-    function tick(){
-      if(i < text.length){
-        el.textContent += text.charAt(i);
-        i++;
-        setTimeout(tick, speed);
-      } else if(callback) callback();
-    }
-    tick();
-  }
-
-  var heroText = document.getElementById('typewriter-text');
-  if(heroText){
-    var lines = [
-      'Swarm Intelligence,',
-      'Local-First'
-    ];
-    var lineIdx = 0;
-    var charIdx = 0;
-    var isDeleting = false;
-    var speed = 60;
-    var pause = 1800;
-
-    function typeLoop(){
-      var current = lines[lineIdx];
-      if(!isDeleting){
-        heroText.textContent = current.substring(0, charIdx + 1);
-        charIdx++;
-        if(charIdx === current.length){
-          isDeleting = true;
-          setTimeout(typeLoop, pause);
-          return;
-        }
-        setTimeout(typeLoop, speed);
-      } else {
-        heroText.textContent = current.substring(0, charIdx - 1);
-        charIdx--;
-        if(charIdx === 0){
-          isDeleting = false;
-          lineIdx = (lineIdx + 1) % lines.length;
-          setTimeout(typeLoop, 200);
-          return;
-        }
-        setTimeout(typeLoop, speed / 2);
-      }
-    }
-    typeLoop();
-  }
-
-  // --- Intersection Observer (Scroll Reveal) ---
-  var animObs = new IntersectionObserver(function(entries){
-    entries.forEach(function(e){
-      if(e.isIntersecting){
-        var delay = e.target.getAttribute('data-delay');
-        var d = delay ? parseInt(delay,10) : 0;
-        setTimeout(function(){ e.target.classList.add('visible'); }, d);
-        animObs.unobserve(e.target);
-      }
-    });
-  }, { threshold: 0.15, rootMargin: '0px 0px -40px 0px' });
-
-  document.querySelectorAll('[data-animate]').forEach(function(el){ animObs.observe(el); });
-
-  // --- 3D Tilt Effect ---
-  document.querySelectorAll('.nv-tilt').forEach(function(card){
-    card.addEventListener('mousemove', function(e){
-      var rect = card.getBoundingClientRect();
-      var x = e.clientX - rect.left;
-      var y = e.clientY - rect.top;
-      var centerX = rect.width / 2;
-      var centerY = rect.height / 2;
-      var rotateX = (y - centerY) / centerY * -12;
-      var rotateY = (x - centerX) / centerX * 12;
-      card.style.transform = 'perspective(800px) rotateX(' + rotateX + 'deg) rotateY(' + rotateY + 'deg)';
-    });
-    card.addEventListener('mouseleave', function(){
-      card.style.transform = 'perspective(800px) rotateX(0deg) rotateY(0deg)';
-    });
-  });
-
-  // --- Parallax Gradient (hero mouse follow) ---
-  var hero = document.getElementById('hero');
-  if(hero){
-    hero.addEventListener('mousemove', function(e){
-      var x = (e.clientX / window.innerWidth - 0.5) * 10;
-      var y = (e.clientY / window.innerHeight - 0.5) * 10;
-      hero.style.setProperty('--parallax-x', x + 'px');
-      hero.style.setProperty('--parallax-y', y + 'px');
-      hero.style.backgroundPosition = 'calc(50% + ' + x + ') calc(50% + ' + y + ')';
-    });
-  }
-
-  // --- Nav Scroll-Spy ---
-  var navLinks = document.querySelectorAll('.nv-nav a:not([target])');
-  var sections = [];
-  navLinks.forEach(function(a){
-    var href = a.getAttribute('href');
-    if(href && href.startsWith('#')){
-      var s = document.querySelector(href);
-      if(s) sections.push({ el: s, link: a });
-    }
-  });
-  function updateActive(){
-    var scrollY = window.scrollY + 100;
-    var current = null;
-    sections.forEach(function(s){
-      if(s.el.offsetTop <= scrollY) current = s;
-    });
-    sections.forEach(function(s){ s.link.classList.remove('active'); });
-    if(current) current.link.classList.add('active');
-  }
-  window.addEventListener('scroll', updateActive, { passive: true });
-  updateActive();
-
-  // --- Smooth Scroll for anchor links ---
-  document.querySelectorAll('a[href^="#"]').forEach(function(a){
-    a.addEventListener('click', function(e){
-      var target = document.querySelector(this.getAttribute('href'));
-      if(target){
-        e.preventDefault();
-        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }
-    });
-  });
-
-  // --- Hamburger Menu ---
-  var hamburger = document.querySelector('.nv-hamburger');
-  var nav = document.querySelector('.nv-nav');
-  if(hamburger && nav){
-    hamburger.addEventListener('click', function(){
-      var expanded = this.getAttribute('aria-expanded') === 'true' ? false : true;
-      this.setAttribute('aria-expanded', expanded);
-      this.classList.toggle('active');
-      nav.classList.toggle('open');
-    });
-    nav.querySelectorAll('a').forEach(function(a){
-      a.addEventListener('click', function(){
-        hamburger.classList.remove('active');
-        nav.classList.remove('open');
-        hamburger.setAttribute('aria-expanded', 'false');
-      });
-    });
-  }
-
-  // --- Header scroll state ---
-  var header = document.querySelector('.nv-header');
-  if(header){
-    window.addEventListener('scroll', function(){
-      header.classList.toggle('scrolled', window.scrollY > 50);
-    }, { passive: true });
-  }
-
-  // --- Demo language tabs (cosmetic) ---
-  var langTabs = document.querySelectorAll('.nv-demo-lang span');
-  var codeEl = document.getElementById('demo-code');
-  var codeSnippets = {
-    zig: '<span style="color:#888"># Install & run nl-veil in one command</span>\n<span style="color:var(--primary)">$</span> zig build run -- --desk\n\n<span style="color:#888"># Cast a research swarm</span>\n<span style="color:var(--primary)">$</span> CAST: research quantum computing trends\n\n<span style="color:#888"># Build a complete web app with one prompt</span>\n<span style="color:var(--primary)">$</span> "Build me a dashboard with three tabs"',
-    npm: '<span style="color:#888"># Quick start with npm</span>\n<span style="color:var(--primary)">$</span> npx nl-veil init my-project\n\n<span style="color:#888"># Start the desk interface</span>\n<span style="color:var(--primary)">$</span> npx nl-veil desk\n\n<span style="color:#888"># Cast a swarm from the CLI</span>\n<span style="color:var(--primary)">$</span> npx nl-veil cast "Analyze this repo"',
-    docker: '<span style="color:#888"># Pull and run with Docker</span>\n<span style="color:var(--primary)">$</span> docker pull ghcr.io/gary23w/nl-veil:latest\n\n<span style="color:#888"># Start a container</span>\n<span style="color:var(--primary)">$</span> docker run -it --rm \\\n  -v $(pwd):/workspace \\\n  ghcr.io/gary23w/nl-veil\n\n<span style="color:#888"># Swarm is ready in the container</span>'
-  };
-  if(langTabs.length && codeEl){
-    langTabs.forEach(function(tab){
-      tab.addEventListener('click', function(){
-        langTabs.forEach(function(t){ t.classList.remove('active'); });
-        this.classList.add('active');
-        var lang = this.getAttribute('data-lang');
-        if(lang && codeSnippets[lang]) codeEl.innerHTML = codeSnippets[lang];
-      });
-    });
-  }
-
-  // --- Reduced motion check (disable animations if user prefers) ---
-  if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){
-    document.querySelectorAll('.nv-fade-up, .nv-fade-left, .nv-fade-right').forEach(function(el){
-      el.classList.add('visible');
-    });
-  }
-
-  // Export namespace for debugging
-  window.NV = {
-    typewriter: typewriter,
-    updateActive: updateActive
-  };
-
-})();
-</script>
+<script src="js/textures.js"></script>
+<script src="js/board.js"></script>
+<script src="js/markdown.js"></script>
+<script src="js/docs.js"></script>
+<script src="js/main.js"></script>
 </body>
 </html>

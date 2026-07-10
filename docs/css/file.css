@@ -1,0 +1,157 @@
+/* ============================================================
+   FILE NL-VEIL — additions on top of the case-file base sheet.
+   Inventory groups, the markdown paper, viewer navigation.
+   ============================================================ */
+
+/* ---------------- inventory groups ---------------- */
+.inv-group{
+  list-style:none;
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:11.5px;
+  letter-spacing:.18em;color:var(--red-ink);
+  padding:26px 6px 6px;border-bottom:2px solid var(--ink);
+}
+.inv-group:first-child{padding-top:4px}
+.inv-group .inv-group-note{
+  float:right;font-weight:400;letter-spacing:.06em;color:var(--ink-faded);text-transform:lowercase;
+}
+.inv-row .inv-title code{
+  font-family:'Courier Prime',monospace;font-size:.92em;
+  background:rgba(168,36,27,.07);padding:0 .25em;border-radius:2px;
+}
+.inv-sheet.flash{animation:inv-flash 1.2s ease 1}
+@keyframes inv-flash{0%{box-shadow:0 0 0 4px rgba(179,48,31,.55)}100%{box-shadow:0 3px 8px rgba(50,30,5,.28)}}
+
+/* ---------------- timeline source links ---------------- */
+.src-link{
+  background:transparent;border:0;padding:0;margin:0;cursor:pointer;
+  font:inherit;color:inherit;letter-spacing:inherit;
+  border-bottom:1.5px dotted rgba(140,27,18,.55);
+}
+.src-link:hover,.src-link:focus-visible{color:var(--red-bright);border-bottom-style:solid}
+
+/* ---------------- the markdown paper ---------------- */
+.docview-body h1{
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:19px;letter-spacing:.07em;
+  text-align:center;line-height:1.5;text-transform:uppercase;
+  border-bottom:2px solid var(--ink);padding-bottom:12px;margin:0 0 18px;
+}
+.docview-body h2{
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:14.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink);
+  margin:1.8em 0 .7em;padding-bottom:4px;
+  border-bottom:1.5px dotted rgba(74,66,52,.5);
+}
+.docview-body h2::before{content:"§ ";color:var(--red-ink)}
+.docview-body h3,.docview-body h4,.docview-body h5,.docview-body h6{
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:13.5px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--ink-faded);margin:1.5em 0 .5em;
+}
+.docview-body p{margin:0 0 1em}
+.docview-body p:last-child{margin-bottom:0}
+.docview-body a{
+  color:var(--red-ink);text-decoration:none;
+  border-bottom:1.5px dotted rgba(140,27,18,.55);
+}
+.docview-body a:hover,.docview-body a:focus-visible{color:var(--red-bright);border-bottom-style:solid}
+.docview-body code{
+  font-family:'Courier Prime',monospace;font-size:.94em;
+  background:rgba(38,33,23,.07);padding:.05em .3em;border-radius:2px;
+  box-decoration-break:clone;-webkit-box-decoration-break:clone;
+}
+.docview-body pre.md-code{
+  background:var(--bond-aged);
+  border:1.5px solid rgba(74,66,52,.35);
+  box-shadow:inset 0 0 8px rgba(140,120,70,.18);
+  padding:14px 16px;margin:0 0 1.2em;overflow-x:auto;
+  font-size:13px;line-height:1.55;
+}
+.docview-body pre.md-code code{background:transparent;padding:0;border-radius:0}
+.docview-body ul,.docview-body ol{margin:0 0 1.1em;padding-left:1.6em}
+.docview-body li{margin:.3em 0}
+.docview-body li::marker{color:var(--red-ink)}
+.docview-body blockquote{
+  margin:0 0 1.2em;padding:.2em 0 .2em 1.1em;
+  border-left:3px solid rgba(168,36,27,.5);
+  color:var(--ink-faded);
+}
+.docview-body hr{
+  border:0;border-top:2px dotted rgba(74,66,52,.5);
+  margin:1.6em auto;width:70%;
+}
+.docview-body img{max-width:100%;height:auto;box-shadow:0 3px 10px rgba(50,30,5,.3)}
+.md-tablewrap{overflow-x:auto;margin:0 0 1.2em}
+.md-table{
+  width:100%;border-collapse:collapse;
+  font-family:'Courier Prime',monospace;font-size:12.5px;
+}
+.md-table th{
+  text-align:left;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  border-bottom:2px solid var(--ink);padding:6px 10px 5px 0;
+}
+.md-table td{
+  padding:7px 10px 6px 0;vertical-align:top;
+  border-bottom:1.5px dotted rgba(74,66,52,.4);
+}
+.md-table tr:last-child td{border-bottom:0}
+
+/* footer link keeps the case-file ink */
+.foot-line a{
+  color:var(--red-ink);text-decoration:none;
+  border-bottom:1.5px dotted rgba(140,27,18,.55);
+}
+.foot-line a:hover,.foot-line a:focus-visible{color:var(--red-bright);border-bottom-style:solid}
+
+/* the typed footer line the generator leaves on every page
+   (nth-last-child(2): the viewer nav is appended after the last paragraph) */
+.docview-body>p:last-child em:only-child,
+.docview-body>p:nth-last-child(2) em:only-child{
+  display:block;text-align:center;font-style:normal;
+  font-family:'Courier Prime',monospace;font-size:11px;letter-spacing:.08em;
+  color:var(--ink-faded);margin-top:1.6em;
+}
+
+/* ---------------- viewer loading + error ---------------- */
+.docview-wait{
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:13px;letter-spacing:.16em;
+  color:var(--ink-faded);text-align:center;padding:60px 0;
+}
+.docview-wait::after{content:"▌";animation:caret 1s steps(2) infinite;color:var(--red-ink)}
+@keyframes caret{50%{opacity:0}}
+.docview-err .doc-head{border-color:var(--red)}
+
+/* ---------------- viewer prev/next ---------------- */
+.docview-nav{
+  display:flex;justify-content:space-between;gap:14px;align-items:baseline;
+  margin-top:34px;padding-top:14px;
+  border-top:2px solid var(--ink);
+  font-family:'Courier Prime',monospace;font-size:12px;letter-spacing:.06em;
+}
+.docview-nav button{
+  background:transparent;border:0;padding:0;cursor:pointer;
+  font:inherit;font-weight:700;color:var(--red-ink);letter-spacing:.08em;
+  border-bottom:1.5px dotted rgba(140,27,18,.55);
+}
+.docview-nav button:hover,.docview-nav button:focus-visible{color:var(--red-bright);border-bottom-style:solid}
+.docview-nav button[disabled]{visibility:hidden}
+.docview-nav .dv-pos{color:var(--ink-faded);font-weight:400}
+@media (max-width:640px){
+  .docview-nav{flex-wrap:wrap}
+  .docview-nav .dv-pos{order:3;width:100%;text-align:center}
+}
+
+/* ---------------- board: hive item tweaks ---------------- */
+.icard .ic-body small{
+  display:block;font-family:'Courier Prime',monospace;font-size:10px;
+  letter-spacing:.08em;color:var(--ink-faded);padding-top:4px;
+}
+
+/* GitHub corner link on the cover */
+.cover-repo{
+  text-align:center;margin-top:10px;
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:12.5px;letter-spacing:.1em;
+}
+.cover-repo a{
+  color:var(--red-ink);text-decoration:none;
+  border-bottom:1.5px dotted rgba(140,27,18,.55);
+}
+.cover-repo a:hover,.cover-repo a:focus-visible{color:var(--red-bright);border-bottom-style:solid}
