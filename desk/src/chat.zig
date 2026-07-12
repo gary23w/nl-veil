@@ -2932,7 +2932,7 @@ pub const Chat = struct {
             // is the model's final decision (looseRunWins) — fixed TOOL-first picked the discarded option.
             const loose_ok = reason.len > 0 and castGoal(full) == null and
                 (full.len == 0 or announcesAction(full));
-            var tc_opt = toolCall(full) orelse toolCallXml(full) orelse toolCallTagXml(full) orelse blk_xn: {
+            var tc_opt = toolCall(full) orelse toolCallXml(full) orelse toolCallTagXml(full) orelse toolCallBracket(full) orelse blk_xn: {
                 // nested-XML call: <read_file><path>..</path><start_line>..</start_line></read_file>. Builds OWNED
                 // JSON args from the XML children (freed via synth_args); NOT `synthesized`, so the prose is still
                 // stripped + narrated and the call renders as a normal in-chat tool chip like any other.
@@ -5166,6 +5166,7 @@ pub fn stripToolTail(text: []const u8) []const u8 {
     if (findToolCall(text)) |f| cut = @min(cut, f.at);
     if (std.mem.indexOf(u8, text, "<tool:")) |p| cut = @min(cut, p);
     if (bareToolTagAt(text)) |p| cut = @min(cut, p); // bare `<edit_file>{...}` XML tool tag
+    if (bracketToolAt(text)) |bt| cut = @min(cut, bt.at); // `[tool:…]` / `[TOOL: …]` square-bracket dialect
     // fenced dialect (```tool: write_file / write_file({...})) — cut at the FENCE so neither the opener nor
     // the `name(` wrapper strand in the display. Matches even while the args are still streaming (open == args
     // unclosed), same live behavior as a leading TOOL: line.
@@ -5200,7 +5201,8 @@ pub fn stripToolTail(text: []const u8) []const u8 {
         while (i < text.len) {
             const nl = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
             const line = std.mem.trimStart(u8, text[i..nl], " \t");
-            if (std.mem.startsWith(u8, line, "RUN:") and line.len > 4) {
+            const rl = if (line.len > 1 and line[0] == '[') line[1..] else line; // tolerate a `[RUN: …]` wrapper
+            if (std.mem.startsWith(u8, rl, "RUN:") and rl.len > 4) {
                 cut = @min(cut, i);
                 break;
             }
@@ -5266,6 +5268,49 @@ pub fn toolCallTagXml(text: []const u8) ?ToolCall {
         if (end > astart + 1) return .{ .name = name, .args = text[astart..end] };
     }
     return null;
+}
+
+const BracketTool = struct { at: usize, name_off: usize };
+
+/// Locate a `[tool:NAME …]` / `[TOOL: NAME …]` call — the SQUARE-bracket dialect the model falls into when it
+/// mimics the desk's own `[tool:…]`/`[console]` result-render labels (fed back to it as history) as if they
+/// were the invocation syntax. No angle-tag/TOOL: parser matches the square form, so the call leaked as inert
+/// text and nothing ran (the moltbook-claim deadlock). Case-insensitive on the marker; gated to a KNOWN chat
+/// tool so a `[note]` / `[1]` citation / `[tooltip]` never matches. Returns the `[` offset (for stripToolTail)
+/// and where the tool NAME begins (for the parser).
+fn bracketToolAt(text: []const u8) ?BracketTool {
+    var search: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, search, '[')) |lb| {
+        search = lb + 1;
+        var i = lb + 1;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        if (i + 5 > text.len or !std.ascii.eqlIgnoreCase(text[i .. i + 5], "tool:")) continue;
+        i += 5;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        var j = i;
+        while (j < text.len and text[j] != ']' and text[j] != ' ' and text[j] != '\t' and text[j] != '{' and text[j] != '\n' and text[j] != '\r') j += 1;
+        const name = std.mem.trim(u8, text[i..j], " \t:`*\"]");
+        if (!knownChatTool(name)) continue;
+        return .{ .at = lb, .name_off = i };
+    }
+    return null;
+}
+
+/// Parse a `[tool:NAME {args}]` / `[TOOL: NAME {args}]` square-bracket call into name + balanced {args}
+/// ("{}" when omitted, e.g. a bare `[tool:web_fetch]` — which then dispatches and the server returns a
+/// missing-arg error the model can react to, instead of the reply silently leaking as text and deadlocking).
+pub fn toolCallBracket(text: []const u8) ?ToolCall {
+    const bt = bracketToolAt(text) orelse return null;
+    var i = bt.name_off;
+    while (i < text.len and text[i] != ']' and text[i] != ' ' and text[i] != '\t' and text[i] != '{' and text[i] != '\n' and text[i] != '\r') i += 1;
+    const name = std.mem.trim(u8, text[bt.name_off..i], " \t:`*\"]");
+    var args: []const u8 = "{}";
+    if (findArgsBrace(text, i)) |astart| {
+        if (jsonObjEnd(text, astart)) |end| {
+            if (end > astart + 1) args = text[astart..end];
+        }
+    }
+    return .{ .name = name, .args = args };
 }
 
 /// Byte offset of the first `<knowntool>…` XML tool call (bare `{json}` OR nested `<arg>…</arg>` form), or null —
@@ -5766,6 +5811,9 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
 fn looksLikeFailedToolCall(text: []const u8) bool {
     const markers = [_][]const u8{
         "\u{FF5C}tool", "tool\u{FF5C}", "tool_calls>", "tool_call>", "invoke name=", "function_calls>", "antml:invoke",
+        // square-bracket render-label dialect: reached only when toolCallBracket/runCall did NOT dispatch (an
+        // unknown/garbled bracketed name), so flagging it turns a silent leak into one corrective retry.
+        "[tool:", "[TOOL:", "[RUN:",
     };
     for (markers) |m| if (std.mem.indexOf(u8, text, m) != null) return true;
     return false;
@@ -6561,10 +6609,18 @@ pub fn runCall(full: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, full, '\n');
     var seen: u32 = 0;
     while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r`*");
+        var line = std.mem.trim(u8, raw, " \t\r`*");
         if (line.len == 0) continue;
         seen += 1;
         if (seen > 4) return null;
+        // Unwrap a single `[…]` wrapper: the model echoes the desk's OWN render-label — `[RUN: cmd]` — back as
+        // if it were the call syntax (the desk re-feeds its `[console]`/`[tool:…]` result rows as history, and
+        // the model imitates that bracketed render). Bracketed, the command leaked as inert text and never ran
+        // — the moltbook-claim deadlock, where every claim POST was silently dropped.
+        if (line.len > 1 and line[0] == '[') {
+            line = line[1..];
+            if (line.len > 0 and line[line.len - 1] == ']') line = line[0 .. line.len - 1];
+        }
         if (std.mem.startsWith(u8, line, "RUN:")) {
             const cmd = std.mem.trim(u8, line["RUN:".len..], " \t\r");
             return if (cmd.len == 0 or cmd.len > 900) null else cmd;
@@ -8780,6 +8836,47 @@ test "toolCallTagXml parses a bare <edit_file>{...} tag; a built page's own mark
     try std.testing.expect(toolCallTagXml("<html><head><title>hi</title></head></html>") == null);
     // a bare mention with no following {args} is not a call
     try std.testing.expect(toolCallTagXml("use <read_file> to inspect the file") == null);
+}
+
+test "square-bracket render-label dialect dispatches (the moltbook-claim deadlock)" {
+    // [tool:NAME {args}] — the model mimicking the desk's own [tool:…] result label as the call syntax
+    {
+        const tc = toolCallBracket("Let me check.\n[tool:web_fetch {\"url\":\"https://www.moltbook.com/api/v1/home\"}]").?;
+        try std.testing.expectEqualStrings("web_fetch", tc.name);
+        try std.testing.expect(std.mem.indexOf(u8, tc.args, "moltbook.com/api/v1/home") != null);
+    }
+    // [TOOL: NAME {args}] — uppercase, space after the colon
+    {
+        const tc = toolCallBracket("[TOOL: read_file {\"path\":\"index.html\"}]").?;
+        try std.testing.expectEqualStrings("read_file", tc.name);
+        try std.testing.expect(argsHasPath(tc.args));
+    }
+    // a bare [tool:web_fetch] with no args -> dispatches with "{}" (server returns a missing-arg error the
+    // model can react to) instead of leaking as inert text
+    {
+        const tc = toolCallBracket("[tool:web_fetch]").?;
+        try std.testing.expectEqualStrings("web_fetch", tc.name);
+        try std.testing.expectEqualStrings("{}", tc.args);
+    }
+    // a citation / note / unknown name is NOT a call
+    try std.testing.expect(toolCallBracket("grounded in the sources [[1]](https://x) and [2]") == null);
+    try std.testing.expect(toolCallBracket("see [tooltip] for details") == null);
+    try std.testing.expect(toolCallBracket("[tool:frobnicate {}]") == null); // unknown tool
+    // the whole [RUN: powershell …] the claim POST deadlocked on now unwraps and dispatches
+    {
+        const cmd = runCall("[RUN: powershell -Command \"Invoke-RestMethod -Uri 'https://www.moltbook.com/claim/x' -Method Post -Body $b | ConvertTo-Json -Depth 5\"]").?;
+        try std.testing.expect(std.mem.startsWith(u8, cmd, "powershell -Command"));
+        try std.testing.expect(std.mem.indexOf(u8, cmd, "moltbook.com/claim/x") != null);
+        try std.testing.expect(cmd[cmd.len - 1] != ']'); // the wrapping bracket was stripped, not the command tail
+    }
+    // an UNbracketed RUN still parses (no regression)
+    try std.testing.expectEqualStrings("dir /b", runCall("Let me list them.\nRUN: dir /b").?);
+    // stripToolTail cuts the bracketed forms out of the displayed prose
+    try std.testing.expectEqualStrings("Checking now.", stripToolTail("Checking now.\n[tool:web_fetch {\"url\":\"https://x\"}]"));
+    try std.testing.expectEqualStrings("Running it.", stripToolTail("Running it.\n[RUN: powershell -Command \"echo hi\"]"));
+    // the failed-call safety net flags an unparseable bracketed call for a corrective retry
+    try std.testing.expect(looksLikeFailedToolCall("[tool:frobnicate]"));
+    try std.testing.expect(looksLikeFailedToolCall("[RUN: something]"));
 }
 
 test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read_file><path>..</path> form)" {
