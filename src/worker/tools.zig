@@ -2053,6 +2053,18 @@ test "urlAllowed SSRF guard: IPv6 literals fail closed; private v4 + metadata st
     try std.testing.expect(!urlAllowed("ftp://example.com/x"));
 }
 
+test "looksLikeJsShell flags unrendered SPA pages so webFetch falls back to the reader" {
+    // the exact shapes the moltbook docs spiral kept re-fetching
+    try std.testing.expect(looksLikeJsShell("Loading... Getting Started on Moltbook"));
+    try std.testing.expect(looksLikeJsShell("<div id=\"__next\"></div>"));
+    try std.testing.expect(looksLikeJsShell("You need to enable JavaScript to run this app."));
+    try std.testing.expect(looksLikeJsShell("")); // empty
+    try std.testing.expect(looksLikeJsShell("tiny")); // too short to be real content
+    // real, substantive page text is NOT a shell
+    const real = "Moltbook API: Complete Guide. Authenticate with a Bearer token. To claim an agent you verify via the claim link and confirm on X/Twitter; posts require a claimed agent." ++ (" More detail here." ** 3);
+    try std.testing.expect(!looksLikeJsShell(real));
+}
+
 test "egressAllowed host-suffix allowlist" {
     // unset allowlist -> fail-open (no extra restriction)
     try std.testing.expect(egressAllowed("", "https://example.com/x"));
@@ -2400,6 +2412,31 @@ fn jsonChunk(s: []const u8) []const u8 {
     return if (b >= a) s[a .. b + 1] else s;
 }
 
+/// A plain fetch of a client-rendered SPA (React/Next/etc.) comes back as an empty shell — a "Loading…" /
+/// "enable JavaScript" placeholder plus cookie/ToS boilerplate — with none of the real content. Detect that so
+/// webFetch can retry through the JS-rendering reader instead of handing the model an unreadable page it then
+/// loops re-fetching (the live moltbook docs spiral: every fetch returned "Loading…" + a Terms banner).
+fn looksLikeJsShell(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (t.len < 64) return true; // too little to be real page content
+    const markers = [_][]const u8{ "enable JavaScript", "enable Javascript", "You need to enable", "Loading...", "Loading…", "__NEXT_DATA__", "id=\"__next\"", "id=\"app-root\"", "id=\"root\"></div>" };
+    for (markers) |m| if (std.mem.indexOf(u8, t, m) != null) return true;
+    return false;
+}
+
+/// Fetch a URL through the JS-rendering reader proxy (the same path read_url uses — default keyless Jina, which
+/// renders client-side content). gpa-owned; "" on empty/timeout.
+fn readerRender(ctx: *ToolCtx, url: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const base = if (ctx.environ.get("NL_READER_URL")) |b| (if (b.len > 0) b else "https://r.jina.ai/") else "https://r.jina.ai/";
+    const full = std.fmt.allocPrint(gpa, "{s}{s}", .{ base, url }) catch return dupe(gpa, "");
+    defer gpa.free(full);
+    const raw = curlToText(ctx, full, false, 31000, 1 << 20);
+    defer gpa.free(raw);
+    const t = std.mem.trim(u8, raw, " \r\n\t");
+    return if (t.len == 0) dupe(gpa, "") else dupe(gpa, clip(t, 1800));
+}
+
 fn webFetch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { url: []const u8 = "", query: []const u8 = "" };
@@ -2409,15 +2446,22 @@ fn webFetch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!egressAllowed(ctx.egress_allow, p.value.url)) return dupe(gpa, "blocked: host not on the egress allowlist (NL_EGRESS_ALLOWLIST)");
     if (ctx.egress_allow.len == 0) {
         const cm = crawlPageFit(ctx, p.value.url, p.value.query, 1800);
-        if (cm.len > 0) return cm;
+        if (cm.len > 0 and !looksLikeJsShell(cm)) return cm; // a shell here still falls through to curl + reader
         gpa.free(cm);
     }
     const raw = curlToText(ctx, p.value.url, false, 26000, 512 << 10);
     defer gpa.free(raw);
-    if (raw.len == 0) return dupe(gpa, "(fetch returned nothing or timed out — try another source)");
     const text = htmlToText(gpa, raw);
     defer gpa.free(text);
     const body = if (text.len > 80) text else raw;
+    // JS-SHELL FALLBACK: an unrendered SPA is useless to the model and it loops re-fetching. Retry ONCE through
+    // the JS-rendering reader (only without an egress allowlist — the reader is a third-party proxy).
+    if (ctx.egress_allow.len == 0 and looksLikeJsShell(body)) {
+        const rendered = readerRender(ctx, p.value.url);
+        if (rendered.len > 0 and !looksLikeJsShell(rendered)) return rendered;
+        gpa.free(rendered);
+    }
+    if (std.mem.trim(u8, body, " \r\n\t").len == 0) return dupe(gpa, "(fetch returned nothing or timed out — try another source)");
     return dupe(gpa, clip(body, 1800));
 }
 

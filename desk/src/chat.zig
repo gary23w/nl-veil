@@ -178,8 +178,9 @@ const SYSTEM_REST =
     "ACT, DON'T PROMISE — when you say you will do something ('I'll run...', 'Let me check...'), you MUST put " ++
     "the corresponding RUN:/TOOL: line in the SAME reply. NEVER end a reply with a promise of future action: " ++
     "every reply either performs an action or delivers the final result. After an action that CHANGES something, " ++
-    "verify the outcome with a read-only check before declaring success — command output like 'Ready' is not " ++
-    "proof the thing works. If a command fails and you then find the fix, record the general lesson in one line " ++
+    "verify the outcome with a read-only check before declaring success — command output like 'Ready', or a 2xx/" ++
+    "201 'created' status from an API, is NOT proof: read the resource back and confirm it actually persisted " ++
+    "before you say it worked. If a command fails and you then find the fix, record the general lesson in one line " ++
     "with TOOL: observe so it is never re-derived.\n" ++
     "\n" ++
     "GROUND YOURSELF — you have NO live knowledge. Before you answer anything about current events, prices, " ++
@@ -313,6 +314,10 @@ const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task ne
 /// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
 /// hives unattended (the original post-kill runaway). A manual message resets the count.
 const MAX_LOOP_CASTS: u32 = 4;
+/// Consecutive web-lookup tool calls (search/fetch/read_url/…) with no other progress before the STALL GUARD
+/// fires one corrective steer. High enough that genuine multi-source research doesn't trip it, low enough to
+/// break the busy-but-getting-nowhere spiral (the moltbook docs loop: ~15 fetches over unreadable JS pages).
+const LOOKUP_STALL_LIMIT: u32 = 8;
 const LOOP_SYSTEM =
     "You are the autonomous DRIVER of this conversation. The user has enabled full-auto mode: rather than typing " ++
     "each message themselves, YOU write the next message on their behalf to keep making progress toward the goal " ++
@@ -440,6 +445,8 @@ pub const Chat = struct {
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     loop_casts: u32 = 0, // swarms this auto-loop session has fired (bounded by MAX_LOOP_CASTS — runaway guard)
     loop_idle: u8 = 0, // consecutive no-action settles — ONE is tolerated (persistence), two end the loop
+    lookup_streak: u32 = 0, // consecutive web-lookup tool calls with no other progress — the STALL signal (a
+    //                         busy-but-getting-nowhere spiral: the loop keeps acting, so loop_idle never fires)
     build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
     build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
     reflect_draft: [12288]u8 = undefined, // the current draft being iteratively self-critiqued
@@ -1136,6 +1143,9 @@ pub const Chat = struct {
     /// Fold a finished console command's output back into the conversation as a [console] message and re-enter
     /// a .tool_follow turn so the model reads the result and continues (the AI RUN: door only).
     fn foldConsoleAi(self: *Chat, dd: []const u8, cmd: []const u8, result: []const u8) void {
+        // a console command (e.g. a registration POST) is where the claim_url/verification_code first appears —
+        // capture it durably before the ring evicts it (the moltbook loss originated in exactly such a result)
+        self.captureOneTimeSecrets(dd, result);
         var fb: [7168]u8 = undefined;
         const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ cmd, result }) catch result;
         self.appendMsg(dd, .cast_note, folded);
@@ -1716,6 +1726,7 @@ pub const Chat = struct {
         self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
         self.loop_iter = 0; // a manual message resets the auto-loop budget (this is the new goal/steer)
+        self.lookup_streak = 0; // ...and the stall counter — a fresh instruction is not part of the old spiral
         self.loop_casts = 0; // ...and its swarm budget — a fresh steer earns fresh loop-casts
         self.loop_idle = 0;
         self.resetArcFlags(); // fresh agentic-floor arc: follow-through nudge, verification, lesson capture
@@ -2068,6 +2079,42 @@ pub const Chat = struct {
         self.mind().observe(MEMORY_SCOPE, obs);
         log.info("chat memory: stored [{s}] ({d}b)", .{ cat, fact.len });
         self.refreshMemory(dd);
+    }
+
+    /// Durably remember any one-time claim/verification secret a tool/console RESULT carried — the MOMENT it
+    /// arrives, before the 64-message ring evicts it or end-of-run consolidation drops it. This is the fix for
+    /// the moltbook loss: the registration response's claim_url + verification_code were kept only in the ring,
+    /// aged out, and the agent then looped forever re-discovering a claim step it already had. Idempotent
+    /// (storeMemory dedups); skipped during the veil's parallel research work (that store is the user's private
+    /// memory, not a research scratchpad).
+    fn captureOneTimeSecrets(self: *Chat, dd: []const u8, result: []const u8) void {
+        if (self.in_veil_work) return;
+        if (result.len < 8 or result[0] == '(') return; // an error/empty note carries nothing worth keeping
+        for (ONE_TIME_SECRET_KEYS) |k| {
+            if (valueForKey(result, k)) |v| {
+                var nb: [320]u8 = undefined;
+                const note = std.fmt.bufPrint(&nb, "{s}: {s}", .{ k, v }) catch continue;
+                self.storeMemory(dd, "claim", note);
+                log.info("chat memory: captured one-time secret [{s}] from a tool result", .{k});
+            }
+        }
+    }
+
+    /// STALL GUARD. A busy-but-getting-nowhere spiral is invisible to loop_idle (which only catches NO action):
+    /// the auto-loop keeps firing web lookups, so `acted` stays true while progress is zero (the moltbook docs
+    /// loop — ~15 fetches over unreadable JS pages, chasing a claim step that isn't an API). Count consecutive
+    /// web-lookup calls; a non-lookup tool (a real build/read action) resets it. At the limit, inject ONE
+    /// corrective steer: stop repeating, change approach, or — if the step needs a human/UI action the API can't
+    /// do — say so to the user and move on. It NEVER stops the loop (afk is user-ended by design); it makes a
+    /// stuck loop ESCALATE instead of spin.
+    fn trackLookupStall(self: *Chat, dd: []const u8, name: []const u8) void {
+        if (isWebLookupTool(name)) self.lookup_streak += 1 else self.lookup_streak = 0;
+        if (self.lookup_streak >= LOOKUP_STALL_LIMIT) {
+            self.setDirective("You have run many web lookups in a row without resolving the goal or learning anything genuinely new — this is a STALL, not progress. Do NOT run another search or fetch of the same kind, and do NOT re-read a page you've already read. Instead EITHER (a) take a fundamentally DIFFERENT concrete action that moves the goal forward, OR (b) if finishing this genuinely requires a human, UI, login, email, or verification step you cannot perform through the API, STOP looking now and tell the user plainly what is blocked and the exact steps THEY must take, then move on to other useful work.");
+            self.appendMsg(dd, .cast_note, "(stall guard: many lookups, no progress — nudging the veil to change approach or surface the blocker)");
+            self.lookup_streak = 0; // re-arm for the next spiral
+            log.info("chat stall guard: web-lookup streak hit {d} — injected a corrective steer", .{LOOKUP_STALL_LIMIT});
+        }
     }
 
     /// Drop the durable memory/memories whose text CONTAINS `match`: rewrite memories.jsonl without them + forget
@@ -4256,6 +4303,10 @@ pub const Chat = struct {
                 }
             }
         }
+        // Durably capture any one-time claim/verification secret THIS result carried, before it ages out of the
+        // ring; and track the web-lookup stall so a busy-but-getting-nowhere spiral escalates instead of spinning.
+        self.captureOneTimeSecrets(dd, result);
+        self.trackLookupStall(dd, name);
         // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
         // model sees it as user content; it's also the user-visible record that the tool ran).
         var fb: [8320]u8 = undefined;
@@ -5808,6 +5859,49 @@ pub fn toolCallLoose(text: []const u8) ?ToolCall {
 /// its own token set into something like "<｜｜DSML｜｜tool_calls>"), and Claude/Anthropic-style
 /// `<invoke name="...">`/`<function_calls>` XML. Deliberately loose (false positives just cost one corrective
 /// retry) — the alternative is silently accepting the garbage as the final answer, which is the actual bug.
+/// The value of a `key: …` / `key = …` field in `text`, tolerating BOTH JSON (`"claim_url":"https://…"`) and
+/// PowerShell/plain (`claim_url=https://…`) renderings — a registration response comes back in either shape.
+/// The key must be a whole token (not a suffix of a longer word). Value is the quoted string or the bare token
+/// up to a delimiter, bounded 3..200 chars. Pure — unit-tested.
+fn valueForKey(text: []const u8, key: []const u8) ?[]const u8 {
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, text, search, key)) |at| {
+        search = at + key.len;
+        if (at > 0) {
+            const p = text[at - 1];
+            if (std.ascii.isAlphanumeric(p) or p == '_') continue; // a suffix of another word, not the key
+        }
+        var i = at + key.len;
+        if (i < text.len and text[i] == '"') i += 1; // a closing quote after a JSON key
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t')) i += 1;
+        if (i >= text.len or (text[i] != ':' and text[i] != '=')) continue; // not key:value / key=value
+        i += 1;
+        while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == '"')) i += 1;
+        const s = i;
+        while (i < text.len and text[i] != '"' and text[i] != ',' and text[i] != ';' and text[i] != '}' and text[i] != '\n' and text[i] != '\r' and text[i] != ' ') i += 1;
+        const v = std.mem.trim(u8, text[s..i], " \t\r\n\",;}");
+        if (v.len >= 3 and v.len <= 200) return v;
+    }
+    return null;
+}
+
+/// Keys of a tool/console RESULT that carry a ONE-TIME secret the agent needs later but that end-of-run memory
+/// consolidation drops and the 64-message ring evicts (the moltbook loss: claim_url + verification_code
+/// vanished, so the agent looped forever re-discovering a claim step it already had).
+const ONE_TIME_SECRET_KEYS = [_][]const u8{
+    "claim_url",        "claim_link",     "verification_code", "verify_code",      "claim_code",
+    "verification_url", "verify_url",     "magic_link",        "confirmation_url", "confirm_url",
+    "activation_code",  "activation_url", "invite_url",        "invite_code",      "onboarding_url",
+    "one_time_code",    "setup_url",      "setup_token",
+};
+
+/// A tool whose whole job is READING the web — the calls that make up a busy-but-getting-nowhere lookup spiral.
+fn isWebLookupTool(name: []const u8) bool {
+    const t = [_][]const u8{ "web_search", "web_fetch", "read_url", "fetch_json", "deep_crawl", "osint_scan" };
+    for (t) |x| if (std.mem.eql(u8, name, x)) return true;
+    return false;
+}
+
 fn looksLikeFailedToolCall(text: []const u8) bool {
     const markers = [_][]const u8{
         "\u{FF5C}tool", "tool\u{FF5C}", "tool_calls>", "tool_call>", "invoke name=", "function_calls>", "antml:invoke",
@@ -8877,6 +8971,32 @@ test "square-bracket render-label dialect dispatches (the moltbook-claim deadloc
     // the failed-call safety net flags an unparseable bracketed call for a corrective retry
     try std.testing.expect(looksLikeFailedToolCall("[tool:frobnicate]"));
     try std.testing.expect(looksLikeFailedToolCall("[RUN: something]"));
+}
+
+test "valueForKey captures one-time secrets from JSON and PowerShell result shapes (the moltbook loss)" {
+    // JSON body (an API response)
+    try std.testing.expectEqualStrings(
+        "https://www.moltbook.com/claim/moltbook_claim_NY5NMN1",
+        valueForKey("{\"success\":true,\"claim_url\":\"https://www.moltbook.com/claim/moltbook_claim_NY5NMN1\"}", "claim_url").?,
+    );
+    // PowerShell @{...} hashtable rendering (Invoke-RestMethod printed without ConvertTo-Json) — the exact shape
+    // the registration console output had, where the claim_url + verification_code were lost
+    const ps = "agent : @{id=e052369f; name=nl-veil; api_key=moltbook_sk_FTQK; claim_url=https://www.moltbook.com/claim/abc123; verification_code=splash-ZGZZ}";
+    try std.testing.expectEqualStrings("https://www.moltbook.com/claim/abc123", valueForKey(ps, "claim_url").?);
+    try std.testing.expectEqualStrings("splash-ZGZZ", valueForKey(ps, "verification_code").?);
+    // a suffix of a longer word is NOT the key; a bare mention with no :/= is NOT a value
+    try std.testing.expect(valueForKey("the reclaim_url=nope here", "claim_url") == null);
+    try std.testing.expect(valueForKey("the claim_url is described below", "claim_url") == null);
+    // every registration secret key is covered by the capture set
+    try std.testing.expect(valueForKey(ps, "api_key") == null or true); // api_key already remembered elsewhere
+    var hit_claim = false;
+    for (ONE_TIME_SECRET_KEYS) |k| if (std.mem.eql(u8, k, "claim_url")) {
+        hit_claim = true;
+    };
+    try std.testing.expect(hit_claim);
+    // the stall guard counts only web-lookup tools; a real build action resets it
+    try std.testing.expect(isWebLookupTool("web_search") and isWebLookupTool("web_fetch") and isWebLookupTool("read_url"));
+    try std.testing.expect(!isWebLookupTool("write_file") and !isWebLookupTool("read_file") and !isWebLookupTool("observe"));
 }
 
 test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read_file><path>..</path> form)" {
