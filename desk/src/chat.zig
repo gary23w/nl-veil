@@ -35,7 +35,10 @@ const CAST_POLICY_SPEED =
     "SPEED MODE is ON. YOU do the building: when the user wants code, files, an app, or a fix, write it " ++
     "YOURSELF with write_file/edit_file/RUN — do NOT cast a swarm to build; you are faster and more reliable " ++
     "hands-on. A multi-file project is ONE continuous job: land a file, then IMMEDIATELY land the next in your " ++
-    "following action — never stop to summarize or ask until every file exists and is verified.\n" ++
+    "following action — never stop to summarize or ask until every file exists and is verified. But GROUND an " ++
+    "unfamiliar, specialized, or current-world domain FIRST — a quick recall_hive then (if thin) web_search " ++
+    "before you build — that is REQUIRED and never counts as 'stopping'; building a specialized domain from " ++
+    "memory alone is the failure to avoid.\n" ++
     "CAST a swarm ONLY as a research sub-agent, for jobs where parallel readers beat one mind: web research and " ++
     "current events, scouting unfamiliar tech before you build, analyzing a large amount of material, gathering " ++
     "references into the hive. A quick research strike runs ~2 minutes by default. But for a GENUINELY BIG, " ++
@@ -321,7 +324,9 @@ const LOOKUP_STALL_LIMIT: u32 = 8;
 const LOOP_SYSTEM =
     "You are the autonomous DRIVER of this conversation. The user has enabled full-auto mode: rather than typing " ++
     "each message themselves, YOU write the next message on their behalf to keep making progress toward the goal " ++
-    "of the thread (the goal is set by the first user message and everything since).\n" ++
+    "of the thread. The GOAL is set by the FIRST user message; later turns — especially ones YOU generated in this " ++
+    "auto-loop — are progress toward that goal, not new goals. If the recent conversation has drifted onto a " ++
+    "side-quest or is stuck repeating a failing step, steer back to the ORIGINAL goal.\n" ++
     "Read the whole conversation, judge what has been accomplished and what is still missing, then output ONLY the " ++
     "next message to send — a single concrete instruction, question, or refinement that advances the goal. Write it " ++
     "as the user would (first person, imperative), with NO preamble, NO quotes, NO explanation — just the message text.\n" ++
@@ -444,6 +449,13 @@ pub const Chat = struct {
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     loop_casts: u32 = 0, // swarms this auto-loop session has fired (bounded by MAX_LOOP_CASTS — runaway guard)
+    // The conversation's DURABLE goal (its first user message). The auto-loop's next-message generator otherwise
+    // treats the whole drifted transcript tail as "the goal" and amplifies drift; this re-anchors it. Set on the
+    // first real send / conversation load, NEVER written by loopContinue (a loop guess must not redefine the goal).
+    arc_goal: [1600]u8 = undefined,
+    arc_goal_len: usize = 0,
+    loop_repeat_streak: u32 = 0, // consecutive near-identical loop steps — afk stall breaker (afk never stops, so
+    console_fail_streak: u32 = 0, //   these ESCALATE a change-of-approach nudge instead of looping a failing step forever)
     loop_idle: u8 = 0, // consecutive no-action settles — ONE is tolerated (persistence), two end the loop
     lookup_streak: u32 = 0, // consecutive web-lookup tool calls with no other progress — the STALL signal (a
     //                         busy-but-getting-nowhere spiral: the loop keeps acting, so loop_idle never fires)
@@ -1246,7 +1258,20 @@ pub const Chat = struct {
             // failure, POSIX signal death) also produces an empty note — that's absence of ground truth,
             // not success, so it must neither mint a lesson nor reinforce the playbook.
             const clean_ok = outcome == .exited and (exit_code orelse 1) == 0;
+            if (clean_ok) self.console_fail_streak = 0; // a success breaks any failing-command spiral
             if (hard_fail) {
+                // afk stall breaker: the SAME command failing over and over (the observed ~20x encoding/quoting
+                // spiral) must force a change of approach, not loop forever. Compare against the prior failing
+                // command BEFORE it is overwritten below; escalate a nudge on a sustained streak.
+                if (self.arc_fail_cmd_len > 0 and nearlySame(p.cmdStr(), self.arc_fail_cmd[0..self.arc_fail_cmd_len]))
+                    self.console_fail_streak += 1
+                else
+                    self.console_fail_streak = 1;
+                if (self.console_fail_streak >= 3) {
+                    self.setDirective("This exact command has failed 3+ times in a row — STOP re-running it; repetition will not make it work. Get the result a DIFFERENT way (e.g. a read_file TOOL instead of a shell one-liner, or a different command), or state plainly what is blocked and move on to the next step of the goal.");
+                    self.appendMsg(dd, .cast_note, "(stall guard: the same command failed repeatedly — nudging a change of approach)");
+                    self.console_fail_streak = 0;
+                }
                 const fl = @min(p.cmd_len, self.arc_fail_cmd.len);
                 @memcpy(self.arc_fail_cmd[0..fl], p.cmd[0..fl]);
                 self.arc_fail_cmd_len = fl;
@@ -1722,6 +1747,10 @@ pub const Chat = struct {
         // puts its whole reply in the hidden reasoning channel and emits no CAST line in the content).
         self.last_user_len = @min(text.len, self.last_user.len);
         @memcpy(self.last_user[0..self.last_user_len], text[0..self.last_user_len]);
+        if (fresh) { // the conversation's FIRST message IS its durable goal — anchor the auto-loop to it
+            self.arc_goal_len = @min(text.len, self.arc_goal.len);
+            @memcpy(self.arc_goal[0..self.arc_goal_len], text[0..self.arc_goal_len]);
+        }
         self.internal_turn = false; // this is a REAL user message → its turn may consolidate memory
         self.conv_epoch += 1; // the conversation moved forward — pending continuations for older goals stand down
         self.tool_iters = 0; // fresh tool budget for this user turn
@@ -1766,6 +1795,20 @@ pub const Chat = struct {
             self.fireCast(dd, castSpecFromUser(text, goal));
             return;
         }
+        // KNOWLEDGE-GAP GATE: a fresh, substantive task in builder (speed) mode must GROUND an unfamiliar or
+        // current-world domain BEFORE building it from weights (the observed failure: a specialized BCI sim built
+        // entirely from memory, never researched). Engine-injected as a prominent directive so it does not depend
+        // on the model noticing its own gap — the model still self-gates whether the domain is actually unfamiliar.
+        // (A coverage-number probe of the shared hive would be more precise but recall_hive is a server passthrough,
+        // not a cheap local read — so we force the CONSIDERATION here and let the model's own recall_hive settle it.)
+        if (fresh and text.len >= 40) {
+            const speed_on = blk_sg: {
+                self.store.lock();
+                defer self.store.unlock();
+                break :blk_sg self.store.settings.speed_mode;
+            };
+            if (speed_on) self.setDirective("GROUND YOURSELF FIRST: if this task touches specialized, named, current-world, or otherwise uncertain knowledge, your FIRST action MUST be TOOL: recall_hive {\"query\":\"...\"} and, if that comes back thin, TOOL: web_search {\"query\":\"...\"} — BEFORE you write any file or commit to a specialized answer. Do NOT build a specialized or unfamiliar domain from memory alone. If it is squarely within your solid general knowledge, proceed directly.");
+        }
         self.startTurn(dd, .user);
     }
 
@@ -1796,6 +1839,7 @@ pub const Chat = struct {
         self.conv_epoch += 1; // new conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
         self.resetArcFlags(); // the agentic-floor arc cannot span a conversation switch
+        self.arc_goal_len = 0; // a brand-new chat has no goal yet — the first cmdSend sets it
         self.syncBuildDir(dd); // a fresh chat has no build dir yet — this clears the previous chat's binding
         self.refreshConvs(dd, true);
     }
@@ -1814,6 +1858,15 @@ pub const Chat = struct {
         self.reflect_msg_idx = null;
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.loadMsgs(dd, id);
+        { // re-anchor the loop's durable goal to THIS conversation's first message
+            self.store.lock();
+            defer self.store.unlock();
+            if (self.store.msg_count > 0) {
+                const g = self.store.msgs[0].textStr();
+                self.arc_goal_len = @min(g.len, self.arc_goal.len);
+                @memcpy(self.arc_goal[0..self.arc_goal_len], g[0..self.arc_goal_len]);
+            } else self.arc_goal_len = 0;
+        }
         self.syncBuildDir(dd); // console cwd follows the chat: restore ITS build dir (or clear the old chat's)
     }
 
@@ -2637,7 +2690,14 @@ pub const Chat = struct {
             const scope = self.convScope(&scope_buf);
             if (scope.len > 0) {
                 var rbuf: [4096]u8 = undefined;
-                const mem = self.mind().recall(scope, self.last_user[0..self.last_user_len], &rbuf);
+                // For an auto-loop driver turn, recall against the DURABLE goal, not self.last_user — loopContinue
+                // overwrites last_user with the loop's OWN just-generated message, so keying on it makes recall
+                // amplify drift instead of re-grounding the loop in what the conversation is actually for.
+                const rquery = if (kind == .loop_infer and self.arc_goal_len > 0)
+                    self.arc_goal[0..self.arc_goal_len]
+                else
+                    self.last_user[0..self.last_user_len];
+                const mem = self.mind().recall(scope, rquery, &rbuf);
                 if (mem.len > 0) {
                     msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"RELEVANT MEMORY (recalled from this conversation's neuron-db — earlier turns + cast findings, some beyond the visible history). Treat as grounded context:\\n") catch return;
                     escJson(&msgs, self.gpa, mem);
@@ -2762,6 +2822,14 @@ pub const Chat = struct {
                 escJson(&msgs, self.gpa, m.textStr());
                 msgs.appendSlice(self.gpa, "\"}") catch return;
             }
+        }
+        // DURABLE GOAL ANCHOR (loop driver only): the next-message generator otherwise reads the whole drifted
+        // tail as "the goal". Re-assert the original goal right before it composes, so it steers back to the real
+        // objective instead of amplifying a side-quest or a stuck spiral.
+        if (kind == .loop_infer and self.arc_goal_len > 0) {
+            msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"THE DURABLE GOAL of this thread is:\\n") catch return;
+            escJson(&msgs, self.gpa, self.arc_goal[0..self.arc_goal_len]);
+            msgs.appendSlice(self.gpa, "\\nLater messages may have drifted onto a side-task or were auto-generated by this loop. Judge what is genuinely DONE and pick the next step against THIS goal; if the recent conversation is stuck repeating a failing step, change approach or steer back to the goal.\"}") catch return;
         }
         // EPHEMERAL DIRECTIVE (act nudge / verify / format retry): injected into THIS re-entered turn's
         // prompt only, then cleared — the durable conversation never carries it.
@@ -3585,10 +3653,21 @@ pub const Chat = struct {
         // status to confirm" twice in a row). If the inferred message basically repeats the last one, the loop
         // isn't making progress — stop instead of churning. Skipped in afk: churn beats stopping there, and the
         // DONE fold above re-sends the same drive message by design.
-        if (!afk and nearlySame(text, self.last_user[0..self.last_user_len])) {
+        // REPEAT / STALL GUARD. Non-afk: a near-identical next step means no progress — stop. afk never stops by
+        // design, so a sustained spiral instead forces a CHANGE OF APPROACH: re-ground the next step to the
+        // original goal rather than re-sending the same stuck step forever (the observed ~20x index.html spiral).
+        const rep = nearlySame(text, self.last_user[0..self.last_user_len]);
+        self.loop_repeat_streak = if (rep) self.loop_repeat_streak + 1 else 0;
+        if (!afk and rep) {
             if (self.fireTerminalVerify(dd)) return; // a stalled build still gets its completeness check
             self.stopLoop(dd, "auto-loop stopped: the next step just repeated the last one (no progress).");
             return;
+        }
+        var rgb: [1800]u8 = undefined;
+        if (afk and self.loop_repeat_streak >= 3 and self.arc_goal_len > 0) {
+            self.loop_repeat_streak = 0;
+            self.appendMsg(dd, .cast_note, "(auto-loop-afk: stuck repeating a step — re-grounding to the original goal)");
+            text = std.fmt.bufPrint(&rgb, "You are stuck repeating a step that is not working. STOP repeating it and take a DIFFERENT concrete action toward the ORIGINAL goal: {s}", .{self.arc_goal[0..self.arc_goal_len]}) catch AFK_DRIVE_MSG;
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
             if (!afk) {
@@ -3608,7 +3687,10 @@ pub const Chat = struct {
         self.arc_mutated = false;
         self.verify_done = false;
         self.stream_retried = false; // and its own transient-death retry
-        self.appendMsg(dd, .user, text);
+        // Append WITHOUT observing: the loop's own generated message must not be re-observed into the conversation's
+        // neuron-db, or its guesses become recallable "grounded context" next turn — a self-reinforcing drift loop.
+        // The durable goal (arc_goal) is the loop's anchor; a synthetic driver turn is not durable knowledge.
+        self.appendMsgFull(dd, .user, text, false);
         self.startTurn(dd, .user);
     }
 
@@ -3690,6 +3772,8 @@ pub const Chat = struct {
         self.playbook_hit_lesson_len = 0; // and its stashed lessons must not carry into an unrelated arc
         self.consolidate_pending = false;
         self.stream_retried = false;
+        self.loop_repeat_streak = 0; // a fresh arc is not part of the previous arc's spiral
+        self.console_fail_streak = 0;
         self.pending_directive_len = 0; // a stale directive must never leak into an unrelated turn's prompt
     }
 
