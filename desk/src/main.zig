@@ -25,6 +25,31 @@ const Tab = store_mod.Tab;
 // (server offline); silence the diagnostic trace so the 1Hz liveness probe doesn't spam stderr.
 pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
+// The server spawns us with `.stderr = .ignore`, so a ReleaseSafe panic (bounds violation, unreachable,
+// unwrapped null) dies SILENTLY — the log just stops mid-turn and the exact fault is lost. That made a
+// real streaming-turn crash undiagnosable. Install a panic handler that appends the panic message +
+// return address to a durable file BEFORE the normal panic path runs, so any recurrence is pinpointable
+// regardless of how the desk was launched. Best-effort and allocation-free — we may be in a corrupt state.
+pub const panic = std.debug.FullPanic(deskPanic);
+
+fn deskPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
+    writeCrashLine(msg, first_trace_addr);
+    std.debug.defaultPanic(msg, first_trace_addr); // preserve the normal stderr trace + abort
+}
+
+fn writeCrashLine(msg: []const u8, ra: ?usize) void {
+    var buf: [700]u8 = undefined;
+    const line = (if (ra) |a|
+        std.fmt.bufPrint(&buf, "=== desk PANIC === {s} (ret_addr=0x{x})\n", .{ msg, a })
+    else
+        std.fmt.bufPrint(&buf, "=== desk PANIC === {s} (ret_addr=?)\n", .{msg})) catch return;
+    // The app's gpa may be corrupt mid-panic, so stand up a throwaway blocking Io on the page allocator
+    // (lock-free VirtualAlloc, no shared state). A single writeFile runs inline — no pool thread is spawned.
+    // Skip deinit: we abort in defaultPanic immediately after, so there's nothing to clean up.
+    var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = "data/desk-panic.log", .data = line }) catch {};
+}
+
 const WIN_W = 1220;
 const WIN_H = 820;
 const TITLE_H = 34;
@@ -2077,7 +2102,13 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
         if (ll > 0) {
             @memcpy(cand[0..ll], line_buf[0..ll]);
             cl = ll;
-            if (cl < cand.len) {
+            // Reserve the trailing sentinel slot. `cl + 1 < cand.len` (not `cl < cand.len`): once the running
+            // line reaches ll==1023, letting the separator fill the last byte pushes cl to cand.len (1024), and
+            // the `cand[cl] = 0` below then writes one past [1024]. A >=1023-byte spaceless run — minified JS/CSS,
+            // base64, a data URI, a long path/hex — as the first token of a wrapped segment hit exactly this,
+            // crashing the render thread mid-stream while folding a large read_file result (write content is
+            // shown as a short "writing <path>…" label, never wrapped — hence the write=ok / read=crash split).
+            if (cl + 1 < cand.len) {
                 cand[cl] = ' ';
                 cl += 1;
             }
@@ -2085,6 +2116,7 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
         const wl = @min(word.len, cand.len -| cl -| 1);
         @memcpy(cand[cl..][0..wl], word[0..wl]);
         cl += wl;
+        if (cl >= cand.len) cl = cand.len - 1; // belt-and-suspenders: the sentinel index is never OOB
         cand[cl] = 0;
         const cw: f32 = @floatFromInt(t.measure(cand[0..cl :0], fsz));
         if (ll > 0 and cw > max_w) {
