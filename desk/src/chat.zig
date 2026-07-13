@@ -3218,7 +3218,16 @@ pub const Chat = struct {
                     // for an action it never chose). A kill still recovers when the USER asked for one.
                     if (std.mem.eql(u8, lt.name, "kill_swarm") and !userWantsKill(self.last_user[0..self.last_user_len])) break :blk_loose null;
                     break :blk_loose lt;
-                } else null) orelse toolCallFenced(full) orelse toolCallJsonInferred(full) orelse blk: {
+                } else null) orelse toolCallFenced(full) orelse toolCallJsonInferred(full) orelse blk_nr: {
+                    // NATURAL-LANGUAGE READ: `read_file <path> [start_line N] [end_line M]` with no JSON/XML/fence —
+                    // deepseek drops to this bare form and it never dispatched, so the model re-announced the read
+                    // forever (the c6a54da12 stall). read_file is NON-DESTRUCTIVE, so recover it even ungated. OWNED.
+                    if (naturalReadCall(self.gpa, full)) |nc| {
+                        synth_args = @constCast(nc.args);
+                        break :blk_nr ToolCall{ .name = nc.name, .args = nc.args };
+                    }
+                    break :blk_nr null;
+                } orelse blk: {
                 // observed live: "cast a swarm to finish the two-page site" answered with a pasted
                 // index.html, this rescue synthesized a write_file, and the veil silently self-built
                 // for the rest of the arc while the hive never existed — the cast recovery owns this
@@ -5807,6 +5816,120 @@ fn jsonHasKey(a: []const u8, key: []const u8) bool {
     var buf: [40]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return false;
     return std.mem.indexOf(u8, a, needle) != null;
+}
+
+/// A token that looks like a FILE PATH — only path-ish chars, and (when require_sep) contains a '.', '/', or '\'
+/// so a `read_file <path>` is told from a prose word like "read_file the docs". list_dir passes require_sep=false
+/// because a bare dir name ("src", "advanced-bci") has no separator; a stray list is non-destructive anyway.
+fn looksLikePathTok(s: []const u8, require_sep: bool) bool {
+    if (s.len == 0 or s.len > 400) return false;
+    var has_sep = false;
+    for (s) |c| {
+        if (c == '/' or c == '\\' or c == '.') {
+            has_sep = true;
+        } else if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-' or c == '~' or c == ':')) {
+            return false;
+        }
+    }
+    return has_sep or !require_sep;
+}
+
+/// The integer immediately after a WHOLE-TOKEN `key` (`key 430`, `key=430`, `key: 430`) within a short gap. null
+/// if absent/far. Whole-token so `start_lines`/`start_line_no` don't satisfy a `start_line` lookup.
+fn intAfter(text: []const u8, key: []const u8) ?u32 {
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, key)) |at| {
+        from = at + key.len;
+        if (from < text.len) {
+            const c = text[from];
+            if (std.ascii.isAlphanumeric(c) or c == '_') continue; // longer token, not this key
+        }
+        var i = from;
+        var gap: usize = 0;
+        while (i < text.len and !std.ascii.isDigit(text[i])) {
+            if (text[i] == '\n' or gap >= 6) return null; // the value must sit right after the key
+            i += 1;
+            gap += 1;
+        }
+        const d0 = i;
+        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
+        if (i == d0) return null;
+        return std.fmt.parseInt(u32, text[d0..i], 10) catch null;
+    }
+    return null;
+}
+
+/// Trim a trailing run of sentence punctuation glued to an unquoted path (`main.py.` -> `main.py`). Never trims
+/// below one char, so a legitimate bare `.` (current dir, for list_dir) survives.
+fn trimTrailingPathPunct(s: []const u8) []const u8 {
+    var e = s.len;
+    while (e > 1) : (e -= 1) {
+        switch (s[e - 1]) {
+            '.', ',', ';', ':', ')', ']', '}', '!', '?' => {},
+            else => break,
+        }
+    }
+    return s[0..e];
+}
+
+/// Recover the model's NATURAL-LANGUAGE read form — `read_file <path> [start_line N] [end_line M]` with no JSON,
+/// XML, or fence — into a real read_file call with OWNED JSON args. deepseek repeatedly drops to this bare form
+/// and it never dispatched (every structured parser needs a `{`), so the model re-announced the read forever (the
+/// c6a54da12 stall). Scoped to read_file ONLY, which is NON-DESTRUCTIVE, so recovering even a prose mention is
+/// harmless (a stray read, never a write) — hence no action gate. Skips the `{`/`(` forms the real parsers own.
+/// Args are heap-OWNED (caller frees via synth_args).
+fn naturalReadCall(gpa: std.mem.Allocator, text: []const u8) ?ToolCall {
+    const Spec = struct { name: []const u8, ranged: bool, require_sep: bool };
+    const specs = [_]Spec{
+        .{ .name = "read_file", .ranged = true, .require_sep = true }, // a file has an extension/path separator
+        .{ .name = "list_dir", .ranged = false, .require_sep = false }, // a dir can be a bare name
+    };
+    for (specs) |sp| {
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, text, search, sp.name)) |at| {
+            search = at + sp.name.len;
+            if (at > 0) { // word boundary before it: not part of a longer token / a quoted or XML form the parsers own
+                const p = text[at - 1];
+                if (std.ascii.isAlphanumeric(p) or p == '_' or p == '"' or p == '<' or p == '/') continue;
+            }
+            if (at + sp.name.len < text.len) { // ...and after it, so `read_files`/`read_file.py`/`list_dirs` isn't a match
+                const nx = text[at + sp.name.len];
+                if (std.ascii.isAlphanumeric(nx) or nx == '_' or nx == '.' or nx == '-') continue;
+            }
+            var i = at + sp.name.len;
+            while (i < text.len and (text[i] == ' ' or text[i] == '\t' or text[i] == ':')) i += 1;
+            if (i >= text.len or text[i] == '{' or text[i] == '(') continue; // JSON / fn-call form — a real parser owns it
+            var quote: u8 = 0;
+            if (text[i] == '"' or text[i] == '\'') {
+                quote = text[i];
+                i += 1;
+            }
+            const pstart = i;
+            while (i < text.len and (if (quote != 0) text[i] != quote else (text[i] != ' ' and text[i] != '\t' and text[i] != '\n' and text[i] != '\r'))) i += 1;
+            const path = if (quote != 0) text[pstart..i] else trimTrailingPathPunct(text[pstart..i]);
+            if (!looksLikePathTok(path, sp.require_sep)) continue;
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer out.deinit(gpa);
+            out.appendSlice(gpa, "{\"path\":\"") catch return null;
+            escJson(&out, gpa, path);
+            out.append(gpa, '"') catch return null;
+            if (sp.ranged) {
+                const win = text[@min(i, text.len)..@min(text.len, i + 100)]; // start_line/end_line ride just after the path
+                var nb: [24]u8 = undefined;
+                if (intAfter(win, "start_line")) |n| {
+                    out.appendSlice(gpa, ",\"start_line\":") catch return null;
+                    out.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}", .{n}) catch return null) catch return null;
+                }
+                if (intAfter(win, "end_line")) |n| {
+                    out.appendSlice(gpa, ",\"end_line\":") catch return null;
+                    out.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}", .{n}) catch return null) catch return null;
+                }
+            }
+            out.append(gpa, '}') catch return null;
+            return .{ .name = sp.name, .args = out.toOwnedSlice(gpa) catch return null };
+        }
+    }
+    return null;
 }
 
 /// A bare JSON args block with NO tool name — ```json {"path":..,"content":..} ``` — is how deepseek emits its
@@ -9464,6 +9587,40 @@ test "fencedShellCall recovers only a SHELL-tagged command fence, last valid win
     try std.testing.expectEqualStrings("git push", fencedShellCall("maybe ```bash\ngit status\n``` or better ```bash\ngit push\n```").?);
     // a non-shell fence before a shell fence: recover the shell command
     try std.testing.expectEqualStrings("git status", fencedShellCall("```python\nx=1\n```\nthen run:\n```bash\ngit status\n```").?);
+}
+
+test "naturalReadCall recovers the bare read_file/list_dir natural forms (the c6a54da12 stall)" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, out: []const u8 }{
+        .{ .in = "Let me read the tail.\nread_file advanced-bci/core.py start_line 430 end_line 449", .out = "{\"path\":\"advanced-bci/core.py\",\"start_line\":430,\"end_line\":449}" },
+        .{ .in = "read_file core.py", .out = "{\"path\":\"core.py\"}" }, // bare path, no range
+        .{ .in = "```python\nread_file src/app.py start_line 1 end_line 40\n```", .out = "{\"path\":\"src/app.py\",\"start_line\":1,\"end_line\":40}" }, // wrapped in a fence
+        .{ .in = "read_file main.py.", .out = "{\"path\":\"main.py\"}" }, // trailing sentence period trimmed
+        .{ .in = "read_file x.py start_lines 99", .out = "{\"path\":\"x.py\"}" }, // start_lines is not a whole-token start_line
+        .{ .in = "list_dir advanced-bci", .out = "{\"path\":\"advanced-bci\"}" }, // bare dir name (no separator needed)
+        .{ .in = "list_dir .", .out = "{\"path\":\".\"}" },
+    };
+    for (cases) |c| {
+        const tc = naturalReadCall(gpa, c.in).?;
+        defer gpa.free(tc.args);
+        try std.testing.expectEqualStrings(c.out, tc.args);
+    }
+    // read_file's name is preserved; list_dir picks the list tool
+    {
+        const tc = naturalReadCall(gpa, "read_file core.py").?;
+        defer gpa.free(tc.args);
+        try std.testing.expectEqualStrings("read_file", tc.name);
+    }
+    {
+        const tc = naturalReadCall(gpa, "list_dir src/models").?;
+        defer gpa.free(tc.args);
+        try std.testing.expectEqualStrings("list_dir", tc.name);
+    }
+    // NOT recovered: prose with no path token, a proper JSON form (a real parser owns it), a longer token
+    try std.testing.expect(naturalReadCall(gpa, "I'll use read_file to inspect the code") == null);
+    try std.testing.expect(naturalReadCall(gpa, "read_file {\"path\":\"x.py\"}") == null);
+    try std.testing.expect(naturalReadCall(gpa, "read_files.py list") == null);
+    try std.testing.expect(naturalReadCall(gpa, "read_file.md is a file") == null); // '.' after the token
 }
 
 test "looseRunWins: the later action line in the reasoning is the decision" {
