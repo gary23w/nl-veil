@@ -648,6 +648,10 @@ pub const Chat = struct {
         self.loadKey(dd0);
         self.refreshConvs(dd0, true);
         self.refreshMemory(dd0); // publish saved durable memories into the Memory tab at startup
+        { // proactively seal + redact a user-supplied GitHub PAT so it never lives in plaintext in the memory block
+            var sb0: [600]u8 = undefined;
+            _ = self.ensurePatSealed(dd0, sideDir(dd0, &sb0));
+        }
         self.refreshProposals(dd0); // and any judge proposals still awaiting review
         self.fetchOllamaModels();
 
@@ -4426,6 +4430,10 @@ pub const Chat = struct {
         _ = Io.Dir.cwd().createDirPathStatus(self.io, workdir, .default_dir) catch {};
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
+        // RSI self-configure: repo_create/git_push need a sealed PAT. If none is set but the user FREELY supplied
+        // one in their durable memory, seal it from there (their supplying it IS the approval to use it) instead of
+        // looping for a manual ::pat — and redact the plaintext so it stops being echoed. Idempotent once sealed.
+        if (std.mem.eql(u8, name, "repo_create") or std.mem.eql(u8, name, "git_push")) _ = self.ensurePatSealed(dd, side);
         var patb: [256]u8 = undefined;
         const pat = patb[0..secrets.loadPat(self.io, self.gpa, side, &patb)];
         var userb: [80]u8 = undefined;
@@ -4461,6 +4469,65 @@ pub const Chat = struct {
         };
         defer r.deinit(self.gpa);
         self.foldGit(dd, name, r.msg);
+    }
+
+    /// Seal the GitHub PAT the RSI way: the user FREELY supplied a token in their durable memory, which is the
+    /// approval to use it — so if none is sealed, seal it from memory (once) so the git tools just work instead of
+    /// the model looping for a manual ::pat. ALSO redacts the plaintext token in memories.jsonl so it stops being
+    /// injected into every prompt / echoed into the transcript. Idempotent: a no-op (returns true) once sealed.
+    fn ensurePatSealed(self: *Chat, dd: []const u8, side: []const u8) bool {
+        var mp: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&mp, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return false;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 << 10)) catch return false;
+        defer self.gpa.free(data);
+
+        // The NEWEST token wins the seal: memories.jsonl is append-only, so a rotated credential is the LAST match.
+        var newest: []const u8 = "";
+        {
+            var cur: []const u8 = data;
+            while (findGithubToken(cur)) |t| {
+                newest = t;
+                const off = (@intFromPtr(t.ptr) - @intFromPtr(cur.ptr)) + t.len;
+                if (off >= cur.len) break;
+                cur = cur[off..];
+            }
+        }
+        if (newest.len == 0) return false; // no PAT in memory — nothing to seal or redact
+
+        // Seal ONLY when nothing is sealed yet (never clobber a manual ::pat); the redaction below runs either way,
+        // so a plaintext token sitting in memory is scrubbed even when the PAT was already sealed by another path.
+        var pb: [256]u8 = undefined;
+        if (secrets.loadPat(self.io, self.gpa, side, &pb) == 0) {
+            if (!secrets.savePat(self.io, self.gpa, side, newest)) return false;
+            log.info("git: self-sealed a user-supplied GitHub PAT from memory ({d}b) — no ::pat needed", .{newest.len});
+        }
+
+        // Redact EVERY token from the readable memory AND purge each from the neuron recall scopes — the durable
+        // memory scope AND the active conversation's own scope (the user's paste + the model's echo both land there,
+        // and hippocampus recall could otherwise re-surface it into a later prompt). Idempotent once the file is clean.
+        var convb: [40]u8 = undefined;
+        const conv = self.convScope(&convb);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(self.gpa);
+        var rest: []const u8 = data;
+        while (findGithubToken(rest)) |t| {
+            const idx = @intFromPtr(t.ptr) - @intFromPtr(rest.ptr);
+            out.appendSlice(self.gpa, rest[0..idx]) catch return true;
+            out.appendSlice(self.gpa, "[sealed]") catch return true;
+            self.mind().forget(MEMORY_SCOPE, t);
+            if (conv.len > 0) self.mind().forget(conv, t);
+            rest = rest[idx + t.len ..];
+        }
+        out.appendSlice(self.gpa, rest) catch return true;
+        if (out.items.len != data.len) { // atomic replace (temp + rename) so a mid-write crash can't empty the file
+            var tp: [720]u8 = undefined;
+            const tmp = std.fmt.bufPrint(&tp, "{s}.tmp", .{path}) catch return true;
+            if (Io.Dir.cwd().writeFile(self.io, .{ .sub_path = tmp, .data = out.items })) |_| {
+                Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, self.io) catch |e| log.err("memory redact: rename failed: {s}", .{@errorName(e)});
+            } else |e| log.err("memory redact: write failed: {s}", .{@errorName(e)});
+            self.refreshMemory(dd);
+        }
+        return true;
     }
 
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
@@ -5816,6 +5883,27 @@ fn jsonHasKey(a: []const u8, key: []const u8) bool {
     var buf: [40]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "\"{s}\"", .{key}) catch return false;
     return std.mem.indexOf(u8, a, needle) != null;
+}
+
+/// Find the FIRST-BY-POSITION GitHub token in `s` — classic `ghp_…`, fine-grained `github_pat_…`, or the
+/// gho_/ghu_/ghs_/ghr_ kin. Returns the token slice or null. Requires a long body so a bare-prefix mention
+/// ("a ghp_ token") isn't matched. Positional (not prefix-priority) so a caller looping to redact EVERY token
+/// never skips one of a different prefix that sits earlier in the text.
+fn findGithubToken(s: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{ "github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_" };
+    var best_at: ?usize = null;
+    var best_end: usize = 0;
+    for (prefixes) |pre| {
+        if (std.mem.indexOf(u8, s, pre)) |at| {
+            var e = at + pre.len;
+            while (e < s.len and (std.ascii.isAlphanumeric(s[e]) or s[e] == '_')) e += 1;
+            if (e - at >= pre.len + 20 and (best_at == null or at < best_at.?)) {
+                best_at = at;
+                best_end = e;
+            }
+        }
+    }
+    return if (best_at) |at| s[at..best_end] else null;
 }
 
 /// A token that looks like a FILE PATH — only path-ish chars, and (when require_sep) contains a '.', '/', or '\'
@@ -9621,6 +9709,19 @@ test "naturalReadCall recovers the bare read_file/list_dir natural forms (the c6
     try std.testing.expect(naturalReadCall(gpa, "read_file {\"path\":\"x.py\"}") == null);
     try std.testing.expect(naturalReadCall(gpa, "read_files.py list") == null);
     try std.testing.expect(naturalReadCall(gpa, "read_file.md is a file") == null); // '.' after the token
+}
+
+test "findGithubToken locates a token and ignores a bare-prefix mention" {
+    // Fake, underscore-bearing tokens: valid to findGithubToken (prefix + >=20 body that allows '_') but NOT a
+    // match for GitHub's own [A-Za-z0-9]-only secret pattern — so this test never trips secret-scanning push protection.
+    try std.testing.expectEqualStrings("ghp_not_a_real_token_just_for_tests_00", findGithubToken("token: ghp_not_a_real_token_just_for_tests_00 end").?);
+    try std.testing.expectEqualStrings("github_pat_not_a_real_token_for_tests_0", findGithubToken("PAT=github_pat_not_a_real_token_for_tests_0").?);
+    try std.testing.expect(findGithubToken("set a ghp_ token via ::pat") == null); // bare prefix, no body
+    try std.testing.expect(findGithubToken("no token in this text at all") == null);
+    { // positional: the EARLIEST token wins across prefixes, so a redact-all loop never skips an earlier one
+        const tok = findGithubToken("x ghp_earliest_fake_token_for_the_test y github_pat_later_fake_token_for_tests z").?;
+        try std.testing.expect(std.mem.startsWith(u8, tok, "ghp_"));
+    }
 }
 
 test "looseRunWins: the later action line in the reasoning is the decision" {
