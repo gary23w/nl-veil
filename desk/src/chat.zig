@@ -17,6 +17,7 @@ const netcli = @import("netcli.zig");
 const httpc = @import("httpc.zig");
 const llm = @import("llm.zig");
 const secrets = @import("secrets.zig");
+const gitvc = @import("gitvc.zig");
 const catalog = @import("catalog.zig");
 const log = @import("log.zig");
 const neurondb = @import("neuron.zig");
@@ -147,6 +148,18 @@ const SYSTEM_REST =
     "- run_tests {}  — run the project's tests (pytest / test_*.py) and get pass/fail.\n" ++
     "- run_python {\"code\":\"...\"}  — run a short Python script in the workdir.\n" ++
     "- delete_file {\"path\":\"...\"}  — remove a file you created.\n" ++
+    "VERSION CONTROL — your workdir is a git repo; use it to build durable software/research the way an engineer " ++
+    "does. Commit meaningful units of work, and push to GitHub when the user wants it published:\n" ++
+    "- git_status {}  — what changed + the current branch.\n" ++
+    "- git_commit {\"message\":\"add sepsis assay BOM\"}  — stage everything and commit (auto-inits the repo the " ++
+    "first time). Write a real, specific message.\n" ++
+    "- repo_create {\"name\":\"neuronet\",\"private\":false}  — create the GitHub repo. DO THIS BEFORE the first " ++
+    "push — a push to a repo that doesn't exist fails. Needs a stored token (the user sets one).\n" ++
+    "- git_push {\"repo\":\"neuronet\"}  — push to github.com/<user>/<repo>. Commit first; the remote is set for you.\n" ++
+    "- git_log {}  — recent commits.\n" ++
+    "The GitHub token is stored sealed on this machine and is NEVER shown to you or written to the chat — you never " ++
+    "handle it. If the user hasn't set one, tell them to run `::pat <token>` (and `::ghuser <username>`) once. " ++
+    "Normal flow: write files → git_commit → (first time) repo_create → git_push.\n" ++
     "KNOW YOUR LIMITS: your reply has a length cap. A NORMAL file (a one-page site, a module) fits in ONE " ++
     "write_file — do that. Only a genuinely HUGE file needs CHUNKS. When you chunk: your FIRST write_file sends " ++
     "the opening part (default overwrite), then EACH following reply calls write_file with the SAME path and " ++
@@ -1002,6 +1015,8 @@ pub const Chat = struct {
                 .forget_mem => self.forgetMemory(dd, c.textStr()), // Memory tab: delete-button drops one saved memory
                 .prop_accept => self.acceptProposal(dd, c.idStr(), c.textStr()), // Memory pane: promote a judge proposal
                 .prop_reject => self.rejectProposal(dd, c.idStr(), c.textStr()), // Memory pane: discard one
+                .set_github_pat => self.cmdSaveGithubPat(dd, c.textStr()), // ::pat / Settings — seal the GitHub token
+                .set_github_user => self.cmdSaveGithubUser(dd, c.textStr()), // ::ghuser / Settings — the GitHub username
             }
         }
     }
@@ -1053,6 +1068,9 @@ pub const Chat = struct {
         @memcpy(self.build_dir[0..n], abs[0..n]);
         self.build_dir_len = n;
         _ = Io.Dir.cwd().createDirPathStatus(self.io, abs, .default_dir) catch {}; // ensure it exists locally too
+        // Isolate this conversation as its OWN git repo the moment its workdir is adopted, BEFORE any git can
+        // run here — so a `RUN: git` shell (or the git tools) can never walk up to a parent repo and pollute it.
+        gitvc.ensureRepo(self.gpa, self.io, abs);
         var nb: [480]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, "[build] working directory: {s} — the console (You + Veil tabs) is cd'd here, so you can inspect and run the files.", .{rel}) catch "[build] working directory set";
         self.appendMsg(dd, .cast_note, note);
@@ -1077,6 +1095,7 @@ pub const Chat = struct {
         const n = @min(abs.len, self.build_dir.len);
         @memcpy(self.build_dir[0..n], abs[0..n]);
         self.build_dir_len = n;
+        gitvc.ensureRepo(self.gpa, self.io, abs); // a reopened chat's workdir is isolated too, before any shell git
     }
 
     /// Launch a micro-console command as an INDEPENDENT OS process and register it as the in-flight console
@@ -2360,6 +2379,30 @@ pub const Chat = struct {
             self.store.settings.chat_key_len = @intCast(n);
         }
         if (ok) self.store.pushNotif("Key saved", "stored in the OS-protected local store", 1) else self.store.pushNotif("Key NOT saved", "could not write the secure store", 2);
+    }
+
+    /// Seal the GitHub PAT (same at-rest protection as the chat key) — the token NEVER reaches settings.json or
+    /// the transcript. Entered via `::pat <token>` or the Settings pane.
+    fn cmdSaveGithubPat(self: *Chat, dd: []const u8, pat: []const u8) void {
+        var sb: [600]u8 = undefined;
+        const side = sideDir(dd, &sb);
+        const ok = secrets.savePat(self.io, self.gpa, side, std.mem.trim(u8, pat, " \r\n\t"));
+        if (ok) self.store.pushNotif("GitHub token saved", "sealed in the OS-protected local store — never in the transcript", 1) else self.store.pushNotif("Token NOT saved", "could not write the secure store", 2);
+    }
+
+    /// Persist the (public) GitHub username — the owner for the remote URL + the commit author. Plain file in the
+    /// user-private sidecar dir (not a secret).
+    fn cmdSaveGithubUser(self: *Chat, dd: []const u8, user: []const u8) void {
+        var sb: [600]u8 = undefined;
+        const side = sideDir(dd, &sb);
+        const u = std.mem.trim(u8, user, " \r\n\t");
+        var pb: [700]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "{s}/github_user", .{side}) catch return;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = p, .data = u }) catch {
+            self.store.pushNotif("Username NOT saved", "could not write", 2);
+            return;
+        };
+        self.store.pushNotif("GitHub username set", u, 1);
     }
 
     // ------------------------------------------------------------------------------ settings persistence
@@ -4302,6 +4345,91 @@ pub const Chat = struct {
     /// WORKER thread (not the UI thread), so the block is invisible — the status line set just before keeps
     /// the UI honest. Orchestration verbs (stop_swarm/swarm_findings) default to the live cast when the model
     /// gives no id, so "kill the swarm and tell me what it found" works without the model knowing the hex id.
+    fn isGitToolName(name: []const u8) bool {
+        const g = [_][]const u8{ "repo_create", "git_commit", "git_push", "git_status", "git_log" };
+        for (g) |t| if (std.mem.eql(u8, name, t)) return true;
+        return false;
+    }
+
+    /// The (public) configured GitHub username from the sidecar dir; "" if unset.
+    fn loadGhUser(self: *Chat, side: []const u8, buf: []u8) []const u8 {
+        var pb: [700]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "{s}/github_user", .{side}) catch return "";
+        const data = Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(256)) catch return "";
+        defer self.gpa.free(data);
+        const t = std.mem.trim(u8, data, " \r\n\t");
+        const n = @min(t.len, buf.len);
+        @memcpy(buf[0..n], t[0..n]);
+        return buf[0..n];
+    }
+
+    /// Fold a git tool's result back into the chat exactly like any other tool chip, and re-enter the turn so
+    /// the veil reads the outcome (a failed push tells it to repo_create first, etc.). tool_iters was already
+    /// bumped by the dispatcher before this ran.
+    fn foldGit(self: *Chat, dd: []const u8, name: []const u8, result: []const u8) void {
+        var fb: [4400]u8 = undefined;
+        const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ name, result[0..@min(result.len, 4000)] }) catch result;
+        log.info("chat git: {s} -> {s}", .{ name, result[0..@min(result.len, 100)] });
+        self.appendMsg(dd, .cast_note, folded);
+        self.setStatus("");
+        self.startTurn(dd, .tool_follow);
+    }
+
+    /// DESK-SIDE version control: run one git/GitHub tool in this conversation's build dir using the sealed PAT,
+    /// which never leaves this process. Results fold back like a normal tool chip.
+    fn runGitTool(self: *Chat, dd: []const u8, name: []const u8, args: []const u8) void {
+        if (std.mem.eql(u8, name, "git_commit") or std.mem.eql(u8, name, "git_push") or std.mem.eql(u8, name, "repo_create")) self.arc_mutated = true;
+        var relb: [180]u8 = undefined;
+        const rel = self.chatBuildRel(&relb);
+        if (rel.len == 0) {
+            self.foldGit(dd, name, "no conversation workdir yet — write a file first so there's something to version-control.");
+            return;
+        }
+        var wdb: [820]u8 = undefined;
+        const workdir = std.fmt.bufPrint(&wdb, "{s}/{s}/work", .{ dd, rel }) catch {
+            self.foldGit(dd, name, "workdir path too long");
+            return;
+        };
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, workdir, .default_dir) catch {};
+        var sb: [600]u8 = undefined;
+        const side = sideDir(dd, &sb);
+        var patb: [256]u8 = undefined;
+        const pat = patb[0..secrets.loadPat(self.io, self.gpa, side, &patb)];
+        var userb: [80]u8 = undefined;
+        const user = self.loadGhUser(side, &userb);
+
+        var stbuf: [64]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s}...", .{name}) catch "running git...");
+
+        const r: gitvc.Res = if (std.mem.eql(u8, name, "git_status"))
+            gitvc.status(self.gpa, self.io, workdir)
+        else if (std.mem.eql(u8, name, "git_log"))
+            gitvc.logLine(self.gpa, self.io, workdir, 20)
+        else if (std.mem.eql(u8, name, "git_commit")) blk: {
+            var mb: [2048]u8 = undefined;
+            const msg = jStr(args, "message", &mb) orelse "";
+            break :blk gitvc.commit(self.gpa, self.io, workdir, user, "", msg);
+        } else if (std.mem.eql(u8, name, "repo_create")) blk: {
+            var nb: [128]u8 = undefined;
+            var sn: [128]u8 = undefined;
+            const rn = gitvc.sanitizeRepoName(jStr(args, "name", &nb) orelse "", &sn);
+            const private = std.mem.indexOf(u8, args, "\"private\":true") != null or std.mem.indexOf(u8, args, "\"private\": true") != null;
+            break :blk gitvc.repoCreate(self.gpa, self.io, side, pat, rn, private);
+        } else blk: { // git_push
+            var rb: [128]u8 = undefined;
+            var sr: [128]u8 = undefined;
+            const repo = gitvc.sanitizeRepoName(jStr(args, "repo", &rb) orelse "", &sr);
+            var ob: [80]u8 = undefined;
+            const owner_arg = jStr(args, "owner", &ob) orelse "";
+            const owner = if (owner_arg.len > 0) owner_arg else user;
+            var brb: [80]u8 = undefined;
+            const branch = jStr(args, "branch", &brb) orelse "";
+            break :blk gitvc.push(self.gpa, self.io, workdir, side, owner, repo, user, pat, branch);
+        };
+        defer r.deinit(self.gpa);
+        self.foldGit(dd, name, r.msg);
+    }
+
     fn runToolAndContinue(self: *Chat, dd: []const u8, tc: ToolCall) void {
         self.acted = true; // a tool ran this exchange → the veil is working → auto-loop may continue
         self.arc_acted = true;
@@ -4333,6 +4461,15 @@ pub const Chat = struct {
         };
         defer self.gpa.free(raw_args);
         self.stream.deinit(self.gpa); // now safe — name/raw_args are owned copies
+
+        // VERSION CONTROL runs entirely DESK-SIDE (never a server round-trip): the GitHub PAT stays in this
+        // process, sealed at rest, and is used by gitvc without ever crossing the wire or the transcript. Git
+        // operates in this conversation's own build dir. Handled here and returned — it never reaches the shared
+        // tool endpoint.
+        if (isGitToolName(name)) {
+            self.runGitTool(dd, name, raw_args);
+            return;
+        }
 
         var abuf: [256]u8 = undefined;
         var args = raw_args;
@@ -5234,6 +5371,7 @@ fn knownChatTool(name: []const u8) bool {
         "list_swarms", "stop_swarm", "kill_swarm",  "swarm_status", "swarm_findings", "web_search",
         "web_fetch",   "fetch_json", "recall_hive", "observe",      "write_file",     "edit_file",
         "read_file",   "list_dir",   "run_tests",   "run_python",   "delete_file",
+        "git_status",  "git_commit", "git_push",    "git_log",      "repo_create",
     };
     for (names) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;

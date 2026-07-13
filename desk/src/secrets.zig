@@ -11,6 +11,8 @@ const log = @import("log.zig");
 
 const FILE_WIN = "chat_key.bin"; // DPAPI blob
 const FILE_POSIX = "chat_key"; // plain (dir is user-private, same trust as .desktop_key)
+const PAT_WIN = "github_pat.bin"; // the GitHub Personal Access Token, sealed the same way as the chat key
+const PAT_POSIX = "github_pat";
 
 const win = struct {
     const DATA_BLOB = extern struct { cbData: u32, pbData: ?[*]u8 };
@@ -20,9 +22,27 @@ const win = struct {
     extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 };
 
-fn path(gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
-    const name = if (builtin.os.tag == .windows) FILE_WIN else FILE_POSIX;
+fn pathFor(gpa: std.mem.Allocator, dir: []const u8, win_name: []const u8, posix_name: []const u8) ?[]u8 {
+    const name = if (builtin.os.tag == .windows) win_name else posix_name;
     return std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, name }) catch null;
+}
+
+fn path(gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
+    return pathFor(gpa, dir, FILE_WIN, FILE_POSIX);
+}
+
+/// Seal + persist the GitHub PAT under `dir` (sealed exactly like the chat key). Empty removes it.
+pub fn savePat(io: Io, gpa: std.mem.Allocator, dir: []const u8, pat: []const u8) bool {
+    const p = pathFor(gpa, dir, PAT_WIN, PAT_POSIX) orelse return false;
+    defer gpa.free(p);
+    return sealSaveAt(io, gpa, p, pat);
+}
+
+/// Load the sealed GitHub PAT into `out`; returns its length (0 = none / unreadable).
+pub fn loadPat(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
+    const p = pathFor(gpa, dir, PAT_WIN, PAT_POSIX) orelse return 0;
+    defer gpa.free(p);
+    return sealLoadAt(io, gpa, p, out);
 }
 
 /// Persist `key` under `dir` (the .veil-desk sidecar dir). An empty key removes the stored secret.
@@ -30,6 +50,13 @@ pub fn save(io: Io, gpa: std.mem.Allocator, dir: []const u8, key: []const u8) bo
     log.trace("secrets.save dir={s} key_len={d}", .{ dir, key.len });
     const p = path(gpa, dir) orelse return false;
     defer gpa.free(p);
+    return sealSaveAt(io, gpa, p, key);
+}
+
+/// The shared seal-and-write core (DPAPI on Windows, plain in the user-private dir on POSIX). `p` is the full
+/// file path; an empty key deletes it.
+fn sealSaveAt(io: Io, gpa: std.mem.Allocator, p: []const u8, key: []const u8) bool {
+    _ = gpa; // sealing needs no allocation (DPAPI blob / direct write); kept for signature symmetry with load
     if (key.len == 0) {
         Io.Dir.cwd().deleteFile(io, p) catch {};
         return true;
@@ -58,6 +85,11 @@ pub fn load(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
     log.trace("secrets.load dir={s}", .{dir});
     const p = path(gpa, dir) orelse return 0;
     defer gpa.free(p);
+    return sealLoadAt(io, gpa, p, out);
+}
+
+/// The shared read-and-unseal core. `p` is the full file path.
+fn sealLoadAt(io: Io, gpa: std.mem.Allocator, p: []const u8, out: []u8) usize {
     const data = Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(4 << 10)) catch return 0;
     defer gpa.free(data);
     if (data.len == 0) return 0;

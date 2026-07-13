@@ -198,7 +198,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject };
+pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.

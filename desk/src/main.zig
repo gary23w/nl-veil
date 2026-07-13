@@ -506,6 +506,15 @@ pub fn main() !void {
                                 store.pushChatCmd(store_mod.mkChatCmd(.console_approve, "always", ""));
                             } else if (std.mem.eql(u8, cmd, "deny")) {
                                 store.pushChatCmd(store_mod.mkChatCmd(.console_deny, "veil", ""));
+                            } else if (std.mem.startsWith(u8, cmd, "pat ")) {
+                                // seal the GitHub token. It rides in the command's TEXT field (not id) so
+                                // mkChatCmd's trace logs only its length — the token never hits the log or
+                                // the transcript. The SIM.txt message itself is consumed (deleted) as usual.
+                                const tok = std.mem.trim(u8, cmd[4..], " \r\n\t");
+                                if (tok.len > 0) store.pushChatCmd(store_mod.mkChatCmd(.set_github_pat, "", tok));
+                            } else if (std.mem.startsWith(u8, cmd, "ghuser ")) {
+                                const usr = std.mem.trim(u8, cmd[7..], " \r\n\t");
+                                if (usr.len > 0) store.pushChatCmd(store_mod.mkChatCmd(.set_github_user, "", usr));
                             } else if (std.mem.eql(u8, cmd, "adopt")) {
                                 // headless: accept the FIRST pending judge proposal (same path as the
                                 // Memory pane's keep button — test harness only, inert in real use)
