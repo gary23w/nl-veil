@@ -1449,7 +1449,18 @@ pub const Chat = struct {
             const cl = @min(p.cmd_len, cmdb.len);
             @memcpy(cmdb[0..cl], p.cmd[0..cl]);
             var rb: [6144]u8 = undefined;
-            const result = composeConsoleResult(&rb, out_slice, err_slice, note);
+            // TRUNCATION MARKER, keyed to what the MODEL actually sees. composeConsoleResult copies out+err into rb
+            // and keeps the HEAD up to a ~6KB body cap (rb minus the note), so anything past that is dropped from
+            // the model's view — NOT readSink's 40KB sink. Detect at THIS layer and say so, or the model re-runs the
+            // same dump thinking the file "didn't show" (the observed `type core.py` spiral: a 15KB dump → ~6KB).
+            const vis_budget = if (rb.len > note.len + 280) rb.len - note.len - 280 else 0;
+            const vis_clipped = out_slice.len + err_slice.len > vis_budget;
+            var note_buf: [640]u8 = undefined;
+            const note_full = if (vis_clipped)
+                (std.fmt.bufPrint(&note_buf, "{s}(output was long and TRUNCATED — you are seeing only PART of it, roughly the first {d}KB. To read a file in full use TOOL: read_file {{\"path\":\"...\"}}; to run a command make it output less, e.g. Get-Content <file> -TotalCount 80.)\n", .{ note, vis_budget / 1024 }) catch note)
+            else
+                note;
+            const result = composeConsoleResult(&rb, out_slice, err_slice, note_full);
             // RAG-ON-FAILURE: a failing command recalls the playbook against the COMMAND ITSELF (the
             // user's request rarely names the executable) — if a past verified fix covers this failure
             // family, the model reads it in the same fold as the failure instead of re-deriving it.
@@ -3054,7 +3065,8 @@ pub const Chat = struct {
                 !isSmallTalk(self.last_user[0..self.last_user_len]);
             if (gate) self.draft_latched = true;
             const action_tail = toolCall(self.stream.content.items) != null or
-                castGoal(self.stream.content.items) != null or runCall(self.stream.content.items) != null;
+                castGoal(self.stream.content.items) != null or runCall(self.stream.content.items) != null or
+                fencedShellCall(self.stream.content.items) != null;
             if (action_tail) self.draft_latched = false;
             self.store.stream_draft = self.turn == .reflect or self.draft_latched;
             // show the TAIL of the reasoning if it exceeds the buffer (the newest thinking matters most)
@@ -3276,7 +3288,12 @@ pub const Chat = struct {
             // budget), output streams into the Veil console tab and folds back so the model reads the result.
             // Same reasoning-channel recovery as TOOL (this asymmetry was half the fizzle: a RUN: narrated in
             // the thinking had NO recovery path at all, so the turn settled as prose and the app went idle).
-            const run_opt = runCall(full) orelse (if (loose_ok) runCallLoose(reason) else null);
+            // ...and, last, a shell command the model left in a ```<shell> fence instead of a RUN: line — the
+            // observed `type core.py` spiral was exactly this (never dispatched → re-emitted → stalled). Gated on
+            // announcesAction (like the loose term) so a fence that merely ILLUSTRATES a command in a plain answer
+            // is never run — only a reply that announces it is about to act recovers its fenced command.
+            const fenced = if (announcesAction(full)) fencedShellCall(full) else null;
+            const run_opt = runCall(full) orelse (if (loose_ok) runCallLoose(reason) else null) orelse fenced;
             if (run_opt) |cmd| {
                 if (self.tool_iters >= MAX_TOOL_ITERS) {
                     self.appendMsg(dd, .veil, "(I ran several commands in a row without settling on an answer, so I stopped. Ask me to continue if you'd like.)");
@@ -6389,6 +6406,54 @@ pub fn runCallLoose(text: []const u8) ?[]const u8 {
     return if (runCallLooseAt(text)) |r| r.cmd else null;
 }
 
+/// A fenced body that is a rendered TERMINAL TRANSCRIPT (output the model is showing), not a command it is
+/// issuing: a line begins with a shell prompt ($ , > , PS>). Never dispatch such a body.
+fn looksLikeTranscript(body: []const u8) bool {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        const l = std.mem.trimStart(u8, line, " \t");
+        if (std.mem.startsWith(u8, l, "$ ") or std.mem.startsWith(u8, l, "> ") or
+            std.ascii.startsWithIgnoreCase(l, "PS>") or std.ascii.startsWithIgnoreCase(l, "PS ")) return true;
+    }
+    return false;
+}
+
+/// Recover a shell command the model put in a ```<shell> fenced block instead of a `RUN:` line. RUN: is what it
+/// SHOULD use, but it inconsistently drops to a bare fence (```powershell\ntype core.py) and the command then
+/// never dispatches — so the model re-emits it and spirals (observed: ~6x `type core.py` reading nothing). This
+/// is a pure EXTRACTOR; the caller gates it on an action signal (announcesAction) so an illustrative fence in a
+/// plain answer never runs, and the approval gate still governs execution. Only a SHELL-tagged fence counts
+/// (powershell/pwsh/bash/sh/cmd/bat/zsh — NOT `console`/`shell`, which usually tag a transcript, nor untagged /
+/// ```python / ```md content). Returns the LAST valid shell fence's body (mirrors runCallLoose's last-wins: the
+/// model's final choice, not an alternative it weighed then discarded earlier). Handles an unclosed trailing
+/// fence and skips transcript bodies and over-long/empty ones.
+fn fencedShellCall(text: []const u8) ?[]const u8 {
+    const shells = [_][]const u8{ "powershell", "pwsh", "bash", "sh", "cmd", "bat", "zsh" };
+    var best: ?[]const u8 = null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, "```")) |open| {
+        const after = open + 3;
+        const nl = std.mem.indexOfScalarPos(u8, text, after, '\n') orelse break;
+        const lang = std.mem.trim(u8, text[after..nl], " \t\r");
+        const body_start = nl + 1;
+        const close = std.mem.indexOfPos(u8, text, body_start, "```") orelse text.len;
+        var is_shell = false;
+        for (shells) |s| {
+            if (std.ascii.eqlIgnoreCase(lang, s)) {
+                is_shell = true;
+                break;
+            }
+        }
+        if (is_shell) {
+            const body = std.mem.trim(u8, text[body_start..close], " \t\r\n");
+            if (body.len > 0 and body.len <= 900 and !looksLikeTranscript(body)) best = body; // LAST valid wins
+        }
+        if (close >= text.len) break;
+        from = close + 3;
+    }
+    return best;
+}
+
 /// The reasoning holds BOTH recoverable action forms — which is the model's FINAL decision? The one that
 /// appears LATER wins (mirrors each parser's own last-match rule); fixed TOOL-before-RUN priority was a
 /// confirmed way to dispatch the option the reasoning had discarded. True = the RUN should dispatch.
@@ -9375,6 +9440,30 @@ test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wi
     try std.testing.expect(runCallLoose("the DRY-RUN: output looked fine") == null); // pseudo-label is not an anchor
     try std.testing.expectEqualStrings("del *", runCallLoose("RUN: del *").?); // a real trailing wildcard survives
     try std.testing.expectEqualStrings("dir /b", runCallLoose("**RUN: dir /b**").?); // markdown bold unwrapped
+}
+
+test "fencedShellCall recovers only a SHELL-tagged command fence, last valid wins, never a transcript" {
+    // the observed `type core.py` spiral: the model dropped to a bare shell fence and it never dispatched
+    try std.testing.expectEqualStrings("type core.py", fencedShellCall("Let me read it.\n```powershell\ntype core.py\n```").?);
+    try std.testing.expectEqualStrings("type core.py", fencedShellCall("```powershell\ntype core.py").?); // unclosed (settled reply)
+    try std.testing.expectEqualStrings("ls -la", fencedShellCall("```bash\nls -la\n```").?);
+    try std.testing.expectEqualStrings("dir && echo done", fencedShellCall("```cmd\ndir && echo done\n```").?);
+    // NON-shell fences are CONTENT, never commands — the safety line
+    try std.testing.expect(fencedShellCall("```python\nprint('hi')\n```") == null);
+    try std.testing.expect(fencedShellCall("```json\n{\"a\":1}\n```") == null);
+    try std.testing.expect(fencedShellCall("```\nplain untagged fence\n```") == null);
+    try std.testing.expect(fencedShellCall("no fence here at all") == null);
+    try std.testing.expect(fencedShellCall("```powershell\n\n```") == null); // empty body
+    // console/shell tags are DROPPED — they usually mark a rendered transcript, not a command to run
+    try std.testing.expect(fencedShellCall("```console\n$ npm run build\nok\n```") == null);
+    try std.testing.expect(fencedShellCall("```shell\nls\n```") == null);
+    // a transcript body (prompt-prefixed lines) is rejected even under a real shell tag
+    try std.testing.expect(fencedShellCall("```bash\n$ ls -la\ntotal 8\n```") == null);
+    try std.testing.expect(fencedShellCall("```powershell\nPS> Get-ChildItem\n```") == null);
+    // LAST valid shell fence wins — the model's final choice, not an alternative it weighed then discarded
+    try std.testing.expectEqualStrings("git push", fencedShellCall("maybe ```bash\ngit status\n``` or better ```bash\ngit push\n```").?);
+    // a non-shell fence before a shell fence: recover the shell command
+    try std.testing.expectEqualStrings("git status", fencedShellCall("```python\nx=1\n```\nthen run:\n```bash\ngit status\n```").?);
 }
 
 test "looseRunWins: the later action line in the reasoning is the decision" {
