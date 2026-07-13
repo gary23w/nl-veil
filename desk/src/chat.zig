@@ -3580,10 +3580,12 @@ pub const Chat = struct {
         } else if (full.len > 0) {
             self.appendVeil(dd, reason, full);
         } else if (reason.len > 0) {
-            // content empty but the model reasoned — show the reasoning AS the reply so it's never blank.
-            self.appendMsg(dd, .veil, reason);
+            // content empty but the model reasoned — show the reasoning AS the reply so it's never blank. NOT
+            // observed (appendMsgFull ..., false): gpt-oss commonly answers in the reasoning channel, so observing
+            // this would re-open the exact confabulation loop appendVeil closes (parrot → re-observe → amplify).
+            self.appendMsgFull(dd, .veil, reason, false);
         } else {
-            self.appendMsg(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)");
+            self.appendMsgFull(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)", false);
         }
         // LEARNING (neuron-db Hebbian plasticity): a completed answer turn means the query topic + the memory
         // recalled for it proved useful — STRENGTHEN the stored turn for that topic so it out-ranks the
@@ -4041,8 +4043,14 @@ pub const Chat = struct {
             }
             return; // nothing left to show
         }
+        // The veil's OWN reply is appended WITHOUT observing it into the hippocampus (appendMsgFull ..., false). It
+        // is already re-fed into the visible window (rowRefeeds→assistant), so storing it for recall is redundant
+        // AND is a confabulation vector: the per-conversation recall re-injects the model's own ephemeral narration
+        // as "grounded context", so a stuck phrase gets parroted → re-observed → amplified from a one-off into a
+        // runaway loop (observed: "The tests failed on the import…" ×17 in c6a5523f7). The hippocampus keeps DURABLE
+        // facts — user turns, cast findings, tool/console results — not the veil's own chatter.
         if (reasoning.len == 0) {
-            self.appendMsg(dd, .veil, text);
+            self.appendMsgFull(dd, .veil, text, false);
             return;
         }
         // Reasoning lands as its OWN collapsed .thought message above the answer. It used to be baked into the
@@ -4066,7 +4074,7 @@ pub const Chat = struct {
             w += 3;
         }
         if (w > 0) self.appendMsgFull(dd, .thought, buf[0..w], false);
-        if (text.len > 0) self.appendMsg(dd, .veil, text);
+        if (text.len > 0) self.appendMsgFull(dd, .veil, text, false); // not observed — see the note above
     }
 
     /// STEER: <instruction> — the veil's control door to a LIVE hive. Each STEER line is delivered on the
@@ -4144,8 +4152,7 @@ pub const Chat = struct {
     /// it (the "reasoning locker" the user opens if curious). Clears all reflect state.
     fn revealReflect(self: *Chat, dd: []const u8, answer: []const u8) void {
         if (answer.len > 0) {
-            self.appendMsgFull(dd, .veil, answer, false);
-            self.observeFinal(answer); // hippocampus stores the FINAL text, never a superseded draft
+            self.appendMsgFull(dd, .veil, answer, false); // not observed into the hippocampus (see appendVeil's note)
             // Only when some pass contributed REAL thinking — a labels-only trace ("- drafting -" +
             // "- self-check pass 1: ... -" with nothing under them) is noise, not a reasoning locker.
             if (self.reflect_trace_len > 0 and self.reflect_trace_has_reason) {
@@ -4170,21 +4177,6 @@ pub const Chat = struct {
             if (self.store.msgs[i].role == role) return i;
         }
         return null;
-    }
-
-    /// Hippocampus observe of the FINAL answer text — deferred from the draft commit so recall never
-    /// surfaces a superseded draft.
-    fn observeFinal(self: *Chat, text: []const u8) void {
-        if (text.len == 0) return;
-        var idb: [32]u8 = undefined;
-        var idn: usize = 0;
-        {
-            self.store.lock();
-            defer self.store.unlock();
-            idn = self.store.conv_active_len;
-            @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
-        }
-        if (idn > 0) self.mind().observe(idb[0..idn], text);
     }
 
     // ------------------------------------------------------------------------------ casting (the existing door)
