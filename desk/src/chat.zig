@@ -251,6 +251,24 @@ const USER_PROPOSED = USER_SCOPE ++ "-proposed";
 const JUDGE_EVERY_TURNS: u32 = 10; // cadence trigger: grade the trace every ~N REAL user turns...
 const JUDGE_COOLDOWN_S: i64 = 240; // ...and never more than one pass per 4 minutes (outcome trigger included)
 const JUDGE_MAX_TOKENS: u32 = 800;
+// ACT-INTENT ROUTER — the language-model replacement for the hardcoded announcesAction verb/ack whitelist.
+// A lexical list can only ever match a FIXED vocabulary of how intent is phrased ("I'll…"/"let me…"); it missed
+// the gerund/imperative header style ("**Writing X:**", "**Running Python now:**") the veil actually uses, so the
+// act-follow-through never fired and, under auto-loop-afk, the same instruction re-prompted forever. This asks the
+// model itself: given a reply that dispatched NO tool call, did it INTEND an action it failed to perform? The
+// heuristic stays as the FALLBACK FLOOR (no endpoint / call fails / unparseable → announcesAction), so it is
+// never worse than before. Generous token budget so a reasoning gateway model emits the verdict (the SCREEN trap).
+const ROUTER_MAX_TOKENS: u32 = 1024;
+const ACT_ROUTER_SYS =
+    "You are a strict intent classifier inside an autonomous coding assistant's control loop. You are given the " ++
+    "USER's latest instruction and the ASSISTANT's reply. IMPORTANT: the assistant issued NO tool call and took " ++
+    "NO action this turn. Decide ONE thing: did the assistant ANNOUNCE or clearly INTEND a concrete action — " ++
+    "writing/editing a file, running a command or code, searching the web, committing, etc. — that it then FAILED " ++
+    "to actually execute (e.g. it said 'Writing X…' or 'Let me run…' or 'Executing…' but emitted no tool call)? " ++
+    "Answer meant_to_act=true if so (it must be nudged to actually do it). Answer meant_to_act=false if the reply " ++
+    "is instead a genuine ANSWER to the user, a QUESTION back to them, a request for clarification, a plain " ++
+    "explanation, or a task it has legitimately completed. Reply with ONLY compact JSON: {\"meant_to_act\":true} " ++
+    "or {\"meant_to_act\":false} — no prose.";
 // The judge reads TRACES, never self-report — an agent asked "did you do well?" produces a confident,
 // self-flattering narrative as a structural property of the model, so grading must rest on real exit
 // codes, verify outcomes and user contradictions alone. The STRICT RULES are anti-poisoning invariants:
@@ -668,6 +686,78 @@ pub const Chat = struct {
 
     fn nowMs(self: *Chat) i64 {
         return @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_ms));
+    }
+
+    /// AI ACT-INTENT ROUTER — the model's own judgment, replacing the hardcoded announcesAction verb/ack list for
+    /// the act-follow-through decision. Given a reply that dispatched NO tool call, returns true if it
+    /// announced/intended an action it failed to perform (→ nudge), false if it's a genuine answer/question/done
+    /// (→ leave it), or null when it can't decide (no endpoint / call or parse failure) so the caller falls back
+    /// to the announcesAction heuristic FLOOR. Bounded + SYNCHRONOUS (briefly blocks this settle) — the
+    /// acknowledged cost trade for correctness. See ACT_ROUTER_SYS.
+    fn routeMeantToAct(self: *Chat, dd: []const u8, reply: []const u8) ?bool {
+        const body = std.mem.trim(u8, reply, " \r\n\t");
+        if (body.len == 0) return false; // said nothing → nothing to follow through on
+        var bb: [256]u8 = undefined;
+        var kb: [192]u8 = undefined;
+        var mb: [96]u8 = undefined;
+        const prov = self.judgeProvider(&bb, &kb, &mb);
+        if (prov.model.len == 0 or prov.base_url.len == 0) return null; // no endpoint → heuristic floor
+
+        var msgs: std.ArrayListUnmanaged(u8) = .empty;
+        defer msgs.deinit(self.gpa);
+        msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return null;
+        escJson(&msgs, self.gpa, ACT_ROUTER_SYS);
+        msgs.appendSlice(self.gpa, "\"},{\"role\":\"user\",\"content\":\"") catch return null;
+        escJson(&msgs, self.gpa, "USER INSTRUCTION:\n");
+        escJson(&msgs, self.gpa, self.last_user[0..@min(self.last_user_len, 700)]);
+        escJson(&msgs, self.gpa, "\n\nASSISTANT REPLY (no tool call was made this turn):\n");
+        escJson(&msgs, self.gpa, body[0..@min(body.len, 1400)]);
+        escJson(&msgs, self.gpa, "\n\nDid the assistant intend an action it did not perform? Reply only the JSON.");
+        msgs.appendSlice(self.gpa, "\"}") catch return null;
+
+        const content = self.syncGatewayClassify(dd, prov, msgs.items, ROUTER_MAX_TOKENS) orelse return null;
+        defer self.gpa.free(content);
+        const key = "\"meant_to_act\"";
+        const at = std.mem.indexOf(u8, content, key) orelse return null;
+        const w = content[at + key.len .. @min(content.len, at + key.len + 24)];
+        if (std.mem.indexOf(u8, w, "true") != null) {
+            log.info("act router: meant_to_act=true (nudging) — reply had no tool call", .{});
+            return true;
+        }
+        if (std.mem.indexOf(u8, w, "false") != null) {
+            log.info("act router: meant_to_act=false (genuine answer/question) — no nudge", .{});
+            return false;
+        }
+        return null; // unparseable → heuristic floor
+    }
+
+    /// A BOUNDED synchronous gateway completion: start a stream, poll it to completion (small sleeps, hard wall
+    /// timeout), return gpa-owned content or null. The desk is async-stream-only, so this blocks the chat settle
+    /// for the call's duration — acceptable for a rare, bounded classify (cost/latency optimized later). Uses its
+    /// OWN curl-scratch dir so it never clobbers the live chat stream's files.
+    fn syncGatewayClassify(self: *Chat, dd: []const u8, prov: llm.Provider, msgs: []const u8, max_tokens: u32) ?[]u8 {
+        var sb: [600]u8 = undefined;
+        const side = sideDir(dd, &sb);
+        var rb: [700]u8 = undefined;
+        const rdir = std.fmt.bufPrint(&rb, "{s}/router", .{side}) catch return null;
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, rdir, .default_dir) catch {};
+        var s: llm.Stream = .{};
+        if (!llm.start(&s, self.io, self.gpa, rdir, prov, msgs, max_tokens, self.nowS())) {
+            s.deinit(self.gpa);
+            return null;
+        }
+        const start_s = self.nowS();
+        var guard: u32 = 0;
+        while (!s.done and guard < 5000) : (guard += 1) {
+            llm.poll(&s, self.io, self.gpa, self.nowS(), true);
+            if (s.done) break;
+            if (self.nowS() - start_s > 10) break; // hard 10s wall cap — a slow/unreachable gateway must not wedge the UI
+            self.io.sleep(.{ .nanoseconds = 12 * std.time.ns_per_ms }, .awake) catch {};
+        }
+        llm.finish(&s, self.io);
+        defer s.deinit(self.gpa);
+        if (s.failed or s.content.items.len == 0) return null;
+        return self.gpa.dupe(u8, s.content.items) catch null;
     }
 
     /// Record one completed turn's performance into the Metrics ring (chars are a ~4x proxy for tokens; the
@@ -3197,9 +3287,14 @@ pub const Chat = struct {
             // Own capped counter: narration nudges must never spend the real tool budget. Placed BEFORE
             // the reflect gate — reflect's critique prompt forbids action lines, so it would launder the
             // announced intent into more polished prose instead of an action.
+            // AI ROUTER decides "announced an action but performed none" (replacing the hardcoded verb/ack list
+            // that missed the gerund/imperative announcements); the short-circuit ordering means the gateway call
+            // fires ONLY inside this decision window (≤2/arc), and it falls back to the announcesAction floor when
+            // it can't decide — never worse than the old heuristic, and it catches the styles the list can't.
             if (self.act_nudges < 2 and !self.in_veil_work and !self.castPending() and !cast_owed and
                 castGoal(full) == null and // a literal CAST: IS the performed action — it dispatches below
-                (announcesAction(full) or (full.len == 0 and announcesAction(reason))))
+                (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
+                    (announcesAction(full) or (full.len == 0 and announcesAction(reason)))))
             {
                 self.act_nudges += 1;
                 // The fizzled reply is what the user watched stream — commit it (unobserved: a promise is
@@ -3325,7 +3420,8 @@ pub const Chat = struct {
             // the live stream slices, commit the answer, then re-enter as a .tool_follow turn (a kind that
             // CAN act) with the same bounded follow-through directive the plain-answer path uses.
             const fizzled = self.act_nudges < 2 and
-                (announcesAction(full) or (full.len == 0 and announcesAction(reason)));
+                (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
+                    (announcesAction(full) or (full.len == 0 and announcesAction(reason))));
             self.appendVeil(dd, reason, full);
             if (fizzled) {
                 self.act_nudges += 1;
