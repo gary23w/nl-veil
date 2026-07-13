@@ -11,6 +11,7 @@ const bufedit = @import("bufedit.zig");
 const vcs = @import("vcs.zig");
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
+const rerank = @import("rerank.zig");
 const crawl = @import("crawl.zig");
 
 extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
@@ -182,6 +183,11 @@ pub const ToolCtx = struct {
     slot_path: []const u8 = "",
     blueprint: []const u8 = "",
     egress_allow: []const u8 = "",
+    // gateway (BYOK) creds for the SECOND-STAGE reranker — the same endpoint screenPass/gapToQuery use, so
+    // recall_hive can reorder+filter its first-stage hits through the selected API. Empty model ⇒ no rerank.
+    gw_base: []const u8 = "",
+    gw_key: []const u8 = "",
+    gw_model: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
     vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
     reject_notes: ?*std.ArrayListUnmanaged(u8) = null, // per-round write-refusal ledger (owned by the Worker) — folded into the fitness block so refusals are visible, not silent
@@ -556,6 +562,36 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             if (part.len == 0) continue;
             if (out.items.len > 0) out.append(gpa, '\n') catch {};
             out.appendSlice(gpa, part) catch {};
+        }
+        // SECOND-STAGE RERANK: first-stage assoc always returns its argmax even when nothing truly matches the
+        // query (the "surfaces a top match even when nothing matches" failure). When a gateway (BYOK) endpoint
+        // is configured and there's a real field to reorder, judge the hits against the query through the
+        // selected API: reorder+filter to the genuinely-relevant ones, or ABSTAIN so the mind is told the hive
+        // has nothing relevant instead of being handed off-topic facts to chase. Falls through to the raw
+        // recall on any failure — never worse than first-stage. (See rerank.zig for the algorithm.)
+        var cands: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer cands.deinit(gpa);
+        var lit = std.mem.splitScalar(u8, out.items, '\n');
+        while (lit.next()) |ln| {
+            const t = std.mem.trim(u8, ln, " \r\t-•*");
+            if (t.len >= 8) cands.append(gpa, t) catch {};
+        }
+        if (ctx.gw_model.len > 0 and cands.items.len > 4) {
+            const rr = rerank.rerank(gpa, ctx.io, ctx.run_dir, ctx.gw_base, ctx.gw_key, ctx.gw_model, p.value.query, cands.items, 8);
+            defer rr.deinit(gpa);
+            switch (rr.outcome) {
+                .abstain => return dupe(gpa, "(the hive holds facts but none rank as relevant to that query — refine the query, or research it externally rather than assuming the hive already knows)"),
+                .reranked => {
+                    var ro: std.ArrayListUnmanaged(u8) = .empty;
+                    defer ro.deinit(gpa);
+                    for (rr.order) |idx| {
+                        if (ro.items.len > 0) ro.append(gpa, '\n') catch {};
+                        ro.appendSlice(gpa, cands.items[idx]) catch {};
+                    }
+                    if (ro.items.len > 0) return dupe(gpa, ro.items);
+                },
+                .passthrough => {},
+            }
         }
         return dupe(gpa, out.items);
     }
