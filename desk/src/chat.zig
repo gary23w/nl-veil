@@ -777,7 +777,11 @@ pub const Chat = struct {
     /// tok/s is measured over the GENERATION window = total minus first-byte, so queue/prefill latency doesn't
     /// deflate the rate). Called once per turn, at the settle point and the error path.
     fn recordMetric(self: *Chat, kind: Turn, ok: bool, out_chars: usize) void {
-        const total_ms: u32 = @intCast(@max(0, self.nowMs() - self.turn_start_ms));
+        // turn_start_ms is 0 until startTurn stamps it; an aborted or conversation-switch-raced turn can reach
+        // here unstamped, and nowMs()-0 is a full epoch timestamp (~1.7e12) that overflows u32 — @max only guards
+        // the negative side. Treat a missing/implausible start as an unmeasurable 0ms sample, never crash the desk.
+        const raw_total_ms = self.nowMs() - self.turn_start_ms;
+        const total_ms: u32 = if (self.turn_start_ms == 0 or raw_total_ms <= 0 or raw_total_ms > std.math.maxInt(u32)) 0 else @intCast(raw_total_ms);
         const gen_ms = if (total_ms > self.turn_fb_ms) total_ms - self.turn_fb_ms else total_ms;
         const toks: f32 = @as(f32, @floatFromInt(out_chars)) / 4.0;
         const tok_s: f32 = if (gen_ms > 0) toks / (@as(f32, @floatFromInt(gen_ms)) / 1000.0) else 0;
@@ -3078,7 +3082,10 @@ pub const Chat = struct {
             }
             if (self.stream.saw_any and !self.first_byte_logged) {
                 self.first_byte_logged = true;
-                if (self.turn_fb_ms == 0) self.turn_fb_ms = @intCast(@max(1, self.nowMs() - self.turn_start_ms));
+                if (self.turn_fb_ms == 0) { // same u32-overflow guard as recordMetric: an unstamped turn_start_ms makes nowMs()-0 overflow
+                    const fb_ms = self.nowMs() - self.turn_start_ms;
+                    self.turn_fb_ms = if (self.turn_start_ms == 0 or fb_ms <= 0 or fb_ms > std.math.maxInt(u32)) 1 else @intCast(fb_ms);
+                }
                 log.info("chat turn: first byte after {d}s", .{el});
             }
             return;
