@@ -154,6 +154,178 @@ pub fn computeView(head: []const u8, tail: []const u8, size: usize, window_bytes
     return .{ .goal_line = "", .window = window, .window_start = window_start, .goal_end = 0, .gap = window_start > 0 };
 }
 
+// -------------------------------------------------------------------------- markup tool-call recovery (gpt-oss)
+
+pub const RecoveredCall = struct { name: []u8, args: []u8 }; // both gpa-owned
+pub const MarkupRecovery = struct {
+    stripped: []u8, // gpa-owned: `content` with the markup block removed
+    calls: []RecoveredCall, // gpa-owned
+};
+
+/// True if `s` carries the Claude-style tool-call markup a local model may emit into the CONTENT channel instead
+/// of a structured tool_calls entry (`<｜｜DSML｜｜invoke name="…">` / `<｜｜DSML｜｜tool_calls>`). Anchors on the
+/// ASCII substrings so it is robust to sentinel variations (｜DSML｜ vs ｜｜DSML｜｜ vs none).
+pub fn looksLikeToolMarkup(s: []const u8) bool {
+    return std.mem.indexOf(u8, s, "invoke name=\"") != null or std.mem.indexOf(u8, s, "tool_calls>") != null;
+}
+
+fn lastLtBefore(s: []const u8, pos: usize) usize {
+    return if (std.mem.lastIndexOfScalar(u8, s[0..pos], '<')) |lt| lt else pos;
+}
+
+/// The portion of `s` BEFORE any tool-call markup block (trimmed) — used to strip leaked markup from a reply
+/// shown to the user when it couldn't be recovered into an actual call. Returns `s` (trimmed) when there's none.
+pub fn contentBeforeMarkup(s: []const u8) []const u8 {
+    var start: usize = s.len;
+    if (std.mem.indexOf(u8, s, "invoke name=\"")) |inv| start = lastLtBefore(s, inv);
+    if (std.mem.indexOf(u8, s, "tool_calls>")) |tc| {
+        const lt = lastLtBefore(s, tc);
+        if (lt < start) start = lt;
+    }
+    return std.mem.trim(u8, s[0..start], " \r\n\t");
+}
+
+/// Minimal JSON string escaper (std-only; http.jstr lives in the gateway layer). Appends a quoted, escaped `s`.
+fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        else => if (c < 0x20) {
+            var b: [8]u8 = undefined;
+            try out.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch "");
+        } else try out.append(gpa, c),
+    };
+    try out.append(gpa, '"');
+}
+
+/// Is `v` a bare JSON scalar (number / true / false / null) safe to emit UNQUOTED? Used for parameters the model
+/// tagged string="false". Anything else (an IP like 10.0.0.1, a version 1.2.3, a stray "+5") falls back to a
+/// quoted string so the args JSON the tool then parses is always valid.
+fn isBareScalar(v: []const u8) bool {
+    if (std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "null")) return true;
+    return isJsonNumber(v);
+}
+
+/// Strict JSON number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? consuming ALL of `v`. Rejects
+/// leading zeros, a bare/trailing '.', a '+' sign, and an empty exponent — anything std.json would reject.
+fn isJsonNumber(v: []const u8) bool {
+    if (v.len == 0) return false;
+    var i: usize = 0;
+    if (v[i] == '-') i += 1;
+    if (i >= v.len) return false;
+    if (v[i] == '0') {
+        i += 1; // a leading 0 must stand alone (no 00, no 01)
+    } else if (v[i] >= '1' and v[i] <= '9') {
+        i += 1;
+        while (i < v.len and v[i] >= '0' and v[i] <= '9') i += 1;
+    } else return false;
+    if (i < v.len and v[i] == '.') { // fraction: at least one digit
+        i += 1;
+        if (i >= v.len or v[i] < '0' or v[i] > '9') return false;
+        while (i < v.len and v[i] >= '0' and v[i] <= '9') i += 1;
+    }
+    if (i < v.len and (v[i] == 'e' or v[i] == 'E')) { // exponent: optional sign then at least one digit
+        i += 1;
+        if (i < v.len and (v[i] == '+' or v[i] == '-')) i += 1;
+        if (i >= v.len or v[i] < '0' or v[i] > '9') return false;
+        while (i < v.len and v[i] >= '0' and v[i] <= '9') i += 1;
+    }
+    return i == v.len;
+}
+
+/// Build the JSON args object from one invoke's parameter region: each `parameter name="Y" string="B">VALUE
+/// </…parameter>` becomes `"Y":VALUE` (raw when string="false" and VALUE is a bare scalar, else a quoted string).
+fn buildArgs(gpa: std.mem.Allocator, region: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '{');
+    var first = true;
+    var j: usize = 0;
+    const PAR = "parameter name=\"";
+    while (std.mem.indexOfPos(u8, region, j, PAR)) |p_at| {
+        const pn_start = p_at + PAR.len;
+        const pn_end = std.mem.indexOfScalarPos(u8, region, pn_start, '"') orelse break;
+        const pname = region[pn_start..pn_end];
+        const gt = std.mem.indexOfScalarPos(u8, region, pn_end, '>') orelse break;
+        const attrs = region[pn_end..gt]; // between the name's closing quote and the tag's '>'
+        const raw_ok = std.mem.indexOf(u8, attrs, "string=\"false\"") != null;
+        const close = std.mem.indexOfPos(u8, region, gt, "parameter>") orelse break;
+        const val_end = lastLtBefore(region, close); // the '<' beginning the closing tag
+        const value = if (val_end > gt) region[gt + 1 .. val_end] else "";
+        if (!first) try out.append(gpa, ',');
+        first = false;
+        try appendJsonString(gpa, &out, pname);
+        try out.append(gpa, ':');
+        if (raw_ok and isBareScalar(std.mem.trim(u8, value, " \r\n\t")))
+            try out.appendSlice(gpa, std.mem.trim(u8, value, " \r\n\t"))
+        else
+            try appendJsonString(gpa, &out, value);
+        j = close + "parameter>".len;
+    }
+    try out.append(gpa, '}');
+    return out.toOwnedSlice(gpa);
+}
+
+/// Recover tool call(s) a model emitted as markup in the CONTENT channel (see looksLikeToolMarkup). Returns the
+/// content with the markup block stripped + the parsed calls, or null when there's nothing recoverable. `content`
+/// is BORROWED; on success the caller frees its old content and adopts `stripped`. On any allocation failure the
+/// partial work is freed and null is returned (caller keeps the original content — the drive-loop guard is the
+/// safety net).
+pub fn recoverMarkupCalls(gpa: std.mem.Allocator, content: []const u8) ?MarkupRecovery {
+    const INV = "invoke name=\"";
+    const first_inv = std.mem.indexOf(u8, content, INV) orelse return null;
+
+    // Where does the markup block begin? The '<' before the first invoke, or an earlier `<…tool_calls>` opener.
+    var block_start = lastLtBefore(content, first_inv);
+    if (std.mem.indexOf(u8, content[0..first_inv], "tool_calls>")) |tc| {
+        const lt = lastLtBefore(content, tc);
+        if (lt < block_start) block_start = lt;
+    }
+
+    var calls: std.ArrayListUnmanaged(RecoveredCall) = .empty;
+    defer calls.deinit(gpa);
+    var i: usize = first_inv;
+    while (std.mem.indexOfPos(u8, content, i, INV)) |inv_at| {
+        const name_start = inv_at + INV.len;
+        const name_end = std.mem.indexOfScalarPos(u8, content, name_start, '"') orelse break;
+        const name = content[name_start..name_end];
+        const region_end = std.mem.indexOfPos(u8, content, name_end, INV) orelse content.len;
+        const args = buildArgs(gpa, content[name_end..region_end]) catch break;
+        const nm = gpa.dupe(u8, name) catch {
+            gpa.free(args);
+            break;
+        };
+        calls.append(gpa, .{ .name = nm, .args = args }) catch {
+            gpa.free(args);
+            gpa.free(nm);
+            break;
+        };
+        i = region_end;
+    }
+    if (calls.items.len == 0) return null; // nothing parsed → leave content as-is
+
+    const stripped = gpa.dupe(u8, std.mem.trim(u8, content[0..block_start], " \r\n\t")) catch {
+        for (calls.items) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        return null;
+    };
+    const owned = calls.toOwnedSlice(gpa) catch {
+        gpa.free(stripped);
+        for (calls.items) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        return null;
+    };
+    return .{ .stripped = stripped, .calls = owned };
+}
+
 // ------------------------------------------------------------------------------------------------- tests
 
 test "computeView: whole small file fits — replay verbatim, no goal pin, no gap" {
@@ -246,6 +418,27 @@ test "computeView: a goal line longer than the head read is NOT pinned as a trun
     try std.testing.expectEqual(@as(u8, '{'), v.window[0]);
 }
 
+test "isBareScalar: accepts real JSON numbers/bools, rejects IPs/versions/malformed (else args JSON would break)" {
+    try std.testing.expect(isBareScalar("0"));
+    try std.testing.expect(isBareScalar("42"));
+    try std.testing.expect(isBareScalar("-17"));
+    try std.testing.expect(isBareScalar("3.14"));
+    try std.testing.expect(isBareScalar("1e10"));
+    try std.testing.expect(isBareScalar("-2.5e-3"));
+    try std.testing.expect(isBareScalar("true") and isBareScalar("false") and isBareScalar("null"));
+    // must be REJECTED (→ quoted) — these are the args-corrupting cases from the review:
+    try std.testing.expect(!isBareScalar("10.0.0.1"));
+    try std.testing.expect(!isBareScalar("1.2.3"));
+    try std.testing.expect(!isBareScalar("+5"));
+    try std.testing.expect(!isBareScalar("5."));
+    try std.testing.expect(!isBareScalar(".5"));
+    try std.testing.expect(!isBareScalar("1e"));
+    try std.testing.expect(!isBareScalar("00"));
+    try std.testing.expect(!isBareScalar("01"));
+    try std.testing.expect(!isBareScalar(""));
+    try std.testing.expect(!isBareScalar("three.js"));
+}
+
 test "estTokens: rough proxy divides by BYTES_PER_TOKEN" {
     try std.testing.expectEqual(@as(usize, 256), estTokens(1024));
     try std.testing.expectEqual(@as(usize, 0), estTokens(3));
@@ -288,4 +481,57 @@ test "readHeadTail: null on a missing file" {
     var hb: [8]u8 = undefined;
     var tb: [8]u8 = undefined;
     try std.testing.expect(readHeadTail(io, "zig-chatctx-does-not-exist.jsonl", &hb, &tb) == null);
+}
+
+test "recoverMarkupCalls: parses the real DeepSeek/gpt-oss DSML tool-call markup, strips it from content" {
+    const gpa = std.testing.allocator;
+    // EXACT format captured from a live gpt-oss run (conv c6a566d24): narration + a Claude-style invoke block.
+    const content =
+        "I see the issue.\n\n" ++
+        "<｜｜DSML｜｜tool_calls>\n" ++
+        "<｜｜DSML｜｜invoke name=\"read_file\">\n" ++
+        "<｜｜DSML｜｜parameter name=\"path\" string=\"true\">index.html</｜｜DSML｜｜parameter>\n" ++
+        "<｜｜DSML｜｜parameter name=\"start_line\" string=\"false\">1</｜｜DSML｜｜parameter>\n" ++
+        "<｜｜DSML｜｜parameter name=\"end_line\" string=\"false\">100</｜｜DSML｜｜parameter>\n" ++
+        "</｜｜DSML｜｜invoke>\n" ++
+        "</｜｜DSML｜｜tool_calls>";
+    const rec = recoverMarkupCalls(gpa, content) orelse return error.NoRecovery;
+    defer {
+        gpa.free(rec.stripped);
+        for (rec.calls) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        gpa.free(rec.calls);
+    }
+    try std.testing.expectEqualStrings("I see the issue.", rec.stripped); // markup block removed
+    try std.testing.expectEqual(@as(usize, 1), rec.calls.len);
+    try std.testing.expectEqualStrings("read_file", rec.calls[0].name);
+    // path quoted (string="true"); start_line/end_line raw (string="false" + bare integer)
+    try std.testing.expectEqualStrings("{\"path\":\"index.html\",\"start_line\":1,\"end_line\":100}", rec.calls[0].args);
+}
+
+test "recoverMarkupCalls: null when there is no markup; a non-numeric raw value falls back to a string" {
+    const gpa = std.testing.allocator;
+    try std.testing.expect(recoverMarkupCalls(gpa, "just a normal reply, no tool calls here") == null);
+
+    // string="false" but the value isn't a bare scalar → must be quoted so the args JSON still parses.
+    const content =
+        "<｜｜DSML｜｜invoke name=\"web_search\">" ++
+        "<｜｜DSML｜｜parameter name=\"query\" string=\"false\">three.js sprites</｜｜DSML｜｜parameter>" ++
+        "</｜｜DSML｜｜invoke>";
+    const rec = recoverMarkupCalls(gpa, content) orelse return error.NoRecovery;
+    defer {
+        gpa.free(rec.stripped);
+        for (rec.calls) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        gpa.free(rec.calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rec.calls.len);
+    try std.testing.expectEqualStrings("web_search", rec.calls[0].name);
+    try std.testing.expectEqualStrings("{\"query\":\"three.js sprites\"}", rec.calls[0].args);
+    try std.testing.expect(looksLikeToolMarkup(content));
+    try std.testing.expect(!looksLikeToolMarkup("a clean answer"));
 }

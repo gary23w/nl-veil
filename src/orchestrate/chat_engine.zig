@@ -290,8 +290,30 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
-        // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
         var answer = inner.content;
+
+        // Strip any leaked tool-call markup the recovery couldn't parse into a call, so the user never sees raw
+        // `<｜｜DSML｜｜invoke …>` in the reply.
+        if (cctx.looksLikeToolMarkup(answer)) {
+            const clean = cctx.contentBeforeMarkup(answer);
+            if (gpa.dupe(u8, clean)) |d| {
+                gpa.free(answer);
+                answer = d;
+            } else |_| {}
+        }
+
+        // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing): don't
+        // commit an empty reply or drive further on nothing. Surface a brief honest note and end the turn.
+        if (std.mem.trim(u8, answer, " \r\n\t").len == 0) {
+            gpa.free(answer);
+            const note = "(no reply — the model returned an empty or malformed response this turn)";
+            appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
+            emitAssistant(app, conv_dir, note);
+            emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+            return;
+        }
+
+        // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
         if (drive == 0 and answer.len >= REFLECT_MIN) {
             if (reflectAnswer(app, run_root, base_url, key, model, user_text, answer)) |improved| {
                 gpa.free(answer);
@@ -318,9 +340,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         conv_buf.shrinkRetainingCapacity(saved_len); // drop the synthetic loop question
 
         const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
-        // STOP the drive when the goal is achieved (DONE), the inference is empty/failed, or the next step just
-        // repeats the last one (no progress) — the settled answer above is the turn's final reply.
-        if (!next.ok or trimmed.len == 0 or loopIsDone(next.content) or nearlySame(trimmed, prev_drive)) break :outer;
+        // STOP the drive when the goal is achieved (DONE), the inference is empty/failed, the next step just
+        // repeats the last one (no progress), OR the next step is itself leaked tool-call markup rather than a real
+        // instruction (a malfunctioning model — driving on it is the "janked back and forth" churn). The settled
+        // answer above is the turn's final reply.
+        if (!next.ok or trimmed.len == 0 or loopIsDone(next.content) or nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed)) break :outer;
 
         // CONTINUE: the inferred step becomes the next (synthetic) user turn in the LLM context — NOT written to
         // messages.jsonl (only real user + assistant turns are durable there).
@@ -566,6 +590,49 @@ fn runInnerAgentic(
         // stream:true), emit the reasoning once here so the desk still shows the thinking (no regression).
         if (!sctx.streamed and step.reasoning.len > 0)
             emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
+
+        // MARKUP TOOL-CALL RECOVERY: a local gpt-oss/DeepSeek model sometimes emits its tool call as Claude-style
+        // XML markup in the CONTENT channel (<｜｜DSML｜｜invoke name="…">) instead of a structured tool_calls entry.
+        // The transport then returns it as plain content with NO calls, so no tool runs, the markup leaks into the
+        // reply, and the drive loop churns on it ("bad tool requests / janked back and forth"). Recover the call(s)
+        // from the markup + strip it from the content, so the tool actually executes and the turn makes progress.
+        if (step.calls.len == 0 and cctx.looksLikeToolMarkup(step.content)) {
+            if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
+                var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
+                for (rec.calls) |rc| {
+                    const idc = gpa.dupe(u8, "") catch {
+                        gpa.free(rc.name);
+                        gpa.free(rc.args);
+                        continue;
+                    };
+                    built.append(gpa, .{ .id = idc, .name = rc.name, .args = rc.args }) catch {
+                        gpa.free(idc);
+                        gpa.free(rc.name);
+                        gpa.free(rc.args);
+                    };
+                }
+                gpa.free(rec.calls); // wrapper array only; name/args ownership moved into `built` (or freed above)
+                if (built.items.len == 0) {
+                    built.deinit(gpa);
+                    gpa.free(rec.stripped); // every append OOM-failed — leave the original content untouched
+                } else if (built.toOwnedSlice(gpa)) |owned| {
+                    gpa.free(step.content);
+                    step.content = rec.stripped; // narration with the markup block removed
+                    step.calls = owned; // adopted into the Step; freed by step.deinit
+                    var nb: [72]u8 = undefined;
+                    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "recovered {d} tool call(s) from model markup", .{owned.len}) catch "recovered tool call from markup");
+                } else |_| {
+                    // OOM finalizing the slice — free each built call + the backing array + the stripped content.
+                    for (built.items) |c| {
+                        gpa.free(c.id);
+                        gpa.free(c.name);
+                        gpa.free(c.args);
+                    }
+                    built.deinit(gpa);
+                    gpa.free(rec.stripped);
+                }
+            }
+        }
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
             return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty };
