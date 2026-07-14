@@ -666,6 +666,12 @@ pub const Chat = struct {
     // send routes to the conv's SERVER-side turn instead of the local loop, and pumpServerChat renders the turn's
     // event frames into the transcript by polling /events past a byte cursor.
     sc_active: bool = false, // a server turn is in flight for sc_conv → pumpServerChat renders its NEW frames
+    // The LAST send was routed to the server (persists after the turn ends). The local auto-loop (maybeLoop) checks
+    // this: when the conv is served by the server, the SERVER drives its own loop, so the desk must not also run
+    // the local loop (the "enabling auto-loop falls back to the client-side engine" bug). A fallback to local sets
+    // it false so the local loop resumes — and it isn't tied to the 45s serverChatOn() cooldown, which would else
+    // strand a >45s local fallback build mid-loop.
+    sc_serving: bool = false,
     sc_from: usize = 0, //      byte cursor into the conv's events.jsonl — only frames past here are new
     sc_conv: [64]u8 = [_]u8{0} ** 64, // the conv the server turn was fired for (its id doubles as the /events path)
     sc_conv_len: usize = 0,
@@ -1045,6 +1051,7 @@ pub const Chat = struct {
             switch (c.kind) {
                 .none => {},
                 .send => self.cmdSend(dd, c.textStr()),
+                .steer_turn => self.cmdSteerTurn(dd, c.textStr()),
                 // Guard a chat switch/new-chat while ANY work is pending (a streaming reply, a running cast, or an
                 // AI console command): switching would repoint conv_active and the settling output would land in —
                 // and overwrite — the wrong chat (the "old chat bleeds into the new chat" bug). Mirror the
@@ -1107,6 +1114,13 @@ pub const Chat = struct {
         // In cooldown after a recent fallback → keep using the local engine until the backend has had time to
         // come back (avoids re-paying the failed round-trip on every message while a server is down/misconfigured).
         return self.nowS() >= self.sc_cooldown_until;
+    }
+
+    /// Set the server-turn-active state, mirroring it to the store so the input row can enable "Enter = steer".
+    /// A plain bool write needs no lock (single-word, read by the render thread; a 1-frame-stale read is harmless).
+    fn setServerActive(self: *Chat, v: bool) void {
+        self.sc_active = v;
+        self.store.chat_server_turn = v;
     }
 
     /// Route one user send to the conv's SERVER-side chat turn. Returns true if the send was handed to the server
@@ -1184,7 +1198,8 @@ pub const Chat = struct {
             self.sc_from = from0;
             self.sc_fails = 0;
             self.scClearStream(); // fresh live preview for this turn's streamed deltas
-            self.sc_active = true; // keep busy; pumpServerChat clears it on {done}
+            self.setServerActive(true); // keep busy; pumpServerChat clears it on {done}
+            self.sc_serving = true; // this conv is served by the server → the desk's local auto-loop stands down
             return true;
         }
 
@@ -1372,7 +1387,7 @@ pub const Chat = struct {
         }
         if (std.mem.eql(u8, kind, "done")) {
             self.scClearStream(); // any unsealed preview is stale now
-            self.sc_active = false;
+            self.setServerActive(false);
             self.setBusy(false);
             self.setStatus("");
             return;
@@ -1385,7 +1400,7 @@ pub const Chat = struct {
     fn abortServerChat(self: *Chat, dd: []const u8, note: []const u8) void {
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
-        self.sc_active = false;
+        self.setServerActive(false);
         self.setBusy(false);
         self.setStatus("");
         // A server turn that died mid-flight → cool the backend off so the user's next send goes to the local
@@ -2202,6 +2217,36 @@ pub const Chat = struct {
         if (found > 0) log.info("curator: {s} — {d} merge candidate(s) proposed", .{ scope, found });
     }
 
+    /// POST-TO-STEER a RUNNING server-chat turn: write a {"op":"steer","text":..} op to the conv's control.jsonl,
+    /// which the server turn reads between steps and folds in as a user message — the user guiding a running turn
+    /// without stopping it. No-op (with a notice) when no server turn is live (a local turn: Stop then send).
+    fn cmdSteerTurn(self: *Chat, dd: []const u8, text: []const u8) void {
+        const txt = std.mem.trim(u8, text, " \r\n\t");
+        if (txt.len == 0) return;
+        if (!self.sc_active) {
+            self.store.pushNotif("Busy", "the veil is working — press Stop to interrupt, then send", 2);
+            return;
+        }
+        const conv = self.sc_conv[0..self.sc_conv_len];
+        if (conv.len == 0) return;
+        const cap = txt.len * 2 + 32;
+        const body = self.gpa.alloc(u8, cap) catch return;
+        defer self.gpa.free(body);
+        var w = Io.Writer.fixed(body);
+        const ok = blk: {
+            w.writeAll("{\"op\":\"steer\",\"text\":\"") catch break :blk false;
+            wesc(&w, txt);
+            w.writeAll("\"}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return;
+        if (self.runner().chatControl(self.io, self.gpa, conv, w.buffered())) |r| {
+            if (r.body.len > 0) self.gpa.free(r.body);
+        }
+        self.appendMsg(dd, .user, txt); // show the steer in the transcript
+        self.setStatus("steer sent — the veil will fold it into the running turn");
+    }
+
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
         if (text.len == 0) return;
         if (self.turn != .idle or self.consoleAiBusy() or self.sc_active) {
@@ -2273,6 +2318,9 @@ pub const Chat = struct {
         if (self.serverChatOn()) {
             if (self.routeToServerChat(dd, text)) return;
         }
+        // Past the server route → this message is served LOCALLY (server off, in cooldown, or a fallback). Mark the
+        // conv as NOT server-served so the local auto-loop (maybeLoop) is allowed to drive it.
+        self.sc_serving = false;
         // SUB-AGENT DISPATCH: an explicit "cast a swarm to ..." IS the task — deploy it NOW instead of
         // spending a whole model turn deciding to (measured ~10s hosted, up to a minute on a local thinking
         // model, before the hive even existed). Config rides the user's own words mechanically (N minds /
@@ -4175,6 +4223,11 @@ pub const Chat = struct {
     /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
     /// (no in-flight turn, no running cast). Called at the settle point and on a fresh toggle-on (.loop_kick).
     fn maybeLoop(self: *Chat, dd: []const u8) void {
+        // SERVER CHAT owns the loop. When the conv is SERVED by the server (sc_serving — set on a successful route,
+        // cleared on a fallback to local), the SERVER turn drives its own multi-step loop, so the desk must NOT run
+        // its LOCAL auto-loop — doing so is the "enabling auto-loop falls back to the client-side engine" bug. Keyed
+        // on sc_serving (not the 45s serverChatOn() cooldown) so a >45s local fallback build isn't stranded mid-loop.
+        if (self.sc_serving) return;
         // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending finish (else auto-loop
         // would grab the shared turn slot out from under the veil work / finish).
         if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil) return;
@@ -4414,7 +4467,7 @@ pub const Chat = struct {
                 }
             }
             self.scClearStream();
-            self.sc_active = false;
+            self.setServerActive(false);
             self.appendMsg(dd, .cast_note, "(stopped)");
         }
         self.setStatus("");
@@ -9088,6 +9141,7 @@ test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settl
     store.* = .{};
     @memcpy(store.settings.data_dir[0..dd.len], dd);
     store.settings.data_dir_len = dd.len;
+    store.settings.server_chat = false; // this test exercises the LOCAL auto-loop; maybeLoop now defers to the server when server_chat is on
     var chat = std.testing.allocator.create(Chat) catch unreachable;
     defer std.testing.allocator.destroy(chat);
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
@@ -9157,6 +9211,7 @@ test "auto-loop-afk: the third tier never backs itself out — idle settles, DON
     store.* = .{};
     @memcpy(store.settings.data_dir[0..dd.len], dd);
     store.settings.data_dir_len = dd.len;
+    store.settings.server_chat = false; // this test exercises the LOCAL auto-loop; maybeLoop now defers to the server when server_chat is on
     var chat = std.testing.allocator.create(Chat) catch unreachable;
     defer std.testing.allocator.destroy(chat);
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };

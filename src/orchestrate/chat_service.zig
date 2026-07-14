@@ -229,16 +229,17 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .ok = true, .conv = seg, .turn = "running", .events_url = events_url }, .{});
 }
 
-/// POST /api/v1/chat/convs/:id/control — append a cooperative control op (e.g. {"op":"stop"}) to the conv's
-/// control.jsonl. The synchronous turn does not consult it yet; this is the durable seam a future async/streamed
-/// turn reads to stop between tool calls. Structural ownership: the path is under the caller's own uid prefix.
+/// POST /api/v1/chat/convs/:id/control — append a cooperative control op to the conv's control.jsonl. The running
+/// server turn reads it between drive steps + before each tool: `{"op":"stop"}` ends the turn; `{"op":"steer",
+/// "text":".."}` folds the user's mid-turn guidance in as a user message (posting to steer a running turn).
+/// Structural ownership: the path is under the caller's own uid prefix.
 pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
 
-    const Body = struct { op: []const u8 = "" };
+    const Body = struct { op: []const u8 = "", text: []const u8 = "" };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const op = std.mem.trim(u8, b.op, " \r\n\t");
     if (op.len == 0) return badReq(res, "op is required");
@@ -251,6 +252,10 @@ pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer line.deinit(app.gpa);
     try line.appendSlice(app.gpa, "{\"op\":");
     try http.jstr(app.gpa, &line, op);
+    if (b.text.len > 0) { // a steer/say op carries the user's guidance text — persist it so the turn can fold it in
+        try line.appendSlice(app.gpa, ",\"text\":");
+        try http.jstr(app.gpa, &line, b.text);
+    }
     try line.appendSlice(app.gpa, "}\n");
     http.appendFile(app.io, app.gpa, path, line.items) catch {};
 

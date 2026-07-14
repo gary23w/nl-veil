@@ -202,7 +202,7 @@ pub const CastRow = struct {
     }
 };
 
-pub const ChatCmdKind = enum { none, send, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
+pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.
@@ -312,6 +312,8 @@ pub const Store = struct {
     //                             running) — the UI renders it as thinking, never as a delivered answer
     chat_busy: bool = false, // a model turn is in flight (Send disabled)
     chat_loop: bool = false, // full-auto: the AI writes + sends its own next message until DONE or the cap (runtime only)
+    chat_server_turn: bool = false, // a SERVER-side chat turn is currently in flight (mirror of Chat.sc_active) —
+    //                                 the input row reads this to enable "type + Enter = steer the running turn"
     chat_loop_afk: bool = false, // THIRD TIER (double-click the toggle): the loop NEVER backs itself out —
     //                              DONE, failures, caps, cast pauses, and questions all reset their budget
     //                              instead of stopping; runs until the user clicks it off or hits Stop
