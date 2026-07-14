@@ -363,7 +363,7 @@ pub const Worker = struct {
         while (it.next()) |raw| {
             const ln = std.mem.trim(u8, raw, " \r\t");
             if (ln.len == 0) continue;
-            const C = struct { op: []const u8 = "", text: []const u8 = "", goal: []const u8 = "", answered: u8 = 0, steer: u8 = 0, reply: []const u8 = "", directive: []const u8 = "" };
+            const C = struct { op: []const u8 = "", to: []const u8 = "", id: []const u8 = "", text: []const u8 = "", goal: []const u8 = "", answered: u8 = 0, steer: u8 = 0, reply: []const u8 = "", directive: []const u8 = "" };
             const p = std.json.parseFromSlice(C, self.gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
             defer p.deinit();
             if (std.mem.eql(u8, p.value.op, "stop")) {
@@ -375,6 +375,13 @@ pub const Worker = struct {
             } else if ((std.mem.eql(u8, p.value.op, "say") or std.mem.eql(u8, p.value.op, "broadcast")) and p.value.text.len > 0) {
                 commons.sendMessage(self.gpa, self.io, self.run_dir, "operator", "all", p.value.text, self.cur_round);
                 self.emit("control", std.fmt.allocPrint(self.a(), ",\"applied\":1,\"text\":\"{s}\"", .{self.esc(p.value.text)}) catch ",\"applied\":1");
+            } else if (std.mem.eql(u8, p.value.op, "answer") and p.value.to.len > 0 and p.value.text.len > 0) {
+                // the veil answered a mind's ask_veil question — deliver it to THAT mind's inbox, from "veil" (the
+                // mind treats a "veil"/"operator" inbox message as a priority directive). `id` correlates it to the
+                // ask in the veil's own dedup ledger; the worker just routes the reply.
+                const body = std.fmt.allocPrint(self.a(), "The veil answers your question: {s}", .{p.value.text}) catch p.value.text;
+                commons.sendMessage(self.gpa, self.io, self.run_dir, "veil", p.value.to, body, self.cur_round);
+                self.emit("ask_answered", std.fmt.allocPrint(self.a(), ",\"to\":\"{s}\",\"id\":\"{s}\"", .{ self.esc(p.value.to), self.esc(p.value.id) }) catch ",\"applied\":1");
             } else if (std.mem.eql(u8, p.value.op, "veil") and p.value.text.len > 0) {
                 // answered=1: the veil SHELL already replied out-of-band in the veil's voice — record the
                 // exchange (+ optional steer) instead of composing a duplicate reply at round latency.
@@ -3794,7 +3801,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         .scout => tools.SCOUT_SCHEMA,
         .assembler => tools.ASSEMBLER_SCHEMA,
         .operate => tools.OPERATE_SCHEMA,
-        .full => tools.SCHEMA,
+        .full => tools.FULL_SCHEMA, // SCHEMA + ask_veil — full-tier minds can ask the veil a question
     };
     const fence_now = gate.fence;
     const off_schema = if (w.internet) base_schema_raw else offlineSchema(gpa, base_schema_raw);

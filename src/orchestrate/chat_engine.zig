@@ -81,8 +81,9 @@ const SYSTEM_PROMPT =
     "list, and for EACH subtask decide the best route: (a) DELEGATE TO A HIVE -- if a team building or " ++
     "researching in parallel would do it better or faster, `cast` a swarm for that part (it builds in THIS " ++
     "conversation, so its files sit alongside yours), then GUIDE that swarm: `swarm_status` to see how it's " ++
-    "doing, `steer_swarm` to send its minds a live directive or retarget their goal, `stop_swarm` when it's done " ++
-    "or off track. When a user asks you to \"use a hive\", do exactly that -- cast one, don't build it yourself. " ++
+    "doing, `steer_swarm` to send its minds a live directive or retarget their goal, `swarm_asks` to see " ++
+    "questions its minds raised for you and `answer_swarm` to unblock them, `stop_swarm` when it's done or off " ++
+    "track. When a user asks you to \"use a hive\", do exactly that -- cast one, don't build it yourself. " ++
     "(b) LEARN FIRST -- if you're missing knowledge for a part, research it (web_search / read_url / recall_hive) " ++
     "BEFORE acting instead of guessing. (c) DO IT YOURSELF -- for a small, direct change, build it inline " ++
     "(write_file / edit_file / run_python). Revise the plan as you learn. Keep coordinating -- casting, steering, " ++
@@ -96,7 +97,9 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"cast","description":"Deploy a SWARM (a hive of AI minds) to work on a goal in parallel, in THIS conversation's build dir so its files co-exist with yours. Use for a big or parallelizable build/research task you want a team to carry out while you guide them. Returns a swarm id; watch it with swarm_status, guide it with steer_swarm, end it with stop_swarm.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"what the swarm should accomplish"},"minds":{"type":"integer","description":"how many minds (default 3)"},"minutes":{"type":"integer","description":"time budget (0 = server default)"},"mode":{"type":"string","enum":["cast","continuous"],"description":"cast = fast one-shot strike; continuous = sustained hive"},"files":{"type":"string","description":"declared deliverable files, comma/newline separated — adopted verbatim as the blueprint"}},"required":["goal"]}}},
     \\{"type":"function","function":{"name":"steer_swarm","description":"Send LIVE guidance to a RUNNING swarm — a priority directive every mind reads at its next round (course-correct, add a constraint, unblock a mind). Or pass `goal` to retarget the whole hive.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id from cast/swarm_status"},"text":{"type":"string","description":"the guidance/directive for the minds"},"goal":{"type":"string","description":"optional: a new goal to retarget the hive"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"stop_swarm","description":"Stop a running swarm (cooperative; takes effect at its next round). Its files + findings are kept.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"swarm_status","description":"Check a swarm's state: whether it is running or finished, how many minds, and whether it has produced a result yet.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}}
+    \\{"type":"function","function":{"name":"swarm_status","description":"Check a swarm's state: whether it is running or finished, how many minds, and whether it has produced a result yet.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"swarm_asks","description":"List the OPEN questions a running swarm's minds have raised for you (via their ask_veil tool) and not yet been answered. Check this while a swarm runs — a mind may be blocked waiting on a decision only you can make. Each ask has an ask_id, the mind that asked, and the question.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}}
 ;
 const TURN_TOOLS = tools.SCHEMA ++ "," ++ ORCH_TOOLS;
 
@@ -786,6 +789,8 @@ fn orchTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, args);
+    if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
+    if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
     return null;
 }
 
@@ -894,6 +899,120 @@ fn statusTool(app: *App, uid: u64, args: []const u8) []u8 {
         } else |_| {}
     } else |_| {}
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"swarm_status\",\"id\":\"{s}\",\"state\":\"{s}\",\"minds\":{d},\"alive\":{s},\"finished\":{s}}}", .{ sw.id, @tagName(sw.state), sw.minds, if (ps.alive) "true" else "false", if (finished) "true" else "false" }) catch emptyRes();
+}
+
+/// Read the veil's answered-ledger for a swarm ({run_dir}/veil_answered.jsonl — one ask_id per line). gpa-owned
+/// blob or empty. The veil is the ONLY writer (in-process chat turn), so there's no cross-process contention.
+fn readAnswered(app: *App, run_dir: []const u8) []u8 {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/veil_answered.jsonl", .{run_dir}) catch return emptyRes();
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch emptyRes();
+}
+
+/// Is `id` listed (as a whole trimmed line) in a ledger blob?
+fn idInLedger(blob: []const u8, id: []const u8) bool {
+    if (id.len == 0) return false;
+    var it = std.mem.splitScalar(u8, blob, '\n');
+    while (it.next()) |raw| {
+        if (std.mem.eql(u8, std.mem.trim(u8, raw, " \r\t"), id)) return true;
+    }
+    return false;
+}
+
+/// swarm_asks — the OPEN questions a running swarm's minds raised (ask_veil) that the veil hasn't answered yet.
+/// Reads {run_dir}/asks.jsonl (each line {id, mind, q}, a stable random id) and drops any id already in the
+/// answered-ledger. gpa-owned JSON result.
+fn asksTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "swarm_asks: could not parse args JSON");
+    defer p.deinit();
+    if (p.value.id.len == 0) return orchErr(gpa, "swarm_asks: an id is required");
+    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_asks: no such swarm");
+    if (sw.uid != uid) return orchErr(gpa, "swarm_asks: that swarm isn't yours");
+
+    const askpath = std.fmt.allocPrint(gpa, "{s}/asks.jsonl", .{sw.run_dir}) catch return orchErr(gpa, "swarm_asks: out of memory");
+    defer gpa.free(askpath);
+    const asks = std.Io.Dir.cwd().readFileAlloc(app.io, askpath, gpa, .limited(1 << 20)) catch return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"swarm_asks\",\"asks\":[]}") catch emptyRes();
+    defer gpa.free(asks);
+    const answered = readAnswered(app, sw.run_dir);
+    defer if (answered.len > 0) gpa.free(answered);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"ok\":true,\"tool\":\"swarm_asks\",\"asks\":[") catch return emptyRes();
+    var count: usize = 0;
+    const R = struct { id: []const u8 = "", mind: []const u8 = "", q: []const u8 = "" };
+    var it = std.mem.splitScalar(u8, asks, '\n');
+    while (it.next()) |raw| {
+        if (count >= 20) break; // cap the surfaced asks
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        const rp = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer rp.deinit();
+        if (rp.value.id.len == 0 or std.mem.trim(u8, rp.value.q, " \r\n\t").len == 0) continue;
+        if (idInLedger(answered, rp.value.id)) continue;
+        var obj: std.ArrayListUnmanaged(u8) = .empty;
+        defer obj.deinit(gpa);
+        const objs = build: {
+            obj.appendSlice(gpa, "{\"ask_id\":") catch break :build false;
+            http.jstr(gpa, &obj, rp.value.id) catch break :build false;
+            obj.appendSlice(gpa, ",\"mind\":") catch break :build false;
+            http.jstr(gpa, &obj, rp.value.mind) catch break :build false;
+            obj.appendSlice(gpa, ",\"question\":") catch break :build false;
+            http.jstr(gpa, &obj, rp.value.q) catch break :build false;
+            obj.append(gpa, '}') catch break :build false;
+            break :build true;
+        };
+        if (!objs) continue; // couldn't build this object — skip it (never emit a partial)
+        if (count > 0) out.append(gpa, ',') catch break;
+        out.appendSlice(gpa, obj.items) catch break;
+        count += 1;
+    }
+    out.appendSlice(gpa, "]}") catch return emptyRes();
+    return out.toOwnedSlice(gpa) catch emptyRes();
+}
+
+/// answer_swarm — deliver the veil's answer to a mind's open ask: write an `answer` control op (routed to that
+/// mind's inbox by the worker's drainControl) and record the ask_id in the answered-ledger so swarm_asks stops
+/// surfacing it. gpa-owned JSON result.
+fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "", ask_id: []const u8 = "", mind: []const u8 = "", text: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "answer_swarm: could not parse args JSON");
+    defer p.deinit();
+    const a = p.value;
+    if (a.id.len == 0 or a.ask_id.len == 0 or a.mind.len == 0 or std.mem.trim(u8, a.text, " \r\n\t").len == 0)
+        return orchErr(gpa, "answer_swarm: id, ask_id, mind, and text are all required");
+    const sw = app.sup.resolve(a.id) orelse return orchErr(gpa, "answer_swarm: no such swarm");
+    if (sw.uid != uid) return orchErr(gpa, "answer_swarm: that swarm isn't yours");
+
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(gpa);
+    const built = build: {
+        line.appendSlice(gpa, "{\"op\":\"answer\",\"to\":") catch break :build false;
+        http.jstr(gpa, &line, a.mind) catch break :build false;
+        line.appendSlice(gpa, ",\"id\":") catch break :build false;
+        http.jstr(gpa, &line, a.ask_id) catch break :build false;
+        line.appendSlice(gpa, ",\"text\":") catch break :build false;
+        http.jstr(gpa, &line, a.text) catch break :build false;
+        line.appendSlice(gpa, "}\n") catch break :build false;
+        break :build true;
+    };
+    if (!built) return orchErr(gpa, "answer_swarm: out of memory");
+    const ctl = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{sw.run_dir}) catch return orchErr(gpa, "answer_swarm: out of memory");
+    defer gpa.free(ctl);
+    http.appendFile(app.io, gpa, ctl, line.items) catch return orchErr(gpa, "answer_swarm: could not write the control channel");
+    // dedup ledger (best-effort — a failed write just means swarm_asks may re-show this ask)
+    if (std.fmt.allocPrint(gpa, "{s}/veil_answered.jsonl", .{sw.run_dir})) |ap| {
+        defer gpa.free(ap);
+        if (std.fmt.allocPrint(gpa, "{s}\n", .{a.ask_id})) |aline| {
+            defer gpa.free(aline);
+            http.appendFile(app.io, gpa, ap, aline) catch {};
+        } else |_| {}
+    } else |_| {}
+    return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"answer_swarm\",\"note\":\"answer delivered to the mind's inbox; it reads it on its next round\"}") catch emptyRes();
 }
 
 fn runInnerAgentic(
