@@ -412,6 +412,17 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only available when the swarm has a spatial substrate). You cannot see the grid directly — you sense it ONE cell at a time. probe(x,y) reads the cell at column x, row y (both 0-based) and AUTO-RECORDS it to the hive's shared map so every teammate sees it. This is the hive's spatial superpower: divide the grid into regions, each mind probes a DIFFERENT region in parallel, and the shared map fills in far faster than one mind alone. Check the 'Discovered map' you're shown before re-probing a known cell.","parameters":{"type":"object","properties":{"x":{"type":"integer","description":"column, 0-based"},"y":{"type":"integer","description":"row, 0-based"}},"required":["x","y"]}}}
 ;
 
+/// ask_veil — a full-tier-mind tool (in FULL_SCHEMA, NOT the shared SCHEMA the chat veil uses): a mind poses a
+/// question/blocker to the veil overseeing the hive. The call is mirrored to events.jsonl as an "act"
+/// (tool=ask_veil, args={question}); the veil reads pending asks (swarm_asks) and answers them (answer_swarm),
+/// which lands in the mind's inbox next round. The mind proceeds meanwhile — it never blocks.
+pub const ASK_VEIL_TOOL =
+    \\{"type":"function","function":{"name":"ask_veil","description":"Ask the VEIL (the overseer coordinating this hive) a question when you hit a blocker or a decision you can't make alone — an ambiguous requirement, a missing resource, or a choice between approaches. State the question clearly. The answer arrives in your inbox on a later round; proceed with your best assumption meanwhile.","parameters":{"type":"object","properties":{"question":{"type":"string"}},"required":["question"]}}}
+;
+/// The full-tier mind schema = the shared SCHEMA + ask_veil. The chat veil uses SCHEMA alone (it doesn't ask
+/// itself). Joined with ",\n" so ask_veil is its OWN line for the newline-split tool droppers (offlineSchema etc.).
+pub const FULL_SCHEMA = SCHEMA ++ ",\n" ++ ASK_VEIL_TOOL;
+
 /// The SCOUT's tool set — a RESEARCH-ONLY subset of SCHEMA. The build tools (run_python, write_file) are
 /// deliberately ABSENT so the learner mind STRUCTURALLY cannot drift into building: an imperative "do not build"
 /// prompt did not hold (the LLM scout ignored it and wrote files like everyone else), so the engine simply
@@ -482,6 +493,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);
     if (std.mem.eql(u8, name, "patch_system")) return patchSystem(ctx, args_json);
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, args_json);
+    if (std.mem.eql(u8, name, "ask_veil")) return askVeil(ctx, args_json);
     if (std.mem.eql(u8, name, "run_tests")) return runTests(ctx, args_json);
     if (std.mem.eql(u8, name, "delete_file")) return deleteFile(ctx, args_json);
     if (std.mem.eql(u8, name, "host_status")) return hostStatus(ctx, args_json);
@@ -3895,6 +3907,51 @@ fn clip(s: []const u8, n: usize) []const u8 {
 }
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("error");
+}
+
+/// ask_veil — the mind's question to the overseer. It never blocks. The question is appended to
+/// {run_dir}/asks.jsonl with a UNIQUE random id (stable across a resume, unlike the event seq); the veil reads
+/// pending asks via swarm_asks and answers via answer_swarm (the answer lands in this mind's inbox next round).
+fn askVeil(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { question: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "ask_veil: could not parse args");
+    defer p.deinit();
+    const q = std.mem.trim(u8, p.value.question, " \r\n\t");
+    if (q.len == 0) return dupe(gpa, "ask_veil: a question is required");
+
+    var rnd: [6]u8 = undefined;
+    ctx.io.random(&rnd);
+    const id = std.fmt.bytesToHex(rnd, .lower);
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(gpa);
+    const line_ok = build: {
+        line.appendSlice(gpa, "{\"id\":\"") catch break :build false;
+        line.appendSlice(gpa, &id) catch break :build false;
+        line.appendSlice(gpa, "\",\"mind\":") catch break :build false;
+        llm.jstr(gpa, &line, ctx.mind) catch break :build false;
+        const mid = std.fmt.allocPrint(gpa, ",\"round\":{d},\"q\":", .{ctx.round}) catch break :build false;
+        defer gpa.free(mid);
+        line.appendSlice(gpa, mid) catch break :build false;
+        llm.jstr(gpa, &line, q) catch break :build false;
+        line.appendSlice(gpa, "}\n") catch break :build false;
+        break :build true;
+    };
+    if (line_ok) {
+        const path = std.fmt.allocPrint(gpa, "{s}/asks.jsonl", .{ctx.run_dir}) catch "";
+        defer if (path.len > 0) gpa.free(path);
+        if (path.len > 0) {
+            // read-modify-write append (mirrors the .build_manifest write pattern)
+            const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, gpa, .limited(256 << 10)) catch &[_]u8{};
+            defer if (existing.len > 0) gpa.free(existing);
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            defer buf.deinit(gpa);
+            buf.appendSlice(gpa, existing) catch {};
+            buf.appendSlice(gpa, line.items) catch {};
+            std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = buf.items }) catch {};
+        }
+    }
+    return dupe(gpa, "Question sent to the veil (the hive's overseer). Proceed with your best assumption for now — the veil's answer will arrive in your inbox on a later round.");
 }
 
 test "fileOwnedBy/pathKeyMatch: bare probe = whole basename, path probe = exact sibling only" {

@@ -300,7 +300,7 @@ fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_ke
 /// swarm.json (fine, deploy rewrites it) but ALSO mind.sqlite, the minds/ dirs, and .usage; a re-cast should
 /// KEEP the conversation's accumulated hive memory. Never touches work/ or any other user file.
 fn resetCastLifecycle(app: *App, arena: std.mem.Allocator, run_dir: []const u8) void {
-    const drops = [_][]const u8{ "STOP", "DONE", "control.jsonl", "worker.pid" };
+    const drops = [_][]const u8{ "STOP", "DONE", "control.jsonl", "worker.pid", "asks.jsonl", "veil_answered.jsonl" };
     for (drops) |f| {
         const p = std.fmt.allocPrint(arena, "{s}/{s}", .{ run_dir, f }) catch continue;
         std.Io.Dir.cwd().deleteFile(app.io, p) catch {};
