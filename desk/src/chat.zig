@@ -348,6 +348,11 @@ const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task ne
 /// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
 /// hives unattended (the original post-kill runaway). A manual message resets the count.
 const MAX_LOOP_CASTS: u32 = 4;
+/// Autonomous ESCALATION research casts one arc may fire (the stuck→research→cast ladder's top rung). This is a
+/// HARD, loop-INDEPENDENT bound: loop_casts only counts in an auto-loop (loop_iter>0), so a stuck MANUAL chat
+/// would otherwise deploy swarms with no cap. A fresh user message re-earns the budget (resetArcFlags). Each
+/// escalation cast is billable compute, so keep this small — after it, pause and hand back to the user.
+const MAX_ESCALATE_CASTS: u8 = 2;
 /// Consecutive web-lookup tool calls (search/fetch/read_url/…) with no other progress before the STALL GUARD
 /// fires one corrective steer. High enough that genuine multi-source research doesn't trip it, low enough to
 /// break the busy-but-getting-nowhere spiral (the moltbook docs loop: ~15 fetches over unreadable JS pages).
@@ -487,6 +492,20 @@ pub const Chat = struct {
     arc_goal_len: usize = 0,
     loop_repeat_streak: u32 = 0, // consecutive near-identical loop steps — afk stall breaker (afk never stops, so
     console_fail_streak: u32 = 0, //   these ESCALATE a change-of-approach nudge instead of looping a failing step forever)
+    // ESCALATION LADDER (user directive: issue → try-fix → CANNOT fix → research → cast a swarm). arc_stuck is the
+    // shared rung counter every stall signal feeds; it climbs rung 1 (change-approach nudge) → 2 (force recall_hive/
+    // web_search on the ACTUAL error) → 3 (arm a research cast). Cleared only at arc boundaries + on a real success,
+    // so repeated DIFFERENT failures still climb even across a mode's own streak reset.
+    arc_stuck: u8 = 0,
+    tool_fail_streak: u8 = 0, // consecutive same-tool same-arg failures ("ok":false) — the blind spot no other streak caught
+    last_tool_fail: [200]u8 = undefined, // the last failing tool's arg signature (to detect a repeat)
+    last_tool_fail_len: usize = 0,
+    arc_escalate_cast: bool = false, // rung 3 ARMED: fire a research cast at the next idle seam (never inline from a breaker)
+    arc_escalate_casts: u8 = 0, // escalation research casts FIRED this arc — the hard, loop-independent runaway bound
+    arc_escalate_capped: bool = false, // the arc spent its escalation-cast budget; the "pausing" note printed once
+    arc_researched: bool = false, // this arc already did a forced research step (rung 2)
+    force_cast_goal: [512]u8 = undefined, // the composed research-cast goal (arc_goal + failure signature)
+    force_cast_goal_len: usize = 0,
     loop_idle: u8 = 0, // consecutive no-action settles — ONE is tolerated (persistence), two end the loop
     lookup_streak: u32 = 0, // consecutive web-lookup tool calls with no other progress — the STALL signal (a
     //                         busy-but-getting-nowhere spiral: the loop keeps acting, so loop_idle never fires)
@@ -1376,6 +1395,10 @@ pub const Chat = struct {
             // not success, so it must neither mint a lesson nor reinforce the playbook.
             const clean_ok = outcome == .exited and (exit_code orelse 1) == 0;
             if (clean_ok) self.console_fail_streak = 0; // a success breaks any failing-command spiral
+            // NOTE: arc_stuck is NOT decayed on a bare clean exit — only when a PREVIOUSLY-FAILING command now
+            // succeeds (the lessonPair branch below), i.e. the actual blocker cleared. A clean diagnostic probe,
+            // or a successful build step while the real failure persists, is not progress and must not walk the
+            // ladder back down (that residual kept a stuck build from ever reaching the research/cast rungs).
             if (hard_fail) {
                 // afk stall breaker: the SAME command failing over and over (the observed ~20x encoding/quoting
                 // spiral) must force a change of approach, not loop forever. Compare against the prior failing
@@ -1384,11 +1407,6 @@ pub const Chat = struct {
                     self.console_fail_streak += 1
                 else
                     self.console_fail_streak = 1;
-                if (self.console_fail_streak >= 3) {
-                    self.setDirective("This exact command has failed 3+ times in a row — STOP re-running it; repetition will not make it work. Get the result a DIFFERENT way (e.g. a read_file TOOL instead of a shell one-liner, or a different command), or state plainly what is blocked and move on to the next step of the goal.");
-                    self.appendMsg(dd, .cast_note, "(stall guard: the same command failed repeatedly — nudging a change of approach)");
-                    self.console_fail_streak = 0;
-                }
                 const fl = @min(p.cmd_len, self.arc_fail_cmd.len);
                 @memcpy(self.arc_fail_cmd[0..fl], p.cmd[0..fl]);
                 self.arc_fail_cmd_len = fl;
@@ -1398,9 +1416,20 @@ pub const Chat = struct {
                 // the failure's own words (exception line / last error line) ride into the minted lesson —
                 // without them a lesson is only a command, and commands alone are not a failure family
                 self.arc_fail_sig_len = salientFailLine(out_slice, err_slice, &self.arc_fail_sig).len;
+                // ESCALATION LADDER: the SAME command failing 3+ times in a row is a stall — climb the rung
+                // (nudge → force research on the error → cast a swarm) instead of only nudging "change approach"
+                // forever. The freshly-captured salient error line seeds the research + cast so they target the
+                // ACTUAL failure, not the command in the abstract.
+                if (self.console_fail_streak >= 3) {
+                    self.console_fail_streak = 0;
+                    self.escalateStuck(dd, self.arc_fail_sig[0..self.arc_fail_sig_len]);
+                }
             } else if (clean_ok and self.arc_fail_cmd_len > 0 and
                 lessonPair(self.arc_fail_cmd[0..self.arc_fail_cmd_len], p.cmdStr()))
             {
+                // A command that was FAILING now succeeds — the blocker genuinely cleared, so walk the escalation
+                // ladder back down one rung (this, not any clean exit, is what "progress" means to the ladder).
+                if (self.arc_stuck > 0) self.arc_stuck -= 1;
                 var lb2: [1400]u8 = undefined;
                 const fail_note = std.mem.trim(u8, self.arc_fail_note[0..self.arc_fail_note_len], " \r\n\t");
                 // the captured failure signature travels inside the lesson: future recalls that share the
@@ -1923,19 +1952,21 @@ pub const Chat = struct {
             self.fireCast(dd, castSpecFromUser(text, goal));
             return;
         }
-        // KNOWLEDGE-GAP GATE: a fresh, substantive task in builder (speed) mode must GROUND an unfamiliar or
-        // current-world domain BEFORE building it from weights (the observed failure: a specialized BCI sim built
-        // entirely from memory, never researched). Engine-injected as a prominent directive so it does not depend
-        // on the model noticing its own gap — the model still self-gates whether the domain is actually unfamiliar.
-        // (A coverage-number probe of the shared hive would be more precise but recall_hive is a server passthrough,
-        // not a cheap local read — so we force the CONSIDERATION here and let the model's own recall_hive settle it.)
+        // QUESTION-YOUR-KNOWLEDGE POSTURE (user directive): a fresh, substantive task in builder (speed) mode
+        // should treat its training as a STARTING POINT to improve on, not a ceiling. This is broader than the
+        // old gap-based gate ("research only if the domain is unfamiliar") — the user's point was that even a
+        // FAMILIAR task ("build a website") is done BETTER by first checking CURRENT methods/best-practices and
+        // RAG'ing them in, rather than building from memory alone. Still engine-injected as a directive (the weak
+        // model won't reliably question itself) and still scaled to SUBSTANCE — a trivial edit or a plain-general
+        // answer proceeds directly; the model self-gates that. (The reactive ladder above handles getting STUCK;
+        // this is the proactive front of the same instinct: check current methods before, escalate research after.)
         if (fresh and text.len >= 40) {
             const speed_on = blk_sg: {
                 self.store.lock();
                 defer self.store.unlock();
                 break :blk_sg self.store.settings.speed_mode;
             };
-            if (speed_on) self.setDirective("GROUND YOURSELF FIRST: if this task touches specialized, named, current-world, or otherwise uncertain knowledge, your FIRST action MUST be TOOL: recall_hive {\"query\":\"...\"} and, if that comes back thin, TOOL: web_search {\"query\":\"...\"} — BEFORE you write any file or commit to a specialized answer. Do NOT build a specialized or unfamiliar domain from memory alone. If it is squarely within your solid general knowledge, proceed directly.");
+            if (speed_on) self.setDirective("CHECK CURRENT METHODS FIRST — treat your training as a starting point, not the ceiling. For any SUBSTANTIVE task (building something real, or a specialized/named/current-world/uncertain domain), your FIRST action should be TOOL: recall_hive {\"query\":\"...\"} and, if that comes back thin, TOOL: web_search {\"query\":\"...\"} to find the CURRENT best method — then build on what you learn, not from memory alone. Ask yourself: \"I could do this from memory, but would researching current methods make it materially BETTER?\" — if yes, research first. Do NOT research trivia or something squarely within solid general knowledge (a quick edit, a basic answer); scale the research to the task's substance. When in doubt on a real build, check first.");
         }
         self.startTurn(dd, .user);
     }
@@ -2292,9 +2323,14 @@ pub const Chat = struct {
         if (isWebLookupTool(name)) self.lookup_streak += 1 else self.lookup_streak = 0;
         if (self.lookup_streak >= LOOKUP_STALL_LIMIT) {
             self.setDirective("You have run many web lookups in a row without resolving the goal or learning anything genuinely new — this is a STALL, not progress. Do NOT run another search or fetch of the same kind, and do NOT re-read a page you've already read. Instead EITHER (a) take a fundamentally DIFFERENT concrete action that moves the goal forward, OR (b) if finishing this genuinely requires a human, UI, login, email, or verification step you cannot perform through the API, STOP looking now and tell the user plainly what is blocked and the exact steps THEY must take, then move on to other useful work.");
-            self.appendMsg(dd, .cast_note, "(stall guard: many lookups, no progress — nudging the veil to change approach or surface the blocker)");
+            self.appendMsg(dd, .cast_note, "(stall guard: many lookups, no progress — changing approach, and escalating if it stays stuck)");
             self.lookup_streak = 0; // re-arm for the next spiral
-            log.info("chat stall guard: web-lookup streak hit {d} — injected a corrective steer", .{LOOKUP_STALL_LIMIT});
+            // A lookup spiral means research is ALREADY happening and not converging — so jump the ladder past
+            // the research rung straight toward a cast (a swarm can research harder + in parallel than one turn).
+            // The directive above stands (escalateStuck rung 3 only arms the cast, it doesn't clobber a directive).
+            if (self.arc_stuck < 2) self.arc_stuck = 2;
+            self.escalateStuck(dd, "many web lookups in a row without resolving the goal — one turn's research isn't converging");
+            log.info("chat stall guard: web-lookup streak hit {d} — steer + ladder escalation", .{LOOKUP_STALL_LIMIT});
         }
     }
 
@@ -3583,7 +3619,9 @@ pub const Chat = struct {
             // content empty but the model reasoned — show the reasoning AS the reply so it's never blank. NOT
             // observed (appendMsgFull ..., false): gpt-oss commonly answers in the reasoning channel, so observing
             // this would re-open the exact confabulation loop appendVeil closes (parrot → re-observe → amplify).
-            self.appendMsgFull(dd, .veil, reason, false);
+            // dedupSentences collapses the "I am … I am … I am …" flail this raw-reasoning path is most prone to.
+            var ddb: [8192]u8 = undefined;
+            self.appendMsgFull(dd, .veil, dedupSentences(reason, &ddb), false);
         } else {
             self.appendMsgFull(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)", false);
         }
@@ -3683,6 +3721,97 @@ pub const Chat = struct {
             (full.len > 0 and exchangeHasDurableSignal(full));
     }
 
+    // ------------------------------------------------------------------------------ escalation ladder (stuck → research → cast)
+
+    /// The stuck→research→cast escalation ladder (user directive: "issues arise > it tries to fix > cannot fix?
+    /// >> then it should research and use the swarm tool"). arc_stuck is the shared rung counter EVERY stall
+    /// signal feeds — the console-command spiral, a tool failing on the same args, a web-lookup spiral, an afk
+    /// repeat. Each call climbs one rung:
+    ///   rung 1 — nudge a CHANGE OF APPROACH (stop repeating; get the result a different way)
+    ///   rung 2 — FORCE a research step: recall_hive + web_search the ACTUAL error before trying again
+    ///   rung 3 — ARM a research CAST at the next idle seam (a swarm breaks through what one turn can't)
+    /// `sig_in` is the failure's own words (error line / stuck description) so the research + cast target the
+    /// real blocker, not the goal in the abstract. arc_stuck resets at arc boundaries + decays on each success.
+    fn escalateStuck(self: *Chat, dd: []const u8, sig_in: []const u8) void {
+        // Don't climb during the veil's parallel research or while a cast is already live — that IS the top rung.
+        if (self.in_veil_work or self.castPending()) return;
+        const sig = std.mem.trim(u8, sig_in, " \r\n\t");
+        if (self.arc_stuck < 255) self.arc_stuck += 1;
+        if (self.arc_stuck == 1) {
+            self.setDirective("This step has failed repeatedly — STOP repeating it; repetition will not make it work. Get the result a DIFFERENT way (a different tool, command, or approach), or state plainly what is blocked and move to the next step of the goal.");
+            self.appendMsg(dd, .cast_note, "(stuck: nudging a change of approach)");
+        } else if (self.arc_stuck == 2) {
+            self.forceResearch(dd, sig);
+        } else {
+            // rung 3: ARM a research cast — fired at the next idle seam by maybeEscalateCast, NEVER inline from
+            // here (a breaker runs deep in a tool-fold / console-pump path where entering the cast machinery isn't
+            // safe). Bounded per-arc: once the arc has spent its escalation-cast budget, DON'T re-arm or re-promise
+            // — say so once and stand down until the user sends a fresh message (this is the loop-independent
+            // runaway guard; loop_casts alone can't bound a manual arc where loop_iter stays 0).
+            if (self.arc_escalate_casts >= MAX_ESCALATE_CASTS) {
+                if (!self.arc_escalate_capped) {
+                    self.arc_escalate_capped = true;
+                    self.appendMsg(dd, .cast_note, "(still stuck after casting for help — pausing escalation. Say 'continue' to push on, or take over.)");
+                }
+                return;
+            }
+            self.arc_escalate_cast = true;
+            const goal_src = if (self.arc_goal_len > 0) self.arc_goal[0..self.arc_goal_len] else self.last_user[0..self.last_user_len];
+            const gs = goal_src[0..@min(goal_src.len, 300)];
+            var gb: [512]u8 = undefined;
+            const g = if (sig.len > 0)
+                std.fmt.bufPrint(&gb, "Research and solve this blocker, then report the working method: {s} -- the obstacle is: {s}", .{ gs, sig[0..@min(sig.len, 160)] }) catch gs
+            else
+                std.fmt.bufPrint(&gb, "Research a better, working method to accomplish this, then report it: {s}", .{gs}) catch gs;
+            self.force_cast_goal_len = @min(g.len, self.force_cast_goal.len);
+            @memcpy(self.force_cast_goal[0..self.force_cast_goal_len], g[0..self.force_cast_goal_len]);
+            self.appendMsg(dd, .cast_note, "(stuck after research — arming a swarm to break through at the next opening)");
+        }
+    }
+
+    /// Rung 2: the fix attempts aren't working — force a RESEARCH step before any further retry. Mirrors the
+    /// startTurn grounding gate, but SEEDED with the actual failure so the lookups target the blocker, not the
+    /// goal in the abstract. Ephemeral directive (next turn only); arc_researched marks that the research rung
+    /// fired so a later look at posture can tell research already happened.
+    fn forceResearch(self: *Chat, dd: []const u8, sig: []const u8) void {
+        self.arc_researched = true;
+        var db: [900]u8 = undefined;
+        const generic = "You have tried to fix this and it keeps failing — STOP retrying the same fix. Your NEXT action MUST be RESEARCH: TOOL: recall_hive {\"query\":\"...\"} on this problem, then TOOL: web_search {\"query\":\"...\"} for a known-good method — BEFORE you touch it again.";
+        const d = if (sig.len > 0)
+            std.fmt.bufPrint(&db, "You have tried to fix this and it is STILL failing — do NOT retry the same fix. Your NEXT action MUST be RESEARCH: TOOL: recall_hive {{\"query\":\"...\"}} on this exact problem, then TOOL: web_search {{\"query\":\"...\"}} for the error and a known-good method — BEFORE you touch it again. The specific blocker is: {s}", .{sig[0..@min(sig.len, 200)]}) catch generic
+        else
+            generic;
+        self.setDirective(d);
+        self.appendMsg(dd, .cast_note, "(stuck: forcing a research step — recall_hive + web_search the error before retrying)");
+    }
+
+    /// Fire a rung-3 research cast if one is armed and the seam is safe. Called at the top of maybeLoop, so it
+    /// runs whether or not auto-loop is on (a stuck manual arc escalates too). Files-less → veil_join stays off
+    /// (fireCast) → the cast is a research strike that FOLDS BACK, not a punitive isolated-build freeze. Bounded
+    /// by arc_escalate_casts (a HARD, per-arc, LOOP-INDEPENDENT cap — loop_casts stays 0 in a manual arc and so
+    /// can't bound it; escalateStuck also stops re-arming once the budget is spent). Returns true if it fired.
+    fn maybeEscalateCast(self: *Chat, dd: []const u8) bool {
+        if (!self.arc_escalate_cast) return false;
+        // RECOVERED since arming? A rung-3 cast is armed deep in a failing turn, but between arming and this idle
+        // seam the model may have fixed the blocker (arc_stuck decays when the failing command/tool finally
+        // succeeds). Firing then would deploy a pointless swarm — stand down and disarm if we're no longer at the
+        // cast rung (arc_stuck >= 3 is where escalateStuck arms; below it the arc is recovering, not stuck).
+        if (self.arc_stuck < 3) {
+            self.arc_escalate_cast = false;
+            return false;
+        }
+        if (self.castPending()) return false; // a cast is already live — let it finish and fold first (arming kept)
+        self.arc_escalate_cast = false; // consume the arming (escalateStuck re-arms only while budget remains)
+        if (self.arc_escalate_casts >= MAX_ESCALATE_CASTS) return false; // per-arc runaway guard (belt-and-suspenders)
+        const goal = self.force_cast_goal[0..self.force_cast_goal_len];
+        if (goal.len == 0) return false;
+        self.arc_escalate_casts += 1;
+        self.appendMsg(dd, .cast_note, "(escalation: stuck after trying + researching — casting a swarm to break through)");
+        if (self.loop_iter > 0) self.loop_casts += 1; // still counts toward the auto-loop bound when in a loop
+        self.fireCast(dd, .{ .goal = goal });
+        return true;
+    }
+
     // ------------------------------------------------------------------------------ prompt loop (full-auto)
 
     /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
@@ -3691,6 +3820,9 @@ pub const Chat = struct {
         // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending finish (else auto-loop
         // would grab the shared turn slot out from under the veil work / finish).
         if (self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil) return;
+        // A stuck arc's armed research cast fires HERE, at the first safe idle seam — loop on or off (a stuck
+        // manual arc escalates too). It re-enters its own settle when the findings fold back.
+        if (self.maybeEscalateCast(dd)) return;
         const st = blk: {
             self.store.lock();
             defer self.store.unlock();
@@ -3845,6 +3977,9 @@ pub const Chat = struct {
         if (afk and self.loop_repeat_streak >= 3 and self.arc_goal_len > 0) {
             self.loop_repeat_streak = 0;
             self.appendMsg(dd, .cast_note, "(auto-loop-afk: stuck repeating a step — re-grounding to the original goal)");
+            // Also climb the escalation ladder: an afk spiral is a stall like any other, so a sustained one
+            // should force research and eventually a cast, not just re-ground to the goal forever.
+            self.escalateStuck(dd, "repeating the same step in the auto-loop without making progress");
             text = std.fmt.bufPrint(&rgb, "You are stuck repeating a step that is not working. STOP repeating it and take a DIFFERENT concrete action toward the ORIGINAL goal: {s}", .{self.arc_goal[0..self.arc_goal_len]}) catch AFK_DRIVE_MSG;
         }
         if (self.loop_iter >= LOOP_MAX_ITERS) {
@@ -3952,6 +4087,14 @@ pub const Chat = struct {
         self.stream_retried = false;
         self.loop_repeat_streak = 0; // a fresh arc is not part of the previous arc's spiral
         self.console_fail_streak = 0;
+        self.arc_stuck = 0; // the escalation ladder is per-arc — a new/switched/stopped goal starts un-stuck
+        self.tool_fail_streak = 0;
+        self.last_tool_fail_len = 0;
+        self.arc_escalate_cast = false; // a stale armed cast must not fire into an unrelated arc
+        self.arc_escalate_casts = 0; // a fresh arc re-earns its escalation-cast budget
+        self.arc_escalate_capped = false;
+        self.arc_researched = false;
+        self.force_cast_goal_len = 0;
         self.pending_directive_len = 0; // a stale directive must never leak into an unrelated turn's prompt
     }
 
@@ -4026,7 +4169,11 @@ pub const Chat = struct {
         // so only the prose survives (the call itself runs in the tool loop + shows as a chip, or is dropped).
         // Then act on + strip STEER: hive-guidance lines and any durable-memory directives (REMEMBER:/FORGET:)
         // so they take effect but never render as answer text.
-        const text = self.processMemory(dd, self.processSteer(dd, stripToolTail(text_raw)));
+        const text0 = self.processMemory(dd, self.processSteer(dd, stripToolTail(text_raw)));
+        // Collapse an intra-reply "flail" (the same sentence emitted several times in a row) before it renders.
+        // Prose only — tool/steer/memory lines are already stripped above, so nothing structural is at risk.
+        var tdb: [8192]u8 = undefined;
+        const text = dedupSentences(text0, &tdb);
         if (text.len == 0 and reasoning.len == 0) {
             // The whole reply was memory directives (nothing left to render). Don't go silent — confirm the save so
             // the user gets feedback that their key/preference landed (it's in the Memory tab now).
@@ -4059,7 +4206,9 @@ pub const Chat = struct {
         var buf: [4096]u8 = undefined;
         var w: usize = 0;
         const cap = @min(reasoning.len, 4000);
-        var it = std.mem.splitScalar(u8, reasoning[0..cap], '\n');
+        var rdb: [4096]u8 = undefined;
+        const reason_d = dedupSentences(reasoning[0..cap], &rdb); // de-flail the shown reasoning too
+        var it = std.mem.splitScalar(u8, reason_d, '\n');
         while (it.next()) |line| {
             const ln = std.mem.trim(u8, line, " \r\t");
             if (ln.len == 0) continue;
@@ -4196,7 +4345,12 @@ pub const Chat = struct {
         // Concurrent Veil: the veil's parallel attempt JOINS the hive here — both build in this SAME "{conv}"
         // dir (no separate "-veil" copy), so the swarm's own concurrent-edit safety (not a post-hoc AI merge)
         // is what reconciles the two streams of edits. veil_join just gates whether maybeVeilWork fires.
-        const veil_join = CONCURRENT_VEIL and conv.len > 0 and conv.len <= self.cast_conv.len;
+        // GATED ON DECLARED FILES: a files-less RESEARCH cast (the escalation strike, or any "go find out X")
+        // must NOT tie the veil up in an isolated parallel BUILD — there's nothing to build, and the isolated
+        // work + its merge-wait is exactly the punitive freeze that made a 2-minute swarm read as a dead end
+        // (user: "do 2-minute swarms still lock it?"). Only a BUILD cast (declared deliverables) gets the
+        // concurrent veil-build; a research cast just runs, folds its findings back, and the loop resumes.
+        const veil_join = CONCURRENT_VEIL and spec.files.len > 0 and conv.len > 0 and conv.len <= self.cast_conv.len;
         const hive_dir = conv;
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
         // SPEED MODE ceiling: a chat cast is a 2-minute research sub-agent — the observed failure was the
@@ -4659,12 +4813,17 @@ pub const Chat = struct {
 
         var rbuf: [8192]u8 = undefined;
         var result: []const u8 = "(tool error)";
+        var tool_failed = false; // did THIS call fail? drives the same-tool-same-arg escalation ladder below
         if (!bok) {
             result = "(the tool arguments were too long to send)";
+            tool_failed = true;
         } else if (netcli.chatTool(self.io, self.gpa, port, tokb[0..tok_n], w.buffered())) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("chat tool: {s} -> status={d} body={s}", .{ name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
             result = extractToolResult(resp.body, &rbuf);
+            // the server marks a failed tool with "ok":false (a non-200 is a transport/route failure) — either
+            // way this call did not succeed, which the same-tool-same-arg escalation below counts.
+            tool_failed = resp.status != 200 or std.mem.indexOf(u8, resp.body, "\"ok\":false") != null;
             // the server echoes the workdir on EVERY tool response, but only a real BUILD tool means the AI is
             // writing files there — only then adopt it as the build dir + cd the console (a web_search turn must
             // NOT announce a build dir or redirect the console into an empty folder).
@@ -4694,6 +4853,7 @@ pub const Chat = struct {
             }
         } else {
             result = "(no response from the veil server on :8787 — is it running?)";
+            tool_failed = true;
             log.err("chat tool: {s} netcli NULL", .{name});
         }
 
@@ -4716,6 +4876,34 @@ pub const Chat = struct {
         // ring; and track the web-lookup stall so a busy-but-getting-nowhere spiral escalates instead of spinning.
         self.captureOneTimeSecrets(dd, result);
         self.trackLookupStall(dd, name);
+        // TOOL-failure escalation — the blind spot no other stall breaker caught (they watch shell commands and
+        // web lookups, not a build/edit TOOL that keeps failing on the SAME args). Count consecutive same-tool
+        // same-arg failures; the second identical failure onward climbs the stuck ladder (nudge → research →
+        // cast). Web-lookup tools are already driven by trackLookupStall, so they're excluded here.
+        if (!isWebLookupTool(name)) {
+            if (tool_failed) {
+                const nl = std.mem.indexOfScalar(u8, result, '\n') orelse result.len;
+                const one_line = result[0..@min(nl, 140)];
+                var sgb: [200]u8 = undefined;
+                const sig = std.fmt.bufPrint(&sgb, "{s}: {s}", .{ name, one_line }) catch name;
+                if (self.last_tool_fail_len > 0 and nearlySame(sig, self.last_tool_fail[0..self.last_tool_fail_len])) {
+                    if (self.tool_fail_streak < 255) self.tool_fail_streak += 1; // saturate — u8 in a ReleaseSafe build
+                } else self.tool_fail_streak = 1;
+                self.last_tool_fail_len = @min(sig.len, self.last_tool_fail.len);
+                @memcpy(self.last_tool_fail[0..self.last_tool_fail_len], sig[0..self.last_tool_fail_len]);
+                if (self.tool_fail_streak >= 2) self.escalateStuck(dd, sig);
+            } else if (self.tool_fail_streak > 0 and self.last_tool_fail_len > name.len and
+                std.mem.startsWith(u8, self.last_tool_fail[0..self.last_tool_fail_len], name) and
+                self.last_tool_fail[name.len] == ':')
+            {
+                // The blocker clears (and the ladder decays) ONLY when the tool that was FAILING finally succeeds
+                // — NOT when any other mutation lands. In the canonical edit → test → fail loop the successful
+                // edit_file is not the failing action, so it must not cancel the accumulated stuck-pressure; that
+                // residual was what kept a genuinely stuck build from ever climbing to the research/cast rungs.
+                self.tool_fail_streak = 0;
+                if (self.arc_stuck > 0) self.arc_stuck -= 1;
+            }
+        }
         // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
         // model sees it as user content; it's also the user-visible record that the tool ran).
         var fb: [8320]u8 = undefined;
@@ -7352,6 +7540,51 @@ fn nearlySame(a_in: []const u8, b_in: []const u8) bool {
     return std.mem.indexOf(u8, sa, sb) != null or std.mem.indexOf(u8, sb, sa) != null;
 }
 
+/// Collapse a tightly-repeated sentence WITHIN one reply. A weak model under stress "flails" — re-emitting the
+/// same sentence ("I am going to check the file." … "I am going to check the file.") several times in a row (the
+/// observed "reasoning bounces back and forth with 'I am'"). Splits `in` on sentence terminators (. ! ? \n) and
+/// drops a substantial (>=8-char) fragment ONLY when it near-duplicates the fragment IMMEDIATELY before it — a
+/// window of one, deliberately, so a decimal / version / abbreviation split ("98." then "6.", "Fig." then "1.")
+/// or two matching sentences that are not adjacent are NEVER fused into wrong output. Skips any reply carrying a
+/// code fence outright (identical adjacent code lines are legitimate). Returns `in` unchanged when nothing was
+/// dropped or it won't fit `out`, so it is safe to wrap any display-time text. Prose only: never pass text that
+/// still carries a TOOL:/RUN:/CAST: line — every call site here runs after those are parsed/stripped.
+fn dedupSentences(in: []const u8, out: []u8) []const u8 {
+    if (in.len == 0 or in.len > out.len) return in;
+    if (std.mem.indexOf(u8, in, "```") != null) return in; // never reshape a reply that carries code
+    var last_off: usize = 0; // the last EMITTED fragment's (offset,len) in `out` — the only thing we compare to
+    var last_len: usize = 0;
+    var have_last = false;
+    var w: usize = 0;
+    var dropped = false;
+    var i: usize = 0;
+    while (i < in.len) {
+        const s = i;
+        while (i < in.len and in[i] != '.' and in[i] != '!' and in[i] != '?' and in[i] != '\n') i += 1;
+        while (i < in.len and (in[i] == '.' or in[i] == '!' or in[i] == '?' or in[i] == '\n')) i += 1;
+        const frag = in[s..i];
+        const core = std.mem.trim(u8, frag, " \r\n\t");
+        if (core.len >= 8 and have_last) { // short fragments ("OK.", "6.") never dedup — they may repeat fine
+            const prev = std.mem.trim(u8, out[last_off..][0..last_len], " \r\n\t");
+            // near-EQUAL length as well as near-match: the length band stops a short sentence being dropped as a
+            // "duplicate" of a longer one it merely prefixes ("Let me check." vs "Let me check the config file.").
+            const lo = @min(prev.len, core.len);
+            const hi = @max(prev.len, core.len);
+            if (hi > 0 and lo * 4 >= hi * 3 and nearlySame(prev, core)) {
+                dropped = true;
+                continue; // drop it; the last-kept anchor stays, so a whole run collapses to one
+            }
+        }
+        @memcpy(out[w..][0..frag.len], frag);
+        last_off = w;
+        last_len = frag.len;
+        have_last = true;
+        w += frag.len;
+    }
+    if (!dropped) return in;
+    return std.mem.trim(u8, out[0..w], " \r\n\t");
+}
+
 pub fn userWantsKill(msg: []const u8) bool {
     if (msg.len == 0 or msg.len > 4000) return false;
     var lower: [4000]u8 = undefined;
@@ -9805,6 +10038,148 @@ test "contentOverlap: near-duplicates true, distinct or thin entries false" {
         "fix: curl progress output goes to stderr, use -sS for clean captures",
     ));
     try std.testing.expect(!contentOverlap("a b c", "a b c")); // no substantial tokens at all
+}
+
+test "dedupSentences collapses a repeated flail but keeps distinct + prefix-longer sentences" {
+    var buf: [1024]u8 = undefined;
+    // the exact "I am ..." flail this targets: the same sentence three times -> one survives
+    const flail = "I am going to check the models file. I am going to check the models file. I am going to check the models file.";
+    const out = dedupSentences(flail, &buf);
+    try std.testing.expect(std.mem.count(u8, out, "I am going to check the models file") == 1);
+
+    // wholly distinct sentences are all preserved (nothing dropped -> returns the input unchanged)
+    const distinct = "First I read the config. Then I patch the handler. Finally I run the tests.";
+    try std.testing.expectEqualStrings(distinct, dedupSentences(distinct, &buf));
+
+    // a longer DISTINCT sentence that a shorter one merely prefixes must NOT be swallowed (the 75% length guard)
+    const prefixy = "Let me check. Let me check the config file for the missing key.";
+    try std.testing.expect(std.mem.indexOf(u8, dedupSentences(prefixy, &buf), "config file for the missing key") != null);
+
+    // short fragments (<8 chars) are never deduped even when repeated
+    try std.testing.expectEqualStrings("OK. OK. OK.", dedupSentences("OK. OK. OK.", &buf));
+
+    // decimals / abbreviations split on '.' but the two clauses are NOT adjacent duplicates -> nothing fused
+    try std.testing.expectEqualStrings("Temperature is 98.6. Temperature is 98.7.", dedupSentences("Temperature is 98.6. Temperature is 98.7.", &buf));
+    try std.testing.expectEqualStrings("See Fig. 1 for details. See Fig. 2 for details.", dedupSentences("See Fig. 1 for details. See Fig. 2 for details.", &buf));
+
+    // a reply carrying a code fence is left completely untouched (identical adjacent code lines are legitimate)
+    const fenced = "Here:\n```\nprint(\"hello\")\nprint(\"hello\")\n```\ndone.";
+    try std.testing.expectEqualStrings(fenced, dedupSentences(fenced, &buf));
+
+    // empty in -> empty out; and an out too small to hold the input returns the input unchanged (no partial write)
+    try std.testing.expectEqualStrings("", dedupSentences("", &buf));
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings(flail, dedupSentences(flail, &tiny));
+}
+
+test "escalateStuck climbs nudge -> research -> arm-cast; a live cast freezes it; resetArcFlags clears it" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-ladder-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd); // establish an active conversation so appendMsg has somewhere to land
+    const goal = "build a REST API in rust";
+    chat.arc_goal_len = goal.len;
+    @memcpy(chat.arc_goal[0..goal.len], goal);
+
+    // rung 1: a change-approach nudge is queued; nothing armed yet
+    chat.escalateStuck(dd, "error: connection refused");
+    try std.testing.expectEqual(@as(u8, 1), chat.arc_stuck);
+    try std.testing.expect(chat.pending_directive_len > 0);
+    try std.testing.expect(!chat.arc_escalate_cast);
+
+    // rung 2: a research step is forced
+    chat.escalateStuck(dd, "error: connection refused");
+    try std.testing.expectEqual(@as(u8, 2), chat.arc_stuck);
+    try std.testing.expect(chat.arc_researched);
+    try std.testing.expect(!chat.arc_escalate_cast);
+
+    // rung 3: a research cast is ARMED, its goal seeded from the arc goal + the failure signature
+    chat.escalateStuck(dd, "error: connection refused");
+    try std.testing.expectEqual(@as(u8, 3), chat.arc_stuck);
+    try std.testing.expect(chat.arc_escalate_cast);
+    try std.testing.expect(std.mem.indexOf(u8, chat.force_cast_goal[0..chat.force_cast_goal_len], "REST API") != null);
+
+    // a cast already in flight must FREEZE the ladder (no further climb)
+    chat.cast_active = true;
+    chat.escalateStuck(dd, "error: connection refused");
+    try std.testing.expectEqual(@as(u8, 3), chat.arc_stuck);
+    chat.cast_active = false;
+
+    // budget spent: rung 3 refuses to re-arm and latches the "paused" note (the loop-independent runaway guard)
+    chat.arc_escalate_cast = false;
+    chat.arc_escalate_casts = MAX_ESCALATE_CASTS;
+    chat.escalateStuck(dd, "error: connection refused"); // arc_stuck 3 -> 4, else branch, budget check
+    try std.testing.expect(!chat.arc_escalate_cast); // NOT re-armed past the budget
+    try std.testing.expect(chat.arc_escalate_capped);
+
+    // a fresh arc wipes the whole ladder
+    chat.resetArcFlags();
+    try std.testing.expectEqual(@as(u8, 0), chat.arc_stuck);
+    try std.testing.expect(!chat.arc_escalate_cast);
+    try std.testing.expect(!chat.arc_researched);
+    try std.testing.expectEqual(@as(u8, 0), chat.arc_escalate_casts);
+    try std.testing.expect(!chat.arc_escalate_capped);
+    try std.testing.expectEqual(@as(usize, 0), chat.force_cast_goal_len);
+}
+
+test "maybeEscalateCast is a no-op unless armed, and never fires past the per-arc escalation bound" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-ladder-cast-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+
+    // not armed -> no-op
+    try std.testing.expect(!chat.maybeEscalateCast(dd));
+
+    const g = "research the blocker";
+    chat.force_cast_goal_len = g.len;
+    @memcpy(chat.force_cast_goal[0..g.len], g);
+
+    // armed but RECOVERED since arming (arc_stuck fell below the cast rung) -> disarms, never fires a stale swarm
+    chat.arc_escalate_cast = true;
+    chat.arc_stuck = 1;
+    try std.testing.expect(!chat.maybeEscalateCast(dd));
+    try std.testing.expect(!chat.arc_escalate_cast);
+
+    // armed + still stuck but the arc already spent its escalation-cast budget -> consumes the arming, refuses to
+    // fire (no network). LOOP-INDEPENDENT bound: loop_casts stays 0 in a manual arc, so it can't be the guard.
+    chat.arc_escalate_cast = true;
+    chat.arc_stuck = 3;
+    chat.loop_casts = 0; // deliberately NOT at the loop bound — proves the guard is arc_escalate_casts, not loop_casts
+    chat.arc_escalate_casts = MAX_ESCALATE_CASTS;
+    try std.testing.expect(!chat.maybeEscalateCast(dd));
+    try std.testing.expect(!chat.arc_escalate_cast); // one-shot: the arming was consumed even though it didn't fire
+
+    // armed + still stuck + budget available but a cast is already pending -> refuses, KEEPS the arming
+    chat.arc_escalate_cast = true;
+    chat.arc_stuck = 3;
+    chat.arc_escalate_casts = 0;
+    chat.cast_active = true;
+    try std.testing.expect(!chat.maybeEscalateCast(dd));
+    try std.testing.expect(chat.arc_escalate_cast); // NOT consumed — it must still fire once the cast clears
+    chat.cast_active = false;
 }
 
 test "needsBatchPercentHint fires only on single-% for-loop variables" {
