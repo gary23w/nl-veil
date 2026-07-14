@@ -29,6 +29,27 @@ pub var calls_made: std.atomic.Value(u64) = .init(0);
 /// a run whose cached share is ~0 is paying full price for re-sending the same doctrine every call.
 pub var tokens_cached: std.atomic.Value(u64) = .init(0);
 
+pub const TokUsage = struct { in: u64, out: u64 };
+
+/// Per-THREAD token totals (paid + free summed). Each chat turn runs on its OWN detached thread (spawnTurn), so a
+/// thread-local total read as a delta across the turn is exactly THAT turn's usage — correct even when several
+/// conversations' turns run concurrently in the gateway (the process-global atomics above would cross-count them).
+/// The swarm reports cost from the global atomics in its own worker process and never touches these.
+threadlocal var tl_tokens_in: u64 = 0;
+threadlocal var tl_tokens_out: u64 = 0;
+
+/// Add one call's tokens to the calling thread's running total (called at each usage-fold site, beside the atomics).
+fn meterTL(in: u64, out: u64) void {
+    tl_tokens_in += in;
+    tl_tokens_out += out;
+}
+
+/// Snapshot the CALLING THREAD's token totals. A chat turn reads it before + after its work and reports the delta
+/// as that turn's usage. Thread-local, so concurrent turns on other threads don't inflate the number.
+pub fn tokensSnapshot() TokUsage {
+    return .{ .in = tl_tokens_in, .out = tl_tokens_out };
+}
+
 pub const Caps = struct {
     probed: bool = false,
     ollama_native: bool = false,
@@ -310,6 +331,7 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
             _ = tokens_in.fetchAdd(parsed.value.prompt_eval_count orelse 0, .monotonic);
             _ = tokens_out.fetchAdd(ec, .monotonic);
         }
+        meterTL(parsed.value.prompt_eval_count orelse 0, ec);
         _ = calls_made.fetchAdd(1, .monotonic);
     }
     if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
@@ -722,6 +744,7 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
             _ = tokens_out.fetchAdd(u.completion_tokens, .monotonic);
             if (u.prompt_tokens_details) |d| _ = tokens_cached.fetchAdd(d.cached_tokens, .monotonic);
         }
+        meterTL(u.prompt_tokens, u.completion_tokens);
         _ = calls_made.fetchAdd(1, .monotonic);
     }
     if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
@@ -981,6 +1004,7 @@ fn meterStream(st: *const StreamState, local: bool) void {
         _ = tokens_out.fetchAdd(st.p_out, .monotonic);
         _ = tokens_cached.fetchAdd(st.p_cached, .monotonic);
     }
+    meterTL(st.p_in, st.p_out);
     _ = calls_made.fetchAdd(1, .monotonic);
 }
 

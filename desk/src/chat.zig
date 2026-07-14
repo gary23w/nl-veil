@@ -710,13 +710,14 @@ pub const Chat = struct {
             const dd = self.dataDir(&db);
             self.drainCommands(dd);
             self.pumpStream(dd);
+            self.pumpServerChat(dd); // EVERY tick (10Hz), matching the local pumpStream — a SERVER turn's streamed
+            //                          frames type out smoothly instead of the old ~1Hz burst. No-op unless sc_active.
             self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
             // ~1Hz auto-loop backstop: a .loop_kick that lands the instant a turn is finishing hits maybeLoop's
             // `turn != .idle` guard and is lost — the settle-point call can't recover it if the turn had already
             // settled. Re-checking every idle tick self-heals that gap (maybeLoop no-ops unless loop is on AND the
             // chat is genuinely idle with something to continue from, so this can't run away or double-fire).
             if (tick % 10 == 5) self.maybeLoop(dd);
-            if (tick % 10 == 2) self.pumpServerChat(dd); // ~1Hz: render a SERVER-side turn's frames (no-op unless sc_active)
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
             if (tick % 10 == 3) self.maybeFinishAfterVeil(dd); // concurrent veil: compose the answer once cast + veil are both done
@@ -1382,6 +1383,18 @@ pub const Chat = struct {
                 var buf: [160]u8 = undefined;
                 const t = scUnescape(raw, &buf);
                 if (t.len > 0) self.setStatus(t);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "usage")) {
+            // the turn's token usage — a subtle transcript note (persists; a status would be cleared by {done} next)
+            if (scRawField(line, "text")) |raw| {
+                var buf: [128]u8 = undefined;
+                const t = scUnescape(raw, &buf);
+                if (t.len > 0) {
+                    var nb: [160]u8 = undefined;
+                    self.appendMsg(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t);
+                }
             }
             return;
         }
