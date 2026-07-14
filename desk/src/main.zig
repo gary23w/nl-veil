@@ -2608,6 +2608,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // in-flight turn + halts auto-loop, so the user can always take back control.
     if (busy or loop_on) {
         if (t.buttonSolid(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+        // POST-TO-STEER: while a SERVER turn is running, Enter sends the typed text as a LIVE steer — the server turn
+        // reads it between steps and folds it in. Gated on chat_server_turn so a local-loop turn doesn't clear +
+        // discard the user's text (there's no local steer sink); the Stop button still aborts either way.
+        if (store.chat_server_turn) {
+            const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+            const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
+            if (ui.c_input.len > 0 and ui.focus == .c_input and enter) {
+                store.pushChatCmd(store_mod.mkChatCmd(.steer_turn, "", ui.c_input.str()));
+                ui.c_input.clear();
+                ui.chat_follow = true;
+            }
+        }
     } else {
         const can_send = ui.c_input.len > 0;
         const clicked = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, can_send);

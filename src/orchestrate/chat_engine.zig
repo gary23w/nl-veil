@@ -325,12 +325,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
 
     const max_steps = if (has_plan) PLAN_STEPS_PER_TURN else DRIVE_MAX;
+    var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
-        // COOPERATIVE STOP (between drive steps): a `"op":"stop"` written to control.jsonl after the turn began.
-        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
-            emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
-            return;
+        // CONTROL (between drive steps): a `stop` op ends the turn; a `steer`/`say` op injects the user's text as a
+        // mid-turn user message (posting to steer a running turn) so the next inference picks it up.
+        switch (drainChatControl(app, conv_dir, &steer_cursor, &conv_buf)) {
+            .stop => {
+                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                return;
+            },
+            .none => {},
         }
 
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
@@ -1134,6 +1139,11 @@ fn runInnerAgentic(
 
         // ... then run each call, narrate + observe its result, and append its result turn.
         for (step.calls) |c| {
+            // COOPERATIVE STOP (between tool calls): a single inference can request many tools (66 web_searches in
+            // one live run), each taking seconds — checking stop only per-inference let a Stop wait minutes. Check
+            // before EACH tool so a Stop lands promptly; abort with the narration so far.
+            if (stopRequestedSince(app, conv_dir, ctrl_cursor))
+                return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty };
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
             // via deploy_service + app.sup, NOT the mind-tool executor. Everything else falls through to tools.execute.
@@ -1248,6 +1258,41 @@ fn stopRequestedSince(app: *App, conv_dir: []const u8, cursor: usize) bool {
     defer gpa.free(data);
     if (data.len <= cursor) return false;
     return std.mem.indexOf(u8, data[cursor..], "\"op\":\"stop\"") != null;
+}
+
+const CtlResult = enum { none, stop };
+
+/// Drain the conv's control.jsonl from *cursor (between drive steps): a `stop` op ENDS the turn; a `steer`/`say`
+/// op INJECTS the user's text as a mid-turn user message so the next inference incorporates it — this is the user
+/// "posting to steer" a running turn without stopping it. Advances *cursor past everything read.
+fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, conv_buf: *std.ArrayListUnmanaged(u8)) CtlResult {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return .none;
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return .none;
+    defer gpa.free(data);
+    if (data.len <= cursor.*) return .none;
+    var it = std.mem.splitScalar(u8, data[cursor.*..], '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        const C = struct { op: []const u8 = "", text: []const u8 = "" };
+        const p = std.json.parseFromSlice(C, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (std.mem.eql(u8, p.value.op, "stop")) {
+            cursor.* = data.len;
+            return .stop;
+        }
+        if ((std.mem.eql(u8, p.value.op, "steer") or std.mem.eql(u8, p.value.op, "say")) and std.mem.trim(u8, p.value.text, " \r\n\t").len > 0) {
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch continue;
+            http.jstr(gpa, conv_buf, p.value.text) catch {};
+            conv_buf.append(gpa, '}') catch {};
+            var sb: [200]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "steering: {s}", .{clipBytes(p.value.text, 120)}) catch "steering");
+        }
+    }
+    cursor.* = data.len;
+    return .none;
 }
 
 /// The drive is DONE when the inference's next-step text is exactly a terminal token (desk loopIsDone): trim the
