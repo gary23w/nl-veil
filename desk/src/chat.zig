@@ -1265,8 +1265,16 @@ pub const Chat = struct {
         if (std.mem.eql(u8, kind, "tool")) {
             const tool = scRawField(line, "tool") orelse "";
             const state = scRawField(line, "state") orelse "";
-            var nb: [140]u8 = undefined;
-            const note = std.fmt.bufPrint(&nb, "[tool:{s}] {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)] }) catch "[tool]";
+            var pvb: [260]u8 = undefined;
+            const preview: []const u8 = if (std.mem.eql(u8, state, "done"))
+                (if (scRawField(line, "preview")) |raw| scUnescape(raw, &pvb) else "")
+            else
+                "";
+            var nb: [440]u8 = undefined;
+            const note = if (preview.len > 0)
+                std.fmt.bufPrint(&nb, "[tool:{s}] {s} — {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)], preview[0..@min(preview.len, 220)] }) catch "[tool]"
+            else
+                std.fmt.bufPrint(&nb, "[tool:{s}] {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)] }) catch "[tool]";
             self.appendMsg(dd, .cast_note, note);
             return;
         }
@@ -1278,13 +1286,33 @@ pub const Chat = struct {
             self.appendMsg(dd, .veil, note);
             return;
         }
+        if (std.mem.eql(u8, kind, "reasoning")) {
+            // the model's thinking — render it as a collapsed .thought chip, same as the local engine shows
+            // reasoning (so "no reasoning back to the user" is fixed). One frame per reasoning block today; when
+            // token streaming lands these arrive as deltas and append into one live chip.
+            if (scRawField(line, "delta")) |raw| {
+                var buf: [store_mod.STREAM_CAP]u8 = undefined;
+                const d = scUnescape(raw, &buf);
+                if (d.len > 0) self.appendMsg(dd, .thought, d);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "status")) {
+            // a short progress line ("continuing: ...", "reflected") — surface it as the status, not a transcript row
+            if (scRawField(line, "text")) |raw| {
+                var buf: [160]u8 = undefined;
+                const t = scUnescape(raw, &buf);
+                if (t.len > 0) self.setStatus(t);
+            }
+            return;
+        }
         if (std.mem.eql(u8, kind, "done")) {
             self.sc_active = false;
             self.setBusy(false);
             self.setStatus("");
             return;
         }
-        // "reasoning" (and any other kind): not rendered into the transcript in this first cut.
+        // any other kind: not rendered.
     }
 
     /// End a server-chat exchange, optionally leaving a one-line notice (unreachable / poll failure). An empty
@@ -8038,7 +8066,11 @@ fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const
 /// enough for the server chat event frames (flat objects, string values). A non-string value returns null.
 fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [40]u8 = undefined;
-    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    // Match the KEY + its colon (`"tool":`), not the bare word (`"tool"`) — otherwise a value that equals the key
+    // name matches first: searching `"tool"` in {"kind":"tool","tool":"run_python"} hits the "tool" VALUE of kind
+    // before the real "tool": key, yielding an empty field ([tool:] done). The server writes compact JSON, so the
+    // colon sits immediately after the key. (Note the [40]u8 pat cap allows key+`":` up to 37 chars — ample.)
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{key}) catch return null;
     const kidx = std.mem.indexOf(u8, s, pat) orelse return null;
     var i = kidx + pat.len;
     while (i < s.len and (s[i] == ' ' or s[i] == ':' or s[i] == '\t')) : (i += 1) {}
@@ -10480,6 +10512,19 @@ test "maybeEscalateCast is a no-op unless armed, and never fires past the per-ar
     try std.testing.expect(!chat.maybeEscalateCast(dd));
     try std.testing.expect(chat.arc_escalate_cast); // NOT consumed — it must still fire once the cast clears
     chat.cast_active = false;
+}
+
+test "scRawField matches the KEY, not a same-named VALUE (the [tool:] blank-name bug)" {
+    // {"kind":"tool",...} — searching bare "tool" hit the "tool" VALUE of kind first, yielding an empty name.
+    const frame = "{\"kind\":\"tool\",\"tool\":\"run_python\",\"state\":\"done\",\"preview\":\"exit=0\"}";
+    try std.testing.expectEqualStrings("tool", scRawField(frame, "kind").?);
+    try std.testing.expectEqualStrings("run_python", scRawField(frame, "tool").?); // was "" before the fix
+    try std.testing.expectEqualStrings("done", scRawField(frame, "state").?);
+    try std.testing.expectEqualStrings("exit=0", scRawField(frame, "preview").?);
+    const msg = "{\"kind\":\"message\",\"role\":\"assistant\",\"content\":\"hi there\"}";
+    try std.testing.expectEqualStrings("assistant", scRawField(msg, "role").?);
+    try std.testing.expectEqualStrings("hi there", scRawField(msg, "content").?);
+    try std.testing.expect(scRawField(msg, "tool") == null); // absent field → null
 }
 
 test "needsBatchPercentHint fires only on single-% for-loop variables" {
