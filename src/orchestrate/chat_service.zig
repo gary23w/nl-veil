@@ -20,6 +20,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
+const chat_engine = @import("chat_engine.zig");
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -166,6 +167,78 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{data.len}));
     res.content_type = .EVENTS;
     res.body = slice;
+}
+
+/// POST /api/v1/chat/convs/:id/messages — run ONE server-side agentic turn for this conversation. GATED: this
+/// whole write surface is inert until VEIL_CHAT_BACKEND=1, so with the flag unset the running app is unchanged.
+/// The turn runs SYNCHRONOUSLY (it blocks this httpz worker thread, exactly as a cast/deploy does); progress is
+/// written to the conv's messages.jsonl + events.jsonl, which the P0-4 read routes (getConv / convEvents) serve.
+pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    // FLAG GATE FIRST — before auth, parsing, anything. Off (unset or != "1") ⇒ 501, zero side effects.
+    const enabled = if (app.sup.parent_env) |env| blk: {
+        const v = env.get("VEIL_CHAT_BACKEND") orelse break :blk false;
+        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \r\n\t"), "1");
+    } else false;
+    if (!enabled) {
+        res.status = 501;
+        return res.json(.{ .ok = false, .err = "chat backend disabled" }, .{});
+    }
+
+    const u = requireUser(app, req, res) orelse return;
+    // ADMIN-ONLY for now. runTurn hands the model the FULL tool surface (incl. code-exec / host / engine
+    // self-mod), and tools.execute does not gate by role — so until per-role SAFE-only tool access lands (strip
+    // admin tools from the schema + gate execution, mirroring chat_tools' SAFE/ADMIN split), restrict the whole
+    // turn to admins. This matches local-first: the desktop is admin on localhost, the intended user.
+    if (!app.auth.isAdmin(u)) {
+        res.status = 403;
+        return res.json(.{ .ok = false, .err = "the server chat backend is admin-only for now" }, .{});
+    }
+    const id = req.param("id") orelse return badReq(res, "no id");
+    const seg = safeSeg(id);
+    if (seg.len == 0) return notFound(res);
+
+    const Body = struct {
+        text: []const u8 = "",
+        base_url: []const u8 = "",
+        model: []const u8 = "",
+        api_key: []const u8 = "",
+    };
+    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    const text = std.mem.trim(u8, b.text, " \r\n\t");
+    if (text.len == 0) return badReq(res, "text is required");
+
+    chat_engine.runTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text);
+
+    const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
+    try res.json(.{ .ok = true, .conv = seg, .turn = "done", .events_url = events_url }, .{});
+}
+
+/// POST /api/v1/chat/convs/:id/control — append a cooperative control op (e.g. {"op":"stop"}) to the conv's
+/// control.jsonl. The synchronous turn does not consult it yet; this is the durable seam a future async/streamed
+/// turn reads to stop between tool calls. Structural ownership: the path is under the caller's own uid prefix.
+pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const id = req.param("id") orelse return badReq(res, "no id");
+    const seg = safeSeg(id);
+    if (seg.len == 0) return notFound(res);
+
+    const Body = struct { op: []const u8 = "" };
+    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    const op = std.mem.trim(u8, b.op, " \r\n\t");
+    if (op.len == 0) return badReq(res, "op is required");
+
+    const dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg });
+    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch {};
+    const path = try std.fmt.allocPrint(res.arena, "{s}/control.jsonl", .{dir});
+
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(app.gpa);
+    try line.appendSlice(app.gpa, "{\"op\":");
+    try http.jstr(app.gpa, &line, op);
+    try line.appendSlice(app.gpa, "}\n");
+    http.appendFile(app.io, app.gpa, path, line.items) catch {};
+
+    try res.json(.{ .ok = true }, .{});
 }
 
 // ----- tiny JSON field readers (flat, escape-naive — enough for the list preview) ------------
