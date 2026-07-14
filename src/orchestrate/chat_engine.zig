@@ -38,6 +38,16 @@ const LOOP_QUESTION =
     "What is the single next concrete step toward the goal? Reply with ONLY that next instruction, or reply " ++
     "exactly DONE if the goal is fully achieved.";
 
+/// REFLECT (desk REFLECT_PASSES): one self-critique/improve pass on a substantial first answer before it's
+/// committed — the model reviews its own reply against the question and returns the final (improved-or-unchanged)
+/// text. Gated to the FIRST drive step only (one reflect per turn) and to answers >= REFLECT_MIN bytes, so a
+/// terse reply or a multi-step build's intermediate narration doesn't spend an extra full completion.
+const REFLECT_MIN: usize = 240;
+const REFLECT_PROMPT =
+    "Critically review the answer you just gave for correctness, completeness, and clarity against the user's " ++
+    "request. If it can be materially improved, reply with ONLY the improved answer. If it is already good, reply " ++
+    "with it unchanged. Do not add commentary about the review itself.";
+
 /// Serializes edit_file's micro-VCS commits (vcs.zig) across concurrent chat turns IN THIS gateway process —
 /// the exact role chat_tools.chat_vcs_mtx plays for /api/v1/chat/tool. A live hive cast building in the same
 /// conversation dir is a SEPARATE process with its own such lock; both sides still rebase onto the HEAD they
@@ -258,7 +268,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
-        const answer = inner.content;
+        // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
+        var answer = inner.content;
+        if (drive == 0 and answer.len >= REFLECT_MIN) {
+            if (reflectAnswer(app, run_root, base_url, key, model, user_text, answer)) |improved| {
+                gpa.free(answer);
+                answer = improved;
+                emitKV(app, conv_dir, "status", "text", "reflected");
+            }
+        }
         defer gpa.free(answer);
         appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
         emitAssistant(app, conv_dir, answer);
@@ -396,6 +414,30 @@ fn runInnerAgentic(
     // ran out of tool iterations mid-loop: hand the last narration (or a placeholder) back as the settled answer.
     const fallback: []const u8 = if (last_content.len > 0) last_content else "(reached the step limit for this turn)";
     return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty };
+}
+
+/// One REFLECT pass: hand the model its own answer + the original question and ask for the final (improved-or-
+/// unchanged) text. Fresh minimal context (system + user + assistant + critique), no tools. Returns a gpa-owned
+/// improved answer, or null to keep the original (a failed / empty / too-short reply means "leave it alone").
+fn reflectAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, SYSTEM_PROMPT) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, user_text) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"assistant\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, answer) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, REFLECT_PROMPT) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "reflect", base_url, key, model, msgs.items, "", 4096, 0.5);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    if (t.len < REFLECT_MIN) return null; // too short to be a genuine improved answer → keep the original
+    return gpa.dupe(u8, t) catch null;
 }
 
 /// Observe a SHORT durable note of a successful tool result into the conversation's neuron-db: `tool <name>: <=200b`.
