@@ -22,9 +22,21 @@ const llm = @import("../worker/llm.zig");
 
 const App = http.App;
 
-/// Hard ceiling on tool-calling round-trips per turn — the same bound the worker's round loop keeps, so a
-/// model that loops on tools can never wedge the httpz worker thread indefinitely.
+/// Hard ceiling on tool-calling round-trips per ONE settled answer — the same bound the worker's round loop
+/// keeps, so a model that loops on tools can never wedge the httpz worker thread indefinitely.
 const MAX_ITERS: usize = 12;
+
+/// Hard ceiling on AUTO-LOOP drive steps in one turn — after each settled answer the engine infers the next
+/// step and drives again, up to this many times (desk's LOOP_MAX_ITERS). A plain Q&A stops after one step
+/// because the drive inference returns DONE for an achieved goal; this bound only caps a genuine multi-step build.
+const DRIVE_MAX: usize = 30;
+
+/// The single question the drive inference answers between settled steps: it either names the next concrete
+/// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
+/// swapping the system prompt (a server-turn simplification of desk's dedicated LOOP_SYSTEM driver turn).
+const LOOP_QUESTION =
+    "What is the single next concrete step toward the goal? Reply with ONLY that next instruction, or reply " ++
+    "exactly DONE if the goal is fully achieved.";
 
 /// Serializes edit_file's micro-VCS commits (vcs.zig) across concurrent chat turns IN THIS gateway process —
 /// the exact role chat_tools.chat_vcs_mtx plays for /api/v1/chat/tool. A live hive cast building in the same
@@ -135,6 +147,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     defer gpa.free(conv_dir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, conv_dir, .default_dir) catch {};
 
+    // ---- HIPPOCAMPUS scope: this conversation's own durable neuron-db partition (user turns + tool findings) ----
+    const mem_scope = std.fmt.allocPrint(gpa, "chat:{s}", .{conv}) catch return;
+    defer gpa.free(mem_scope);
+
+    // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
+    const ctrl_cursor = controlLen(app, conv_dir);
+
     // ---- record the user's message BEFORE anything else, so it's durable even if the LLM call dies ----
     appendMsg(app, conv_dir, "user", user_text, "user", nowSecs(app.io));
     emitUserRole(app, conv_dir, user_text); // {"kind":"message","role":"user","content":..}
@@ -182,78 +201,260 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     conv_buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return;
     http.jstr(gpa, &conv_buf, SYSTEM_PROMPT) catch return;
     conv_buf.append(gpa, '}') catch return;
+
+    // HIPPOCAMPUS (recall): pull the facts most relevant to THIS user text from the conversation's own neuron-db
+    // — earlier turns + tool findings, including ones evicted from the visible history — and inject them as a
+    // grounded-context system message RIGHT AFTER the base prompt (before the replayed history). Additive: an
+    // empty/failed recall leaves conv_buf byte-identical to the history-only seed, so it can only help.
+    {
+        const recalled = ctx.mem.recall(mem_scope, user_text);
+        defer gpa.free(recalled);
+        if (recalled.len > 0) {
+            scrubUtf8(recalled); // observed facts are already scrubbed, but a fetched-byte tail could slip in
+            var mem_content: std.ArrayListUnmanaged(u8) = .empty;
+            defer mem_content.deinit(gpa);
+            mem_content.appendSlice(gpa, "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
+            mem_content.appendSlice(gpa, recalled) catch return;
+            conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+            http.jstr(gpa, &conv_buf, mem_content.items) catch return;
+            conv_buf.append(gpa, '}') catch return;
+        }
+    }
     seedPriorMessages(app, conv_dir, &conv_buf);
 
-    // ---- the agentic loop ----
-    var last_content: []u8 = &[_]u8{};
+    // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
+    // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
+    // text then recalling it as "grounded context" is the parrot/confabulation loop the desk fix removed.
+    _ = ctx.mem.observe(mem_scope, user_text);
+
+    // ---- AUTO-LOOP DRIVE: settle one answer, infer the next step, drive again until DONE / repeat / DRIVE_MAX ----
+    // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
+    var prev_drive: []u8 = gpa.dupe(u8, user_text) catch &[_]u8{};
+    defer if (prev_drive.len > 0) gpa.free(prev_drive);
+
+    var drive: usize = 0;
+    outer: while (drive < DRIVE_MAX) : (drive += 1) {
+        // COOPERATIVE STOP (between drive steps): a `"op":"stop"` written to control.jsonl after the turn began.
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
+            emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+            return;
+        }
+
+        // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
+        const inner = runInnerAgentic(app, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
+        switch (inner.outcome) {
+            .hard_error => return, // the inference failed — helper already emitted the error event; end the turn
+            .stopped => {
+                // stop landed mid tool-loop — commit the last narration (if any) so the user keeps it, then close.
+                if (inner.content.len > 0) {
+                    appendMsg(app, conv_dir, "assistant", inner.content, "veil", nowSecs(app.io));
+                    emitAssistant(app, conv_dir, inner.content);
+                }
+                gpa.free(inner.content);
+                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                return;
+            },
+            .settled => {},
+        }
+
+        // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
+        const answer = inner.content;
+        defer gpa.free(answer);
+        appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
+        emitAssistant(app, conv_dir, answer);
+        conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
+        http.jstr(gpa, &conv_buf, answer) catch break :outer;
+        conv_buf.append(gpa, '}') catch break :outer;
+
+        // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE). The loop question is a
+        // SYNTHETIC turn — appended only long enough to ask, then truncated back off conv_buf so it never rides
+        // into the next real pass and never touches messages.jsonl.
+        const saved_len = conv_buf.items.len;
+        conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+        http.jstr(gpa, &conv_buf, LOOP_QUESTION) catch break :outer;
+        conv_buf.append(gpa, '}') catch break :outer;
+        var next = llm.complete(gpa, app.io, run_root, "loop", base_url, key, model, conv_buf.items, "", 512, 0.5);
+        defer next.deinit(gpa);
+        conv_buf.shrinkRetainingCapacity(saved_len); // drop the synthetic loop question
+
+        const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
+        // STOP the drive when the goal is achieved (DONE), the inference is empty/failed, or the next step just
+        // repeats the last one (no progress) — the settled answer above is the turn's final reply.
+        if (!next.ok or trimmed.len == 0 or loopIsDone(next.content) or nearlySame(trimmed, prev_drive)) break :outer;
+
+        // CONTINUE: the inferred step becomes the next (synthetic) user turn in the LLM context — NOT written to
+        // messages.jsonl (only real user + assistant turns are durable there).
+        conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+        http.jstr(gpa, &conv_buf, trimmed) catch break :outer;
+        conv_buf.append(gpa, '}') catch break :outer;
+        var sbuf: [128]u8 = undefined;
+        const status = std.fmt.bufPrint(&sbuf, "continuing: {s}", .{clipBytes(trimmed, 80)}) catch "continuing";
+        emitKV(app, conv_dir, "status", "text", status);
+        const nd: []u8 = gpa.dupe(u8, trimmed) catch &[_]u8{};
+        if (prev_drive.len > 0) gpa.free(prev_drive);
+        prev_drive = nd;
+    }
+
+    // The drive loop ended (DONE / repeat / DRIVE_MAX / an OOM append) — every settled answer is already durable;
+    // emit the single terminal `done` exactly once.
+    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+}
+
+/// One settled agentic tool pass: runs the tool-calling loop against the current `conv_buf` until the model emits
+/// a NO-tool-call answer (that answer is `.settled`), a completion fails (`.hard_error` — the error event is
+/// already emitted here), or a cooperative stop lands before an inference (`.stopped`). Grows `conv_buf` with the
+/// assistant tool_call turns + tool-result turns (shared context for the outer drive). `.content` is gpa-owned;
+/// the caller frees it in every outcome. Successful tool results are observed into `mem_scope` (confab-safe:
+/// only tool findings + user turns are observed, never assistant replies).
+const InnerResult = struct {
+    outcome: enum { settled, hard_error, stopped },
+    content: []u8,
+};
+fn runInnerAgentic(
+    app: *App,
+    conv_dir: []const u8,
+    run_root: []const u8,
+    base_url: []const u8,
+    key: []const u8,
+    model: []const u8,
+    conv_buf: *std.ArrayListUnmanaged(u8),
+    ctx: *tools.ToolCtx,
+    mem_scope: []const u8,
+    ctrl_cursor: usize,
+) InnerResult {
+    const gpa = app.gpa;
+    const empty: []u8 = &[_]u8{};
+    // the last narrated content across tool iterations — the salvage if we exhaust MAX_ITERS or a stop lands mid-loop.
+    var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
 
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
+        // COOPERATIVE STOP (before each inference): abort with whatever narration we have; the caller commits it.
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor))
+            return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty };
+
         var step = llm.complete(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools.SCHEMA, 4096, 0.7);
         defer step.deinit(gpa);
 
         if (!step.ok) {
             emitKV(app, conv_dir, "error", "err", clipBytes(step.content, 400));
-            return;
+            return .{ .outcome = .hard_error, .content = empty };
         }
         if (step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 2000));
 
-        if (step.calls.len == 0) {
-            // no tool calls — this is the assistant's answer to the user; commit it and finish.
-            appendMsg(app, conv_dir, "assistant", step.content, "veil", nowSecs(app.io));
-            emitAssistant(app, conv_dir, step.content);
-            emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
-            return;
-        }
+        if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
+            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty };
 
         // remember the last narrated content in case we run out of iterations mid-tool-loop
         if (step.content.len > 0) {
             if (last_content.len > 0) gpa.free(last_content);
-            last_content = gpa.dupe(u8, step.content) catch &[_]u8{};
+            last_content = gpa.dupe(u8, step.content) catch empty;
         }
 
         // append the assistant tool_call turn to the running context (standard OpenAI tool_calls shape) ...
-        conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch return;
-        http.jstr(gpa, &conv_buf, step.content) catch return;
-        conv_buf.appendSlice(gpa, ",\"tool_calls\":[") catch return;
+        conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch return .{ .outcome = .hard_error, .content = empty };
+        http.jstr(gpa, conv_buf, step.content) catch return .{ .outcome = .hard_error, .content = empty };
+        conv_buf.appendSlice(gpa, ",\"tool_calls\":[") catch return .{ .outcome = .hard_error, .content = empty };
         for (step.calls, 0..) |c, i| {
-            if (i > 0) conv_buf.append(gpa, ',') catch return;
-            conv_buf.appendSlice(gpa, "{\"id\":") catch return;
-            http.jstr(gpa, &conv_buf, c.id) catch return;
-            conv_buf.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":") catch return;
-            http.jstr(gpa, &conv_buf, c.name) catch return;
-            conv_buf.appendSlice(gpa, ",\"arguments\":") catch return;
-            http.jstr(gpa, &conv_buf, c.args) catch return;
-            conv_buf.appendSlice(gpa, "}}") catch return;
+            if (i > 0) conv_buf.append(gpa, ',') catch return .{ .outcome = .hard_error, .content = empty };
+            conv_buf.appendSlice(gpa, "{\"id\":") catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, c.id) catch return .{ .outcome = .hard_error, .content = empty };
+            conv_buf.appendSlice(gpa, ",\"type\":\"function\",\"function\":{\"name\":") catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, c.name) catch return .{ .outcome = .hard_error, .content = empty };
+            conv_buf.appendSlice(gpa, ",\"arguments\":") catch return .{ .outcome = .hard_error, .content = empty };
+            http.jstr(gpa, conv_buf, c.args) catch return .{ .outcome = .hard_error, .content = empty };
+            conv_buf.appendSlice(gpa, "}}") catch return .{ .outcome = .hard_error, .content = empty };
         }
-        conv_buf.appendSlice(gpa, "]}") catch return;
+        conv_buf.appendSlice(gpa, "]}") catch return .{ .outcome = .hard_error, .content = empty };
 
-        // ... then run each call and append its result turn.
+        // ... then run each call, narrate + observe its result, and append its result turn.
         for (step.calls) |c| {
             emitToolState(app, conv_dir, c.name, "start", "");
-            const result = tools.execute(&ctx, c.name, c.args);
+            const result = tools.execute(ctx, c.name, c.args);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
+            // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
+            // — "(...)" notes and `"ok":false` payloads — and never observe assistant reply content (confab fix).
+            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null)
+                observeToolResult(app, ctx, mem_scope, c.name, result);
+
             conv_buf.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {
                 if (result.len > 0) gpa.free(result);
-                return;
+                return .{ .outcome = .hard_error, .content = empty };
             };
-            http.jstr(gpa, &conv_buf, c.id) catch {};
+            http.jstr(gpa, conv_buf, c.id) catch {};
             conv_buf.appendSlice(gpa, ",\"content\":") catch {};
-            http.jstr(gpa, &conv_buf, result) catch {};
+            http.jstr(gpa, conv_buf, result) catch {};
             conv_buf.append(gpa, '}') catch {};
             if (result.len > 0) gpa.free(result); // OOM fallback in execute() can hand back a static "" — don't free that
         }
         // loop: feed the tool results back for the next completion
     }
 
-    // ---- ran out of iterations mid-tool-loop: commit whatever the last narration was + close the turn ----
-    const final: []const u8 = if (last_content.len > 0) last_content else "(reached the step limit for this turn)";
-    appendMsg(app, conv_dir, "assistant", final, "veil", nowSecs(app.io));
-    emitAssistant(app, conv_dir, final);
-    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+    // ran out of tool iterations mid-loop: hand the last narration (or a placeholder) back as the settled answer.
+    const fallback: []const u8 = if (last_content.len > 0) last_content else "(reached the step limit for this turn)";
+    return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty };
+}
+
+/// Observe a SHORT durable note of a successful tool result into the conversation's neuron-db: `tool <name>: <=200b`.
+fn observeToolResult(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, name: []const u8, result: []const u8) void {
+    const gpa = app.gpa;
+    const note = std.fmt.allocPrint(gpa, "tool {s}: {s}", .{ name, clipBytes(result, 200) }) catch return;
+    defer gpa.free(note);
+    _ = ctx.mem.observe(mem_scope, note);
+}
+
+/// Current byte length of control.jsonl (0 if absent/unreadable) — the cursor past which a later stop op counts.
+fn controlLen(app: *App, conv_dir: []const u8) usize {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return 0;
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return 0;
+    defer gpa.free(data);
+    return data.len;
+}
+
+/// True if control.jsonl carries a `"op":"stop"` in the bytes appended AFTER `cursor` (i.e. since the turn began).
+/// Best-effort: any read error means "no stop" (never block the turn on a control-file hiccup).
+fn stopRequestedSince(app: *App, conv_dir: []const u8, cursor: usize) bool {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return false;
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return false;
+    defer gpa.free(data);
+    if (data.len <= cursor) return false;
+    return std.mem.indexOf(u8, data[cursor..], "\"op\":\"stop\"") != null;
+}
+
+/// The drive is DONE when the inference's next-step text is exactly a terminal token (desk loopIsDone): trim the
+/// chatty punctuation/markers, then case-insensitively match one of the short "finished" words (<=16 bytes).
+fn loopIsDone(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \t\r\n.!\"'`*:");
+    if (t.len == 0 or t.len > 16) return false;
+    return std.ascii.eqlIgnoreCase(t, "DONE") or
+        std.ascii.eqlIgnoreCase(t, "COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "GOAL COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "TASK COMPLETE") or
+        std.ascii.eqlIgnoreCase(t, "FINISHED");
+}
+
+/// Repeat guard (desk nearlySame): case-insensitive substring containment either way, capped at 400 bytes so it
+/// only guards short chatty next-steps, not long build instructions. A near-repeat means the drive isn't
+/// progressing, so it stops instead of churning the same step.
+fn nearlySame(a_in: []const u8, b_in: []const u8) bool {
+    const a = std.mem.trim(u8, a_in, " \r\n\t.!?");
+    const b = std.mem.trim(u8, b_in, " \r\n\t.!?");
+    if (a.len == 0 or b.len == 0) return false;
+    if (a.len > 400 or b.len > 400) return false;
+    var la: [400]u8 = undefined;
+    var lb: [400]u8 = undefined;
+    for (a, 0..) |c, i| la[i] = std.ascii.toLower(c);
+    for (b, 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const sa = la[0..a.len];
+    const sb = lb[0..b.len];
+    return std.mem.indexOf(u8, sa, sb) != null or std.mem.indexOf(u8, sb, sa) != null;
 }
 
 /// {"kind":"message","role":"user","content":..}
