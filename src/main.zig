@@ -264,6 +264,8 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/chat/convs/:id", chat_service.getConv, .{});
     router.delete("/api/v1/chat/convs/:id", chat_service.deleteConv, .{});
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
+    router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
+    router.post("/api/v1/chat/convs/:id/control", chat_service.chatControl, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
