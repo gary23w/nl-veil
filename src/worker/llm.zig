@@ -744,6 +744,440 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     return .{ .content = content, .reasoning = reasoning, .calls = calls.toOwnedSlice(gpa) catch &.{}, .ok = true, .truncated = trunc };
 }
 
+// ============================================================================
+// STREAMING (chat only) — an ADDITIVE path parallel to complete(). The swarm's
+// complete() / completeBody() / completeOllamaNative() above are UNTOUCHED. This variant
+// asks the backend for "stream":true, curl-streams the SSE (hosted) / NDJSON (Ollama
+// native) response to a scratch file that we TAIL line-by-line, firing on_delta for each
+// incremental content/reasoning chunk, and accumulates the full content + reasoning
+// (+ tool_calls) into the SAME Step complete() returns — so the agentic loop downstream is
+// byte-identical. ANY streaming trouble (spawn/setup failure, an error line, a body that
+// never streamed, or a hosted SSE tool call whose fragmented deltas aren't worth
+// reassembling) transparently FALLS BACK to complete(): the turn still works, it just
+// doesn't type out. This mirrors desk/src/llm.zig's transport (curl -N to a scratch file).
+// ============================================================================
+
+/// Which channel a streamed delta belongs to. `.content` is the visible reply; `.reasoning`
+/// is the hidden thinking channel (reasoning models).
+pub const DeltaKind = enum { content, reasoning };
+
+const STREAM_STAT = "\n__VEILSTAT__"; // curl -w appends this + the 3-digit HTTP code once the transfer ends
+
+const StreamState = struct {
+    native: bool,
+    ctx: *anyopaque,
+    on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
+    content: std.ArrayListUnmanaged(u8) = .empty,
+    reasoning: std.ArrayListUnmanaged(u8) = .empty,
+    carry: std.ArrayListUnmanaged(u8) = .empty, // partial trailing line held between polls
+    tool_line: std.ArrayListUnmanaged(u8) = .empty, // the native NDJSON line that carried tool_calls (owned)
+    saw_tool_calls: bool = false,
+    truncated: bool = false,
+    failed: bool = false,
+    done: bool = false,
+    metered: bool = false,
+    p_in: u64 = 0,
+    p_out: u64 = 0,
+    p_cached: u64 = 0,
+
+    fn deinit(st: *StreamState, gpa: std.mem.Allocator) void {
+        st.content.deinit(gpa);
+        st.reasoning.deinit(gpa);
+        st.carry.deinit(gpa);
+        st.tool_line.deinit(gpa);
+    }
+    /// Emit one non-empty delta (borrowed — the callback copies it) and accumulate it.
+    fn fire(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
+        if (text.len == 0) return;
+        st.on_delta(st.ctx, kind, text);
+        switch (kind) {
+            .content => st.content.appendSlice(gpa, text) catch {},
+            .reasoning => st.reasoning.appendSlice(gpa, text) catch {},
+        }
+    }
+};
+
+/// Append newly-arrived stream bytes; process every COMPLETE line (SSE or NDJSON), keep the trailing
+/// partial line in `carry` for the next feed. Each line is a whole JSON object (SSE `data: {…}` payload or
+/// one NDJSON object), so std.json parses it directly — no partial-fragment hand-parsing.
+fn feedStream(st: *StreamState, gpa: std.mem.Allocator, new_bytes: []const u8) void {
+    st.carry.appendSlice(gpa, new_bytes) catch return;
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, st.carry.items, start, '\n')) |nl| {
+        const line = std.mem.trimEnd(u8, st.carry.items[start..nl], "\r");
+        handleStreamLine(st, gpa, line);
+        start = nl + 1;
+        if (st.done) break;
+    }
+    if (start > 0) {
+        const rem = st.carry.items.len - start;
+        if (rem > 0) std.mem.copyForwards(u8, st.carry.items[0..rem], st.carry.items[start..]);
+        st.carry.shrinkRetainingCapacity(rem);
+    }
+}
+
+fn handleStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u8) void {
+    if (st.native) handleNativeStreamLine(st, gpa, line) else handleSseStreamLine(st, gpa, line);
+}
+
+/// Ollama native /api/chat NDJSON: {"message":{"content":"…","thinking":"…","tool_calls":[…]},"done":bool,…}.
+fn handleNativeStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u8) void {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (t.len == 0 or t[0] != '{') return;
+    const P = struct {
+        message: ?struct {
+            content: ?[]const u8 = null,
+            thinking: ?[]const u8 = null,
+            reasoning: ?[]const u8 = null,
+            tool_calls: ?[]const std.json.Value = null,
+        } = null,
+        done: bool = false,
+        done_reason: ?[]const u8 = null,
+        eval_count: ?u64 = null,
+        prompt_eval_count: ?u64 = null,
+        @"error": ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(P, gpa, t, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    if (parsed.value.@"error") |_| {
+        st.failed = true;
+        st.done = true;
+        return;
+    }
+    if (parsed.value.message) |m| {
+        if (m.thinking) |th| st.fire(gpa, .reasoning, th);
+        if (m.reasoning) |r| st.fire(gpa, .reasoning, r);
+        if (m.content) |c| st.fire(gpa, .content, c);
+        if (m.tool_calls) |tcs| {
+            if (tcs.len > 0) {
+                // Ollama emits the parsed tool_calls array complete in a single NDJSON line (arguments as a
+                // whole JSON value) — capture that line; parseNativeToolCalls reconstructs the calls at the end.
+                st.saw_tool_calls = true;
+                st.tool_line.clearRetainingCapacity();
+                st.tool_line.appendSlice(gpa, t) catch {};
+            }
+        }
+    }
+    if (parsed.value.eval_count) |ec| {
+        st.p_out = ec;
+        st.p_in = parsed.value.prompt_eval_count orelse 0;
+        st.metered = true;
+    }
+    if (parsed.value.done_reason) |dr| {
+        if (std.mem.eql(u8, dr, "length")) st.truncated = true;
+    }
+    if (parsed.value.done) st.done = true;
+}
+
+/// OpenAI SSE: `data: {"choices":[{"delta":{"content":"…","reasoning":"…"}}]}` and `data: [DONE]`.
+/// `stream_options.include_usage` makes the final `data:` chunk carry a `usage` block for the token meter.
+fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u8) void {
+    if (!std.mem.startsWith(u8, line, "data:")) return;
+    const payload = std.mem.trim(u8, line[5..], " \t\r");
+    if (payload.len == 0) return;
+    if (std.mem.eql(u8, payload, "[DONE]")) {
+        st.done = true;
+        return;
+    }
+    if (payload[0] != '{') return;
+    const P = struct {
+        choices: []const struct {
+            delta: ?struct {
+                content: ?[]const u8 = null,
+                reasoning: ?[]const u8 = null,
+                reasoning_content: ?[]const u8 = null,
+                tool_calls: ?[]const std.json.Value = null,
+            } = null,
+            finish_reason: ?[]const u8 = null,
+        } = &.{},
+        usage: ?struct {
+            prompt_tokens: u64 = 0,
+            completion_tokens: u64 = 0,
+            prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+        } = null,
+        @"error": ?struct { message: []const u8 = "" } = null,
+    };
+    const parsed = std.json.parseFromSlice(P, gpa, payload, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    if (parsed.value.@"error") |_| {
+        st.failed = true;
+        st.done = true;
+        return;
+    }
+    for (parsed.value.choices) |ch| {
+        if (ch.delta) |d| {
+            if (d.reasoning) |r| st.fire(gpa, .reasoning, r);
+            if (d.reasoning_content) |r| st.fire(gpa, .reasoning, r);
+            if (d.content) |c| st.fire(gpa, .content, c);
+            if (d.tool_calls) |tcs| {
+                if (tcs.len > 0) st.saw_tool_calls = true;
+            }
+        }
+        if (ch.finish_reason) |fr| {
+            if (std.mem.eql(u8, fr, "length")) st.truncated = true;
+            if (std.mem.eql(u8, fr, "tool_calls")) st.saw_tool_calls = true;
+        }
+    }
+    if (parsed.value.usage) |u| {
+        st.p_in = u.prompt_tokens;
+        st.p_out = u.completion_tokens;
+        if (u.prompt_tokens_details) |dd| st.p_cached = dd.cached_tokens;
+        st.metered = true;
+    }
+}
+
+/// Reconstruct the native tool call(s) from the captured NDJSON line — arguments re-serialized to a JSON
+/// string, exactly like parseOllamaNative. Empty slice on none/unparseable → caller falls back to complete().
+fn parseNativeToolCalls(gpa: std.mem.Allocator, raw: []const u8) []ToolCall {
+    const Resp = struct {
+        message: ?struct {
+            tool_calls: ?[]const struct {
+                function: struct { name: []const u8 = "", arguments: std.json.Value = .null },
+            } = null,
+        } = null,
+    };
+    const parsed = std.json.parseFromSlice(Resp, gpa, raw, .{ .ignore_unknown_fields = true }) catch return &.{};
+    defer parsed.deinit();
+    const msg = parsed.value.message orelse return &.{};
+    const tcs = msg.tool_calls orelse return &.{};
+    var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+    for (tcs) |tc| {
+        const args = std.json.Stringify.valueAlloc(gpa, tc.function.arguments, .{}) catch continue;
+        calls.append(gpa, .{
+            .id = gpa.dupe(u8, "") catch {
+                gpa.free(args);
+                continue;
+            },
+            .name = gpa.dupe(u8, tc.function.name) catch {
+                gpa.free(args);
+                continue;
+            },
+            .args = args,
+        }) catch {
+            gpa.free(args);
+        };
+    }
+    return calls.toOwnedSlice(gpa) catch &.{};
+}
+
+fn freeCalls(gpa: std.mem.Allocator, calls: []ToolCall) void {
+    for (calls) |c| {
+        gpa.free(c.id);
+        gpa.free(c.name);
+        gpa.free(c.args);
+    }
+    gpa.free(calls);
+}
+
+/// Fold a streamed step's token counts into the process meters — the SAME local/hosted split completeBody
+/// and parseOllamaNative use, so streamed chat steps still contribute to REAL cost reporting.
+fn meterStream(st: *const StreamState, local: bool) void {
+    if (!st.metered) return;
+    if (local) {
+        _ = tokens_in_free.fetchAdd(st.p_in, .monotonic);
+        _ = tokens_out_free.fetchAdd(st.p_out, .monotonic);
+    } else {
+        _ = tokens_in.fetchAdd(st.p_in, .monotonic);
+        _ = tokens_out.fetchAdd(st.p_out, .monotonic);
+        _ = tokens_cached.fetchAdd(st.p_cached, .monotonic);
+    }
+    _ = calls_made.fetchAdd(1, .monotonic);
+}
+
+/// STREAMING agentic step (chat only). Same request as complete() but "stream":true; curl streams the
+/// response to a scratch file that we tail, firing on_delta(ctx, .content|.reasoning, chunk) for each
+/// incremental delta and accumulating the full Step (content + reasoning + tool_calls). ANY failure — or a
+/// case we can't stream cleanly (hosted SSE tool-call fragments) — FALLS BACK to complete(), and on_delta
+/// simply never fires. The returned Step is caller-owned (step.deinit) and identical in shape to complete()'s.
+pub fn completeStream(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    run_dir: []const u8,
+    tag: []const u8,
+    base_url: []const u8,
+    key: []const u8,
+    model: []const u8,
+    messages_json: []const u8,
+    tools_json: []const u8,
+    max_tokens: u32,
+    temperature: f32,
+    ctx: *anyopaque,
+    on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
+) Step {
+    return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta) orelse
+        complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
+}
+
+/// The streaming body. Returns a Step on a clean stream, or null to signal "fall back to complete()".
+fn streamAttempt(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    run_dir: []const u8,
+    tag: []const u8,
+    base_url: []const u8,
+    key: []const u8,
+    model: []const u8,
+    messages_json: []const u8,
+    tools_json: []const u8,
+    max_tokens: u32,
+    temperature: f32,
+    ctx: *anyopaque,
+    on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
+) ?Step {
+    const native = isOllama(base_url);
+    const local = isLocal(base_url);
+
+    // ---- URL (native /api/chat, else OpenAI /chat/completions) ----
+    const url = blk: {
+        if (native) {
+            var root = trimSlash(base_url);
+            if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
+            break :blk std.fmt.allocPrint(gpa, "{s}/api/chat", .{root}) catch return null;
+        }
+        break :blk std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return null;
+    };
+    defer gpa.free(url);
+
+    // ---- body: the SAME shape complete() builds, plus "stream":true (and, on the hosted path,
+    // stream_options.include_usage so the terminal chunk still carries the token meter). ----
+    const temp_frag = if (temperature >= 0)
+        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return null
+    else
+        gpa.dupe(u8, "") catch return null;
+    defer gpa.free(temp_frag);
+
+    const body = blk: {
+        if (native) {
+            const np: u32 = if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens;
+            const ctxw = effectiveCtx();
+            break :blk (if (tools_json.len > 0)
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })
+            else
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })) catch return null;
+        }
+        const mt = effTokens(base_url, model, max_tokens);
+        break :blk (if (tools_json.len > 0)
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt })
+        else
+            std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt })) catch return null;
+    };
+    defer gpa.free(body);
+
+    // ---- scratch files (per-tag, so concurrent callers don't clobber) ----
+    const reqpath = std.fmt.allocPrint(gpa, "{s}/.streamreq{s}{s}.json", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    defer gpa.free(reqpath);
+    const cfgpath = std.fmt.allocPrint(gpa, "{s}/.streamcfg{s}{s}", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    defer gpa.free(cfgpath);
+    const outpath = std.fmt.allocPrint(gpa, "{s}/.stream{s}{s}.sse", .{ run_dir, if (tag.len > 0) "-" else "", tag }) catch return null;
+    defer gpa.free(outpath);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = reqpath, .data = body }) catch return null;
+    // Engine convention: the key rides a curl config file (-K), never the argv.
+    const cfg = if (key.len > 0)
+        std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\nheader = \"Content-Type: application/json\"\n", .{key}) catch return null
+    else
+        gpa.dupe(u8, "header = \"Content-Type: application/json\"\n") catch return null;
+    defer gpa.free(cfg);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cfgpath, .data = cfg }) catch return null;
+
+    const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return null;
+    defer gpa.free(data_at);
+
+    const stream_max_s: u32 = if (local) 240 else 90; // parity with post()/postUrl's --max-time
+    var tt_buf: [16]u8 = undefined;
+    const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{stream_max_s}) catch "240";
+
+    var sink = std.Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch return null;
+    // -w appends STREAM_STAT + the HTTP code after the transfer so the tail loop sees curl exit.
+    const argv: []const []const u8 = &.{ "curl", "-sS", "-N", "--connect-timeout", "20", "--max-time", tt, "-K", cfgpath, "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url };
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .{ .file = sink },
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch {
+        sink.close(io);
+        return null;
+    };
+    sink.close(io); // curl holds its own inherited handle; we read the file back independently
+    defer child.kill(io); // kill terminates AND reaps in one idempotent call (mirrors desk.finish)
+
+    var st = StreamState{ .native = native, .ctx = ctx, .on_delta = on_delta };
+    defer st.deinit(gpa);
+
+    // ---- tail the sink until curl exits (STAT sentinel) or the stream self-completes ----
+    var offset: usize = 0;
+    const wall: i64 = @as(i64, stream_max_s) + 30;
+    const t0 = std.Io.Timestamp.now(io, .real).toSeconds();
+    while (true) {
+        const data = std.Io.Dir.cwd().readFileAlloc(io, outpath, gpa, .limited(8 << 20)) catch {
+            // file not created yet — curl still connecting (or it died before writing)
+            if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
+            io.sleep(.{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+            continue;
+        };
+        var body_bytes = data;
+        var sentinel = false;
+        if (std.mem.lastIndexOf(u8, data, STREAM_STAT)) |m| {
+            const after = data[m + STREAM_STAT.len ..];
+            if (after.len >= 3) {
+                body_bytes = data[0..m];
+                sentinel = true;
+            }
+        }
+        if (body_bytes.len > offset) {
+            feedStream(&st, gpa, body_bytes[offset..]);
+            offset = body_bytes.len;
+        }
+        gpa.free(data);
+        if (st.done or sentinel) {
+            // flush a final line that arrived without a trailing newline (native's last object can)
+            if (!st.done and st.carry.items.len > 0) {
+                const line = std.mem.trimEnd(u8, st.carry.items, "\r\n");
+                if (line.len > 0) handleStreamLine(&st, gpa, line);
+            }
+            break;
+        }
+        if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
+        io.sleep(.{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    // ---- decide: return a clean streamed Step, or null → complete() reparses authoritatively ----
+    if (st.failed) return null; // an error line — let complete() surface the exact error
+
+    if (st.saw_tool_calls) {
+        if (native) {
+            const calls = parseNativeToolCalls(gpa, st.tool_line.items);
+            if (calls.len > 0) {
+                const c_owned = gpa.dupe(u8, st.content.items) catch {
+                    freeCalls(gpa, calls);
+                    return null;
+                };
+                const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
+                    gpa.free(c_owned);
+                    freeCalls(gpa, calls);
+                    return null;
+                };
+                meterStream(&st, local);
+                return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
+            }
+            freeCalls(gpa, calls); // couldn't reconstruct — fall through to complete()
+        }
+        return null; // hosted SSE tool-call fragments (or a native miss): complete() reparses cleanly
+    }
+
+    if (st.content.items.len == 0 and st.reasoning.items.len == 0) return null; // nothing streamed → complete()
+
+    const c_owned = gpa.dupe(u8, st.content.items) catch return null;
+    const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
+        gpa.free(c_owned);
+        return null;
+    };
+    meterStream(&st, local);
+    return .{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
+}
+
 fn trimSlash(s: []const u8) []const u8 {
     return if (s.len > 0 and s[s.len - 1] == '/') s[0 .. s.len - 1] else s;
 }
@@ -1009,4 +1443,89 @@ test "fenceWrites: hosted backend fences only on measured text-emission evidence
     try std.testing.expect(fenceWrites("https://api.example.com/v1", "some-hosted-model"));
     caps = .{ .probed = true, .ollama_native = false, .tools_native_ok = true };
     try std.testing.expect(!fenceWrites("https://api.example.com/v1", "some-hosted-model"));
+}
+
+// ---- streaming parser (pure over byte chunks — no network) ----
+
+const StreamCapture = struct {
+    content: std.ArrayListUnmanaged(u8) = .empty,
+    reasoning: std.ArrayListUnmanaged(u8) = .empty,
+    fn deinit(self: *StreamCapture, gpa: std.mem.Allocator) void {
+        self.content.deinit(gpa);
+        self.reasoning.deinit(gpa);
+    }
+    fn onDelta(cx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+        const self: *StreamCapture = @ptrCast(@alignCast(cx));
+        const dst = switch (kind) {
+            .content => &self.content,
+            .reasoning => &self.reasoning,
+        };
+        dst.appendSlice(std.testing.allocator, text) catch {};
+    }
+};
+
+test "completeStream SSE parser: reasoning + content deltas fire on_delta, accumulate, and [DONE] completes" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    // reasoning first (thinking model), then the answer split mid-line across two feeds, then usage + [DONE]
+    feedStream(&st, gpa, "data: {\"choices\":[{\"delta\":{\"reasoning\":\"think \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"cont");
+    try std.testing.expectEqualStrings("Hel", st.content.items);
+    feedStream(&st, gpa, "ent\":\"lo\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n\ndata: [DONE]\n");
+    try std.testing.expect(st.done and !st.failed);
+    try std.testing.expect(!st.saw_tool_calls);
+    try std.testing.expectEqualStrings("Hello", st.content.items);
+    try std.testing.expectEqualStrings("Hello", cap.content.items);
+    try std.testing.expectEqualStrings("think ", st.reasoning.items);
+    try std.testing.expectEqualStrings("think ", cap.reasoning.items);
+    try std.testing.expect(st.metered and st.p_in == 11 and st.p_out == 2);
+}
+
+test "completeStream SSE parser: an error chunk fails the stream; finish_reason tool_calls flags fallback" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var e = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer e.deinit(gpa);
+    feedStream(&e, gpa, "data: {\"error\":{\"message\":\"invalid api key\"}}\n");
+    try std.testing.expect(e.failed and e.done);
+
+    var t = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer t.deinit(gpa);
+    feedStream(&t, gpa, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read_file\"}}]},\"finish_reason\":\"tool_calls\"}]}\n");
+    try std.testing.expect(t.saw_tool_calls);
+}
+
+test "completeStream native parser: streams thinking + content, reconstructs a tool call, meters on done" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = true, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    feedStream(&st, gpa, "{\"message\":{\"role\":\"assistant\",\"thinking\":\"plan \",\"content\":\"\"},\"done\":false}\n");
+    feedStream(&st, gpa, "{\"message\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"function\":{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}}]},\"done\":false}\n");
+    feedStream(&st, gpa, "{\"message\":{\"content\":\"\"},\"done\":true,\"eval_count\":5,\"prompt_eval_count\":9}\n");
+    try std.testing.expect(st.done and !st.failed and st.saw_tool_calls);
+    try std.testing.expectEqualStrings("plan ", st.reasoning.items);
+    try std.testing.expect(st.metered and st.p_out == 5 and st.p_in == 9);
+
+    const calls = parseNativeToolCalls(gpa, st.tool_line.items);
+    defer freeCalls(gpa, calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, calls[0].args, "a.txt") != null);
+}
+
+test "completeStream native parser: content-only reply accumulates and done:true completes" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = true, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    feedStream(&st, gpa, "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi \"},\"done\":false}\n{\"message\":{\"content\":\"there\"},\"done\":true,\"eval_count\":3,\"prompt_eval_count\":7}\n");
+    try std.testing.expect(st.done and !st.failed and !st.saw_tool_calls);
+    try std.testing.expectEqualStrings("Hi there", st.content.items);
+    try std.testing.expectEqualStrings("Hi there", cap.content.items);
 }
