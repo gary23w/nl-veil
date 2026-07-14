@@ -20,6 +20,7 @@ const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
 const llm = @import("../worker/llm.zig");
 const cctx = @import("chat_context.zig");
+const cplan = @import("chat_plan.zig");
 const deploy_service = @import("deploy_service.zig");
 
 const App = http.App;
@@ -47,6 +48,16 @@ const LOOP_QUESTION =
 /// committed — the model reviews its own reply against the question and returns the final (improved-or-unchanged)
 /// text. Gated to the FIRST drive step only (one reflect per turn) and to answers >= REFLECT_MIN bytes, so a
 /// terse reply or a multi-step build's intermediate narration doesn't spend an extra full completion.
+/// PLAN-BOARD: how many subtasks one turn works before pausing (the plan persists, so "continue" resumes the
+/// rest). Bounds a big plan's turn length — each subtask is a full agentic pass, so this * MAX_ITERS is the ceiling.
+const PLAN_STEPS_PER_TURN: usize = 8;
+const PLAN_PROMPT =
+    "Decompose the user's request into an ordered list of concrete subtasks, and for EACH pick the best ROUTE: " ++
+    "\"hive\" (delegate to a swarm of AI minds — a big or parallelizable build/research chunk), \"research\" (you " ++
+    "need to learn or look something up first), or \"inline\" (a small, direct step you just do yourself). Reply " ++
+    "with ONLY compact JSON: {\"plan\":[{\"task\":\"…\",\"route\":\"hive|research|inline\"}, …]}. If the request " ++
+    "is a simple question, a greeting, or a single trivial step that needs no plan, reply exactly {\"plan\":[]}.";
+
 const REFLECT_MIN: usize = 240;
 const REFLECT_PROMPT =
     "Critically review the answer you just gave for correctness, completeness, and clarity against the user's " ++
@@ -273,13 +284,46 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // between drive steps so a multi-step turn stays bounded ACROSS steps, not only within one pass.
     const assembled_len = conv_buf.items.len;
 
-    // ---- AUTO-LOOP DRIVE: settle one answer, infer the next step, drive again until DONE / repeat / DRIVE_MAX ----
+    // ---- PLAN-BOARD: the veil's first move on a non-trivial task is to decompose it into routed subtasks. Try a
+    // fresh decomposition of THIS message; if it yields a plan, that's the new board (persist + show it). If not
+    // (a question / "continue" / trivial step), resume an existing unfinished plan if one is on disk; else run a
+    // normal free-form turn. When a plan is active the drive loop below walks it deterministically. ----
+    var plan: []cplan.Task = blk: {
+        // RESUME-PREFERRED: if an UNFINISHED plan is on disk, keep working IT — never silently clobber in-progress
+        // work (with its completed-subtask state) by decomposing the new message into a fresh board. This is also
+        // how "continue" resumes. A message sent mid-plan still rides in the model's context for the next subtask.
+        const resumed = resumePlan(app, conv_dir);
+        if (resumed.len > 0 and !cplan.allDone(resumed)) {
+            emitPlanMessage(app, conv_dir, resumed);
+            break :blk resumed;
+        }
+        cplan.freeTasks(gpa, resumed);
+        // No unfinished plan → decompose a fresh, non-trivial message into a new board (the >= 12-char gate skips
+        // greetings/acks so a plan inference isn't paid on every "hi"/"thanks"). This persistPlan only overwrites a
+        // completed/absent plan, so no in-progress work is lost.
+        if (std.mem.trim(u8, user_text, " \r\n\t").len >= 12) {
+            const fresh = planTask(app, run_root, base_url, key, model, user_text);
+            if (fresh.len > 0) {
+                persistPlan(app, conv_dir, fresh);
+                emitPlanMessage(app, conv_dir, fresh);
+                break :blk fresh;
+            }
+            cplan.freeTasks(gpa, fresh);
+        }
+        break :blk &.{};
+    };
+    defer cplan.freeTasks(gpa, plan);
+    const has_plan = plan.len > 0;
+
+    // ---- AUTO-LOOP DRIVE: settle one answer, then either take the next PLAN subtask (deterministic) or infer the
+    // next free-form step, and drive again until the plan/goal is done, a repeat, or the step cap. ----
     // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
     var prev_drive: []u8 = gpa.dupe(u8, user_text) catch &[_]u8{};
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
 
+    const max_steps = if (has_plan) PLAN_STEPS_PER_TURN else DRIVE_MAX;
     var drive: usize = 0;
-    outer: while (drive < DRIVE_MAX) : (drive += 1) {
+    outer: while (drive < max_steps) : (drive += 1) {
         // COOPERATIVE STOP (between drive steps): a `"op":"stop"` written to control.jsonl after the turn began.
         if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
             emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
@@ -291,17 +335,38 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
         compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len);
 
+        // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
+        // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
+        // (already the last turn) and later steps work the free-form next-step inferred at the bottom of the loop.
+        var task_idx: ?usize = null;
+        if (has_plan) {
+            const ti = cplan.nextPending(plan) orelse break :outer; // whole plan done
+            task_idx = ti;
+            cplan.setStatus(gpa, &plan[ti], cplan.STATUS_ACTIVE);
+            persistPlan(app, conv_dir, plan);
+            var sb: [220]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "subtask {d}/{d} ({s}): {s}", .{ ti + 1, plan.len, plan[ti].route, clipBytes(plan[ti].text, 80) }) catch "subtask");
+            if (subtaskInstruction(gpa, plan[ti], ti, plan.len)) |instr| {
+                defer gpa.free(instr);
+                conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+                http.jstr(gpa, &conv_buf, instr) catch break :outer;
+                conv_buf.append(gpa, '}') catch break :outer;
+            }
+        }
+
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
                 // poller disarms + clears busy instead of hanging forever (the "kept streaming after an error").
+                planStepInterrupted(app, conv_dir, plan, task_idx);
                 emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
                 return;
             },
             .stopped => {
                 // stop landed mid tool-loop — commit the last narration (if any) so the user keeps it, then close.
+                planStepInterrupted(app, conv_dir, plan, task_idx);
                 if (inner.content.len > 0) {
                     appendMsg(app, conv_dir, "assistant", inner.content, "veil", nowSecs(app.io));
                     emitAssistant(app, conv_dir, inner.content);
@@ -330,6 +395,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // commit an empty reply or drive further on nothing. Surface a brief honest note and end the turn.
         if (std.mem.trim(u8, answer, " \r\n\t").len == 0) {
             gpa.free(answer);
+            planStepInterrupted(app, conv_dir, plan, task_idx);
             const note = "(no reply — the model returned an empty or malformed response this turn)";
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
@@ -338,7 +404,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
-        if (drive == 0 and answer.len >= REFLECT_MIN) {
+        // Skipped when a plan drives the turn — the plan already structures the work, and reflecting each subtask
+        // would double the inferences.
+        if (!has_plan and drive == 0 and answer.len >= REFLECT_MIN) {
             if (reflectAnswer(app, run_root, base_url, key, model, user_text, answer)) |improved| {
                 gpa.free(answer);
                 answer = improved;
@@ -351,6 +419,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         conv_buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"content\":") catch break :outer;
         http.jstr(gpa, &conv_buf, answer) catch break :outer;
         conv_buf.append(gpa, '}') catch break :outer;
+
+        // PLAN ADVANCE: mark this subtask done + move on. The next iteration picks the next pending subtask; the
+        // free-form drive inference below is SKIPPED (the plan is the driver).
+        if (task_idx) |ti| {
+            cplan.setStatus(gpa, &plan[ti], cplan.STATUS_DONE);
+            persistPlan(app, conv_dir, plan);
+            if (cplan.nextPending(plan) == null) break :outer; // plan complete
+            continue :outer;
+        }
 
         // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE). The loop question is a
         // SYNTHETIC turn — appended only long enough to ask, then truncated back off conv_buf so it never rides
@@ -383,8 +460,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         prev_drive = nd;
     }
 
-    // The drive loop ended (DONE / repeat / DRIVE_MAX / an OOM append) — every settled answer is already durable;
-    // emit the single terminal `done` exactly once.
+    // The drive loop ended (plan complete / DONE / repeat / step cap / an OOM append) — every settled answer is
+    // already durable. A plan run gets a closing summary (all done, or paused at N/M — say "continue" to resume).
+    if (has_plan) emitPlanClosing(app, conv_dir, plan);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
@@ -568,6 +646,112 @@ fn streamFlush(sc: *StreamCtx) void {
         sc.rsn_len = 0;
     }
 }
+// ------------------------------------------------------------------------------------ veil PLAN-BOARD (Phase A+)
+
+/// Slice out the outermost {...} JSON object from a model reply (which may wrap it in prose or ``` fences).
+fn extractJsonObject(s: []const u8) []const u8 {
+    const a = std.mem.indexOfScalar(u8, s, '{') orelse return s;
+    const b = std.mem.lastIndexOfScalar(u8, s, '}') orelse return s;
+    if (b > a) return s[a .. b + 1];
+    return s;
+}
+
+/// DECOMPOSITION inference: ask the model to break the request into routed subtasks. Returns owned tasks (empty =
+/// no plan needed → a normal single-step turn). No tools; deterministic (low temp). Any failure → empty.
+fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8) []cplan.Task {
+    const gpa = app.gpa;
+    const empty: []cplan.Task = &.{};
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return empty;
+    http.jstr(gpa, &msgs, "You are veil. Plan how to tackle the user's request by decomposing it into routed subtasks.") catch return empty;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return empty;
+    var uc: std.ArrayListUnmanaged(u8) = .empty;
+    defer uc.deinit(gpa);
+    uc.appendSlice(gpa, "USER REQUEST:\n") catch return empty;
+    uc.appendSlice(gpa, clipBytes(user_text, 8000)) catch return empty;
+    uc.appendSlice(gpa, "\n\n") catch return empty;
+    uc.appendSlice(gpa, PLAN_PROMPT) catch return empty;
+    http.jstr(gpa, &msgs, uc.items) catch return empty;
+    msgs.append(gpa, '}') catch return empty;
+    var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1024, 0.3);
+    defer step.deinit(gpa);
+    if (!step.ok) return empty;
+    return cplan.parseDecomposition(gpa, extractJsonObject(step.content));
+}
+
+/// Read the persisted plan.jsonl back into a task list (for resuming a plan across turns). Empty if absent.
+fn resumePlan(app: *App, conv_dir: []const u8) []cplan.Task {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/plan.jsonl", .{conv_dir}) catch return &.{};
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return &.{};
+    defer gpa.free(data);
+    return cplan.parsePlan(gpa, data);
+}
+
+/// Write the current plan state to plan.jsonl (full overwrite — it's the live board, not an append log).
+fn persistPlan(app: *App, conv_dir: []const u8, plan: []const cplan.Task) void {
+    const gpa = app.gpa;
+    const body = cplan.formatPlan(gpa, plan) catch return;
+    defer gpa.free(body);
+    const path = std.fmt.allocPrint(gpa, "{s}/plan.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = body }) catch {};
+}
+
+/// Commit a readable rendering of the plan as an assistant message — durable + visible in chat + in the model's
+/// own context so it knows its plan. Marks each task with its route and (on a resume) its status.
+fn emitPlanMessage(app: *App, conv_dir: []const u8, plan: []const cplan.Task) void {
+    const gpa = app.gpa;
+    var m: std.ArrayListUnmanaged(u8) = .empty;
+    defer m.deinit(gpa);
+    m.appendSlice(gpa, "Here's my plan:\n") catch return;
+    for (plan, 0..) |t, i| {
+        const mark = if (std.mem.eql(u8, t.status, cplan.STATUS_DONE)) "[x] " else "[ ] ";
+        const line = std.fmt.allocPrint(gpa, "{d}. {s}({s}) {s}\n", .{ i + 1, mark, t.route, t.text }) catch return;
+        defer gpa.free(line);
+        m.appendSlice(gpa, line) catch return;
+    }
+    appendMsg(app, conv_dir, "assistant", m.items, "veil", nowSecs(app.io));
+    emitAssistant(app, conv_dir, m.items);
+}
+
+/// The instruction injected as the working turn for one subtask — the subtask text + a route-specific nudge.
+fn subtaskInstruction(gpa: std.mem.Allocator, task: cplan.Task, idx: usize, total: usize) ?[]u8 {
+    const hint = if (std.mem.eql(u8, task.route, cplan.ROUTE_HIVE))
+        "This subtask suits a HIVE — `cast` a swarm for it and steer it; don't build it all yourself."
+    else if (std.mem.eql(u8, task.route, cplan.ROUTE_RESEARCH))
+        "You may be missing knowledge here — research it first (web_search / read_url / recall_hive) before acting."
+    else
+        "Do this directly with your own tools (write_file / edit_file / run_python).";
+    return std.fmt.allocPrint(gpa, "Work this subtask now — step {d} of {d} in your plan: {s}\nSuggested route ({s}): {s}\nWhen it's done, briefly say what you did.", .{ idx + 1, total, task.text, task.route, hint }) catch null;
+}
+
+/// A plan subtask was mid-flight when the turn aborted (Stop / hard error / empty answer). Mark it DONE + persist
+/// so a resume does NOT re-run it — critically, a `route:hive` subtask that already cast a swarm must not re-cast a
+/// duplicate on "continue". No-op when no subtask is active. (The user sees it marked and can re-plan if needed.)
+fn planStepInterrupted(app: *App, conv_dir: []const u8, plan: []cplan.Task, task_idx: ?usize) void {
+    const ti = task_idx orelse return;
+    if (ti >= plan.len) return;
+    cplan.setStatus(app.gpa, &plan[ti], cplan.STATUS_DONE);
+    persistPlan(app, conv_dir, plan);
+}
+
+/// Closing message after the drive loop worked a plan: all done, or paused with N/M and how to resume.
+fn emitPlanClosing(app: *App, conv_dir: []const u8, plan: []const cplan.Task) void {
+    const gpa = app.gpa;
+    const done = cplan.doneCount(plan);
+    const total = plan.len;
+    const note = if (cplan.allDone(plan))
+        std.fmt.allocPrint(gpa, "Plan complete — worked all {d} subtasks.", .{total}) catch return
+    else
+        std.fmt.allocPrint(gpa, "Worked {d} of {d} planned subtasks this turn. Say \"continue\" to do the rest.", .{ done, total }) catch return;
+    defer gpa.free(note);
+    appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
+    emitAssistant(app, conv_dir, note);
+}
+
 // --------------------------------------------------------------------------- veil ORCHESTRATION tools (Phase A)
 
 /// A safe empty tool-result (len 0) for OOM fallbacks — never freed (the caller frees only result.len>0).
