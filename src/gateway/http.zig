@@ -71,9 +71,21 @@ pub fn sessionToken(req: *httpz.Request) ?[]const u8 {
     return null;
 }
 
+/// Append `data` to `path` (read-modify-write: read the file, then rewrite it with `data` appended). NOTE this is
+/// not an O_APPEND; it is O(file) per call, so it suits small/moderate logs, not unbounded high-frequency streams.
+///
+/// CRITICAL: a MISSING file is the normal first-append case (empty existing). But any OTHER read error — above all
+/// error.StreamTooLong once the file passes the read cap — must NOT fall through to an empty `existing`, or the
+/// writeFile below would OVERWRITE the entire file with just `data` (silent total truncation to one record — the
+/// "8 MiB amnesia cliff"). On such an error we refuse to write and propagate it, leaving the file intact. The cap
+/// is generous (64 MiB) so real conversation logs keep growing long before the ceiling.
 pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     const dir = std.Io.Dir.cwd();
-    const existing = dir.readFileAlloc(io, path, alloc, .limited(8 << 20)) catch &[_]u8{};
+    const existing: []u8 = dir.readFileAlloc(io, path, alloc, .limited(64 << 20)) catch |e| switch (e) {
+        error.FileNotFound => &[_]u8{},
+        else => return e, // e.g. StreamTooLong — do NOT overwrite; preserve the file
+    };
+    defer if (existing.len > 0) alloc.free(existing); // was previously leaked on every append
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
     try buf.appendSlice(alloc, existing);
