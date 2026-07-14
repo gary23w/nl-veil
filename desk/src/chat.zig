@@ -4400,10 +4400,20 @@ pub const Chat = struct {
             self.turn = .idle;
             self.appendMsg(dd, .cast_note, "(stopped)");
         }
-        // Stop a SERVER-chat turn's desk-side rendering: the poller stops rendering frames. The server turn itself
-        // keeps running server-side (like a running cast, which Stop also leaves alone) — this just returns the
-        // desk to idle so the user can take over.
+        // Stop a SERVER-chat turn: signal the running server turn to abort (control POST below), then stop the
+        // desk-side poller + drop any half-streamed preview so the desk returns to idle and the user can take over.
         if (self.sc_active) {
+            // Reach the SERVER turn: POST {"op":"stop"} to its control channel (the turn checks control.jsonl
+            // between drive steps + before each inference and aborts). WITHOUT this, the detached background turn
+            // keeps running + streaming forever — the "killed the loop but it kept going" bug. Then disarm the
+            // desk poller + drop any half-streamed preview.
+            const conv = self.sc_conv[0..self.sc_conv_len];
+            if (conv.len > 0) {
+                if (self.runner().chatControl(self.io, self.gpa, conv, "{\"op\":\"stop\"}")) |r| {
+                    if (r.body.len > 0) self.gpa.free(r.body);
+                }
+            }
+            self.scClearStream();
             self.sc_active = false;
             self.appendMsg(dd, .cast_note, "(stopped)");
         }

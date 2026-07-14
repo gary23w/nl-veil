@@ -132,6 +132,15 @@ pub fn chatEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, 
     return httpReq(io, gpa, "GET", port, path, token, null, 8);
 }
 
+/// POST /api/v1/chat/convs/<conv>/control — write a cooperative control op (e.g. {"op":"stop"}) the running
+/// server turn reads BETWEEN steps + before each inference. Fire-and-return; the turn aborts at its next check.
+pub fn chatControl(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.chatControl port={d} conv={s}", .{ port, conv });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}/control", .{conv}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 8);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });
