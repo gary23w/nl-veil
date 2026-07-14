@@ -209,10 +209,14 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
 
-    chat_engine.runTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text);
+    // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames
+    // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes — the
+    // "shows only 'server thinking'" symptom. The turn writes frames to events.jsonl as it runs.
+    chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text);
 
+    res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
-    try res.json(.{ .ok = true, .conv = seg, .turn = "done", .events_url = events_url }, .{});
+    try res.json(.{ .ok = true, .conv = seg, .turn = "running", .events_url = events_url }, .{});
 }
 
 /// POST /api/v1/chat/convs/:id/control — append a cooperative control op (e.g. {"op":"stop"}) to the conv's
