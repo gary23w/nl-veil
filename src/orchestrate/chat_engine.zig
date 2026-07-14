@@ -162,9 +162,9 @@ fn appendMsg(app: *App, conv_dir: []const u8, role: []const u8, content: []const
 }
 
 /// Emit the turn's token USAGE (the delta of the process token counters since `t0`, i.e. this turn's tokens) as a
-/// `{"kind":"usage",...}` frame, then the terminal `{"kind":"done"}`. Called at EVERY turn-completion path so the
-/// desk always gets a usage frame right before it disarms. Zero delta (e.g. a no-op turn) emits no usage frame.
-fn finishTurn(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
+/// `{"kind":"usage",...}` frame. Snapshotted BEFORE any deferred end-of-turn maintenance (the rolling-summary
+/// refresh) so the displayed usage reflects the ANSWER's tokens, not background summarization. Zero delta = no frame.
+fn emitUsage(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
     const t1 = llm.tokensSnapshot();
     const din = if (t1.in >= t0.in) t1.in - t0.in else 0;
     const dout = if (t1.out >= t0.out) t1.out - t0.out else 0;
@@ -172,6 +172,13 @@ fn finishTurn(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
         var b: [160]u8 = undefined;
         emitEvent(app, conv_dir, std.fmt.bufPrint(&b, "{{\"kind\":\"usage\",\"tokens_in\":{d},\"tokens_out\":{d},\"text\":\"{d} tokens in · {d} out\"}}", .{ din, dout, din, dout }) catch "{\"kind\":\"usage\"}");
     }
+}
+
+/// Emit the turn's usage then the terminal `{"kind":"done"}`. Used at the STOP / error / empty completion paths
+/// (which must end promptly — no deferred summary work). The NORMAL completion path emits usage, runs the deferred
+/// summary refresh, THEN done inline (so {done} still comes last), instead of calling this.
+fn finishTurn(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
+    emitUsage(app, conv_dir, t0);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
@@ -294,7 +301,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + a recency window of the newest turns. The durable log stays whole.
-    assembleHistory(app, conv_dir, run_root, base_url, key, model, user_text, &conv_buf);
+    assembleHistory(app, conv_dir, user_text, &conv_buf);
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
     // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
@@ -501,7 +508,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // The drive loop ended (plan complete / DONE / repeat / step cap / an OOM append) — every settled answer is
     // already durable. A plan run gets a closing summary (all done, or paused at N/M — say "continue" to resume).
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
-    finishTurn(app, conv_dir, usage_t0);
+    // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
+    // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
+    // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
+    // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
+    emitUsage(app, conv_dir, usage_t0);
+    refreshSummary(app, conv_dir, run_root, base_url, key, model);
+    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
 // ---- PER-CONVERSATION TURN LOCK ----------------------------------------------------------------------------
@@ -1524,7 +1537,7 @@ fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
@@ -1537,10 +1550,13 @@ fn assembleHistory(app: *App, conv_dir: []const u8, run_root: []const u8, base_u
     const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return; // no history yet → nothing to seed
     const view = cctx.computeView(ht.head, ht.tail, ht.size, cctx.HISTORY_WINDOW_BYTES);
 
-    // ROLLING SUMMARY: when older turns have scrolled past the recency window, inject a condensed running summary
-    // of them so continuity survives beyond the window + relevance recall.
+    // ROLLING SUMMARY: when older turns have scrolled past the recency window, inject the condensed running summary
+    // of them so continuity survives beyond the window + relevance recall. CRITICAL PATH: only the PERSISTED summary
+    // is loaded here (a cheap file read) — the LLM fold-in of newly-dropped history is deferred to refreshSummary at
+    // end-of-turn, so the first streamed token never waits on a summarization round-trip. The injected summary can
+    // therefore lag by one turn's worth of dropped middle; the recency window + goal pin + relevance recall cover it.
     if (view.gap) {
-        const sum = loadOrUpdateSummary(app, conv_dir, run_root, base_url, key, model, mpath, view);
+        const sum = loadSummary(app, conv_dir);
         defer if (sum.len > 0) gpa.free(sum);
         if (sum.len > 0) {
             var sc: std.ArrayListUnmanaged(u8) = .empty;
@@ -1564,43 +1580,83 @@ fn assembleHistory(app: *App, conv_dir: []const u8, run_root: []const u8, base_u
     if (view.window.len == 0) appendMsgObj(gpa, conv_buf, "user", user_text, cctx.CURRENT_MSG_PIN_CAP);
 }
 
-/// Load the persisted rolling summary + its coverage cursor from {conv_dir}/context.json, and if the recency
-/// window has rolled forward past what the summary covers, fold the newly-dropped span into it (one cheap no-tools
-/// completion) and persist the advance. Returns the (gpa-owned) summary text to inject, or an EMPTY slice (never
-/// null) when there's nothing / on any failure — the caller frees only a non-empty return.
-fn loadOrUpdateSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, mpath: []const u8, view: cctx.View) []u8 {
+/// Serializes context.json reads/writes across the (rare) case of a deferred refreshSummary on one turn's thread
+/// racing the next turn's loadSummary — held only for the quick file ops, NEVER across the summarization LLM call.
+var ctx_json_mtx: std.Io.Mutex = .init;
+
+/// CRITICAL PATH: load ONLY the persisted rolling summary text from {conv_dir}/context.json (a cheap file read, no
+/// LLM). The fold-in of newly-dropped history is deferred to refreshSummary at end-of-turn, so the first streamed
+/// token never waits on a summarization round-trip. gpa-owned text, or an EMPTY slice (never null) if absent/garbage.
+fn loadSummary(app: *App, conv_dir: []const u8) []u8 {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
-
-    // ---- load existing {covered, summary} (absent/garbage → covered 0, empty summary) ----
-    var covered: usize = 0;
-    var summary: []u8 = empty; // gpa-owned once duped below
     const cpath = std.fmt.allocPrint(gpa, "{s}/context.json", .{conv_dir}) catch return empty;
     defer gpa.free(cpath);
-    if (std.Io.Dir.cwd().readFileAlloc(app.io, cpath, gpa, .limited(1 << 20))) |raw| {
-        defer gpa.free(raw);
-        const S = struct { covered: usize = 0, summary: []const u8 = "" };
-        if (std.json.parseFromSlice(S, gpa, raw, .{ .ignore_unknown_fields = true })) |p| {
-            defer p.deinit();
-            covered = p.value.covered;
-            if (p.value.summary.len > 0) summary = gpa.dupe(u8, p.value.summary) catch empty;
-        } else |_| {}
-    } else |_| {}
+    ctx_json_mtx.lockUncancelable(app.io);
+    defer ctx_json_mtx.unlock(app.io);
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, cpath, gpa, .limited(1 << 20)) catch return empty;
+    defer gpa.free(raw);
+    const S = struct { covered: usize = 0, summary: []const u8 = "" };
+    const p = std.json.parseFromSlice(S, gpa, raw, .{ .ignore_unknown_fields = true }) catch return empty;
+    defer p.deinit();
+    if (p.value.summary.len == 0) return empty;
+    return gpa.dupe(u8, p.value.summary) catch empty;
+}
 
-    // ---- is there newly-dropped history to fold in? summary should cover [goal_end, window_start) ----
+/// DEFERRED (end of a NORMAL turn, after the answer is delivered): if the recency window has rolled forward past
+/// what the persisted summary covers, fold the newly-dropped span into the summary (one no-tools ctxsum completion)
+/// and persist it for the NEXT turn. This is the ONLY place the summary advances — kept OFF the first-token path,
+/// which is the whole point. Re-reads the (now-grown) transcript for a fresh view. Best-effort: any failure leaves
+/// the prior summary intact (the next turn retries). The ctxsum LLM call runs OUTSIDE the context.json lock so it
+/// never blocks a concurrent loadSummary; two overlapping refreshes just race to persist and the later (wider) wins.
+fn refreshSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8) void {
+    const gpa = app.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(mpath);
+    const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
+    defer gpa.free(head_buf);
+    const tail_buf = gpa.alloc(u8, cctx.HISTORY_WINDOW_BYTES) catch return;
+    defer gpa.free(tail_buf);
+    const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return;
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, cctx.HISTORY_WINDOW_BYTES);
+    if (!view.gap) return; // the window still covers everything → nothing has dropped that needs summarizing
+
+    const cpath = std.fmt.allocPrint(gpa, "{s}/context.json", .{conv_dir}) catch return;
+    defer gpa.free(cpath);
+
+    // load current {covered, summary} under the lock (quick file read only)
+    var covered: usize = 0;
+    var summary: []u8 = &[_]u8{};
+    {
+        ctx_json_mtx.lockUncancelable(app.io);
+        defer ctx_json_mtx.unlock(app.io);
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, cpath, gpa, .limited(1 << 20))) |raw| {
+            defer gpa.free(raw);
+            const S = struct { covered: usize = 0, summary: []const u8 = "" };
+            if (std.json.parseFromSlice(S, gpa, raw, .{ .ignore_unknown_fields = true })) |p| {
+                defer p.deinit();
+                covered = p.value.covered;
+                if (p.value.summary.len > 0) summary = gpa.dupe(u8, p.value.summary) catch &[_]u8{};
+            } else |_| {}
+        } else |_| {}
+    }
+    defer if (summary.len > 0) gpa.free(summary);
+
+    // is there newly-dropped history to fold in? the summary should cover [goal_end, window_start)
     const target = view.window_start;
     const span_from = @max(covered, view.goal_end);
-    if (target <= span_from) return summary; // already covered (or no middle) → inject what we have
+    if (target <= span_from) return; // already covered → nothing to do
 
-    const span_buf = gpa.alloc(u8, cctx.SUMMARY_SPAN_CAP) catch return summary;
+    const span_buf = gpa.alloc(u8, cctx.SUMMARY_SPAN_CAP) catch return;
     defer gpa.free(span_buf);
-    const span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return summary;
-    if (span.len == 0) return summary;
+    const span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return;
+    if (span.len == 0) return;
 
-    const updated = summarizeInto(app, run_root, base_url, key, model, summary, span) orelse return summary;
-    persistSummary(app, cpath, target, updated); // best-effort; even if the write fails we still inject `updated`
-    if (summary.len > 0) gpa.free(summary);
-    return updated;
+    const updated = summarizeInto(app, run_root, base_url, key, model, summary, span) orelse return; // LLM call, no lock held
+    defer gpa.free(updated);
+    ctx_json_mtx.lockUncancelable(app.io);
+    defer ctx_json_mtx.unlock(app.io);
+    persistSummary(app, cpath, target, updated); // best-effort
 }
 
 /// One no-tools completion that rewrites the running summary to incorporate a span of just-dropped messages.
