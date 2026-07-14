@@ -348,6 +348,10 @@ const MAX_TOOL_ITERS: u32 = 20;
 // conditions end the loop. DONE folds into a fresh drive, the repeat-guard is skipped, the caps wrap, a
 // question is answered on the away user's behalf, and failures re-plan. Only the user ends it (toggle/Stop).
 const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task needs many steps
+/// SERVER CHAT (P0-6): consecutive failed/unreachable event polls before pumpServerChat gives up and un-sticks
+/// the busy UI. The poller runs ~1Hz, so ~180 ≈ 3 minutes of a genuinely down/wedged server (a healthy turn's
+/// polls all return 200 and reset the count long before this).
+const SC_MAX_FAILS: u32 = 180;
 /// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
 /// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
 /// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
@@ -655,6 +659,16 @@ pub const Chat = struct {
     internal_turn: bool = false, // the current turn's `last_user` is a MACHINE directive (merge/nudge), not a real
     //                              user message — so it must NOT trigger memory consolidation. Cleared in cmdSend.
 
+    // SERVER CHAT (P0-6, gated on Settings.server_chat; default OFF ⇒ all of these stay inert). When ON, a user
+    // send routes to the conv's SERVER-side turn instead of the local loop, and pumpServerChat renders the turn's
+    // event frames into the transcript by polling /events past a byte cursor.
+    sc_active: bool = false, // a server turn is in flight for sc_conv → pumpServerChat renders its NEW frames
+    sc_from: usize = 0, //      byte cursor into the conv's events.jsonl — only frames past here are new
+    sc_conv: [64]u8 = [_]u8{0} ** 64, // the conv the server turn was fired for (its id doubles as the /events path)
+    sc_conv_len: usize = 0,
+    sc_fails: u32 = 0, //        consecutive failed/unreachable event polls — bounds the retry so a down server can't
+    //                           leave the UI busy forever (reset on any good poll)
+
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
         const dd0 = self.dataDir(&dbuf);
@@ -691,6 +705,7 @@ pub const Chat = struct {
             // settled. Re-checking every idle tick self-heals that gap (maybeLoop no-ops unless loop is on AND the
             // chat is genuinely idle with something to continue from, so this can't run away or double-fire).
             if (tick % 10 == 5) self.maybeLoop(dd);
+            if (tick % 10 == 2) self.pumpServerChat(dd); // ~1Hz: render a SERVER-side turn's frames (no-op unless sc_active)
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
             if (tick % 10 == 3) self.maybeFinishAfterVeil(dd); // concurrent veil: compose the answer once cast + veil are both done
@@ -1074,6 +1089,191 @@ pub const Chat = struct {
         return runner_mod.local(self.store);
     }
 
+    // ---------------------------------------------------------------- SERVER CHAT (P0-6, gated on server_chat)
+
+    /// True when the SERVER CHAT setting is on (the chat brain runs in the backend, not the local loop). Read
+    /// under the store lock. Default false ⇒ cmdSend takes the existing local path and this whole surface is inert.
+    fn serverChatOn(self: *Chat) bool {
+        self.store.lock();
+        defer self.store.unlock();
+        return self.store.settings.server_chat;
+    }
+
+    /// Route one user send to the conv's SERVER-side chat turn. Returns true if the send was handed to the server
+    /// (the caller then SKIPS the entire local turn path); false if no conv could be resolved, so the caller falls
+    /// back to the local loop. The user message is ALREADY in the transcript (cmdSend appended it before calling).
+    fn routeToServerChat(self: *Chat, dd: []const u8, text: []const u8) bool {
+        var convb: [96]u8 = undefined;
+        const conv = self.convScope(&convb);
+        if (conv.len == 0 or conv.len > self.sc_conv.len) return false; // no resolvable conv → local fallback
+
+        // The desk's local auto-loop must NOT also drive turns while the server owns the brain (maybeLoop grabs the
+        // idle turn slot whenever chat_loop is set). One server send = one server turn; disarm the local loop.
+        {
+            self.store.lock();
+            self.store.chat_loop = false;
+            self.store.chat_loop_afk = false;
+            self.store.unlock();
+        }
+
+        // Baseline cursor: only frames written AFTER this send are new. Anything already in events.jsonl is either
+        // rendered by a prior server turn or empty (a fresh conv). chatEvents(conv,0).body.len = whole-file length.
+        var from0: usize = 0;
+        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
+            from0 = er.body.len;
+            if (er.body.len > 0) self.gpa.free(er.body);
+        }
+
+        // Resolve the provider so BYOK carries server-side; the server falls back to its OWN configured provider on
+        // blank fields, so even a local-Ollama desk works though these come through populated.
+        var bb: [256]u8 = undefined;
+        var kb: [192]u8 = undefined;
+        var mb: [96]u8 = undefined;
+        const prov = self.resolveProvider(&bb, &kb, &mb);
+
+        var body: [4096]u8 = undefined;
+        var w = Io.Writer.fixed(&body);
+        const bok = blk: {
+            w.writeAll("{\"text\":\"") catch break :blk false;
+            wesc(&w, text);
+            w.writeAll("\",\"base_url\":\"") catch break :blk false;
+            wesc(&w, prov.base_url);
+            w.writeAll("\",\"model\":\"") catch break :blk false;
+            wesc(&w, prov.model);
+            w.writeAll("\",\"api_key\":\"") catch break :blk false;
+            wesc(&w, prov.key);
+            w.writeAll("\"}") catch break :blk false;
+            break :blk true;
+        };
+        if (!bok) {
+            self.appendMsg(dd, .veil, "(server chat: the request was too large to build)");
+            return true; // handled (as a failure) — do NOT also run the local path
+        }
+
+        // ARM the poller BEFORE the (blocking) send: chatSend runs the whole turn synchronously server-side and
+        // returns only when it finishes or the POST ceiling is hit — but frames land in events.jsonl the whole
+        // time, so a turn that outlives the POST still has its frames rendered by pumpServerChat from this cursor.
+        @memcpy(self.sc_conv[0..conv.len], conv);
+        self.sc_conv_len = conv.len;
+        self.sc_from = from0;
+        self.sc_fails = 0;
+        self.sc_active = true;
+        self.setBusy(true);
+        self.setStatus("server turn running...");
+        log.info("server chat: send conv={s} from={d} model={s}", .{ conv, from0, prov.model });
+
+        if (self.runner().chatSend(self.io, self.gpa, conv, w.buffered())) |resp| {
+            defer if (resp.body.len > 0) self.gpa.free(resp.body);
+            log.info("server chat: POST -> status={d}", .{resp.status});
+            // 200/201 = the turn RAN to completion (its frames, incl. {done}, are on disk) — leave the poller
+            // armed to render them. Any other status is terminal (501 flag off, 401/403 auth, other 4xx/5xx): disarm.
+            if (resp.status != 200 and resp.status != 201) {
+                var nb: [240]u8 = undefined;
+                const msg = std.fmt.bufPrint(&nb, "(server chat unavailable — HTTP {d}. Is the veil server running with VEIL_CHAT_BACKEND=1, and are you signed in as admin?)", .{resp.status}) catch "(server chat unavailable)";
+                self.appendMsg(dd, .veil, msg);
+                self.sc_active = false;
+                self.setBusy(false);
+                self.setStatus("");
+            }
+        } else {
+            // Null = the POST hit its ceiling or the server was briefly unreachable. The server may STILL be running
+            // the turn and writing frames — keep the poller armed; it renders them, or gives up on SC_MAX_FAILS.
+            log.warn("server chat: POST returned null — poller will render any frames the server writes", .{});
+        }
+        return true;
+    }
+
+    /// SERVER CHAT poller: render a server-side turn's event frames into the transcript. No-op unless a server send
+    /// armed it (sc_active) — so with server_chat OFF this never does anything. Reads the conv's events.jsonl past
+    /// the byte cursor and renders each COMPLETE line, advancing the cursor ONLY past complete lines (a trailing
+    /// partial line waits for the next poll — keeps rendering idempotent). Called ~1Hz from run().
+    fn pumpServerChat(self: *Chat, dd: []const u8) void {
+        if (!self.sc_active) return;
+        const conv = self.sc_conv[0..self.sc_conv_len];
+        if (conv.len == 0) {
+            self.abortServerChat(dd, "");
+            return;
+        }
+        const resp = self.runner().chatEvents(self.io, self.gpa, conv, self.sc_from) orelse {
+            // server unreachable this tick — don't spin or crash: retry next tick, but bound it so a truly down
+            // server can't leave the chat busy forever.
+            self.sc_fails +%= 1;
+            if (self.sc_fails >= SC_MAX_FAILS) self.abortServerChat(dd, "(server chat: no response from the veil server — stopping)");
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) {
+            self.sc_fails +%= 1;
+            if (self.sc_fails >= SC_MAX_FAILS) {
+                var nb: [200]u8 = undefined;
+                self.abortServerChat(dd, std.fmt.bufPrint(&nb, "(server chat: events poll failed — HTTP {d}, stopping)", .{resp.status}) catch "(server chat: events poll failed)");
+            }
+            return;
+        }
+        self.sc_fails = 0; // a good poll refills the failure budget
+        const bodyb = resp.body;
+        var consumed: usize = 0;
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, bodyb, start, '\n')) |nl| {
+            const line = bodyb[start..nl]; // a COMPLETE line (excludes the '\n')
+            consumed = nl + 1; //            everything up to and including this '\n' is safe to advance past
+            start = nl + 1;
+            self.renderScFrame(dd, line);
+            if (!self.sc_active) break; // a {done} frame disarmed us — stop rendering the rest of this poll
+        }
+        self.sc_from += consumed; // advance ONLY past complete lines; a trailing partial waits for the next poll
+    }
+
+    /// Render ONE server event frame line into the transcript. Frames are one flat JSON object per line, keyed by
+    /// "kind" (see src/orchestrate/chat_service.zig): message / tool / reasoning / error / done.
+    fn renderScFrame(self: *Chat, dd: []const u8, line_raw: []const u8) void {
+        const line = std.mem.trim(u8, line_raw, " \r\n\t");
+        if (line.len == 0) return;
+        const kind = scRawField(line, "kind") orelse return; // no kind → not a frame we render
+        if (std.mem.eql(u8, kind, "message")) {
+            const role = scRawField(line, "role") orelse "";
+            if (std.mem.eql(u8, role, "user")) return; // the user message is already in the transcript locally
+            if (scRawField(line, "content")) |raw| {
+                var buf: [store_mod.STREAM_CAP]u8 = undefined;
+                const content = scUnescape(raw, &buf);
+                if (content.len > 0) self.appendMsg(dd, .veil, content);
+            }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "tool")) {
+            const tool = scRawField(line, "tool") orelse "";
+            const state = scRawField(line, "state") orelse "";
+            var nb: [140]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "[tool:{s}] {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)] }) catch "[tool]";
+            self.appendMsg(dd, .cast_note, note);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "error")) {
+            var buf: [512]u8 = undefined;
+            const err = if (scRawField(line, "err")) |raw| scUnescape(raw, &buf) else "";
+            var nb: [600]u8 = undefined;
+            const note = std.fmt.bufPrint(&nb, "(server error: {s})", .{err[0..@min(err.len, 500)]}) catch "(server error)";
+            self.appendMsg(dd, .veil, note);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "done")) {
+            self.sc_active = false;
+            self.setBusy(false);
+            self.setStatus("");
+            return;
+        }
+        // "reasoning" (and any other kind): not rendered into the transcript in this first cut.
+    }
+
+    /// End a server-chat exchange, optionally leaving a one-line notice (unreachable / poll failure). An empty
+    /// note just disarms silently. Clears the busy/status the send set.
+    fn abortServerChat(self: *Chat, dd: []const u8, note: []const u8) void {
+        if (note.len > 0) self.appendMsg(dd, .veil, note);
+        self.sc_active = false;
+        self.setBusy(false);
+        self.setStatus("");
+    }
+
     /// Is there work in flight that a chat switch/new-chat would corrupt (a live model turn, a running cast, or an
     /// AI console command)? Any settling output resolves its target conversation from conv_active at write time, so
     /// repointing it mid-flight misroutes the reply — refuse the switch while this is true.
@@ -1081,8 +1281,9 @@ pub const Chat = struct {
         // Also block during the WHOLE concurrent-veil window: castFinished flips cast_active false while the merge
         // is still pending (cast_awaiting_merge) and the veil turn may still be running (veil_work_active). A switch
         // in those idle gaps would repoint conv_active and the settling veil/merge appends would overwrite the
-        // newly-selected chat. Mirror maybeLoop's guard.
-        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil;
+        // newly-selected chat. Mirror maybeLoop's guard. sc_active: a SERVER-chat turn renders its frames into the
+        // active conv from the poller (self.turn stays .idle for it), so a switch mid-turn would misroute them.
+        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil or self.sc_active;
     }
 
     /// Is a cast in flight anywhere in its lifecycle (deploying/running, or the concurrent-veil parallel attempt /
@@ -1884,9 +2085,10 @@ pub const Chat = struct {
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
         if (text.len == 0) return;
-        if (self.turn != .idle or self.consoleAiBusy()) {
+        if (self.turn != .idle or self.consoleAiBusy() or self.sc_active) {
             // Don't silently drop the message (the "new chat fails to deploy / nothing happens" report) — tell the
             // user why. Sending DURING a cast is fine (cast_active isn't blocked here); only a live turn/console is.
+            // sc_active: a server-chat turn is rendering — a second send would clobber its poll cursor/conv.
             self.store.pushNotif("Busy", "finish or Stop the current reply before sending", 2);
             return;
         }
@@ -1945,6 +2147,13 @@ pub const Chat = struct {
         self.reflect_trace_has_reason = false;
         self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
         self.appendMsg(dd, .user, text);
+        // SERVER CHAT ROUTING (P0-6, gated on Settings.server_chat; default OFF ⇒ never taken, the LOCAL path
+        // below runs exactly as today). When ON, the brain lives in the backend: hand this send to the conv's
+        // server turn and let pumpServerChat render the frames. The whole local path (cast fast-path, knowledge
+        // directive, startTurn, auto-loop) is SKIPPED. On a resolvable conv this returns; else it falls through.
+        if (self.serverChatOn()) {
+            if (self.routeToServerChat(dd, text)) return;
+        }
         // SUB-AGENT DISPATCH: an explicit "cast a swarm to ..." IS the task — deploy it NOW instead of
         // spending a whole model turn deciding to (measured ~10s hosted, up to a minute on a local thinking
         // model, before the hive even existed). Config rides the user's own words mechanically (N minds /
@@ -2501,6 +2710,7 @@ pub const Chat = struct {
         var ropen = true;
         var shell_allow = false;
         var speed = true;
+        var server_chat = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -2520,6 +2730,7 @@ pub const Chat = struct {
             ropen = s.chat_right_open;
             shell_allow = s.shell_always_allow;
             speed = s.speed_mode;
+            server_chat = s.server_chat;
         }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -2530,7 +2741,7 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{}}}", .{ lopen, ropen, shell_allow, speed }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"server_chat\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -2571,6 +2782,7 @@ pub const Chat = struct {
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
+        s.server_chat = std.mem.indexOf(u8, data, "\"server_chat\":true") != null; // absent = default OFF (local brain)
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -4067,6 +4279,13 @@ pub const Chat = struct {
             llm.abort(&self.stream, self.io);
             self.stream.deinit(self.gpa);
             self.turn = .idle;
+            self.appendMsg(dd, .cast_note, "(stopped)");
+        }
+        // Stop a SERVER-chat turn's desk-side rendering: the poller stops rendering frames. The server turn itself
+        // keeps running server-side (like a running cast, which Stop also leaves alone) — this just returns the
+        // desk to idle so the user can take over.
+        if (self.sc_active) {
+            self.sc_active = false;
             self.appendMsg(dd, .cast_note, "(stopped)");
         }
         self.setStatus("");
@@ -7786,6 +8005,58 @@ fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const
             i += n;
         }
     }
+}
+
+/// Locate the string value of a flat top-level "key" in one JSON object line, RESPECTING backslash escapes so an
+/// escaped quote inside the value doesn't clip it early. Returns the RAW (still-escaped) inner slice into `s`, or
+/// null if the key or its opening quote isn't found. Desk-local, escape-aware twin of chat_service.jsonField —
+/// enough for the server chat event frames (flat objects, string values). A non-string value returns null.
+fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {
+    var pat_buf: [40]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const kidx = std.mem.indexOf(u8, s, pat) orelse return null;
+    var i = kidx + pat.len;
+    while (i < s.len and (s[i] == ' ' or s[i] == ':' or s[i] == '\t')) : (i += 1) {}
+    if (i >= s.len or s[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') { // skip the escaped byte so a \" doesn't end the value
+            i += 1;
+            continue;
+        }
+        if (s[i] == '"') return s[start..i];
+    }
+    return null; // unterminated
+}
+
+/// Unescape a JSON string body (the RAW slice from scRawField) into `buf`, returning the decoded slice (clamped to
+/// buf.len). Handles the escapes these frames actually use (\" \\ \/ \n \r \t); any other \x passes the following
+/// byte through, and a bare \uXXXX is left literal (the server's writers never emit one).
+fn scUnescape(raw: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len and n < buf.len) {
+        const c = raw[i];
+        if (c == '\\' and i + 1 < raw.len) {
+            buf[n] = switch (raw[i + 1]) {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                else => raw[i + 1],
+            };
+            n += 1;
+            i += 2;
+            continue;
+        }
+        buf[n] = c;
+        n += 1;
+        i += 1;
+    }
+    return buf[0..n];
 }
 
 fn wesc(w: *Io.Writer, s: []const u8) void {

@@ -109,6 +109,29 @@ pub fn chatTool(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, bo
     return httpReq(io, gpa, "POST", port, "/api/v1/chat/tool", token, body_json, 45);
 }
 
+/// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn for this conversation (the brain
+/// moved into the backend; P0-6). body_json = {"text":..,"base_url":..,"model":..,"api_key":..}. The turn runs
+/// SYNCHRONOUSLY server-side, so this blocks until it finishes or the ceiling is hit — the turn's frames are
+/// written to the conv's events.jsonl incrementally either way, and chatEvents renders them. `conv` is the
+/// safeSeg-clean conversation id (no URL-escaping needed). Generous ceiling: a full agentic turn (several tool
+/// calls) can run well past a single tool's time.
+pub fn chatSend(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.chatSend port={d} conv={s} body_len={d}", .{ port, conv, body_json.len });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}/messages", .{conv}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 180);
+}
+
+/// GET /api/v1/chat/convs/<conv>/events?from=<from> — byte-cursor poll over the conv's events.jsonl: returns the
+/// bytes from offset `from` to end (so the NEXT offset = from + returned_body.len). Idempotent + short ceiling:
+/// the desk poller calls this ~1Hz while a server turn runs, so a slow server must not stall it for long.
+pub fn chatEvents(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8, from: usize) ?Resp {
+    log.trace("netcli.chatEvents port={d} conv={s} from={d}", .{ port, conv, from });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}/events?from={d}", .{ conv, from }) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 8);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });
