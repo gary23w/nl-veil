@@ -20,6 +20,7 @@ const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
 const llm = @import("../worker/llm.zig");
 const cctx = @import("chat_context.zig");
+const deploy_service = @import("deploy_service.zig");
 
 const App = http.App;
 
@@ -63,7 +64,30 @@ const SYSTEM_PROMPT =
     "for the live web, read_file / write_file / edit_file / list_dir / run_python / run_tests to build and run " ++
     "code in your working directory, and observe / recall / recall_hive for memory. Use a tool when it genuinely " ++
     "helps; call tools one or more times, then when you have what you need reply to the user directly in plain " ++
-    "prose. Keep answers concrete and grounded in what the tools actually returned.";
+    "prose. Keep answers concrete and grounded in what the tools actually returned.\n" ++
+    "HOW YOU WORK A TASK. Your FIRST move on any non-trivial request is to BREAK IT DOWN into a concrete list of " ++
+    "smaller subtasks -- however many it takes, a handful or dozens -- and show the user that plan. Then work the " ++
+    "list, and for EACH subtask decide the best route: (a) DELEGATE TO A HIVE -- if a team building or " ++
+    "researching in parallel would do it better or faster, `cast` a swarm for that part (it builds in THIS " ++
+    "conversation, so its files sit alongside yours), then GUIDE that swarm: `swarm_status` to see how it's " ++
+    "doing, `steer_swarm` to send its minds a live directive or retarget their goal, `stop_swarm` when it's done " ++
+    "or off track. When a user asks you to \"use a hive\", do exactly that -- cast one, don't build it yourself. " ++
+    "(b) LEARN FIRST -- if you're missing knowledge for a part, research it (web_search / read_url / recall_hive) " ++
+    "BEFORE acting instead of guessing. (c) DO IT YOURSELF -- for a small, direct change, build it inline " ++
+    "(write_file / edit_file / run_python). Revise the plan as you learn. Keep coordinating -- casting, steering, " ++
+    "researching, building -- and narrate each move so the user can follow the work, until the goal is truly met.";
+
+/// The chat turn's tool surface = the shared mind-tool SCHEMA + the veil's ORCHESTRATION verbs (cast / steer /
+/// stop / status). The orchestration verbs are handled in-process by orchTool (deploy_service + app.sup), NOT by
+/// tools.execute — the swarm minds themselves never get these (a mind can't spawn sibling swarms). Comptime
+/// concatenation (both are comptime `\\` strings), joined by a comma into the "tools":[ … ] array body.
+const ORCH_TOOLS =
+    \\{"type":"function","function":{"name":"cast","description":"Deploy a SWARM (a hive of AI minds) to work on a goal in parallel, in THIS conversation's build dir so its files co-exist with yours. Use for a big or parallelizable build/research task you want a team to carry out while you guide them. Returns a swarm id; watch it with swarm_status, guide it with steer_swarm, end it with stop_swarm.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"what the swarm should accomplish"},"minds":{"type":"integer","description":"how many minds (default 3)"},"minutes":{"type":"integer","description":"time budget (0 = server default)"},"mode":{"type":"string","enum":["cast","continuous"],"description":"cast = fast one-shot strike; continuous = sustained hive"},"files":{"type":"string","description":"declared deliverable files, comma/newline separated — adopted verbatim as the blueprint"}},"required":["goal"]}}},
+    \\{"type":"function","function":{"name":"steer_swarm","description":"Send LIVE guidance to a RUNNING swarm — a priority directive every mind reads at its next round (course-correct, add a constraint, unblock a mind). Or pass `goal` to retarget the whole hive.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id from cast/swarm_status"},"text":{"type":"string","description":"the guidance/directive for the minds"},"goal":{"type":"string","description":"optional: a new goal to retarget the hive"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"stop_swarm","description":"Stop a running swarm (cooperative; takes effect at its next round). Its files + findings are kept.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"swarm_status","description":"Check a swarm's state: whether it is running or finished, how many minds, and whether it has produced a result yet.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}}
+;
+const TURN_TOOLS = tools.SCHEMA ++ "," ++ ORCH_TOOLS;
 
 /// io-based wall clock — the SAME source the worker stamps its event `t` with (std time under io, never a raw
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.
@@ -268,7 +292,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len);
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -544,8 +568,154 @@ fn streamFlush(sc: *StreamCtx) void {
         sc.rsn_len = 0;
     }
 }
+// --------------------------------------------------------------------------- veil ORCHESTRATION tools (Phase A)
+
+/// A safe empty tool-result (len 0) for OOM fallbacks — never freed (the caller frees only result.len>0).
+fn emptyRes() []u8 {
+    return @constCast(@as([]const u8, ""));
+}
+
+/// Mirror of llm.isLocal / deploy_service's local-model detection over a base_url (loopback = local Ollama etc.).
+fn isLocalBase(base_url: []const u8) bool {
+    return std.mem.indexOf(u8, base_url, "localhost") != null or
+        std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, base_url, "0.0.0.0") != null or
+        std.mem.indexOf(u8, base_url, "[::1]") != null;
+}
+
+/// Build a gpa-owned `{"ok":false,"err":<escaped msg>}` tool result (or emptyRes on OOM).
+fn orchErr(gpa: std.mem.Allocator, msg: []const u8) []u8 {
+    var l: std.ArrayListUnmanaged(u8) = .empty;
+    defer l.deinit(gpa); // no-op after a successful toOwnedSlice (list is emptied); frees the buffer on OOM
+    (build: {
+        l.appendSlice(gpa, "{\"ok\":false,\"err\":") catch break :build;
+        http.jstr(gpa, &l, msg) catch break :build;
+        l.append(gpa, '}') catch break :build;
+    });
+    return l.toOwnedSlice(gpa) catch emptyRes();
+}
+
+/// Dispatch the veil's orchestration verbs. Returns a gpa-owned result string, or null when `name` is not an
+/// orchestration verb (the caller then routes to the normal mind-tool executor).
+fn orchTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8) ?[]u8 {
+    if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, base_url, key, model, args);
+    if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
+    if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
+    if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, args);
+    return null;
+}
+
+/// cast — deploy a swarm into THIS conversation's build dir, using the chat turn's own model/creds so the hive
+/// runs on the same backend the user is chatting with. Reuses deploy_service.castSwarm (the exact server cast
+/// pipeline the HTTP /cast route uses). gpa-owned result.
+fn castTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { goal: []const u8 = "", minds: u32 = 3, minutes: u32 = 0, mode: []const u8 = "cast", files: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "cast: could not parse args JSON");
+    defer p.deinit();
+    const a = p.value;
+    if (std.mem.trim(u8, a.goal, " \r\n\t").len == 0) return orchErr(gpa, "cast: a goal is required");
+    const user = app.auth.userById(uid) orelse return orchErr(gpa, "cast: user not found");
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const rq = deploy_service.CastReq{
+        .goal = a.goal,
+        .minutes = a.minutes,
+        .minds = a.minds,
+        // The swarm runs on the SAME backend the chat turn uses (local Ollama or hosted): pass the turn's creds.
+        .provider = if (isLocalBase(base_url)) "ollama" else "openai",
+        .model = model,
+        .api_key = key,
+        .base_url = base_url,
+        .style = "auto",
+        .mode = a.mode,
+        .dir = conv, // build in this conversation's dir so the cast + chat co-edit one tree
+        .files = a.files,
+        // No autonomous public egress: the veil's casts stay local build/research. Telegraph publishing remains a
+        // deliberate user action via the deploy path, never something the chat veil triggers on its own.
+        .publish = false,
+        .post = false,
+    };
+    switch (deploy_service.castSwarm(app, arena.allocator(), user, rq)) {
+        .ok => |sp| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"cast\",\"id\":\"{s}\",\"minds\":{d},\"state\":\"{s}\",\"note\":\"swarm deployed in this conversation's build dir; watch it with swarm_status, guide it with steer_swarm (use this id), end it with stop_swarm\"}}", .{ sp.id, sp.minds, sp.state }) catch emptyRes(),
+        .fail => |f| return orchErr(gpa, f.msg),
+    }
+}
+
+/// steer_swarm — deliver a live directive (op:"say" to all minds) or retarget the goal (op:"set_goal") to a
+/// running swarm by appending to its control.jsonl, which the worker drains each round. gpa-owned result.
+fn steerTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "", text: []const u8 = "", goal: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "steer_swarm: could not parse args JSON");
+    defer p.deinit();
+    const a = p.value;
+    if (a.id.len == 0) return orchErr(gpa, "steer_swarm: an id is required (from cast/swarm_status)");
+    const sw = app.sup.resolve(a.id) orelse return orchErr(gpa, "steer_swarm: no such swarm — check the id");
+    if (sw.uid != uid) return orchErr(gpa, "steer_swarm: that swarm isn't yours");
+
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(gpa);
+    const built = build: {
+        if (a.goal.len > 0) {
+            line.appendSlice(gpa, "{\"op\":\"set_goal\",\"goal\":") catch break :build false;
+            http.jstr(gpa, &line, a.goal) catch break :build false;
+            line.appendSlice(gpa, "}\n") catch break :build false;
+            break :build true;
+        }
+        if (a.text.len == 0) break :build false;
+        line.appendSlice(gpa, "{\"op\":\"say\",\"to\":\"all\",\"text\":") catch break :build false;
+        http.jstr(gpa, &line, a.text) catch break :build false;
+        line.appendSlice(gpa, "}\n") catch break :build false;
+        break :build true;
+    };
+    if (!built) return orchErr(gpa, "steer_swarm: provide `text` (a directive for the minds) or `goal` (to retarget the hive)");
+    const ctl = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{sw.run_dir}) catch return orchErr(gpa, "steer_swarm: out of memory");
+    defer gpa.free(ctl);
+    http.appendFile(app.io, gpa, ctl, line.items) catch return orchErr(gpa, "steer_swarm: could not write the control channel");
+    return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"steer_swarm\",\"note\":\"delivered; the minds read it at their next round\"}") catch emptyRes();
+}
+
+/// stop_swarm — cooperative stop of a running swarm (its files + findings are kept). gpa-owned result.
+fn stopTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "stop_swarm: could not parse args JSON");
+    defer p.deinit();
+    if (p.value.id.len == 0) return orchErr(gpa, "stop_swarm: an id is required");
+    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "stop_swarm: no such swarm");
+    if (sw.uid != uid) return orchErr(gpa, "stop_swarm: that swarm isn't yours");
+    app.sup.stop(sw.id);
+    return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"stop_swarm\",\"state\":\"stopping\",\"note\":\"stop requested (cooperative; effective at the swarm's next round). files + findings are kept.\"}") catch emptyRes();
+}
+
+/// swarm_status — compact liveness for the veil to decide keep-going / steer / collect: supervisor state, whether
+/// the worker process is alive, mind count, and whether a terminal DONE marker exists yet. gpa-owned result.
+fn statusTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "swarm_status: could not parse args JSON");
+    defer p.deinit();
+    if (p.value.id.len == 0) return orchErr(gpa, "swarm_status: an id is required");
+    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no such swarm");
+    if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
+    const ps = app.sup.pidStatus(sw.run_dir);
+    var finished = false;
+    if (std.fmt.allocPrint(gpa, "{s}/DONE", .{sw.run_dir})) |dp| {
+        defer gpa.free(dp);
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, dp, gpa, .limited(64))) |d| {
+            gpa.free(d);
+            finished = true;
+        } else |_| {}
+    } else |_| {}
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"swarm_status\",\"id\":\"{s}\",\"state\":\"{s}\",\"minds\":{d},\"alive\":{s},\"finished\":{s}}}", .{ sw.id, @tagName(sw.state), sw.minds, if (ps.alive) "true" else "false", if (finished) "true" else "false" }) catch emptyRes();
+}
+
 fn runInnerAgentic(
     app: *App,
+    uid: u64,
+    conv: []const u8,
     conv_dir: []const u8,
     run_root: []const u8,
     base_url: []const u8,
@@ -577,7 +747,7 @@ fn runInnerAgentic(
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir };
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools.SCHEMA, 4096, 0.7, &sctx, streamOnDelta);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, TURN_TOOLS, 4096, 0.7, &sctx, streamOnDelta);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
 
@@ -662,7 +832,9 @@ fn runInnerAgentic(
         // ... then run each call, narrate + observe its result, and append its result turn.
         for (step.calls) |c| {
             emitToolState(app, conv_dir, c.name, "start", "");
-            const result = tools.execute(ctx, c.name, c.args);
+            // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
+            // via deploy_service + app.sup, NOT the mind-tool executor. Everything else falls through to tools.execute.
+            const result = orchTool(app, uid, conv, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
