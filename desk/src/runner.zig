@@ -28,6 +28,8 @@ pub const Runner = struct {
         chatSend: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
         /// GET /api/v1/chat/convs/<conv>/events?from=N — byte-cursor poll over the conv's turn frames.
         chatEvents: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp,
+        /// POST /api/v1/chat/convs/<conv>/control — a cooperative control op (e.g. {"op":"stop"}) the turn reads.
+        chatControl: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
     };
 
     pub fn runTool(self: Runner, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp {
@@ -42,11 +44,14 @@ pub const Runner = struct {
     pub fn chatEvents(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp {
         return self.vt.chatEvents(self.ctx, io, gpa, conv, from);
     }
+    pub fn chatControl(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+        return self.vt.chatControl(self.ctx, io, gpa, conv, body_json);
+    }
 };
 
 // ------------------------------------------------------------------ LocalRunner (today's behavior, verbatim)
 
-const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents };
+const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents, .chatControl = localChatControl };
 
 /// A Runner backed by the loopback server. `ctx` is the shared Store — the live port + bearer token are read
 /// from it on each call (the settings can change at runtime), exactly as the old call sites did.
@@ -91,4 +96,11 @@ fn localChatEvents(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []cons
     var tokb: [128]u8 = undefined;
     const pt = portToken(store, &tokb);
     return netcli.chatEvents(io, gpa, pt.port, pt.tok, conv, from);
+}
+
+fn localChatControl(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatControl(io, gpa, pt.port, pt.tok, conv, body_json);
 }

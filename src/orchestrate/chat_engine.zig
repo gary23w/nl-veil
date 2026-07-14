@@ -28,10 +28,11 @@ const App = http.App;
 /// single-turn build; the outer DRIVE_MAX still bounds the whole turn, and a genuine runaway summarizes (below).
 const MAX_ITERS: usize = 24;
 
-/// Hard ceiling on AUTO-LOOP drive steps in one turn — after each settled answer the engine infers the next
-/// step and drives again, up to this many times (desk's LOOP_MAX_ITERS). A plain Q&A stops after one step
-/// because the drive inference returns DONE for an achieved goal; this bound only caps a genuine multi-step build.
-const DRIVE_MAX: usize = 30;
+/// Hard ceiling on AUTO-LOOP drive steps in one turn. Lowered 30 -> 6: at 30 a thorough model would "verify"
+/// and re-read forever after a fix (observed: a fix-the-bug turn drove endlessly, thousands of frames). 6 is
+/// enough for a build + a couple of follow-through steps; a plain Q&A still stops after one (DONE). The user's
+/// Stop now reaches the turn (control.jsonl), and MAX_ITERS bounds each step's tool rounds.
+const DRIVE_MAX: usize = 6;
 
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
@@ -255,7 +256,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const inner = runInnerAgentic(app, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
         switch (inner.outcome) {
-            .hard_error => return, // the inference failed — helper already emitted the error event; end the turn
+            .hard_error => {
+                // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
+                // poller disarms + clears busy instead of hanging forever (the "kept streaming after an error").
+                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                return;
+            },
             .stopped => {
                 // stop landed mid tool-loop — commit the last narration (if any) so the user keeps it, then close.
                 if (inner.content.len > 0) {
@@ -390,19 +396,58 @@ const InnerResult = struct {
 };
 
 /// Borrowed handle the streaming callback needs to emit live deltas into this turn's event log.
-const StreamCtx = struct { app: *App, conv_dir: []const u8, streamed: bool = false };
+/// Batch streamed deltas to ~this many chars per emitted frame. Streaming one FRAME per model TOKEN produced
+/// thousands of frames per turn (8400 reasoning frames observed) — each is a file append + a desk poll-parse,
+/// which overwhelmed the client ("the chat is dying"). Coalescing to ~60-char chunks cuts frames ~15x while the
+/// reply still visibly types out.
+const FLUSH_CHARS: usize = 60;
 
-/// llm.completeStream fires this for each incremental delta as the model generates. `.content` becomes a
-/// live `{"kind":"token","delta":…}` frame (the reply typing out); `.reasoning` a `{"kind":"reasoning",
-/// "delta":…}` frame (thinking typing out). emitKV JSON-escapes the chunk via http.jstr. The chunk is
-/// borrowed (valid only during this call) — emitKV copies it into the frame immediately, so that's fine.
+const StreamCtx = struct {
+    app: *App,
+    conv_dir: []const u8,
+    streamed: bool = false,
+    tok: [256]u8 = undefined,
+    tok_len: usize = 0,
+    rsn: [256]u8 = undefined,
+    rsn_len: usize = 0,
+};
+
+/// llm.completeStream fires this per delta. We ACCUMULATE into a small buffer and emit a `{"kind":"token"|
+/// "reasoning","delta":…}` frame only every ~FLUSH_CHARS (or when the buffer fills) — the reply still types out,
+/// but at a sane frame rate. The chunk is borrowed (valid only during this call); scAccum copies it immediately.
 fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
     if (text.len == 0) return;
     const sc: *StreamCtx = @ptrCast(@alignCast(cx));
-    sc.streamed = true; // a real stream happened — so the fallback reasoning emit below is skipped
-    switch (kind) {
-        .content => emitKV(sc.app, sc.conv_dir, "token", "delta", text),
-        .reasoning => emitKV(sc.app, sc.conv_dir, "reasoning", "delta", text),
+    sc.streamed = true; // a real stream happened — so the fallback reasoning emit is skipped
+    scAccum(sc, kind == .reasoning, text);
+}
+
+fn scAccum(sc: *StreamCtx, is_reason: bool, text: []const u8) void {
+    const buf: []u8 = if (is_reason) &sc.rsn else &sc.tok;
+    const len: *usize = if (is_reason) &sc.rsn_len else &sc.tok_len;
+    const kind: []const u8 = if (is_reason) "reasoning" else "token";
+    var rest = text;
+    while (rest.len > 0) {
+        const n = @min(rest.len, buf.len - len.*);
+        @memcpy(buf[len.*..][0..n], rest[0..n]);
+        len.* += n;
+        rest = rest[n..];
+        if (len.* >= FLUSH_CHARS or len.* == buf.len) {
+            emitKV(sc.app, sc.conv_dir, kind, "delta", buf[0..len.*]);
+            len.* = 0;
+        }
+    }
+}
+
+/// Emit any buffered tail deltas — called after completeStream returns so the last partial chunk isn't lost.
+fn streamFlush(sc: *StreamCtx) void {
+    if (sc.tok_len > 0) {
+        emitKV(sc.app, sc.conv_dir, "token", "delta", sc.tok[0..sc.tok_len]);
+        sc.tok_len = 0;
+    }
+    if (sc.rsn_len > 0) {
+        emitKV(sc.app, sc.conv_dir, "reasoning", "delta", sc.rsn[0..sc.rsn_len]);
+        sc.rsn_len = 0;
     }
 }
 fn runInnerAgentic(
@@ -436,6 +481,7 @@ fn runInnerAgentic(
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir };
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools.SCHEMA, 4096, 0.7, &sctx, streamOnDelta);
         defer step.deinit(gpa);
+        streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
 
         if (!step.ok) {
             emitKV(app, conv_dir, "error", "err", clipBytes(step.content, 400));
