@@ -1,23 +1,25 @@
-//! secrets.zig — at-rest protection for the chat API key. On Windows the key is sealed with DPAPI
-//! (CryptProtectData, current-user scope) so the blob on disk is useless off this account/machine; on
-//! POSIX it falls back to a plain file inside the (user-private) data dir, mirroring how the server
-//! already keeps `.desktop_key` there. The key NEVER goes into a repo-tracked file — everything under
-//! <data>/ is untracked run state. Runs on the CHAT thread (it owns io for all chat-side storage).
+//! secrets.zig — at-rest storage for the chat API key and the GitHub PAT. This is a LOCAL, single-user,
+//! login-gated app, so secrets are kept as PLAINTEXT inside the (user-private, git-untracked) <data>/ dir —
+//! the trust boundary is the OS login, not per-secret encryption. Storing them plaintext-local is deliberate:
+//! it lets the veil READ its own GitHub token (to curl / set a remote URL) instead of it being locked in an
+//! opaque blob it can't use. Older builds DPAPI-sealed these files; `loadAt` transparently unseals such a
+//! legacy blob ONCE and rewrites it as plaintext (the auto-unseal migration). Nothing here ever reaches a
+//! repo-tracked file. Runs on the CHAT thread (it owns io for all chat-side storage).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const log = @import("log.zig");
 
-const FILE_WIN = "chat_key.bin"; // DPAPI blob
+const FILE_WIN = "chat_key.bin"; // plaintext now (legacy DPAPI blobs auto-migrate on load); name kept so old files still resolve
 const FILE_POSIX = "chat_key"; // plain (dir is user-private, same trust as .desktop_key)
-const PAT_WIN = "github_pat.bin"; // the GitHub Personal Access Token, sealed the same way as the chat key
+const PAT_WIN = "github_pat.bin"; // the GitHub PAT — plaintext-local, same as the chat key
 const PAT_POSIX = "github_pat";
 
 const win = struct {
     const DATA_BLOB = extern struct { cbData: u32, pbData: ?[*]u8 };
     const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
-    extern "crypt32" fn CryptProtectData(pDataIn: *const DATA_BLOB, szDataDescr: ?[*:0]const u16, pOptionalEntropy: ?*const DATA_BLOB, pvReserved: ?*anyopaque, pPromptStruct: ?*anyopaque, dwFlags: u32, pDataOut: *DATA_BLOB) callconv(.winapi) i32;
+    // Only UNSEAL survives — used once to migrate a legacy sealed blob to plaintext. We never seal again.
     extern "crypt32" fn CryptUnprotectData(pDataIn: *const DATA_BLOB, ppszDataDescr: ?*?[*:0]u16, pOptionalEntropy: ?*const DATA_BLOB, pvReserved: ?*anyopaque, pPromptStruct: ?*anyopaque, dwFlags: u32, pDataOut: *DATA_BLOB) callconv(.winapi) i32;
     extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 };
@@ -31,52 +33,40 @@ fn path(gpa: std.mem.Allocator, dir: []const u8) ?[]u8 {
     return pathFor(gpa, dir, FILE_WIN, FILE_POSIX);
 }
 
-/// Seal + persist the GitHub PAT under `dir` (sealed exactly like the chat key). Empty removes it.
+/// Persist the GitHub PAT under `dir` as plaintext-local. Empty removes it.
 pub fn savePat(io: Io, gpa: std.mem.Allocator, dir: []const u8, pat: []const u8) bool {
     const p = pathFor(gpa, dir, PAT_WIN, PAT_POSIX) orelse return false;
     defer gpa.free(p);
-    return sealSaveAt(io, gpa, p, pat);
+    return saveAt(io, gpa, p, pat);
 }
 
-/// Load the sealed GitHub PAT into `out`; returns its length (0 = none / unreadable).
+/// Load the GitHub PAT into `out`; returns its length (0 = none / unreadable). Legacy sealed blobs auto-migrate.
 pub fn loadPat(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
     const p = pathFor(gpa, dir, PAT_WIN, PAT_POSIX) orelse return 0;
     defer gpa.free(p);
-    return sealLoadAt(io, gpa, p, out);
+    return loadAt(io, gpa, p, out);
 }
 
-/// Persist `key` under `dir` (the .veil-desk sidecar dir). An empty key removes the stored secret.
+/// Persist `key` under `dir` (the .veil-desk sidecar dir) as plaintext-local. An empty key removes it.
 pub fn save(io: Io, gpa: std.mem.Allocator, dir: []const u8, key: []const u8) bool {
     log.trace("secrets.save dir={s} key_len={d}", .{ dir, key.len });
     const p = path(gpa, dir) orelse return false;
     defer gpa.free(p);
-    return sealSaveAt(io, gpa, p, key);
+    return saveAt(io, gpa, p, key);
 }
 
-/// The shared seal-and-write core (DPAPI on Windows, plain in the user-private dir on POSIX). `p` is the full
-/// file path; an empty key deletes it.
-fn sealSaveAt(io: Io, gpa: std.mem.Allocator, p: []const u8, key: []const u8) bool {
-    _ = gpa; // sealing needs no allocation (DPAPI blob / direct write); kept for signature symmetry with load
+/// Write `key` to `p` as plaintext in the user-private (untracked) data dir. An empty key deletes the file.
+/// LOCAL, login-gated app — the OS account is the trust boundary; no per-secret sealing (see the module doc).
+fn saveAt(io: Io, gpa: std.mem.Allocator, p: []const u8, key: []const u8) bool {
+    _ = gpa;
     if (key.len == 0) {
         Io.Dir.cwd().deleteFile(io, p) catch {};
         return true;
     }
-    if (builtin.os.tag == .windows) {
-        var in_blob: win.DATA_BLOB = .{ .cbData = @intCast(key.len), .pbData = @constCast(key.ptr) };
-        var out_blob: win.DATA_BLOB = .{ .cbData = 0, .pbData = null };
-        if (win.CryptProtectData(&in_blob, null, null, null, null, win.CRYPTPROTECT_UI_FORBIDDEN, &out_blob) == 0) {
-            log.err("secrets: CryptProtectData failed", .{});
-            return false;
-        }
-        defer _ = win.LocalFree(out_blob.pbData);
-        const sealed = out_blob.pbData.?[0..out_blob.cbData];
-        Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = sealed }) catch {
-            log.err("secrets: could not write {s}", .{p});
-            return false;
-        };
-        return true;
-    }
-    Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = key }) catch return false;
+    Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = key }) catch {
+        log.err("secrets: could not write {s}", .{p});
+        return false;
+    };
     return true;
 }
 
@@ -85,26 +75,30 @@ pub fn load(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
     log.trace("secrets.load dir={s}", .{dir});
     const p = path(gpa, dir) orelse return 0;
     defer gpa.free(p);
-    return sealLoadAt(io, gpa, p, out);
+    return loadAt(io, gpa, p, out);
 }
 
-/// The shared read-and-unseal core. `p` is the full file path.
-fn sealLoadAt(io: Io, gpa: std.mem.Allocator, p: []const u8, out: []u8) usize {
+/// Read the plaintext secret from `p`. AUTO-UNSEAL MIGRATION: a file written by an older build is a DPAPI blob;
+/// on Windows we try to unseal it ONCE and, on success, rewrite it as plaintext so at-rest is plaintext-local
+/// from here on. A plaintext file fails the unseal (DPAPI blobs are structured) and falls through unchanged.
+fn loadAt(io: Io, gpa: std.mem.Allocator, p: []const u8, out: []u8) usize {
     const data = Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(4 << 10)) catch return 0;
     defer gpa.free(data);
     if (data.len == 0) return 0;
     if (builtin.os.tag == .windows) {
         var in_blob: win.DATA_BLOB = .{ .cbData = @intCast(data.len), .pbData = data.ptr };
         var out_blob: win.DATA_BLOB = .{ .cbData = 0, .pbData = null };
-        if (win.CryptUnprotectData(&in_blob, null, null, null, null, win.CRYPTPROTECT_UI_FORBIDDEN, &out_blob) == 0) {
-            log.warn("secrets: CryptUnprotectData failed (blob from another account?)", .{});
-            return 0;
+        if (win.CryptUnprotectData(&in_blob, null, null, null, null, win.CRYPTPROTECT_UI_FORBIDDEN, &out_blob) != 0) {
+            defer _ = win.LocalFree(out_blob.pbData);
+            const plain = out_blob.pbData.?[0..out_blob.cbData];
+            const n = @min(plain.len, out.len);
+            @memcpy(out[0..n], plain[0..n]);
+            // best-effort: migrate the legacy blob to plaintext so future loads (and the veil) read it directly
+            Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = plain }) catch {};
+            log.info("secrets: migrated a legacy sealed secret to plaintext-local ({s})", .{p});
+            return n;
         }
-        defer _ = win.LocalFree(out_blob.pbData);
-        const plain = out_blob.pbData.?[0..out_blob.cbData];
-        const n = @min(plain.len, out.len);
-        @memcpy(out[0..n], plain[0..n]);
-        return n;
+        // not a sealed blob — already plaintext; fall through
     }
     const trimmed = std.mem.trim(u8, data, " \r\n\t");
     const n = @min(trimmed.len, out.len);
