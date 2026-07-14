@@ -13,7 +13,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const scan = @import("scan.zig");
-const netcli = @import("netcli.zig");
+const runner_mod = @import("runner.zig");
 const httpc = @import("httpc.zig");
 const llm = @import("llm.zig");
 const secrets = @import("secrets.zig");
@@ -1064,6 +1064,14 @@ pub const Chat = struct {
     fn consoleAiBusy(self: *Chat) bool {
         if (self.awaitingShellApproval()) return true; // a parked command holds the turn until approved/denied
         return if (self.console) |*p| p.ai else false;
+    }
+
+    /// The engine's handle to the outside world for server verbs (tool exec + cast). Constructed on demand over
+    /// the shared store — the LocalRunner reads the live port + token from it. The engine NEVER calls netcli
+    /// directly, so when the brain moves in-process server-side this getter returns an in-process runner instead
+    /// with no other engine change. (P0-1 of the chat→backend move.)
+    fn runner(self: *Chat) runner_mod.Runner {
+        return runner_mod.local(self.store);
     }
 
     /// Is there work in flight that a chat switch/new-chat would corrupt (a live model turn, a running cast, or an
@@ -4404,17 +4412,13 @@ pub const Chat = struct {
         const prov = self.resolveProvider(&bb, &kb, &mb);
         var kind: u8 = 0;
         var byok: u8 = 0;
-        var port: u16 = 8787;
-        var tokb: [128]u8 = undefined;
-        var tok_n: usize = 0;
+        var port: u16 = 8787; // kept only for the unreachable-server log below; the runner reads port+token itself
         {
             self.store.lock();
             defer self.store.unlock();
             kind = self.store.settings.chat_kind;
             byok = self.store.settings.chat_byok;
             port = self.store.settings.port;
-            tok_n = self.store.settings.token_len;
-            @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
         }
         const prov_key = castProviderId(kind, byok);
 
@@ -4461,7 +4465,7 @@ pub const Chat = struct {
             return;
         }
 
-        const resp = netcli.cast(self.io, self.gpa, port, tokb[0..tok_n], w.buffered()) orelse {
+        const resp = self.runner().cast(self.io, self.gpa, w.buffered()) orelse {
             log.err("cast: netcli returned NULL (no response after retries) — server on :{d}?", .{port});
             self.appendMsg(dd, .cast_note, "[cast] no response from the veil server on :8787 — it may be starting up or briefly busy. If casts keep failing, make sure the server is running (run the veil server / `python deploy.py`), then try again.");
             self.updateCastRow(.failed, 0, -1, "no response from :8787 (busy or down)", "");
@@ -4777,17 +4781,6 @@ pub const Chat = struct {
         self.setStatus(std.fmt.bufPrint(&stbuf, "running {s}...", .{name}) catch "running a tool...");
         log.info("chat tool: run {s} args={s}", .{ name, args[0..@min(args.len, 100)] });
 
-        var tokb: [128]u8 = undefined;
-        var tok_n: usize = 0;
-        var port: u16 = 8787;
-        {
-            self.store.lock();
-            defer self.store.unlock();
-            port = self.store.settings.port;
-            tok_n = self.store.settings.token_len;
-            @memcpy(tokb[0..tok_n], self.store.settings.token[0..tok_n]);
-        }
-
         // the active conversation id → a per-conversation build workdir the server writes into + the console cd's to.
         // The veil's PARALLEL attempt (in_veil_work) targets this SAME dir too — it joins the hive's build rather
         // than a separate copy, so there's nothing to reconcile afterward (the server's edit_file already
@@ -4824,7 +4817,7 @@ pub const Chat = struct {
         if (!bok) {
             result = "(the tool arguments were too long to send)";
             tool_failed = true;
-        } else if (netcli.chatTool(self.io, self.gpa, port, tokb[0..tok_n], w.buffered())) |resp| {
+        } else if (self.runner().runTool(self.io, self.gpa, w.buffered())) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("chat tool: {s} -> status={d} body={s}", .{ name, resp.status, resp.body[0..@min(resp.body.len, 160)] });
             result = extractToolResult(resp.body, &rbuf);
