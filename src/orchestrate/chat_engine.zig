@@ -22,9 +22,11 @@ const llm = @import("../worker/llm.zig");
 
 const App = http.App;
 
-/// Hard ceiling on tool-calling round-trips per ONE settled answer — the same bound the worker's round loop
-/// keeps, so a model that loops on tools can never wedge the httpz worker thread indefinitely.
-const MAX_ITERS: usize = 12;
+/// Hard ceiling on tool-calling round-trips per ONE settled answer. 12 was too low — a real build (e.g. a
+/// three.js game: many write_file + read_file + edit_file rounds) exhausted it MID-BUILD and committed a raw
+/// "(reached the step limit)" string as the reply even though the build succeeded. 24 comfortably fits a big
+/// single-turn build; the outer DRIVE_MAX still bounds the whole turn, and a genuine runaway summarizes (below).
+const MAX_ITERS: usize = 24;
 
 /// Hard ceiling on AUTO-LOOP drive steps in one turn — after each settled answer the engine infers the next
 /// step and drives again, up to this many times (desk's LOOP_MAX_ITERS). A plain Q&A stops after one step
@@ -469,9 +471,31 @@ fn runInnerAgentic(
         // loop: feed the tool results back for the next completion
     }
 
-    // ran out of tool iterations mid-loop: hand the last narration (or a placeholder) back as the settled answer.
-    const fallback: []const u8 = if (last_content.len > 0) last_content else "(reached the step limit for this turn)";
+    // Ran out of tool iterations mid-loop: ask for a brief no-tools SUMMARY so the reply is a real closing message
+    // ("here's what I built…") rather than a raw step-limit string (the shooter turn committed exactly that). Fall
+    // back to the last narration, then a friendly note, only if the summary itself fails.
+    if (summarizeTurn(app, run_root, base_url, key, model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum };
+    const fallback: []const u8 = if (last_content.len > 0) last_content else "I did as much as I could this turn — say \"continue\" if there's more you want.";
     return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty };
+}
+
+/// A brief no-tools completion asking the model to summarize what it just did — used when the tool loop hits its
+/// round cap, so the reply is a real closing message instead of a raw step-limit note. gpa-owned text or null (a
+/// failed/empty summary lets the caller fall back to the last narration).
+fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_items: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, conv_items) catch return null;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, "In 1-3 sentences, tell the user what you accomplished this turn and what (if anything) remains. Do not call any tools.") catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "summary", base_url, key, model, msgs.items, "", 1024, 0.5);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    if (t.len == 0) return null;
+    return gpa.dupe(u8, t) catch null;
 }
 
 /// One REFLECT pass: hand the model its own answer + the original question and ask for the final (improved-or-
