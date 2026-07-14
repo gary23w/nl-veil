@@ -320,10 +320,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             break :blk resumed;
         }
         cplan.freeTasks(gpa, resumed);
-        // No unfinished plan → decompose a fresh, non-trivial message into a new board (the >= 12-char gate skips
-        // greetings/acks so a plan inference isn't paid on every "hi"/"thanks"). This persistPlan only overwrites a
-        // completed/absent plan, so no in-progress work is lost.
-        if (std.mem.trim(u8, user_text, " \r\n\t").len >= 12) {
+        // No unfinished plan → decompose a fresh message into a new board, but ONLY when it reads like a genuine
+        // multi-step BUILD/RESEARCH task (shouldPlan). A question, greeting, ack, or one-liner skips the whole
+        // decomposition ROUND-TRIP — that sequential inference added ~3-4s to time-to-first-token even when the
+        // model correctly returned an empty plan (measured: 6.7s TTFT on a plain "explain rainbows"), and weak
+        // models over-decomposed greetings into swarm plans. Real tasks still plan + coordinate; chat stays fast.
+        // This persistPlan only overwrites a completed/absent plan, so no in-progress work is lost.
+        if (shouldPlan(user_text)) {
             const fresh = planTask(app, run_root, base_url, key, model, user_text);
             if (fresh.len > 0) {
                 persistPlan(app, conv_dir, fresh);
@@ -431,9 +434,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
-        // Skipped when a plan drives the turn — the plan already structures the work, and reflecting each subtask
-        // would double the inferences.
-        if (!has_plan and drive == 0 and answer.len >= REFLECT_MIN) {
+        // Skipped when a plan drives the turn (the plan already structures the work) AND — critically — when the
+        // answer already STREAMED to the user (inner.streamed): re-generating a streamed answer non-streamed froze
+        // the chat ~8s and then swapped the text the user just watched type out. Reflect only runs when nothing
+        // streamed (a non-streaming backend), where there's no live answer to preserve.
+        if (!has_plan and !inner.streamed and drive == 0 and answer.len >= REFLECT_MIN) {
             if (reflectAnswer(app, run_root, base_url, key, model, user_text, answer)) |improved| {
                 gpa.free(answer);
                 answer = improved;
@@ -455,6 +460,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             if (cplan.nextPending(plan) == null) break :outer; // plan complete
             continue :outer;
         }
+
+        // FAST PATH: a first-step, no-plan answer that used NO tools is a complete one-shot reply (a plain Q&A) —
+        // there's no agentic work in flight to continue, so the LOOP_QUESTION "are you done?" completion below is
+        // pure wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on EVERY simple
+        // chat). End the turn now. Anything that ran a tool (agentic work) still drives so multi-step work continues.
+        if (drive == 0 and !inner.tools_ran) break :outer;
 
         // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE). The loop question is a
         // SYNTHETIC turn — appended only long enough to ask, then truncated back off conv_buf so it never rides
@@ -616,24 +627,42 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, ke
 const InnerResult = struct {
     outcome: enum { settled, hard_error, stopped },
     content: []u8,
+    // Did this settled answer TYPE OUT to the user live (streamOnDelta fired)? If so, reflect MUST NOT run — you
+    // cannot silently re-generate + swap an answer the user already watched stream (it froze the chat ~8s then
+    // replaced the text). Reflect only makes sense when nothing streamed (a non-streaming backend fallback).
+    streamed: bool = false,
+    // Did ANY tool execute during this pass? A pure-prose answer with no tools on the first step is DONE — there's
+    // no agentic work in flight to continue, so the drive loop's LOOP_QUESTION "are you done?" completion is pure
+    // wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on every simple Q&A).
+    tools_ran: bool = false,
 };
 
 /// Borrowed handle the streaming callback needs to emit live deltas into this turn's event log.
 /// Batch streamed deltas to ~this many chars per emitted frame. Streaming one FRAME per model TOKEN produced
 /// thousands of frames per turn (8400 reasoning frames observed) — each is a file append + a desk poll-parse,
-/// which overwhelmed the client ("the chat is dying"). Coalescing to ~60-char chunks cuts frames ~15x while the
-/// reply still visibly types out.
-const FLUSH_CHARS: usize = 60;
+/// which overwhelmed the client ("the chat is dying"). Coalescing cuts frames while the reply still visibly types
+/// out. 60 felt chunky (≈300 chars/s visible); now that appendFile is a TRUE O(1) positioned append (frames are
+/// cheap), 28 chars/frame types out ~2x smoother without flooding the desk poller.
+const FLUSH_CHARS: usize = 28;
 
 const StreamCtx = struct {
     app: *App,
     conv_dir: []const u8,
+    ctrl_cursor: usize = 0, // control.jsonl offset for the mid-stream abort check (chat Stop)
     streamed: bool = false,
     tok: [256]u8 = undefined,
     tok_len: usize = 0,
     rsn: [256]u8 = undefined,
     rsn_len: usize = 0,
 };
+
+/// completeStream's cooperative-abort hook: fires (~every 40ms) during a streaming reply so a chat Stop kills the
+/// in-flight generation promptly instead of waiting out the whole ~15s inference. Reads control.jsonl from the
+/// turn's cursor for a `stop` op — the SAME predicate the between-tool / between-step checks use.
+fn streamShouldAbort(cx: *anyopaque) bool {
+    const sc: *StreamCtx = @ptrCast(@alignCast(cx));
+    return stopRequestedSince(sc.app, sc.conv_dir, sc.ctrl_cursor);
+}
 
 /// llm.completeStream fires this per delta. We ACCUMULATE into a small buffer and emit a `{"kind":"token"|
 /// "reasoning","delta":…}` frame only every ~FLUSH_CHARS (or when the buffer fills) — the reply still types out,
@@ -655,11 +684,39 @@ fn scAccum(sc: *StreamCtx, is_reason: bool, text: []const u8) void {
         @memcpy(buf[len.*..][0..n], rest[0..n]);
         len.* += n;
         rest = rest[n..];
-        if (len.* >= FLUSH_CHARS or len.* == buf.len) {
-            emitKV(sc.app, sc.conv_dir, kind, "delta", buf[0..len.*]);
-            len.* = 0;
+        const buffer_full = (len.* == buf.len);
+        if (len.* >= FLUSH_CHARS or buffer_full) {
+            // Deltas arrive as WHOLE codepoints (whole JSON strings, split on \n which never bisects a codepoint),
+            // so a FLUSH_CHARS-threshold flush always lands on a boundary. The ONE place a multibyte char can be
+            // split is the buffer-full clamp when a single delta overflows the 256-byte buffer — emitting a frame
+            // ending in a truncated lead byte (invalid UTF-8, which a strict JSON reader of events.jsonl rejects).
+            // Back off to the last complete UTF-8 boundary and keep the trailing partial bytes for the next chunk.
+            var emit_len = len.*;
+            if (buffer_full) {
+                const cut = utf8SafeCut(buf[0..len.*]);
+                if (cut > 0) emit_len = cut; // cut==0 ⇒ a >256-byte "codepoint" (never happens); emit as-is, don't stall
+            }
+            emitKV(sc.app, sc.conv_dir, kind, "delta", buf[0..emit_len]);
+            const carry = len.* - emit_len;
+            if (carry > 0) std.mem.copyForwards(u8, buf[0..carry], buf[emit_len..len.*]);
+            len.* = carry;
         }
     }
+}
+
+/// Largest prefix of `b` that ends on a UTF-8 codepoint boundary (i.e. contains no trailing partial codepoint).
+/// Returns b.len when the last codepoint is already complete. Used to avoid splitting a multibyte char across two
+/// streamed frames when the fixed accumulation buffer fills mid-codepoint.
+fn utf8SafeCut(b: []const u8) usize {
+    if (b.len == 0) return 0;
+    var i: usize = b.len;
+    while (i > 0) { // walk back past continuation bytes (0b10xxxxxx) to the lead byte of the last codepoint
+        i -= 1;
+        if (b[i] & 0xC0 != 0x80) break;
+    }
+    const lead = b[i];
+    const need: usize = if (lead < 0x80) 1 else if (lead & 0xE0 == 0xC0) 2 else if (lead & 0xF0 == 0xE0) 3 else if (lead & 0xF8 == 0xF0) 4 else 1;
+    return if (i + need <= b.len) b.len else i; // last codepoint complete → keep all; else cut before it
 }
 
 /// Emit any buffered tail deltas — called after completeStream returns so the last partial chunk isn't lost.
@@ -681,6 +738,44 @@ fn extractJsonObject(s: []const u8) []const u8 {
     const b = std.mem.lastIndexOfScalar(u8, s, '}') orelse return s;
     if (b > a) return s[a .. b + 1];
     return s;
+}
+
+/// Cheap, inference-free pre-gate: does THIS message warrant a plan-decomposition round-trip? The plan-board is
+/// for genuine multi-step BUILD/RESEARCH jobs — the veil breaking a real task into routed subtasks and steering a
+/// swarm. A question, a greeting, an ack, or a one-line ask must NOT pay a sequential decomposition inference
+/// (it dominated time-to-first-token) nor risk a weak model over-decomposing "hi" into a swarm plan. Bias HARD
+/// toward NOT planning: only a clear build/research intent verb (with enough length to be a real task) plans;
+/// everything else answers directly and fast. A message that IS a task phrased without a marker still gets worked
+/// by the drive loop — it just isn't pre-decomposed into a persisted board, which is the safe direction to err.
+fn shouldPlan(user_text: []const u8) bool {
+    const t = std.mem.trim(u8, user_text, " \r\n\t");
+    if (t.len < 24) return false; // greetings, acks, short questions — never a multi-step task
+    var buf: [192]u8 = undefined;
+    const n = @min(t.len, buf.len);
+    for (t[0..n], 0..) |c, i| buf[i] = std.ascii.toLower(c);
+    const low = buf[0..n];
+    // UNAMBIGUOUS multi-step markers — checked BEFORE the question guard so a task phrased with a leading verb like
+    // "do a deep dive …" or "audit the engine and categorize …" still plans (these almost never occur in plain Q&A).
+    const strong_markers = [_][]const u8{ "audit ", "deep dive", "deep-dive", "step by step", "step-by-step", "from scratch", "end to end", "end-to-end" };
+    for (strong_markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
+    // A clear question / explanation / lookup opener → answer directly, never plan (even if a build verb like
+    // "write" appears later, as in "write 200 words explaining X" — that's Q&A, not a build).
+    const q_openers = [_][]const u8{
+        "what ", "what's", "whats ", "why ", "how ", "how's", "hows ", "when ", "who ", "where ", "which ",
+        "whose ", "is ", "are ", "am ", "was ", "were ", "do ", "does ", "did ", "can you tell", "could you tell",
+        "will ", "would ", "should ", "explain", "tell me", "describe", "summar", "define", "what is", "what are",
+    };
+    for (q_openers) |q| if (std.mem.startsWith(u8, low, q)) return false;
+    // Strong multi-step build / research task intent anywhere → plan + coordinate.
+    const task_markers = [_][]const u8{
+        "build ", "create ", "implement ", "develop ", "scaffold", "set up a", "set up the", "make me a",
+        "make a ", "write me a", "write a ", "write the ", "code me", "refactor ", "migrate ", "port the",
+        "port it", "deploy ", "generate a", "research ", "investigate ", "analyze ", "gather ", "scrape ",
+        "crawl ", "design a", "design and", "from scratch", "step by step", "step-by-step", "and then ",
+        "an app", "a website", "a web app", "a cli", "a rest api", "a full ", "end to end", "end-to-end",
+    };
+    for (task_markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
+    return false; // ambiguous / conversational → fast direct answer (no decomposition round-trip)
 }
 
 /// DECOMPOSITION inference: ask the model to break the request into routed subtasks. Returns owned tasks (empty =
@@ -1058,6 +1153,7 @@ fn runInnerAgentic(
     // the last narrated content across tool iterations — the salvage if we exhaust MAX_ITERS or a stop lands mid-loop.
     var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
+    var any_tool = false; // did any tool run this pass? gates the drive loop's LOOP_QUESTION for pure-prose answers
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -1073,10 +1169,18 @@ fn runInnerAgentic(
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
-        var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir };
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, TURN_TOOLS, 4096, 0.7, &sctx, streamOnDelta);
+        var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, TURN_TOOLS, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
+
+        // STOP DURING STREAMING: the abort hook killed the stream mid-generation. Commit the partial that already
+        // streamed to the user (step.content) as the stopped narration and end the turn — don't fall through to
+        // treat the truncated reply as a settled answer or drive on it.
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
+            const partial = if (step.content.len > 0) step.content else last_content;
+            return .{ .outcome = .stopped, .content = gpa.dupe(u8, partial) catch empty };
+        }
 
         if (!step.ok) {
             emitKV(app, conv_dir, "error", "err", clipBytes(step.content, 400));
@@ -1132,7 +1236,9 @@ fn runInnerAgentic(
         }
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
-            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty };
+            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .streamed = sctx.streamed, .tools_ran = any_tool };
+
+        any_tool = true; // this iteration is running tools — the turn did agentic work, so the drive loop may continue
 
         // remember the last narrated content in case we run out of iterations mid-tool-loop
         if (step.content.len > 0) {
@@ -1201,9 +1307,11 @@ fn runInnerAgentic(
     // Ran out of tool iterations mid-loop: ask for a brief no-tools SUMMARY so the reply is a real closing message
     // ("here's what I built…") rather than a raw step-limit string (the shooter turn committed exactly that). Fall
     // back to the last narration, then a friendly note, only if the summary itself fails.
-    if (summarizeTurn(app, run_root, base_url, key, model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum };
+    // These salvage returns follow a full tool loop, so tools_ran reflects the real work (any_tool) — the drive
+    // loop must keep its multi-step continuation, not be short-circuited by the no-tools fast path.
+    if (summarizeTurn(app, run_root, base_url, key, model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum, .tools_ran = any_tool };
     const fallback: []const u8 = if (last_content.len > 0) last_content else "I did as much as I could this turn — say \"continue\" if there's more you want.";
-    return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty };
+    return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty, .tools_ran = any_tool };
 }
 
 /// A brief no-tools completion asking the model to summarize what it just did — used when the tool loop hits its
