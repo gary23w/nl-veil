@@ -58,47 +58,66 @@ const DeployReq = struct {
 
 const Spawned = struct { id: []const u8, state: []const u8, minds: usize, run_dir: []const u8 };
 
+/// Response-decoupled result of a deploy/cast so the same validate→manifest→spawn core serves BOTH the HTTP
+/// handlers (which translate a `.fail` back through badReq/capErr/serverErr — byte-identical to before) and the
+/// in-process server chat turn (the veil casting its own swarm). `msg` lives in the arena the caller passed.
+pub const FailKind = enum { bad_request, capped, server_error };
+pub const DeployOutcome = union(enum) {
+    ok: Spawned,
+    fail: struct { kind: FailKind, msg: []const u8 },
+};
+fn failBad(msg: []const u8) DeployOutcome {
+    return .{ .fail = .{ .kind = .bad_request, .msg = msg } };
+}
+fn failCap(msg: []const u8) DeployOutcome {
+    return .{ .fail = .{ .kind = .capped, .msg = msg } };
+}
+fn failSrv(msg: []const u8) DeployOutcome {
+    return .{ .fail = .{ .kind = .server_error, .msg = msg } };
+}
+/// Send a `.fail` outcome through the matching HTTP helper (preserves the exact status each error used before).
+fn sendFail(res: *httpz.Response, f: anytype) !void {
+    switch (f.kind) {
+        .bad_request => try badReq(res, f.msg),
+        .capped => try capErr(res, f.msg),
+        .server_error => try serverErr(res, f.msg),
+    }
+}
+
 pub fn deploy(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const body = (try req.json(DeployReq)) orelse return badReq(res, "bad body");
     // A raw /deploy request never picks its own run_dir — that would be a path-traversal hole. Only the cast
     // path (below) supplies a server-sanitized build dir so a chat cast lands in the chat's conversation folder.
-    const sp = (try deployCore(app, res, u, body, "")) orelse return;
-    res.status = 201;
-    try res.json(.{ .ok = true, .id = sp.id, .state = sp.state, .minds = sp.minds }, .{});
+    switch (deploySwarm(app, res.arena, u, body, "")) {
+        .ok => |sp| {
+            res.status = 201;
+            try res.json(.{ .ok = true, .id = sp.id, .state = sp.state, .minds = sp.minds }, .{});
+        },
+        .fail => |f| try sendFail(res, f),
+    }
 }
 
 /// `run_dir_override`, when non-empty, replaces the default `{data}/u{uid}/{id}` run_dir. The swarm id stays a
 /// fresh random hex (URLs + supervisor tracking key off it), but the on-disk run_dir — and therefore the
 /// worker's `{run_dir}/work` build dir — is redirected to a caller-chosen, already-sanitized absolute path.
 /// This is how a chat cast builds IN the chat's conversation dir instead of its own throwaway folder.
-fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, run_dir_override: []const u8) !?Spawned {
+/// Response-decoupled deploy core (was deployCore): validate → run_dir + swarm.json → spawn. Returns a
+/// DeployOutcome the caller renders (HTTP handlers via sendFail; the chat turn reads .ok/.fail directly). All
+/// short-lived allocations use `arena` (HTTP passes res.arena; the chat turn passes a per-cast ArenaAllocator).
+pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: DeployReq, run_dir_override: []const u8) DeployOutcome {
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
-    if (body.minds.len == 0) {
-        try badReq(res, "a swarm needs at least 1 mind");
-        return null;
-    }
-    if (body.minds.len > e.per_swarm_minds) {
-        try capErr(res, try std.fmt.allocPrint(res.arena, "a single swarm is capped at {d} minds on your plan", .{e.per_swarm_minds}));
-        return null;
-    }
-    if (body.encrypt and !e.encrypted) {
-        try capErr(res, "encrypted minds are an admin feature");
-        return null;
-    }
-    if (app.sup.liveMindsForUser(u.id) + body.minds.len > e.max_minds) {
-        try capErr(res, "that would exceed your plan's live-mind limit — stop a swarm or upgrade to Pro");
-        return null;
-    }
-    if (app.sup.activeSwarmsForUser(u.id) >= e.max_swarms) {
-        try capErr(res, "your plan's concurrent-swarm limit is reached — stop one or upgrade to Pro");
-        return null;
-    }
+    if (body.minds.len == 0) return failBad("a swarm needs at least 1 mind");
+    if (body.minds.len > e.per_swarm_minds)
+        return failCap(std.fmt.allocPrint(arena, "a single swarm is capped at {d} minds on your plan", .{e.per_swarm_minds}) catch "minds cap exceeded");
+    if (body.encrypt and !e.encrypted) return failCap("encrypted minds are an admin feature");
+    if (app.sup.liveMindsForUser(u.id) + body.minds.len > e.max_minds)
+        return failCap("that would exceed your plan's live-mind limit — stop a swarm or upgrade to Pro");
+    if (app.sup.activeSwarmsForUser(u.id) >= e.max_swarms)
+        return failCap("your plan's concurrent-swarm limit is reached — stop one or upgrade to Pro");
     if (http.metered(app, u)) {
-        if (app.ledger) |l| if (!l.hasBalance(u.id, u.plan)) {
-            try capErr(res, "you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
-            return null;
-        };
+        if (app.ledger) |l| if (!l.hasBalance(u.id, u.plan))
+            return failCap("you're out of neurons for this billing period — upgrade your plan or add a top-up to run more swarms");
     }
     // A cast targets a LOCAL model when the provider is ollama OR the base_url names a loopback host. This set
     // MUST match the worker's isLocal() (src/worker/llm.zig): a host the worker treats as local but the gate
@@ -108,33 +127,31 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
         std.mem.indexOf(u8, body.base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, body.base_url, "0.0.0.0") != null or
         std.mem.indexOf(u8, body.base_url, "[::1]") != null;
-    if (local_model and !app.auth.isAdmin(u)) {
-        try capErr(res, "local models (Ollama) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
-        return null;
-    }
+    if (local_model and !app.auth.isAdmin(u))
+        return failCap("local models (Ollama) are admin-only and don't run in the hosted environment — choose Cloudflare Workers AI or bring your own API key");
 
     var rnd: [8]u8 = undefined;
     app.io.random(&rnd);
-    const id = try std.fmt.allocPrint(res.arena, "{s}", .{std.fmt.bytesToHex(rnd, .lower)});
+    const id = std.fmt.allocPrint(arena, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return failSrv("out of memory");
     // run_dir is the override (a chat conversation dir) when the cast asked to build in place, else the default
     // per-swarm folder. Either way `{run_dir}/work` is the deliverable dir the worker uses — the worker needs no
     // change, it just inherits whichever run_dir we spawn it with.
-    const run_dir = if (run_dir_override.len > 0)
-        try res.arena.dupe(u8, run_dir_override)
+    const run_dir = (if (run_dir_override.len > 0)
+        arena.dupe(u8, run_dir_override)
     else
-        try std.fmt.allocPrint(res.arena, "{s}/u{d}/{s}", .{ app.data, u.id, id });
-    const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{run_dir});
+        std.fmt.allocPrint(arena, "{s}/u{d}/{s}", .{ app.data, u.id, id })) catch return failSrv("out of memory");
+    const workdir = std.fmt.allocPrint(arena, "{s}/work", .{run_dir}) catch return failSrv("out of memory");
 
     // RE-CAST HYGIENE: a cast into a chat conversation dir REUSES the previous cast's run_dir
     // (`_chat/builds/{conv}`), so its lifecycle files are still on disk. A leftover STOP would stop the new
     // worker at its first boundary check, a leftover DONE would read the fresh spawn as already-finished,
     // and the old events.jsonl would splice two runs into one stream. Reset lifecycle metadata ONLY —
     // never work/ or any other user file — BEFORE the manifest write + spawn.
-    if (run_dir_override.len > 0) resetCastLifecycle(app, res.arena, run_dir);
+    if (run_dir_override.len > 0) resetCastLifecycle(app, arena, run_dir);
 
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     for (body.minds) |m| {
-        const md = try std.fmt.allocPrint(res.arena, "{s}/minds/{s}", .{ run_dir, m.name });
+        const md = std.fmt.allocPrint(arena, "{s}/minds/{s}", .{ run_dir, m.name }) catch return failSrv("out of memory");
         _ = std.Io.Dir.cwd().createDirPathStatus(app.io, md, .default_dir) catch {};
     }
 
@@ -147,15 +164,10 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     // server's own configured Workers AI credentials — so a missing account id never yields a broken URL.
     const cf_base_ok = std.mem.startsWith(u8, body.base_url, "http") and std.mem.indexOf(u8, body.base_url, "{account}") == null;
     if (wants_cf_ai and (body.api_key.len == 0 or !cf_base_ok)) {
-        if (!e.workers_ai) {
-            try capErr(res, "Workers AI is not enabled for your account");
-            return null;
-        }
-        if (app.cf_account_id.len == 0 or app.workers_ai_token.len == 0) {
-            try serverErr(res, "Workers AI is not configured on this server (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN)");
-            return null;
-        }
-        eff_base = try std.fmt.allocPrint(res.arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id});
+        if (!e.workers_ai) return failCap("Workers AI is not enabled for your account");
+        if (app.cf_account_id.len == 0 or app.workers_ai_token.len == 0)
+            return failSrv("Workers AI is not configured on this server (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN)");
+        eff_base = std.fmt.allocPrint(arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id}) catch return failSrv("out of memory");
         eff_key = app.workers_ai_token;
         if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
     } else if (eff_key.len == 0 and body.base_url.len == 0) {
@@ -163,7 +175,7 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
         // flow: pick a provider, no base, no key). A custom OpenAI-compatible endpoint always carries its own
         // base_url — pulling the user's real "openai" vault key/base for it would silently redirect the cast
         // to OpenAI with the wrong credentials.
-        if (app.vault.resolve(u.id, body.provider, res.arena)) |rk| {
+        if (app.vault.resolve(u.id, body.provider, arena)) |rk| {
             eff_key = rk.key;
             if (rk.base_url.len > 0) eff_base = rk.base_url;
         }
@@ -174,112 +186,112 @@ fn deployCore(app: *App, res: *httpz.Response, u: http.User, body: DeployReq, ru
     // caller may not.
     if (local_model and eff_base.len == 0) eff_base = "http://127.0.0.1:11434/v1";
 
+    const mani_items = buildManifest(arena, body, workdir, eff_base, eff_model, body.encrypt and e.encrypted) catch return failSrv("out of memory");
+    const mani_path = std.fmt.allocPrint(arena, "{s}/swarm.json", .{run_dir}) catch return failSrv("out of memory");
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = mani_path, .data = mani_items }) catch return failSrv("could not write manifest");
+
+    if (eff_key.len > 0)
+        writeKeysEnv(app, arena, run_dir, eff_key, eff_base, body.encrypt and e.encrypted) catch return failSrv("could not prepare keys");
+
+    const sw = app.sup.spawn(u.id, id, body.name, run_dir, eff_model, body.minds.len) catch return failSrv("could not spawn worker");
+    return .{ .ok = .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir } };
+}
+
+/// Build the swarm.json manifest bytes into `arena` (freed with the arena). Byte-for-byte the same manifest the
+/// HTTP deploy path wrote before the refactor — only the allocator moved from app.gpa to the caller's arena.
+fn buildManifest(arena: std.mem.Allocator, body: DeployReq, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool) ![]u8 {
     var mani: std.ArrayListUnmanaged(u8) = .empty;
-    defer mani.deinit(app.gpa);
-    try mani.appendSlice(app.gpa, "{\"swarm\":");
-    try jstr(app.gpa, &mani, body.name);
-    try mani.appendSlice(app.gpa, ",\"provider\":");
-    try jstr(app.gpa, &mani, body.provider);
-    try mani.appendSlice(app.gpa, ",\"base_url\":");
-    try jstr(app.gpa, &mani, eff_base);
-    try mani.appendSlice(app.gpa, ",\"model\":");
-    try jstr(app.gpa, &mani, eff_model);
-    try mani.appendSlice(app.gpa, ",\"style\":");
-    try jstr(app.gpa, &mani, body.style);
-    try mani.appendSlice(app.gpa, ",\"mode\":");
-    try jstr(app.gpa, &mani, body.mode);
-    try mani.appendSlice(app.gpa, ",\"stack\":");
-    try jstr(app.gpa, &mani, body.stack);
-    try mani.appendSlice(app.gpa, ",\"workdir\":");
-    try jstr(app.gpa, &mani, workdir);
-    try mani.appendSlice(app.gpa, ",\"goal\":");
-    try jstr(app.gpa, &mani, body.goal);
-    const mline = try std.fmt.allocPrint(res.arena, ",\"minutes\":{d}", .{body.minutes});
-    try mani.appendSlice(app.gpa, mline);
+    try mani.appendSlice(arena, "{\"swarm\":");
+    try jstr(arena, &mani, body.name);
+    try mani.appendSlice(arena, ",\"provider\":");
+    try jstr(arena, &mani, body.provider);
+    try mani.appendSlice(arena, ",\"base_url\":");
+    try jstr(arena, &mani, eff_base);
+    try mani.appendSlice(arena, ",\"model\":");
+    try jstr(arena, &mani, eff_model);
+    try mani.appendSlice(arena, ",\"style\":");
+    try jstr(arena, &mani, body.style);
+    try mani.appendSlice(arena, ",\"mode\":");
+    try jstr(arena, &mani, body.mode);
+    try mani.appendSlice(arena, ",\"stack\":");
+    try jstr(arena, &mani, body.stack);
+    try mani.appendSlice(arena, ",\"workdir\":");
+    try jstr(arena, &mani, workdir);
+    try mani.appendSlice(arena, ",\"goal\":");
+    try jstr(arena, &mani, body.goal);
+    const mline = try std.fmt.allocPrint(arena, ",\"minutes\":{d}", .{body.minutes});
+    try mani.appendSlice(arena, mline);
     if (body.gateway_model.len > 0) {
-        try mani.appendSlice(app.gpa, ",\"gateway_model\":");
-        try jstr(app.gpa, &mani, body.gateway_model);
+        try mani.appendSlice(arena, ",\"gateway_model\":");
+        try jstr(arena, &mani, body.gateway_model);
     }
     if (body.gateway_base_url.len > 0) {
-        try mani.appendSlice(app.gpa, ",\"gateway_base_url\":");
-        try jstr(app.gpa, &mani, body.gateway_base_url);
+        try mani.appendSlice(arena, ",\"gateway_base_url\":");
+        try jstr(arena, &mani, body.gateway_base_url);
     }
     if (body.gateway_key.len > 0) {
-        try mani.appendSlice(app.gpa, ",\"gateway_key\":");
-        try jstr(app.gpa, &mani, body.gateway_key);
+        try mani.appendSlice(arena, ",\"gateway_key\":");
+        try jstr(arena, &mani, body.gateway_key);
     }
-    if (body.veil_population) try mani.appendSlice(app.gpa, ",\"veil_population\":true");
+    if (body.veil_population) try mani.appendSlice(arena, ",\"veil_population\":true");
     // RSI dials — write them explicitly so the manifest carries the same knobs the wizard sets (and the
     // desktop Deploy form can toggle). Autonomy is a string; the rest are bools the worker reads verbatim.
-    try mani.appendSlice(app.gpa, ",\"autonomy\":");
-    try jstr(app.gpa, &mani, if (std.mem.eql(u8, body.autonomy, "bounded")) "bounded" else "full");
-    try mani.appendSlice(app.gpa, if (body.internet) ",\"internet\":true" else ",\"internet\":false");
-    try mani.appendSlice(app.gpa, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
-    if (body.breakout) try mani.appendSlice(app.gpa, ",\"breakout\":true");
-    if (body.observe_psyche) try mani.appendSlice(app.gpa, ",\"observe_psyche\":true");
+    try mani.appendSlice(arena, ",\"autonomy\":");
+    try jstr(arena, &mani, if (std.mem.eql(u8, body.autonomy, "bounded")) "bounded" else "full");
+    try mani.appendSlice(arena, if (body.internet) ",\"internet\":true" else ",\"internet\":false");
+    try mani.appendSlice(arena, if (body.gap_assess) ",\"gap_assess\":true" else ",\"gap_assess\":false");
+    if (body.breakout) try mani.appendSlice(arena, ",\"breakout\":true");
+    if (body.observe_psyche) try mani.appendSlice(arena, ",\"observe_psyche\":true");
     // NEWS DESK dials — publish gates the discourse/briefing path; post gates the actual Telegraph egress
     // (default on, so "publish without post" is grounded-and-screened-to-disk only). Only emit when publishing.
     if (body.publish) {
-        try mani.appendSlice(app.gpa, ",\"publish\":true");
-        try mani.appendSlice(app.gpa, if (body.post) ",\"post\":true" else ",\"post\":false");
+        try mani.appendSlice(arena, ",\"publish\":true");
+        try mani.appendSlice(arena, if (body.post) ",\"post\":true" else ",\"post\":false");
     }
     // the worker's terminate-don't-chain gate (a sustained cast is mode="continuous", so mode can't carry it)
-    if (body.cast) try mani.appendSlice(app.gpa, ",\"cast\":true");
+    if (body.cast) try mani.appendSlice(arena, ",\"cast\":true");
     if (body.files.len > 0) {
-        try mani.appendSlice(app.gpa, ",\"files\":");
-        try jstr(app.gpa, &mani, body.files);
+        try mani.appendSlice(arena, ",\"files\":");
+        try jstr(arena, &mani, body.files);
     }
-    if (body.encrypt and e.encrypted) try mani.appendSlice(app.gpa, ",\"encrypted\":true");
-    try mani.appendSlice(app.gpa, ",\"minds\":[");
+    if (encrypted) try mani.appendSlice(arena, ",\"encrypted\":true");
+    try mani.appendSlice(arena, ",\"minds\":[");
     for (body.minds, 0..) |m, i| {
-        if (i > 0) try mani.append(app.gpa, ',');
-        try mani.appendSlice(app.gpa, "{\"name\":");
-        try jstr(app.gpa, &mani, m.name);
-        try mani.appendSlice(app.gpa, ",\"role\":");
-        try jstr(app.gpa, &mani, m.role);
-        try mani.appendSlice(app.gpa, ",\"duty\":");
-        try jstr(app.gpa, &mani, m.duty);
-        if (m.lead) try mani.appendSlice(app.gpa, ",\"lead\":true");
-        try mani.append(app.gpa, '}');
+        if (i > 0) try mani.append(arena, ',');
+        try mani.appendSlice(arena, "{\"name\":");
+        try jstr(arena, &mani, m.name);
+        try mani.appendSlice(arena, ",\"role\":");
+        try jstr(arena, &mani, m.role);
+        try mani.appendSlice(arena, ",\"duty\":");
+        try jstr(arena, &mani, m.duty);
+        if (m.lead) try mani.appendSlice(arena, ",\"lead\":true");
+        try mani.append(arena, '}');
     }
-    try mani.appendSlice(app.gpa, "]}");
+    try mani.appendSlice(arena, "]}");
+    return mani.items;
+}
 
-    const mani_path = try std.fmt.allocPrint(res.arena, "{s}/swarm.json", .{run_dir});
-    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = mani_path, .data = mani.items }) catch {
-        try serverErr(res, "could not write manifest");
-        return null;
-    };
-
-    if (eff_key.len > 0) {
-        var kbuf: std.ArrayListUnmanaged(u8) = .empty;
-        defer kbuf.deinit(app.gpa);
-        try kbuf.appendSlice(app.gpa, "NL_LLM_KEY=");
-        try kbuf.appendSlice(app.gpa, eff_key);
-        try kbuf.append(app.gpa, '\n');
-        if (eff_base.len > 0) {
-            try kbuf.appendSlice(app.gpa, "NL_LLM_BASE_URL=");
-            try kbuf.appendSlice(app.gpa, eff_base);
-            try kbuf.append(app.gpa, '\n');
-        }
-        if (body.encrypt and e.encrypted) {
-            const sealed = crypto.seal(app.gpa, app.io, app.server_key, kbuf.items) catch {
-                try serverErr(res, "could not seal keys");
-                return null;
-            };
-            defer app.gpa.free(sealed);
-            const kpath = try std.fmt.allocPrint(res.arena, "{s}/keys.env.enc", .{run_dir});
-            std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = kpath, .data = sealed }) catch {};
-        } else {
-            const kpath = try std.fmt.allocPrint(res.arena, "{s}/keys.env", .{run_dir});
-            std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = kpath, .data = kbuf.items }) catch {};
-        }
+/// Write keys.env (or keys.env.enc when encrypted) for the worker. Only a SEAL failure is fatal (returns an
+/// error the caller maps to a failure); a plaintext write error is best-effort silent, matching the prior code.
+fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_key: []const u8, eff_base: []const u8, encrypted: bool) !void {
+    var kbuf: std.ArrayListUnmanaged(u8) = .empty;
+    try kbuf.appendSlice(arena, "NL_LLM_KEY=");
+    try kbuf.appendSlice(arena, eff_key);
+    try kbuf.append(arena, '\n');
+    if (eff_base.len > 0) {
+        try kbuf.appendSlice(arena, "NL_LLM_BASE_URL=");
+        try kbuf.appendSlice(arena, eff_base);
+        try kbuf.append(arena, '\n');
     }
-
-    const sw = app.sup.spawn(u.id, id, body.name, run_dir, eff_model, body.minds.len) catch {
-        try serverErr(res, "could not spawn worker");
-        return null;
-    };
-    return .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir };
+    if (encrypted) {
+        const sealed = try crypto.seal(app.gpa, app.io, app.server_key, kbuf.items);
+        defer app.gpa.free(sealed);
+        const kpath = try std.fmt.allocPrint(arena, "{s}/keys.env.enc", .{run_dir});
+        std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = kpath, .data = sealed }) catch {};
+    } else {
+        const kpath = try std.fmt.allocPrint(arena, "{s}/keys.env", .{run_dir});
+        std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = kpath, .data = kbuf.items }) catch {};
+    }
 }
 
 /// Reset a reused run dir's LIFECYCLE files before a re-cast spawns into it: drop STOP/DONE/control.jsonl/
@@ -347,7 +359,10 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .gateway_model = rq.gateway_model,
         .minds = minds,
     };
-    const sp = (try deployCore(app, res, u, body, "")) orelse return;
+    const sp = switch (deploySwarm(app, res.arena, u, body, "")) {
+        .ok => |s| s,
+        .fail => |f| return sendFail(res, f),
+    };
     if (req.header("accept") orelse req.header("Accept")) |acc| {
         if (std.mem.indexOf(u8, acc, "text/event-stream") != null)
             return tail_fanout.startStream(app, res, sp.id, sp.run_dir);
@@ -371,7 +386,7 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// the run id at once; the caller (veil-desk chat, another AI, a script) then watches events/control like
 /// any swarm. This is the server-side twin of the CLI's `veil cast`: the SERVER owns the cast defaults
 /// (short time budget, 3 minds, full-autonomy research/build dials) so every client casts the same way.
-const CastReq = struct {
+pub const CastReq = struct {
     goal: []const u8 = "",
     minutes: u32 = 8, // a cast is time-budgeted by default, not until-stopped
     minds: u32 = 3,
@@ -415,22 +430,44 @@ fn safeConv(arena: std.mem.Allocator, raw: []const u8) []const u8 {
 pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const rq = (try req.json(CastReq)) orelse return badReq(res, "bad body");
-    if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0) return badReq(res, "a goal is required, e.g. {\"goal\":\"research X and report findings\"}");
+    switch (castSwarm(app, res.arena, u, rq)) {
+        .ok => |sp| {
+            res.status = 201;
+            try res.json(.{
+                .ok = true,
+                .id = sp.id,
+                .state = sp.state,
+                .minds = sp.minds,
+                .events_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/events", .{sp.id}),
+                .control_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/control", .{sp.id}),
+                .files_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/files", .{sp.id}),
+            }, .{});
+        },
+        .fail => |f| try sendFail(res, f),
+    }
+}
+
+/// The server-owned CAST pipeline (was inlined in the `cast` handler): server cast defaults, mind naming, the
+/// workload-time floor, and the conversation build-dir redirect — then deploySwarm. Response-decoupled so BOTH
+/// the HTTP cast route and the in-process server chat turn (the veil casting its own swarm) call it.
+pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq) DeployOutcome {
+    if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0)
+        return failBad("a goal is required, e.g. {\"goal\":\"research X and report findings\"}");
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
     var n: usize = if (rq.minds == 0) 3 else rq.minds;
     if (n > e.per_swarm_minds) n = e.per_swarm_minds;
     if (n == 0) n = 1;
     const names = [_][]const u8{ "nova", "ada", "rex", "lux", "sol" };
-    const minds = try res.arena.alloc(MindSpec, n);
+    const minds = arena.alloc(MindSpec, n) catch return failSrv("out of memory");
     // UNIQUE names past the first 5 (a big cast can line up to 30) — `i % len` would repeat "nova/ada/…" and two
     // minds with the same name collide on their minds/<name> dir + per-mind memory scope.
     for (minds, 0..) |*m, i| {
-        const nm = if (i < names.len) names[i] else try std.fmt.allocPrint(res.arena, "mind{d}", .{i + 1});
+        const nm = if (i < names.len) names[i] else (std.fmt.allocPrint(arena, "mind{d}", .{i + 1}) catch return failSrv("out of memory"));
         m.* = .{ .name = nm, .role = if (i == 0) "Lead" else "Maker", .duty = "build", .lead = i == 0 };
     }
     var sfx: [3]u8 = undefined;
     app.io.random(&sfx);
-    const name = if (rq.name.len > 0) rq.name else try std.fmt.allocPrint(res.arena, "cast-{s}", .{std.fmt.bytesToHex(sfx, .lower)});
+    const name = if (rq.name.len > 0) rq.name else (std.fmt.allocPrint(arena, "cast-{s}", .{std.fmt.bytesToHex(sfx, .lower)}) catch return failSrv("out of memory"));
     const body = DeployReq{
         .name = name,
         .provider = if (rq.provider.len > 0) rq.provider else "workers-ai",
@@ -478,9 +515,9 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // Build IN the chat's conversation dir when the caller named one, so the hive's `{run_dir}/work` is the SAME
     // folder the chat's own build tools (and the desktop console) use — the cast and the chat co-edit one tree
     // instead of the cast disappearing into a throwaway `{hex}/work`. Blank/unsafe conv → default per-swarm dir.
-    const conv = safeConv(res.arena, rq.dir);
+    const conv = safeConv(arena, rq.dir);
     const build_override = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/builds/{s}", .{ app.data, u.id, conv })
+        (std.fmt.allocPrint(arena, "{s}/u{d}/_chat/builds/{s}", .{ app.data, u.id, conv }) catch return failSrv("out of memory"))
     else
         "";
     if (build_override.len > 0) {
@@ -488,17 +525,7 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // parent now so the run_dir root (events.jsonl, swarm.json, minds/) has somewhere to land.
         _ = std.Io.Dir.cwd().createDirPathStatus(app.io, build_override, .default_dir) catch {};
     }
-    const sp = (try deployCore(app, res, u, body, build_override)) orelse return;
-    res.status = 201;
-    try res.json(.{
-        .ok = true,
-        .id = sp.id,
-        .state = sp.state,
-        .minds = sp.minds,
-        .events_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/events", .{sp.id}),
-        .control_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/control", .{sp.id}),
-        .files_url = try std.fmt.allocPrint(res.arena, "/api/v1/swarms/{s}/files", .{sp.id}),
-    }, .{});
+    return deploySwarm(app, arena, u, body, build_override);
 }
 
 const ResolveReq = struct { provider: []const u8 = "mock", model: []const u8 = "mock", minds: u32 = 1 };
