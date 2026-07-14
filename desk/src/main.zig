@@ -2456,9 +2456,13 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
             if (ui.tool_open == i) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
-                if (copyChip(view.x + view.width - 126, y0 + 3)) {
-                    copyToClipboard(m.textStr());
-                    markCopied();
+                // copy chip: flush RIGHT and only while the row is hovered (was pinned mid-row at width-126, which
+                // read as floating "in the middle" on a reasoning block that has no token-cost label to its right).
+                if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
+                    if (copyChip(view.x + view.width - 60, y0 + 3)) {
+                        copyToClipboard(m.textStr());
+                        markCopied();
+                    }
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
