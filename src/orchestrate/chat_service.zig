@@ -209,9 +209,19 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
 
+    // ONE in-flight turn per conversation. A turn does an unlocked read-modify-write of messages.jsonl / context.json
+    // on a detached thread, so a second concurrent turn for the same conv would lost-update the durable log. Reject
+    // the racing request with 409 (the desk cleanly falls back to its local engine on a non-2xx; a raw API client
+    // can retry). Claiming here (not inside spawnTurn) lets us answer 409 before persisting anything.
+    if (!chat_engine.tryBeginTurn(app.io, seg)) {
+        res.status = 409;
+        return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
+    }
+
     // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes — the
-    // "shows only 'server thinking'" symptom. The turn writes frames to events.jsonl as it runs.
+    // "shows only 'server thinking'" symptom. The turn writes frames to events.jsonl as it runs. spawnTurn owns
+    // releasing the per-conv slot (via turnThread / its inline paths) on every completion path.
     chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text);
 
     res.status = 202;

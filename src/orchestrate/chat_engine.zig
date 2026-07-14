@@ -19,6 +19,7 @@ const http = @import("../gateway/http.zig");
 const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
 const llm = @import("../worker/llm.zig");
+const cctx = @import("chat_context.zig");
 
 const App = http.App;
 
@@ -233,12 +234,20 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             conv_buf.append(gpa, '}') catch return;
         }
     }
-    seedPriorMessages(app, conv_dir, &conv_buf);
+    // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
+    // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
+    // scrolled-out turns + the pinned goal + a recency window of the newest turns. The durable log stays whole.
+    assembleHistory(app, conv_dir, run_root, base_url, key, model, user_text, &conv_buf);
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
     // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
     // text then recalling it as "grounded context" is the parrot/confabulation loop the desk fix removed.
     _ = ctx.mem.observe(mem_scope, user_text);
+
+    // The assembled, bounded PREFIX (system + recall + summary + goal + recency window). Everything appended past
+    // this by the drive loop (settled answers, synthetic drive steps, per-pass tool notes) is compacted against it
+    // between drive steps so a multi-step turn stays bounded ACROSS steps, not only within one pass.
+    const assembled_len = conv_buf.items.len;
 
     // ---- AUTO-LOOP DRIVE: settle one answer, infer the next step, drive again until DONE / repeat / DRIVE_MAX ----
     // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
@@ -252,6 +261,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
             return;
         }
+
+        // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
+        // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
+        // across steps. No-op on the first step (nothing past the assembled prefix yet).
+        compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len);
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const inner = runInnerAgentic(app, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
@@ -326,6 +340,52 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
+// ---- PER-CONVERSATION TURN LOCK ----------------------------------------------------------------------------
+// A turn is a detached background thread that does an UNLOCKED read-modify-write of messages.jsonl + context.json.
+// Two turns for the SAME conversation running concurrently (a raced double-POST, a second client, an auto-loop
+// follow-up firing during a long turn) would lost-update the durable log or torn-read the summary cursor. This
+// serializes them: at most one in-flight turn per conv. A distinct conv is unaffected (up to MAX_ACTIVE_TURNS at
+// once — a 17th distinct conv while 16 run is rejected, which is safe, never silent corruption). Bounded fixed
+// storage (conv is safeSeg'd and <= 64 bytes) so no allocation is needed on the hot path.
+const MAX_ACTIVE_TURNS = 16;
+var turn_mtx: std.Io.Mutex = .init;
+var active_convs: [MAX_ACTIVE_TURNS][64]u8 = undefined;
+var active_lens: [MAX_ACTIVE_TURNS]usize = [_]usize{0} ** MAX_ACTIVE_TURNS;
+
+/// Claim the single in-flight slot for `conv`. Returns false if a turn is already running for it (caller rejects
+/// the concurrent request) or all slots are busy. A caller that gets `true` MUST pair it with endTurn(io, conv).
+pub fn tryBeginTurn(io: std.Io, conv: []const u8) bool {
+    if (conv.len == 0 or conv.len > 64) return false; // unrepresentable (shouldn't happen: safeSeg'd, <=64) — reject
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    var free_slot: ?usize = null;
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == 0) {
+            if (free_slot == null) free_slot = i;
+        } else if (std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
+            return false; // a turn is already running for this conversation
+        }
+    }
+    const slot = free_slot orelse return false; // all slots busy — reject rather than run unserialized
+    @memcpy(active_convs[slot][0..conv.len], conv);
+    active_lens[slot] = conv.len;
+    return true;
+}
+
+/// Release the in-flight slot for `conv` (matches tryBeginTurn). Copies nothing — safe to call before freeing any
+/// backing storage `conv` points into.
+fn endTurn(io: std.Io, conv: []const u8) void {
+    if (conv.len == 0 or conv.len > 64) return;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
+            active_lens[i] = 0;
+            return;
+        }
+    }
+}
+
 /// Owned arguments for a background turn: one backing `blob` holds every string arg (the request arena that
 /// spawnTurn was called from dies immediately), plus slices into it. turnThread frees the blob + the struct.
 pub const TurnArgs = struct {
@@ -343,6 +403,7 @@ pub const TurnArgs = struct {
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
     runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text);
+    endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     const gpa = args.app.gpa;
     gpa.free(args.blob);
     gpa.destroy(args);
@@ -356,10 +417,19 @@ fn turnThread(args: *TurnArgs) void {
 pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8) void {
     const gpa = app.gpa;
     const total = conv.len + base_url.len + key.len + model.len + text.len;
-    const args = gpa.create(TurnArgs) catch return runTurn(app, uid, conv, base_url, key, model, text);
+    // The caller (postMessage) already claimed the per-conv turn slot via tryBeginTurn; EVERY completion path here
+    // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
+    // paths run the turn directly, so they release explicitly.
+    const args = gpa.create(TurnArgs) catch {
+        runTurn(app, uid, conv, base_url, key, model, text);
+        endTurn(app.io, conv);
+        return;
+    };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        return runTurn(app, uid, conv, base_url, key, model, text);
+        runTurn(app, uid, conv, base_url, key, model, text);
+        endTurn(app.io, conv);
+        return;
     };
     var o: usize = 0;
     const cv = blob[o..][0..conv.len];
@@ -468,6 +538,10 @@ fn runInnerAgentic(
     var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
 
+    // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
+    // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
+    const base_len = conv_buf.items.len;
+
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
         // COOPERATIVE STOP (before each inference): abort with whatever narration we have; the caller commits it.
@@ -530,16 +604,26 @@ fn runInnerAgentic(
             if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null)
                 observeToolResult(app, ctx, mem_scope, c.name, result);
 
-            conv_buf.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch {
-                if (result.len > 0) gpa.free(result);
-                return .{ .outcome = .hard_error, .content = empty };
+            // Build the whole tool-result object in a scratch list, then append it to conv_buf in ONE shot. A
+            // mid-object OOM must never leave conv_buf as a partial/unterminated object — that malformed JSON would
+            // ride into the next completion (a 400) instead of a clean hard_error. On any failure: free + hard_error.
+            var toolobj: std.ArrayListUnmanaged(u8) = .empty;
+            defer toolobj.deinit(gpa);
+            const obj_ok = blk: {
+                toolobj.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch break :blk false;
+                http.jstr(gpa, &toolobj, c.id) catch break :blk false;
+                toolobj.appendSlice(gpa, ",\"content\":") catch break :blk false;
+                http.jstr(gpa, &toolobj, result) catch break :blk false;
+                toolobj.append(gpa, '}') catch break :blk false;
+                conv_buf.appendSlice(gpa, toolobj.items) catch break :blk false;
+                break :blk true;
             };
-            http.jstr(gpa, conv_buf, c.id) catch {};
-            conv_buf.appendSlice(gpa, ",\"content\":") catch {};
-            http.jstr(gpa, conv_buf, result) catch {};
-            conv_buf.append(gpa, '}') catch {};
             if (result.len > 0) gpa.free(result); // OOM fallback in execute() can hand back a static "" — don't free that
+            if (!obj_ok) return .{ .outcome = .hard_error, .content = empty };
         }
+        // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
+        // into a progress note so a long/afk turn can keep going without overflowing the model window.
+        compactWorking(app, run_root, base_url, key, model, conv_buf, base_len);
         // loop: feed the tool results back for the next completion
     }
 
@@ -690,18 +774,26 @@ fn emitToolState(app: *App, conv_dir: []const u8, name: []const u8, state: []con
     emitEvent(app, conv_dir, ev.items);
 }
 
-/// Rebuild the prior conversation from messages.jsonl into `conv_buf` as OpenAI message objects. Each stored
-/// line is parsed as JSON (so its content is UNescaped raw text) and re-emitted via jstr — round-tripping the
-/// escaped-on-disk form through jstr again would double-escape it.
-fn seedPriorMessages(app: *App, conv_dir: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
-    const gpa = app.gpa;
-    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
-    defer gpa.free(mpath);
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, mpath, gpa, .limited(8 << 20)) catch return;
-    defer gpa.free(data);
+/// Append ONE `,{"role":..,"content":..}` object to conv_buf, built whole in a scratch list first so a mid-object
+/// OOM can never leave conv_buf as invalid JSON. `content` is clipped to `cap` bytes (UTF-8 safe via clipBytes).
+fn appendMsgObj(gpa: std.mem.Allocator, conv_buf: *std.ArrayListUnmanaged(u8), role: []const u8, content: []const u8, cap: usize) void {
+    var obj: std.ArrayListUnmanaged(u8) = .empty;
+    defer obj.deinit(gpa);
+    obj.appendSlice(gpa, ",{\"role\":") catch return;
+    http.jstr(gpa, &obj, role) catch return;
+    obj.appendSlice(gpa, ",\"content\":") catch return;
+    http.jstr(gpa, &obj, clipBytes(content, cap)) catch return;
+    obj.append(gpa, '}') catch return;
+    conv_buf.appendSlice(gpa, obj.items) catch return;
+}
 
+/// Replay a run of stored messages.jsonl lines (`bytes`) into conv_buf as OpenAI message objects. Each stored line
+/// is parsed as JSON (content is UNescaped raw text) and re-emitted via appendMsgObj — round-tripping the escaped-
+/// on-disk form through jstr again would double-escape it. `cap` clips each message's content.
+fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8, cap: usize) void {
+    const gpa = app.gpa;
     const M = struct { role: []const u8 = "", content: []const u8 = "" };
-    var it = std.mem.splitScalar(u8, data, '\n');
+    var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t");
         if (ln.len == 0) continue;
@@ -710,10 +802,166 @@ fn seedPriorMessages(app: *App, conv_dir: []const u8, conv_buf: *std.ArrayListUn
         if (p.value.content.len == 0) continue;
         // stored role is already an OpenAI role ("user"/"assistant"); anything else falls back to user.
         const role: []const u8 = if (std.mem.eql(u8, p.value.role, "assistant")) "assistant" else "user";
-        conv_buf.appendSlice(gpa, ",{\"role\":") catch return;
-        http.jstr(gpa, conv_buf, role) catch return;
-        conv_buf.appendSlice(gpa, ",\"content\":") catch return;
-        http.jstr(gpa, conv_buf, p.value.content) catch return;
-        conv_buf.append(gpa, '}') catch return;
+        appendMsgObj(gpa, conv_buf, role, p.value.content, cap);
     }
+}
+
+/// Assemble the prior-conversation context into conv_buf under a bounded budget (chat_context): a rolling summary
+/// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
+/// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
+/// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
+fn assembleHistory(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+    const gpa = app.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(mpath);
+
+    const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return;
+    defer gpa.free(head_buf);
+    const tail_buf = gpa.alloc(u8, cctx.HISTORY_WINDOW_BYTES) catch return;
+    defer gpa.free(tail_buf);
+
+    const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return; // no history yet → nothing to seed
+    const view = cctx.computeView(ht.head, ht.tail, ht.size, cctx.HISTORY_WINDOW_BYTES);
+
+    // ROLLING SUMMARY: when older turns have scrolled past the recency window, inject a condensed running summary
+    // of them so continuity survives beyond the window + relevance recall.
+    if (view.gap) {
+        const sum = loadOrUpdateSummary(app, conv_dir, run_root, base_url, key, model, mpath, view);
+        defer if (sum.len > 0) gpa.free(sum);
+        if (sum.len > 0) {
+            var sc: std.ArrayListUnmanaged(u8) = .empty;
+            defer sc.deinit(gpa);
+            sc.appendSlice(gpa, "CONVERSATION SUMMARY (older turns of THIS conversation, condensed — everything before the messages shown below). Treat as grounded context:\n") catch {};
+            sc.appendSlice(gpa, sum) catch {};
+            if (sc.items.len > 0) appendMsgObj(gpa, conv_buf, "system", sc.items, cctx.SUMMARY_INJECT_CAP + 256);
+        }
+    }
+
+    // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
+    if (view.goal_line.len > 0) seedLines(app, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
+
+    // RECENCY WINDOW: replay the newest complete turns verbatim (includes the just-appended user message).
+    seedLines(app, conv_buf, view.window, cctx.HISTORY_WINDOW_BYTES);
+
+    // SAFETY NET: an EMPTY window means the newest line (the just-appended current user message) is itself larger
+    // than the recency window and fell out — so the live question would ride only on the fallible rolling summary
+    // (and be lost entirely if that summary call fails or the message exceeds SUMMARY_SPAN_CAP). Seed the current
+    // message verbatim (clipped) so the model always sees the actual question it must answer.
+    if (view.window.len == 0) appendMsgObj(gpa, conv_buf, "user", user_text, cctx.CURRENT_MSG_PIN_CAP);
+}
+
+/// Load the persisted rolling summary + its coverage cursor from {conv_dir}/context.json, and if the recency
+/// window has rolled forward past what the summary covers, fold the newly-dropped span into it (one cheap no-tools
+/// completion) and persist the advance. Returns the (gpa-owned) summary text to inject, or an EMPTY slice (never
+/// null) when there's nothing / on any failure — the caller frees only a non-empty return.
+fn loadOrUpdateSummary(app: *App, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, mpath: []const u8, view: cctx.View) []u8 {
+    const gpa = app.gpa;
+    const empty: []u8 = &[_]u8{};
+
+    // ---- load existing {covered, summary} (absent/garbage → covered 0, empty summary) ----
+    var covered: usize = 0;
+    var summary: []u8 = empty; // gpa-owned once duped below
+    const cpath = std.fmt.allocPrint(gpa, "{s}/context.json", .{conv_dir}) catch return empty;
+    defer gpa.free(cpath);
+    if (std.Io.Dir.cwd().readFileAlloc(app.io, cpath, gpa, .limited(1 << 20))) |raw| {
+        defer gpa.free(raw);
+        const S = struct { covered: usize = 0, summary: []const u8 = "" };
+        if (std.json.parseFromSlice(S, gpa, raw, .{ .ignore_unknown_fields = true })) |p| {
+            defer p.deinit();
+            covered = p.value.covered;
+            if (p.value.summary.len > 0) summary = gpa.dupe(u8, p.value.summary) catch empty;
+        } else |_| {}
+    } else |_| {}
+
+    // ---- is there newly-dropped history to fold in? summary should cover [goal_end, window_start) ----
+    const target = view.window_start;
+    const span_from = @max(covered, view.goal_end);
+    if (target <= span_from) return summary; // already covered (or no middle) → inject what we have
+
+    const span_buf = gpa.alloc(u8, cctx.SUMMARY_SPAN_CAP) catch return summary;
+    defer gpa.free(span_buf);
+    const span = cctx.readSpanTailTrimmed(app.io, mpath, span_from, target, span_buf) orelse return summary;
+    if (span.len == 0) return summary;
+
+    const updated = summarizeInto(app, run_root, base_url, key, model, summary, span) orelse return summary;
+    persistSummary(app, cpath, target, updated); // best-effort; even if the write fails we still inject `updated`
+    if (summary.len > 0) gpa.free(summary);
+    return updated;
+}
+
+/// One no-tools completion that rewrites the running summary to incorporate a span of just-dropped messages.
+/// gpa-owned new summary (clipped) or null on failure. Kept deterministic (low temp) and short.
+fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, prior_summary: []const u8, span_json: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, "You maintain a running summary of a long assistant/user conversation so older turns can be dropped from the live context without losing continuity. Be faithful and concise; preserve concrete facts, decisions, file names, and open threads. Output ONLY the updated summary, no preamble.") catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    var uc: std.ArrayListUnmanaged(u8) = .empty;
+    defer uc.deinit(gpa);
+    uc.appendSlice(gpa, "Running summary so far:\n") catch return null;
+    uc.appendSlice(gpa, if (prior_summary.len > 0) prior_summary else "(none yet)") catch return null;
+    uc.appendSlice(gpa, "\n\nOlder conversation messages now scrolling out of the live window (JSON lines, oldest to newest):\n") catch return null;
+    uc.appendSlice(gpa, span_json) catch return null;
+    uc.appendSlice(gpa, "\n\nRewrite the running summary to incorporate these messages. Keep it under 250 words.") catch return null;
+    http.jstr(gpa, &msgs, uc.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "ctxsum", base_url, key, model, msgs.items, "", 1024, 0.3);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    if (t.len == 0) return null;
+    return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
+}
+
+/// Persist {covered, summary} to context.json as one atomic overwrite (whole line built first). Best-effort.
+fn persistSummary(app: *App, cpath: []const u8, covered: usize, summary: []const u8) void {
+    const gpa = app.gpa;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    const head = std.fmt.allocPrint(gpa, "{{\"covered\":{d},\"summary\":", .{covered}) catch return;
+    defer gpa.free(head);
+    out.appendSlice(gpa, head) catch return;
+    http.jstr(gpa, &out, summary) catch return;
+    out.append(gpa, '}') catch return;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = cpath, .data = out.items }) catch {};
+}
+
+/// One no-tools completion that compresses the CURRENT turn's working log (assistant tool_call turns + tool
+/// results appended since the pass began) into a short progress note, so a long/afk turn can keep going without
+/// its single-turn buffer overflowing the model window. gpa-owned note (clipped) or null on failure.
+fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, span_json: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, "You compress the working log of an in-progress task so it can continue without exceeding the context window. Preserve concrete progress: files created/edited, commands run and their key results, decisions made, and what remains. Output ONLY the compressed progress note.") catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    var uc: std.ArrayListUnmanaged(u8) = .empty;
+    defer uc.deinit(gpa);
+    uc.appendSlice(gpa, "Working log so far (assistant tool calls + tool results as JSON):\n") catch return null;
+    uc.appendSlice(gpa, clipBytes(span_json, 200 * 1024)) catch return null; // bound the summarizer's own input
+    uc.appendSlice(gpa, "\n\nWrite the compressed progress note (<= 200 words).") catch return null;
+    http.jstr(gpa, &msgs, uc.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "compact", base_url, key, model, msgs.items, "", 1024, 0.3);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t");
+    if (t.len == 0) return null;
+    return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
+}
+
+/// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace it
+/// with a single compressed progress note so the loop can continue bounded. Called at a STEP BOUNDARY (after all of
+/// a step's tool results are appended), so the message sequence stays protocol-valid (no dangling tool_calls).
+/// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
+fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize) void {
+    if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= cctx.WORKING_COMPACT_BYTES) return;
+    const gpa = app.gpa;
+    const note = summarizeWorkingSpan(app, run_root, base_url, key, model, conv_buf.items[base_len..]) orelse return;
+    defer gpa.free(note);
+    conv_buf.shrinkRetainingCapacity(base_len);
+    appendMsgObj(gpa, conv_buf, "assistant", note, cctx.SUMMARY_INJECT_CAP);
 }
