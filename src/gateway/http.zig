@@ -71,26 +71,20 @@ pub fn sessionToken(req: *httpz.Request) ?[]const u8 {
     return null;
 }
 
-/// Append `data` to `path` (read-modify-write: read the file, then rewrite it with `data` appended). NOTE this is
-/// not an O_APPEND; it is O(file) per call, so it suits small/moderate logs, not unbounded high-frequency streams.
-///
-/// CRITICAL: a MISSING file is the normal first-append case (empty existing). But any OTHER read error — above all
-/// error.StreamTooLong once the file passes the read cap — must NOT fall through to an empty `existing`, or the
-/// writeFile below would OVERWRITE the entire file with just `data` (silent total truncation to one record — the
-/// "8 MiB amnesia cliff"). On such an error we refuse to write and propagate it, leaving the file intact. The cap
-/// is generous (64 MiB) so real conversation logs keep growing long before the ceiling.
+/// Append `data` to `path` as a TRUE O(1) append: open-or-create WITHOUT truncating, then a single positioned
+/// write at the current end-of-file. The file grows monotonically (never rewritten), so:
+///   * a byte-cursor reader (the chat events poller streams events.jsonl by offset) never sees the file shrink,
+///   * a streaming turn emitting hundreds of token frames no longer pays an O(n²) whole-file rewrite per frame
+///     (the old read-modify-write was the throttle that made streaming feel chunky), and
+///   * the 8/64 MiB read-cap "amnesia cliff" is gone — nothing reads the existing content.
+/// Open+close per call (like the worker's emit) so the file is never held locked against a concurrent reader.
 pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    _ = alloc; // no scratch buffer needed for a positioned append
     const dir = std.Io.Dir.cwd();
-    const existing: []u8 = dir.readFileAlloc(io, path, alloc, .limited(64 << 20)) catch |e| switch (e) {
-        error.FileNotFound => &[_]u8{},
-        else => return e, // e.g. StreamTooLong — do NOT overwrite; preserve the file
-    };
-    defer if (existing.len > 0) alloc.free(existing); // was previously leaked on every append
-    var buf: std.ArrayListUnmanaged(u8) = .empty;
-    defer buf.deinit(alloc);
-    try buf.appendSlice(alloc, existing);
-    try buf.appendSlice(alloc, data);
-    try dir.writeFile(io, .{ .sub_path = path, .data = buf.items });
+    const f = try dir.createFile(io, path, .{ .truncate = false }); // create if missing; open-at-0 without truncating if it exists
+    defer f.close(io);
+    const end = f.length(io) catch 0;
+    try f.writePositionalAll(io, data, end);
 }
 
 pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) !void {

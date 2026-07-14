@@ -161,6 +161,20 @@ fn appendMsg(app: *App, conv_dir: []const u8, role: []const u8, content: []const
     http.appendFile(app.io, gpa, path, line.items) catch {};
 }
 
+/// Emit the turn's token USAGE (the delta of the process token counters since `t0`, i.e. this turn's tokens) as a
+/// `{"kind":"usage",...}` frame, then the terminal `{"kind":"done"}`. Called at EVERY turn-completion path so the
+/// desk always gets a usage frame right before it disarms. Zero delta (e.g. a no-op turn) emits no usage frame.
+fn finishTurn(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
+    const t1 = llm.tokensSnapshot();
+    const din = if (t1.in >= t0.in) t1.in - t0.in else 0;
+    const dout = if (t1.out >= t0.out) t1.out - t0.out else 0;
+    if (din > 0 or dout > 0) {
+        var b: [160]u8 = undefined;
+        emitEvent(app, conv_dir, std.fmt.bufPrint(&b, "{{\"kind\":\"usage\",\"tokens_in\":{d},\"tokens_out\":{d},\"text\":\"{d} tokens in · {d} out\"}}", .{ din, dout, din, dout }) catch "{\"kind\":\"usage\"}");
+    }
+    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+}
+
 /// Append `obj` (a complete, already-escaped single-line JSON object) as one line to events.jsonl.
 fn emitEvent(app: *App, conv_dir: []const u8, obj: []const u8) void {
     const gpa = app.gpa;
@@ -212,8 +226,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
     const environ = app.sup.parent_env orelse {
         emitKV(app, conv_dir, "error", "err", "server env unavailable");
+        emitEvent(app, conv_dir, "{\"kind\":\"done\"}"); // the desk disarms only on {done}; an error alone would hang it
         return;
     };
+
+    // USAGE: snapshot the process token counters BEFORE any LLM work (plan decomposition, history summary, drive,
+    // reflect, the agentic loop) — finishTurn emits the delta as this turn's usage at every completion path.
+    const usage_t0 = llm.tokensSnapshot();
 
     // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree) ----
     const run_root = std.fmt.allocPrint(gpa, "{s}/builds/{s}", .{ base, conv }) catch return;
@@ -332,7 +351,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // mid-turn user message (posting to steer a running turn) so the next inference picks it up.
         switch (drainChatControl(app, conv_dir, &steer_cursor, &conv_buf)) {
             .stop => {
-                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                finishTurn(app, conv_dir, usage_t0);
                 return;
             },
             .none => {},
@@ -369,7 +388,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
                 // poller disarms + clears busy instead of hanging forever (the "kept streaming after an error").
                 planStepInterrupted(app, conv_dir, plan, task_idx);
-                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                finishTurn(app, conv_dir, usage_t0);
                 return;
             },
             .stopped => {
@@ -380,7 +399,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                     emitAssistant(app, conv_dir, inner.content);
                 }
                 gpa.free(inner.content);
-                emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+                finishTurn(app, conv_dir, usage_t0);
                 return;
             },
             .settled => {},
@@ -407,7 +426,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             const note = "(no reply — the model returned an empty or malformed response this turn)";
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
-            emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+            finishTurn(app, conv_dir, usage_t0);
             return;
         }
 
@@ -471,7 +490,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // The drive loop ended (plan complete / DONE / repeat / step cap / an OOM append) — every settled answer is
     // already durable. A plan run gets a closing summary (all done, or paused at N/M — say "continue" to resume).
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
-    emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+    finishTurn(app, conv_dir, usage_t0);
 }
 
 // ---- PER-CONVERSATION TURN LOCK ----------------------------------------------------------------------------
