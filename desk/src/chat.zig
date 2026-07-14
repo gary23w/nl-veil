@@ -1183,6 +1183,7 @@ pub const Chat = struct {
             self.sc_conv_len = conv.len;
             self.sc_from = from0;
             self.sc_fails = 0;
+            self.scClearStream(); // fresh live preview for this turn's streamed deltas
             self.sc_active = true; // keep busy; pumpServerChat clears it on {done}
             return true;
         }
@@ -1246,15 +1247,84 @@ pub const Chat = struct {
         self.sc_from += consumed; // advance ONLY past complete lines; a trailing partial waits for the next poll
     }
 
-    /// Render ONE server event frame line into the transcript. Frames are one flat JSON object per line, keyed by
-    /// "kind" (see src/orchestrate/chat_service.zig): message / tool / reasoning / error / done.
+    /// Append a streamed delta to the in-flight reply (is_reason=false) or reasoning (is_reason=true) buffer — the
+    /// SAME buffers the local engine streams into, so main.zig renders them growing live (the reply "types out").
+    /// Appends until full; a reply longer than the buffer caps the live preview, but the final {kind:message}
+    /// commits it whole. No-op after overflow.
+    fn scStreamAppend(self: *Chat, is_reason: bool, delta: []const u8) void {
+        self.store.lock();
+        defer self.store.unlock();
+        if (is_reason) {
+            const cur = self.store.stream_reason_len;
+            const n = @min(delta.len, self.store.stream_reason.len - cur);
+            @memcpy(self.store.stream_reason[cur..][0..n], delta[0..n]);
+            self.store.stream_reason_len = cur + n;
+        } else {
+            const cur = self.store.stream_len;
+            const n = @min(delta.len, self.store.stream_text.len - cur);
+            @memcpy(self.store.stream_text[cur..][0..n], delta[0..n]);
+            self.store.stream_len = cur + n;
+        }
+    }
+
+    /// Commit the in-flight streamed REASONING as a durable .thought chip and clear the live buffer (0 = no-op).
+    fn scCommitReason(self: *Chat, dd: []const u8) void {
+        var rbuf: [4096]u8 = undefined;
+        var rlen: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            rlen = @min(self.store.stream_reason_len, rbuf.len);
+            @memcpy(rbuf[0..rlen], self.store.stream_reason[0..rlen]);
+            self.store.stream_reason_len = 0;
+        }
+        if (rlen > 0) self.appendMsg(dd, .thought, rbuf[0..rlen]);
+    }
+
+    /// Commit the in-flight streamed REPLY as a durable .veil message and clear the live buffer (0 = no-op).
+    fn scCommitText(self: *Chat, dd: []const u8) void {
+        var tbuf: [store_mod.STREAM_CAP]u8 = undefined;
+        var tlen: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            tlen = @min(self.store.stream_len, tbuf.len);
+            @memcpy(tbuf[0..tlen], self.store.stream_text[0..tlen]);
+            self.store.stream_len = 0;
+        }
+        if (tlen > 0) self.appendMsg(dd, .veil, tbuf[0..tlen]);
+    }
+
+    /// Discard any in-flight streamed reply/reasoning preview WITHOUT committing (both buffers).
+    fn scClearStream(self: *Chat) void {
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.stream_len = 0;
+        self.store.stream_reason_len = 0;
+    }
+
+    /// Render ONE server event frame line. Frames are one flat JSON object per line, keyed by "kind" (see
+    /// src/orchestrate/chat_engine.zig): token/reasoning (streamed deltas → the live preview) | message (the
+    /// authoritative final reply, seals the stream) | tool | status | error | done.
     fn renderScFrame(self: *Chat, dd: []const u8, line_raw: []const u8) void {
         const line = std.mem.trim(u8, line_raw, " \r\n\t");
         if (line.len == 0) return;
         const kind = scRawField(line, "kind") orelse return; // no kind → not a frame we render
+        // STREAMED DELTAS: grow the live preview (types out). Robust to a non-streaming backend too, which sends
+        // ONE reasoning delta (whole thinking) + then the message — the buffer just grows in one step.
+        if (std.mem.eql(u8, kind, "token") or std.mem.eql(u8, kind, "reasoning")) {
+            if (scRawField(line, "delta")) |raw| {
+                var buf: [store_mod.STREAM_CAP]u8 = undefined;
+                const d = scUnescape(raw, &buf);
+                if (d.len > 0) self.scStreamAppend(std.mem.eql(u8, kind, "reasoning"), d);
+            }
+            return;
+        }
         if (std.mem.eql(u8, kind, "message")) {
             const role = scRawField(line, "role") orelse "";
             if (std.mem.eql(u8, role, "user")) return; // the user message is already in the transcript locally
+            self.scCommitReason(dd); // seal the streamed thinking as a .thought chip
+            self.scClearStream(); // discard the live reply PREVIEW — the message content below is authoritative
             if (scRawField(line, "content")) |raw| {
                 var buf: [store_mod.STREAM_CAP]u8 = undefined;
                 const content = scUnescape(raw, &buf);
@@ -1263,6 +1333,9 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "tool")) {
+            // a tool call ends the current streamed step — seal the pre-tool narration (thinking + any content).
+            self.scCommitReason(dd);
+            self.scCommitText(dd);
             const tool = scRawField(line, "tool") orelse "";
             const state = scRawField(line, "state") orelse "";
             var pvb: [260]u8 = undefined;
@@ -1279,22 +1352,13 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "error")) {
+            self.scCommitReason(dd);
+            self.scCommitText(dd);
             var buf: [512]u8 = undefined;
             const err = if (scRawField(line, "err")) |raw| scUnescape(raw, &buf) else "";
             var nb: [600]u8 = undefined;
             const note = std.fmt.bufPrint(&nb, "(server error: {s})", .{err[0..@min(err.len, 500)]}) catch "(server error)";
             self.appendMsg(dd, .veil, note);
-            return;
-        }
-        if (std.mem.eql(u8, kind, "reasoning")) {
-            // the model's thinking — render it as a collapsed .thought chip, same as the local engine shows
-            // reasoning (so "no reasoning back to the user" is fixed). One frame per reasoning block today; when
-            // token streaming lands these arrive as deltas and append into one live chip.
-            if (scRawField(line, "delta")) |raw| {
-                var buf: [store_mod.STREAM_CAP]u8 = undefined;
-                const d = scUnescape(raw, &buf);
-                if (d.len > 0) self.appendMsg(dd, .thought, d);
-            }
             return;
         }
         if (std.mem.eql(u8, kind, "status")) {
@@ -1307,6 +1371,7 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "done")) {
+            self.scClearStream(); // any unsealed preview is stale now
             self.sc_active = false;
             self.setBusy(false);
             self.setStatus("");
@@ -1318,6 +1383,7 @@ pub const Chat = struct {
     /// End a server-chat exchange, optionally leaving a one-line notice (unreachable / poll failure). An empty
     /// note just disarms silently. Clears the busy/status the send set.
     fn abortServerChat(self: *Chat, dd: []const u8, note: []const u8) void {
+        self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
         self.sc_active = false;
         self.setBusy(false);
