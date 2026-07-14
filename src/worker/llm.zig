@@ -1027,8 +1027,13 @@ pub fn completeStream(
     temperature: f32,
     ctx: *anyopaque,
     on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
+    // Optional cooperative ABORT: the poll loop calls this (~every 40ms) with `ctx`; returning true kills the curl
+    // child and returns the PARTIAL stream immediately (NOT a fallback to complete(), which would re-run the whole
+    // inference). This is what makes a chat Stop interrupt a long in-flight streaming reply promptly instead of
+    // waiting out the whole ~15s generation. null ⇒ never aborts (unchanged behavior for any non-abortable caller).
+    should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) Step {
-    return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta) orelse
+    return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort) orelse
         complete(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
 }
 
@@ -1047,6 +1052,7 @@ fn streamAttempt(
     temperature: f32,
     ctx: *anyopaque,
     on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
+    should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) ?Step {
     const native = isOllama(base_url);
     const local = isLocal(base_url);
@@ -1132,9 +1138,16 @@ fn streamAttempt(
 
     // ---- tail the sink until curl exits (STAT sentinel) or the stream self-completes ----
     var offset: usize = 0;
+    var aborted = false;
     const wall: i64 = @as(i64, stream_max_s) + 30;
     const t0 = std.Io.Timestamp.now(io, .real).toSeconds();
     while (true) {
+        // COOPERATIVE ABORT (chat Stop): kill the in-flight stream promptly instead of waiting out generation. We
+        // still feed whatever already arrived (below returns the partial), so the user keeps the streamed text.
+        if (should_abort) |ab| if (ab(ctx)) {
+            aborted = true;
+            break;
+        };
         const data = std.Io.Dir.cwd().readFileAlloc(io, outpath, gpa, .limited(8 << 20)) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
@@ -1165,6 +1178,18 @@ fn streamAttempt(
         }
         if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
         io.sleep(.{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+    }
+
+    // ABORTED mid-stream (chat Stop): return whatever already streamed as a partial Step — do NOT fall back to
+    // complete() (that re-runs the whole inference, defeating the abort) and do NOT take the empty→null path below.
+    // ok=true with partial (possibly empty) content; the caller's next stop check ends the turn, committing this.
+    if (aborted) {
+        const c_owned = gpa.dupe(u8, st.content.items) catch return null;
+        const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
+            gpa.free(c_owned);
+            return null;
+        };
+        return .{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
     }
 
     // ---- decide: return a clean streamed Step, or null → complete() reparses authoritatively ----
