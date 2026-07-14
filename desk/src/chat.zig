@@ -352,6 +352,9 @@ const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task ne
 /// the busy UI. The poller runs ~1Hz, so ~180 ≈ 3 minutes of a genuinely down/wedged server (a healthy turn's
 /// polls all return 200 and reset the count long before this).
 const SC_MAX_FAILS: u32 = 180;
+/// After a server chat send falls back to local (server unreachable / disabled / not-admin / errored), skip the
+/// server for this many seconds so a down or misconfigured backend doesn't cost a failed round-trip on every send.
+const SC_COOLDOWN_S: i64 = 45;
 /// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
 /// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
 /// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
@@ -668,6 +671,8 @@ pub const Chat = struct {
     sc_conv_len: usize = 0,
     sc_fails: u32 = 0, //        consecutive failed/unreachable event polls — bounds the retry so a down server can't
     //                           leave the UI busy forever (reset on any good poll)
+    sc_cooldown_until: i64 = 0, // after a server turn falls back to local, skip the server for a bit (unix secs) so a
+    //                            down/misconfigured server doesn't pay the failed round-trip on EVERY send
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -1094,45 +1099,37 @@ pub const Chat = struct {
     /// True when the SERVER CHAT setting is on (the chat brain runs in the backend, not the local loop). Read
     /// under the store lock. Default false ⇒ cmdSend takes the existing local path and this whole surface is inert.
     fn serverChatOn(self: *Chat) bool {
-        self.store.lock();
-        defer self.store.unlock();
-        return self.store.settings.server_chat;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            if (!self.store.settings.server_chat) return false;
+        }
+        // In cooldown after a recent fallback → keep using the local engine until the backend has had time to
+        // come back (avoids re-paying the failed round-trip on every message while a server is down/misconfigured).
+        return self.nowS() >= self.sc_cooldown_until;
     }
 
     /// Route one user send to the conv's SERVER-side chat turn. Returns true if the send was handed to the server
     /// (the caller then SKIPS the entire local turn path); false if no conv could be resolved, so the caller falls
     /// back to the local loop. The user message is ALREADY in the transcript (cmdSend appended it before calling).
     fn routeToServerChat(self: *Chat, dd: []const u8, text: []const u8) bool {
+        _ = dd;
         var convb: [96]u8 = undefined;
         const conv = self.convScope(&convb);
-        if (conv.len == 0 or conv.len > self.sc_conv.len) return false; // no resolvable conv → local fallback
+        if (conv.len == 0 or conv.len > self.sc_conv.len) return false; // no resolvable conv → local
 
-        // The desk's local auto-loop must NOT also drive turns while the server owns the brain (maybeLoop grabs the
-        // idle turn slot whenever chat_loop is set). One server send = one server turn; disarm the local loop.
-        {
-            self.store.lock();
-            self.store.chat_loop = false;
-            self.store.chat_loop_afk = false;
-            self.store.unlock();
-        }
-
-        // Baseline cursor: only frames written AFTER this send are new. Anything already in events.jsonl is either
-        // rendered by a prior server turn or empty (a fresh conv). chatEvents(conv,0).body.len = whole-file length.
-        var from0: usize = 0;
-        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
-            from0 = er.body.len;
-            if (er.body.len > 0) self.gpa.free(er.body);
-        }
-
-        // Resolve the provider so BYOK carries server-side; the server falls back to its OWN configured provider on
-        // blank fields, so even a local-Ollama desk works though these come through populated.
+        // Resolve the provider so BYOK carries server-side (the server falls back to its own config on blanks).
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
         var mb: [96]u8 = undefined;
         const prov = self.resolveProvider(&bb, &kb, &mb);
 
-        var body: [4096]u8 = undefined;
-        var w = Io.Writer.fixed(&body);
+        // Heap body: on default-on a long user message would overflow a fixed buffer (which would then wrongly
+        // fall back). Size it to the escaped worst case; any alloc/build failure just falls back to local.
+        const cap = text.len * 2 + prov.base_url.len + prov.model.len + prov.key.len + 128;
+        const body = self.gpa.alloc(u8, cap) catch return false;
+        defer self.gpa.free(body);
+        var w = Io.Writer.fixed(body);
         const bok = blk: {
             w.writeAll("{\"text\":\"") catch break :blk false;
             wesc(&w, text);
@@ -1145,42 +1142,66 @@ pub const Chat = struct {
             w.writeAll("\"}") catch break :blk false;
             break :blk true;
         };
-        if (!bok) {
-            self.appendMsg(dd, .veil, "(server chat: the request was too large to build)");
-            return true; // handled (as a failure) — do NOT also run the local path
+        if (!bok) return false; // couldn't build the request → local fallback
+
+        // Baseline cursor: only frames written AFTER this send are new (prior frames are already rendered/empty).
+        var from0: usize = 0;
+        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
+            from0 = er.body.len;
+            if (er.body.len > 0) self.gpa.free(er.body);
         }
 
-        // ARM the poller BEFORE the (blocking) send: chatSend runs the whole turn synchronously server-side and
-        // returns only when it finishes or the POST ceiling is hit — but frames land in events.jsonl the whole
-        // time, so a turn that outlives the POST still has its frames rendered by pumpServerChat from this cursor.
-        @memcpy(self.sc_conv[0..conv.len], conv);
-        self.sc_conv_len = conv.len;
-        self.sc_from = from0;
-        self.sc_fails = 0;
-        self.sc_active = true;
         self.setBusy(true);
         self.setStatus("server turn running...");
         log.info("server chat: send conv={s} from={d} model={s}", .{ conv, from0, prov.model });
 
+        // The send BLOCKS until the (synchronous) server turn finishes or the POST ceiling is hit. 200/201 = it ran;
+        // null = timed out or unreachable (it may STILL have completed — check for a {done} frame); anything else is
+        // a definitive failure (501 flag off, 401/403 not-admin, 404 old server binary, 5xx). Any non-success FALLS
+        // BACK to the local engine so the user always gets a reply.
+        var handled = false;
         if (self.runner().chatSend(self.io, self.gpa, conv, w.buffered())) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("server chat: POST -> status={d}", .{resp.status});
-            // 200/201 = the turn RAN to completion (its frames, incl. {done}, are on disk) — leave the poller
-            // armed to render them. Any other status is terminal (501 flag off, 401/403 auth, other 4xx/5xx): disarm.
-            if (resp.status != 200 and resp.status != 201) {
-                var nb: [240]u8 = undefined;
-                const msg = std.fmt.bufPrint(&nb, "(server chat unavailable — HTTP {d}. Is the veil server running with VEIL_CHAT_BACKEND=1, and are you signed in as admin?)", .{resp.status}) catch "(server chat unavailable)";
-                self.appendMsg(dd, .veil, msg);
-                self.sc_active = false;
-                self.setBusy(false);
-                self.setStatus("");
-            }
+            handled = resp.status == 200 or resp.status == 201;
         } else {
-            // Null = the POST hit its ceiling or the server was briefly unreachable. The server may STILL be running
-            // the turn and writing frames — keep the poller armed; it renders them, or gives up on SC_MAX_FAILS.
-            log.warn("server chat: POST returned null — poller will render any frames the server writes", .{});
+            log.warn("server chat: POST returned null — checking whether the turn completed anyway", .{});
+            handled = self.serverTurnDone(conv, from0);
         }
-        return true;
+
+        if (handled) {
+            // Commit to the server for this turn: the local auto-loop must not also drive turns (it grabs the idle
+            // slot whenever chat_loop is set), so disarm it; arm the poller to render the frames the turn wrote.
+            {
+                self.store.lock();
+                self.store.chat_loop = false;
+                self.store.chat_loop_afk = false;
+                self.store.unlock();
+            }
+            @memcpy(self.sc_conv[0..conv.len], conv);
+            self.sc_conv_len = conv.len;
+            self.sc_from = from0;
+            self.sc_fails = 0;
+            self.sc_active = true; // keep busy; pumpServerChat clears it on {done}
+            return true;
+        }
+
+        // FALLBACK → local engine: clear the UX we set, arm a cooldown (don't re-pay the failed round-trip on
+        // every send while the backend is down/misconfigured), and return false so cmdSend runs the local path.
+        self.setBusy(false);
+        self.setStatus("");
+        self.sc_cooldown_until = self.nowS() + SC_COOLDOWN_S;
+        log.info("server chat: unavailable — falling back to the local engine (cooldown {d}s)", .{SC_COOLDOWN_S});
+        return false;
+    }
+
+    /// One cheap poll: does the conv's events.jsonl carry a {"kind":"done"} frame past byte offset `from`? Detects
+    /// a server turn that COMPLETED but whose POST timed out, so we render it instead of double-running locally.
+    fn serverTurnDone(self: *Chat, conv: []const u8, from: usize) bool {
+        const resp = self.runner().chatEvents(self.io, self.gpa, conv, from) orelse return false;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return false;
+        return std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null;
     }
 
     /// SERVER CHAT poller: render a server-side turn's event frames into the transcript. No-op unless a server send
@@ -1272,6 +1293,9 @@ pub const Chat = struct {
         self.sc_active = false;
         self.setBusy(false);
         self.setStatus("");
+        // A server turn that died mid-flight → cool the backend off so the user's next send goes to the local
+        // engine instead of stalling on the same broken server again.
+        self.sc_cooldown_until = self.nowS() + SC_COOLDOWN_S;
     }
 
     /// Is there work in flight that a chat switch/new-chat would corrupt (a live model turn, a running cast, or an
@@ -2782,7 +2806,7 @@ pub const Chat = struct {
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
-        s.server_chat = std.mem.indexOf(u8, data, "\"server_chat\":true") != null; // absent = default OFF (local brain)
+        s.server_chat = std.mem.indexOf(u8, data, "\"server_chat\":false") == null; // absent = default ON (prefer backend, fall back to local)
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -8612,6 +8636,7 @@ test "first message auto-titles the conversation (both the type-first and +-firs
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
 
     // flow 1: user types first (no conversation yet)
+    chat.store.settings.server_chat = false; // this test drives the LOCAL engine (no server round-trip)
     chat.cmdSend(dd, "hello there veil, how are you?");
     llm.abort(&chat.stream, io);
     chat.stream.deinit(std.testing.allocator);
@@ -9131,6 +9156,7 @@ test "cast fast-path: an explicit cast request deploys straight from send — no
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
     chat.cmdNewConv(dd);
 
+    chat.store.settings.server_chat = false; // this test drives the LOCAL engine (no server round-trip)
     chat.cmdSend(dd, "cast a swarm to build a tiny two-page site: index.html and about.html.");
     // the dispatch happened synchronously: no model turn was started, and the cast note (deployed OR the
     // bounded "no response from the veil server" failure — this env has no server) is already in the chat
@@ -9222,6 +9248,7 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     defer std.testing.allocator.destroy(chat);
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
 
+    chat.store.settings.server_chat = false; // this test drives the LOCAL engine (no server round-trip)
     chat.cmdSend(dd, "Reply with exactly one short sentence: what is the capital of France?");
     try std.testing.expect(chat.turn == .user);
     var waited: usize = 0;
@@ -9336,6 +9363,7 @@ test "E2E cowork: explicit cast fires, chat replies in parallel, collect answers
 
     // 1) explicit cast request -> user turn completes -> a cast fires (CAST line or the userWantsCast recovery)
     std.debug.print("[E2E] step1: sending cast request...\n", .{});
+    chat.store.settings.server_chat = false; // this test drives the LOCAL engine (no server round-trip)
     chat.cmdSend(dd, "cast a swarm to write two facts about the moon to facts.md");
     var waited: usize = 0;
     while (chat.turn != .idle and waited < 3600) : (waited += 1) tick.pump(chat, dd, io, waited, "s1"); // <=6min for the turn
