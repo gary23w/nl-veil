@@ -91,7 +91,7 @@ pub const Settings = struct {
     // SERVER CHAT (default OFF ⇒ zero behavior change): when ON, a user send routes to the SERVER-side chat
     // turn (POST /api/v1/chat/convs/:id/messages) and the desk renders the turn's event frames by polling
     // /events, instead of running the local turn loop. The brain moves into the backend. (P0-6.)
-    server_chat: bool = false,
+    server_chat: bool = true, // default ON: prefer the backend chat turn, fall back to the local engine on any problem
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];

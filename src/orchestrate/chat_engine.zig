@@ -11,8 +11,8 @@
 //! chat + a cast co-edit ONE workdir with ONE micro-VCS history. Ownership is structural: every path is built
 //! from the caller's own uid, so a turn can only ever touch its own conversation.
 //!
-//! This whole surface is INERT until VEIL_CHAT_BACKEND=1 — postMessage (chat_service.zig) gates on the flag
-//! before it ever reaches runTurn, so with the flag unset the running app is 100% unaffected.
+//! ON by default — postMessage (chat_service.zig) runs this unless VEIL_CHAT_BACKEND=0 (the kill switch), and it
+//! is admin-only. The desk prefers this backend turn and falls back to its own local engine on any failure.
 
 const std = @import("std");
 const http = @import("../gateway/http.zig");

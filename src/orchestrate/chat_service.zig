@@ -169,17 +169,19 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = slice;
 }
 
-/// POST /api/v1/chat/convs/:id/messages — run ONE server-side agentic turn for this conversation. GATED: this
-/// whole write surface is inert until VEIL_CHAT_BACKEND=1, so with the flag unset the running app is unchanged.
+/// POST /api/v1/chat/convs/:id/messages — run ONE server-side agentic turn for this conversation. ON by default
+/// (kill switch VEIL_CHAT_BACKEND=0); a disabled backend returns 501, which the desk treats as a fall-back signal.
 /// The turn runs SYNCHRONOUSLY (it blocks this httpz worker thread, exactly as a cast/deploy does); progress is
 /// written to the conv's messages.jsonl + events.jsonl, which the P0-4 read routes (getConv / convEvents) serve.
 pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
-    // FLAG GATE FIRST — before auth, parsing, anything. Off (unset or != "1") ⇒ 501, zero side effects.
-    const enabled = if (app.sup.parent_env) |env| blk: {
+    // KILL SWITCH — before auth, parsing, anything. DEFAULT ON: the server chat turn runs unless VEIL_CHAT_BACKEND
+    // is explicitly "0". A definitive 501 here is just one of the signals the desk uses to fall back to its own
+    // local engine, so disabling the backend cleanly degrades to local chat rather than breaking it.
+    const disabled = if (app.sup.parent_env) |env| blk: {
         const v = env.get("VEIL_CHAT_BACKEND") orelse break :blk false;
-        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \r\n\t"), "1");
+        break :blk std.mem.eql(u8, std.mem.trim(u8, v, " \r\n\t"), "0");
     } else false;
-    if (!enabled) {
+    if (disabled) {
         res.status = 501;
         return res.json(.{ .ok = false, .err = "chat backend disabled" }, .{});
     }
