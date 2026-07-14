@@ -24,6 +24,10 @@ pub const Runner = struct {
         runTool: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp,
         /// POST /api/v1/cast — deploy a swarm; returns the server reply (null = unreachable).
         cast: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp,
+        /// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn (brain-in-backend; P0-6).
+        chatSend: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
+        /// GET /api/v1/chat/convs/<conv>/events?from=N — byte-cursor poll over the conv's turn frames.
+        chatEvents: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp,
     };
 
     pub fn runTool(self: Runner, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp {
@@ -32,11 +36,17 @@ pub const Runner = struct {
     pub fn cast(self: Runner, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp {
         return self.vt.cast(self.ctx, io, gpa, body_json);
     }
+    pub fn chatSend(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+        return self.vt.chatSend(self.ctx, io, gpa, conv, body_json);
+    }
+    pub fn chatEvents(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp {
+        return self.vt.chatEvents(self.ctx, io, gpa, conv, from);
+    }
 };
 
 // ------------------------------------------------------------------ LocalRunner (today's behavior, verbatim)
 
-const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast };
+const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents };
 
 /// A Runner backed by the loopback server. `ctx` is the shared Store — the live port + bearer token are read
 /// from it on each call (the settings can change at runtime), exactly as the old call sites did.
@@ -67,4 +77,18 @@ fn localCast(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, body_json: []const
     var tokb: [128]u8 = undefined;
     const pt = portToken(store, &tokb);
     return netcli.cast(io, gpa, pt.port, pt.tok, body_json);
+}
+
+fn localChatSend(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatSend(io, gpa, pt.port, pt.tok, conv, body_json);
+}
+
+fn localChatEvents(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatEvents(io, gpa, pt.port, pt.tok, conv, from);
 }
