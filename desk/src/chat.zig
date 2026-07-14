@@ -1155,15 +1155,16 @@ pub const Chat = struct {
         self.setStatus("server turn running...");
         log.info("server chat: send conv={s} from={d} model={s}", .{ conv, from0, prov.model });
 
-        // The send BLOCKS until the (synchronous) server turn finishes or the POST ceiling is hit. 200/201 = it ran;
-        // null = timed out or unreachable (it may STILL have completed — check for a {done} frame); anything else is
-        // a definitive failure (501 flag off, 401/403 not-admin, 404 old server binary, 5xx). Any non-success FALLS
-        // BACK to the local engine so the user always gets a reply.
+        // The send returns FAST: the server fires the turn on a background thread and replies 202 ("running"), so
+        // the poller below streams its event frames live (no blocking on the whole turn). 200/201/202 = accepted;
+        // null = unreachable (a turn that already completed still exposes a {done} frame — check); anything else is
+        // a definitive failure (501 kill switch, 401/403 not-admin, 404 old server binary, 5xx). Any non-success
+        // FALLS BACK to the local engine so the user always gets a reply.
         var handled = false;
         if (self.runner().chatSend(self.io, self.gpa, conv, w.buffered())) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             log.info("server chat: POST -> status={d}", .{resp.status});
-            handled = resp.status == 200 or resp.status == 201;
+            handled = resp.status == 200 or resp.status == 201 or resp.status == 202;
         } else {
             log.warn("server chat: POST returned null — checking whether the turn completed anyway", .{});
             handled = self.serverTurnDone(conv, from0);

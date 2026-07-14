@@ -318,6 +318,64 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
+/// Owned arguments for a background turn: one backing `blob` holds every string arg (the request arena that
+/// spawnTurn was called from dies immediately), plus slices into it. turnThread frees the blob + the struct.
+pub const TurnArgs = struct {
+    app: *App,
+    uid: u64,
+    blob: []u8,
+    conv: []const u8,
+    base_url: []const u8,
+    key: []const u8,
+    model: []const u8,
+    text: []const u8,
+};
+
+/// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
+/// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
+fn turnThread(args: *TurnArgs) void {
+    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text);
+    const gpa = args.app.gpa;
+    gpa.free(args.blob);
+    gpa.destroy(args);
+}
+
+/// Launch a turn for (uid, conv) on a DETACHED background thread with owned copies of every arg, so the HTTP
+/// handler can return 202 at once and the client streams the turn's event frames live (a synchronous turn would
+/// block the client's /events poll for the whole turn — the "shows only 'server thinking'" bug). On an
+/// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
+/// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8) void {
+    const gpa = app.gpa;
+    const total = conv.len + base_url.len + key.len + model.len + text.len;
+    const args = gpa.create(TurnArgs) catch return runTurn(app, uid, conv, base_url, key, model, text);
+    const blob = gpa.alloc(u8, total) catch {
+        gpa.destroy(args);
+        return runTurn(app, uid, conv, base_url, key, model, text);
+    };
+    var o: usize = 0;
+    const cv = blob[o..][0..conv.len];
+    @memcpy(cv, conv);
+    o += conv.len;
+    const bu = blob[o..][0..base_url.len];
+    @memcpy(bu, base_url);
+    o += base_url.len;
+    const ky = blob[o..][0..key.len];
+    @memcpy(ky, key);
+    o += key.len;
+    const md = blob[o..][0..model.len];
+    @memcpy(md, model);
+    o += model.len;
+    const tx = blob[o..][0..text.len];
+    @memcpy(tx, text);
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx };
+    if (std.Thread.spawn(.{}, turnThread, .{args})) |t| {
+        t.detach();
+    } else |_| {
+        turnThread(args); // spawn failed → run inline (blocks) + free, rather than drop the turn
+    }
+}
+
 /// One settled agentic tool pass: runs the tool-calling loop against the current `conv_buf` until the model emits
 /// a NO-tool-call answer (that answer is `.settled`), a completion fails (`.hard_error` — the error event is
 /// already emitted here), or a cooperative stop lands before an inference (`.stopped`). Grows `conv_buf` with the
