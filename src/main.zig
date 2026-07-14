@@ -20,6 +20,7 @@ const deploy_service = @import("orchestrate/deploy_service.zig");
 const tail_fanout = @import("orchestrate/tail_fanout.zig");
 const control_writer = @import("orchestrate/control_writer.zig");
 const chat_tools = @import("orchestrate/chat_tools.zig");
+const chat_service = @import("orchestrate/chat_service.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
@@ -259,6 +260,10 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/swarms/:id/deploy/cloudflare", deploy_service.swarmDeployCf, .{});
     router.post("/api/v1/swarms/:id/control", control_writer.swarmControl, .{});
     router.post("/api/v1/chat/tool", chat_tools.chatTool, .{});
+    router.get("/api/v1/chat/convs", chat_service.listConvs, .{});
+    router.get("/api/v1/chat/convs/:id", chat_service.getConv, .{});
+    router.delete("/api/v1/chat/convs/:id", chat_service.deleteConv, .{});
+    router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
