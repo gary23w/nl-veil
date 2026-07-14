@@ -388,6 +388,23 @@ const InnerResult = struct {
     outcome: enum { settled, hard_error, stopped },
     content: []u8,
 };
+
+/// Borrowed handle the streaming callback needs to emit live deltas into this turn's event log.
+const StreamCtx = struct { app: *App, conv_dir: []const u8, streamed: bool = false };
+
+/// llm.completeStream fires this for each incremental delta as the model generates. `.content` becomes a
+/// live `{"kind":"token","delta":…}` frame (the reply typing out); `.reasoning` a `{"kind":"reasoning",
+/// "delta":…}` frame (thinking typing out). emitKV JSON-escapes the chunk via http.jstr. The chunk is
+/// borrowed (valid only during this call) — emitKV copies it into the frame immediately, so that's fine.
+fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
+    if (text.len == 0) return;
+    const sc: *StreamCtx = @ptrCast(@alignCast(cx));
+    sc.streamed = true; // a real stream happened — so the fallback reasoning emit below is skipped
+    switch (kind) {
+        .content => emitKV(sc.app, sc.conv_dir, "token", "delta", text),
+        .reasoning => emitKV(sc.app, sc.conv_dir, "reasoning", "delta", text),
+    }
+}
 fn runInnerAgentic(
     app: *App,
     conv_dir: []const u8,
@@ -412,14 +429,23 @@ fn runInnerAgentic(
         if (stopRequestedSince(app, conv_dir, ctrl_cursor))
             return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty };
 
-        var step = llm.complete(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools.SCHEMA, 4096, 0.7);
+        // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
+        // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
+        // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
+        // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
+        var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir };
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, tools.SCHEMA, 4096, 0.7, &sctx, streamOnDelta);
         defer step.deinit(gpa);
 
         if (!step.ok) {
             emitKV(app, conv_dir, "error", "err", clipBytes(step.content, 400));
             return .{ .outcome = .hard_error, .content = empty };
         }
-        if (step.reasoning.len > 0) emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 2000));
+        // reasoning normally streams via the .reasoning deltas above. But if completeStream FELL BACK to a
+        // non-streaming complete() (no deltas fired — e.g. a hosted tool-call step, or a backend that ignored
+        // stream:true), emit the reasoning once here so the desk still shows the thinking (no regression).
+        if (!sctx.streamed and step.reasoning.len > 0)
+            emitKV(app, conv_dir, "reasoning", "delta", clipBytes(step.reasoning, 4000));
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
             return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty };
