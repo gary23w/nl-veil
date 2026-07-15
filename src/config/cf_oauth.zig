@@ -18,6 +18,13 @@ const key_vault = @import("key_vault.zig");
 const App = http.App;
 const requireUser = http.requireUser;
 
+/// Compiled-in default OAuth client id, so "Log in with Cloudflare" works out of the box with no env var —
+/// set this to the project's own PUBLIC OAuth client (register it once in the Cloudflare dashboard:
+/// Manage Account → OAuth clients → Create client → Public/PKCE, verify the client URL's domain to make it
+/// public, add the redirect http://localhost:8787/api/v1/oauth/cloudflare/callback). NL_CF_OAUTH_CLIENT_ID
+/// still overrides it. Empty here = the login stays "not set up" until an env var or this constant is filled.
+pub const DEFAULT_CLIENT_ID = "";
+
 /// Vault provider slot for the sealed OAuth bundle — distinct from the "workers-ai" slot a manually pasted
 /// BYOK key would use, so the two never collide.
 pub const CF_PROVIDER = "cf-oauth";
