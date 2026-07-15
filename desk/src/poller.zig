@@ -54,6 +54,7 @@ pub const Poller = struct {
     last_sched_s: i64 = 0,
     sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
+    last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -493,11 +494,18 @@ pub const Poller = struct {
         {
             self.store.lock();
             const pending = self.store.cf_oauth_pending;
+            const connected = self.store.cf_oauth_connected;
             self.store.unlock();
             const cf_every: i64 = if (pending) 2 else 6;
             if (online and now_s - self.last_cf_s >= cf_every) {
                 self.last_cf_s = now_s;
                 self.refreshCfOAuth();
+            }
+            // live model list — only while connected, refreshed ~every 60s (the catalog changes fast but not
+            // second-to-second). last_cfm_s starts at 0, so the first connected tick fetches immediately.
+            if (online and connected and now_s - self.last_cfm_s >= 60) {
+                self.last_cfm_s = now_s;
+                self.refreshCfModels();
             }
         }
 
@@ -705,6 +713,40 @@ pub const Poller = struct {
         const n = @min(account.len, self.store.cf_oauth_account.len);
         @memcpy(self.store.cf_oauth_account[0..n], account[0..n]);
         self.store.cf_oauth_account_len = n;
+    }
+
+    /// Fetch the connected account's live Workers AI model list and publish it to the store (the Settings model
+    /// dropdown uses it for the Cloudflare provider). Model names are plain `@cf/...` strings — no unescaping.
+    fn refreshCfModels(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfModels(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return; // transient — keep the last-known list
+        const key = "\"models\":[";
+        const at = std.mem.indexOf(u8, resp.body, key) orelse return;
+        var i = at + key.len;
+        var names: [store_mod.MAX_CF_MODELS][96]u8 = undefined;
+        var lens: [store_mod.MAX_CF_MODELS]u8 = undefined;
+        var n: usize = 0;
+        while (n < names.len and i < resp.body.len) {
+            while (i < resp.body.len and resp.body[i] != '"' and resp.body[i] != ']') i += 1;
+            if (i >= resp.body.len or resp.body[i] == ']') break;
+            i += 1; // past the opening quote
+            const start = i;
+            while (i < resp.body.len and resp.body[i] != '"') i += 1;
+            const name = resp.body[start..i];
+            if (i < resp.body.len) i += 1; // past the closing quote
+            const m = @min(name.len, names[n].len);
+            @memcpy(names[n][0..m], name[0..m]);
+            lens[n] = @intCast(m);
+            n += 1;
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.cf_models[0..n], names[0..n]);
+        @memcpy(self.store.cf_model_lens[0..n], lens[0..n]);
+        self.store.cf_model_count = n;
     }
 
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {

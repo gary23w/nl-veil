@@ -296,6 +296,94 @@ pub fn resolveToken(app: *App, uid: u64, alloc: std.mem.Allocator) ?struct { key
     };
 }
 
+// ------------------------------------------------------------------------------------ live model list
+
+/// The Workers AI catalog changes fast, so the model list is fetched LIVE from the user's account rather
+/// than hardcoded. Cached in-process (single desktop user) with a short TTL; the cache dies on restart, so
+/// every server start refetches — "dynamic collection every time the machine turns on and connects".
+const MODELS_TTL_S: i64 = 900; // 15 min
+var models_mtx: std.Io.Mutex = .init;
+var mc_uid: u64 = 0;
+var mc_buf: [16384]u8 = undefined; // the built JSON array of model-name strings
+var mc_len: usize = 0;
+var mc_at: i64 = 0;
+
+/// GET the account's text-generation Workers AI models and build a JSON array of their names
+/// (e.g. `["@cf/meta/llama-3.3-70b-instruct-fp8-fast", …]`). null when not connected or the fetch fails.
+fn fetchModelsList(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(app.gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    const tok = resolveToken(app, uid, sa) orelse return null;
+    if (tok.account_id.len == 0) return null;
+    var ub: [700]u8 = undefined;
+    // task filter narrows to chat models; hide_experimental drops preview entries; one generous page.
+    const url = std.fmt.bufPrint(&ub, "{s}/{s}/ai/models/search?task=Text%20Generation&hide_experimental=true&per_page=100", .{ app.cf_oauth_accounts_url, tok.account_id }) catch return null;
+    const raw = curlCall(app, "GET", url, "", tok.key) orelse return null;
+    defer app.gpa.free(raw);
+    const ModelsResp = struct {
+        result: []const struct { name: []const u8 = "" } = &.{},
+    };
+    const parsed = std.json.parseFromSlice(ModelsResp, app.gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.result.len == 0) return null; // no models parsed → let the caller keep the catalog defaults
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(app.gpa);
+    out.append(app.gpa, '[') catch return null;
+    var n: usize = 0;
+    for (parsed.value.result) |m| {
+        if (m.name.len == 0 or m.name.len > 120) continue;
+        if (n > 0) out.append(app.gpa, ',') catch return null;
+        http.jstr(app.gpa, &out, m.name) catch return null;
+        n += 1;
+    }
+    out.append(app.gpa, ']') catch return null;
+    if (n == 0) return null;
+    return alloc.dupe(u8, out.items) catch null;
+}
+
+/// Cached model-list JSON array for `uid`. Serves a fresh cache; else refetches (and on a fetch failure,
+/// falls back to a stale cache if one exists). alloc-owned copy, or null when there's nothing to serve.
+fn modelsJson(app: *App, uid: u64, alloc: std.mem.Allocator) ?[]const u8 {
+    const now = nowS(app.io);
+    {
+        models_mtx.lockUncancelable(app.io);
+        defer models_mtx.unlock(app.io);
+        if (mc_uid == uid and mc_len > 0 and now - mc_at < MODELS_TTL_S)
+            return alloc.dupe(u8, mc_buf[0..mc_len]) catch null;
+    }
+    const fresh = fetchModelsList(app, uid, alloc) orelse {
+        models_mtx.lockUncancelable(app.io);
+        defer models_mtx.unlock(app.io);
+        if (mc_uid == uid and mc_len > 0) return alloc.dupe(u8, mc_buf[0..mc_len]) catch null;
+        return null;
+    };
+    models_mtx.lockUncancelable(app.io);
+    defer models_mtx.unlock(app.io);
+    if (fresh.len <= mc_buf.len) {
+        @memcpy(mc_buf[0..fresh.len], fresh);
+        mc_len = fresh.len;
+        mc_uid = uid;
+        mc_at = now;
+    }
+    return fresh;
+}
+
+/// GET /api/v1/oauth/cloudflare/models — the account's live Workers AI (text-generation) models. The desk
+/// swaps this into its model dropdown for the Cloudflare provider, falling back to the catalog when empty.
+pub fn models(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    var arena = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    res.content_type = .JSON;
+    if (modelsJson(app, u.id, a)) |ml| {
+        res.body = try std.fmt.allocPrint(res.arena, "{{\"ok\":true,\"connected\":true,\"models\":{s}}}", .{ml});
+    } else {
+        res.body = "{\"ok\":true,\"connected\":false,\"models\":[]}";
+    }
+}
+
 // ------------------------------------------------------------------------------------ HTTP handlers
 
 /// POST /api/v1/oauth/cloudflare/start — mint state + PKCE, return the Cloudflare consent URL for the desk to

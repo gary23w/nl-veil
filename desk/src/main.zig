@@ -4681,6 +4681,12 @@ fn flushChatDropdown(store: *Store) void {
     var cur_model: [96]u8 = undefined;
     const cur_model_n = store.settings.chat_model_len;
     @memcpy(cur_model[0..cur_model_n], store.settings.chat_model[0..cur_model_n]);
+    // live Cloudflare model list (stack-local copy, so its slices are valid through drawList below)
+    var cf_models: [store_mod.MAX_CF_MODELS][96]u8 = undefined;
+    var cf_lens: [store_mod.MAX_CF_MODELS]u8 = undefined;
+    const cf_n = store.cf_model_count;
+    @memcpy(cf_models[0..cf_n], store.cf_models[0..cf_n]);
+    @memcpy(cf_lens[0..cf_n], store.cf_model_lens[0..cf_n]);
     store.unlock();
 
     var labels: [64][]const u8 = undefined;
@@ -4714,11 +4720,21 @@ fn flushChatDropdown(store: *Store) void {
                 count = ol_n;
             } else {
                 const prov = if (kind == 1) &catalog.providers[@min(byok, catalog.providers.len - 1)] else &catalog.providers[2]; // 2 = ollama
-                for (prov.models, 0..) |m, i| {
-                    if (i >= labels.len) break;
-                    labels[i] = m.id;
-                    if (std.mem.eql(u8, m.id, cur_model[0..cur_model_n])) current = i;
-                    count += 1;
+                // Cloudflare: prefer the LIVE model list fetched from the account (the catalog changes fast).
+                if (kind == 1 and prov.needs_account and cf_n > 0) {
+                    for (0..cf_n) |i| {
+                        if (i >= labels.len) break;
+                        labels[i] = cf_models[i][0..cf_lens[i]];
+                        if (std.mem.eql(u8, labels[i], cur_model[0..cur_model_n])) current = i;
+                        count += 1;
+                    }
+                } else {
+                    for (prov.models, 0..) |m, i| {
+                        if (i >= labels.len) break;
+                        labels[i] = m.id;
+                        if (std.mem.eql(u8, m.id, cur_model[0..cur_model_n])) current = i;
+                        count += 1;
+                    }
                 }
             }
         },
@@ -4741,7 +4757,7 @@ fn flushChatDropdown(store: *Store) void {
                 setChatModelLocked(store, if (ol_n > 0) models[0].nameStr() else "gpt-oss:20b");
             } else if (newkind == 1) {
                 const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
-                if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+                if (p.needs_account and cf_n > 0) setChatModelLocked(store, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
             } // custom (2) keeps its typed model
             store.unlock();
         },
@@ -4750,7 +4766,7 @@ fn flushChatDropdown(store: *Store) void {
             store.lock();
             store.settings.chat_byok = newbyok;
             const p = &catalog.providers[newbyok];
-            if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+            if (p.needs_account and cf_n > 0) setChatModelLocked(store, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
             store.unlock();
         },
         .chat_model => setChatModel(store, labels[chosen]),
