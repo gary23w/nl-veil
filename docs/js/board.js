@@ -33,7 +33,7 @@
       <text x="46" y="88" font-size="7.5">AUTH GATE</text>
       <text x="96" y="88" font-size="7.5">WORKER</text>
       <text x="96" y="97" font-size="7.5">YARDS</text>
-      <text x="52" y="122" font-size="7.5">ORCHESTRATE</text>
+      <text x="52" y="122" font-size="7.5">CONTROL PLANE</text>
       <text x="120" y="62" font-size="7.5">THE HIVE</text>
       <text x="14" y="14" font-size="7">SHEET 1 OF 1 - NOT TO SCALE</text>
     </g>
@@ -111,7 +111,7 @@
   };
 
   const manifest = [
-    { id: 'hive', type: 'polaroid', x: 552, y: 58, rot: 1.5, w: 170, doc: 'orchestrate/neuron_client', scene: 'hive', tag: 'P-1',
+    { id: 'hive', type: 'polaroid', x: 552, y: 58, rot: 1.5, w: 170, doc: 'worker/neuron/client', scene: 'hive', tag: 'P-1',
       cap: 'the hive. every mind reads every mind.', label: 'Photograph: the shared hive memory, long exposure' },
     { id: 'desk', type: 'polaroid', x: 72, y: 84, rot: -3, w: 170, doc: 'main', scene: 'desk', tag: 'P-2',
       cap: 'the desk, past midnight. auto-loop armed.', label: 'Photograph: the operator desk, terminal mid-cast' },
@@ -130,7 +130,7 @@
     { id: 'vcs', type: 'icard', x: 1004, y: 322, rot: -2.2, w: 228, doc: 'worker/vcs',
       title: 'THE MERGE', body: 'Many minds, one file. Disjoint edits merge on their own; the same region is a CONFLICT, said out loud. <em>NOBODY WRITES BLIND.</em>',
       label: 'Index card: the micro version control for concurrent minds' },
-    { id: 'ticket', type: 'ticket', x: 330, y: 622, rot: -4, w: 216, doc: 'orchestrate/supervisor', tag: 'E-2', label: 'Cast ticket: goal to deliverable, one way' },
+    { id: 'ticket', type: 'ticket', x: 330, y: 622, rot: -4, w: 216, doc: 'worker/control/supervisor', tag: 'E-2', label: 'Cast ticket: goal to deliverable, one way' },
     { id: 'match', type: 'matchbook', x: 724, y: 420, rot: 3, w: 116, doc: 'worker/agi', tag: 'E-3', label: 'Matchbook from the Veil' },
     { id: 'map', type: 'mapfrag', x: 56, y: 588, rot: 1.2, w: 250, doc: 'index', label: 'Map fragment of the nl-veil system' },
     { id: 'steno', type: 'steno', x: 1092, y: 84, rot: -2.5, w: 150, doc: 'plan/billing_seam', tag: 'E-4', label: 'Steno page: neuron budget against metered spend' },

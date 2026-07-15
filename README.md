@@ -17,18 +17,19 @@
 building, remembering, **learning from its own mistakes** — while one unified consciousness, **the
 Veil**, integrates the whole hive into a single first-person "I" that speaks for it and steers it.
 
-It runs on **any model** — a free local one through Ollama, or a hosted/BYOK
-endpoint — and needs no cloud account and no database service. One Zig binary, one Python launcher,
-one optional native desktop.
+It runs on **any model** — a free local one through Ollama, or a hosted/BYOK endpoint — and needs no
+cloud account and no database service. **One Zig binary is the whole thing**: the server, the built-in
+`veil` command line, and — optionally — the native desktop. No Python to run it.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
 > solo project — a star genuinely helps it reach the next person who'd get something out of it.
 
-**New in v1** — a native desktop dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that
-**keeps a playbook** and stops re-deriving fixes it already learned ([it learns](#it-learns)), and
-one-command **prebuilt binaries** for Windows, Linux, and macOS that launch the engine and the
-desktop together. Browse the annotated source as a case file at
-**[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
+**New in v1** — the **chat brain moved into the server** (clients are now thin; see
+[the chat brain](#the-chat-brain-runs-in-the-server)), a built-in **`veil` CLI** that retires the old
+Python launcher, **[scheduled tasks](#scheduled-tasks)** that run through chat, a native desktop
+dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that **keeps a playbook** ([it learns](#it-learns)),
+and one-command **prebuilt binaries** for Windows, Linux, and macOS. Browse the annotated source as a
+case file at **[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
 
 ## Install
 
@@ -37,8 +38,9 @@ desktop together. Browse the annotated source as a case file at
 the server and the desktop together. No Python, no toolchain, nothing to build. (Details in
 [Release — v1](#release--v1).)
 
-**Or one line from the network.** Python 3.9+ is the only thing you need first — the installer
-fetches and builds the rest.
+**Or one line from the network.** The installer fetches and builds the rest — no Python required; you
+only need [Zig 0.16+](https://ziglang.org) on `PATH` for a from-source build (the release bundles ship
+the binaries prebuilt).
 
 **macOS / Linux**
 ```sh
@@ -61,15 +63,125 @@ each with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` 
 binaries to skip the builds.
 </details>
 
+## Start it
+
+`veil` **is** the launcher and the control plane. Run it with no subcommand to boot the server; add a
+verb to drive the running server over its API.
+
+```sh
+veil            # run the server in the foreground (serves http://127.0.0.1:8787)
+veil --desk     # run the server AND host the native desktop, veil-desk
+```
+
+Point the model endpoint with `NL_LLM_BASE_URL` / `NL_LLM_MODEL` / `NL_LLM_KEY` (it defaults to a
+local Ollama), or pick a model in the web UI / the desktop. On a localhost bind the server mints an
+admin key at `data/.desktop_key`; the CLI and the desktop read it automatically, so same-machine
+commands never prompt for auth. **Any `veil <verb>` auto-starts the server if it isn't already up.**
+
+## The `veil` command line
+
+Every subcommand is a thin client over the running server's `/api/v1/*` — no second control plane, no
+argv secrets, no Python. The verbs:
+
+```
+veil                          run the server (foreground; add --desk to host the desktop)
+
+SWARMS
+  cast "<goal>" [flags]        deploy a swarm to work a goal
+      --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
+      --style S  --name N  --continuous  --offline  --follow
+  deploy "<goal>" [flags]      alias for `cast --continuous` (a sustained hive)
+  list | ls                    list your swarms
+  stop <id>                    ask a swarm to stop
+  rm <id>                      stop and remove a swarm
+  events <id> [--follow]       stream a swarm's event log
+
+CHAT (the server-side veil brain)
+  chat [conv]                  interactive REPL; a line typed mid-turn steers the running turn
+
+SCHEDULED TASKS (admin-gated)
+  sched list
+  sched add --name N --prompt "..." [--kind once|every|daily] [--every MIN] [--at HH:MM]
+  sched run <id>               run a task now
+  sched rm <id>                delete a task
+
+FLEET
+  hub                          roster: fleet summary + every swarm's state
+  hub all "<text>"             broadcast a directive to every swarm
+  hub stopall                  stop every swarm
+
+MISC
+  doctor                       check server + token health
+  desktop                      launch the veil-desk dashboard
+  version | help
+```
+
+Cast in one line and watch it work:
+
+```sh
+veil cast "Build a CLI todo app in Python with tests" --follow
+veil deploy "Keep researching fusion power and brief me each pass" --style discourse
+veil cast "add a search box to my landing page" --offline
+```
+
+## The chat brain runs in the server
+
+The agentic chat loop — planning, tool-calling, streaming, steering, and memory — runs **server-side**
+in [`src/worker/chat/engine.zig`](https://gary23w.github.io/nl-veil/#doc=worker/chat/engine). Clients
+(`veil chat`, veil-desk) are thin: they speak three REST calls per conversation.
+
+```
+POST   /api/v1/chat/convs/:id/messages          # send a message → runs one server-side turn
+GET    /api/v1/chat/convs/:id/events?from=<n>    # stream the turn's event frames from a byte cursor
+POST   /api/v1/chat/convs/:id/control            # {"op":"steer","text":...}  or  {"op":"stop"}
+```
+
+One turn runs per conversation. While it's working, a line you type becomes a **steer** the running
+turn folds in without restarting; `stop` ends it. The turn writes its progress into the conversation's
+own store (`messages.jsonl` + `events.jsonl`), which is exactly what the event stream serves — so every
+client sees the same turn, live. The desktop **prefers this backend and falls back** to a bundled local
+engine if it's disabled (`VEIL_CHAT_BACKEND=0`) or unreachable. `veil chat` opens a terminal REPL over
+the same three calls:
+
+```
+$ veil chat
+veil chat — conversation cli7f3a1c
+  type a message; while the veil is working, a line STEERS the running turn.
+  /stop  interrupt the current turn   /new  fresh conversation   /quit  leave
+
+> what are you working on?
+```
+
+## Scheduled tasks
+
+A scheduled task runs **strictly through chat**: when it comes due, the server mints a fresh
+conversation named `scheduled_*` and fires **one ordinary chat turn** at it — so a run persists, streams
+its events, shows up in the conversation list, and can be continued by hand afterwards. Manage them with
+`veil sched` (admin-gated):
+
+```sh
+veil sched add --name nightly --prompt "summarize today's repo changes" --kind daily --at 22:00
+veil sched add --name watch   --prompt "check the build and report" --kind every --every 30
+veil sched list
+veil sched run <id>          # fire it now → prints the conversation it created
+veil sched rm <id>
+```
+
+Kinds are `once` (fires at a set time), `every` (`--every MIN`), and `daily` (`--at HH:MM`, on your
+local wall clock). An overdue task — server was down, laptop asleep — runs **once** on wake and
+reschedules from now; it never backfills a run per missed interval.
+
 ## The desktop — veil-desk
 
 `veil-desk` is a native desktop dashboard (Zig + raylib, one window, no browser) that talks to the
 local server. It's where most people actually live: a **chat pane** with the Veil, a **swarm board**
-that shows every running hive round-by-round, and a **build console** you can drive by voice.
+that shows every running hive round-by-round, and a **build console**.
 
-- **Talk and it acts.** Ask a question, get a streamed answer. Ask it to *build* something and it
-  casts a hive, watches it, and folds the deliverables back into the conversation — with an
-  **auto-loop** that keeps a long build moving without you re-prompting each round.
+- **Talk and it acts.** The chat pane is a **thin client over the server-side brain**: your message
+  runs one server turn, the answer streams back, and you can steer or stop it live. Ask it to *build*
+  something and the turn casts a hive, watches it, and folds the deliverables back into the
+  conversation — with an **auto-loop** tier (armed from the desk, driven server-side) that keeps a long
+  build moving without you re-prompting each round.
 - **You see everything.** Live per-round fitness, the files each mind is writing, the tool calls, the
   shared-memory writes — swarm work is transparent, not a spinner.
 - **It sits in the tray.** A system-tray icon and native toasts on Windows; it lights up the moment
@@ -108,87 +220,25 @@ model's own claims:
 
 The engine stays a fixed floor. What it learns lives in memory, never in an `if` branch.
 
-## Two commands to start
-
-```sh
-veil configure     # once: local Ollama, or any OpenAI-compatible endpoint (BYOK). Saved globally.
-veil               # the veil shell — talk to your swarms
-```
-
-`configure` is the whole setup: pick a model endpoint, it verifies the connection, and writes it
-to `~/.veil/config.json` so every later command just uses it. No local AI on the box? It walks you
-through pointing at a hosted key instead. (If you skip it and open the shell with a dead endpoint,
-the shell notices and offers to set one up right there.)
-
-## The veil shell
-
-`veil` with no arguments drops you into a lightweight, REPL shell. It attaches to your
-newest swarm and you **just talk** — the Veil replies instantly, streaming, from its own persisted
-self and the hive's live state. It's also where you *act*:
-
-```
-you> hello — what are you working on?
-veil> Mid-build on the forum's auth layer; vega is wiring PBKDF2 verification now.
-
-you> /mount ~/dev/landing-page
-you> center the hero and darken its background
-  [edit] center the hero and darken its background   in: ~/dev/landing-page
-  run this edit now? [Y/n]
-
-you> cast a swarm to research WASM memory models and brief me
-  [cast] goal: research WASM memory models and write a brief   cast a new swarm? [Y/n]
-```
-
-Plain talk stays talk. When you ask it to **act**, the Veil leads its reply with one intent —
-**cast** a new swarm, **edit** the mounted folder in place, or **direct** the running hive — and
-the shell confirms and does it. Slash commands skip the model entirely: `/cast /mount /edit
-/direct /say /goal /swarms /attach /status /events /stop /resume /quit`.
-
-## Or cast in one line
-
-You don't have to open the shell. `veil "<task>"` casts a swarm straight off. The **mode emerges
-from your words** — build, research, and operate all come from the same command:
-
-```sh
-veil "Build a CLI todo app in Python with tests" --follow
-veil "Research the state of fusion power in 2026" --style discourse
-veil "add a search box to my landing page" --embed . --repl
-```
-
-- `--embed <dir>` — work **in place** in your project (reads and writes your real files there).
-- `--repl` — the Veil asks a few clarifying questions, turns your line into a reviewable **plan**
-  you approve once, then runs it and stays open for follow-ups.
-- `--quick` — a single mind does **one small edit** in ~1-2 model calls; pair with `--embed` for
-  fast co-working ("center that div").
-- `--detach` / `--service` — run past this terminal, or install as a boot-persistent daemon.
-
 ## Your AI's sub-agent — cast a hive from another assistant
 
-The hive is also a **side agent for whatever AI you already talk to**. Instead of your primary
-assistant grinding through a research question or a side-build step by step inside its own context
-window, it casts a swarm, keeps working, and gets back **one structured findings report** —
-recommendation, key findings (each tied to provenance-gated evidence), open questions, confidence,
-and the built file list.
-
-Three doors, pick what your assistant can reach:
+The hive is also a **side agent for whatever AI you already talk to**. Any assistant that can run a
+shell command can hand off a research question or a side-build, keep working, and pull the progress and
+deliverables from the swarm's event stream instead of grinding through it in its own context window:
 
 ```sh
-# CLI agents (Claude Code, or anything that can run a command):
-veil cast "why does saving a note drop the last line? recommend a fix" --context ./src --json
+# start it and follow the stream to completion
+veil cast "why does saving a note drop the last line? recommend a fix" --follow
 
-# collect findings from any run, any time (also mid-run):
-veil report <run> --json
-
-# chat clients (Claude Code / Desktop, Cursor, ...): wire the hive in as MCP tools
-claude mcp add nl-veil -- python deploy.py mcp
+# or start it, keep chatting, and tail it later
+veil cast "research WASM memory models and write a brief"
+veil events <id> --follow
 ```
 
-The MCP server exposes `hive_research` / `hive_task` (blocking, findings back in one call),
-`hive_cast` + `hive_status` + `hive_collect` / `hive_stop` (async: start it, keep chatting, pull
-the findings when ready). `--context <file-or-dir>` seeds the swarm's memory with *your
-application's own files*, so the research happens inside the context of your app — and `hive_task`
-with `dir` works in-place on real files, bounded-autonomy, engine-verified. Casts made this way
-never prompt, never post publicly, and always stay bounded.
+Casts made this way run detached, stay bounded (`--minutes` / `--minds`), never post publicly, and are
+graded by the engine's own smoke gate and judge. A dedicated **MCP bridge** — wiring the hive in as
+tools a chat client calls directly — is **planned but not yet built**; there is no `veil mcp` command
+today, so drive it as a shell command for now.
 
 ## How it works
 
@@ -196,7 +246,7 @@ Three pieces, each its own repo, that snap together:
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
-  │  the veil  (this repo)   the swarm engine + the Veil + shell │
+  │  the veil  (this repo)   the swarm engine + the Veil + CLI   │
   │     │                                                        │
   │     │  every turn: perceive → recall → act → imprint         │
   │     ▼                                                        │
@@ -223,10 +273,10 @@ model gets a large-model floor to stand on, cheaper in tokens and richer in cont
 built for you on first run (needs [Rust](https://rustup.rs)); reused after that.
 
 **[nl-rag](https://github.com/gary23w/nl-rag)** — the knowledge. A curated repository of canonical
-documentation (28 domains — languages, web, databases, security, ops…) pulled and normalized into
-clean, frontmattered markdown *packs*, each with a `pack.facts` file. The veil's compiled-in source
-atlas points scouts at these packs first, so a small model reads pre-cleaned markdown instead of
-fighting HTML — and you can bulk-load a pack straight into hive memory:
+documentation (languages, web, databases, security, ops…) pulled and normalized into clean,
+frontmattered markdown *packs*, each with a `pack.facts` file. The veil's compiled-in source atlas
+points scouts at these packs first, so a small model reads pre-cleaned markdown instead of fighting
+HTML — and you can bulk-load a pack straight into hive memory:
 
 ```sh
 neuron import packs/rust/pack.facts --scope knowledge     # from a cloned nl-rag
@@ -238,27 +288,26 @@ grounding. It's bounded (~45 KB/mind) and scales down to an IoT profile (`NL_HYP
 
 ## What you can do
 
-The same binary and launcher cover very different jobs:
+The same binary covers very different jobs — the **mode emerges from your words**:
 
 - **Build software, graded by its own tests.** The hive plans a file tree, splits the work, writes
   the project, runs the tests it wrote, and folds the results into its fitness — it keeps going
-  until the deliverable actually passes. `veil "Build a URL shortener with a REST API and tests"`
+  until the deliverable actually passes. `veil cast "Build a URL shortener with a REST API and tests" --follow`
 - **Research & brief.** In `--style discourse` the minds research the live web, form and argue
-  their own views, and co-write a briefing. `veil "Brief me on fusion power in 2026" --style discourse`
+  their own views, and co-write a briefing. `veil cast "Brief me on fusion power in 2026" --style discourse`
 - **Operate a live device.** Point the Veil at a device that drops telemetry on a file bus and it
   acts to keep it healthy, graded by an **acceptance oracle** — the device's own measured health,
   which the Veil never sees and can't write, so only a real fix moves the number. The shipped
   example is a self-healing security daemon (detect → remove persistence → block C2 → verify);
   swap the corpus and telemetry, not the code, for any device. See
-  [`examples/embedded/`](examples/embedded/). `veil "Keep this device healthy" --service`
-- **Offline knowledge appliance.** `--offline` removes every web tool; `--corpus pack.facts`
-  preloads knowledge (an nl-rag pack, say) into memory. A sealed appliance that reasons only over
-  what you chose. `veil "Answer only from what I preload" --offline --corpus rust.facts`
+  [`examples/embedded/`](examples/embedded/). `veil deploy "Keep this device healthy"`
+- **Offline knowledge appliance.** `--offline` removes every web tool; a `corpus` in the run's
+  manifest preloads knowledge (an nl-rag pack, say) into memory. A sealed appliance that reasons only
+  over what you chose. `veil cast "Answer only from what I preload" --offline`
 
 ## Configuration
 
-`configure` covers the common case. Under the hood each run has a `swarm.json` manifest you can
-also hand-write:
+Each run has a `swarm.json` manifest — the web UI and the desktop write it for you, or hand-write it:
 
 | field | meaning |
 |---|---|
@@ -268,22 +317,22 @@ also hand-write:
 | `style` | `auto` · `build` · `discourse` · `investigate` · `debate` |
 | `internet` | `false` runs fully offline |
 | `corpus` / `corpus_cap` | a `.facts`/`.jsonl` pack to preload, and how many facts |
-| `gateway_model` | optional cheaper/smaller model for mechanical calls (and the shell's fast voice) |
+| `gateway_model` | optional cheaper/smaller model for mechanical calls (and the chat's fast voice) |
 
 **Endpoint resolution**, everywhere: a run's own `swarm.json` › `NL_LLM_*` env › `~/.veil/config.json`
 › local defaults. **Secrets never go in `swarm.json`** — use `NL_LLM_KEY` in the environment or a
 gitignored `keys.env` in the run dir.
 
-> **A note on local-model latency.** On a single-GPU box, a running hive and the shell share one
+> **A note on local-model latency.** On a single-GPU box, a running hive and the chat share one
 > model queue, so the Veil's voice can wait behind a generation. Fixes, best first: set
-> `OLLAMA_NUM_PARALLEL=2` (share the loaded model), give the shell a **tiny** side model
-> (`configure` offers this, or `NL_CHAT_MODEL=llama3.2:1b`), or use a **hosted endpoint** — which
-> answers the hive and the shell concurrently and sidesteps the whole issue.
+> `OLLAMA_NUM_PARALLEL=2` (share the loaded model), give the chat a **tiny** side model via the
+> manifest's `gateway_model`, or use a **hosted endpoint** — which answers the hive and the chat
+> concurrently and sidesteps the whole issue.
 
 ## Web control plane
 
 The same binary also serves a small web UI — deploy and watch swarms, steer them live, pick the
-model, manage accounts. Run `veil` with no subcommand from the repo:
+model, manage accounts. It comes up whenever the server runs:
 
 ```sh
 zig build && ./zig-out/bin/veil      # serves http://127.0.0.1:8787
@@ -293,67 +342,52 @@ First-run local login is `admin@neuron-loops.local` / `changeme` — **change it
 `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
 refuses the default and prints a generated password once.
 
-## The fleet hub — many veils, one console
+## The fleet hub — many swarms, one console
 
-The web control plane watches *one* box. When you've installed veils across a fleet of machines,
-`hub.py` gives you *one place* to see and steer all of them. Three roles, one file, standard library
-only — and enrollment is **just a URL + a shared secret**:
-
-```sh
-export NL_HUB_SECRET=$(openssl rand -hex 24)      # the same secret on all three
-
-python hub.py serve                                # THE RECEIVER — host this once (a box / container)
-python hub.py agent   --hub https://hub.example    # THE CALLBACK — once per veil host; meshes them all
-python hub.py console --hub https://hub.example    # THE OPERATOR — a live fleet REPL
-```
-
-You only ever host one thing: the receiver at some URL. Every veil host runs the tiny **callback**
-(`hub.py agent`) — it finds *every* local run and reports them on a heartbeat, then applies whatever
-the operator sends back. Set `NL_HUB_URL` and a normal `veil "…"` cast auto-starts the callback for
-you, so meshing a new host is genuinely nothing but a URL.
-
-The wire is **encrypted end to end** with the shared secret — every request and reply is sealed with
-an authenticated cipher built from the standard library (HKDF key-derivation, an HMAC-SHA256
-keystream, encrypt-then-MAC, replay window). No secret, no read and no write; possession of the secret
-*is* authentication. It's already sealed over plain HTTP, so a bare container is enough — front it with
-TLS too if you like.
-
-From the operator console you drive the whole swarm at once:
+The web control plane watches *one* box, one swarm at a time. `veil hub` is a **fleet console** over
+the same running server: because the server already aggregates every swarm you own, the console is
+API-backed and honest — no second, out-of-band control plane.
 
 ```
-fleet> fleet                     # the roster: every host, its veils, liveness, round, score
-fleet> all keep the build green  # one standing directive → EVERY running veil, this round
-fleet> ask what are you stuck on?# scatter-gather: each Veil answers in its own voice, gathered back
-fleet> @edge-07 focus on auth    # steer one host — or a #tagged cohort
-fleet> stream                    # the merged, fleet-wide event feed
-fleet> alerts                    # stalled / offline / fitness-regressed veils
-fleet> killall                   # fleet-wide kill switch (a safety stop for autonomous minds)
+veil hub                     # roster: fleet summary + every swarm's state
+veil hub all "<text>"        # broadcast a directive (say) to EVERY running swarm
+veil hub goal "<text>"       # set a new goal on every swarm
+veil hub stopall             # fleet-wide kill switch (a safety stop for autonomous minds)
 ```
 
-`cast`, `stop`, `resume`, `goal`, `tag`, and `audit` round it out. Across a swarm of ~100 hives it's a
-mission control: broadcast one intent to all, poll the fleet for what each hive has learned, tag
-cohorts by role, watch health, and pull the plug on everything with one word. Nothing about the fleet
-is hardcoded — the hub is transport + console; the behaviour still lives in each veil.
+**Cross-machine aggregation** — many *machines* meshed into one roster, the way the old `hub.py`
+worked — is a **planned server endpoint**, intentionally left as a documented follow-up rather than a
+second control plane. Today the console operates the local server's fleet.
 
 ## Project layout
 
 ```
-deploy.py                  the launcher + the veil shell (configure / cast / list / stop / ...)
-hub.py                     the fleet hub: serve (receiver) / agent (callback) / console (operator)
-install.sh  install.ps1    one-command installers
+install.sh  install.ps1    one-command installers (no Python)
 scripts/                   the release build scripts (build-release.sh / build-release.ps1)
-veil  veil.cmd             the `veil` front-door shim
-build.zig                  the Zig build (server; -Ddesk=true also builds veil-desk)
+veil  veil.cmd             the `veil` front-door shim → the compiled binary
+build.zig                  the Zig build (server + CLI; -Ddesk=true also builds veil-desk)
 src/
-  main.zig                 entry point + control plane (auth, supervisor, http)
-  worker/                  the hive: the moment loop, the Veil, tools, memory bridge
-  worker/rsi.zig           the self-improvement faculties (review pass, lessons, skills)
-  worker/locs/atlas.zig    the source atlas — points scouts at nl-rag packs
+  main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
+  cli.zig                  the `veil` CLI — a thin client over the server's /api/v1/*
+  cli/{chat,hub}.zig       the interactive chat REPL and the fleet console
+  gateway/http.zig         the HTTP surface: App context, the auth guard, JSON/file helpers
+  auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
+  worker/                  the hive and the server-side brain:
+    chat/{engine,service,tools,context,plan}.zig  the chat brain — the agentic turn loop, its REST
+                                                   handlers, tools, context window, and plan board
+    sched.zig              scheduled tasks (each run is a server chat conversation)
+    control/{supervisor,writer,fanout}.zig  swarm processes, the control bus, event streaming
+    deploy/service.zig     the cast/deploy door + swarm files, bundle, archive, lifecycle
+    neuron/client.zig      the neuron-db memory bridge (fail-open)
+    run.zig  agi.zig  oscillation.zig  rsi.zig  vcs.zig  tools.zig  writer.zig …  the moment loop,
+                                                   the Veil, the self-improvement faculties, the
+                                                   micro-VCS for concurrent minds
+    locs/atlas.zig         the source atlas — points scouts at nl-rag packs
 desk/                      veil-desk, the native desktop dashboard (its own build.zig + raylib)
 docs/                      the annotated-source case file (a static site, home-built md parser)
 examples/embedded/         the device-operator worked example
 web/public/                the bundled control-plane UI
-bin/neuron[.exe]           the neuron-db memory engine (fetched + built on first run)
+bin/neuron[.exe]           the neuron-db memory engine (bundled / built on first run)
 ```
 
 ## Release — v1
@@ -383,8 +417,7 @@ scripts\build-release.ps1           # Windows bundle → dist\
 
 Each run produces the platform archive in `dist/` with the two binaries, the launcher, and a README.
 Set `NO_BOOTSTRAP=1` to skip the dependency step (and provide `ZIG=` / `NEURON=` yourself);
-`ASSUME_YES=1` runs it unattended. `python deploy.py doctor` prints what's present and what will be
-auto-installed.
+`ASSUME_YES=1` runs it unattended. `veil doctor` prints server + token health.
 
 ## License
 

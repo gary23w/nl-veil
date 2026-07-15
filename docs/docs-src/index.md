@@ -1,7 +1,7 @@
 # nl-veil — Source Documentation
 
 > Repository: [gary23w/nl-veil](https://github.com/gary23w/nl-veil)  
-> 47 `.zig` source files documented across 9 modules — the server (8) and the native desktop, veil-desk.
+> Every `.zig` source file across the modules — the server (including the CLI and the server-side chat brain) and the native desktop, veil-desk.
 
 ---
 
@@ -36,16 +36,6 @@
 |------|---------|
 | [audit_log.md](obs/audit_log.md) | Observability audit log — structured event recording |
 
-### [`orchestrate/`](orchestrate/)
-| File | Purpose |
-|------|---------|
-| [chat_tools.md](orchestrate/chat_tools.md) | Chat tool definitions — function calling registry |
-| [control_writer.md](orchestrate/control_writer.md) | Control-plane writer — state mutation orchestration |
-| [deploy_service.md](orchestrate/deploy_service.md) | Deploy service — deployment lifecycle management |
-| [neuron_client.md](orchestrate/neuron_client.md) | Neuron client — inter-agent communication |
-| [supervisor.md](orchestrate/supervisor.md) | Supervisor — agent lifecycle, health, coordination |
-| [tail_fanout.md](orchestrate/tail_fanout.md) | Tail fanout — log streaming and event distribution |
-
 ### [`plan/`](plan/)
 | File | Purpose |
 |------|---------|
@@ -53,7 +43,24 @@
 | [entitlements.md](plan/entitlements.md) | Entitlements — feature gating by plan level |
 | [neurons.md](plan/neurons.md) | Neuron plan definitions — resource allocation models |
 
-### [`worker/`](worker/)
+### [`worker/chat/`](worker/chat/) — the server-side chat brain
+| File | Purpose |
+|------|---------|
+| [engine.md](worker/chat/engine.md) | The chat brain — the server-side agentic turn loop |
+| [service.md](worker/chat/service.md) | Chat REST handlers — convs, messages, events, control |
+| [tools.md](worker/chat/tools.md) | Chat tool surface + the shared `/chat/tool` endpoint |
+
+### [`worker/control/`](worker/control/) · [`worker/deploy/`](worker/deploy/) · [`worker/neuron/`](worker/neuron/) — the swarm control plane
+| File | Purpose |
+|------|---------|
+| [control/supervisor.md](worker/control/supervisor.md) | Supervisor — detached swarm processes, re-adoption |
+| [control/writer.md](worker/control/writer.md) | Control writer — the swarm control bus (stop / steer / goal) |
+| [control/fanout.md](worker/control/fanout.md) | Event fanout — swarm `events.jsonl` cursor + SSE stream |
+| [deploy/service.md](worker/deploy/service.md) | Deploy service — cast/deploy + swarm files and lifecycle |
+| [neuron/client.md](worker/neuron/client.md) | Neuron client — the neuron-db memory bridge (fail-open) |
+| [sched.md](worker/sched.md) | Scheduled tasks — each run is a server chat conversation |
+
+### [`worker/`](worker/) — the runtime
 | File | Purpose |
 |------|---------|
 | [agi.md](worker/agi.md) | AGI worker core — autonomous reasoning loop |
@@ -74,7 +81,7 @@
 | File | Purpose |
 |------|---------|
 | [main.md](desk/main.md) | Entry point — borderless raylib window, render loop, tabs |
-| [chat.md](desk/chat.md) | The brain — chat worker: turns, casts, the learning loop, auto-loop |
+| [chat.md](desk/chat.md) | Chat tab client — sends to the server chat brain, streams + steers (local fallback) |
 | [llm.md](desk/llm.md) | LLM client — streaming, SSE/NDJSON, tool-call recovery |
 | [store.md](desk/store.md) | Shared state — lock-guarded records + rings across threads |
 | [poller.md](desk/poller.md) | The IO thread — fleet liveness, run scan, event tail, notifications |
@@ -100,9 +107,10 @@
 | `config/` | Configuration & secrets — encrypted key vault, key management |
 | `gateway/` | HTTP ingress — routing, middleware, request lifecycle |
 | `obs/` | Observability — audit logging, telemetry |
-| `orchestrate/` | Orchestration — deployment, supervision, inter-agent comms |
 | `plan/` | Plan & billing — entitlements, metering, resource models |
-| `worker/` | Worker runtime — LLM, tools, crawling, RSI, editing, VCS |
+| `worker/chat/` | The server-side chat brain — the agentic turn loop, REST surface, tools |
+| `worker/control/` · `deploy/` · `neuron/` | The swarm control plane — deploy, supervise, stream, steer, memory bridge |
+| `worker/` | Worker runtime — LLM, tools, crawling, RSI, editing, VCS, scheduled tasks |
 | `desk/` | veil-desk — the native desktop dashboard (Zig + raylib): chat, casts, monitoring |
 
 ---
