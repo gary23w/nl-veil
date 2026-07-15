@@ -1,7 +1,7 @@
-//! netcli.zig — a deliberately tiny HTTP/1.1 client for the LOCAL veil server (127.0.0.1). Only the few
-//! actions that genuinely require the running server go through here: an unauthenticated GET /api/v1/fleet
-//! for the dashboard counters, and authenticated POST/DELETE to deploy/cast/remove a swarm. Everything the
-//! console/chat/stop needs comes from the filesystem (scan.zig).
+//! netcli.zig — a deliberately tiny HTTP/1.1 client for the veil server (the local 127.0.0.1 default, or a
+//! remote host set in Settings). Only the few actions that genuinely require the running server go through
+//! here: an unauthenticated GET /api/v1/fleet for the dashboard counters, and authenticated POST/DELETE to
+//! deploy/cast/remove a swarm. Everything the console/chat/stop needs comes from the filesystem (scan.zig).
 //!
 //! Transport is httpc.zig (in-process sockets with real HTTP framing and a hard timeout ceiling), so a
 //! wedged/slow server surfaces as a clean null — the caller shows "server unreachable" rather than hanging
@@ -18,6 +18,19 @@ pub const Resp = httpc.Resp;
 // TCP connection but closes without a full reply. That's transient, not "server down", so retry it a couple
 // times for IDEMPOTENT requests before giving up.
 const MAX_ATTEMPTS = 3;
+
+// The host every request in this module dials — the desk targets ONE veil at a time, so this lives here
+// instead of threading a host parameter through every caller. Empty = the local loopback default. The
+// poller re-copies it from Settings each tick (the steady writer; the Settings Apply button writes the
+// same settings-sourced value), so a torn read can at worst fail one request and heal on the next tick.
+var host_buf: [64]u8 = [_]u8{0} ** 64;
+var host_len: u8 = 0;
+
+pub fn setHost(h: []const u8) void {
+    const n = @min(h.len, host_buf.len);
+    @memcpy(host_buf[0..n], h[0..n]);
+    host_len = @intCast(n);
+}
 
 /// One HTTP round-trip to the local veil server. `timeout_s` is a hard ceiling on the whole round trip:
 /// a healthy localhost server answers in milliseconds, so a call that hits the ceiling means the server is
@@ -42,6 +55,7 @@ fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: 
         // CLOSE_WAIT pile-up that exhausts a small local server).
         switch (httpc.request(io, gpa, .{
             .method = method,
+            .host = host_buf[0..host_len],
             .port = port,
             .path = path,
             .bearer = token,
