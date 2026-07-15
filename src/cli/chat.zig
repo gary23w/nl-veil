@@ -39,7 +39,7 @@ pub fn run(
         conv = hex;
     }
 
-    std.debug.print(
+    cli.out(
         \\veil chat — conversation {s}
         \\  type a message and press enter; while the veil is working, a line STEERS the running turn.
         \\  /stop  interrupt the current turn      /new  start a fresh conversation
@@ -53,11 +53,11 @@ pub fn run(
     const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse "http://127.0.0.1:11434/v1";
     const model = ctx.environ.get("NL_LLM_MODEL") orelse "gpt-oss:20b";
     const api_key = ctx.environ.get("NL_LLM_KEY") orelse "";
-    std.debug.print("  backend: {s}  ({s})\n", .{ model, base_url });
+    cli.out("  backend: {s}  ({s})\n", .{ model, base_url });
 
     var stdin_buf: [4096]u8 = undefined;
     while (true) {
-        std.debug.print("\n> ", .{});
+        cli.out("\n> ", .{});
         const line = readLine(ctx, &stdin_buf) orelse break; // EOF (Ctrl-D / closed pipe) ends the REPL
         const msg = std.mem.trim(u8, line, " \r\n\t");
         if (msg.len == 0) continue;
@@ -66,12 +66,12 @@ pub fn run(
             var rnd: [6]u8 = undefined;
             ctx.io.random(&rnd);
             conv = std.fmt.bufPrint(&conv_buf, "cli{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch conv;
-            std.debug.print("(new conversation {s})\n", .{conv});
+            cli.out("(new conversation {s})\n", .{conv});
             continue;
         }
         if (std.mem.eql(u8, msg, "/stop")) {
             _ = postControl(ctx, call, conv, "{\"op\":\"stop\"}");
-            std.debug.print("(stop requested)\n", .{});
+            cli.out("(stop requested)\n", .{});
             continue;
         }
 
@@ -103,7 +103,7 @@ pub fn run(
         // stream the turn; a {done} frame returns. (A future refinement: a background reader so a line typed
         // mid-turn posts a steer — for now the turn streams to completion, then the next prompt accepts input.)
         followConv(ctx, conv);
-        std.debug.print("\n", .{});
+        cli.out("\n", .{});
     }
     return 0;
 }

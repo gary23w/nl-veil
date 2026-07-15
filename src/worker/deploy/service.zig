@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const httpz = @import("httpz");
+
+const log = std.log.scoped(.billing);
 const http = @import("../../gateway/http.zig");
 const ent = @import("../../plan/entitlements.zig");
 const neurons = @import("../../plan/neurons.zig");
@@ -581,7 +583,7 @@ fn enforceBudget(app: *App) void {
         if (app.auth.isAdmin(u)) continue;
         if (l.status(uid, u.plan).balance <= 0) {
             const paused = app.sup.pauseUserSwarms(uid);
-            if (paused > 0) std.debug.print("billing: paused {d} swarm(s) for uid {d} — out of neurons\n", .{ paused, uid });
+            if (paused > 0) log.warn("paused {d} swarm(s) for uid {d} — out of neurons", .{ paused, uid });
         }
     }
 }

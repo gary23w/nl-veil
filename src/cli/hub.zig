@@ -45,7 +45,7 @@ fn roster(ctx: *Ctx, call: cli.CallFn) u8 {
         return 1;
     };
     defer if (fl.body.len > 0) ctx.gpa.free(fl.body);
-    std.debug.print("FLEET  {s}\n\n", .{fl.body[0..@min(fl.body.len, 200)]});
+    cli.out("FLEET  {s}\n\n", .{fl.body[0..@min(fl.body.len, 200)]});
 
     const resp = call(ctx, "GET", "/api/v1/swarms", null, 6, true) catch {
         std.debug.print("(could not list swarms)\n", .{});
@@ -57,7 +57,7 @@ fn roster(ctx: *Ctx, call: cli.CallFn) u8 {
         return 1;
     }
     var it = cli.JsonObjs.init(resp.body);
-    std.debug.print("{s: <18}  {s: <9}  {s: <6}  {s}\n", .{ "ID", "STATE", "MINDS", "GOAL" });
+    cli.out("{s: <18}  {s: <9}  {s: <6}  {s}\n", .{ "ID", "STATE", "MINDS", "GOAL" });
     var any = false;
     while (it.next()) |obj| {
         const id = cli.jsonStr(ctx.gpa, obj, "id") orelse continue;
@@ -66,10 +66,10 @@ fn roster(ctx: *Ctx, call: cli.CallFn) u8 {
         defer ctx.gpa.free(state);
         const goal = cli.jsonStr(ctx.gpa, obj, "goal") orelse ctx.gpa.dupe(u8, "") catch continue;
         defer ctx.gpa.free(goal);
-        std.debug.print("{s: <18}  {s: <9}  {d: <6}  {s}\n", .{ id[0..@min(id.len, 18)], state[0..@min(state.len, 9)], cli.jsonNum(obj, "minds"), goal[0..@min(goal.len, 56)] });
+        cli.out("{s: <18}  {s: <9}  {d: <6}  {s}\n", .{ id[0..@min(id.len, 18)], state[0..@min(state.len, 9)], cli.jsonNum(obj, "minds"), goal[0..@min(goal.len, 56)] });
         any = true;
     }
-    if (!any) std.debug.print("(the fleet is empty)\n", .{});
+    if (!any) cli.out("(the fleet is empty)\n", .{});
     return 0;
 }
 
@@ -111,12 +111,12 @@ fn broadcast(ctx: *Ctx, call: cli.CallFn, op: []const u8, text: []const u8) u8 {
         if (cr.body.len > 0) ctx.gpa.free(cr.body);
         if (cr.status == 200 or cr.status == 202) sent += 1 else failed += 1;
     }
-    std.debug.print("broadcast {s}: {d} sent, {d} failed\n", .{ op, sent, failed });
+    cli.out("broadcast {s}: {d} sent, {d} failed\n", .{ op, sent, failed });
     return if (failed == 0) 0 else 1;
 }
 
 fn help() u8 {
-    std.debug.print(
+    cli.out(
         \\veil hub — fleet console (the running server aggregates all your swarms)
         \\
         \\  veil hub                 roster: fleet summary + every swarm's state

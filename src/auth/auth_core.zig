@@ -3,6 +3,8 @@
 const std = @import("std");
 const Neuron = @import("../worker/neuron/client.zig").Neuron;
 
+const log = std.log.scoped(.auth);
+
 pub const Plan = @import("../plan/entitlements.zig").Plan;
 
 pub const User = struct {
@@ -55,13 +57,13 @@ pub const Auth = struct {
         const email = self.admin_email orelse DEFAULT_ADMIN_EMAIL;
         const pw = password orelse "changeme";
         self.register(email, pw) catch |e| {
-            if (e != AuthError.EmailTaken) std.debug.print("seed admin {s}: {t}\n", .{ email, e });
+            if (e != AuthError.EmailTaken) log.err("seed admin {s}: {t}", .{ email, e });
             return;
         };
         if (password == null)
-            std.debug.print("\n*** DEFAULT ADMIN SEEDED: {s} / changeme — set NL_ADMIN_PASSWORD and change this ***\n\n", .{email})
+            log.warn("*** DEFAULT ADMIN SEEDED: {s} / changeme — set NL_ADMIN_PASSWORD and change this ***", .{email})
         else
-            std.debug.print("admin account ready: {s}\n", .{email});
+            log.info("admin account ready: {s}", .{email});
     }
 
     fn userScope(email: []const u8, out: *[16]u8) []const u8 {

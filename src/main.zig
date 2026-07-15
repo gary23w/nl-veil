@@ -30,7 +30,12 @@ const cf_oauth = @import("config/cf_oauth.zig");
 const worker = @import("worker/run.zig");
 const cli = @import("cli.zig");
 
-pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
+// .info, explicitly: the default log_level tracks the optimize mode, and the ReleaseFast default (.err)
+// would silently swallow every operational message below — including the one-shot generated-admin-password
+// banner. This is the single binary-wide switch; per-module scopes are declared at each file's top.
+pub const std_options: std.Options = .{ .unexpected_error_tracing = false, .log_level = .info };
+
+const log = std.log.scoped(.server);
 
 const VERSION = "1.0.0";
 
@@ -100,7 +105,7 @@ fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.En
     // CPU/RAM until the HTTP server starves. 2 keeps some concurrency for steering without oversubscribing.
     if (!par_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_NUM_PARALLEL", "2" });
     if (!ctx_ok) runQuiet(gpa, io, &.{ "setx", "OLLAMA_CONTEXT_LENGTH", "8192" });
-    std.debug.print("nl-veil: persisted Ollama tuning (OLLAMA_NUM_PARALLEL=2, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.\n", .{});
+    log.info("persisted Ollama tuning (OLLAMA_NUM_PARALLEL=2, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -172,9 +177,9 @@ pub fn main(init: std.process.Init) !void {
     var auth = Auth.init(gpa, nb);
     var ledger = @import("plan/neurons.zig").NeuronLedger.init(gpa, nb);
     var api_keys = @import("auth/api_keys.zig").ApiKeys.init(gpa, nb);
-    api_keys.warm() catch |e| std.debug.print("api_keys warm: {t}\n", .{e});
+    api_keys.warm() catch |e| log.warn("api_keys warm: {t}", .{e});
     auth.setAdminEmail(init.environ_map.get("NL_ADMIN_EMAIL"));
-    auth.warm() catch |e| std.debug.print("warm: {t}\n", .{e});
+    auth.warm() catch |e| log.warn("auth warm: {t}", .{e});
     const bind_all = if (init.environ_map.get("NL_BIND")) |v| v.len > 0 and !std.mem.eql(u8, v, "127.0.0.1") else false;
     var apw_buf: [48]u8 = undefined;
     const admin_pw: ?[]const u8 = init.environ_map.get("NL_ADMIN_PASSWORD") orelse blk: {
@@ -183,7 +188,7 @@ pub fn main(init: std.process.Init) !void {
         io.random(&raw);
         const hx = std.fmt.bytesToHex(raw, .lower);
         @memcpy(apw_buf[0..hx.len], &hx);
-        std.debug.print("\n*** NL_ADMIN_PASSWORD unset on a public bind — generated admin password: {s}\n*** SAVE THIS NOW (shown once); set NL_ADMIN_PASSWORD to pin a stable one. ***\n\n", .{apw_buf[0..hx.len]});
+        log.warn("*** NL_ADMIN_PASSWORD unset on a public bind — generated admin password: {s}\n*** SAVE THIS NOW (shown once); set NL_ADMIN_PASSWORD to pin a stable one. ***", .{apw_buf[0..hx.len]});
         break :blk apw_buf[0..hx.len];
     };
     auth.seedDefaultAdmin(admin_pw);
@@ -195,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
     const retention_days: u32 = if (init.environ_map.get("NL_RETENTION_DAYS")) |v| (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 14) else 14;
     if (retention_days > 0) {
         const swept = sup.pruneOldRuns(paths.data, retention_days);
-        if (swept > 0) std.debug.print("retention: pruned {d} stale run dir(s) at startup (>= {d}d inactive)\n", .{ swept, retention_days });
+        if (swept > 0) log.info("retention: pruned {d} stale run dir(s) at startup (>= {d}d inactive)", .{ swept, retention_days });
     }
     // Swarm reconcile + retention GC run on a BACKGROUND thread, never on an httpz request thread — reconcile
     // can spawn a worker subprocess (respawn) which, inline in a /fleet or list handler, starves the pool and
@@ -227,9 +232,9 @@ pub fn main(init: std.process.Init) !void {
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
     // main's stack for the life of the process (listen() below never returns in normal operation).
     if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
-    std.debug.print("billing: {s} (NL_PRODUCTION)\n", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
-    if (!open_reg) std.debug.print("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups\n", .{});
-    if (cf_account.len > 0 and wai_token.len > 0) std.debug.print("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint\n", .{}) else std.debug.print("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)\n", .{});
+    log.info("billing: {s} (NL_PRODUCTION)", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
+    if (!open_reg) log.info("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups", .{});
+    if (cf_account.len > 0 and wai_token.len > 0) log.info("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint", .{}) else log.info("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)", .{});
 
     const port = cli_port; // resolved once above (NL_PORT else 8787), shared with the CLI client
     // On Windows httpz runs the BLOCKING thread-per-connection worker (one pool thread per live socket),
@@ -315,7 +320,7 @@ pub fn main(init: std.process.Init) !void {
     router.delete("/api/v1/admin/swarms/:id", admin_service.adminKill, .{});
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});
 
-    std.debug.print("neuron-loops {s} on http://127.0.0.1:{d}  home={s}  ({d} users, {d} swarms re-adopted)\n", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+    log.info("neuron-loops {s} on http://127.0.0.1:{d}  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, paths.home, auth.userCount(), readopted });
     // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
     // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
     if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
@@ -345,7 +350,7 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     const key = keys.create(u.id, "veil-desk") catch return;
     defer gpa.free(key);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = key }) catch return;
-    std.debug.print("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)\n", .{});
+    log.info("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)", .{});
 }
 
 const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
@@ -372,7 +377,7 @@ fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: 
         return; // not built in either layout → nothing to host
     // Spawn and forget — it's an independent same-machine companion, not a child we manage.
     _ = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
-    std.debug.print("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)\n", .{});
+    log.info("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)", .{});
 }
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {

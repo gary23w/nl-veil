@@ -5,6 +5,8 @@ const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
 
+const log = std.log.scoped(.supervisor);
+
 // Native process liveness/termination via the Win32 API directly — NO subprocess. Spawning tasklist/taskkill
 // on the httpz request thread for every reconcile-probe and kill starves the worker pool under load; and a
 // recycled stale pid handed to taskkill could target the server itself. Direct API calls are cheap and
@@ -236,7 +238,7 @@ pub const Supervisor = struct {
         sw.restarts += 1;
         sw.last_restart = now;
         sw.last_check = now;
-        std.debug.print("[supervisor] auto-restarted crashed swarm {s} (restart {d}/{d})\n", .{ id, sw.restarts, MAX_RESTARTS });
+        log.info("auto-restarted crashed swarm {s} (restart {d}/{d})", .{ id, sw.restarts, MAX_RESTARTS });
     }
 
     fn encInjectEnv(self: *Supervisor, penv: *const std.process.Environ.Map, run_dir: []const u8) ?std.process.Environ.Map {
@@ -506,7 +508,7 @@ pub const Supervisor = struct {
         if (self.last_gc != 0 and now - self.last_gc < 3600) return;
         self.last_gc = now;
         const n = self.pruneOldRuns(data_dir, days);
-        if (n > 0) std.debug.print("retention: pruned {d} run dir(s) inactive >= {d}d\n", .{ n, days });
+        if (n > 0) log.info("retention: pruned {d} run dir(s) inactive >= {d}d", .{ n, days });
     }
 
     pub fn pruneOldRuns(self: *Supervisor, data_dir: []const u8, days: u32) usize {
@@ -737,7 +739,7 @@ pub const Supervisor = struct {
         if (s.last_restart != 0 and now - s.last_restart > HEALTH_RESET_SECS) s.restarts = 0;
         if (s.restarts >= MAX_RESTARTS) {
             s.breaker_open = true;
-            std.debug.print("[supervisor] circuit-breaker OPEN for swarm {s} after {d} restarts — leaving it crashed\n", .{ s.id, s.restarts });
+            log.warn("circuit-breaker OPEN for swarm {s} after {d} restarts — leaving it crashed", .{ s.id, s.restarts });
             return false;
         }
         return true;
