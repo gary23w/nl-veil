@@ -1139,6 +1139,15 @@ pub const Chat = struct {
         var mb: [96]u8 = undefined;
         const prov = self.resolveProvider(&bb, &kb, &mb);
 
+        // AUTO-LOOP MODE: the server now owns the loop, so PASS the desk's live toggle (0=off, 1=on, 2=afk) in the
+        // body instead of throwing it away. The server drive loop drives persistently when armed (afk = never accept
+        // DONE, only Stop ends it); the desk's LOCAL maybeLoop still stands down for this conv via the sc_serving guard.
+        const loop_mode: u8 = blk_lm: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_lm if (self.store.chat_loop_afk) @as(u8, 2) else if (self.store.chat_loop) @as(u8, 1) else @as(u8, 0);
+        };
+
         // Heap body: on default-on a long user message would overflow a fixed buffer (which would then wrongly
         // fall back). Size it to the escaped worst case; any alloc/build failure just falls back to local.
         const cap = text.len * 2 + prov.base_url.len + prov.model.len + prov.key.len + 128;
@@ -1154,7 +1163,9 @@ pub const Chat = struct {
             wesc(&w, prov.model);
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
-            w.writeAll("\"}") catch break :blk false;
+            w.writeAll("\",\"loop\":") catch break :blk false;
+            w.writeByte('0' + loop_mode) catch break :blk false; // 0|1|2 — the desk's live auto-loop tier
+            w.writeAll("}") catch break :blk false;
             break :blk true;
         };
         if (!bok) return false; // couldn't build the request → local fallback
@@ -1186,14 +1197,10 @@ pub const Chat = struct {
         }
 
         if (handled) {
-            // Commit to the server for this turn: the local auto-loop must not also drive turns (it grabs the idle
-            // slot whenever chat_loop is set), so disarm it; arm the poller to render the frames the turn wrote.
-            {
-                self.store.lock();
-                self.store.chat_loop = false;
-                self.store.chat_loop_afk = false;
-                self.store.unlock();
-            }
+            // Commit to the server for this turn. The SERVER now owns the loop (we passed loop_mode in the body), so
+            // the desk's LOCAL auto-loop must NOT also drive turns — but we no longer CLEAR the toggle (that discarded
+            // the user's auto-loop/afk intent): sc_serving standing down the local maybeLoop (its guard at the top)
+            // keeps the desk from double-driving while the toggle stays visibly armed and the server drives it.
             @memcpy(self.sc_conv[0..conv.len], conv);
             self.sc_conv_len = conv.len;
             self.sc_from = from0;

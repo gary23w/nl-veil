@@ -204,10 +204,15 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         base_url: []const u8 = "",
         model: []const u8 = "",
         api_key: []const u8 = "",
+        // AUTO-LOOP mode the desk armed for this conversation: 0=off (a normal bounded turn), 1=on (drive toward the
+        // goal until DONE / no-progress / cap), 2=afk (persistent — never accept DONE, only Stop ends it). Absent =
+        // 0. The server drive loop owns the loop now, so the desk stops running its own local loop for served convs.
+        loop: u8 = 0,
     };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
+    const loop_mode: u8 = if (b.loop > 2) 2 else b.loop; // clamp to the known tiers
 
     // ONE in-flight turn per conversation. A turn does an unlocked read-modify-write of messages.jsonl / context.json
     // on a detached thread, so a second concurrent turn for the same conv would lost-update the durable log. Reject
@@ -222,7 +227,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes — the
     // "shows only 'server thinking'" symptom. The turn writes frames to events.jsonl as it runs. spawnTurn owns
     // releasing the per-conv slot (via turnThread / its inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text);
+    chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text, loop_mode);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
