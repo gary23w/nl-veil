@@ -9,7 +9,7 @@
 #   dep_desk_libs      -> ensures raylib's GL/X11/wayland dev libs (Linux desktop link)
 #
 # All are best-effort and idempotent. Honor ASSUME_YES=1 for unattended runs.
-# Uses the same pinned Zig version and package set as deploy.py / the CI.
+# Uses the same pinned Zig version and package set as the CI.
 # ============================================================================
 
 DEP_ZIG_VERSION="${DEP_ZIG_VERSION:-0.16.0}"

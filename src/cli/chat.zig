@@ -47,9 +47,9 @@ pub fn run(
         \\
     , .{conv});
 
-    // provider fields come from the environment (the deploy.py convention): NL_LLM_BASE_URL / NL_LLM_MODEL /
-    // NL_LLM_KEY. Blank base_url means the server has no backend to call (a chat turn needs one), so if it's
-    // unset we default to a local Ollama — the common local case — and let the user override via env.
+    // provider fields come from the environment: NL_LLM_BASE_URL / NL_LLM_MODEL / NL_LLM_KEY. Blank base_url
+    // means the server has no backend to call (a chat turn needs one), so if it's unset we default to a local
+    // Ollama — the common local case — and let the user override via env.
     const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse "http://127.0.0.1:11434/v1";
     const model = ctx.environ.get("NL_LLM_MODEL") orelse "gpt-oss:20b";
     const api_key = ctx.environ.get("NL_LLM_KEY") orelse "";

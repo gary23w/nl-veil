@@ -3,16 +3,17 @@
 #   curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/install.sh | sh
 #
 # What it does (and nothing more): put the repo at $VEIL_HOME (default ~/nl-veil), link the
-# `veil` command into ~/.local/bin, and tell you the next two commands. Python 3.9+ is the one
-# thing it won't install for you; everything else (Zig, the neuron-db memory engine, a local
-# model) is bootstrapped by `deploy.py` itself on first use, with a prompt before each download.
+# `veil` command into ~/.local/bin, and tell you the next two commands. Zig 0.16+ is the one
+# thing it won't install for you; on first run the `veil` shim builds the binary with
+# `zig build`, and the neuron-db memory engine ships prebuilt in bin/ (or is fetched by the
+# release bundler). No Python required.
 set -e
 
 REPO="https://github.com/gary23w/nl-veil"
 DIR="${VEIL_HOME:-$HOME/nl-veil}"
 
-command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1 || {
-  echo "! nl-veil needs Python 3.9+ first: https://www.python.org/downloads/"
+command -v zig >/dev/null 2>&1 || {
+  echo "! nl-veil builds from source and needs Zig 0.16+ first: https://ziglang.org/download/"
   exit 1
 }
 
@@ -41,5 +42,5 @@ case ":$PATH:" in
 esac
 echo ""
 echo "  next:"
-echo "    veil configure      # once - local Ollama, or any OpenAI-compatible endpoint (BYOK)"
-echo "    veil                # the veil shell"
+echo "    veil                # run the server (first run builds the binary)"
+echo "    veil cast \"...\"      # deploy a swarm    |    veil chat    # talk to the veil"

@@ -2,19 +2,15 @@
 
 Thanks for your interest — contributions are welcome.
 
-1. You only strictly need **Python 3.9+**. Run `python deploy.py doctor` for a readiness table —
-   it shows what's present and what `deploy.py` will auto-install for you.
-2. `deploy.py` bootstraps the build toolchain on first run: it downloads a pinned **Zig** into
-   `./.zig` if `zig` is missing, and installs the **Rust toolchain** via [rustup](https://rustup.rs)
-   if `cargo` is missing (needed once to build the `neuron` memory engine — skip it entirely with an
-   existing `neuron` binary via `--neuron-bin <path>`). The one thing it can't auto-install is a **C
-   compiler** (neuron compiles SQLite); `doctor` prints the one-liner for your OS.
+1. You need **Zig 0.16+** ([download](https://ziglang.org/download/)). Run `veil doctor` once the
+   binary exists for a readiness table (server + token health).
+2. Build: `zig build` — the binary lands in `zig-out/bin/veil`. The `neuron` memory engine ships
+   prebuilt in `bin/` (or build it from the sibling neuron-db repo — needs a **C compiler** for
+   SQLite and the **Rust toolchain** via [rustup](https://rustup.rs)).
 3. Get a model endpoint (the easiest is [Ollama](https://ollama.com): `ollama pull gpt-oss:20b`, the
-   default — or `llama3.1:8b` on very small devices; `deploy.py` will offer to install Ollama and pull
-   the model for you too).
-4. To build by hand: `zig build` — the binary lands in `zig-out/bin/veil`.
-5. `python deploy.py "say hello" --minutes 1 --follow` confirms the loop runs end to end
-   (the first run fetches + builds `neuron`; pass `--yes` to take every auto-install default).
+   default — or `llama3.1:8b` on very small devices).
+4. `veil` runs the server; `veil cast "say hello" --minutes 1 --follow` confirms the loop runs end
+   to end (the CLI auto-starts the server if it isn't already up).
 
 ## Ground rules
 
@@ -35,5 +31,5 @@ Thanks for your interest — contributions are welcome.
 
 ## Reporting issues
 
-Open an issue with what you ran (`deploy.py` command or `swarm.json`), what you expected, and what
+Open an issue with what you ran (a `veil` command or `swarm.json`), what you expected, and what
 happened — a snippet of the run's `events.jsonl` helps a lot.
