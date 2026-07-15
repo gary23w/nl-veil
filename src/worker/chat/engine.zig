@@ -966,6 +966,13 @@ fn streamShouldAbort(cx: *anyopaque) bool {
 fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
     if (text.len == 0) return;
     const sc: *StreamCtx = @ptrCast(@alignCast(cx));
+    if (kind == .tool_progress) {
+        // Composing a big tool call emits NO content/reasoning deltas — surface what's being written as a live
+        // status line ("writing index.html — 12 KB...") so the user isn't staring at a silent turn. Not part of
+        // the reply: don't set `streamed` (a call-only step must still fall back to emitting its reasoning once).
+        emitKV(sc.app, sc.conv_dir, "status", "text", text);
+        return;
+    }
     sc.streamed = true; // a real stream happened — so the fallback reasoning emit is skipped
     scAccum(sc, kind == .reasoning, text);
 }
