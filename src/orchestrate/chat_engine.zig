@@ -128,7 +128,12 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"swarm_asks","description":"List the OPEN questions a running swarm's minds have raised for you (via their ask_veil tool) and not yet been answered. Check this while a swarm runs — a mind may be blocked waiting on a decision only you can make. Each ask has an ask_id, the mind that asked, and the question.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}}
 ;
-const TURN_TOOLS = tools.SCHEMA ++ "," ++ ORCH_TOOLS;
+// The chat surface = the REACHABLE mind-tool subset (tools.CHAT_SCHEMA, not the full ~33-tool SCHEMA whose
+// swarm-mind/host-sim/RSI-only verbs a solo chat turn can't use) + the veil's orchestration verbs. Trimming the
+// unreachable tools roughly halves the cold-cache prefill re-sent on every drive step and stops the model emitting
+// an off-surface tool call that would burn a whole agentic round-trip. tools.execute still dispatches the full
+// SCHEMA, so nothing breaks if a tool is ever re-advertised. See tools.CHAT_SCHEMA for the exact keep-set + why.
+const TURN_TOOLS = tools.CHAT_SCHEMA ++ "," ++ ORCH_TOOLS;
 
 /// io-based wall clock — the SAME source the worker stamps its event `t` with (std time under io, never a raw
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.

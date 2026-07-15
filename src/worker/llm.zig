@@ -843,6 +843,26 @@ fn handleStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u8) 
     if (st.native) handleNativeStreamLine(st, gpa, line) else handleSseStreamLine(st, gpa, line);
 }
 
+/// Move `buf[from..]` to the front, shrink, and return the new length. Used by the streaming poll loop to keep only
+/// the still-unfed carry (a straddled end-marker prefix) in the accumulator between polls.
+fn keepFront(buf: *std.ArrayListUnmanaged(u8), from: usize) usize {
+    const rem = buf.items.len - from;
+    if (from > 0 and rem > 0) std.mem.copyForwards(u8, buf.items[0..rem], buf.items[from..]);
+    buf.shrinkRetainingCapacity(rem);
+    return rem;
+}
+
+/// Longest k (>=1) such that the last k bytes of `buf` equal `mark[0..k]` — i.e. `buf` ends in a strict prefix of
+/// `mark`. Returns 0 if none. The streaming loop holds these bytes back so a curl `-w` end-marker straddling a read
+/// boundary is never fed to feedStream as body (which would resurface as a garbage trailing line).
+fn markPrefixSuffix(buf: []const u8, mark: []const u8) usize {
+    var k = @min(buf.len, mark.len - 1);
+    while (k > 0) : (k -= 1) {
+        if (std.mem.eql(u8, buf[buf.len - k ..], mark[0..k])) return k;
+    }
+    return 0;
+}
+
 /// Ollama native /api/chat NDJSON: {"message":{"content":"…","thinking":"…","tool_calls":[…]},"done":bool,…}.
 fn handleNativeStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u8) void {
     const t = std.mem.trim(u8, line, " \t\r");
@@ -1137,37 +1157,88 @@ fn streamAttempt(
     defer st.deinit(gpa);
 
     // ---- tail the sink until curl exits (STAT sentinel) or the stream self-completes ----
+    // POSITIONAL read from a byte cursor — NOT a whole-file re-read every poll. curl only ever APPENDS to the .sse
+    // scratch, so a growing `offset` stays valid; each poll reads just the new bytes into a reused buffer and feeds
+    // them to feedStream (which keeps its own partial-line carry). This turns the old O(final_size^2) read+rescan
+    // (readFileAlloc from byte 0 + lastIndexOf over the whole buffer every 20ms, plus a growing alloc/free per poll)
+    // into O(total_bytes), and dissolves the latent 8MB cliff: a native reasoning stream at NATIVE_THINK_TOKENS can
+    // exceed the old .limited(8<<20), which readFileAlloc then misread as "file not created yet" → spin to the wall
+    // and return a silently truncated partial. curl -w appends "\n__VEILSTAT__<http_code>"; we scan for the core
+    // MARK "__VEILSTAT__" (never present in SSE/NDJSON data) so a body-terminating '\n' feeds with zero delay, and
+    // hold back only a trailing suffix that is a strict prefix of MARK (a sentinel straddling a read boundary).
+    const MARK = "__VEILSTAT__";
+    const read_cap: usize = 256 << 10;
+    const rbuf = gpa.alloc(u8, read_cap) catch return null;
+    defer gpa.free(rbuf);
+    var vbuf: std.ArrayListUnmanaged(u8) = .empty; // holds only the still-unfed carry (a straddled MARK prefix)
+    defer vbuf.deinit(gpa);
     var offset: usize = 0;
+    var last_fed: u8 = 0; // last body byte handed to feedStream — the left-context for a marker landing at vbuf[0]
     var aborted = false;
+    var sentinel = false;
     const wall: i64 = @as(i64, stream_max_s) + 30;
     const t0 = std.Io.Timestamp.now(io, .real).toSeconds();
     while (true) {
         // COOPERATIVE ABORT (chat Stop): kill the in-flight stream promptly instead of waiting out generation. We
-        // still feed whatever already arrived (below returns the partial), so the user keeps the streamed text.
+        // still feed whatever already arrived (st holds it), so the user keeps the streamed text.
         if (should_abort) |ab| if (ab(ctx)) {
             aborted = true;
             break;
         };
-        const data = std.Io.Dir.cwd().readFileAlloc(io, outpath, gpa, .limited(8 << 20)) catch {
+        var f = std.Io.Dir.cwd().openFile(io, outpath, .{}) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
             io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast so frames reach the desk's ~30Hz poll promptly
             continue;
         };
-        var body_bytes = data;
-        var sentinel = false;
-        if (std.mem.lastIndexOf(u8, data, STREAM_STAT)) |m| {
-            const after = data[m + STREAM_STAT.len ..];
-            if (after.len >= 3) {
-                body_bytes = data[0..m];
-                sentinel = true;
+        {
+            defer f.close(io);
+            // Read ACTUAL bytes from the cursor — do NOT gate on f.length(): on Windows a freshly-opened read handle's
+            // length does not reflect curl's in-progress appends from the OTHER process (the metadata lags the write),
+            // so gating on it stalls the stream until curl exits — the reply then lands all-at-once and, with st.content
+            // still empty, falls back to complete() (no live tokens at all). readPositionalAll reads up to rbuf.len
+            // bytes and stops at the CURRENT end of file (a regular file's positional read returns 0 at EOF, it never
+            // blocks), i.e. exactly the old readFileAlloc read-to-current-end, but bounded and from the cursor (no
+            // whole-file re-read, no 8MB cap). More than rbuf.len pending just drains across the next polls.
+            const n = f.readPositionalAll(io, rbuf, offset) catch 0;
+            if (n > 0) {
+                vbuf.appendSlice(gpa, rbuf[0..n]) catch {};
+                offset += n;
             }
         }
-        if (body_bytes.len > offset) {
-            feedStream(&st, gpa, body_bytes[offset..]);
-            offset = body_bytes.len;
+        // resolve vbuf (== last poll's carry ++ this poll's new bytes): feed body up to curl's end-marker, hold back a
+        // straddled marker prefix. After this, vbuf holds exactly the still-unfed carry again. curl's real marker is
+        // ALWAYS newline-anchored ("\n__VEILSTAT__<code>") and last in the file, so we only treat a MARK match as the
+        // sentinel when the byte before it is '\n' (from this window, else `last_fed` — the byte fed in a prior poll).
+        // A bare "__VEILSTAT__" the model itself emits sits inside a JSON string (preceded by '"', a letter, …, never
+        // a raw '\n'), so it is fed as ordinary body instead of silently truncating the reply — the newline anchor is
+        // what the old STREAM_STAT match relied on, restored here without holding back a body-terminating '\n'.
+        if (vbuf.items.len > 0) {
+            var did_sentinel = false;
+            if (std.mem.lastIndexOf(u8, vbuf.items, MARK)) |m| { // last occurrence — curl's marker is always last in the file
+                const anchor: u8 = if (m > 0) vbuf.items[m - 1] else last_fed;
+                if (anchor == '\n') {
+                    if (m > 0) last_fed = vbuf.items[m - 1];
+                    feedStream(&st, gpa, vbuf.items[0..m]); // body up to the marker (its anchoring '\n' at m-1 included)
+                    if (vbuf.items.len - (m + MARK.len) >= 3) {
+                        sentinel = true; // full marker + 3-digit http code present → curl finished
+                    } else {
+                        _ = keepFront(&vbuf, m); // marker present but the code hasn't fully landed — hold it, wait
+                    }
+                    did_sentinel = true;
+                }
+            }
+            if (!did_sentinel) {
+                // no newline-anchored marker → all body except a trailing suffix that is a strict prefix of MARK (a
+                // real, newline-anchored marker straddling the next read boundary; a body '__VEILSTAT__' feeds through).
+                const keep = vbuf.items.len - markPrefixSuffix(vbuf.items, MARK);
+                if (keep > 0) {
+                    last_fed = vbuf.items[keep - 1];
+                    feedStream(&st, gpa, vbuf.items[0..keep]);
+                }
+                _ = keepFront(&vbuf, keep);
+            }
         }
-        gpa.free(data);
         if (st.done or sentinel) {
             // flush a final line that arrived without a trailing newline (native's last object can)
             if (!st.done and st.carry.items.len > 0) {
