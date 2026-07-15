@@ -864,10 +864,14 @@ pub const Supervisor = struct {
 };
 
 /// True when `id` names this run dir by its BASENAME (either slash form) — the alternate swarm-id form a
-/// re-adopted dir gets and the desktop Swarm tab sends for chat casts.
+/// re-adopted dir gets and the desktop Swarm tab sends for chat casts. Hand-rolled, not
+/// std.fs.path.basename: that splits only on '/' under POSIX, while run_dir strings are fmt-joined with
+/// '/' onto native base paths, so a Windows-written dir carries both separator forms on any host.
 fn idMatchesRunDir(run_dir: []const u8, id: []const u8) bool {
     if (id.len == 0) return false;
-    return std.mem.eql(u8, std.fs.path.basename(run_dir), id);
+    const trimmed = std.mem.trimEnd(u8, run_dir, "/\\");
+    const base = if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
+    return std.mem.eql(u8, base, id);
 }
 
 /// Read at most `buf.len` bytes from the END of the file at `path` (positional read at size-buf.len).
