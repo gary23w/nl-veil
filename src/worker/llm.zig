@@ -796,6 +796,17 @@ const ToolAccum = struct {
 /// write_file — enough to show life without spamming status frames).
 const TP_NOTIFY_BYTES: usize = 6 << 10;
 
+// REASONING-CHANNEL DEGENERATION armor. Reasoning models sometimes loop mid-think, emitting one sentence
+// over and over (observed live: ~30 identical lines filling the chat). The model usually recovers, so the
+// stream filter shows the first few repeats, condenses the rest behind one marker, and resumes live the
+// moment the loop breaks — every client sees a clean stream because the frames themselves are filtered. A
+// loop that runs absurdly long never recovers usefully: the circuit breaker kills the generation (the caller
+// gets the partial and the drive loop takes another run) instead of paying for tokens forever.
+const RSN_REPEAT_SHOW: usize = 3; // identical lines shown live before the condenser engages
+const RSN_LINE_FORCE: usize = 512; // a newline-less "line" is force-completed at this length so loops without \n still compare
+const RSN_REPEAT_ABORT: usize = 120; // consecutive repeats that trip the circuit breaker
+const RSN_LOOP_ABORT_BYTES: usize = 48 << 10; // or this many swallowed loop bytes
+
 /// Human verb for a composing tool call's progress line.
 fn toolVerb(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "write_file")) return "writing";
@@ -832,6 +843,12 @@ const StreamState = struct {
     tool_accum: std.ArrayListUnmanaged(ToolAccum) = .empty, // hosted SSE tool calls assembled by index (see ToolAccum)
     tp_total: usize = 0, // total tool-args bytes streamed so far (drives the .tool_progress throttle)
     tp_notified: usize = 0, // tp_total at the last .tool_progress notification
+    rsn_line: std.ArrayListUnmanaged(u8) = .empty, // current (partial) reasoning line being assembled
+    rsn_last: std.ArrayListUnmanaged(u8) = .empty, // last completed reasoning line (loop comparison target)
+    rsn_repeats: usize = 0, // consecutive completed lines identical to rsn_last
+    rsn_suppress: bool = false, // inside a detected loop: swallow instead of forward
+    rsn_looped: usize = 0, // bytes swallowed while suppressing (circuit-breaker budget)
+    runaway: bool = false, // the loop tripped the circuit breaker — the poll loop aborts the generation
     saw_tool_calls: bool = false,
     truncated: bool = false,
     failed: bool = false,
@@ -846,6 +863,8 @@ const StreamState = struct {
         st.reasoning.deinit(gpa);
         st.carry.deinit(gpa);
         st.tool_line.deinit(gpa);
+        st.rsn_line.deinit(gpa);
+        st.rsn_last.deinit(gpa);
         for (st.tool_accum.items) |*a| a.deinit(gpa);
         st.tool_accum.deinit(gpa);
     }
@@ -878,14 +897,69 @@ const StreamState = struct {
             st.on_delta(st.ctx, .tool_progress, line);
         }
     }
-    /// Emit one non-empty delta (borrowed — the callback copies it) and accumulate it.
+    /// Emit one non-empty delta (borrowed — the callback copies it) and accumulate it. Reasoning routes
+    /// through the degeneration filter; content passes straight through.
     fn fire(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
+        if (text.len == 0) return;
+        if (kind == .reasoning) return st.fireReasoning(gpa, text);
+        st.forward(gpa, kind, text);
+    }
+
+    /// The raw emit: callback + accumulate. st.reasoning mirrors what was FORWARDED (the condensed stream),
+    /// so every downstream consumer of the assembled reasoning — the engine's non-streamed fallback emit
+    /// included — inherits the filtering.
+    fn forward(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
         if (text.len == 0) return;
         st.on_delta(st.ctx, kind, text);
         switch (kind) {
             .content => st.content.appendSlice(gpa, text) catch {},
             .reasoning => st.reasoning.appendSlice(gpa, text) catch {},
             .tool_progress => {}, // status-only; emitted directly from accumToolCall, never accumulated
+        }
+    }
+
+    /// DEGENERATION FILTER: assemble reasoning deltas into lines; identical consecutive lines forward live
+    /// only up to RSN_REPEAT_SHOW, then a single "(reasoning repeating — condensed…)" marker replaces the
+    /// loop; the first differing line ends suppression and is forwarded whole (it streamed while swallowed).
+    fn fireReasoning(st: *StreamState, gpa: std.mem.Allocator, text: []const u8) void {
+        var rest = text;
+        while (rest.len > 0) {
+            const nl = std.mem.indexOfScalar(u8, rest, '\n');
+            const take = if (nl) |i| i + 1 else rest.len;
+            const chunk = rest[0..take];
+            rest = rest[take..];
+            st.rsn_line.appendSlice(gpa, std.mem.trimEnd(u8, chunk, "\n")) catch {};
+            if (!st.rsn_suppress and st.rsn_repeats < RSN_REPEAT_SHOW) {
+                st.forward(gpa, .reasoning, chunk); // normal case: live type-out, fragment granularity
+            } else {
+                st.rsn_looped += chunk.len;
+                if (st.rsn_repeats >= RSN_REPEAT_ABORT or st.rsn_looped >= RSN_LOOP_ABORT_BYTES) st.runaway = true;
+            }
+            if (nl != null or st.rsn_line.items.len > RSN_LINE_FORCE) st.reasoningLineDone(gpa);
+        }
+    }
+
+    fn reasoningLineDone(st: *StreamState, gpa: std.mem.Allocator) void {
+        defer st.rsn_line.clearRetainingCapacity();
+        const line = std.mem.trim(u8, st.rsn_line.items, " \r\t");
+        if (line.len == 0) return; // blank lines neither extend nor break a loop
+        if (std.mem.eql(u8, line, st.rsn_last.items)) {
+            st.rsn_repeats += 1;
+            if (!st.rsn_suppress and st.rsn_repeats >= RSN_REPEAT_SHOW) {
+                st.rsn_suppress = true;
+                st.forward(gpa, .reasoning, "\n(reasoning repeating - condensed...)\n");
+            }
+            return;
+        }
+        st.rsn_last.clearRetainingCapacity();
+        st.rsn_last.appendSlice(gpa, line) catch {};
+        st.rsn_repeats = 0;
+        if (st.rsn_suppress) {
+            st.rsn_suppress = false;
+            st.rsn_looped = 0;
+            // this line broke the loop but streamed while swallowed — forward it whole so the resume is seamless
+            st.forward(gpa, .reasoning, line);
+            st.forward(gpa, .reasoning, "\n");
         }
     }
 };
@@ -1297,6 +1371,13 @@ fn streamAttempt(
             aborted = true;
             break;
         };
+        // CIRCUIT BREAKER: a reasoning loop past the runaway thresholds never recovers usefully — stop paying
+        // for its tokens. Same partial-return path as a user Stop; the drive loop simply takes another run.
+        if (st.runaway) {
+            std.log.scoped(.llm).warn("stream: reasoning runaway ({d} repeats, {d} looped bytes) — aborting the generation", .{ st.rsn_repeats, st.rsn_looped });
+            aborted = true;
+            break;
+        }
         var f = std.Io.Dir.cwd().openFile(io, outpath, .{}) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
@@ -1786,6 +1867,56 @@ test "completeStream SSE parser: hosted tool_calls assemble from streamed fragme
     try std.testing.expectEqualStrings("read_file", calls[1].name);
     try std.testing.expectEqualStrings("call_b", calls[1].id);
     try std.testing.expect(std.mem.indexOf(u8, calls[1].args, "a.txt") != null);
+}
+
+test "reasoning degeneration: repeats condense behind one marker, resume live on loop exit" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    const L = "Let me search for the most recent stats - I need numbers.\n";
+    // one original + 3 repeats forward live; the next 20 swallow behind the marker; then the loop breaks
+    var i: usize = 0;
+    while (i < 24) : (i += 1) st.fire(gpa, .reasoning, L);
+    st.fire(gpa, .reasoning, "Found it - the CIFFC page has the numbers.\n");
+    const seen = cap.reasoning.items;
+    // the loop line appears exactly 4x (original + RSN_REPEAT_SHOW), not 24x
+    var count: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, seen, from, "Let me search")) |at| {
+        count += 1;
+        from = at + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "(reasoning repeating - condensed...)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen, "Found it - the CIFFC page has the numbers.") != null); // resumed
+    try std.testing.expect(!st.runaway); // 24 repeats is a recoverable loop, not a runaway
+    // st.reasoning (the assembled channel) carries the CONDENSED stream — downstream consumers inherit it
+    try std.testing.expect(st.reasoning.items.len < 24 * L.len);
+}
+
+test "reasoning degeneration: fragment-split lines still detected; runaway trips the breaker" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    // deltas arrive as token-sized fragments — the line assembler must still see whole-line repeats
+    var i: usize = 0;
+    while (i < RSN_REPEAT_ABORT + 8) : (i += 1) {
+        st.fire(gpa, .reasoning, "same ");
+        st.fire(gpa, .reasoning, "thought");
+        st.fire(gpa, .reasoning, "\n");
+    }
+    try std.testing.expect(st.runaway); // past the repeat threshold → the generation should be aborted
+    var count: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, cap.reasoning.items, from, "same thought")) |at| {
+        count += 1;
+        from = at + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), count); // display stayed condensed the whole way
 }
 
 test "tool-compose progress: .tool_progress fires past the byte threshold and names the path" {
