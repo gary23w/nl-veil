@@ -6,6 +6,7 @@ const http = @import("../../gateway/http.zig");
 const ent = @import("../../plan/entitlements.zig");
 const neurons = @import("../../plan/neurons.zig");
 const crypto = @import("../../config/key_vault.zig");
+const cf_oauth = @import("../../config/cf_oauth.zig");
 const tail_fanout = @import("../control/fanout.zig");
 const App = http.App;
 const requireUser = http.requireUser;
@@ -164,10 +165,17 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     const cf_base_ok = std.mem.startsWith(u8, body.base_url, "http") and std.mem.indexOf(u8, body.base_url, "{account}") == null;
     if (wants_cf_ai and (body.api_key.len == 0 or !cf_base_ok)) {
         if (!e.workers_ai) return failCap("Workers AI is not enabled for your account");
-        if (app.cf_account_id.len == 0 or app.workers_ai_token.len == 0)
-            return failSrv("Workers AI is not configured on this server (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN)");
-        eff_base = std.fmt.allocPrint(arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id}) catch return failSrv("out of memory");
-        eff_key = app.workers_ai_token;
+        // Prefer this user's own Cloudflare login (OAuth) — a per-user token + account, auto-refreshed. Falls
+        // back to the server-wide NL_CF_* credentials only when the user hasn't logged in.
+        if (cf_oauth.resolveToken(app, u.id, arena)) |cf| {
+            eff_base = cf.base_url;
+            eff_key = cf.key;
+        } else if (app.cf_account_id.len == 0 or app.workers_ai_token.len == 0) {
+            return failSrv("Workers AI needs a Cloudflare login (Settings → Log in with Cloudflare) or server NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN");
+        } else {
+            eff_base = std.fmt.allocPrint(arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id}) catch return failSrv("out of memory");
+            eff_key = app.workers_ai_token;
+        }
         if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
     } else if (eff_key.len == 0 and body.base_url.len == 0) {
         // Fall back to a stored BYOK key ONLY when the caller gave no explicit endpoint (the deploy-wizard

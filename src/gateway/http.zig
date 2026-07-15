@@ -32,6 +32,15 @@ pub const App = struct {
     production: bool = false,
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
+    // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all
+    // fields are overridable from the environment in main() so a deployment registers its own client without a
+    // rebuild. The redirect must match one registered on the OAuth client (localhost is allowed for it).
+    cf_oauth_client_id: []const u8 = "",
+    cf_oauth_scopes: []const u8 = "account:read ai:write offline_access",
+    cf_oauth_redirect: []const u8 = "http://localhost:8787/api/v1/oauth/cloudflare/callback",
+    cf_oauth_auth_url: []const u8 = "https://dash.cloudflare.com/oauth2/auth",
+    cf_oauth_token_url: []const u8 = "https://dash.cloudflare.com/oauth2/token",
+    cf_oauth_accounts_url: []const u8 = "https://api.cloudflare.com/client/v4/accounts",
 };
 
 pub fn metered(app: *App, u: User) bool {
