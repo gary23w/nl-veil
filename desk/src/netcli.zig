@@ -134,6 +134,17 @@ pub fn chatControl(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8,
     return httpReq(io, gpa, "POST", port, path, token, body_json, 8);
 }
 
+/// POST /api/v1/chat/convs/<conv>/tool_result — client-mode delegation: hand the server the result of a tool it
+/// asked us to run (a `tool_request` frame). Body is {"id":..,"result":..}. The blocked server turn is polling
+/// tool_results.jsonl for this id, so answer promptly; generous ceiling since the write is small but the server's
+/// awaiting turn must not be starved by a slow loopback.
+pub fn chatToolResult(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.chatToolResult port={d} conv={s} body_len={d}", .{ port, conv, body_json.len });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}/tool_result", .{conv}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 15);
+}
+
 /// GET /api/v1/chat/convs — the SERVER's conversation list (scheduled_* runs live only there). Short
 /// ceiling: the chat worker folds this into its ~5s sidebar refresh, so a slow server must not stall it.
 pub fn chatConvs(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {

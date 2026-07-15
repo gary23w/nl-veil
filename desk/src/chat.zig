@@ -1229,7 +1229,9 @@ pub const Chat = struct {
             wesc(&w, prov.model);
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
-            w.writeAll("\",\"loop\":") catch break :blk false;
+            // CLIENT MODE: the server delegates every tool call back as a tool_request frame; the desk runs it on
+            // THIS machine (via `veil exec-tool`) so the veil acts in the user's environment, not the server's box.
+            w.writeAll("\",\"tool_client\":true,\"loop\":") catch break :blk false;
             w.writeByte('0' + loop_mode) catch break :blk false; // 0|1|2 — the desk's live auto-loop tier
             w.writeAll("}") catch break :blk false;
             break :blk true;
@@ -1544,7 +1546,130 @@ pub const Chat = struct {
             self.sc_serving = false; // no longer server-served; the local maybeLoop may drive a future turn
             return;
         }
+        if (std.mem.eql(u8, kind, "tool_request")) {
+            // CLIENT MODE: the server delegated this tool call and is now BLOCKED awaiting our result. Run it on
+            // THIS machine via the shared executor and post the result so the turn resumes. The matching "tool"
+            // start/done frames still draw the transcript chip — this frame is purely the delegation signal.
+            self.scCommitReason(dd); // seal any pre-tool narration before we go run the tool
+            self.scCommitText(dd);
+            const id = scRawField(line, "id") orelse return;
+            const tool = scRawField(line, "tool") orelse return;
+            self.runDelegatedTool(dd, id, tool, line); // extracts args off `line`, runs, posts to /tool_result
+            return;
+        }
         // any other kind: not rendered.
+    }
+
+    /// Resolve the `veil` server binary to invoke as `veil exec-tool` — it hosts the ONE tool executor, so the desk
+    /// never re-implements a tool. Order: next to our own exe (release bundle colocates them) → the dev zig-out
+    /// layout (desk/zig-out/bin → repo/zig-out/bin) → bare name on PATH. Written into `buf`.
+    fn veilBinPath(self: *Chat, buf: []u8) []const u8 {
+        const exe = if (builtin.os.tag == .windows) "veil.exe" else "veil";
+        var selfb: [1024]u8 = undefined;
+        if (std.process.executablePath(self.io, &selfb)) |n| {
+            const self_exe = selfb[0..n];
+            if (std.fs.path.dirname(self_exe)) |dir| {
+                if (std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, exe })) |c| {
+                    if (fileExists(self.io, c)) return c;
+                } else |_| {}
+                if (std.fmt.bufPrint(buf, "{s}/../../../zig-out/bin/{s}", .{ dir, exe })) |c| {
+                    if (fileExists(self.io, c)) return c;
+                } else |_| {}
+            }
+        } else |_| {}
+        return std.fmt.bufPrint(buf, "{s}", .{exe}) catch exe; // PATH fallback
+    }
+
+    /// Run a server-delegated tool on THIS machine and post its result back. `line` is the full tool_request frame
+    /// (we pull "args" off it here so the caller needn't heap-unescape). Rooted at this conv's build workdir — the
+    /// SAME path the server would use — so files the tool writes land where the Files tab reads them.
+    fn runDelegatedTool(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
+        // 1) workdir = {dd}/{uid}/_chat/builds/{conv}/work (created on demand). Falls back to dd if unresolvable.
+        var relb: [180]u8 = undefined;
+        const rel = self.chatBuildRel(&relb);
+        var wdb: [820]u8 = undefined;
+        const workdir = if (rel.len > 0)
+            (std.fmt.bufPrint(&wdb, "{s}/{s}/work", .{ dd, rel }) catch dd)
+        else
+            dd;
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, workdir, .default_dir) catch {};
+
+        // 2) unescape the tool args (a write_file payload can be large → heap) and write them to a temp file that
+        //    `veil exec-tool --args-file` reads. Off the argv: large + may contain quotes/newlines.
+        const raw = scRawField(line, "args") orelse "{}";
+        const argsbuf = self.gpa.alloc(u8, raw.len + 1) catch {
+            self.postToolResult(id, "(desk: out of memory building tool args)");
+            return;
+        };
+        defer self.gpa.free(argsbuf);
+        const args_json = scUnescape(raw, argsbuf);
+        var afb: [900]u8 = undefined;
+        const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-tool-args.json", .{workdir}) catch {
+            self.postToolResult(id, "(desk: tool args path too long)");
+            return;
+        };
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = args_file, .data = args_json }) catch {
+            self.postToolResult(id, "(desk: could not stage tool args)");
+            return;
+        };
+        defer Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
+
+        // 3) spawn `veil exec-tool <tool> --workdir <wd> --args-file <af>` and capture its stdout (the tool result).
+        var binb: [1100]u8 = undefined;
+        const bin = self.veilBinPath(&binb);
+        const argv = [_][]const u8{ bin, "exec-tool", tool, "--workdir", workdir, "--args-file", args_file };
+        var stbuf: [96]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
+        const r = std.process.run(self.gpa, self.io, .{
+            .argv = &argv,
+            .stdout_limit = .limited(512 << 10),
+            .stderr_limit = .limited(32 << 10),
+        }) catch |e| {
+            var eb: [256]u8 = undefined;
+            self.postToolResult(id, std.fmt.bufPrint(&eb, "(desk: could not run '{s} exec-tool' ({s}) — is the veil binary reachable?)", .{ bin[0..@min(bin.len, 120)], @errorName(e) }) catch "(desk: exec-tool failed to run)");
+            return;
+        };
+        defer self.gpa.free(r.stdout);
+        defer self.gpa.free(r.stderr);
+        const out = r.stdout;
+        const stderr = std.mem.trim(u8, r.stderr, " \r\n\t");
+        // 4) post the result. Prefer stdout; if the subprocess produced nothing but wrote to stderr, surface that.
+        if (out.len > 0) {
+            self.postToolResult(id, out);
+        } else if (stderr.len > 0) {
+            var sb: [640]u8 = undefined;
+            self.postToolResult(id, std.fmt.bufPrint(&sb, "(tool produced no output; stderr: {s})", .{stderr[0..@min(stderr.len, 600)]}) catch "(tool produced no output)");
+        } else {
+            self.postToolResult(id, ""); // empty is a valid result (e.g. a silent write); the turn must still resume
+        }
+    }
+
+    /// POST {"id":..,"result":..} to /tool_result so the blocked server turn continues. Best-effort: if the post
+    /// fails, the server's delegateTool times out (180s) rather than hanging forever — but that's a degraded turn,
+    /// so this is the one call in the delegation path that must not silently drop.
+    fn postToolResult(self: *Chat, id: []const u8, result: []const u8) void {
+        var convb: [96]u8 = undefined;
+        const conv = self.convScope(&convb);
+        if (conv.len == 0) return;
+        const cap = id.len * 2 + result.len * 2 + 64;
+        const body = self.gpa.alloc(u8, cap) catch return;
+        defer self.gpa.free(body);
+        var w = Io.Writer.fixed(body);
+        const ok = blk: {
+            w.writeAll("{\"id\":\"") catch break :blk false;
+            wesc(&w, id);
+            w.writeAll("\",\"result\":\"") catch break :blk false;
+            wesc(&w, result);
+            w.writeAll("\"}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return;
+        if (self.runner().chatToolResult(self.io, self.gpa, conv, w.buffered())) |resp| {
+            if (resp.body.len > 0) self.gpa.free(resp.body);
+            if (resp.status != 200 and resp.status != 202) log.warn("delegated tool_result POST -> {d}", .{resp.status});
+        } else {
+            log.warn("delegated tool_result POST unreachable (conv={s})", .{conv});
+        }
     }
 
     /// End a server-chat exchange, optionally leaving a one-line notice (unreachable / poll failure). An empty
@@ -3138,11 +3263,12 @@ pub const Chat = struct {
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
-        // Persisted under a NEW key `chat_server` (absent = LOCAL). The old `server_chat` key is deliberately
-        // ignored: it had no UI toggle, so every persisted value was just the old server-default — reading it
-        // would pin existing installs to the server. The new default is local; a user opts into the server via
-        // the Settings toggle, which writes `chat_server`.
-        s.server_chat = std.mem.indexOf(u8, data, "\"chat_server\":true") != null;
+        // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
+        // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
+        // stays a thin client. The local engine survives only as a break-glass fallback when the server is
+        // unreachable. Persisted under `chat_server`; absent (fresh or upgraded install) = ON. A user opts OUT via
+        // the Settings toggle, which writes `"chat_server":false`.
+        s.server_chat = std.mem.indexOf(u8, data, "\"chat_server\":false") == null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -8645,6 +8771,13 @@ fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const
 /// escaped quote inside the value doesn't clip it early. Returns the RAW (still-escaped) inner slice into `s`, or
 /// null if the key or its opening quote isn't found. Desk-local, escape-aware twin of chat_service.jsonField —
 /// enough for the server chat event frames (flat objects, string values). A non-string value returns null.
+/// True if `path` names an existing file (used to probe candidate `veil` binary locations). Best-effort: any stat
+/// error (missing, permission) reads as "not here" so the resolver moves to its next candidate.
+fn fileExists(io: Io, path: []const u8) bool {
+    _ = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return true;
+}
+
 fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [40]u8 = undefined;
     // Match the KEY + its colon (`"tool":`), not the bare word (`"tool"`) — otherwise a value that equals the key
