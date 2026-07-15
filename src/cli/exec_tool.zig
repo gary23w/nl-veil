@@ -41,6 +41,10 @@ pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: 
         .internet = true,
         .fmtx = &fmtx,
         .vcs_enabled = false,
+        // CLIENT privilege: this executor runs on the user's own machine at the user's own request — read-only
+        // tools may take absolute/~ paths, and stage_file may copy outside files into the workdir. Swarm minds
+        // never get this (their ToolCtx builders don't set it).
+        .roam = true,
     };
     return tools.execute(&tctx, name, args_json);
 }
