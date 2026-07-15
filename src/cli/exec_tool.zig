@@ -44,32 +44,47 @@ pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: 
     return tools.execute(&tctx, name, args_json);
 }
 
-/// `veil exec-tool <name> [--workdir DIR]` — args JSON on stdin, result on stdout. The subprocess form a
-/// non-Zig client (the desk) uses to reach the shared executor; defaults the workdir to the current directory.
+/// `veil exec-tool <name> [--workdir DIR] [--args-file PATH]` — args JSON from PATH (or stdin), result on
+/// stdout. The subprocess form a non-Zig client (the desk) uses to reach the shared executor; defaults the
+/// workdir to the current directory. `--args-file` avoids stdin plumbing for a caller that spawns+captures with
+/// a simple run() helper (the desk writes the args to a temp file in the build dir and passes its path here).
 pub fn cmd(ctx: *cli.Ctx, args: []const []const u8) u8 {
     if (args.len == 0) {
-        std.debug.print("usage: veil exec-tool <tool-name> [--workdir DIR]   (tool args JSON on stdin)\n", .{});
+        std.debug.print("usage: veil exec-tool <tool-name> [--workdir DIR] [--args-file PATH]   (else args JSON on stdin)\n", .{});
         return 1;
     }
     const name = args[0];
     var workdir: []const u8 = ".";
+    var args_file: []const u8 = "";
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--workdir") and i + 1 < args.len) {
             i += 1;
             workdir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--args-file") and i + 1 < args.len) {
+            i += 1;
+            args_file = args[i];
         }
     }
-    // read the whole args JSON from stdin (a write_file payload can be large)
+    // args source: an --args-file (preferred by the desk) else stdin. Either can carry a large write_file payload.
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(ctx.gpa);
-    const stdin = std.Io.File.stdin();
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        var bufs = [_][]u8{&chunk};
-        const n = stdin.readStreaming(ctx.io, &bufs) catch break;
-        if (n == 0) break;
-        body.appendSlice(ctx.gpa, chunk[0..n]) catch break;
+    if (args_file.len > 0) {
+        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, args_file, ctx.gpa, .limited(8 << 20)) catch |e| {
+            std.debug.print("exec-tool: cannot read --args-file {s}: {s}\n", .{ args_file, @errorName(e) });
+            return 1;
+        };
+        body.appendSlice(ctx.gpa, data) catch {};
+        ctx.gpa.free(data);
+    } else {
+        const stdin = std.Io.File.stdin();
+        var chunk: [4096]u8 = undefined;
+        while (true) {
+            var bufs = [_][]u8{&chunk};
+            const n = stdin.readStreaming(ctx.io, &bufs) catch break;
+            if (n == 0) break;
+            body.appendSlice(ctx.gpa, chunk[0..n]) catch break;
+        }
     }
     const args_json = if (body.items.len > 0) body.items else "{}";
     const result = runTool(ctx, workdir, name, args_json);

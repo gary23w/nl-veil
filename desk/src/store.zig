@@ -91,7 +91,7 @@ pub const Settings = struct {
     // AI's tools execute in the client's environment on this machine — not the server's buried sandbox. When ON,
     // a send instead routes to the SERVER-side chat turn (POST /api/v1/chat/convs/:id/messages, rendered by
     // polling /events). Scheduled tasks always run server-side regardless of this — the desk may be closed.
-    server_chat: bool = false, // default OFF: interactive chat runs locally (the client's built-in engine)
+    server_chat: bool = true, // default ON: the brain runs server-side and delegates tools to this client's harness
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];

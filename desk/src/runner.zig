@@ -35,6 +35,8 @@ pub const Runner = struct {
         chatConv: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp,
         /// DELETE /api/v1/chat/convs/<conv> — remove a conversation server-side (else it re-merges).
         chatDelete: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp,
+        /// POST /api/v1/chat/convs/<conv>/tool_result — client-mode: return a delegated tool's result to the turn.
+        chatToolResult: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
     };
 
     pub fn runTool(self: Runner, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp {
@@ -61,11 +63,14 @@ pub const Runner = struct {
     pub fn chatDelete(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp {
         return self.vt.chatDelete(self.ctx, io, gpa, conv);
     }
+    pub fn chatToolResult(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+        return self.vt.chatToolResult(self.ctx, io, gpa, conv, body_json);
+    }
 };
 
 // ------------------------------------------------------------------ LocalRunner (today's behavior, verbatim)
 
-const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents, .chatControl = localChatControl, .chatConvs = localChatConvs, .chatConv = localChatConv, .chatDelete = localChatDelete };
+const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents, .chatControl = localChatControl, .chatConvs = localChatConvs, .chatConv = localChatConv, .chatDelete = localChatDelete, .chatToolResult = localChatToolResult };
 
 /// A Runner backed by the loopback server. `ctx` is the shared Store — the live port + bearer token are read
 /// from it on each call (the settings can change at runtime), exactly as the old call sites did.
@@ -138,4 +143,11 @@ fn localChatDelete(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []cons
     var tokb: [128]u8 = undefined;
     const pt = portToken(store, &tokb);
     return netcli.chatConvDelete(io, gpa, pt.port, pt.tok, conv);
+}
+
+fn localChatToolResult(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatToolResult(io, gpa, pt.port, pt.tok, conv, body_json);
 }
