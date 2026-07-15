@@ -118,6 +118,10 @@ pub fn getConv(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer arr.deinit(app.gpa);
     try arr.appendSlice(app.gpa, "{\"ok\":true,\"id\":");
     try http.jstr(app.gpa, &arr, seg);
+    // `live` = a turn is executing for this conv RIGHT NOW (the engine's per-conv turn table). The desk uses
+    // it to ATTACH its live event poller when opening a server-born run (a scheduled task's conversation) —
+    // without it the view was a frozen snapshot while the run streamed server-side.
+    try arr.appendSlice(app.gpa, if (chat_engine.isTurnLive(app.io, seg)) ",\"live\":true" else ",\"live\":false");
     try arr.appendSlice(app.gpa, ",\"messages\":[");
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, data, '\n');

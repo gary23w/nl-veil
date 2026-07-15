@@ -690,6 +690,8 @@ pub const Chat = struct {
     //                           leave the UI busy forever (reset on any good poll)
     sc_cooldown_until: i64 = 0, // after a server turn falls back to local, skip the server for a bit (unix secs) so a
     //                            down/misconfigured server doesn't pay the failed round-trip on EVERY send
+    mirror_live: bool = false, // the last mirrorServerConv saw "live":true — a turn is EXECUTING for that conv
+    //                            right now (a scheduled run), so selecting it should ATTACH the live poller
     // METRICS for a SERVER turn: the local recordMetric fires only on the LOCAL turn-settle path, so with the brain
     // server-side the Metrics tab went empty. These accumulate from the server frames (pumpServerChat) and record
     // one sample on {done}, exactly like a local turn — the same numbers, sourced from the backend's own stream.
@@ -2835,6 +2837,7 @@ pub const Chat = struct {
         self.reflect_msg_idx = null;
         self.releaseServerCastDisplay("detached (left the conversation)"); // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
+        self.mirror_live = false; // stale liveness from a previous select must never arm a watch on THIS conv
         self.loadMsgs(dd, id);
         { // re-anchor the loop's durable goal to THIS conversation's first message
             self.store.lock();
@@ -2846,6 +2849,41 @@ pub const Chat = struct {
             } else self.arc_goal_len = 0;
         }
         self.syncBuildDir(dd); // console cwd follows the chat: restore ITS build dir (or clear the old chat's)
+        // A server-born run (a scheduled task's turn) is EXECUTING right now — ATTACH the live event poller so
+        // the run streams into this view exactly like a desk-fired turn (tokens, tools, status, Post/steer,
+        // Stop), instead of the frozen snapshot the mirror alone gives. {done} disarms it as usual.
+        if (self.mirror_live and !self.sc_active and id.len <= self.sc_conv.len) self.attachServerTurn(dd, id);
+    }
+
+    /// Attach the server-chat poller to a turn THIS desk did not fire (a scheduled run in progress). Baselines
+    /// the event cursor at the CURRENT end of events.jsonl — the mirror already showed everything committed;
+    /// only new frames stream in (an in-flight message's earlier tokens arrive when it commits as a whole).
+    /// From here the run behaves like any served turn: pumpServerChat renders, Stop posts {op:stop}, Enter
+    /// steers, and {done} (or the silence failsafe) disarms.
+    fn attachServerTurn(self: *Chat, dd: []const u8, conv: []const u8) void {
+        _ = dd;
+        var from0: usize = 0;
+        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
+            from0 = er.body.len;
+            if (er.body.len > 0) self.gpa.free(er.body);
+        }
+        @memcpy(self.sc_conv[0..conv.len], conv);
+        self.sc_conv_len = conv.len;
+        self.sc_from = from0;
+        self.sc_fails = 0;
+        self.sc_next_poll_ms = 0;
+        self.sc_empty_polls = 0;
+        self.scClearStream();
+        self.sc_turn_start_ms = self.nowMs();
+        self.sc_fb_ms = 0;
+        self.sc_chars = 0;
+        self.sc_tools = 0;
+        self.sc_tokens_out = 0;
+        self.sc_serving = true; // the SERVER drives this conv — the local loop stands down
+        self.setServerActive(true);
+        self.setBusy(true);
+        self.setStatus("scheduled run in progress — attached to the live turn");
+        log.info("server chat: attached to live turn conv={s} from={d}", .{ conv, from0 });
     }
 
     fn cmdRenameConv(self: *Chat, dd: []const u8, id: []const u8, title: []const u8) void {
@@ -3595,9 +3633,13 @@ pub const Chat = struct {
     /// is re-emitted verbatim — its escape repertoire (incl. \uXXXX) is exactly what loadMsgs' unescape
     /// reads. Returns false when the server can't produce the conv (down / 404 / denied) — select no-ops.
     fn mirrorServerConv(self: *Chat, dd: []const u8, id: []const u8) bool {
+        self.mirror_live = false;
         const resp = self.runner().chatConv(self.io, self.gpa, id) orelse return false;
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if (resp.status != 200) return false;
+        // the conv GET carries turn liveness — a scheduled run may be EXECUTING right now; the selector uses
+        // this to attach the live event poller instead of leaving the user staring at a frozen snapshot
+        self.mirror_live = std.mem.indexOf(u8, resp.body, "\"live\":true") != null;
         const arr = std.mem.indexOf(u8, resp.body, "\"messages\":[") orelse return false;
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
