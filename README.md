@@ -171,6 +171,39 @@ Kinds are `once` (fires at a set time), `every` (`--every MIN`), and `daily` (`-
 local wall clock). An overdue task — server was down, laptop asleep — runs **once** on wake and
 reschedules from now; it never backfills a run per missed interval.
 
+## Log in with Cloudflare (Workers AI)
+
+Instead of pasting a Cloudflare API token, a user can grant Workers AI access once through the browser.
+In the desktop **Settings**, pick the Cloudflare provider and click **Log in with Cloudflare**: the
+system browser opens Cloudflare's consent page, and on grant the server exchanges the code
+(Authorization Code + **PKCE**, a public client — no secret), resolves the account, and keeps the token
+(auto-refreshed) in the server's sealed vault. Chat and casts then run Workers AI with no pasted key.
+The manual account-id + token fields stay as a fallback.
+
+This uses Cloudflare's **self-managed OAuth clients**, so a deployment registers its own client once:
+
+1. In the Cloudflare dashboard: **Manage Account → OAuth clients → Create client**. Choose **Public
+   client (Authorization Code + PKCE)**, allow **localhost** redirect URIs, and add the redirect
+   `http://localhost:8787/api/v1/oauth/cloudflare/callback` (match your `NL_PORT`). Select the scopes
+   your app needs — at least account read, Workers AI, and offline access (a refresh token). The exact
+   scope strings are shown in the dashboard's scope picker (or `wrangler login --scopes-list`).
+2. To let **any** user log in to their **own** Cloudflare account, verify ownership of the client's URL
+   domain and make the client public; a client used only within your own account needs no verification.
+3. Point the server at the client — only the public `client_id` is baked in:
+
+```sh
+NL_CF_OAUTH_CLIENT_ID=<your-public-client-id>          # required; the feature is off until set
+NL_CF_OAUTH_SCOPES="account:read ai:write offline_access"   # override to match your client's scopes
+# optional overrides (sane defaults shown):
+NL_CF_OAUTH_REDIRECT=http://localhost:8787/api/v1/oauth/cloudflare/callback
+NL_CF_OAUTH_AUTH_URL=https://dash.cloudflare.com/oauth2/auth
+NL_CF_OAUTH_TOKEN_URL=https://dash.cloudflare.com/oauth2/token
+```
+
+The flow is exposed as `POST /api/v1/oauth/cloudflare/start` (returns the consent URL), the browser
+callback `GET …/callback`, `GET …/status`, and `POST …/logout`. The token is stored per user and never
+returned to the client; the desktop only ever sees the connection status + account id.
+
 ## The desktop — veil-desk
 
 `veil-desk` is a native desktop dashboard (Zig + raylib, one window, no browser) that talks to the
