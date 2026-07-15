@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const httpc = @import("worker/httpc.zig");
 const exec_tool = @import("cli/exec_tool.zig");
+const cync = @import("worker/chat/sync.zig");
 
 const VEIL_EXE = if (builtin.os.tag == .windows) "veil.exe" else "veil";
 
@@ -52,10 +53,11 @@ pub const Ctx = struct {
 /// anything else, keeping bare `veil` = run the daemon). Kept in sync with `dispatch` below.
 pub fn isCommand(sub: []const u8) bool {
     const verbs = [_][]const u8{
-        "cast",  "deploy", "list",   "ls",      "ps",        "stop",
-        "rm",    "delete", "events", "logs",    "watch",     "chat",
-        "sched", "hub",    "doctor", "health",  "desktop",   "desk",
-        "help",  "--help", "-h",     "version", "--version", "exec-tool",
+        "cast",      "deploy",        "list",      "ls",      "ps",        "stop",
+        "rm",        "delete",        "events",    "logs",    "watch",     "chat",
+        "sched",     "hub",           "doctor",    "health",  "desktop",   "desk",
+        "help",      "--help",        "-h",        "version", "--version", "exec-tool",
+        "sync-read", "sync-manifest",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -85,6 +87,8 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx);
     if (std.mem.eql(u8, sub, "desktop") or std.mem.eql(u8, sub, "desk")) return cmdDesktop(ctx);
     if (std.mem.eql(u8, sub, "exec-tool")) return exec_tool.cmd(ctx, args);
+    if (std.mem.eql(u8, sub, "sync-manifest")) return exec_tool.cmdSyncManifest(ctx, args);
+    if (std.mem.eql(u8, sub, "sync-read")) return exec_tool.cmdSyncRead(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -589,6 +593,26 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
             applyFileSync(ctx, ln);
             continue;
         }
+        if (std.mem.eql(u8, kind, "sync_request")) {
+            // workdir-sync manifest exchange (see worker/chat/sync.zig): answer with this cwd's manifest +
+            // the probe echo so the server can diff (or detect a shared disk) instead of transferring blind.
+            const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
+            defer ctx.gpa.free(id);
+            const resp = cync.manifestResponse(ctx.gpa, ctx.io, ".");
+            defer ctx.gpa.free(resp);
+            postToolResult(ctx, conv, id, resp);
+            continue;
+        }
+        if (std.mem.eql(u8, kind, "file_pull")) {
+            // the server wants these files for a hive it is about to cast — send only what it asked for
+            const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
+            defer ctx.gpa.free(id);
+            std.debug.print("  [sending workdir files to the server for the hive...]\n", .{});
+            const resp = cync.readResponse(ctx.gpa, ctx.io, ".", ln);
+            defer ctx.gpa.free(resp);
+            postToolResult(ctx, conv, id, resp);
+            continue;
+        }
         if (!std.mem.eql(u8, kind, "tool_request")) continue;
         const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
         defer ctx.gpa.free(id);
@@ -607,27 +631,12 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
 fn applyFileSync(ctx: *Ctx, line: []const u8) void {
     const path = jsonStr(ctx.gpa, line, "path") orelse return;
     defer ctx.gpa.free(path);
-    if (!safeSyncPath(path)) return;
+    if (!cync.safeSyncPath(path)) return;
     const content = jsonStr(ctx.gpa, line, "content") orelse return;
     defer ctx.gpa.free(content);
     if (std.fs.path.dirname(path)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, parent, .default_dir) catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch return;
     std.debug.print("  [synced {s} from the hive — {d}b]\n", .{ path, content.len });
-}
-
-/// A server-pushed file_sync path must stay INSIDE the workdir: relative, forward slashes only, no "."/".."
-/// segments, no drive letters or ADS colons. Twin of the desk's checker.
-fn safeSyncPath(p: []const u8) bool {
-    if (p.len == 0 or p.len > 400) return false;
-    if (p[0] == '/' or p[0] == '\\') return false;
-    if (std.mem.indexOfScalar(u8, p, ':') != null) return false;
-    if (std.mem.indexOfScalar(u8, p, '\\') != null) return false;
-    var it = std.mem.splitScalar(u8, p, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0) return false;
-        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
-    }
-    return true;
 }
 
 /// POST the delegated tool's result back to the blocked server turn.
