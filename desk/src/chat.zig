@@ -3336,12 +3336,14 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        // Server chat persists as an OPT-OUT flag under `chat_local` (true = user chose the local fallback).
+        // Server chat persists as an OPT-OUT flag under `local_brain` (true = user chose the local fallback).
         // Written this way so the DEFAULT (server) needs no key: older files, whatever they carry, read as
-        // server-on. The previous `chat_server` key is dead — the old default-local build wrote
-        // `"chat_server":false` for every user, which the new absent=on reader misread as an explicit opt-out
-        // and silently pinned existing installs to the retired local brain.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"chat_local\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat }) catch return;
+        // server-on. TWO dead predecessors, both ignored on read: `chat_server` (the old default-local build
+        // wrote `"chat_server":false` for everyone — reading it pinned upgraded installs local) and
+        // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
+        // your environment" as the local option's advantage after delegation made that the SERVER path's
+        // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3390,10 +3392,12 @@ pub const Chat = struct {
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
         // stays a thin client. The local engine survives only as a break-glass fallback when the server is
-        // unreachable. Persisted as the OPT-OUT key `chat_local` (absent = server on). The old `chat_server` key
-        // is deliberately ignored: the default-local build wrote `"chat_server":false` on every save, so reading
-        // it would pin upgraded installs — users who never touched the toggle — to the retired local brain.
-        s.server_chat = std.mem.indexOf(u8, data, "\"chat_local\":true") == null;
+        // unreachable. Persisted as the OPT-OUT key `local_brain` (absent = server on). Two dead predecessors are
+        // deliberately ignored: `chat_server` (the default-local build wrote `false` for everyone — reading it
+        // pinned upgraded installs to the retired brain) and `chat_local` (its opt-outs came from a misleading
+        // Settings label, not user intent — see saveSettings). A user who truly wants the fallback re-unchecks
+        // the now-honest toggle once.
+        s.server_chat = std.mem.indexOf(u8, data, "\"local_brain\":true") == null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
