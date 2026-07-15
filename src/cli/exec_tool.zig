@@ -100,9 +100,15 @@ pub fn cmd(ctx: *cli.Ctx, args: []const []const u8) u8 {
 
 /// `veil sync-manifest [--workdir DIR]` — print the workdir's sync manifest response (probe echo + file
 /// hashes; see worker/chat/sync.zig). The subprocess form the desk uses to answer a {kind:"sync_request"}
-/// frame — same one implementation the CLI chat calls in-process.
+/// frame — same one implementation the CLI chat calls in-process. A non-"." workdir must be a SAFE absolute
+/// path (a conv workdir or a sync_dir projection root) — anything else answers an empty manifest.
 pub fn cmdSyncManifest(ctx: *cli.Ctx, args: []const []const u8) u8 {
-    const resp = cync.manifestResponse(ctx.gpa, ctx.io, argWorkdir(args));
+    const wd = argWorkdir(args);
+    if (!std.mem.eql(u8, wd, ".") and !cync.safeRoot(wd)) {
+        cli.out("{s}", .{"{\"probe\":\"\",\"files\":[]}"});
+        return 0;
+    }
+    const resp = cync.manifestResponse(ctx.gpa, ctx.io, wd);
     defer ctx.gpa.free(resp);
     cli.out("{s}", .{resp});
     return 0;
@@ -112,6 +118,11 @@ pub fn cmdSyncManifest(ctx: *cli.Ctx, args: []const []const u8) u8 {
 /// frame JSON is the args file) and print the batched contents response. Desk twin of the CLI's in-process
 /// handler.
 pub fn cmdSyncRead(ctx: *cli.Ctx, args: []const []const u8) u8 {
+    const wd = argWorkdir(args);
+    if (!std.mem.eql(u8, wd, ".") and !cync.safeRoot(wd)) {
+        cli.out("{s}", .{"{\"files\":[]}"});
+        return 0;
+    }
     var frame: []const u8 = "{}";
     var owned: ?[]u8 = null;
     defer if (owned) |o| ctx.gpa.free(o);
@@ -125,7 +136,7 @@ pub fn cmdSyncRead(ctx: *cli.Ctx, args: []const []const u8) u8 {
             }
         }
     }
-    const resp = cync.readResponse(ctx.gpa, ctx.io, argWorkdir(args), frame);
+    const resp = cync.readResponse(ctx.gpa, ctx.io, wd, frame);
     defer ctx.gpa.free(resp);
     cli.out("{s}", .{resp});
     return 0;

@@ -1569,13 +1569,14 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "sync_request")) {
-            // workdir-sync manifest exchange (server diffs before transferring; the probe detects a shared disk)
+            // workdir-sync manifest exchange (server diffs before transferring; the probe detects a shared
+            // disk). A `root` on the frame is a sync_dir projection: manifest THAT absolute client folder.
             const id = scRawField(line, "id") orelse return;
-            self.answerSyncRequest(dd, id);
+            self.answerSyncRequest(dd, id, line);
             return;
         }
         if (std.mem.eql(u8, kind, "file_pull")) {
-            // the server wants these files for a hive it is about to cast — send only what it asked for
+            // the server wants these files (a cast's workdir sync, or a sync_dir projection's contents)
             const id = scRawField(line, "id") orelse return;
             self.answerFilePull(dd, id, line);
             return;
@@ -1627,13 +1628,18 @@ pub const Chat = struct {
         return wd;
     }
 
-    /// Answer a {kind:"sync_request"} frame: spawn `veil sync-manifest` on this conv's workdir and post the
-    /// manifest (+ probe echo) it prints. On ANY failure post an EMPTY manifest — the server then degrades to
-    /// a full push instead of stalling to its timeout. The desk stays a dumb pipe: hashing, caps, and the
-    /// probe read all live in the shared sync module the spawned verb calls.
-    fn answerSyncRequest(self: *Chat, dd: []const u8, id: []const u8) void {
+    /// Answer a {kind:"sync_request"} frame: spawn `veil sync-manifest` on this conv's workdir — or on the
+    /// frame's `root` (a sync_dir projection of an absolute client folder; the subcommand validates it) — and
+    /// post the manifest (+ probe echo) it prints. On ANY failure post an EMPTY manifest — the server then
+    /// degrades to a full push instead of stalling to its timeout. The desk stays a dumb pipe: hashing, caps,
+    /// the probe read, and root validation all live in the shared sync module the spawned verb calls.
+    fn answerSyncRequest(self: *Chat, dd: []const u8, id: []const u8, line: []const u8) void {
+        var rb: [512]u8 = undefined;
         var wdb: [820]u8 = undefined;
-        const workdir = self.delegatedWorkdir(dd, &wdb);
+        const workdir = if (scRawField(line, "root")) |raw|
+            scUnescape(raw, &rb)
+        else
+            self.delegatedWorkdir(dd, &wdb);
         var binb: [1100]u8 = undefined;
         const bin = self.veilBinPath(&binb);
         const argv = [_][]const u8{ bin, "sync-manifest", "--workdir", workdir };
@@ -1647,12 +1653,19 @@ pub const Chat = struct {
     }
 
     /// Answer a {kind:"file_pull"} frame: stage the frame as the args file, spawn `veil sync-read`, and post
-    /// the batched contents it prints. Empty batch on any failure — the hive casts with what the server has.
+    /// the batched contents it prints. A `root` on the frame reads from that absolute client folder (sync_dir;
+    /// validated by the subcommand). Empty batch on any failure — the hive casts with what the server has.
     fn answerFilePull(self: *Chat, dd: []const u8, id: []const u8, line: []const u8) void {
+        var rb: [512]u8 = undefined;
         var wdb: [820]u8 = undefined;
-        const workdir = self.delegatedWorkdir(dd, &wdb);
+        const workdir = if (scRawField(line, "root")) |raw|
+            scUnescape(raw, &rb)
+        else
+            self.delegatedWorkdir(dd, &wdb);
+        // stage the frame in the DESK's own sidecar dir, never in `workdir` — a rooted sync reads a projected
+        // source folder that must stay untouched (read-only contract; may be an immutable system)
         var afb: [900]u8 = undefined;
-        const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-sync-pull.json", .{workdir}) catch {
+        const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-desk/.veil-sync-pull.json", .{dd}) catch {
             self.postToolResult(id, "{\"files\":[]}");
             return;
         };
@@ -2358,7 +2371,7 @@ pub const Chat = struct {
         // politeness: fire only AFTER answers land (idle chat, no console, no cast/veil work) — the judge
         // must never contend with the user's live turn for the model or the machine
         if (self.turn != .idle or self.consoleAiBusy() or self.cast_active or self.veil_work_active) return;
-        var cb: [40]u8 = undefined;
+        var cb: [64]u8 = undefined;
         const conv = self.convScope(&cb);
         if (conv.len == 0) return;
         // the conversation JSONL IS the trace — r:2 result rows carry the real console exit codes inline
@@ -2894,7 +2907,7 @@ pub const Chat = struct {
         self.refreshConvs(dd, true);
         if (was_active) {
             // fall back to the newest remaining conversation
-            var nid: [32]u8 = undefined;
+            var nid: [64]u8 = undefined;
             var nn: usize = 0;
             {
                 self.store.lock();
@@ -2916,7 +2929,7 @@ pub const Chat = struct {
     /// The uid is taken from the leading "uN" segment of build_dir (set when a build tool ran) — defaults to u1,
     /// which is the desktop's admin user on localhost.
     fn chatBuildRel(self: *Chat, buf: []u8) []const u8 {
-        var cb: [40]u8 = undefined;
+        var cb: [64]u8 = undefined;
         const conv = self.convScope(&cb);
         if (conv.len == 0) return "";
         var uid: []const u8 = "u1";
@@ -3448,6 +3461,9 @@ pub const Chat = struct {
             const e = (it.next(self.io) catch break) orelse break;
             if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".jsonl")) continue;
             const stem = e.name[0 .. e.name.len - 6];
+            // scheduled-task runs stay OUT of the primary Chats list (user direction) — they're reachable via
+            // the sidebar's Scheduled inner tab and the Scheduled top tab, where they belong.
+            if (std.mem.startsWith(u8, stem, "scheduled_")) continue;
             var row: store_mod.ConvRow = .{};
             const idn = @min(stem.len, row.id.len);
             @memcpy(row.id[0..idn], stem[0..idn]);
@@ -3497,6 +3513,8 @@ pub const Chat = struct {
                             }
                         }
                         if (row.id_len == 0) continue;
+                        // scheduled runs are listed under Scheduled, never merged into the Chats list
+                        if (std.mem.startsWith(u8, row.idStr(), "scheduled_")) continue;
                         var dup = false;
                         for (rows[0..n_local]) |*r| {
                             if (std.mem.eql(u8, r.idStr(), row.idStr())) {
@@ -3529,6 +3547,11 @@ pub const Chat = struct {
     fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8) void {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return;
+        // SCHEDULED runs live server-side and GROW there (a run may still be streaming, or finished after the
+        // mirror was cut) — a once-mirrored snapshot showed the prompt with no reply and read as "the task
+        // never executed". Re-mirror on EVERY select so the view is the server's current truth; the local copy
+        // is refreshed in place (best-effort — a down server just shows the last mirror).
+        if (std.mem.startsWith(u8, id, "scheduled_")) _ = self.mirrorServerConv(dd, id);
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch blk: {
             // No local file: a SERVER-born conversation (a scheduled_* run merged into the sidebar by
             // refreshConvs). Mirror it down once, then load through the unchanged local path — every
@@ -3875,7 +3898,7 @@ pub const Chat = struct {
         // grounded-context message. Additive + guarded: if recall is empty/disabled, the prompt is byte-identical
         // to the token-tail-only version, so this can only help, never break the turn.
         if (kind != .consolidate and self.mind().enabled() and self.last_user_len > 0) {
-            var scope_buf: [40]u8 = undefined;
+            var scope_buf: [64]u8 = undefined;
             const scope = self.convScope(&scope_buf);
             if (scope.len > 0) {
                 var rbuf: [4096]u8 = undefined;
@@ -4629,7 +4652,7 @@ pub const Chat = struct {
         // it NEVER mints (minting "<prompt>: answered" stance facts would surface them as spurious "relevant
         // memory"). The chat's hippocampus LEARNS from engagement instead of only accumulating.
         if ((kind == .user or kind == .collect or kind == .reflect) and full.len > 0 and self.last_user_len > 3 and self.mind().enabled()) {
-            var scope_buf: [40]u8 = undefined;
+            var scope_buf: [64]u8 = undefined;
             const scope = self.convScope(&scope_buf);
             // Key on the FIRST SENTENCE as observe() stored it: the substrate sentence-splits on
             // store (and drops '?'-sentences entirely), so a raw multi-sentence prefix substring-
@@ -5807,7 +5830,7 @@ pub const Chat = struct {
         // The veil's PARALLEL attempt (in_veil_work) targets this SAME dir too — it joins the hive's build rather
         // than a separate copy, so there's nothing to reconcile afterward (the server's edit_file already
         // serializes/merges concurrent edits the same way it does for multiple hive minds).
-        var convb: [40]u8 = undefined;
+        var convb: [64]u8 = undefined;
         const conv = self.convScope(&convb);
 
         // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call

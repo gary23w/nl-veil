@@ -175,7 +175,8 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}},
     \\{"type":"function","function":{"name":"schedule_task","description":"Create a SCHEDULED TASK when the user asks for something to happen later or repeatedly ('every morning at 9', 'in 20 minutes', 'daily news digest'). Each firing runs a fresh UNATTENDED chat turn with this same provider, and the task keeps its own memory across runs. The prompt must be SELF-CONTAINED (a run cannot see this conversation) — put concrete specifics (locations, formats, file names) in details. kind 'once' needs in_min OR at_hm; 'every' needs every_min; 'daily' needs hm.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"short task name"},"prompt":{"type":"string","description":"the self-contained instruction each run executes"},"details":{"type":"string","description":"pinned specifics every run should use (optional)"},"kind":{"type":"string","enum":["once","every","daily"]},"in_min":{"type":"integer","description":"once: fire this many minutes from now"},"at_hm":{"type":"string","description":"once: fire at the next local occurrence of HH:MM"},"every_min":{"type":"integer","description":"every: interval in minutes"},"hm":{"type":"string","description":"daily: local wall-clock HH:MM"}},"required":["name","prompt","kind"]}}},
     \\{"type":"function","function":{"name":"schedule_list","description":"List the user's scheduled tasks (id, name, kind, next due, run count, enabled) — check before creating a duplicate, and to find ids for schedule_delete.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"schedule_delete","description":"Delete a scheduled task by its id (from schedule_list). Use when the user asks to cancel/remove a schedule.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id"}},"required":["id"]}}}
+    \\{"type":"function","function":{"name":"schedule_delete","description":"Delete a scheduled task by its id (from schedule_list). Use when the user asks to cancel/remove a schedule.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id"}},"required":["id"]}}},
+    \\{"type":"function","function":{"name":"sync_dir","description":"PROJECT a folder from the user's machine into this conversation's workdir (read-only copy, hash-diffed: only changed files transfer, the source is NEVER written back to). Use when the user points you at a project that lives OUTSIDE the workdir — an app inside a game-engine folder, a repo elsewhere on disk, an immutable system — so you AND any hive you cast can work with its files. Re-run it to refresh (cheap: unchanged files skip). Text files only, capped 64 files / 4MB — project the SPECIFIC subfolder that matters, not a whole engine install.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"ABSOLUTE folder on the user's machine (e.g. C:/dev/mygame/src or /home/u/app — no ~, expand it first)"},"as":{"type":"string","description":"optional folder name inside the workdir (default: the source folder's name)"}},"required":["path"]}}}
 ;
 // The chat surface = the REACHABLE mind-tool subset (tools.CHAT_SCHEMA, not the full ~33-tool SCHEMA whose
 // swarm-mind/host-sim/RSI-only verbs a solo chat turn can't use) + the veil's orchestration verbs. Trimming the
@@ -1352,7 +1353,32 @@ fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
     if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, base_url, key, model, args);
     if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
+    if (std.mem.eql(u8, name, "sync_dir")) return syncDirTool(app, conv, conv_dir, ctrl_cursor, args, tool_client);
     return null;
+}
+
+/// sync_dir — PROJECT a directory from the CLIENT's machine into this conversation's workdir (read-only,
+/// hash-diffed: only changed files transfer; the source is NEVER written back to — an immutable system or a
+/// live game project stays untouched). This is how work that lives outside the workdir (an app inside a game
+/// engine folder, a repo elsewhere on disk) becomes visible to the veil AND to any hive it casts, on command.
+fn syncDirTool(app: *App, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, args: []const u8, tool_client: bool) []u8 {
+    const gpa = app.gpa;
+    if (!tool_client) return orchErr(gpa, "sync_dir needs a connected client (desk/CLI) — there is no client machine to project from");
+    const A = struct { path: []const u8 = "", as: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "sync_dir: could not parse args JSON");
+    defer p.deinit();
+    const src = std.mem.trim(u8, p.value.path, " \r\n\t");
+    if (src.len == 0) return orchErr(gpa, "sync_dir: 'path' is required — an ABSOLUTE directory on the user's machine (e.g. C:/dev/mygame/src)");
+    if (std.mem.indexOf(u8, src, "..") != null) return orchErr(gpa, "sync_dir: no '..' in the path");
+    // dest = builds/{conv}/work/{as or the source's basename} — always INSIDE the conversation workdir
+    const base_name = if (p.value.as.len > 0) p.value.as else std.fs.path.basename(src);
+    if (base_name.len == 0 or !cync.safeSyncPath(base_name)) return orchErr(gpa, "sync_dir: bad 'as' — a workdir-relative folder name (e.g. mygame)");
+    const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return orchErr(gpa, "sync_dir: cannot resolve the workdir");
+    const dest = std.fmt.allocPrint(gpa, "{s}/builds/{s}/work/{s}", .{ conv_dir[0..at], conv, base_name }) catch return orchErr(gpa, "sync_dir: out of memory");
+    defer gpa.free(dest);
+    const got = pullClientFilesRooted(app, conv_dir, dest, ctrl_cursor, src);
+    if (got < 0) return orchErr(gpa, "sync_dir: the client did not answer — is the desk/CLI still connected?");
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"sync_dir\",\"projected\":{d},\"into\":\"{s}\",\"note\":\"{d} file(s) copied/updated from the client folder into the workdir (unchanged files skipped by hash; text files only, caps 64 files / 512KB each / 4MB total — project the SPECIFIC subfolder you need). The source folder is never written back to; outputs belong in the workdir.\"}}", .{ got, base_name, got }) catch emptyRes();
 }
 
 /// schedule_task — the veil creates a scheduled task straight from conversation ("do X every morning at 9").
@@ -1748,9 +1774,12 @@ const SyncInfo = struct {
 };
 
 /// One manifest round-trip with the client (+ same-disk probe): write a token into the SERVER's copy of the
-/// workdir, ask the client for its manifest, and see whether the token came back. null = the client never
-/// answered (no client attached / gone) — callers degrade to their no-manifest behavior, never wedge.
-fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize) ?SyncInfo {
+/// workdir, ask the client for its manifest, and see whether the token came back. A non-empty `root` asks the
+/// client to manifest THAT absolute directory on its machine instead of the conv workdir (the sync_dir
+/// projection) — the probe then never matches, so a rooted exchange always runs the full protocol, which is
+/// exactly right (the source dir is never the server's dest dir). null = the client never answered (no client
+/// attached / gone) — callers degrade to their no-manifest behavior, never wedge.
+fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize, root: []const u8) ?SyncInfo {
     const gpa = app.gpa;
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     // the probe token: random hex, written server-side, echoed by the client only if it sees the same disk
@@ -1770,6 +1799,10 @@ fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_curso
     const built = blk: {
         ev.appendSlice(gpa, "{\"kind\":\"sync_request\",\"id\":") catch break :blk false;
         http.jstr(gpa, &ev, id) catch break :blk false;
+        if (root.len > 0) {
+            ev.appendSlice(gpa, ",\"root\":") catch break :blk false;
+            http.jstr(gpa, &ev, root) catch break :blk false;
+        }
         ev.append(gpa, '}') catch break :blk false;
         break :blk true;
     };
@@ -1798,11 +1831,18 @@ fn clientHasFile(m: ?*const cync.ManifestResp, rel: []const u8, hash: []const u8
 /// files whose hash differs from the server's copy. Same-disk installs short-circuit on the probe (zero
 /// transfers); a client that never answers degrades to casting with what the server has.
 fn pullClientFiles(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize) void {
+    _ = pullClientFilesRooted(app, conv_dir, workdir, ctrl_cursor, "");
+}
+
+/// The pull engine behind both cast-time workdir sync (root="") and the sync_dir projection (root = an
+/// absolute directory on the CLIENT's machine, mirrored into `workdir` server-side). Returns how many files
+/// landed; -1 = the client never answered the manifest request.
+fn pullClientFilesRooted(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize, root: []const u8) i64 {
     const gpa = app.gpa;
-    var si = syncExchange(app, conv_dir, workdir, ctrl_cursor) orelse return;
+    var si = syncExchange(app, conv_dir, workdir, ctrl_cursor, root) orelse return -1;
     defer si.deinit();
-    if (si.shared) return; // same directory — the hive already sees the client's files
-    const m = si.manifest() orelse return;
+    if (si.shared) return 0; // same directory — the hive already sees the client's files
+    const m = si.manifest() orelse return 0;
 
     // want-list: every client file the server's copy is missing or has different bytes for
     var paths: std.ArrayListUnmanaged(u8) = .empty;
@@ -1824,31 +1864,35 @@ fn pullClientFiles(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cu
             http.jstr(gpa, &paths, e.p) catch break :blk false;
             break :blk true;
         };
-        if (!ok) return;
+        if (!ok) return 0;
         want += 1;
     }
-    if (want == 0) return;
+    if (want == 0) return 0;
 
     // pull the batch and materialize it into the server's workdir
     var rnd: [8]u8 = undefined;
     app.io.random(&rnd);
     var idb: [24]u8 = undefined;
-    const id = std.fmt.bufPrint(&idb, "pull{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return;
+    const id = std.fmt.bufPrint(&idb, "pull{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return 0;
     var ev: std.ArrayListUnmanaged(u8) = .empty;
     defer ev.deinit(gpa);
     const built = blk: {
         ev.appendSlice(gpa, "{\"kind\":\"file_pull\",\"id\":") catch break :blk false;
         http.jstr(gpa, &ev, id) catch break :blk false;
+        if (root.len > 0) {
+            ev.appendSlice(gpa, ",\"root\":") catch break :blk false;
+            http.jstr(gpa, &ev, root) catch break :blk false;
+        }
         ev.appendSlice(gpa, ",\"paths\":[") catch break :blk false;
         ev.appendSlice(gpa, paths.items) catch break :blk false;
         ev.appendSlice(gpa, "]}") catch break :blk false;
         break :blk true;
     };
-    if (!built) return;
+    if (!built) return 0;
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return 0;
     defer gpa.free(resp);
-    const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return;
+    const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return 0;
     defer parsed.deinit();
     var got: usize = 0;
     for (parsed.value.files) |f| {
@@ -1861,8 +1905,9 @@ fn pullClientFiles(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cu
     }
     if (got > 0) {
         var sb: [96]u8 = undefined;
-        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "pulled {d} file(s) from your machine for the hive", .{got}) catch "pulled your files for the hive");
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "pulled {d} file(s) from your machine", .{got}) catch "pulled your files");
     }
+    return @intCast(got);
 }
 
 /// CLIENT MODE, hive done (server→client): a finished cast's files exist only in the SERVER's run dir, but every
@@ -1899,7 +1944,7 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
     var wb: [1400]u8 = undefined;
     const work = std.fmt.bufPrint(&wb, "{s}/work", .{run_dir}) catch return;
     // manifest exchange: shared disk → nothing to push; no answer → push everything (the pre-manifest behavior)
-    var si_opt = syncExchange(app, conv_dir, work, ctrl_cursor);
+    var si_opt = syncExchange(app, conv_dir, work, ctrl_cursor, "");
     defer if (si_opt) |*si| si.deinit();
     if (si_opt) |si| {
         if (si.shared) return; // the client reads the same directory the hive wrote — already "synced"
