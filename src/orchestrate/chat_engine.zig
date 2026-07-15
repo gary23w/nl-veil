@@ -15,6 +15,7 @@
 //! is admin-only. The desk prefers this backend turn and falls back to its own local engine on any failure.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("../gateway/http.zig");
 const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
@@ -22,6 +23,19 @@ const llm = @import("../worker/llm.zig");
 const cctx = @import("chat_context.zig");
 const cplan = @import("chat_plan.zig");
 const deploy_service = @import("deploy_service.zig");
+
+// Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
+// (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.
+const winsleep = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
+} else struct {};
+fn sleepMsRaw(io: std.Io, ms: u64) void {
+    if (builtin.os.tag == .windows) {
+        winsleep.Sleep(@intCast(ms));
+    } else {
+        io.sleep(.{ .nanoseconds = ms * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
 
 const App = http.App;
 
@@ -377,7 +391,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         break :blk &.{};
     };
     defer cplan.freeTasks(gpa, plan);
-    const has_plan = plan.len > 0;
+    // var (not const): an ARMED turn whose plan completes while its cast hive still runs demotes to FREE-FORM
+    // (has_plan=false) after the await, so the gather step can run through the normal drive machinery.
+    var has_plan = plan.len > 0;
 
     // ---- AUTO-LOOP DRIVE: settle one answer, then either take the next PLAN subtask (deterministic) or infer the
     // next free-form step, and drive again until the plan/goal is done, a repeat, or the step cap. ----
@@ -391,9 +407,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     const afk = loop >= LOOP_AFK;
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
-    const max_steps = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
+    var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
     var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
+    var swarm_timeout_nudged = false; // SWARM_TIMEOUT_MSG fires at most once per turn — after that a stuck hive can't hold the turn open forever
     // afk re-drive / stuck messages, re-grounded to THIS turn's goal (the user message that started the loop) so the
     // persistent loop can't drift onto an unrelated task. Fixed stack buffers (no alloc/free on the hot path).
     var afk_buf: [800]u8 = undefined;
@@ -438,7 +455,38 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                     conv_buf.append(gpa, '}') catch break :outer;
                 }
             } else if (!afk) {
-                break :outer; // whole plan done — end the turn (non-afk)
+                // Whole plan done (non-afk). ARMED: don't settle over a RUNNING cast hive — a hive-routed final
+                // subtask is marked done the pass right after casting, which used to end the turn while the hive
+                // was still working (live conv c6a56f844). Await it, then demote to FREE-FORM and gather.
+                var plan_break = true;
+                if (armed) {
+                    if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                        .stopped => {
+                            finishTurn(app, conv_dir, usage_t0);
+                            return;
+                        },
+                        .finished, .timeout => {
+                            const gm: []const u8 = if (w == .finished) SWARM_GATHER_MSG else SWARM_TIMEOUT_MSG;
+                            if (w == .timeout) {
+                                if (swarm_timeout_nudged) {
+                                    // already nudged once — a stuck hive can't hold the turn open forever
+                                } else {
+                                    swarm_timeout_nudged = true;
+                                    plan_break = false;
+                                }
+                            } else plan_break = false;
+                            if (!plan_break) {
+                                conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+                                http.jstr(gpa, &conv_buf, gm) catch break :outer;
+                                conv_buf.append(gpa, '}') catch break :outer;
+                                emitKV(app, conv_dir, "status", "text", if (w == .finished) "the hive finished — folding its results in" else "the hive ran past its budget — salvaging");
+                                has_plan = false; // plan done — continue free-form so the gather runs through the drive machinery
+                                max_steps = @max(max_steps, LOOP_MAX_STEPS);
+                            }
+                        },
+                    };
+                }
+                if (plan_break) break :outer;
             }
             // afk + plan complete → task_idx stays null → the loop keeps driving FREE-FORM (afk ends only on Stop)
         }
@@ -516,8 +564,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         if (task_idx) |ti| {
             cplan.setStatus(gpa, &plan[ti], cplan.STATUS_DONE);
             persistPlan(app, conv_dir, plan);
-            if (cplan.nextPending(plan) == null and !afk) break :outer; // plan complete (non-afk ends here)
-            continue :outer; // next subtask, OR (afk + plan done) loop back so the top transitions to free-form drive
+            // Plan complete (non-afk): a plain (unarmed) turn ends here; an ARMED one loops back so the top-of-loop
+            // plan-complete branch can await a still-running cast hive before settling (the c6a56f844 premature-end).
+            if (cplan.nextPending(plan) == null and !afk and !armed) break :outer;
+            continue :outer; // next subtask, OR (afk/armed + plan done) loop back — the top transitions or awaits
         }
 
         // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass.
@@ -533,7 +583,27 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 // ends on idle — persistence IS the feature — so its counter just resets.
                 idle_steps += 1;
                 if (idle_steps >= 2) {
-                    if (!afk) break :outer;
+                    if (!afk) {
+                        // Idle over a RUNNING cast hive isn't idleness — it's the veil narrating "the hive is
+                        // working". Await the hive (cheap, stop-checked), then inject the gather step and continue.
+                        if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                            .stopped => {
+                                finishTurn(app, conv_dir, usage_t0);
+                                return;
+                            },
+                            .finished, .timeout => {
+                                if (w == .timeout and swarm_timeout_nudged) break :outer;
+                                if (w == .timeout) swarm_timeout_nudged = true;
+                                idle_steps = 0;
+                                const gm: []const u8 = if (w == .finished) SWARM_GATHER_MSG else SWARM_TIMEOUT_MSG;
+                                conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+                                http.jstr(gpa, &conv_buf, gm) catch break :outer;
+                                conv_buf.append(gpa, '}') catch break :outer;
+                                emitKV(app, conv_dir, "status", "text", if (w == .finished) "the hive finished — folding its results in" else "the hive ran past its budget — salvaging");
+                                continue :outer;
+                            },
+                        } else break :outer;
+                    }
                     idle_steps = 0;
                 }
             }
@@ -565,14 +635,53 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             if (armed and ctx.files_written.* > 0 and !verified_done) {
                 verified_done = true; // TERMINAL BUILD-VERIFY (once): confirm the build before letting DONE stand
                 next_step = TERMINAL_VERIFY_PROMPT;
-            } else if (afk) {
-                next_step = afk_msg; // afk never accepts DONE — re-verify + extend, re-grounded to the goal
+            } else if (armed) {
+                // ARMED (on or afk): never accept DONE while this conversation's cast hive is still working —
+                // await it (cheap, stop-checked), then gather its results instead of settling over them.
+                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                    .stopped => {
+                        finishTurn(app, conv_dir, usage_t0);
+                        return;
+                    },
+                    .finished => next_step = SWARM_GATHER_MSG,
+                    .timeout => {
+                        if (swarm_timeout_nudged) {
+                            if (!afk) break :outer; // nudged once already — a stuck hive can't hold the turn forever
+                            next_step = afk_msg;
+                        } else {
+                            swarm_timeout_nudged = true;
+                            next_step = SWARM_TIMEOUT_MSG;
+                        }
+                    },
+                } else if (afk) {
+                    next_step = afk_msg; // afk never accepts DONE — re-verify + extend, re-grounded to the goal
+                } else {
+                    break :outer; // on: goal achieved, no hive in flight
+                }
             } else {
-                break :outer; // off/on: goal achieved (verified, or nothing was built)
+                break :outer; // off: goal achieved (verified, or nothing was built)
             }
         } else if (is_repeat) {
-            if (!afk) break :outer; // off/on: a no-progress repeat ends the loop
-            next_step = afk_stuck_msg; // afk: don't churn the same step — re-ground + research the blocker
+            if (afk) {
+                next_step = afk_stuck_msg; // afk: don't churn the same step — re-ground + research the blocker
+            } else if (armed) {
+                // ARMED repeat while the hive runs = "the hive is working" narrated twice — that's a wait, not
+                // a stall. Await + gather; a genuine no-progress repeat (no hive) still ends the loop.
+                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                    .stopped => {
+                        finishTurn(app, conv_dir, usage_t0);
+                        return;
+                    },
+                    .finished => next_step = SWARM_GATHER_MSG,
+                    .timeout => {
+                        if (swarm_timeout_nudged) break :outer;
+                        swarm_timeout_nudged = true;
+                        next_step = SWARM_TIMEOUT_MSG;
+                    },
+                } else break :outer;
+            } else {
+                break :outer; // off: a no-progress repeat ends the loop
+            }
         }
         conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
         http.jstr(gpa, &conv_buf, next_step) catch break :outer;
@@ -1001,11 +1110,97 @@ fn orchErr(gpa: std.mem.Allocator, msg: []const u8) []u8 {
 
 /// Dispatch the veil's orchestration verbs. Returns a gpa-owned result string, or null when `name` is not an
 /// orchestration verb (the caller then routes to the normal mind-tool executor).
-fn orchTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8) ?[]u8 {
+// ---- AWAIT-SWARM: the engine-level "wait for the hive" the model can't do itself. Ground truth (live conv
+// c6a56f844): the veil cast a hive, spin-polled swarm_status ~20x back-to-back at inference speed (the only move
+// it had), grew impatient, stop_swarm'd the hive early and did the work itself — then the armed loop accepted
+// DONE while a hive was still running, settling the turn over its half-finished work. Two mechanisms fix it:
+// (1) statusTool BLOCKS while the swarm runs (cheap file probes + stop checks, no inference) so one call replaces
+// a poll storm; (2) an ARMED drive loop refuses to settle while this conversation's cast hive is still working —
+// it awaits, then injects a gather step so the results fold into the turn. Loop OFF keeps fire-and-forget.
+
+/// The gather step injected when the awaited hive finishes: fold its results into the turn instead of settling.
+const SWARM_GATHER_MSG = "The hive you cast has finished. Collect its results NOW: call swarm_status, then list_dir / read_file its deliverable files, verify they satisfy the goal, and fold them into your answer — then continue toward the goal or give the final summary.";
+/// Injected ONCE if the hive outlives its budget+grace: salvage rather than wait forever.
+const SWARM_TIMEOUT_MSG = "The hive you cast is still running past its time budget. Call swarm_status once more; if it is stuck, stop_swarm it and salvage what it produced (list_dir / read_file), then finish the goal yourself.";
+/// Slack past the swarm's minutes budget before the await gives up: the worker's own hang watchdog exits at
+/// minutes+90s and stamps DONE, so budget+150s covers the honest path with margin.
+const SWARM_WAIT_GRACE_S: i64 = 150;
+/// Per-call cap on how long a single swarm_status BLOCKS while the hive works (the drive-loop await has no such
+/// cap — it waits to the budget deadline). One bounded wait per call keeps the model in the loop with fresh
+/// context instead of a poll storm, and keeps any single tool frame's latency predictable.
+const SWARM_STATUS_WAIT_S: i64 = 45;
+
+/// The swarm's `minutes` budget from its manifest ({run_dir}/swarm.json) — the effective value castSwarm computed.
+fn swarmMinutes(app: *App, run_dir: []const u8) i64 {
+    const gpa = app.gpa;
+    var pb: [1280]u8 = undefined;
+    const p = std.fmt.bufPrint(&pb, "{s}/swarm.json", .{run_dir}) catch return 4;
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, p, gpa, .limited(16 << 10)) catch return 4;
+    defer gpa.free(raw);
+    const M = struct { minutes: i64 = 4 };
+    const parsed = std.json.parseFromSlice(M, gpa, raw, .{ .ignore_unknown_fields = true }) catch return 4;
+    defer parsed.deinit();
+    return std.math.clamp(parsed.value.minutes, 1, 60);
+}
+
+/// Is a swarm terminal RIGHT NOW? DONE marker or a dead worker pid — the same fresh predicate statusTool reports
+/// (sw.state lags the supervisor's ~10s reconcile, so never trust it for liveness). A very young swarm whose
+/// worker.pid hasn't landed yet reads as alive (the spawn takes a moment to write it).
+fn swarmTerminal(app: *App, run_dir: []const u8, created: i64) bool {
+    var pb: [1280]u8 = undefined;
+    if (std.fmt.bufPrint(&pb, "{s}/DONE", .{run_dir})) |dp| {
+        if (std.Io.Dir.cwd().access(app.io, dp, .{})) |_| return true else |_| {}
+    } else |_| {}
+    const ps = app.sup.pidStatus(run_dir);
+    if (ps.alive) return false;
+    return nowSecs(app.io) - created > 20; // no live pid: terminal unless the swarm is still spawning
+}
+
+/// This conversation's cast swarm, if one is LIVE. A chat cast always builds in _chat/builds/{conv}, and
+/// sup.resolve falls back to run-dir-basename matching — so the conv id alone finds it, including a cast from an
+/// earlier turn (armed-loop semantics: the loop shouldn't settle over ANY running hive in this conversation).
+fn liveConvCast(app: *App, uid: u64, conv: []const u8) ?struct { run_dir: []const u8, deadline: i64 } {
+    const sw = app.sup.resolve(conv) orelse return null;
+    if (sw.uid != uid) return null;
+    if (swarmTerminal(app, sw.run_dir, sw.created)) return null;
+    return .{ .run_dir = sw.run_dir, .deadline = sw.created + swarmMinutes(app, sw.run_dir) * 60 + SWARM_WAIT_GRACE_S };
+}
+
+const AwaitVerdict = enum { finished, stopped, timeout };
+
+/// Block (cheaply — file probes + stop checks, NO inference) until this conversation's cast hive finishes, a stop
+/// lands, or the hive outlives its budget. null = no live hive (nothing to wait for). Emits a status frame every
+/// ~15s so the desk shows the wait honestly.
+fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize) ?AwaitVerdict {
+    const cast = liveConvCast(app, uid, conv) orelse return null;
+    const t0 = nowSecs(app.io);
+    var last_frame: i64 = 0;
+    var waited: i64 = 0;
+    while (true) {
+        const now = nowSecs(app.io);
+        if (now > cast.deadline) return .timeout;
+        waited = now - t0;
+        if (waited - last_frame >= 15) {
+            last_frame = waited;
+            var sb: [128]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "the hive is still working — waiting to fold its results ({d}s)", .{waited}) catch "waiting on the hive");
+        }
+        // ~2s between probes, stop-checked every 250ms so a desk Stop lands promptly mid-wait.
+        var slice: usize = 0;
+        while (slice < 8) : (slice += 1) {
+            if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return .stopped;
+            sleepMsRaw(app.io, 250);
+        }
+        const sw = app.sup.resolve(conv) orelse return .finished;
+        if (sw.uid != uid or swarmTerminal(app, sw.run_dir, sw.created)) return .finished;
+    }
+}
+
+fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8) ?[]u8 {
     if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, base_url, key, model, args);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
-    if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, args);
+    if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
     return null;
@@ -1044,7 +1239,7 @@ fn castTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []
         .post = false,
     };
     switch (deploy_service.castSwarm(app, arena.allocator(), user, rq)) {
-        .ok => |sp| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"cast\",\"id\":\"{s}\",\"minds\":{d},\"state\":\"{s}\",\"note\":\"swarm deployed in this conversation's build dir; watch it with swarm_status, guide it with steer_swarm (use this id), end it with stop_swarm\"}}", .{ sp.id, sp.minds, sp.state }) catch emptyRes(),
+        .ok => |sp| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"cast\",\"id\":\"{s}\",\"minds\":{d},\"state\":\"{s}\",\"note\":\"swarm deployed in this conversation's build dir; it runs ASYNC for its minutes budget. swarm_status WAITS while the hive works (call it to watch progress — no need to re-poll rapidly); steer_swarm to guide it (use this id). do NOT stop_swarm just because it is still running — only if it is off-track\"}}", .{ sp.id, sp.minds, sp.state }) catch emptyRes(),
         .fail => |f| return orchErr(gpa, f.msg),
     }
 }
@@ -1097,25 +1292,53 @@ fn stopTool(app: *App, uid: u64, args: []const u8) []u8 {
 }
 
 /// swarm_status — compact liveness for the veil to decide keep-going / steer / collect: supervisor state, whether
-/// the worker process is alive, mind count, and whether a terminal DONE marker exists yet. gpa-owned result.
-fn statusTool(app: *App, uid: u64, args: []const u8) []u8 {
+/// the worker process is alive, mind count, and whether a terminal DONE marker exists yet. While the swarm is
+/// STILL RUNNING this call BLOCKS (cheap file probes + stop checks, up to SWARM_STATUS_WAIT_S) — the engine-level
+/// "wait" the model can't express itself. Without it the model's only move was to re-poll at inference speed
+/// (observed: ~20 back-to-back swarm_status calls burning the pass's iterations, then an impatient stop_swarm).
+/// One blocking call replaces the storm; the result says how long it waited. gpa-owned result.
+fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, args: []const u8) []u8 {
     const gpa = app.gpa;
     const A = struct { id: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "swarm_status: could not parse args JSON");
     defer p.deinit();
     if (p.value.id.len == 0) return orchErr(gpa, "swarm_status: an id is required");
-    const sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no such swarm");
+    var sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no such swarm");
     if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
+
+    // WAIT while running: probe every ~2s (stop-checked every 250ms), bounded per call. A finished/dead swarm
+    // returns immediately; a Stop mid-wait returns the current state so the turn's next boundary ends promptly.
+    const t0 = nowSecs(app.io);
+    var waited: i64 = 0;
+    var last_frame: i64 = 0;
+    while (!swarmTerminal(app, sw.run_dir, sw.created) and waited < SWARM_STATUS_WAIT_S) {
+        var slice: usize = 0;
+        stop: while (slice < 8) : (slice += 1) {
+            if (stopRequestedSince(app, conv_dir, ctrl_cursor)) break :stop;
+            sleepMsRaw(app.io, 250);
+        }
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) break;
+        waited = nowSecs(app.io) - t0;
+        if (waited - last_frame >= 15) {
+            last_frame = waited;
+            var sb: [96]u8 = undefined;
+            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "hive still working — watching it ({d}s)", .{waited}) catch "watching the hive");
+        }
+        sw = app.sup.resolve(p.value.id) orelse break; // re-resolve: the registry entry can be replaced/removed
+        if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
+    }
+
     const ps = app.sup.pidStatus(sw.run_dir);
-    var finished = false;
-    if (std.fmt.allocPrint(gpa, "{s}/DONE", .{sw.run_dir})) |dp| {
-        defer gpa.free(dp);
-        if (std.Io.Dir.cwd().readFileAlloc(app.io, dp, gpa, .limited(64))) |d| {
-            gpa.free(d);
-            finished = true;
-        } else |_| {}
-    } else |_| {}
-    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"swarm_status\",\"id\":\"{s}\",\"state\":\"{s}\",\"minds\":{d},\"alive\":{s},\"finished\":{s}}}", .{ sw.id, @tagName(sw.state), sw.minds, if (ps.alive) "true" else "false", if (finished) "true" else "false" }) catch emptyRes();
+    const finished = blk: {
+        var pb: [1280]u8 = undefined;
+        const dp = std.fmt.bufPrint(&pb, "{s}/DONE", .{sw.run_dir}) catch break :blk false;
+        if (std.Io.Dir.cwd().access(app.io, dp, .{})) |_| break :blk true else |_| break :blk false;
+    };
+    const note = if (finished or !ps.alive)
+        "the hive is done — read its deliverable files (list_dir/read_file) and fold the results in"
+    else
+        "still working; this call WAITS while the hive runs — call swarm_status again to keep watching, steer_swarm to guide it, or do other useful work meanwhile. do NOT stop_swarm just because it is still running";
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"swarm_status\",\"id\":\"{s}\",\"state\":\"{s}\",\"minds\":{d},\"alive\":{s},\"finished\":{s},\"waited_s\":{d},\"note\":\"{s}\"}}", .{ sw.id, @tagName(sw.state), sw.minds, if (ps.alive) "true" else "false", if (finished) "true" else "false", waited, note }) catch emptyRes();
 }
 
 /// Read the veil's answered-ledger for a swarm ({run_dir}/veil_answered.jsonl — one ask_id per line). gpa-owned
@@ -1370,7 +1593,7 @@ fn runInnerAgentic(
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
             // via deploy_service + app.sup, NOT the mind-tool executor. Everything else falls through to tools.execute.
-            const result = orchTool(app, uid, conv, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
+            const result = orchTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 

@@ -662,9 +662,16 @@ pub const Chat = struct {
     judge_last_s: i64 = 0,
     curated: bool = false, // the deterministic curator pass runs once per app session
 
+    // PLAN-BOARD watch (right pane checklist): the ACTIVE conv's {conv}/plan.jsonl, polled ~1Hz with a size cache
+    // so an unchanged board costs one statFile. plan_conv keys the cache — a conv switch forces a re-read.
+    plan_conv: [64]u8 = [_]u8{0} ** 64,
+    plan_conv_len: usize = 0,
+    plan_size: u64 = 0,
+
     // scratch (thread-owned)
     ev_scratch: [store_mod.CAST_TAIL]scan.Ev = undefined,
     sw_scratch: [scan.MAX_SWARMS]scan.SwarmSummary = undefined,
+    plan_scratch: [store_mod.MAX_PLAN]store_mod.PlanRow = undefined,
     file_scratch: [scan.MAX_FILES]scan.FileRow = undefined,
     mem_scratch: [12288]u8 = undefined, // durable-memory directive stripping (REMEMBER:/FORGET: removed from the answer)
     mem_saved_n: usize = 0, // memories stored on the turn being finalized (set by processMemory, read by appendVeil)
@@ -744,6 +751,7 @@ pub const Chat = struct {
             // chat is genuinely idle with something to continue from, so this can't run away or double-fire).
             if (tick % 10 == 5) self.maybeLoop(dd);
             if (tick % 10 == 0) self.watchCast(dd); // ~1Hz beside the 10Hz stream pump
+            if (tick % 10 == 4) self.watchPlan(dd); // ~1Hz: the ACTIVE conv's plan-board → right-pane checklist
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
             if (tick % 10 == 3) self.maybeFinishAfterVeil(dd); // concurrent veil: compose the answer once cast + veil are both done
             if (tick % 20 == 11) self.refreshChatFiles(dd); // ~2s: publish this chat's build files for the Files tab
@@ -1130,7 +1138,9 @@ pub const Chat = struct {
                 .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
                 .console_approve => self.cmdConsoleApprove(dd, std.mem.eql(u8, c.idStr(), "always")), // Approve / Bypass a parked veil command
                 .console_deny => self.cmdConsoleDeny(dd), // Deny the parked veil command
-                .loop_kick => self.maybeLoop(dd), // user just enabled auto-loop while idle → start it now
+                // user just enabled auto-loop while idle → start it now. A SERVER-served conv needs its own kick
+                // (maybeLoop stands down via sc_serving, so the old path armed the toggle silently and did NOTHING).
+                .loop_kick => if (self.sc_serving) self.serverLoopKick(dd) else self.maybeLoop(dd),
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
                 .chat_open_folder => self.cmdChatOpenFolder(dd), // Files tab: open this chat's build folder in the OS
@@ -1534,7 +1544,7 @@ pub const Chat = struct {
             }
         }
         self.sc_serving = false; // no longer server-served → the local auto-loop may take over
-        self.cast_server_owned = false; // the server turn that owned any cast display is gone
+        self.releaseServerCastDisplay("detached"); // finalize the row + clear status (the server turn that owned it is gone)
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
         self.setServerActive(false);
@@ -2523,7 +2533,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // new conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
-        self.cast_server_owned = false; // a server-cast display cannot span a conversation switch
+        self.releaseServerCastDisplay("detached (left the conversation)"); // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // the agentic-floor arc cannot span a conversation switch
         self.arc_goal_len = 0; // a brand-new chat has no goal yet — the first cmdSend sets it
         self.syncBuildDir(dd); // a fresh chat has no build dir yet — this clears the previous chat's binding
@@ -2542,7 +2552,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // switched conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
-        self.cast_server_owned = false; // a server-cast display cannot span a conversation switch
+        self.releaseServerCastDisplay("detached (left the conversation)"); // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.loadMsgs(dd, id);
         { // re-anchor the loop's durable goal to THIS conversation's first message
@@ -2947,7 +2957,7 @@ pub const Chat = struct {
         _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}"); // round-boundary fallback
         self.store.pushNotif("Stop sent", rel, 2);
         self.cast_stop_sent = true;
-        self.cast_server_owned = false; // releasing a server-owned display too (its run dir got the STOP above)
+        self.releaseServerCastDisplay("stopped"); // releasing a server-owned display too (its run dir got the STOP above)
         self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending finish
     }
 
@@ -4362,6 +4372,23 @@ pub const Chat = struct {
 
     /// After a turn settles, start a loop-infer turn IF auto-loop is on and the conversation is genuinely idle
     /// (no in-flight turn, no running cast). Called at the settle point and on a fresh toggle-on (.loop_kick).
+    /// The user armed auto-loop while a SERVER-served conv sat IDLE. The server owns the loop but only drives
+    /// WITHIN a turn — with no turn running, arming the toggle used to do nothing (maybeLoop stands down via
+    /// sc_serving). Fire one normal send with a synthetic continue: the server's resume-preferred plan-board +
+    /// durable goal give it real work, and the send body carries the fresh loop tier (on/afk). Fired ONLY from
+    /// the explicit .loop_kick command — never from the ~1Hz backstop — so a completed (DONE) turn is not
+    /// endlessly re-fired; afk persistence lives INSIDE the server turn, not in desk re-fires.
+    fn serverLoopKick(self: *Chat, dd: []const u8) void {
+        if (self.turn != .idle or self.sc_active or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil) return;
+        const st = blk: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk [2]bool{ self.store.chat_loop or self.store.chat_loop_afk, self.store.msg_count > 0 };
+        };
+        if (!st[0] or !st[1]) return; // not armed, or an empty conv (no goal to drive toward yet)
+        self.cmdSend(dd, "Auto-loop armed: continue driving toward the goal — pick up the plan (or the last goal) where it left off.");
+    }
+
     fn maybeLoop(self: *Chat, dd: []const u8) void {
         // SERVER CHAT owns the loop. When the conv is SERVED by the server (sc_serving — set on a successful route,
         // cleared on a fallback to local), the SERVER turn drives its own multi-step loop, so the desk must NOT run
@@ -4619,9 +4646,10 @@ pub const Chat = struct {
                 const rel = self.cast_rel[0..self.cast_rel_len];
                 _ = scan.writeStop(self.io, self.gpa, dd, rel);
                 _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
-                self.updateCastRow(.done, self.cast_m.round, self.cast_m.pct, "stopped", rel);
             }
-            self.cast_server_owned = false;
+            // finalize the row even with an UNRESOLVED run dir (updateCastRow skips the rel copy) — a .deploying
+            // row left behind here pinned the green "hive is working" bar forever.
+            self.releaseServerCastDisplay("stopped");
         }
         self.setStatus("");
         self.setBusy(false);
@@ -5055,8 +5083,8 @@ pub const Chat = struct {
             self.setStatus("");
             return;
         }
+        self.releaseServerCastDisplay("superseded"); // a fresh LOCAL cast owns the lifecycle; finalize any server-cast display first
         self.cast_active = true;
-        self.cast_server_owned = false; // a fresh LOCAL cast owns the lifecycle; drop any server-cast display
         self.cast_epoch = self.conv_epoch; // the conversation position this cast (and its veil work) belongs to
         self.cast_stop_sent = false;
         self.cast_ev_size = 0; // fresh watch state for this run
@@ -5597,6 +5625,11 @@ pub const Chat = struct {
     fn startServerCastWatch(self: *Chat) void {
         const conv = self.sc_conv[0..self.sc_conv_len];
         if (conv.len == 0 or conv.len > self.cast_conv.len) return; // no resolvable conv → nothing to watch
+        // IDEMPOTENT: a server turn can cast more than once (observed live: cast → stop → re-cast). While a watch
+        // is already armed on this conv's run dir, a second cast "start" frame must NOT push a second CastRow —
+        // updateCastRow only ever touches the newest row, so the first would freeze mid-"running" forever (a
+        // stuck-green-bar maker). Same run dir either way (build-in-place), so the existing watch covers it.
+        if (self.cast_server_owned) return;
         self.cast_server_owned = true;
         self.cast_active = false; // the desk does NOT run the local collect/compose lifecycle for this cast
         self.cast_conv_len = conv.len; // watchCast matches the run-dir basename against <conv>
@@ -5615,6 +5648,93 @@ pub const Chat = struct {
         self.nar_pct = -1;
         self.nar_txt_len = 0;
         self.pushCastRow("hive (server)"); // the row's round/pct/last fill in live from watchCast (updateCastRow)
+    }
+
+    /// Release a server-owned cast DISPLAY at a seam that abandons the watch (conv switch, new conv, stop-cast,
+    /// abort). Finalizes the newest row to .done and clears the status line — without this, dropping
+    /// cast_server_owned killed the row's only updater and stranded it mid-"running": cast_live stayed true, so
+    /// the green "the hive is working" bar rendered forever and even carried into a NEW conversation's view.
+    /// The swarm itself is untouched (it keeps running server-side; the global Swarm tab still tracks it).
+    fn releaseServerCastDisplay(self: *Chat, note: []const u8) void {
+        if (!self.cast_server_owned) return;
+        self.updateCastRow(.done, self.cast_m.round, self.cast_m.pct, note, self.cast_rel[0..self.cast_rel_len]);
+        if (!self.sc_active) self.setStatus(""); // a LIVE server turn owns the status; its {done} clears it
+        self.cast_server_owned = false;
+    }
+
+    /// Publish the ACTIVE conversation's server plan-board ({conv}/plan.jsonl) into the store so the right pane
+    /// renders a live checklist (the user asked to SEE plan progress throughout the chat, not just the plan
+    /// message). ~1Hz with a size cache: an unchanged board costs one statFile; a conv switch (plan_conv key
+    /// mismatch) forces a re-read; an absent/empty board publishes 0 rows. The server rewrites the whole file per
+    /// subtask update (non-atomic) — the skip-bad-lines parse self-heals a torn read on the next tick.
+    fn watchPlan(self: *Chat, dd: []const u8) void {
+        var cb: [64]u8 = undefined;
+        const conv = self.convScope(&cb);
+        if (conv.len == 0 or conv.len > self.plan_conv.len) {
+            self.publishPlan(0);
+            self.plan_conv_len = 0;
+            self.plan_size = 0;
+            return;
+        }
+        const switched = !std.mem.eql(u8, conv, self.plan_conv[0..self.plan_conv_len]);
+        if (switched) {
+            @memcpy(self.plan_conv[0..conv.len], conv);
+            self.plan_conv_len = conv.len;
+            self.plan_size = 0; // force a re-read for the new conv
+            self.publishPlan(0); // and never show the previous conv's board meanwhile
+        }
+        // uid default mirrors chatBuildRel: desktop admin is u1 on localhost; a build-dir binding overrides.
+        var uid: []const u8 = "u1";
+        if (self.build_dir_len > 0) {
+            const bd = self.build_dir[0..self.build_dir_len];
+            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
+                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
+            }
+        }
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/{s}/_chat/convs/{s}/plan.jsonl", .{ dd, uid, conv }) catch return;
+        const size: u64 = if (Io.Dir.cwd().statFile(self.io, path, .{})) |st| st.size else |_| {
+            // no board (a fresh conv, or plan.jsonl deleted) → clear the checklist
+            if (self.plan_size != 0) {
+                self.publishPlan(0);
+                self.plan_size = 0;
+            }
+            return;
+        };
+        if (size == self.plan_size) return; // unchanged — one stat, no parse
+        const raw = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(64 << 10)) catch return;
+        defer self.gpa.free(raw);
+        self.plan_size = size;
+
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, raw, '\n');
+        while (it.next()) |line| {
+            if (n >= self.plan_scratch.len) break;
+            const t = std.mem.trim(u8, line, " \r\t");
+            if (t.len == 0 or t[0] != '{') continue;
+            const T = struct { task: []const u8 = "", route: []const u8 = "inline", status: []const u8 = "pending" };
+            const parsed = std.json.parseFromSlice(T, self.gpa, t, .{ .ignore_unknown_fields = true }) catch continue; // skip a torn/bad line
+            defer parsed.deinit();
+            var row = store_mod.PlanRow{};
+            const tl = @min(parsed.value.task.len, row.text.len);
+            @memcpy(row.text[0..tl], parsed.value.task[0..tl]);
+            row.text_len = @intCast(tl);
+            const rl = @min(parsed.value.route.len, row.route.len);
+            @memcpy(row.route[0..rl], parsed.value.route[0..rl]);
+            row.route_len = @intCast(rl);
+            row.status = if (std.mem.eql(u8, parsed.value.status, "done")) .done else if (std.mem.eql(u8, parsed.value.status, "active")) .active else .pending;
+            self.plan_scratch[n] = row;
+            n += 1;
+        }
+        self.publishPlan(n);
+    }
+
+    /// Copy plan_scratch[0..n] into the store under one short lock (the watchCast tail-publish pattern).
+    fn publishPlan(self: *Chat, n: usize) void {
+        self.store.lock();
+        defer self.store.unlock();
+        if (n > 0) @memcpy(self.store.plan[0..n], self.plan_scratch[0..n]);
+        self.store.plan_count = n;
     }
 
     pub fn watchCast(self: *Chat, dd: []const u8) void {
@@ -5735,6 +5855,10 @@ pub const Chat = struct {
             if (self.cast_server_owned) {
                 // DISPLAY-ONLY: the swarm ended on its own; the row is already .done. The SERVER veil composes the
                 // answer via swarm_status — the desk must NOT run castFinished (which would compose a DUPLICATE).
+                // Clear the "hive running" status line we own — leaving it froze the green "the hive is working"
+                // bar forever after the hive finished (the stuck-bar bug). A LIVE server turn (sc_active) owns the
+                // status itself and its {done} frame clears it, so only touch it once the turn has settled.
+                if (!self.sc_active) self.setStatus("the hive finished — results in Swarm activity");
                 self.cast_server_owned = false;
                 self.cast_active = false; // belt-and-suspenders; was already false
                 return;
