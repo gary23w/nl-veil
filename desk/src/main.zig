@@ -4473,22 +4473,23 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x + 100), @intFromFloat(y), 11, t.comment);
     y += 22;
 
-    // CHAT ENGINE: local (this machine) vs the server. Local runs the AI's tools in the client's own
-    // environment with no round-trip; the server path centralizes the turn (and is what scheduled tasks always
-    // use, since the desk may be closed). Default is local — the natural fit for acting on your own machine.
+    // CHAT ENGINE: the server brain (default + recommended) vs the retired local fallback. IMPORTANT COPY
+    // LESSON: in client mode the SERVER brain STILL runs every tool on THIS machine (delegation) — the old
+    // label sold "tools in your environment" as the LOCAL option's advantage, which misled the user into
+    // opting out of the server path right after it became the primary one.
     {
         const cur = blk_ce: {
             store.lock();
             defer store.unlock();
             break :blk_ce store.settings.server_chat;
         };
-        const nv = t.checkbox(.{ .x = x, .y = y, .width = 22, .height = 22 }, t.z("run chat on the server (default: on this machine, tools in your environment)", .{}), cur);
+        const nv = t.checkbox(.{ .x = x, .y = y, .width = 22, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur);
         if (nv != cur) {
             store.lock();
             store.settings.server_chat = nv;
             store.unlock();
             store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-            store.pushNotif(if (nv) "Chat: server" else "Chat: local (this machine)", if (nv) "interactive chat runs server-side" else "interactive chat runs on this machine - tools act in your environment", 1);
+            store.pushNotif(if (nv) "Chat: server brain" else "Chat: local fallback engine", if (nv) "the brain runs in the backend; every tool still executes on this machine" else "the RETIRED local engine - use only if the server is unreachable", if (nv) 1 else 0);
         }
         y += 30;
     }
