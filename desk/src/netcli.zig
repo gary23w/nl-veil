@@ -217,6 +217,15 @@ pub fn oauthCfLogout(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/logout", token, "{}", 8);
 }
 
+/// DELETE /api/v1/chat/convs/<conv> — remove a conversation's whole tree server-side. Without this a
+/// server-born conv (a scheduled_* run, or one merged into the sidebar) reappears on the next list refresh.
+pub fn chatConvDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8) ?Resp {
+    log.trace("netcli.chatConvDelete port={d} conv={s}", .{ port, conv });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}", .{conv}) catch return null;
+    return httpReq(io, gpa, "DELETE", port, path, token, null, 8);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });

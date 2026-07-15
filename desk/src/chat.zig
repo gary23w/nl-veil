@@ -356,6 +356,12 @@ const SC_COOLDOWN_S: i64 = 45;
 const SC_POLL_FAST_MS: i64 = 33;
 const SC_POLL_SLOW_MS: i64 = 120;
 const SC_POLL_EMPTY_BACKOFF: u16 = 3;
+/// Consecutive EMPTY (0-byte, HTTP-200) polls before we give up on a server turn that stopped writing frames
+/// without ever emitting {done} (a turn thread that died while the server process stayed up). A server that
+/// CRASHES is caught faster by SC_MAX_FAILS (failed polls); this covers the rarer up-but-silent case so the
+/// send column can't lock forever. At ~120ms/empty-poll this is ~3 min of TOTAL silence — well past any real
+/// TTFT or hive-wait, which emit status frames that reset the counter.
+const SC_MAX_EMPTY: u16 = 1500;
 /// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast
 /// (delegating a scoped sub-task to a hive is the veil doing its job), but bounded so a weak model can't
 /// runaway-deploy hives unattended. A manual message resets the count.
@@ -1349,6 +1355,12 @@ pub const Chat = struct {
             self.sc_next_poll_ms = poll_now + SC_POLL_FAST_MS;
         } else {
             self.sc_empty_polls +|= 1;
+            // Give up if the turn went totally silent without a {done} (server up but the turn thread died): the
+            // send column would otherwise stay locked on Stop with no way back but a manual click.
+            if (self.sc_empty_polls >= SC_MAX_EMPTY) {
+                self.abortServerChat(dd, "(server chat: the turn went silent without finishing — stopping)");
+                return;
+            }
             self.sc_next_poll_ms = poll_now + (if (self.sc_empty_polls >= SC_POLL_EMPTY_BACKOFF) SC_POLL_SLOW_MS else SC_POLL_FAST_MS);
         }
     }
@@ -1518,6 +1530,18 @@ pub const Chat = struct {
             self.setServerActive(false);
             self.setBusy(false);
             self.setStatus("");
+            // The SERVER owns/drove this turn's whole (possibly multi-step) sequence and just finished it, so
+            // the desk's auto-loop flags are stale — clear them. cmdSend force-arms chat_loop on every send, and
+            // for a server-served conv the local stopLoop (which clears it) never runs, so without this the send
+            // column stays stuck on "Stop" after the reply and the user has to click Stop before they can send
+            // again. The server drove to completion regardless of these flags; clearing them only fixes the UI.
+            {
+                self.store.lock();
+                self.store.chat_loop = false;
+                self.store.chat_loop_afk = false;
+                self.store.unlock();
+            }
+            self.sc_serving = false; // no longer server-served; the local maybeLoop may drive a future turn
             return;
         }
         // any other kind: not rendered.
@@ -1543,6 +1567,14 @@ pub const Chat = struct {
         self.setServerActive(false);
         self.setBusy(false);
         self.setStatus("");
+        // clear the auto-loop flags so the send column returns to "Send" (see the {done} handler) — an aborted
+        // server turn is done driving too.
+        {
+            self.store.lock();
+            self.store.chat_loop = false;
+            self.store.chat_loop_afk = false;
+            self.store.unlock();
+        }
         // A server turn that died mid-flight → cool the backend off so the user's next send goes to the local
         // engine instead of stalling on the same broken server again.
         self.sc_cooldown_until = self.nowS() + SC_COOLDOWN_S;
@@ -2599,6 +2631,12 @@ pub const Chat = struct {
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        // ALSO delete it server-side. A server-born conv (a scheduled_* run, or one merged into the sidebar)
+        // has no local file, so unlinking the local file alone is a no-op and the next refreshConvs re-merges
+        // it straight back — deletes appeared to do nothing. The server route removes the authoritative copy.
+        if (self.runner().chatDelete(self.io, self.gpa, id)) |r| {
+            if (r.body.len > 0) self.gpa.free(r.body);
+        }
         var was_active = false;
         {
             self.store.lock();
