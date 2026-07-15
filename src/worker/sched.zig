@@ -465,7 +465,10 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     const conv = convIdFor(&cb, t.id, now + localOffsetSecs());
 
     // First message = the prompt, plus the task's pinned data block when present — the same text every run,
-    // so each minted conversation is self-contained (the turn cannot see the task file).
+    // so each minted conversation is self-contained (the turn cannot see the task file). No preamble: the run
+    // fires with the AUTO-LOOP ARMED (loop=1 below), so the drive loop carries it through ambiguity to a
+    // completed deliverable, and the engine injects the task's memory (recall) + records outcomes/lessons
+    // (see runTurn's sched branches) — autonomy and learning are ENGINE mechanics, not prompt pleading.
     var text: std.ArrayListUnmanaged(u8) = .empty;
     defer text.deinit(app.gpa);
     text.appendSlice(app.gpa, t.prompt) catch return null;
@@ -474,29 +477,18 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
         text.appendSlice(app.gpa, "\n\nKey details / data to use:\n") catch return null;
         text.appendSlice(app.gpa, det) catch return null;
     }
-    // UNATTENDED-RUN CONTRACT. Observed failure without it: the model answered a scheduled "get local news"
-    // with "where's 'local' for you?" — a question posted into a conversation NOBODY is watching, so the run
-    // produced nothing and read as "scheduled tasks don't work". A scheduled run must act, not converse.
-    text.appendSlice(app.gpa,
-        \\
-        \\
-        \\[UNATTENDED SCHEDULED RUN — no human is watching this conversation, and nobody will answer a question.
-        \\NEVER ask back or end on a clarification; recall() your task memory first (it carries lessons and
-        \\answers from previous runs of this same task), make the most reasonable assumption for anything still
-        \\ambiguous, state that assumption in the deliverable, and COMPLETE the task. Store what you learn with
-        \\observe() — especially anything that would have unblocked you sooner and any user preference you
-        \\inferred — it persists into this task's future runs.]
-    ) catch return null;
 
     const pr = resolveProvider(app, alloc, uid, t);
 
     // Claim-before-spawn, exactly like postMessage: a `false` here means a same-named run from this minute is
     // still going, or the engine is saturated — skip WITHOUT bookkeeping so the task fires on a later tick.
     if (!chat_engine.tryBeginTurn(app.io, conv)) return null;
-    // loop=0: one bounded turn — a schedule fires a task, it must not arm an open-ended auto-loop unattended.
-    // spawnTurn copies every arg into its own blob (conv lives in a stack buffer here) and owns releasing the
-    // turn slot on every completion path.
-    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 0, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
+    // loop=1 (AUTO-LOOP ON): autonomy IS the point of a scheduled run — the drive loop pushes through
+    // ambiguity, waits out any hive it casts, runs the terminal build-verify, and only settles on a genuine
+    // DONE (bounded by LOOP_MAX_STEPS, so a stuck task ends instead of burning forever). Never afk: an
+    // unattended run must terminate on its own. spawnTurn copies every arg into its own blob (conv lives in
+    // a stack buffer here) and owns releasing the turn slot on every completion path.
+    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
 
     // Bookkeeping AFTER the spawn is committed. last_run = now first, so the "every" recompute re-anchors the
     // interval to NOW (the catch-up policy: an overdue task runs once, never once per missed interval).

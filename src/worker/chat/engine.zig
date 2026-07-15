@@ -377,7 +377,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         .workdir = workdir,
         // a scheduled run's recall()/observe() tools work the TASK's own memory (the observe tool already
         // dual-writes the hive, giving "task memory AND hive memory" for free); ordinary chat keeps the
-        // shared "chat" scope.
+        // shared "chat" scope. DIRECTORY ISOLATION (strict): a scheduled run executes tools SERVER-side with
+        // roam=false (the ToolCtx default — only the client executor ever sets it), so every file tool is
+        // jailed to this run's builds/{conv}/work by safeRel, exactly like a chat. An unattended run can
+        // never write outside its own workdir.
         .scope = if (sched_task != null) mem_scope else "chat",
         .mind = "chat",
         .round = 0,
@@ -416,7 +419,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             scrubUtf8(recalled); // observed facts are already scrubbed, but a fetched-byte tail could slip in
             var mem_content: std.ArrayListUnmanaged(u8) = .empty;
             defer mem_content.deinit(gpa);
-            mem_content.appendSlice(gpa, "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
+            mem_content.appendSlice(gpa, if (sched_task != null)
+                "TASK MEMORY — lessons, outcomes, and findings from PREVIOUS RUNS of this scheduled task. USE them: prefer sources/approaches that worked, skip recorded pitfalls, keep stated assumptions, and improve on the last run instead of starting from zero:\n"
+            else
+                "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
             mem_content.appendSlice(gpa, recalled) catch return;
             recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
             http.jstr(gpa, &recall_frag, mem_content.items) catch return;
@@ -642,6 +648,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             const note = "(no reply — the model returned an empty or malformed response this turn)";
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
+            // SCHEDULED runs learn from an empty run too — a mechanical fact the next run's recall sees.
+            if (sched_task != null) {
+                var fb: [180]u8 = undefined;
+                _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "run {s} produced NO ANSWER (empty/malformed model response) — retry with a simpler first step", .{conv[0..@min(conv.len, 64)]}) catch "a previous run produced no answer");
+            }
             salvageSteers(app, conv_dir, &steer_cursor); // an empty-reply end must not eat a pending steer
             finishTurn(app, conv_dir, usage_t0);
             return;
@@ -834,6 +845,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // drainChatControl persists each pending steer as a durable user message, so the NEXT turn replays it.
     salvageSteers(app, conv_dir, &steer_cursor);
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
+    // SCHEDULED-RUN LEARNING: at normal completion, fold this run's outcome + one distilled lesson into the
+    // TASK's memory so the next run starts smarter — the recursive-improvement loop for recurring tasks.
+    if (sched_task != null) schedLearn(app, &ctx, mem_scope, conv, conv_dir, run_root, base_url, key, model, &conv_buf);
     // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
     // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
@@ -841,6 +855,37 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     emitUsage(app, conv_dir, usage_t0);
     refreshSummary(app, conv_dir, run_root, base_url, key, model);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
+}
+
+/// The scheduled task's LEARNING step, run once at a run's NORMAL completion. Two writes into the task's own
+/// memory scope ("sched:{taskid}", shared by every run of the task):
+///   1. a MECHANICAL outcome note (files written, observations stored) — never depends on the model;
+///   2. ONE model-distilled lesson ("what should the next run do differently/faster?") — the deliberate
+///      counterpart of the desk's playbook pattern. This is NOT the forbidden observe-own-reply confab loop:
+///      the reply itself is never stored, only a provenance-labeled lesson ("lesson from run X: ..."), and the
+///      recall injection presents it as task history, not as ground truth about the world.
+/// Difficult recurring tasks improve because every run leaves behind what happened, what to change, and every
+/// tool finding already observed during the run. Bounded: one small extra inference, best-effort.
+fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, conv: []const u8, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+    const gpa = app.gpa;
+    var ob: [220]u8 = undefined;
+    const note = std.fmt.bufPrint(&ob, "run {s} COMPLETED: {d} file(s) written, {d} observation(s) stored", .{ conv[0..@min(conv.len, 64)], ctx.files_written.*, ctx.observed.* }) catch "scheduled run completed";
+    _ = ctx.mem.observe(mem_scope, note);
+
+    const saved = conv_buf.items.len;
+    defer conv_buf.shrinkRetainingCapacity(saved); // the lesson question never rides into durable context
+    conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
+    var next = llm.complete(gpa, app.io, run_root, "lesson", base_url, key, model, conv_buf.items, "", 256, 0.3);
+    defer next.deinit(gpa);
+    if (!next.ok) return;
+    scrubUtf8(next.content);
+    const lesson = std.mem.trim(u8, next.content, " \r\n\t\"");
+    if (lesson.len < 8 or lesson.len > 600 or cctx.looksLikeToolMarkup(lesson)) return; // a degenerate/markup "lesson" teaches nothing
+    var lb: [720]u8 = undefined;
+    const lnote = std.fmt.bufPrint(&lb, "lesson from run {s}: {s}", .{ conv[0..@min(conv.len, 40)], lesson }) catch return;
+    _ = ctx.mem.observe(mem_scope, lnote);
+    var sb: [180]u8 = undefined;
+    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "task memory updated: {s}", .{clipBytes(lesson, 120)}) catch "task memory updated");
 }
 
 // ---- PER-CONVERSATION TURN LOCK ----------------------------------------------------------------------------
