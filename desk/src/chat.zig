@@ -355,6 +355,13 @@ const SC_MAX_FAILS: u32 = 180;
 /// After a server chat send falls back to local (server unreachable / disabled / not-admin / errored), skip the
 /// server for this many seconds so a down or misconfigured backend doesn't cost a failed round-trip on every send.
 const SC_COOLDOWN_S: i64 = 45;
+/// ADAPTIVE /events poll cadence (ms). FAST tracks the ~30Hz render pump while frames are actually arriving; SLOW
+/// covers the TTFT dead-window + inter-token lulls where polling only churns empty localhost sockets. After
+/// SC_POLL_EMPTY_BACKOFF consecutive empty (0-byte) polls we drop to SLOW; the first non-empty poll snaps to FAST.
+/// A down/wedged server still retries at tick rate (failures don't gate) so SC_MAX_FAILS timing is unchanged.
+const SC_POLL_FAST_MS: i64 = 33;
+const SC_POLL_SLOW_MS: i64 = 120;
+const SC_POLL_EMPTY_BACKOFF: u16 = 3;
 /// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
 /// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
 /// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
@@ -690,6 +697,13 @@ pub const Chat = struct {
     sc_chars: usize = 0, //      content chars streamed this turn (the ~4x token proxy, matching recordMetric)
     sc_tools: u32 = 0, //        tool calls this turn
     sc_tokens_out: u32 = 0, //   the backend's REAL output-token count from the {usage} frame (preferred over the proxy)
+    // ADAPTIVE /events poll: pumpServerChat is called every ~34ms tick while sc_active, and each call opens a FRESH
+    // localhost TCP socket (Connection: close) for a full round-trip. Through the ~1.6s TTFT dead-window and the
+    // inter-token lulls that is tens of empty 0-byte polls per turn — a sustained ~30 connect+close/sec piling up
+    // TIME_WAIT sockets on the local server. These gate the poll: skip (no socket) until sc_next_poll_ms; poll FAST
+    // right after any poll that consumed bytes, back off to SLOW after a few consecutive empties, snap back on data.
+    sc_next_poll_ms: i64 = 0, //  earliest wall-clock ms for the next /events poll (0 = poll now)
+    sc_empty_polls: u16 = 0, //   consecutive good polls that returned 0 new bytes (drives the back-off)
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -1260,6 +1274,8 @@ pub const Chat = struct {
             self.sc_conv_len = conv.len;
             self.sc_from = from0;
             self.sc_fails = 0;
+            self.sc_next_poll_ms = 0; // poll immediately; the adaptive gate takes over after the first poll
+            self.sc_empty_polls = 0;
             self.scClearStream(); // fresh live preview for this turn's streamed deltas
             self.setServerActive(true); // keep busy; pumpServerChat clears it on {done}
             self.sc_serving = true; // this conv is served by the server → the desk's local auto-loop stands down
@@ -1295,6 +1311,12 @@ pub const Chat = struct {
             self.abortServerChat(dd, "");
             return;
         }
+        // ADAPTIVE gate: skip this tick's poll (open NO socket) until the scheduled next-poll time. This collapses
+        // the tens of empty polls/turn during TTFT + inter-token lulls into a ~120ms cadence while still tracking
+        // arriving frames at ~30Hz. A {done} frame lands right after a non-empty message frame (→ FAST), so turn
+        // completion is still caught within a frame; only a bare lull can delay detection by up to SC_POLL_SLOW_MS.
+        const poll_now = self.nowMs();
+        if (poll_now < self.sc_next_poll_ms) return;
         const resp = self.runner().chatEvents(self.io, self.gpa, conv, self.sc_from) orelse {
             // server unreachable this tick — don't spin or crash: retry next tick, but bound it so a truly down
             // server can't leave the chat busy forever.
@@ -1323,6 +1345,14 @@ pub const Chat = struct {
             if (!self.sc_active) break; // a {done} frame disarmed us — stop rendering the rest of this poll
         }
         self.sc_from += consumed; // advance ONLY past complete lines; a trailing partial waits for the next poll
+        // schedule the next poll: FAST while bytes flow, back off to SLOW once several polls in a row come up empty.
+        if (consumed > 0) {
+            self.sc_empty_polls = 0;
+            self.sc_next_poll_ms = poll_now + SC_POLL_FAST_MS;
+        } else {
+            self.sc_empty_polls +|= 1;
+            self.sc_next_poll_ms = poll_now + (if (self.sc_empty_polls >= SC_POLL_EMPTY_BACKOFF) SC_POLL_SLOW_MS else SC_POLL_FAST_MS);
+        }
     }
 
     /// Append a streamed delta to the in-flight reply (is_reason=false) or reasoning (is_reason=true) buffer — the
