@@ -48,17 +48,19 @@ const Parser = struct {
     i: usize = 0,
     title: []const u8 = "",
 
-    fn newNode(p: *Parser) *Node {
-        const n = p.a.create(Node) catch unreachable;
+    fn newNode(p: *Parser) error{OutOfMemory}!*Node {
+        const n = try p.a.create(Node);
         n.* = .{};
         return n;
     }
 
-    fn parse(p: *Parser) *Node {
-        const root = p.newNode();
+    // Fallible on purpose: a swallowed node/stack append corrupts nesting (or empties the stack under
+    // the items[len-1] indexing below), so OOM propagates and the pub parse() boundary degrades instead.
+    fn parse(p: *Parser) error{OutOfMemory}!*Node {
+        const root = try p.newNode();
         root.tag = "root";
         var stack: std.ArrayListUnmanaged(*Node) = .empty;
-        stack.append(p.a, root) catch {};
+        try stack.append(p.a, root);
         const html = p.html;
         while (p.i < html.len) {
             if (html[p.i] == '<') {
@@ -89,9 +91,9 @@ const Parser = struct {
                 if (gt >= html.len) break;
                 const inner = html[p.i + 1 .. gt];
                 const self_close = inner.len > 0 and inner[inner.len - 1] == '/';
-                const node = p.parseOpen(inner);
+                const node = try p.parseOpen(inner);
                 const parent = stack.items[stack.items.len - 1];
-                parent.children.append(p.a, node) catch {};
+                try parent.children.append(p.a, node);
                 p.i = gt + 1;
                 if (isRawText(node.tag)) {
                     var buf: [16]u8 = undefined;
@@ -99,7 +101,7 @@ const Parser = struct {
                     const end = ciIndexOf(html, p.i, close) orelse html.len;
                     p.i = @min((std.mem.indexOfScalarPos(u8, html, end, '>') orelse html.len) + 1, html.len);
                 } else if (!self_close and !isVoid(node.tag)) {
-                    stack.append(p.a, node) catch {};
+                    try stack.append(p.a, node);
                 }
             } else {
                 const start = p.i;
@@ -107,23 +109,23 @@ const Parser = struct {
                 const raw = html[start..nx];
                 p.i = nx;
                 if (std.mem.trim(u8, raw, " \t\r\n").len > 0) {
-                    const t = p.newNode();
+                    const t = try p.newNode();
                     t.is_text = true;
                     t.text = raw;
                     const parent = stack.items[stack.items.len - 1];
                     if (std.mem.eql(u8, parent.tag, "title") and p.title.len == 0)
                         p.title = std.mem.trim(u8, raw, " \t\r\n");
-                    parent.children.append(p.a, t) catch {};
+                    try parent.children.append(p.a, t);
                 }
             }
         }
         return root;
     }
 
-    fn parseOpen(p: *Parser, inner_in: []const u8) *Node {
+    fn parseOpen(p: *Parser, inner_in: []const u8) error{OutOfMemory}!*Node {
         var inner = inner_in;
         if (inner.len > 0 and inner[inner.len - 1] == '/') inner = inner[0 .. inner.len - 1];
-        const n = p.newNode();
+        const n = try p.newNode();
         var j: usize = 0;
         while (j < inner.len and !std.ascii.isWhitespace(inner[j])) j += 1;
         n.tag = std.ascii.allocLowerString(p.a, inner[0..j]) catch "";
@@ -171,10 +173,20 @@ fn attr(inner: []const u8, name: []const u8) []const u8 {
     return "";
 }
 
+// Last-ditch root for when the arena can't hold even one Node: never freed (Doc.deinit only drops the
+// arena) and never written — every consumer treats a childless non-text tag-"" node as an empty doc and
+// pruneTree early-outs on it before it would reassign children.
+threadlocal var oom_root: Node = .{};
+
 pub fn parse(gpa: std.mem.Allocator, html: []const u8) Doc {
     var arena = std.heap.ArenaAllocator.init(gpa);
     var p = Parser{ .a = arena.allocator(), .html = html };
-    const root = p.parse();
+    // OOM mid-parse degrades to an empty doc (keeping any title already seen) — truncated output over
+    // UB, same contract as the emit side.
+    const root = p.parse() catch p.newNode() catch blk: {
+        oom_root = .{};
+        break :blk &oom_root;
+    };
     return .{ .arena = arena, .root = root, .title = p.title };
 }
 
@@ -808,7 +820,9 @@ fn walkLinks(node: *const Node, base: []const u8, host: []const u8, gpa: std.mem
         if (std.mem.startsWith(u8, abs, "http") and !seen.contains(abs)) {
             const same = host.len > 0 and std.mem.eql(u8, hostOf(abs), host);
             if ((same and ni.* < max) or (!same and ne.* < max)) {
-                seen.put(gpa, gpa.dupe(u8, abs) catch abs, {}) catch {};
+                // seen keys are bulk gpa-freed by extractLinks, so only a gpa-owned dupe may be stored
+                // (`abs` is arena/html-backed — freeing it is invalid); on OOM skip the dedupe entry.
+                if (gpa.dupe(u8, abs) catch null) |key| seen.put(gpa, key, {}) catch gpa.free(key);
                 var tb: std.ArrayListUnmanaged(u8) = .empty;
                 aText(node, &tb, ta);
                 const text = clipText(std.mem.trim(u8, tb.items, " \t\r\n"), 90);
@@ -825,7 +839,8 @@ fn walkLinks(node: *const Node, base: []const u8, host: []const u8, gpa: std.mem
     } else if (std.mem.eql(u8, node.tag, "img") and node.src.len > 0 and nm.* < max) {
         const abs = absUrl(ta, base, node.src);
         if (std.mem.startsWith(u8, abs, "http") and !seen.contains(abs)) {
-            seen.put(gpa, gpa.dupe(u8, abs) catch abs, {}) catch {};
+            // gpa-owned key only — same invalid-free hazard as the anchor branch above
+            if (gpa.dupe(u8, abs) catch null) |key| seen.put(gpa, key, {}) catch gpa.free(key);
             const alt = clipText(std.mem.trim(u8, node.alt, " \t\r\n"), 90);
             media.appendSlice(gpa, std.fmt.allocPrint(ta, "- {s}{s}{s}\n", .{ alt, if (alt.len > 0) " | " else "", abs }) catch "") catch {};
             nm.* += 1;

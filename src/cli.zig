@@ -64,6 +64,7 @@ pub fn isCommand(sub: []const u8) bool {
 /// `veil cast "goal" --minutes 5` it is {"goal","--minutes","5"}). Never boots the server in-process — a verb
 /// that needs it talks over HTTP (auto-starting a detached daemon first).
 pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
+    stdout_io = ctx.io;
     ctx.loadToken();
     if (std.mem.eql(u8, sub, "help") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "-h"))
         return cmdHelp();
@@ -82,7 +83,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "hub")) return cmdHub(ctx, args);
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx);
     if (std.mem.eql(u8, sub, "desktop") or std.mem.eql(u8, sub, "desk")) return cmdDesktop(ctx);
-    out("unknown command '{s}' — run `veil help`\n", .{sub});
+    std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
 
@@ -151,7 +152,7 @@ fn ensureServer(ctx: *Ctx) bool {
 }
 
 fn unreachable_msg(ctx: *Ctx) u8 {
-    out("no veil server on :{d} and it could not be started. Run `veil` (no arguments) in the repo to boot it.\n", .{ctx.port});
+    std.debug.print("no veil server on :{d} and it could not be started. Run `veil` (no arguments) in the repo to boot it.\n", .{ctx.port});
     return 1;
 }
 
@@ -243,11 +244,11 @@ fn cmdCast(ctx: *Ctx, args: []const []const u8) u8 {
     const resp = call(ctx, "POST", "/api/v1/cast", jb.items, 30, true) catch return unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
     if (resp.status != 200 and resp.status != 201) {
-        out("cast rejected (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+        std.debug.print("cast rejected (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
         return 1;
     }
     const id = jsonStr(ctx.gpa, resp.body, "id") orelse {
-        out("cast accepted but no id in reply: {s}\n", .{resp.body[0..@min(resp.body.len, 200)]});
+        std.debug.print("cast accepted but no id in reply: {s}\n", .{resp.body[0..@min(resp.body.len, 200)]});
         return 0;
     };
     defer ctx.gpa.free(id);
@@ -262,7 +263,7 @@ fn cmdList(ctx: *Ctx) u8 {
     const resp = call(ctx, "GET", "/api/v1/swarms", null, 6, true) catch return unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
     if (resp.status != 200) {
-        out("list failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        std.debug.print("list failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
         return 1;
     }
     // The response is a JSON array of swarm objects. Rather than a full parse, walk each {…} and pull the
@@ -298,7 +299,7 @@ fn cmdStop(ctx: *Ctx, args: []const []const u8) u8 {
         out("stop requested for {s}\n", .{args[0]});
         return 0;
     }
-    out("stop failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+    std.debug.print("stop failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
     return 1;
 }
 
@@ -315,7 +316,7 @@ fn cmdRm(ctx: *Ctx, args: []const []const u8) u8 {
         out("removed {s}\n", .{args[0]});
         return 0;
     }
-    out("remove failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+    std.debug.print("remove failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
     return 1;
 }
 
@@ -336,7 +337,7 @@ fn cmdEvents(ctx: *Ctx, args: []const []const u8) u8 {
     const resp = call(ctx, "GET", path, null, 8, true) catch return unreachable_msg(ctx);
     defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
     if (resp.status != 200) {
-        out("events failed (HTTP {d})\n", .{resp.status});
+        std.debug.print("events failed (HTTP {d})\n", .{resp.status});
         return 1;
     }
     out("{s}\n", .{resp.body});
@@ -358,7 +359,7 @@ fn followEvents(ctx: *Ctx, id: []const u8) u8 {
         };
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status == 200 and resp.body.len > 0) {
-            std.debug.print("{s}", .{resp.body});
+            out("{s}", .{resp.body});
             from += resp.body.len;
             idle = 0;
             if (std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null) {
@@ -381,11 +382,11 @@ fn cmdSched(ctx: *Ctx, args: []const []const u8) u8 {
         const resp = call(ctx, "GET", "/api/v1/sched", null, 6, true) catch return unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status == 403) {
-            out("scheduled tasks are admin-only — the CLI needs the admin .desktop_key\n", .{});
+            std.debug.print("scheduled tasks are admin-only — the CLI needs the admin .desktop_key\n", .{});
             return 1;
         }
         if (resp.status != 200) {
-            out("sched list failed (HTTP {d})\n", .{resp.status});
+            std.debug.print("sched list failed (HTTP {d})\n", .{resp.status});
             return 1;
         }
         var it = JsonObjs.init(resp.body);
@@ -420,7 +421,7 @@ fn cmdSched(ctx: *Ctx, args: []const []const u8) u8 {
             } else out("ran now\n", .{});
             return 0;
         }
-        out("run failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        std.debug.print("run failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
         return 1;
     }
     if (std.mem.eql(u8, verb, "rm") or std.mem.eql(u8, verb, "delete")) {
@@ -468,7 +469,7 @@ fn cmdSched(ctx: *Ctx, args: []const []const u8) u8 {
             }
             return 0;
         }
-        out("create failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        std.debug.print("create failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
         return 1;
     }
     out("usage: veil sched [list|add|run|rm] …\n", .{});
@@ -481,12 +482,12 @@ fn cmdDesktop(ctx: *Ctx) u8 {
     const checkout = std.fmt.bufPrint(&eb, "{s}/desk/zig-out/bin/{s}", .{ ctx.home, desk_exe }) catch return 1;
     const bundle = std.fmt.bufPrint(eb[350..], "{s}/{s}", .{ ctx.home, desk_exe }) catch return 1;
     const bin = if (std.Io.Dir.cwd().access(ctx.io, checkout, .{})) |_| checkout else |_| if (std.Io.Dir.cwd().access(ctx.io, bundle, .{})) |_| bundle else |_| {
-        out("veil-desk isn't built. Build it: cd desk && zig build --release=fast\n", .{});
+        std.debug.print("veil-desk isn't built. Build it: cd desk && zig build --release=fast\n", .{});
         return 1;
     };
     _ = ensureServer(ctx); // the desk lights up against a running server
     _ = std.process.spawn(ctx.io, .{ .argv = &.{bin}, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
-        out("could not launch the desktop\n", .{});
+        std.debug.print("could not launch the desktop\n", .{});
         return 1;
     };
     out("launched veil-desk\n", .{});
@@ -582,7 +583,7 @@ fn renderConvFrames(ctx: *Ctx, bytes: []const u8) void {
         if (std.mem.eql(u8, kind, "token")) {
             if (jsonStr(ctx.gpa, ln, "delta")) |d| {
                 defer ctx.gpa.free(d);
-                std.debug.print("{s}", .{d});
+                out("{s}", .{d}); // the reply itself — stdout, so piping a chat turn captures it
             }
         } else if (std.mem.eql(u8, kind, "tool")) {
             if (jsonStr(ctx.gpa, ln, "tool")) |tname| {
@@ -602,8 +603,17 @@ fn renderConvFrames(ctx: *Ctx, bytes: []const u8) void {
 
 // ------------------------------------------------------------------------------- small helpers
 
-fn out(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print(fmt, args);
+// Captured once in dispatch. Results print to STDOUT so they survive a pipe (`veil ls | grep`,
+// `veil events <id> > log`); errors and usage notes stay on std.debug.print's stderr. Threading io
+// through ~50 pure-output call sites buys nothing in a single-threaded CLI, hence the file-scope copy.
+var stdout_io: ?std.Io = null;
+
+pub fn out(comptime fmt: []const u8, args: anytype) void {
+    const io = stdout_io orelse return std.debug.print(fmt, args);
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    w.interface.print(fmt, args) catch return;
+    w.interface.flush() catch {};
 }
 
 /// `--flag value` reader: if `a == flag`, advance `*i` past the value and return it (empty when it's the last
