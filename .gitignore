@@ -4,20 +4,20 @@ zig-out/
 zig-cache/
 zig-pkg/
 
-# toolchains the installer / build scripts bootstrap into the tree (deploy.py, lib-deps.sh)
+# toolchains the installer / build scripts bootstrap into the tree (lib-deps.sh)
 .zig/
 .zig-dl/
 .neuron-src/
 rustup-init.exe
 
-# Python
+# Python bytecode (the example fixtures under examples/ are still Python)
 __pycache__/
 *.py[cod]
 
 # Runtime: per-run swarm dirs (work, sqlite memory, event streams)
 data/
 
-# Fleet hub (hub.py serve) roster/audit snapshot — runtime state, not source
+# Fleet-console roster/audit snapshot — runtime state, not source
 hub_state.json
 hub_state.json.tmp
 
@@ -33,11 +33,11 @@ keys.env
 !.env.example
 
 # The neuron memory-engine binary is a build artifact / release asset, not source.
-# deploy.py fetches + builds it on first run (or place it at bin/neuron[.exe] yourself).
+# Place it at bin/neuron[.exe] (ships prebuilt in the release bundle).
 bin/*
 !bin/.gitkeep
 
-# neuron-db source + target that deploy.py downloads and compiles on first run
+# neuron-db source + target compiled from the sibling repo when building the engine
 .neuron-src/
 
 # OS / editor noise

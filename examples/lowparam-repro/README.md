@@ -19,12 +19,12 @@ and write-time RAG grounding.
 ## Run
 
 ```sh
-python deploy.py "Build a small Python command-line task tracker. Files: store.py (load_tasks/save_tasks/next_task_id, TASKS_PATH constant), cli.py (argparse subcommands add/list/done), and test_store.py (pytest round-trip test using a temp dir). Follow the conventions in hive memory exactly." \
+veil cast "Build a small Python command-line task tracker. Files: store.py (load_tasks/save_tasks/next_task_id, TASKS_PATH constant), cli.py (argparse subcommands add/list/done), and test_store.py (pytest round-trip test using a temp dir). Follow the conventions in hive memory exactly." \
   --name lp_repro --minds 2 --minutes 7 \
-  --model llama3.1:8b --provider ollama --offline \
-  --corpus examples/lowparam-repro/sim_tasktracker.facts \
-  --neuron-bin bin/neuron.exe --bin zig-out/bin/veil.exe --detach -y
+  --model llama3.1:8b --provider ollama --offline --continuous
 ```
+
+(The server resolves its own binary + neuron engine; `veil cast` just needs the goal and knobs.)
 
 ## Grade
 

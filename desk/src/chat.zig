@@ -5192,7 +5192,7 @@ pub const Chat = struct {
 
         const resp = self.runner().cast(self.io, self.gpa, w.buffered()) orelse {
             log.err("cast: netcli returned NULL (no response after retries) — server on :{d}?", .{port});
-            self.appendMsg(dd, .cast_note, "[cast] no response from the veil server on :8787 — it may be starting up or briefly busy. If casts keep failing, make sure the server is running (run the veil server / `python deploy.py`), then try again.");
+            self.appendMsg(dd, .cast_note, "[cast] no response from the veil server on :8787 — it may be starting up or briefly busy. If casts keep failing, make sure the server is running (run `veil`), then try again.");
             self.updateCastRow(.failed, 0, -1, "no response from :8787 (busy or down)", "");
             self.store.pushNotif("Cast failed", "no response from :8787 — try again", 2);
             self.setStatus("");
@@ -5205,7 +5205,7 @@ pub const Chat = struct {
             // (also the usual cause of the on/offline flapping, since it predates the crash + httpz-spin fixes).
             var nb: [280]u8 = undefined;
             const msg = if (resp.status == 404)
-                std.fmt.bufPrint(&nb, "[cast] the veil server is out of date — its build predates the cast endpoint (HTTP 404). Rebuild + restart it (`zig build --release=fast` then relaunch veil.exe, or `python deploy.py`). I'll answer directly from chat in the meantime.", .{}) catch "[cast] server out of date (404) — rebuild + restart it"
+                std.fmt.bufPrint(&nb, "[cast] the veil server is out of date — its build predates the cast endpoint (HTTP 404). Rebuild + restart it (`zig build --release=fast` then relaunch `veil`). I'll answer directly from chat in the meantime.", .{}) catch "[cast] server out of date (404) — rebuild + restart it"
             else
                 std.fmt.bufPrint(&nb, "[cast] rejected by the server (HTTP {d}): {s}", .{ resp.status, resp.body[0..@min(resp.body.len, 120)] }) catch "[cast] rejected";
             self.appendMsg(dd, .cast_note, msg);

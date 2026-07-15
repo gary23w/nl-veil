@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseFast by DEFAULT: this binary is what every user runs (deploy.py builds it with a bare
+    // ReleaseFast by DEFAULT: this binary is what every user runs (the `veil` shim builds it with a bare
     // `zig build`), and the engine's hot paths — BM25 page fitting, salvage scans over long replies,
     // VCS merges, atlas matching on every fetch — run 5-20x slower in Debug. Developers still get a
     // debug build explicitly with `zig build -Doptimize=Debug`.

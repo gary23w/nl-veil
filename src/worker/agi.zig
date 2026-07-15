@@ -407,7 +407,7 @@ pub fn veilConverse(w: *Worker, goal: []const u8, user_text: []const u8) void {
     commons.sendMessage(gpa, w.io, w.run_dir, "veil", "all", clip(user_text, 600), w.cur_round);
 }
 
-/// THE VEIL SHELL FAST LANE. The shell (deploy.py chat) already answered the operator OUT-OF-BAND in the veil's
+/// THE VEIL SHELL FAST LANE. The shell already answered the operator OUT-OF-BAND in the veil's
 /// voice — seconds, not round boundaries. `op:"veil","answered":1` lands here: record the exchange as lived
 /// conversation (veil_chat.jsonl + veil_msg events, so the web pane and every reconnect replay it) and, when the
 /// shell flagged steer, adopt the distilled directive — WITHOUT composing a second reply (one veil, one voice).

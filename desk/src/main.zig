@@ -4051,22 +4051,24 @@ fn drawHub(body: t.Rect) void {
     var y: f32 = body.y + pad;
     const x: f32 = pad;
     const colw = body.width - pad * 2;
-    t.text(t.z("Hub - connect hives across machines", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
+    t.text(t.z("Hub - the fleet console", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
     y += 38;
     const card = t.Rect{ .x = x, .y = y, .width = colw, .height = 150 };
     t.panelBordered(card, t.bg_dark, t.border);
-    t.text(t.z("The hub meshes many veil hosts into one console.", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 13, t.fg_dim);
-    t.text(t.z("Run the receiver once on a hosted box:", .{}), @intFromFloat(x + 14), @intFromFloat(y + 42), 12, t.comment);
-    t.text(t.z("python hub.py serve", .{}), @intFromFloat(x + 14), @intFromFloat(y + 60), 13, t.cyan);
-    t.text(t.z("On each veil host, start the callback:", .{}), @intFromFloat(x + 14), @intFromFloat(y + 88), 12, t.comment);
-    t.text(t.z("python hub.py agent --hub URL", .{}), @intFromFloat(x + 14), @intFromFloat(y + 106), 13, t.cyan);
+    t.text(t.z("The running server already aggregates every swarm you own. The `veil hub`", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 13, t.fg_dim);
+    t.text(t.z("CLI operates the whole fleet at once, over the same API this dashboard uses:", .{}), @intFromFloat(x + 14), @intFromFloat(y + 34), 13, t.fg_dim);
+    t.text(t.z("veil hub", .{}), @intFromFloat(x + 14), @intFromFloat(y + 62), 13, t.cyan);
+    t.text(t.z("roster: fleet summary + every swarm's state", .{}), @intFromFloat(x + 150), @intFromFloat(y + 62), 12, t.comment);
+    t.text(t.z("veil hub all \"...\"", .{}), @intFromFloat(x + 14), @intFromFloat(y + 84), 13, t.cyan);
+    t.text(t.z("broadcast a directive to every swarm", .{}), @intFromFloat(x + 150), @intFromFloat(y + 84), 12, t.comment);
+    t.text(t.z("veil hub stopall", .{}), @intFromFloat(x + 14), @intFromFloat(y + 106), 13, t.cyan);
+    t.text(t.z("stop the whole fleet", .{}), @intFromFloat(x + 150), @intFromFloat(y + 106), 12, t.comment);
     y += 166;
-    const card2 = t.Rect{ .x = x, .y = y, .width = colw, .height = 120 };
+    const card2 = t.Rect{ .x = x, .y = y, .width = colw, .height = 90 };
     t.panelBordered(card2, t.bg_dark, t.border);
-    t.text(t.z("Fleet console", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 14, t.fg);
-    t.text(t.z("python hub.py console --hub URL", .{}), @intFromFloat(x + 14), @intFromFloat(y + 40), 13, t.cyan);
-    t.text(t.z("Live roster, broadcast a directive to every veil, target one, stop all.", .{}), @intFromFloat(x + 14), @intFromFloat(y + 66), 12, t.comment);
-    t.text(t.z("Wire NL_HUB_URL + NL_HUB_SECRET in Settings to embed this here (next).", .{}), @intFromFloat(x + 14), @intFromFloat(y + 88), 12, t.comment);
+    t.text(t.z("Many veils, one console", .{}), @intFromFloat(x + 14), @intFromFloat(y + 14), 14, t.fg);
+    t.text(t.z("Cross-machine aggregation is a planned server endpoint; today the console", .{}), @intFromFloat(x + 14), @intFromFloat(y + 40), 12, t.comment);
+    t.text(t.z("operates the local server's fleet. Run `veil hub help` for the full surface.", .{}), @intFromFloat(x + 14), @intFromFloat(y + 60), 12, t.comment);
 }
 
 // -------------------------------------------------------------------------------- settings
@@ -4208,17 +4210,31 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
             store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
         }
         // the newest run's conversation — click to open it in Chat (a server-side conv mirrors on select)
+        var conv_label_hot = false;
         if (row.last_conv_len > 0) {
             const cw: f32 = @min(170, @max(0, runb.x - (rr.x + 44 + name_w) - 12));
             if (cw > 40) {
                 const cr = t.Rect{ .x = runb.x - cw - 8, .y = rr.y + (rr.height - 14) / 2, .width = cw, .height = 16 };
-                const chot = t.hovering(cr);
-                t.textClip(row.lastConvStr(), @intFromFloat(cr.x), @intFromFloat(cr.y), 12, if (chot) t.fg else t.cyan, @intFromFloat(cw));
-                if (chot) t.wantCursor(.pointing_hand);
-                if (chot and rl.isMouseButtonPressed(.left)) {
+                conv_label_hot = t.hovering(cr);
+                t.textClip(row.lastConvStr(), @intFromFloat(cr.x), @intFromFloat(cr.y), 12, if (conv_label_hot) t.fg else t.cyan, @intFromFloat(cw));
+                if (conv_label_hot) t.wantCursor(.pointing_hand);
+                if (conv_label_hot and rl.isMouseButtonPressed(.left)) {
                     store.pushChatCmd(store_mod.mkChatCmd(.select_conv, row.lastConvStr(), ""));
                     setTab(.chat);
                 }
+            }
+        }
+        // ROW CLICK → the same jump: the whole row is the natural target (the tiny label alone was missed).
+        // Excludes the row's own controls (checkbox / run now / delete / conv label) so their clicks stay theirs.
+        const cb_r = t.Rect{ .x = rr.x + 10, .y = rr.y, .width = 18, .height = rr.height };
+        const row_hot = hot and !t.hovering(cb_r) and !t.hovering(runb) and !t.hovering(xb) and !conv_label_hot;
+        if (row_hot and row.last_conv_len > 0) t.wantCursor(.pointing_hand);
+        if (row_hot and rl.isMouseButtonPressed(.left)) {
+            if (row.last_conv_len > 0) {
+                store.pushChatCmd(store_mod.mkChatCmd(.select_conv, row.lastConvStr(), ""));
+                setTab(.chat);
+            } else {
+                store.pushNotif("No runs yet", "this task hasn't produced a chat - press run now", 2);
             }
         }
         yy += row_h;

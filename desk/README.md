@@ -1,9 +1,13 @@
 # veil-desk
 
 The native desktop dashboard for **nl-veil** — a same-machine companion that gives you a styled UI over
-every swarm on your box: deploy, monitor, chat, and stop hives; watch the live event console and metrics;
-and reach the fleet **Hub**. Built in Zig + [raylib](https://www.raylib.com/), themed in the same Tokyo
-Night palette as the web UI, and cross-platform (Windows / Linux / macOS).
+every swarm on your box: deploy, monitor, chat, and stop hives; craft **Scheduled** tasks; watch the live
+event console and metrics; and reach the fleet **Hub**. Built in Zig + [raylib](https://www.raylib.com/),
+themed in the same Tokyo Night palette as the web UI, and cross-platform (Windows / Linux / macOS).
+
+The chat brain lives in the **server** (`POST /api/v1/chat/convs/:id/messages`, streamed back from
+`/events`); the desk is a thin client that renders it. The same is true of scheduled tasks (`/api/v1/sched`)
+— each run is a server-side chat conversation.
 
 ## What it does
 
@@ -18,7 +22,9 @@ Night palette as the web UI, and cross-platform (Windows / Linux / macOS).
 - **Swarm** — open any swarm to get inner tabs: **Console** (the live event log, color-coded by mind) and
   **Details** (score / pct / best / round / files / smoke gate / tokens in-out-cached / the zero-gradient
   sentinel). A **chat** row messages the hive (`say`), plus **Set goal** and **Stop**.
-- **Hub** — the fleet hub (`hub.py`) commands for meshing many hosts into one console.
+- **Scheduled** — standing instructions the server runs on its own clock (once / every N minutes / daily);
+  each run lands as a `scheduled_*` chat conversation. Build one from scratch or from an open chat's context.
+- **Hub** — the fleet console; the `veil hub` CLI operates every swarm at once over the same API.
 - **Settings** — data directory, server port + reachability, an API token (`nlk_…`) for Deploy, notifications.
 - **System tray + notifications** — on Windows it owns a tray icon (anchored to a hidden message window)
   and raises native toasts on state changes (server up/down, a swarm finishing, a zero-gradient warning);
@@ -26,12 +32,12 @@ Night palette as the web UI, and cross-platform (Windows / Linux / macOS).
 
 ## Architecture
 
-Two threads, one hard rule each. The **UI thread** owns raylib (its hard single-thread requirement) and
-only ever reads a mutex-guarded `Store`. The **poller thread** owns the `std.Io` handle and does *all* I/O
-— it reads the run directories directly (no HTTP, no auth, no latency), TCP-probes the server for the
-online signal, and only reaches the HTTP API for the two actions that genuinely need the running server
-(fleet counters + deploy). Everything else — monitor, chat, set-goal, stop — flows through the same
-`control.jsonl` file bus the worker already drains.
+Three threads. The **UI thread** owns raylib (its hard single-thread requirement) and only ever reads a
+mutex-guarded `Store`. The **poller thread** owns a `std.Io` handle and does the swarm-side I/O — it reads
+run directories directly, TCP-probes the server, and calls the HTTP API for fleet counters, deploy, and
+scheduled-task CRUD. The **chat worker thread** owns chat: it POSTs a message to the server
+(`/api/v1/chat/convs/:id/messages`), polls `/events` to stream the turn's frames, and writes steers/stops
+to `/control` — the brain runs server-side, so the desk just renders it.
 
 | file | role |
 |------|------|
@@ -56,7 +62,7 @@ target OS** (the normal raylib workflow):
 - **Windows**: no extra install (uses the bundled opengl32/gdi32/winmm).
 
 ```sh
-cd desktop
+cd desk
 zig build            # produces zig-out/bin/veil-desk[.exe]
 zig build run        # build + launch
 zig test src/scan.zig   # data-layer tests (parses real run dirs under ../data)
@@ -64,11 +70,11 @@ zig test src/scan.zig   # data-layer tests (parses real run dirs under ../data)
 
 The dependency (`raylib-zig`) is fetched and pinned via `build.zig.zon` — no vendoring needed.
 
-**The server can build and host it for you.** A plain `zig build` at the repo root now does a server-only
-build. Pass `-Ddesktop=true` to also build veil-desk (best-effort), and run with `zig build run
--Ddesktop=true` to start the server in desktop-host mode so the dashboard launches on startup. Set
-`NL_NO_DESKTOP=1` to force-disable launch even in desktop mode. `python deploy.py desktop [--install]
-[--launch]` builds it and can register a login autostart entry.
+**The server can build and host it for you.** A plain `zig build` at the repo root does a server-only
+build. Pass `-Ddesk=true` to also build veil-desk (best-effort), and run with `zig build run -Ddesk=true`
+to start the server in desktop-host mode so the dashboard launches on startup. Set `NL_NO_DESKTOP=1` to
+force-disable launch even in desktop mode. From the CLI, `veil desktop` launches the dashboard against a
+running server.
 
 **Connects with no key pasting.** On a localhost bind the server mints an admin API key and drops it at
 `<data>/.desktop_key`; the desktop reads it on launch, so **Deploy works out of the box** — no need to
@@ -87,8 +93,8 @@ it appears in the roster within a second.
 
 ## Notes / next
 
-- Login/register is intentionally deferred; Deploy uses an API token you paste in Settings (grab one from
-  the web UI's API keys). Monitor/chat/stop need no auth (same machine, same user).
-- The Hub tab currently shows the connect commands; embedding the live fleet roster (via
-  `NL_HUB_URL`/`NL_HUB_SECRET`) is the next increment.
+- Login/register is intentionally deferred; on a localhost bind the desk auto-loads the server's admin key
+  from `<data>/.desktop_key`, so Deploy/chat/scheduled tasks work with no paste.
+- The Hub tab documents the `veil hub` CLI (roster / broadcast / stopall over the local fleet); cross-machine
+  aggregation is a planned server endpoint.
 - POSIX native toasts (notify-send / osascript) are stubbed for v1 — the in-app toast covers all platforms.

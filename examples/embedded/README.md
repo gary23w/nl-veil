@@ -52,7 +52,7 @@ respawn.** A real heal removes the root cause, not just the symptom.
 ## Prerequisites
 
 - The engine binary built at `zig-out/bin/veil` (run `zig build` at the repo root).
-- The `neuron` CLI at `bin/neuron` (the `deploy.py` wizard fetches and builds it on first run).
+- The `neuron` CLI at `bin/neuron` (ships prebuilt in the repo / release bundle).
 - Python 3 on `PATH`.
 - A model. The harnesses default to a local `llama3.1:8b` via Ollama; override with the
   `VEIL_MODEL`, `VEIL_PROVIDER`, `VEIL_BASE_URL`, and `VEIL_KEY` environment variables for any

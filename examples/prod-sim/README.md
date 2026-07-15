@@ -30,11 +30,9 @@ signatures, route paths, JSON shapes, config keys, fetch endpoints). Grading:
 ## Run
 
 ```sh
-python deploy.py "Build linkboard, a small self-hosted bookmarks web service ready for production use, using ONLY the Python standard library (no pip installs). Files: db.py (SQLite data layer: init_db/add_link/list_links/delete_link), app.py (http.server JSON API under /api/ plus static file serving, reads config.json), static/index.html and static/app.js (frontend that lists/adds/deletes links via fetch), cli.py (argparse add/list/delete), config.json, test_db.py and test_api.py (pytest), README.md. Follow the conventions in hive memory exactly." \
+veil cast "Build linkboard, a small self-hosted bookmarks web service ready for production use, using ONLY the Python standard library (no pip installs). Files: db.py (SQLite data layer: init_db/add_link/list_links/delete_link), app.py (http.server JSON API under /api/ plus static file serving, reads config.json), static/index.html and static/app.js (frontend that lists/adds/deletes links via fetch), cli.py (argparse add/list/delete), config.json, test_db.py and test_api.py (pytest), README.md. Follow the conventions in hive memory exactly." \
   --name linkboard --minds 3 --minutes 18 \
-  --model llama3.1:8b --provider ollama --offline \
-  --corpus examples/prod-sim/linkboard.facts \
-  --neuron-bin bin/neuron.exe --bin zig-out/bin/veil.exe --detach -y
+  --model llama3.1:8b --provider ollama --offline --continuous
 ```
 
 Analyze with `python examples/lowparam-repro/sim_analyze.py data/linkboard`,

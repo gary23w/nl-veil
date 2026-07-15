@@ -1,14 +1,33 @@
 #!/bin/sh
-# veil - the front door. Alone it opens the veil shell; with a task it casts a swarm on the fly:
-#   veil
-#   veil "add a header search to my landing page" --embed . --repl
-# A thin wrapper over deploy.py. The installer symlinks this into ~/.local/bin, so resolve
-# symlinks back to the real repo before looking for deploy.py next to it.
+# veil - the front door. Alone it runs the server (foreground); with a verb it drives the running
+# server over its API:
+#   veil                                 # run the server daemon (add --desk to host the desktop)
+#   veil cast "add a header search"      # deploy a swarm
+#   veil chat                            # talk to the server-side veil brain
+#   veil list | stop <id> | sched | hub  # fleet + scheduled-task control
+# Everything is the compiled `veil` binary now (the CLI is built in). The installer symlinks this shim
+# into ~/.local/bin, so resolve symlinks back to the real repo before locating the binary next to it.
 SRC=$0
 while [ -h "$SRC" ]; do
   T=$(readlink "$SRC")
   case $T in /*) SRC=$T ;; *) SRC=$(dirname "$SRC")/$T ;; esac
 done
 DIR="$(cd "$(dirname "$SRC")" && pwd)"
-PY="$(command -v python3 || command -v python)"
-exec "$PY" "$DIR/deploy.py" "$@"
+
+# Prefer a checkout build, then a release bundle laid next to the shim.
+BIN="$DIR/zig-out/bin/veil"
+[ -x "$BIN" ] || BIN="$DIR/bin/veil"
+
+if [ ! -x "$BIN" ]; then
+  # Fresh checkout: build once. Needs zig 0.16+ on PATH.
+  if command -v zig >/dev/null 2>&1; then
+    echo "veil: building the binary (first run)..." >&2
+    ( cd "$DIR" && zig build --release=fast ) || { echo "veil: build failed — install zig 0.16+ and retry" >&2; exit 1; }
+    BIN="$DIR/zig-out/bin/veil"
+  else
+    echo "veil: no binary and no zig on PATH. Install zig 0.16+ then run 'zig build --release=fast' in $DIR" >&2
+    exit 1
+  fi
+fi
+
+exec "$BIN" "$@"

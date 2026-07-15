@@ -81,7 +81,7 @@ elif [ -d "$ROOT/../neuron-db/rust/neuron-core" ] && command -v cargo >/dev/null
   cand="$ROOT/../neuron-db/rust/neuron-core/target/release/neuron$EXE"
   [ -f "$cand" ] && neuron="$cand"
 fi
-[ -n "$neuron" ] || say "! no neuron binary found — bundle will fetch/build it on first run (needs deploy.py)"
+[ -n "$neuron" ] || say "! no neuron binary found — commit one to bin/ or build neuron-db before bundling"
 
 # ---- 3. assemble the bundle ----
 NAME="veil-v$VERSION-$OS-$ARCH"

@@ -54,7 +54,7 @@ else {
     if (Test-Path $cand) { $Neuron = $cand }
   }
 }
-if (-not $Neuron) { Say '! no neuron binary found - bundle will fetch/build it on first run (needs deploy.py)' }
+if (-not $Neuron) { Say '! no neuron binary found - commit one to bin/ or build neuron-db before bundling' }
 
 # ---- 3. assemble the bundle ----
 $Name = "veil-v$Version-$Os-$Arch"
