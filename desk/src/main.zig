@@ -2585,8 +2585,19 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             }
         }
         // Turning it on with an idle, non-empty conversation kicks the first iteration immediately; otherwise it
-        // engages after the next turn settles. Turning it off just stops new iterations (the in-flight turn finishes).
+        // engages after the next turn settles.
         if (mode > 0) store.pushChatCmd(store_mod.mkChatCmd(.loop_kick, "", ""));
+        // Turning it OFF: for a LOCAL-engine turn this just stops new iterations (the in-flight turn finishes). But
+        // when the SERVER is driving this conv's loop, ONE persistent turn IS the loop — clearing the local flag does
+        // nothing to it, so post a Stop to actually halt the server-side loop (Stop is the sole afk exit besides this).
+        if (mode == 0) {
+            const server_driving = blk_sd: {
+                store.lock();
+                defer store.unlock();
+                break :blk_sd store.chat_server_turn;
+            };
+            if (server_driving) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+        }
         if (mode == 2) {
             store.pushNotif("Auto-loop AFK", "runs forever - no DONE, failure, or cap stops it; click the toggle (or Stop) to end it", 1);
         } else if (mode == 1) {

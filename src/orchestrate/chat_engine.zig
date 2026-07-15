@@ -31,11 +31,29 @@ const App = http.App;
 /// single-turn build; the outer DRIVE_MAX still bounds the whole turn, and a genuine runaway summarizes (below).
 const MAX_ITERS: usize = 24;
 
-/// Hard ceiling on AUTO-LOOP drive steps in one turn. Lowered 30 -> 6: at 30 a thorough model would "verify"
-/// and re-read forever after a fix (observed: a fix-the-bug turn drove endlessly, thousands of frames). 6 is
-/// enough for a build + a couple of follow-through steps; a plain Q&A still stops after one (DONE). The user's
-/// Stop now reaches the turn (control.jsonl), and MAX_ITERS bounds each step's tool rounds.
+/// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Lowered 30 -> 6: at 30 a
+/// thorough model would "verify" and re-read forever after a fix (observed: a fix-the-bug turn drove endlessly,
+/// thousands of frames). 6 is enough for a build + a couple of follow-through steps; a plain Q&A still stops after
+/// one (DONE). The user's Stop reaches the turn (control.jsonl), and MAX_ITERS bounds each step's tool rounds.
 const DRIVE_MAX: usize = 6;
+
+/// AUTO-LOOP mode (the desk's chat_loop / chat_loop_afk tiers, now driven SERVER-side). off = a normal bounded
+/// turn; on = the veil writes its own next step and drives toward the goal until DONE / no-progress / the cap;
+/// afk = the persistent tier — it NEVER accepts an end state (DONE folds into a re-verify+extend drive, the repeat
+/// guard is skipped, the cap wraps), so only the user's Stop ends it. Passed on the /messages body (loop: 0|1|2).
+const LOOP_OFF: u8 = 0;
+const LOOP_ON: u8 = 1;
+const LOOP_AFK: u8 = 2;
+/// Drive-step cap for loop=ON (desk LOOP_MAX_ITERS): a long autonomous task needs many steps, but a non-afk loop
+/// still terminates on its own (DONE / two idle steps / repeat) well before this — it's the runaway backstop.
+const LOOP_MAX_STEPS: usize = 30;
+/// Drive-step cap for loop=AFK: effectively unbounded (the user explicitly opted into "run until I Stop"). Every
+/// step drains control (Stop exits promptly) and compacts the working context, so this large bound is a pure
+/// runaway backstop, not a functional limit.
+const AFK_MAX_STEPS: usize = 100_000;
+/// What loop=AFK injects as the next drive step when the driver declares DONE — the afk tier never accepts an end
+/// state, so "done" becomes a re-verify + extend (desk AFK_DRIVE_MSG). Only the user's Stop ends afk.
+const AFK_DRIVE_MSG = "keep going: re-verify the latest work end-to-end, then pick the most valuable next improvement or extension toward the goal and do it.";
 
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
@@ -210,7 +228,7 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, loop: u8) void {
     const gpa = app.gpa;
 
     // ---- store + build paths (conv store under convs/, build tree under builds/ — same split as runMindTool) ----
@@ -353,7 +371,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     var prev_drive: []u8 = gpa.dupe(u8, user_text) catch &[_]u8{};
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
 
-    const max_steps = if (has_plan) PLAN_STEPS_PER_TURN else DRIVE_MAX;
+    // AUTO-LOOP MODE (desk chat_loop / chat_loop_afk, now server-driven). A plan drives its own subtask budget; a
+    // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
+    const armed = loop >= LOOP_ON;
+    const afk = loop >= LOOP_AFK;
+    const max_steps = if (has_plan) PLAN_STEPS_PER_TURN else if (afk) AFK_MAX_STEPS else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
+    var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
+    if (armed) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
     var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
@@ -468,11 +492,24 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             continue :outer;
         }
 
-        // FAST PATH: a first-step, no-plan answer that used NO tools is a complete one-shot reply (a plain Q&A) —
-        // there's no agentic work in flight to continue, so the LOOP_QUESTION "are you done?" completion below is
-        // pure wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on EVERY simple
-        // chat). End the turn now. Anything that ran a tool (agentic work) still drives so multi-step work continues.
-        if (drive == 0 and !inner.tools_ran) break :outer;
+        // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass.
+        if (!inner.tools_ran) {
+            if (!armed) {
+                // OFF: a first-step no-plan answer with no tools is a complete one-shot reply (plain Q&A) — end now,
+                // skipping the wasted LOOP_QUESTION round-trip. (A drive>0 no-tools step falls through to the DONE
+                // check below, which ends it.)
+                if (drive == 0) break :outer;
+            } else {
+                // ARMED: tolerate ONE idle (announce-only) step so a build that pauses to narrate isn't cut off, but
+                // end a non-afk loop after TWO consecutive idle steps (that's a conversation, not work). AFK never
+                // ends on idle — persistence IS the feature — so its counter just resets.
+                idle_steps += 1;
+                if (idle_steps >= 2) {
+                    if (!afk) break :outer;
+                    idle_steps = 0;
+                }
+            }
+        } else idle_steps = 0;
 
         // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE). The loop question is a
         // SYNTHETIC turn — appended only long enough to ask, then truncated back off conv_buf so it never rides
@@ -486,21 +523,28 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         conv_buf.shrinkRetainingCapacity(saved_len); // drop the synthetic loop question
 
         const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
-        // STOP the drive when the goal is achieved (DONE), the inference is empty/failed, the next step just
-        // repeats the last one (no progress), OR the next step is itself leaked tool-call markup rather than a real
-        // instruction (a malfunctioning model — driving on it is the "janked back and forth" churn). The settled
-        // answer above is the turn's final reply.
-        if (!next.ok or trimmed.len == 0 or loopIsDone(next.content) or nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed)) break :outer;
+        // A failed/empty drive inference always ends the turn (even afk — we can't determine a next step, and a
+        // dead backend would spin). Otherwise decide by loop mode.
+        if (!next.ok or trimmed.len == 0) break :outer;
+        const is_done = loopIsDone(next.content);
+        const is_repeat = nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed);
+        // DONE: OFF/ON end (goal achieved); AFK NEVER accepts an end state — DONE folds into a re-verify+extend
+        // drive so the conversation keeps working (only the user's Stop ends afk).
+        if (is_done and !afk) break :outer;
+        // REPEAT / leaked markup: OFF/ON stop (no progress — the "janked back and forth" churn); AFK skips the
+        // repeat guard and churns forward.
+        if (is_repeat and !afk) break :outer;
 
-        // CONTINUE: the inferred step becomes the next (synthetic) user turn in the LLM context — NOT written to
-        // messages.jsonl (only real user + assistant turns are durable there).
+        // CONTINUE: the inferred step (or, when afk reached DONE, the extend message) becomes the next (synthetic)
+        // user turn in the LLM context — NOT written to messages.jsonl (only real user + assistant turns persist).
+        const next_step = if (is_done and afk) AFK_DRIVE_MSG else trimmed;
         conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-        http.jstr(gpa, &conv_buf, trimmed) catch break :outer;
+        http.jstr(gpa, &conv_buf, next_step) catch break :outer;
         conv_buf.append(gpa, '}') catch break :outer;
         var sbuf: [128]u8 = undefined;
-        const status = std.fmt.bufPrint(&sbuf, "continuing: {s}", .{clipBytes(trimmed, 80)}) catch "continuing";
+        const status = std.fmt.bufPrint(&sbuf, "continuing: {s}", .{clipBytes(next_step, 80)}) catch "continuing";
         emitKV(app, conv_dir, "status", "text", status);
-        const nd: []u8 = gpa.dupe(u8, trimmed) catch &[_]u8{};
+        const nd: []u8 = gpa.dupe(u8, next_step) catch &[_]u8{};
         if (prev_drive.len > 0) gpa.free(prev_drive);
         prev_drive = nd;
     }
@@ -574,12 +618,13 @@ pub const TurnArgs = struct {
     key: []const u8,
     model: []const u8,
     text: []const u8,
+    loop: u8,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text);
+    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text, args.loop);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     const gpa = args.app.gpa;
     gpa.free(args.blob);
@@ -591,20 +636,20 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn — the "shows only 'server thinking'" bug). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8, loop: u8) void {
     const gpa = app.gpa;
     const total = conv.len + base_url.len + key.len + model.len + text.len;
     // The caller (postMessage) already claimed the per-conv turn slot via tryBeginTurn; EVERY completion path here
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, base_url, key, model, text);
+        runTurn(app, uid, conv, base_url, key, model, text, loop);
         endTurn(app.io, conv);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, base_url, key, model, text);
+        runTurn(app, uid, conv, base_url, key, model, text, loop);
         endTurn(app.io, conv);
         return;
     };
@@ -623,7 +668,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, ke
     o += model.len;
     const tx = blob[o..][0..text.len];
     @memcpy(tx, text);
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx, .loop = loop };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |t| {
         t.detach();
     } else |_| {
