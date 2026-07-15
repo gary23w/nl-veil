@@ -17,6 +17,10 @@ __pycache__/
 # Runtime: per-run swarm dirs (work, sqlite memory, event streams)
 data/
 
+# Runtime neuron-db files a local dev run drops at the repo root
+neurons.db
+neurons.db-*
+
 # Fleet-console roster/audit snapshot — runtime state, not source
 hub_state.json
 hub_state.json.tmp
