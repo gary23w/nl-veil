@@ -545,11 +545,14 @@ pub const Chat = struct {
 
     // active cast bookkeeping (one at a time)
     cast_active: bool = false,
+    cast_server_owned: bool = false, // a SERVER veil fired this cast; the desk only DISPLAYS it (no local lifecycle)
     cast_hex: [32]u8 = [_]u8{0} ** 32,
     cast_hex_len: usize = 0,
     cast_rel: [96]u8 = [_]u8{0} ** 96, // resolved run path relative to data dir
     cast_rel_len: usize = 0,
-    cast_conv: [40]u8 = [_]u8{0} ** 40, // the conv this cast was fired for — its run dir is _chat/builds/<conv>
+    cast_conv: [64]u8 = [_]u8{0} ** 64, // the conv this cast was fired for — its run dir is _chat/builds/<conv>
+    // (widened 40->64 to match sc_conv[64]: startServerCastWatch copies sc_conv here, and a >40-byte conv id would
+    //  otherwise silently no-op the server-cast display.)
     cast_conv_len: usize = 0, // (chat casts build in the conv dir, so the run-dir basename is <conv>, not the hex)
     cast_deadline_s: i64 = 0,
     cast_minutes: u32 = CAST_MINUTES, // the time budget of the ACTIVE cast (AI-configurable; drives deadline + progress %)
@@ -679,6 +682,14 @@ pub const Chat = struct {
     //                           leave the UI busy forever (reset on any good poll)
     sc_cooldown_until: i64 = 0, // after a server turn falls back to local, skip the server for a bit (unix secs) so a
     //                            down/misconfigured server doesn't pay the failed round-trip on EVERY send
+    // METRICS for a SERVER turn: the local recordMetric fires only on the LOCAL turn-settle path, so with the brain
+    // server-side the Metrics tab went empty. These accumulate from the server frames (pumpServerChat) and record
+    // one sample on {done}, exactly like a local turn — the same numbers, sourced from the backend's own stream.
+    sc_turn_start_ms: i64 = 0, // wall-clock ms the server send was accepted
+    sc_fb_ms: u32 = 0, //        ms to the FIRST streamed frame (first token/reasoning delta)
+    sc_chars: usize = 0, //      content chars streamed this turn (the ~4x token proxy, matching recordMetric)
+    sc_tools: u32 = 0, //        tool calls this turn
+    sc_tokens_out: u32 = 0, //   the backend's REAL output-token count from the {usage} frame (preferred over the proxy)
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -727,6 +738,10 @@ pub const Chat = struct {
             if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
             if (!self.curated and tick > 900 and tick % 50 == 21) self.curateOnce(dd); // once, ~90s after startup
             tick +%= 1;
+            // 10Hz tick (matches the local client's pumpStream cadence). Streaming was made SMOOTHER server-side
+            // instead — FLUSH_CHARS 28->12 + the completeStream 40ms->20ms poll deliver finer frames the desk renders
+            // at 10Hz. (A 3x/tick pump to reach 30Hz was tried but crashed the desk: pumping the HTTP /events poll at
+            // 30Hz under a cast's heavy frame volume is unsafe — the smoothness win is server-side, not poll-rate.)
             self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
         }
         llm.abort(&self.stream, self.io);
@@ -849,6 +864,30 @@ pub const Chat = struct {
             .kind = @intFromEnum(kind),
             .ok = ok,
         });
+    }
+
+    /// Record one completed SERVER turn's performance into the Metrics ring — the server-path twin of recordMetric,
+    /// sourced from the backend's own event stream (accumulated in renderScFrame). Keeps the Metrics tab live now
+    /// that the brain is server-side (the local settle path that calls recordMetric never runs for a served conv).
+    fn recordServerMetric(self: *Chat) void {
+        const raw_total = self.nowMs() - self.sc_turn_start_ms;
+        const total_ms: u32 = if (self.sc_turn_start_ms == 0 or raw_total <= 0 or raw_total > std.math.maxInt(u32)) 0 else @intCast(raw_total);
+        const gen_ms = if (total_ms > self.sc_fb_ms) total_ms - self.sc_fb_ms else total_ms;
+        // Prefer the backend's REAL output-token count; fall back to the char/4 proxy (as recordMetric uses) if the
+        // usage frame carried none.
+        const toks: f32 = if (self.sc_tokens_out > 0) @floatFromInt(self.sc_tokens_out) else @as(f32, @floatFromInt(self.sc_chars)) / 4.0;
+        const tok_s: f32 = if (gen_ms > 0) toks / (@as(f32, @floatFromInt(gen_ms)) / 1000.0) else 0;
+        if (self.sc_turn_start_ms == 0) return; // an aborted/unstamped server turn is unmeasurable — skip, never crash
+        self.store.pushMetric(.{
+            .first_byte_ms = self.sc_fb_ms,
+            .total_ms = total_ms,
+            .out_chars = @intCast(@min(self.sc_chars, std.math.maxInt(u32))),
+            .tok_per_s = tok_s,
+            .tools = @intCast(@min(self.sc_tools, std.math.maxInt(u16))),
+            .kind = @intFromEnum(Turn.user), // a server turn maps to the user-turn kind in the Metrics view
+            .ok = true,
+        });
+        self.sc_turn_start_ms = 0; // consumed — the next send re-stamps (guards a stray duplicate {done})
     }
 
     /// The chat's hippocampus client (neuron-db). All ops no-op when the binary/db is unavailable.
@@ -1197,6 +1236,13 @@ pub const Chat = struct {
         }
 
         if (handled) {
+            // METRICS: start this server turn's perf sample (recorded on {done} in renderScFrame) so the Metrics tab
+            // stays live now that the brain is server-side.
+            self.sc_turn_start_ms = self.nowMs();
+            self.sc_fb_ms = 0;
+            self.sc_chars = 0;
+            self.sc_tools = 0;
+            self.sc_tokens_out = 0;
             // Commit to the server for this turn. The SERVER now owns the loop (we passed loop_mode in the body), so
             // the desk's LOCAL auto-loop must NOT also drive turns — but we no longer CLEAR the toggle (that discarded
             // the user's auto-loop/afk intent): sc_serving standing down the local maybeLoop (its guard at the top)
@@ -1336,10 +1382,18 @@ pub const Chat = struct {
         // STREAMED DELTAS: grow the live preview (types out). Robust to a non-streaming backend too, which sends
         // ONE reasoning delta (whole thinking) + then the message — the buffer just grows in one step.
         if (std.mem.eql(u8, kind, "token") or std.mem.eql(u8, kind, "reasoning")) {
+            if (self.sc_fb_ms == 0 and self.sc_turn_start_ms > 0) { // FIRST streamed frame → first-byte latency
+                const fb = self.nowMs() - self.sc_turn_start_ms;
+                self.sc_fb_ms = if (fb > 0 and fb <= std.math.maxInt(u32)) @intCast(fb) else 1; // >=1 so it reads as "set"
+            }
             if (scRawField(line, "delta")) |raw| {
                 var buf: [store_mod.STREAM_CAP]u8 = undefined;
                 const d = scUnescape(raw, &buf);
-                if (d.len > 0) self.scStreamAppend(std.mem.eql(u8, kind, "reasoning"), d);
+                if (d.len > 0) {
+                    const is_reason = std.mem.eql(u8, kind, "reasoning");
+                    if (!is_reason) self.sc_chars += d.len; // content chars = out_chars proxy (reasoning excluded, as local does)
+                    self.scStreamAppend(is_reason, d);
+                }
             }
             return;
         }
@@ -1361,6 +1415,13 @@ pub const Chat = struct {
             self.scCommitText(dd);
             const tool = scRawField(line, "tool") orelse "";
             const state = scRawField(line, "state") orelse "";
+            if (std.mem.eql(u8, state, "start")) self.sc_tools += 1; // metrics: one count per tool call (start, not done)
+            // A SERVER veil just cast a swarm — arm a DISPLAY-ONLY watch (once per cast, on its "start" frame) so the
+            // right-pane Swarm activity shows the run. The desk never runs the local cast lifecycle here (the server
+            // veil composes the answer via swarm_status). cast_active stays FALSE (see startServerCastWatch).
+            if (std.mem.eql(u8, tool, "cast") and std.mem.eql(u8, state, "start") and !self.cast_active) {
+                self.startServerCastWatch();
+            }
             var pvb: [260]u8 = undefined;
             const preview: []const u8 = if (std.mem.eql(u8, state, "done"))
                 (if (scRawField(line, "preview")) |raw| scUnescape(raw, &pvb) else "")
@@ -1403,9 +1464,14 @@ pub const Chat = struct {
                     self.appendMsg(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t);
                 }
             }
+            // METRICS: the backend's REAL output-token count — preferred over the char/4 proxy for tok/s.
+            if (jInt(line, "tokens_out")) |n| {
+                if (n > 0) self.sc_tokens_out = @intCast(@min(n, @as(i64, std.math.maxInt(u32))));
+            }
             return;
         }
         if (std.mem.eql(u8, kind, "done")) {
+            self.recordServerMetric(); // one perf sample per server turn — keeps the Metrics tab live server-side
             self.scClearStream(); // any unsealed preview is stale now
             self.setServerActive(false);
             self.setBusy(false);
@@ -1429,6 +1495,7 @@ pub const Chat = struct {
             }
         }
         self.sc_serving = false; // no longer server-served → the local auto-loop may take over
+        self.cast_server_owned = false; // the server turn that owned any cast display is gone
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
         self.setServerActive(false);
@@ -2417,6 +2484,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // new conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
+        self.cast_server_owned = false; // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // the agentic-floor arc cannot span a conversation switch
         self.arc_goal_len = 0; // a brand-new chat has no goal yet — the first cmdSend sets it
         self.syncBuildDir(dd); // a fresh chat has no build dir yet — this clears the previous chat's binding
@@ -2435,6 +2503,7 @@ pub const Chat = struct {
         }
         self.conv_epoch += 1; // switched conversation — stale continuations must not post into it
         self.reflect_msg_idx = null;
+        self.cast_server_owned = false; // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.loadMsgs(dd, id);
         { // re-anchor the loop's durable goal to THIS conversation's first message
@@ -2839,6 +2908,7 @@ pub const Chat = struct {
         _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}"); // round-boundary fallback
         self.store.pushNotif("Stop sent", rel, 2);
         self.cast_stop_sent = true;
+        self.cast_server_owned = false; // releasing a server-owned display too (its run dir got the STOP above)
         self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending finish
     }
 
@@ -4501,6 +4571,19 @@ pub const Chat = struct {
             self.setServerActive(false);
             self.appendMsg(dd, .cast_note, "(stopped)");
         }
+        // Stop a SERVER-owned cast DISPLAY: the swarm is a SEPARATE detached worker — the {op:stop} above went to the
+        // chat TURN's control channel, NOT the swarm. Write the STOP into the swarm's own run dir (mirror cmdStopCast)
+        // so the hive actually winds down, then release the display. Without this, Stop leaves the swarm running AND
+        // (once the row goes .done) removes the card's Stop button — orphaning it unstoppable.
+        if (self.cast_server_owned) {
+            if (self.cast_rel_len > 0) {
+                const rel = self.cast_rel[0..self.cast_rel_len];
+                _ = scan.writeStop(self.io, self.gpa, dd, rel);
+                _ = scan.writeControl(self.io, self.gpa, dd, rel, "{\"op\":\"stop\"}");
+                self.updateCastRow(.done, self.cast_m.round, self.cast_m.pct, "stopped", rel);
+            }
+            self.cast_server_owned = false;
+        }
         self.setStatus("");
         self.setBusy(false);
     }
@@ -4934,6 +5017,7 @@ pub const Chat = struct {
             return;
         }
         self.cast_active = true;
+        self.cast_server_owned = false; // a fresh LOCAL cast owns the lifecycle; drop any server-cast display
         self.cast_epoch = self.conv_epoch; // the conversation position this cast (and its veil work) belongs to
         self.cast_stop_sent = false;
         self.cast_ev_size = 0; // fresh watch state for this run
@@ -5467,8 +5551,35 @@ pub const Chat = struct {
         self.store.cast_count += 1;
     }
 
+    /// Arm a DISPLAY-ONLY watch on a swarm the SERVER veil just cast (its cast tool "start" frame). Mirrors the
+    /// arming half of fireCast (fresh watch state + a CastRow) but leaves cast_active FALSE — the desk only renders
+    /// the run into the Swarm pane; the server veil owns the lifecycle (timeout, stop, composing the answer via
+    /// swarm_status). Resolves the run dir by conv basename (build-in-place: _chat/builds/<conv>).
+    fn startServerCastWatch(self: *Chat) void {
+        const conv = self.sc_conv[0..self.sc_conv_len];
+        if (conv.len == 0 or conv.len > self.cast_conv.len) return; // no resolvable conv → nothing to watch
+        self.cast_server_owned = true;
+        self.cast_active = false; // the desk does NOT run the local collect/compose lifecycle for this cast
+        self.cast_conv_len = conv.len; // watchCast matches the run-dir basename against <conv>
+        @memcpy(self.cast_conv[0..conv.len], conv);
+        self.cast_hex_len = 0; // resolve by conv basename, not a hex id (and so the orchestration-id inject stays off)
+        self.cast_rel_len = 0; // watchCast resolves the run dir on its next tick
+        self.cast_ev_size = 0; // fresh watch state for this run
+        self.cast_ev_start = 0;
+        self.cast_ev_n = 0;
+        self.cast_m = .{};
+        self.cast_stop_sent = false;
+        self.cast_forced = false;
+        self.cast_fired_s = self.nowS(); // the stale-prior-run guard in watchCast keys off this
+        self.cast_deadline_s = self.nowS() + 365 * 24 * 3600; // far future: the SERVER owns the timeout, not the desk
+        self.nar_round = -1; // narration is suppressed for server casts, but keep the state clean
+        self.nar_pct = -1;
+        self.nar_txt_len = 0;
+        self.pushCastRow("hive (server)"); // the row's round/pct/last fill in live from watchCast (updateCastRow)
+    }
+
     pub fn watchCast(self: *Chat, dd: []const u8) void {
-        if (!self.cast_active) return;
+        if (!self.cast_active and !self.cast_server_owned) return; // runs for a local cast OR a server-owned display
         const now = self.nowS();
         // resolve the run dir once the scanner can see it (server writes u<uid>/<hex>)
         if (self.cast_rel_len == 0) {
@@ -5488,7 +5599,7 @@ pub const Chat = struct {
                 }
             }
             if (self.cast_rel_len == 0) {
-                if (now > self.cast_deadline_s) self.failCast(dd, "[cast] the run directory never appeared — check the server");
+                if (!self.cast_server_owned and now > self.cast_deadline_s) self.failCast(dd, "[cast] the run directory never appeared — check the server");
                 return;
             }
         }
@@ -5552,7 +5663,7 @@ pub const Chat = struct {
                     // Only narrate into the conversation that OWNS this cast. If the owning conv was deleted and
                     // another is now on screen (delete_conv isn't blocked by busyForSwitch), appendMsg would pour
                     // this cast's live narration into the unrelated conv's transcript + hippocampus.
-                    if (self.castIsForCurrentConv()) self.appendMsg(dd, .cast_note, note);
+                    if (!self.cast_server_owned and self.castIsForCurrentConv()) self.appendMsg(dd, .cast_note, note);
                 } else if (round_new) self.nar_round = pm.round; // advance silently past the repeat
             }
         }
@@ -5565,12 +5676,12 @@ pub const Chat = struct {
             self.ctx_poll_budget -= 1;
             self.localSlowTip(dd); // model may have loaded (huge) only after the cast fired — catch it early
         }
-        if (!m.stopped) {
+        // STATUS: don't fight the LIVE server turn's own {status} frames (server-owned + sc_active). Once the turn
+        // has settled (or for a local cast), the desk owns the "hive running - rN X%" line — and for a server cast
+        // the elapsed-estimate fallback is skipped (its deadline is far-future = garbage math); show the real pct or 0.
+        if (!m.stopped and !(self.cast_server_owned and self.sc_active)) {
             var sbuf: [96]u8 = undefined;
-            // Show the real metric once a score/phase event has landed; before that (common early in a slow
-            // local cast) fall back to an elapsed-vs-budget estimate capped at 90% so the label MOVES instead of
-            // sitting at 0 the whole time. cast_deadline_s = start + CAST_MINUTES*60 + 120, so start is derivable.
-            const shown_pct: i32 = if (m.pct >= 0) m.pct else blk: {
+            const shown_pct: i32 = if (m.pct >= 0) m.pct else if (self.cast_server_owned) 0 else blk: {
                 const start = self.cast_deadline_s - (@as(i64, self.cast_minutes) * 60 + 120);
                 const elapsed = self.nowS() - start;
                 const budget: i64 = @as(i64, self.cast_minutes) * 60;
@@ -5582,11 +5693,18 @@ pub const Chat = struct {
         }
 
         if (m.stopped) {
+            if (self.cast_server_owned) {
+                // DISPLAY-ONLY: the swarm ended on its own; the row is already .done. The SERVER veil composes the
+                // answer via swarm_status — the desk must NOT run castFinished (which would compose a DUPLICATE).
+                self.cast_server_owned = false;
+                self.cast_active = false; // belt-and-suspenders; was already false
+                return;
+            }
             // a user (or the veil-work) turn may still be streaming — collect/merge on a later idle tick
             if (self.turn == .idle) self.castFinished(dd, rel, &m, ev_n);
             return;
         }
-        if (now > self.cast_deadline_s) {
+        if (!self.cast_server_owned and now > self.cast_deadline_s) { // the SERVER owns a server cast's timeout, not the desk
             if (!self.cast_stop_sent) {
                 // STOP file first — the worker honors it PER TURN; control.jsonl only lands at a round boundary
                 _ = scan.writeStop(self.io, self.gpa, dd, rel);
