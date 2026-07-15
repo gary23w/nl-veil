@@ -24,6 +24,7 @@ const cctx = @import("context.zig");
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
 const deploy_service = @import("../deploy/service.zig");
+const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
 // (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.
@@ -171,7 +172,10 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"stop_swarm","description":"Stop a running swarm (cooperative; takes effect at its next round). Its files + findings are kept.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"swarm_status","description":"Check a swarm's state: whether it is running or finished, how many minds, and whether it has produced a result yet.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"swarm_asks","description":"List the OPEN questions a running swarm's minds have raised for you (via their ask_veil tool) and not yet been answered. Check this while a swarm runs — a mind may be blocked waiting on a decision only you can make. Each ask has an ask_id, the mind that asked, and the question.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}}
+    \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}},
+    \\{"type":"function","function":{"name":"schedule_task","description":"Create a SCHEDULED TASK when the user asks for something to happen later or repeatedly ('every morning at 9', 'in 20 minutes', 'daily news digest'). Each firing runs a fresh UNATTENDED chat turn with this same provider, and the task keeps its own memory across runs. The prompt must be SELF-CONTAINED (a run cannot see this conversation) — put concrete specifics (locations, formats, file names) in details. kind 'once' needs in_min OR at_hm; 'every' needs every_min; 'daily' needs hm.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"short task name"},"prompt":{"type":"string","description":"the self-contained instruction each run executes"},"details":{"type":"string","description":"pinned specifics every run should use (optional)"},"kind":{"type":"string","enum":["once","every","daily"]},"in_min":{"type":"integer","description":"once: fire this many minutes from now"},"at_hm":{"type":"string","description":"once: fire at the next local occurrence of HH:MM"},"every_min":{"type":"integer","description":"every: interval in minutes"},"hm":{"type":"string","description":"daily: local wall-clock HH:MM"}},"required":["name","prompt","kind"]}}},
+    \\{"type":"function","function":{"name":"schedule_list","description":"List the user's scheduled tasks (id, name, kind, next due, run count, enabled) — check before creating a duplicate, and to find ids for schedule_delete.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"schedule_delete","description":"Delete a scheduled task by its id (from schedule_list). Use when the user asks to cancel/remove a schedule.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id"}},"required":["id"]}}}
 ;
 // The chat surface = the REACHABLE mind-tool subset (tools.CHAT_SCHEMA, not the full ~33-tool SCHEMA whose
 // swarm-mind/host-sim/RSI-only verbs a solo chat turn can't use) + the veil's orchestration verbs. Trimming the
@@ -188,6 +192,25 @@ fn nowSecs(io: std.Io) i64 {
 
 /// Replace each byte not part of a valid UTF-8 sequence with '?' in place (length-preserving), so arbitrary
 /// tool output (fetched page bytes) always serializes as conformant JSON. Local copy of chat_tools.scrubUtf8.
+/// The task id inside a scheduled-run conv id ("scheduled_{taskid}_MMDDHHMM") — null for ordinary convs.
+/// Drives the per-TASK memory scope: runs of the same task share one partition across conversations.
+fn schedTaskOf(conv: []const u8) ?[]const u8 {
+    const prefix = "scheduled_";
+    if (!std.mem.startsWith(u8, conv, prefix)) return null;
+    const rest = conv[prefix.len..];
+    if (rest.len == 0) return null;
+    const us = std.mem.lastIndexOfScalar(u8, rest, '_') orelse return rest;
+    if (us == 0) return null;
+    return rest[0..us];
+}
+
+test "schedTaskOf: extracts the task id from a run conv, null for ordinary convs" {
+    try std.testing.expectEqualStrings("news-0715174857", schedTaskOf("scheduled_news-0715174857_07151753").?);
+    try std.testing.expectEqualStrings("daily-report-0301070500", schedTaskOf("scheduled_daily-report-0301070500_03010705").?);
+    try std.testing.expect(schedTaskOf("c6a57f852") == null);
+    try std.testing.expect(schedTaskOf("scheduled_") == null);
+}
+
 fn scrubUtf8(buf: []u8) void {
     var i: usize = 0;
     while (i < buf.len) {
@@ -297,8 +320,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     defer gpa.free(conv_dir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, conv_dir, .default_dir) catch {};
 
-    // ---- HIPPOCAMPUS scope: this conversation's own durable neuron-db partition (user turns + tool findings) ----
-    const mem_scope = std.fmt.allocPrint(gpa, "chat:{s}", .{conv}) catch return;
+    // ---- HIPPOCAMPUS scope: this conversation's own durable neuron-db partition (user turns + tool findings).
+    // SCHEDULED RUNS get a TASK-scoped partition instead: every run of "scheduled_{taskid}_{stamp}" shares
+    // "sched:{taskid}", so the recall at run start surfaces previous runs' lessons/answers and everything this
+    // run observes (the prompt, tool findings, the model's own observe() calls) persists into the NEXT run —
+    // the task learns from its own failures and successes across runs, independent of any one conversation.
+    const sched_task = schedTaskOf(conv);
+    const mem_scope = if (sched_task) |tid|
+        (std.fmt.allocPrint(gpa, "sched:{s}", .{tid}) catch return)
+    else
+        (std.fmt.allocPrint(gpa, "chat:{s}", .{conv}) catch return);
     defer gpa.free(mem_scope);
 
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
@@ -343,7 +374,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         .environ = environ,
         .run_dir = run_root,
         .workdir = workdir,
-        .scope = "chat",
+        // a scheduled run's recall()/observe() tools work the TASK's own memory (the observe tool already
+        // dual-writes the hive, giving "task memory AND hive memory" for free); ordinary chat keeps the
+        // shared "chat" scope.
+        .scope = if (sched_task != null) mem_scope else "chat",
         .mind = "chat",
         .round = 0,
         .mem = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db),
@@ -562,6 +596,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 // poller disarms + clears busy instead of hanging forever.
                 planStepInterrupted(app, conv_dir, plan, task_idx);
                 salvageSteers(app, conv_dir, &steer_cursor); // an errored turn must not eat a pending steer
+                // SCHEDULED runs learn from failure mechanically: record the failed run into the TASK's memory
+                // (a plain engine fact, not model output — the confab rule stays intact) so the next run's
+                // recall sees "the previous run failed" and can route around whatever broke.
+                if (sched_task != null) {
+                    var fb: [200]u8 = undefined;
+                    _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "previous scheduled run ({s}) FAILED: the model call errored mid-turn — check the provider/key, or simplify the task prompt", .{conv[0..@min(conv.len, 64)]}) catch "a previous scheduled run failed with a model-call error");
+                }
                 finishTurn(app, conv_dir, usage_t0);
                 return;
             },
@@ -1308,7 +1349,83 @@ fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
+    if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, base_url, key, model, args);
+    if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
+    if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
     return null;
+}
+
+/// schedule_task — the veil creates a scheduled task straight from conversation ("do X every morning at 9").
+/// The task inherits THIS turn's provider creds, so its unattended runs use the same backend that created it.
+/// Time conveniences the model can actually express: in_min (relative) and at_hm (next local occurrence) for
+/// "once" — it never has to guess epoch seconds.
+fn scheduleTool(app: *App, uid: u64, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct {
+        name: []const u8 = "",
+        prompt: []const u8 = "",
+        details: []const u8 = "",
+        kind: []const u8 = "once",
+        in_min: i64 = 0,
+        at_hm: []const u8 = "",
+        every_min: i64 = 0,
+        hm: []const u8 = "",
+    };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "schedule_task: could not parse args JSON");
+    defer p.deinit();
+    const a = p.value;
+    const now = nowSecs(app.io);
+    var at: i64 = 0;
+    if (std.mem.eql(u8, a.kind, "once")) {
+        if (a.in_min > 0) {
+            at = now + a.in_min * 60;
+        } else if (sched.parseHm(a.at_hm) != null) {
+            // next local occurrence of HH:MM — the exact math the daily tick uses
+            at = sched.computeNextDue("daily", 0, 0, a.at_hm, now, 0, now, sched.localOffsetSecs());
+        } else {
+            return orchErr(gpa, "schedule_task: kind \"once\" needs in_min (minutes from now) or at_hm (\"HH:MM\", next occurrence)");
+        }
+    }
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    switch (sched.createFromSpec(app, arena_state.allocator(), uid, .{
+        .name = a.name,
+        .prompt = a.prompt,
+        .details = a.details,
+        .kind = a.kind,
+        .at = at,
+        .every_min = a.every_min,
+        .hm = a.hm,
+        .enabled = true,
+        .base_url = base_url,
+        .model = model,
+        .api_key = key,
+    })) {
+        .id => |id| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"schedule_task\",\"id\":\"{s}\",\"note\":\"created — it fires on schedule as an unattended run with its own cross-run memory; schedule_list shows it\"}}", .{id}) catch emptyRes(),
+        .err => |e| return orchErr(gpa, e),
+    }
+}
+
+/// schedule_list — the user's tasks, one compact line each (id | name | kind | next due | runs | state).
+fn scheduleListTool(app: *App, uid: u64) []u8 {
+    const gpa = app.gpa;
+    const brief = sched.listBrief(app, gpa, uid);
+    defer gpa.free(brief);
+    if (std.mem.trim(u8, brief, " \r\n\t").len == 0) return gpa.dupe(u8, "(no scheduled tasks yet)") catch emptyRes();
+    return std.fmt.allocPrint(gpa, "scheduled tasks (id | name | kind | next due | runs | state):\n{s}", .{brief}) catch emptyRes();
+}
+
+/// schedule_delete — remove one task by id (ownership is structural: the path is built under this uid).
+fn scheduleDeleteTool(app: *App, uid: u64, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { id: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "schedule_delete: could not parse args JSON");
+    defer p.deinit();
+    if (p.value.id.len == 0) return orchErr(gpa, "schedule_delete: an id is required (see schedule_list)");
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    if (!sched.deleteById(app, arena_state.allocator(), uid, p.value.id)) return orchErr(gpa, "schedule_delete: no such task id — call schedule_list for the exact ids");
+    return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"schedule_delete\",\"deleted\":true}") catch emptyRes();
 }
 
 /// cast — deploy a swarm into THIS conversation's build dir, using the chat turn's own model/creds so the hive

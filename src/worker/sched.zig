@@ -108,8 +108,9 @@ const wintz = if (builtin.os.tag == .windows) struct {
 
 /// The local clock's offset from UTC in seconds (local = UTC + offset), asked of the OS on every call so a DST
 /// flip mid-uptime is picked up naturally. Non-Windows (and any query failure) degrades to UTC — a daily task
-/// still fires exactly once a day, just anchored to UTC wall time instead of local.
-fn localOffsetSecs() i64 {
+/// still fires exactly once a day, just anchored to UTC wall time instead of local. Pub: the chat veil's
+/// schedule_task tool converts "at 18:30" the same way the tick loop does.
+pub fn localOffsetSecs() i64 {
     if (builtin.os.tag != .windows) return 0;
     var tzi: wintz.TIME_ZONE_INFORMATION = undefined;
     const r = wintz.GetTimeZoneInformation(&tzi);
@@ -310,6 +311,118 @@ fn saveTask(app: *App, alloc: std.mem.Allocator, uid: u64, t: Task) bool {
     return true;
 }
 
+// ---- in-process create/list/delete (the chat veil's schedule_* tools; shared with the HTTP handlers) ---------
+
+/// The create fields, exactly as POST /api/v1/sched takes them.
+pub const CreateSpec = struct {
+    name: []const u8 = "",
+    prompt: []const u8 = "",
+    details: []const u8 = "",
+    kind: []const u8 = "once",
+    at: i64 = 0,
+    every_min: i64 = 0,
+    hm: []const u8 = "",
+    enabled: bool = true,
+    base_url: []const u8 = "",
+    model: []const u8 = "",
+    api_key: []const u8 = "",
+};
+
+pub const CreateResult = union(enum) { id: []const u8, err: []const u8 };
+
+/// Validate + mint + persist one task. The single create path: the HTTP route and the chat veil's
+/// schedule_task tool both land here, so a task can never enter the tick loop with a shape only one of them
+/// validated. `.id` is duped into `alloc`; `.err` is a static string.
+pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSpec) CreateResult {
+    const name = std.mem.trim(u8, s.name, " \r\n\t");
+    const prompt = std.mem.trim(u8, s.prompt, " \r\n\t");
+    if (name.len == 0) return .{ .err = "name is required" };
+    if (prompt.len == 0) return .{ .err = "prompt is required" };
+    if (!validKind(s.kind)) return .{ .err = "kind must be \"once\", \"every\", or \"daily\"" };
+    if (std.mem.eql(u8, s.kind, "every") and s.every_min < 1) return .{ .err = "every_min must be >= 1" };
+    if (std.mem.eql(u8, s.kind, "daily") and parseHm(s.hm) == null) return .{ .err = "hm must be \"HH:MM\"" };
+
+    const now = nowSecs(app.io);
+    var idb: [64]u8 = undefined;
+    var id = mintTaskId(&idb, name, now + localOffsetSecs());
+    var idb2: [64]u8 = undefined;
+    {
+        const existing = std.fmt.allocPrint(alloc, "{s}/u{d}/_sched/{s}.json", .{ app.data, uid, id }) catch null;
+        if (existing) |p| {
+            if (std.Io.Dir.cwd().access(app.io, p, .{})) |_| {
+                var r: [2]u8 = undefined;
+                app.io.random(&r);
+                id = std.fmt.bufPrint(&idb2, "{s}-{s}", .{ id, std.fmt.bytesToHex(r, .lower) }) catch id;
+            } else |_| {}
+        }
+    }
+    const t = Task{
+        .id = id,
+        .name = name,
+        .prompt = prompt,
+        .details = s.details,
+        .kind = s.kind,
+        .at = s.at,
+        .every_min = s.every_min,
+        .hm = s.hm,
+        .enabled = s.enabled,
+        .created = now,
+        .last_run = 0,
+        .next_due = computeNextDue(s.kind, s.at, s.every_min, s.hm, now, 0, now, localOffsetSecs()),
+        .last_conv = "",
+        .runs = 0,
+        .base_url = s.base_url,
+        .model = s.model,
+        .api_key = s.api_key,
+    };
+    sched_mtx.lockUncancelable(app.io);
+    defer sched_mtx.unlock(app.io);
+    if (!saveTask(app, alloc, uid, t)) return .{ .err = "could not write the task file" };
+    return .{ .id = alloc.dupe(u8, id) catch return .{ .err = "out of memory" } };
+}
+
+/// One compact human line per task ("id | name | kind ... | next due in Nm | runs N | enabled") — the chat
+/// veil's schedule_list result. gpa-owned; empty string when none exist.
+pub fn listBrief(app: *App, gpa: std.mem.Allocator, uid: u64) []u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    const now = nowSecs(app.io);
+    const sd = std.fmt.allocPrint(arena, "{s}/u{d}/_sched", .{ app.data, uid }) catch return gpa.dupe(u8, "") catch @constCast("");
+    if (std.Io.Dir.cwd().openDir(app.io, sd, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(app.io);
+        var it = dir.iterate();
+        while (it.next(app.io) catch null) |ent| {
+            if (ent.kind != .file or !std.mem.endsWith(u8, ent.name, ".json")) continue;
+            const id = safeSeg(ent.name[0 .. ent.name.len - 5]);
+            if (id.len == 0) continue;
+            const id_dup = arena.dupe(u8, id) catch continue;
+            const t = loadTask(app, arena, uid, id_dup) orelse continue;
+            const due_min = @divFloor(t.next_due - now, 60);
+            out.print(gpa, "{s} | {s} | {s}", .{ t.id, t.name, t.kind }) catch break;
+            if (std.mem.eql(u8, t.kind, "every")) out.print(gpa, " {d}min", .{t.every_min}) catch {};
+            if (std.mem.eql(u8, t.kind, "daily")) out.print(gpa, " at {s}", .{t.hm}) catch {};
+            out.print(gpa, " | next due in {d}m | runs {d} | {s}\n", .{ due_min, t.runs, if (t.enabled) "enabled" else "disabled" }) catch break;
+        }
+    } else |_| {}
+    return gpa.dupe(u8, out.items) catch @constCast("");
+}
+
+/// Delete one task by id (in-process twin of the DELETE route). false = no such task / unsafe id.
+pub fn deleteById(app: *App, alloc: std.mem.Allocator, uid: u64, id: []const u8) bool {
+    const seg = safeSeg(id);
+    if (seg.len == 0) return false;
+    const path = std.fmt.allocPrint(alloc, "{s}/u{d}/_sched/{s}.json", .{ app.data, uid, seg }) catch return false;
+    std.Io.Dir.cwd().access(app.io, path, .{}) catch return false;
+    sched_mtx.lockUncancelable(app.io);
+    defer sched_mtx.unlock(app.io);
+    std.Io.Dir.cwd().deleteFile(app.io, path) catch return false;
+    return true;
+}
+
 // ---- provider resolution + launching one run ----------------------------------------------------------------
 
 const Provider = struct { base: []const u8, key: []const u8, model: []const u8 };
@@ -361,6 +474,19 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
         text.appendSlice(app.gpa, "\n\nKey details / data to use:\n") catch return null;
         text.appendSlice(app.gpa, det) catch return null;
     }
+    // UNATTENDED-RUN CONTRACT. Observed failure without it: the model answered a scheduled "get local news"
+    // with "where's 'local' for you?" — a question posted into a conversation NOBODY is watching, so the run
+    // produced nothing and read as "scheduled tasks don't work". A scheduled run must act, not converse.
+    text.appendSlice(app.gpa,
+        \\
+        \\
+        \\[UNATTENDED SCHEDULED RUN — no human is watching this conversation, and nobody will answer a question.
+        \\NEVER ask back or end on a clarification; recall() your task memory first (it carries lessons and
+        \\answers from previous runs of this same task), make the most reasonable assumption for anything still
+        \\ambiguous, state that assumption in the deliverable, and COMPLETE the task. Store what you learn with
+        \\observe() — especially anything that would have unblocked you sooner and any user preference you
+        \\inferred — it persists into this task's future runs.]
+    ) catch return null;
 
     const pr = resolveProvider(app, alloc, uid, t);
 
@@ -514,55 +640,27 @@ pub fn createTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         api_key: []const u8 = "",
     };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
-    const name = std.mem.trim(u8, b.name, " \r\n\t");
-    const prompt = std.mem.trim(u8, b.prompt, " \r\n\t");
-    if (name.len == 0) return badReq(res, "name is required");
-    if (prompt.len == 0) return badReq(res, "prompt is required");
-    if (!validKind(b.kind)) return badReq(res, "kind must be \"once\", \"every\", or \"daily\"");
-    if (std.mem.eql(u8, b.kind, "every") and b.every_min < 1) return badReq(res, "every_min must be >= 1");
-    if (std.mem.eql(u8, b.kind, "daily") and parseHm(b.hm) == null) return badReq(res, "hm must be \"HH:MM\"");
-
-    const now = nowSecs(app.io);
-    var idb: [64]u8 = undefined;
-    var id = mintTaskId(&idb, name, now + localOffsetSecs());
-    // Same-second same-name collision (double-click on Create): tack on two random bytes rather than silently
-    // overwriting the first task's file. mintTaskId's slug cap leaves room, so this never exceeds 64.
-    var idb2: [64]u8 = undefined;
-    {
-        const existing = std.fmt.allocPrint(res.arena, "{s}/u{d}/_sched/{s}.json", .{ app.data, u.id, id }) catch null;
-        if (existing) |p| {
-            if (std.Io.Dir.cwd().access(app.io, p, .{})) |_| {
-                var r: [2]u8 = undefined;
-                app.io.random(&r);
-                id = std.fmt.bufPrint(&idb2, "{s}-{s}", .{ id, std.fmt.bytesToHex(r, .lower) }) catch id;
-            } else |_| {}
-        }
-    }
-
-    const t = Task{
-        .id = id,
-        .name = name,
-        .prompt = prompt,
+    // ONE create path: the same createFromSpec the chat veil's schedule_task tool calls — identical
+    // validation, id minting (with the same-second collision suffix), and persisted shape.
+    switch (createFromSpec(app, res.arena, u.id, .{
+        .name = b.name,
+        .prompt = b.prompt,
         .details = b.details,
         .kind = b.kind,
         .at = b.at,
         .every_min = b.every_min,
         .hm = b.hm,
         .enabled = b.enabled,
-        .created = now,
-        .last_run = 0,
-        .next_due = computeNextDue(b.kind, b.at, b.every_min, b.hm, now, 0, now, localOffsetSecs()),
-        .last_conv = "",
-        .runs = 0,
         .base_url = b.base_url,
         .model = b.model,
         .api_key = b.api_key,
-    };
-    sched_mtx.lockUncancelable(app.io);
-    defer sched_mtx.unlock(app.io);
-    if (!saveTask(app, res.arena, u.id, t)) return serverErr(res, "could not write the task file");
-    res.status = 201;
-    try res.json(.{ .ok = true, .id = id }, .{});
+    })) {
+        .id => |id| {
+            res.status = 201;
+            try res.json(.{ .ok = true, .id = id }, .{});
+        },
+        .err => |e| return badReq(res, e),
+    }
 }
 
 /// POST /api/v1/sched/:id — partial update: any subset of the create fields (+ enabled). Parsed as a generic
