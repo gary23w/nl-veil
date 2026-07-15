@@ -49,6 +49,10 @@ pub const Poller = struct {
     // server-hitting checks (serverOnline + GET /fleet) only need to run every few seconds — a fresh
     // connection every second is needless load on a small local server. Carry the last counters between.
     last_fleet_s: i64 = 0,
+    // scheduled-task list throttle, same shape as last_fleet_s. Reset to 0 after any sched mutation so
+    // the list reflects it on the very next tick instead of up to SCHED_EVERY_S later.
+    last_sched_s: i64 = 0,
+    sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -106,7 +110,103 @@ pub const Poller = struct {
                 .delete => self.doDelete(dd, c.idStr()),
                 .open_folder => self.doOpenFolder(dd),
                 .open_file => self.setSelFile(c.textStr()),
+                .sched_create => self.doSchedCreate(),
+                .sched_toggle => self.doSchedToggle(c.idStr(), c.textStr()),
+                .sched_delete => self.doSchedDelete(c.idStr()),
+                .sched_run => self.doSchedRun(c.idStr()),
             }
+        }
+    }
+
+    /// Snapshot the bearer token under the store lock into `tbuf` (the doDeploy/doDelete pattern, shared).
+    fn tokenSnap(self: *Poller, tbuf: *[128]u8) []const u8 {
+        self.store.lock();
+        defer self.store.unlock();
+        const t = self.store.settings.tokenStr();
+        const n = @min(t.len, tbuf.len);
+        @memcpy(tbuf[0..n], t[0..n]);
+        return tbuf[0..n];
+    }
+
+    /// Shared failure reporting for the sched verbs: null → unreachable, 401/403 → admin-gated, else rejected.
+    /// Returns true when the response says the mutation landed (2xx).
+    fn schedRespOk(self: *Poller, resp: ?netcli.Resp, what: []const u8) bool {
+        const r = resp orelse {
+            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            return false;
+        };
+        defer if (r.body.len > 0) self.gpa.free(r.body);
+        if (r.status >= 200 and r.status < 300) return true;
+        if (r.status == 401 or r.status == 403) {
+            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+        } else {
+            self.store.pushNotif("Schedule rejected", what, 2);
+        }
+        return false;
+    }
+
+    /// POST the create JSON the UI parked in the store's hand-off slot (it outgrows Command.text).
+    fn doSchedCreate(self: *Poller) void {
+        var body: [8192]u8 = undefined;
+        var blen: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            blen = @min(self.store.sched_create_len, body.len);
+            @memcpy(body[0..blen], self.store.sched_create_json[0..blen]);
+            self.store.sched_create_len = 0; // consumed — a stale slot must never re-post
+        }
+        log.trace("poller.doSchedCreate body_len={d}", .{blen});
+        if (blen == 0) return; // ring replayed an already-consumed create — nothing to send
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        if (self.schedRespOk(netcli.schedCreate(self.io, self.gpa, self.port(), tok, body[0..blen]), "task")) {
+            self.store.pushNotif("Task scheduled", "the server accepted the task", 1);
+            self.last_sched_s = 0; // show the new row on the very next refresh tick
+        }
+    }
+
+    /// Toggle a task's enabled flag. `state` is the DESIRED state ("1"/"0") the checkbox click computed.
+    fn doSchedToggle(self: *Poller, id: []const u8, state: []const u8) void {
+        log.trace("poller.doSchedToggle id={s} state={s}", .{ id, state });
+        if (id.len == 0) return;
+        const on = std.mem.eql(u8, state, "1");
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const body = if (on) "{\"enabled\":true}" else "{\"enabled\":false}";
+        if (self.schedRespOk(netcli.schedUpdate(self.io, self.gpa, self.port(), tok, id, body), id)) self.last_sched_s = 0;
+    }
+
+    fn doSchedDelete(self: *Poller, id: []const u8) void {
+        log.trace("poller.doSchedDelete id={s}", .{id});
+        if (id.len == 0) return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        if (self.schedRespOk(netcli.schedDelete(self.io, self.gpa, self.port(), tok, id), id)) {
+            self.store.pushNotif("Task deleted", id, 1);
+            self.last_sched_s = 0;
+        }
+    }
+
+    /// Fire one task immediately; the reply carries the scheduled_* conversation it spawned.
+    fn doSchedRun(self: *Poller, id: []const u8) void {
+        log.trace("poller.doSchedRun id={s}", .{id});
+        if (id.len == 0) return;
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.schedRun(self.io, self.gpa, self.port(), tok, id) orelse {
+            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status >= 200 and resp.status < 300) {
+            const conv = jstr(resp.body, "conv") orelse "";
+            self.store.pushNotif("Run started", if (conv.len > 0) conv else id, 1);
+            self.last_sched_s = 0; // pick up runs/last_conv promptly
+        } else if (resp.status == 401 or resp.status == 403) {
+            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+        } else {
+            self.store.pushNotif("Run rejected", id, 2);
         }
     }
 
@@ -377,6 +477,14 @@ pub const Poller = struct {
             self.store.unlock();
         }
 
+        // 1b) scheduled tasks — same few-second throttle as the fleet poll (one extra GET beside it, never
+        // per-tick). A mutation resets last_sched_s so its effect shows on the next tick.
+        const SCHED_EVERY_S: i64 = 5;
+        if (online and now_s - self.last_sched_s >= SCHED_EVERY_S) {
+            self.last_sched_s = now_s;
+            self.refreshSched();
+        }
+
         // 2) roster
         const nsw = scan.listSwarms(self.io, self.gpa, dd, &self.swarm_scratch, now_s, 45);
 
@@ -463,6 +571,41 @@ pub const Poller = struct {
         self.notifyTransitions(online, self.swarm_scratch[0..nsw], selbuf[0..sel_len], metrics);
     }
 
+    /// GET /api/v1/sched → parse the tasks array → publish SchedRows under one lock. A failed/unreachable
+    /// poll leaves the previous rows in place (carry-forward, like the fleet counters); a 401/403 marks the
+    /// list denied so the Scheduled tab can say "admin token required" instead of spinning on "loading".
+    fn refreshSched(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.schedList(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status == 401 or resp.status == 403) {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.sched_denied = true;
+            self.store.sched_seen = true;
+            self.store.sched_count = 0;
+            return;
+        }
+        if (resp.status != 200) return; // transient server trouble — keep showing the last-known rows
+        const arr = std.mem.indexOf(u8, resp.body, "\"tasks\":[") orelse return;
+        var cur = arr + "\"tasks\":[".len;
+        var n: usize = 0;
+        while (n < self.sched_scratch.len) {
+            const obj = scan.nextJsonObj(resp.body, &cur) orelse break;
+            self.sched_scratch[n] = .{};
+            parseSchedTask(obj, &self.sched_scratch[n]);
+            if (self.sched_scratch[n].id_len == 0) continue; // malformed row — skip, never publish
+            n += 1;
+        }
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.sched_rows[0..n], self.sched_scratch[0..n]);
+        self.store.sched_count = n;
+        self.store.sched_seen = true;
+        self.store.sched_denied = false;
+    }
+
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {
         log.trace("poller.notifyTransitions online={} swarms={d}", .{ online, swarms.len });
         // server up/down
@@ -523,6 +666,44 @@ pub const Poller = struct {
         return false;
     }
 };
+
+/// Fill one SchedRow from a task object, walking it pair-by-pair (scan.nextJsonPair) so free-text values
+/// (a prompt containing `"at":`) can never be misread as fields. Unknown keys (created, details, base_url,
+/// model) are simply skipped — the row only keeps what the tab renders.
+fn parseSchedTask(obj: []const u8, row: *store_mod.SchedRow) void {
+    var cur: usize = 0;
+    while (scan.nextJsonPair(obj, &cur)) |p| {
+        if (p.is_str) {
+            if (std.mem.eql(u8, p.key, "id")) {
+                row.id_len = @intCast(scan.unescapeInto(p.raw, &row.id).len);
+            } else if (std.mem.eql(u8, p.key, "name")) {
+                row.name_len = @intCast(scan.unescapeInto(p.raw, &row.name).len);
+            } else if (std.mem.eql(u8, p.key, "prompt")) {
+                row.prompt_len = @intCast(scan.unescapeInto(p.raw, &row.prompt).len);
+            } else if (std.mem.eql(u8, p.key, "hm")) {
+                row.hm_len = @intCast(scan.unescapeInto(p.raw, &row.hm).len);
+            } else if (std.mem.eql(u8, p.key, "last_conv")) {
+                row.last_conv_len = @intCast(scan.unescapeInto(p.raw, &row.last_conv).len);
+            } else if (std.mem.eql(u8, p.key, "kind")) {
+                row.kind = if (std.mem.eql(u8, p.raw, "every")) 1 else if (std.mem.eql(u8, p.raw, "daily")) 2 else 0;
+            }
+        } else {
+            if (std.mem.eql(u8, p.key, "at")) {
+                row.at = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "every_min")) {
+                row.every_min = std.fmt.parseInt(u32, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "next_due")) {
+                row.next_due = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "last_run")) {
+                row.last_run = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "runs")) {
+                row.runs = std.fmt.parseInt(u32, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "enabled")) {
+                row.enabled = std.mem.eql(u8, p.raw, "true");
+            }
+        }
+    }
+}
 
 fn appendEsc(jb: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) void {
     for (s) |c| {

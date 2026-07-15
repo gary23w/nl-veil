@@ -70,6 +70,7 @@ const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_p
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
+const SchedInner = enum { tasks, build }; // the Scheduled tab's inner tabs (task list | builder form)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -80,10 +81,19 @@ const Ui = struct {
     hot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
     // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) was the
     // client CPU chug on long chats. Cache heights; recompute only when the message set or wrap width changes.
+    // INCREMENTAL: per-row fingerprints (mh_mfp) so a change re-measures only the changed/new rows — a server
+    // turn commits a frame every few hundred ms, and re-wrapping the WHOLE transcript per commit was the
+    // "incredibly slow since the REST migration" desk chug (the cost scaled with history length × commit rate).
     mh: [store_mod.MAX_CHAT_MSGS]f32 = undefined,
+    mh_mfp: [store_mod.MAX_CHAT_MSGS]u64 = undefined,
     mh_count: usize = 0,
     mh_cols: usize = 0,
     mh_fp: u64 = 0,
+    // live-stream measure cache: the growing preview only re-wraps when its length actually changed (it was
+    // re-measured EVERY frame at 30-60fps while busy, on top of the transcript rebuilds).
+    stream_h: f32 = 0,
+    stream_h_len: usize = std.math.maxInt(usize),
+    stream_h_cols: usize = 0,
     tool_open: ?usize = null, // which tool-call message is expanded (else all collapsed to a one-line chip)
     chat: Field = .{},
     // Chat tab
@@ -130,6 +140,18 @@ const Ui = struct {
     d_gap: bool = true,
     d_breakout: bool = false,
     d_psyche: bool = false,
+    // Scheduled tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
+    sched_inner: SchedInner = .tasks,
+    sched_scroll: f32 = 0,
+    sc_name: Field = .{},
+    sc_prompt: Field = .{},
+    sc_details: Field = .{},
+    sc_kind: usize = 0, // 0 once / 1 every N min / 2 daily at — mirrors the wire "kind"
+    sc_once_min: i32 = 30, // once: run this many minutes from submit
+    sc_every_min: i32 = 30, // every: interval minutes
+    sc_hour: i32 = 9, // daily: HH
+    sc_minute: i32 = 0, // daily: MM
+    sc_enabled: bool = true,
     // micro-console (below the swarm activity): dual-tab shell
     con_tab: u8 = 0, // 0 = You, 1 = Veil (the AI's tab)
     con_input: Field = .{},
@@ -159,7 +181,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, con_input };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, con_input, sc_name, sc_prompt, sc_details };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -475,7 +497,7 @@ pub fn main() !void {
                             } else if (std.mem.startsWith(u8, cmd, "tab ")) {
                                 const tn = std.mem.trim(u8, cmd[4..], " \r\n\t");
                                 const tv: ?Tab =
-                                    if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "deploy")) .deploy else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "settings")) .settings else null;
+                                    if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "deploy")) .deploy else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
                                 if (tv) |v| setTab(v);
                             } else if (std.mem.startsWith(u8, cmd, "right ")) {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
@@ -560,6 +582,7 @@ pub fn main() !void {
             .deploy => drawDeploy(&store, body),
             .swarm => drawSwarm(&store, body),
             .hub => drawHub(body),
+            .scheduled => drawScheduled(&store, body),
             .settings => drawSettings(&store, body),
         }
         drawResizeGrip();
@@ -1008,8 +1031,8 @@ fn setTab(tabv: Tab) void {
 fn handleKeys(store: *Store) void {
     // any handled shortcut counts as activity so the redraw stays at 60fps for a beat (see the FPS gate)
     if (rl.isKeyPressed(.f12) or rl.isKeyPressed(.one) or rl.isKeyPressed(.two) or rl.isKeyPressed(.three) or
-        rl.isKeyPressed(.four) or rl.isKeyPressed(.five) or rl.isKeyPressed(.six) or rl.isKeyPressed(.enter) or
-        rl.isKeyPressed(.escape) or rl.isKeyPressed(.tab) or rl.isKeyDown(.left_control)) ui.input_active = true;
+        rl.isKeyPressed(.four) or rl.isKeyPressed(.five) or rl.isKeyPressed(.six) or rl.isKeyPressed(.seven) or
+        rl.isKeyPressed(.enter) or rl.isKeyPressed(.escape) or rl.isKeyPressed(.tab) or rl.isKeyDown(.left_control)) ui.input_active = true;
     if (rl.isKeyPressed(.f12)) ui.show_log = !ui.show_log; // debug log overlay
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) setTab(.dashboard);
@@ -1018,6 +1041,7 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.four)) setTab(.swarm);
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
+        if (rl.isKeyPressed(.seven)) setTab(.scheduled);
     }
     // Keyboard copy — ONE priority chain, NOT gated on focus. The Chat tab force-focuses the prompt
     // input (setTab) and clicks never clear focus, so the old focus==.none gate made "select text,
@@ -1079,6 +1103,9 @@ fn focusedField() ?*Ui.Field {
         .s_ckey => &ui.s_ckey,
         .s_cfacct => &ui.s_cfacct,
         .con_input => &ui.con_input,
+        .sc_name => &ui.sc_name,
+        .sc_prompt => &ui.sc_prompt,
+        .sc_details => &ui.sc_details,
     };
 }
 
@@ -1173,8 +1200,8 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
-    const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .settings };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Scheduled", .{}), t.z("Settings", .{}) };
+    const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .scheduled, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
         const w = t.tabW(lb);
@@ -1377,8 +1404,17 @@ fn drawChat(store: *Store, body: t.Rect) void {
         cast_live = c.status == .deploying or c.status == .running or c.status == .collecting;
     }
 
+    // the active conversation's display title (the schedule button seeds the task name from it)
+    var conv_title: []const u8 = active[0..active_n];
+    for (convs[0..conv_n]) |*cv| {
+        if (cv.title_len > 0 and std.mem.eql(u8, cv.idStr(), active[0..active_n])) {
+            conv_title = cv.titleStr();
+            break;
+        }
+    }
+
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
-    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live);
+    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy);
 }
@@ -2401,7 +2437,7 @@ fn drawSelection() void {
     }
 }
 
-fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool) void {
+fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8) void {
     const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
     const status_h: f32 = 22;
     const tab_h: f32 = 26;
@@ -2415,6 +2451,31 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_metrics), .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
     tx += t.tabW(tl_metrics) + 6;
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_files), .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
+    // right-aligned in the same tab row: seed a scheduled task from THIS conversation (its first user ask
+    // becomes the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
+    if (msgs.len > 0) {
+        const tl_sched = t.z("schedule", .{});
+        const sb = t.Rect{ .x = r.x + r.width - t.btnW(tl_sched, 22) - 2, .y = r.y + 2, .width = t.btnW(tl_sched, 22), .height = 22 };
+        if (t.buttonGhost(sb, tl_sched, t.blue, true)) {
+            setField(&ui.sc_name, if (conv_title.len > 0) conv_title else "chat task");
+            for (msgs) |*m| {
+                if (m.role == .user) {
+                    setField(&ui.sc_prompt, m.textStr()); // the conversation's durable goal (its first ask)
+                    break;
+                }
+            }
+            var i: usize = msgs.len;
+            while (i > 0) {
+                i -= 1;
+                if (msgs[i].role == .veil) {
+                    setField(&ui.sc_details, msgs[i].textStr()); // setField clips to the field's 1200-byte cap
+                    break;
+                }
+            }
+            setTab(.scheduled);
+            ui.sched_inner = .build;
+        }
+    }
     if (ui.chat_inner == .metrics) {
         drawChatMetrics(store, .{ .x = r.x, .y = r.y + tab_h + 6, .width = r.width, .height = r.height - tab_h - 6 });
         return;
@@ -2438,11 +2499,17 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
     if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
     if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
+        // INCREMENTAL rebuild: only rows whose own fingerprint changed re-measure (an appended tool row used to
+        // re-wrap the whole transcript). A width change misses every row fp comparison path via wipe below.
+        const wipe = ui.mh_cols != cols; // wrap width changed → every cached height is stale
         for (msgs, 0..) |*m, i| {
+            const mfp: u64 = @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (ui.tool_open == i) @as(u64, 1) << 48 else 0);
+            if (!wipe and i < ui.mh_count and ui.mh_mfp[i] == mfp) continue; // unchanged row — keep its height
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and ui.tool_open != i)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
                 renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+            ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
         ui.mh_cols = cols;
@@ -2450,7 +2517,15 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     var total: f32 = 8;
     for (msgs, 0..) |_, i| total += ui.mh[i];
-    if (busy or stream.len > 0) total += renderMsg(view, 0, .veil, stream, cols, fsz, false, false) + MSG_LINE_H;
+    if (busy or stream.len > 0) {
+        // re-measure the live preview only when it actually grew (it only ever grows within a step)
+        if (stream.len != ui.stream_h_len or cols != ui.stream_h_cols) {
+            ui.stream_h = renderMsg(view, 0, .veil, stream, cols, fsz, false, false);
+            ui.stream_h_len = stream.len;
+            ui.stream_h_cols = cols;
+        }
+        total += ui.stream_h + MSG_LINE_H;
+    }
     if (cast_live) total += renderCastLive(view, 0, status, false);
 
     const max_scroll = if (total > view.height) total - view.height else 0;
@@ -3995,6 +4070,308 @@ fn drawHub(body: t.Rect) void {
 }
 
 // -------------------------------------------------------------------------------- settings
+
+// -------------------------------------------------------------------------------- scheduled tasks
+
+/// The Scheduled tab: standing instructions the SERVER runs on its own clock — each run lands as a
+/// scheduled_* server conversation that the Chat sidebar merges in. Two inner tabs like the Chat pane:
+/// the task list and a builder form. Every mutation rides the poller's command ring to the admin-gated
+/// /api/v1/sched routes; the poller re-lists every few seconds so the rows track the server.
+fn drawScheduled(store: *Store, body: t.Rect) void {
+    const pad: f32 = t.PAD;
+    const tab_h: f32 = 26;
+    const tl_tasks = t.z("Tasks", .{});
+    const tl_build = t.z("Build a task", .{});
+    var tx: f32 = pad;
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_tasks), .height = tab_h }, tl_tasks, ui.sched_inner == .tasks)) ui.sched_inner = .tasks;
+    tx += t.tabW(tl_tasks) + 6;
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_build), .height = tab_h }, tl_build, ui.sched_inner == .build)) ui.sched_inner = .build;
+    const r = t.Rect{ .x = pad, .y = body.y + pad + tab_h + 8, .width = body.width - pad * 2, .height = body.height - pad * 2 - tab_h - 8 };
+    switch (ui.sched_inner) {
+        .tasks => drawSchedTasks(store, r),
+        .build => drawSchedBuild(store, r),
+    }
+}
+
+/// "every 30m" / "daily 09:00" / "once Jul 15 13:40" — one row's human schedule summary, composed at
+/// draw time from the raw fields so it can never go stale against the clock.
+fn schedSummary(row: *const store_mod.SchedRow, buf: []u8) []const u8 {
+    switch (row.kind) {
+        1 => {
+            if (row.every_min >= 60 and row.every_min % 60 == 0) return std.fmt.bufPrint(buf, "every {d}h", .{row.every_min / 60}) catch "every ?";
+            return std.fmt.bufPrint(buf, "every {d}m", .{row.every_min}) catch "every ?";
+        },
+        2 => return std.fmt.bufPrint(buf, "daily {s}", .{row.hmStr()}) catch "daily ?",
+        else => {
+            if (row.at <= 0) return "once";
+            const mons = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+            const es = std.time.epoch.EpochSeconds{ .secs = @intCast(row.at) };
+            const monday = es.getEpochDay().calculateYearDay().calculateMonthDay(); // (md shadows the mdutil import)
+            const ds = es.getDaySeconds();
+            return std.fmt.bufPrint(buf, "once {s} {d} {d:0>2}:{d:0>2}", .{ mons[monday.month.numeric() - 1], monday.day_index + 1, ds.getHoursIntoDay(), ds.getMinutesIntoHour() }) catch "once";
+        },
+    }
+}
+
+/// "due in 12m" / "due in 3h 20m" / "overdue" — countdown against the poller's epoch clock (the UI
+/// thread's only wall clock; raylib time is app-relative). Empty when the server gave no next_due.
+fn schedDue(next_due: i64, now: i64, buf: []u8) []const u8 {
+    if (next_due <= 0 or now <= 0) return "";
+    const d = next_due - now;
+    if (d <= 0) return "overdue";
+    const mins = @divTrunc(d + 59, 60); // round up: "due in 1m" until it actually fires, never "0m"
+    if (mins >= 60 * 24) return std.fmt.bufPrint(buf, "due in {d}d {d}h", .{ @divTrunc(mins, 60 * 24), @mod(@divTrunc(mins, 60), 24) }) catch "";
+    if (mins >= 60) return std.fmt.bufPrint(buf, "due in {d}h {d}m", .{ @divTrunc(mins, 60), @mod(mins, 60) }) catch "";
+    return std.fmt.bufPrint(buf, "due in {d}m", .{mins}) catch "";
+}
+
+/// The task list: one row per scheduled task with its enabled toggle, schedule summary + countdown, run
+/// count, the newest run's conversation (click → open it in Chat), a "run now", and a hover ✕ delete
+/// (the conv-row pattern: fire the command, the next list refresh drops the row).
+fn drawSchedTasks(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    store.lock();
+    var rows: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined;
+    const n = store.sched_count;
+    @memcpy(rows[0..n], store.sched_rows[0..n]);
+    const seen = store.sched_seen;
+    const denied = store.sched_denied;
+    const online = store.server_online;
+    const now = store.last_refresh_s;
+    store.unlock();
+
+    if (n == 0) {
+        const msg = if (denied)
+            t.z("admin token required - connect the admin key in Settings", .{})
+        else if (!online)
+            t.z("server offline - start it to see scheduled tasks", .{})
+        else if (!seen)
+            t.z("fetching scheduled tasks...", .{})
+        else
+            t.z("no scheduled tasks yet - use Build a task", .{});
+        t.text(msg, @intFromFloat(r.x + t.PAD_IN + 2), @intFromFloat(r.y + t.PAD_IN + 2), 13, t.comment);
+        return;
+    }
+
+    const row_h: f32 = 58;
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 1, .width = r.width - 2, .height = r.height - 2 };
+    const total: f32 = @as(f32, @floatFromInt(n)) * row_h + 12;
+    const max_scroll = if (total > list.height) total - list.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(list)) ui.sched_scroll -= wheel * row_h;
+    if (ui.sched_scroll < 0) ui.sched_scroll = 0;
+    if (ui.sched_scroll > max_scroll) ui.sched_scroll = max_scroll;
+    rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
+    defer rl.endScissorMode();
+    var yy: f32 = r.y + 6 - ui.sched_scroll;
+    for (rows[0..n]) |*row| {
+        // cull rows outside the view but keep advancing yy so offsets stay stable (the conv-list pattern)
+        if (yy + row_h < list.y or yy > list.y + list.height) {
+            yy += row_h;
+            continue;
+        }
+        const rr = t.Rect{ .x = r.x + 6, .y = yy, .width = r.width - 12, .height = row_h - 6 };
+        const hot = t.hovering(rr);
+        if (hot) t.panel(rr, t.bg_hl);
+        // enabled toggle (label-less checkbox): posts the DESIRED state; the ~1s re-list confirms it
+        if (t.checkbox(.{ .x = rr.x + 10, .y = rr.y, .width = 18, .height = rr.height }, t.z("", .{}), row.enabled))
+            store.pushCmd(store_mod.mkCmd(.sched_toggle, row.idStr(), if (row.enabled) "0" else "1"));
+        // name (bold-ish 14) over the schedule summary + countdown + runs subtitle
+        const name_w: f32 = @max(60, rr.width - 340);
+        t.textClip(row.nameStr(), @intFromFloat(rr.x + 44), @intFromFloat(rr.y + 8), 14, if (row.enabled) t.fg else t.fg_dim, @intFromFloat(name_w));
+        var sumb: [48]u8 = undefined;
+        var dueb: [48]u8 = undefined;
+        var sub: [200]u8 = undefined;
+        const due = if (row.enabled) schedDue(row.next_due, now, &dueb) else "paused";
+        const line = std.fmt.bufPrint(&sub, "{s}{s}{s}  -  {d} runs{s}", .{
+            schedSummary(row, &sumb), if (due.len > 0) "  -  " else "", due, row.runs, if (row.prompt_len > 0) "  -  " else "",
+        }) catch "";
+        var lw: f32 = 0;
+        if (line.len > 0) {
+            t.textClip(line, @intFromFloat(rr.x + 44), @intFromFloat(rr.y + 29), 12, if (due.len > 0 and due[0] == 'o') t.orange else t.comment, @intFromFloat(name_w));
+            lw = @floatFromInt(t.measure(t.zs(line), 12));
+        }
+        // the prompt preview trails the subtitle in the quietest color (the row's tooltip-substitute)
+        if (row.prompt_len > 0 and lw + 30 < name_w) {
+            t.textClip(row.promptStr(), @intFromFloat(rr.x + 44 + lw), @intFromFloat(rr.y + 29), 12, t.withAlpha(t.comment, 170), @intFromFloat(name_w - lw));
+        }
+        // ✕ delete (right edge, on row hover — the conv-row pattern)
+        const xb = t.Rect{ .x = rr.x + rr.width - 30, .y = rr.y + (rr.height - 24) / 2, .width = 24, .height = 24 };
+        if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
+            store.pushCmd(store_mod.mkCmd(.sched_delete, row.idStr(), ""));
+        }
+        // run now (always visible — it's the row's primary affordance)
+        const run_label = t.z("run now", .{});
+        const run_w = t.btnW(run_label, 24);
+        const runb = t.Rect{ .x = rr.x + rr.width - 38 - run_w, .y = rr.y + (rr.height - 24) / 2, .width = run_w, .height = 24 };
+        if (t.buttonGhost(runb, run_label, t.blue, online)) {
+            store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
+        }
+        // the newest run's conversation — click to open it in Chat (a server-side conv mirrors on select)
+        if (row.last_conv_len > 0) {
+            const cw: f32 = @min(170, @max(0, runb.x - (rr.x + 44 + name_w) - 12));
+            if (cw > 40) {
+                const cr = t.Rect{ .x = runb.x - cw - 8, .y = rr.y + (rr.height - 14) / 2, .width = cw, .height = 16 };
+                const chot = t.hovering(cr);
+                t.textClip(row.lastConvStr(), @intFromFloat(cr.x), @intFromFloat(cr.y), 12, if (chot) t.fg else t.cyan, @intFromFloat(cw));
+                if (chot) t.wantCursor(.pointing_hand);
+                if (chot and rl.isMouseButtonPressed(.left)) {
+                    store.pushChatCmd(store_mod.mkChatCmd(.select_conv, row.lastConvStr(), ""));
+                    setTab(.chat);
+                }
+            }
+        }
+        yy += row_h;
+    }
+}
+
+/// The builder form: name + prompt + key details, a click-to-cycle schedule kind with its kind-specific
+/// steppers, and the create action. Mirrors the Deploy form's conventions (flabel + field rows + a solid
+/// call-to-action with an inline hint).
+fn drawSchedBuild(store: *Store, r: t.Rect) void {
+    const x = r.x;
+    var y = r.y;
+    const colw = @min(r.width, 760);
+    const fh: f32 = 48; // one field row: 14px label + 34px input
+    const area_h: f32 = 88; // a 4-row textArea (8px pad + 4×18px lines + 8px pad)
+    const gap: f32 = t.GAP;
+
+    flabel(x, y, "NAME");
+    textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_name, ui.focus == .sc_name, "what to call this task", .sc_name);
+    y += fh + gap;
+
+    flabel(x, y, "PROMPT (the message the veil receives on every run)");
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_prompt, ui.focus == .sc_prompt, "e.g. check the overnight build logs and summarize any failures", .sc_prompt, 4);
+    y += 14 + area_h + gap;
+
+    flabel(x, y, "KEY DETAILS / DATA (context every run should carry)");
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_details, ui.focus == .sc_details, "paths, hosts, formats, constraints - anything the run needs to know", .sc_details, 4);
+    y += 14 + area_h + gap;
+
+    // schedule kind: click-to-cycle (three options — a floating dropdown would be overkill), with the
+    // kind's own knobs beside it. once = fire at submit+N; every = repeat on an interval; daily = HH:MM.
+    const half = (colw - gap) / 2;
+    const kinds = [_][:0]const u8{ t.z("once", .{}), t.z("every N min", .{}), t.z("daily at", .{}) };
+    const kd = t.cycle(.{ .x = x, .y = y, .width = half, .height = fh }, t.z("SCHEDULE", .{}), kinds[ui.sc_kind], false);
+    if (kd != 0) ui.sc_kind = wrap(ui.sc_kind, kd, kinds.len);
+    switch (ui.sc_kind) {
+        1 => ui.sc_every_min = t.stepper(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("EVERY (minutes)", .{}), ui.sc_every_min, 5, 1440),
+        2 => {
+            const q = (half - gap) / 2;
+            ui.sc_hour = t.stepper(.{ .x = x + half + gap, .y = y, .width = q, .height = fh }, t.z("HOUR (24h)", .{}), ui.sc_hour, 0, 23);
+            ui.sc_minute = t.stepper(.{ .x = x + half + gap + q + gap, .y = y, .width = q, .height = fh }, t.z("MINUTE", .{}), ui.sc_minute, 0, 59);
+        },
+        else => ui.sc_once_min = t.stepper(.{ .x = x + half + gap, .y = y, .width = half, .height = fh }, t.z("RUN IN (minutes)", .{}), ui.sc_once_min, 5, 1440),
+    }
+    y += fh + gap;
+
+    if (t.checkbox(.{ .x = x, .y = y, .width = 200, .height = 30 }, t.z("enabled", .{}), ui.sc_enabled)) ui.sc_enabled = !ui.sc_enabled;
+    y += 36;
+    t.text(t.z("runs use the chat provider from Settings - base URL, model and key are snapshotted at create", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    y += 24;
+
+    const online = blk: {
+        store.lock();
+        defer store.unlock();
+        break :blk store.server_online;
+    };
+    const cb_label = t.z("Create scheduled task", .{});
+    const cb = t.Rect{ .x = x, .y = y, .width = @max(160, t.btnW(cb_label, t.BTN_LG)), .height = t.BTN_LG };
+    if (t.buttonSolid(cb, cb_label, t.blue, online)) submitSched(store);
+    const hint = if (!online) t.z("server offline - start it to schedule", .{}) else t.z("posts to /api/v1/sched (admin)", .{});
+    t.text(hint, @intFromFloat(cb.x + cb.width + 14), @intFromFloat(y + (t.BTN_LG - 12) / 2), 12, if (online) t.comment else t.orange);
+}
+
+/// Validate + package the builder form into the create JSON and hand it to the poller. The payload rides
+/// the store's dedicated slot, NOT Command.text — three 1200-byte fields at worst-case 2x escaping outgrow
+/// it. The provider snapshot resolves base/model/key exactly the way the chat thread does
+/// (chat.resolveProvider), so a scheduled run uses the same brain a desk chat turn would use right now.
+fn submitSched(store: *Store) void {
+    if (ui.sc_name.len == 0 or ui.sc_prompt.len == 0) {
+        store.pushNotif("Task incomplete", "give the task a name and a prompt", 2);
+        return;
+    }
+    var basebuf: [256]u8 = undefined;
+    var keybuf: [192]u8 = undefined;
+    var modelbuf: [96]u8 = undefined;
+    var base: []const u8 = "";
+    var key: []const u8 = "";
+    var model: []const u8 = "";
+    var now: i64 = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        const s = &store.settings;
+        now = store.last_refresh_s; // the poller's epoch clock — the UI thread's only wall clock
+        var acct_scratch: [256]u8 = undefined;
+        var b: []const u8 = undefined;
+        var k: []const u8 = "";
+        switch (s.chat_kind) {
+            1 => {
+                // resolveBase substitutes the Cloudflare {account} placeholder (no-op for every other provider)
+                b = catalog.resolveBase(&catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)], s.cfAccount(), &acct_scratch);
+                k = s.chatKey();
+            },
+            2 => {
+                b = s.chatBase();
+                k = s.chatKey();
+            },
+            else => b = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1",
+        }
+        const bn = @min(b.len, basebuf.len);
+        @memcpy(basebuf[0..bn], b[0..bn]);
+        base = basebuf[0..bn];
+        const kn = @min(k.len, keybuf.len);
+        @memcpy(keybuf[0..kn], k[0..kn]);
+        key = keybuf[0..kn];
+        var m: []const u8 = s.chatModel();
+        if (m.len == 0) m = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+        const mn = @min(m.len, modelbuf.len);
+        @memcpy(modelbuf[0..mn], m[0..mn]);
+        model = modelbuf[0..mn];
+    }
+    if (ui.sc_kind == 0 and now == 0) {
+        store.pushNotif("Not ready", "still reading the clock - try again in a second", 2);
+        return;
+    }
+
+    const kind: []const u8 = switch (ui.sc_kind) {
+        1 => "every",
+        2 => "daily",
+        else => "once",
+    };
+    const at: i64 = if (ui.sc_kind == 0) now + @as(i64, ui.sc_once_min) * 60 else 0;
+
+    var b: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&b);
+    w.writeAll("{\"name\":\"") catch return;
+    jesc(&w, ui.sc_name.str());
+    w.writeAll("\",\"prompt\":\"") catch return;
+    jesc(&w, ui.sc_prompt.str());
+    w.writeAll("\",\"details\":\"") catch return;
+    jesc(&w, ui.sc_details.str());
+    w.print("\",\"kind\":\"{s}\",\"at\":{d},\"every_min\":{d},\"hm\":\"{d:0>2}:{d:0>2}\",\"enabled\":{s},\"base_url\":\"{s}\",\"model\":\"{s}\",\"api_key\":\"", .{
+        kind, at, ui.sc_every_min, ui.sc_hour, ui.sc_minute, boolStr(ui.sc_enabled), base, model,
+    }) catch return;
+    jesc(&w, key);
+    w.writeAll("\"}") catch return;
+    const body = w.buffered();
+
+    // park the payload + fire the command (the poller consumes and clears the slot)
+    {
+        store.lock();
+        defer store.unlock();
+        const bn = @min(body.len, store.sched_create_json.len);
+        @memcpy(store.sched_create_json[0..bn], body[0..bn]);
+        store.sched_create_len = bn;
+    }
+    store.pushCmd(store_mod.mkCmd(.sched_create, "", ""));
+    store.pushNotif("Scheduling...", ui.sc_name.str(), 0);
+    ui.sc_name.clear();
+    ui.sc_prompt.clear();
+    ui.sc_details.clear();
+    ui.sched_inner = .tasks;
+}
 
 fn drawSettings(store: *Store, body: t.Rect) void {
     // While a dropdown is open, block the form's buttons/toggles from eating a click meant for the dropdown
