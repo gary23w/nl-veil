@@ -3708,7 +3708,7 @@ fn pathLooksPrivileged(rel: []const u8) bool {
         "src/worker/run.zig",
         "src/worker/llm.zig",
         "src/main.zig",
-        "src/orchestrate/supervisor.zig",
+        "src/worker/control/supervisor.zig",
     };
     for (priv) |p| if (std.mem.startsWith(u8, rel, p)) return true;
     return false;
@@ -3724,7 +3724,7 @@ fn patchSystemTouchesPrivileged(mode: []const u8, path: []const u8, patch: []con
         "src/worker/run.zig",
         "src/worker/llm.zig",
         "src/main.zig",
-        "src/orchestrate/supervisor.zig",
+        "src/worker/control/supervisor.zig",
     };
     for (hints) |h| if (std.mem.indexOf(u8, patch, h) != null) return true;
     return false;
@@ -3734,8 +3734,7 @@ fn patchSystemHighImpact(mode: []const u8, path: []const u8, content: []const u8
     if (std.mem.eql(u8, mode, "patch")) return true;
     if (content.len > 1600) return true;
     if (patch.len > 2000) return true;
-    if (std.mem.startsWith(u8, path, "src/worker/")) return true;
-    if (std.mem.startsWith(u8, path, "src/orchestrate/")) return true;
+    if (std.mem.startsWith(u8, path, "src/worker/")) return true; // now covers the former src/orchestrate/* (moved under worker/{chat,control,deploy,neuron}/)
     if (std.mem.startsWith(u8, path, "src/auth/")) return true;
     return false;
 }

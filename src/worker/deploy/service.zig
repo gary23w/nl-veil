@@ -2,11 +2,11 @@
 
 const std = @import("std");
 const httpz = @import("httpz");
-const http = @import("../gateway/http.zig");
-const ent = @import("../plan/entitlements.zig");
-const neurons = @import("../plan/neurons.zig");
-const crypto = @import("../config/key_vault.zig");
-const tail_fanout = @import("tail_fanout.zig");
+const http = @import("../../gateway/http.zig");
+const ent = @import("../../plan/entitlements.zig");
+const neurons = @import("../../plan/neurons.zig");
+const crypto = @import("../../config/key_vault.zig");
+const tail_fanout = @import("../control/fanout.zig");
 const App = http.App;
 const requireUser = http.requireUser;
 const badReq = http.badReq;

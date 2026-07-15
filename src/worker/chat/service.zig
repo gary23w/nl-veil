@@ -19,8 +19,8 @@
 
 const std = @import("std");
 const httpz = @import("httpz");
-const http = @import("../gateway/http.zig");
-const chat_engine = @import("chat_engine.zig");
+const http = @import("../../gateway/http.zig");
+const chat_engine = @import("engine.zig");
 
 const App = http.App;
 const requireUser = http.requireUser;

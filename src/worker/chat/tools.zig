@@ -18,10 +18,10 @@
 
 const std = @import("std");
 const httpz = @import("httpz");
-const http = @import("../gateway/http.zig");
-const tools = @import("../worker/tools.zig");
-const osc = @import("../worker/oscillation.zig");
-const sup_mod = @import("supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
+const http = @import("../../gateway/http.zig");
+const tools = @import("../tools.zig");
+const osc = @import("../oscillation.zig");
+const sup_mod = @import("../control/supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
 
 const App = http.App;
 const requireUser = http.requireUser;
