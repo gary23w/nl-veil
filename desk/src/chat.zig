@@ -738,11 +738,20 @@ pub const Chat = struct {
             if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
             if (!self.curated and tick > 900 and tick % 50 == 21) self.curateOnce(dd); // once, ~90s after startup
             tick +%= 1;
-            // 10Hz tick (matches the local client's pumpStream cadence). Streaming was made SMOOTHER server-side
-            // instead — FLUSH_CHARS 28->12 + the completeStream 40ms->20ms poll deliver finer frames the desk renders
-            // at 10Hz. (A 3x/tick pump to reach 30Hz was tried but crashed the desk: pumping the HTTP /events poll at
-            // 30Hz under a cast's heavy frame volume is unsafe — the smoothness win is server-side, not poll-rate.)
-            self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+            // SMOOTHER STREAMING (~30Hz while a reply types out): pump the stream 2 EXTRA times at ~33ms so the text
+            // renders continuously like the local client, WITHOUT changing the 100ms cadence of the tick-scheduled
+            // periodic tasks above. Inner pumps no-op unless something is actively streaming.
+            if (self.turn != .idle or self.sc_active) {
+                var extra: u8 = 0;
+                while (extra < 2) : (extra += 1) {
+                    self.io.sleep(.{ .nanoseconds = 33 * std.time.ns_per_ms }, .awake) catch {};
+                    self.pumpStream(dd);
+                    self.pumpServerChat(dd);
+                }
+                self.io.sleep(.{ .nanoseconds = 34 * std.time.ns_per_ms }, .awake) catch {};
+            } else {
+                self.io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+            }
         }
         llm.abort(&self.stream, self.io);
         self.stream.deinit(self.gpa);
