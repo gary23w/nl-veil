@@ -594,21 +594,44 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
             continue;
         }
         if (std.mem.eql(u8, kind, "sync_request")) {
-            // workdir-sync manifest exchange (see worker/chat/sync.zig): answer with this cwd's manifest +
-            // the probe echo so the server can diff (or detect a shared disk) instead of transferring blind.
+            // workdir-sync manifest exchange (see worker/chat/sync.zig): answer with the manifest of this cwd
+            // — or, for a sync_dir projection, of the frame's ABSOLUTE `root` on this machine — plus the probe
+            // echo so the server can diff (or detect a shared disk) instead of transferring blind. An unsafe
+            // root answers an EMPTY manifest, never a substitute directory.
             const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
             defer ctx.gpa.free(id);
-            const resp = cync.manifestResponse(ctx.gpa, ctx.io, ".");
+            const root = jsonStr(ctx.gpa, ln, "root");
+            defer if (root) |r| ctx.gpa.free(r);
+            var bad_root = false;
+            const wd: []const u8 = if (root) |r| blk: {
+                if (!cync.safeRoot(r)) {
+                    bad_root = true;
+                    break :blk ".";
+                }
+                std.debug.print("  [projecting {s} for the server...]\n", .{r});
+                break :blk r;
+            } else ".";
+            const resp = if (bad_root) (ctx.gpa.dupe(u8, "{\"probe\":\"\",\"files\":[]}") catch continue) else cync.manifestResponse(ctx.gpa, ctx.io, wd);
             defer ctx.gpa.free(resp);
             postToolResult(ctx, conv, id, resp);
             continue;
         }
         if (std.mem.eql(u8, kind, "file_pull")) {
-            // the server wants these files for a hive it is about to cast — send only what it asked for
+            // the server wants these files (for a hive, or a sync_dir projection) — send only what it asked for
             const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
             defer ctx.gpa.free(id);
-            std.debug.print("  [sending workdir files to the server for the hive...]\n", .{});
-            const resp = cync.readResponse(ctx.gpa, ctx.io, ".", ln);
+            const root = jsonStr(ctx.gpa, ln, "root");
+            defer if (root) |r| ctx.gpa.free(r);
+            var bad_root = false;
+            const wd: []const u8 = if (root) |r| blk: {
+                if (!cync.safeRoot(r)) {
+                    bad_root = true;
+                    break :blk ".";
+                }
+                break :blk r;
+            } else ".";
+            std.debug.print("  [sending files to the server...]\n", .{});
+            const resp = if (bad_root) (ctx.gpa.dupe(u8, "{\"files\":[]}") catch continue) else cync.readResponse(ctx.gpa, ctx.io, wd, ln);
             defer ctx.gpa.free(resp);
             postToolResult(ctx, conv, id, resp);
             continue;

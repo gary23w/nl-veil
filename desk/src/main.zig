@@ -69,6 +69,7 @@ const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_p
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
 const SchedInner = enum { tasks, build }; // the Scheduled tab's inner tabs (task list | builder form)
+const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -104,6 +105,7 @@ const Ui = struct {
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
     conv_scroll: f32 = 0, // scroll offset for the Chats list (left pane)
+    chats_inner: ChatsInner = .chats, // left pane inner tabs: conversations | scheduled tasks
     con_scroll: [2]f32 = .{ 0, 0 }, // micro-console scrollback per tab (You/Veil): wrapped lines back from the tail; 0 = follow
     cast_scroll: f32 = 0, // swarm-activity live console: events back from the tail; 0 = follow
     sel_msg: ?usize = null, // chat text selection: which message (null = none), and the [anchor,cursor) flat range
@@ -409,7 +411,20 @@ pub fn main() !void {
         store.lock();
         const online0 = store.server_online;
         const busy0 = store.chat_busy;
+        // POLLER hand-off: a run-now (or any background action) minted a conversation to show — consume it
+        // once, open it in Chat, and switch tabs, so "run now" visibly runs instead of just toasting.
+        var goto_buf: [64]u8 = undefined;
+        var goto_len: usize = 0;
+        if (store.goto_conv_len > 0) {
+            goto_len = store.goto_conv_len;
+            @memcpy(goto_buf[0..goto_len], store.goto_conv[0..goto_len]);
+            store.goto_conv_len = 0;
+        }
         store.unlock();
+        if (goto_len > 0) {
+            store.pushChatCmd(store_mod.mkChatCmd(.select_conv, goto_buf[0..goto_len], ""));
+            setTab(.chat);
+        }
         // Activity-gated frame rate. This is an immediate-mode UI: EVERY frame re-lays-out + redraws every chat
         // message's markdown, so holding 60fps while the user is just READING pins a CPU core. Stay at 60 only
         // when something is actually changing — mouse activity, a keystroke, or a live token stream — and idle
@@ -1644,11 +1659,24 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, true);
         return;
     }
-    t.text(t.z("Chats", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(r.y + 11), 14, t.fg);
+    // INNER TABS: Chats | Scheduled — the schedule lives beside the conversations it mints, so a task's runs
+    // are one click away from the chats they produced (the Scheduled TOP tab remains the full manager).
+    const tl_chats = t.z("Chats", .{});
+    const tl_sched = t.z("Scheduled", .{});
+    var tx: f32 = r.x + t.PAD_IN;
+    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_chats), .height = 26 }, tl_chats, ui.chats_inner == .chats)) ui.chats_inner = .chats;
+    tx += t.tabW(tl_chats) + 6;
+    if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_sched), .height = 26 }, tl_sched, ui.chats_inner == .sched)) ui.chats_inner = .sched;
     if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z("<", .{}), t.blue, true)) togglePane(store, true);
-    if (t.buttonGhost(.{ .x = r.x + r.width - 62, .y = r.y + 7, .width = 26, .height = 24 }, t.z("+", .{}), t.blue, true)) {
-        store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
-        ui.c_renaming = false;
+    if (ui.chats_inner == .chats) {
+        if (t.buttonGhost(.{ .x = r.x + r.width - 62, .y = r.y + 7, .width = 26, .height = 24 }, t.z("+", .{}), t.blue, true)) {
+            store.pushChatCmd(store_mod.mkChatCmd(.new_conv, "", ""));
+            ui.c_renaming = false;
+        }
+    }
+    if (ui.chats_inner == .sched) {
+        drawChatsSchedList(store, r);
+        return;
     }
 
     const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
@@ -4116,6 +4144,63 @@ fn schedDue(next_due: i64, now: i64, buf: []u8) []const u8 {
 }
 
 /// The task list: one row per scheduled task with its enabled toggle, schedule summary + countdown, run
+/// The chat sidebar's Scheduled inner tab: a COMPACT task list (name over due + runs). Row click opens the
+/// task's newest run conversation right here in Chat; the small "run" fires it now (the poller then auto-opens
+/// the minted conv). The Scheduled TOP tab remains the full manager (builder form, toggle, delete).
+fn drawChatsSchedList(store: *Store, r: t.Rect) void {
+    store.lock();
+    var rows: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined;
+    const n = store.sched_count;
+    @memcpy(rows[0..n], store.sched_rows[0..n]);
+    const online = store.server_online;
+    const now = store.last_refresh_s;
+    store.unlock();
+    const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
+    if (n == 0) {
+        t.text(t.z("no scheduled tasks yet -", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(list.y + 6), 12, t.comment);
+        t.text(t.z("ask the veil to schedule one", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(list.y + 22), 12, t.comment);
+        return;
+    }
+    const row_h: f32 = 42;
+    const total: f32 = @as(f32, @floatFromInt(n)) * row_h;
+    const max_scroll = if (total > list.height) total - list.height else 0;
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and t.hovering(list)) ui.sched_scroll -= wheel * row_h;
+    if (ui.sched_scroll < 0) ui.sched_scroll = 0;
+    if (ui.sched_scroll > max_scroll) ui.sched_scroll = max_scroll;
+    rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
+    defer rl.endScissorMode();
+    var yy: f32 = list.y + 4 - ui.sched_scroll;
+    for (rows[0..n]) |*row| {
+        if (yy + row_h < list.y or yy > list.y + list.height) {
+            yy += row_h;
+            continue;
+        }
+        const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = r.width - 10, .height = row_h - 6 };
+        const hot = t.hovering(rr);
+        if (hot) t.panel(rr, t.bg_hl);
+        t.textClip(row.nameStr(), @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 5), 13, if (row.enabled) t.fg else t.fg_dim, @intFromFloat(rr.width - 52));
+        var dueb: [48]u8 = undefined;
+        var sub: [96]u8 = undefined;
+        const due = if (row.enabled) schedDue(row.next_due, now, &dueb) else "paused";
+        const line = std.fmt.bufPrint(&sub, "{s} - {d} runs", .{ due, row.runs }) catch "";
+        if (line.len > 0) t.textClip(line, @intFromFloat(rr.x + 8), @intFromFloat(rr.y + 22), 11, t.comment, @intFromFloat(rr.width - 52));
+        const runb = t.Rect{ .x = rr.x + rr.width - 40, .y = rr.y + (rr.height - 22) / 2, .width = 36, .height = 22 };
+        const run_hot = t.hovering(runb);
+        if (t.buttonGhost(runb, t.z("run", .{}), t.blue, online)) store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
+        if (hot and !run_hot) t.wantCursor(.pointing_hand);
+        if (hot and !run_hot and rl.isMouseButtonPressed(.left)) {
+            if (row.last_conv_len > 0) {
+                store.pushChatCmd(store_mod.mkChatCmd(.select_conv, row.lastConvStr(), ""));
+                ui.chats_inner = .chats; // jump back to the conversations list with the run selected
+            } else {
+                store.pushNotif("No runs yet", "press run to fire it now", 2);
+            }
+        }
+        yy += row_h;
+    }
+}
+
 /// count, the newest run's conversation (click → open it in Chat), a "run now", and a hover ✕ delete
 /// (the conv-row pattern: fire the command, the next list refresh drops the row).
 fn drawSchedTasks(store: *Store, r: t.Rect) void {

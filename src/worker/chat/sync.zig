@@ -60,6 +60,25 @@ pub fn safeSyncPath(p: []const u8) bool {
     return true;
 }
 
+/// A ROOTED sync source (the sync_dir projection) must be an ABSOLUTE path on the client machine with no
+/// traversal — the client only ever READS it (the projection never writes back), at the user's own
+/// assistant's request, which is the same trust the roaming read_file already carries.
+pub fn safeRoot(p: []const u8) bool {
+    if (p.len == 0 or p.len > 500) return false;
+    if (std.mem.indexOf(u8, p, "..") != null) return false;
+    if (p[0] == '/' or p[0] == '\\') return true;
+    return p.len > 2 and p[1] == ':' and (p[2] == '/' or p[2] == '\\'); // windows drive
+}
+
+test "safeRoot: absolute only, no traversal" {
+    try std.testing.expect(safeRoot("C:/dev/mygame/src"));
+    try std.testing.expect(safeRoot("/home/u/projects/app"));
+    try std.testing.expect(!safeRoot("relative/dir"));
+    try std.testing.expect(!safeRoot("C:/dev/../secrets"));
+    try std.testing.expect(!safeRoot("~"));
+    try std.testing.expect(!safeRoot(""));
+}
+
 /// TEXT ONLY (v1): a control byte beyond \n\r\t in the first KB marks a binary — it can't ride a JSON string,
 /// and \uXXXX escapes round-trip lossily through the small client unescapers. Binaries are skipped everywhere
 /// (manifest AND transfer) so both sides agree on the syncable set.

@@ -203,10 +203,22 @@ pub const Poller = struct {
         if (id.len == 0) return;
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
-        if (self.schedRespOk(netcli.schedDelete(self.io, self.gpa, self.port(), tok, id), id)) {
+        // IDEMPOTENT delete: a 404 means the task is ALREADY gone (double-click, or the row outlived a delete
+        // that landed) — that is success, not "rejected". The old handling notified failure AND skipped the
+        // list refresh, so the ghost row sat there looking undeletable.
+        const resp = netcli.schedDelete(self.io, self.gpa, self.port(), tok, id) orelse {
+            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if ((resp.status >= 200 and resp.status < 300) or resp.status == 404) {
             self.store.pushNotif("Task deleted", id, 1);
-            self.last_sched_s = 0;
+        } else if (resp.status == 401 or resp.status == 403) {
+            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+        } else {
+            self.store.pushNotif("Delete rejected", id, 2);
         }
+        self.last_sched_s = 0; // ALWAYS re-list after a delete attempt — the row must reflect the server truth
     }
 
     /// Fire one task immediately; the reply carries the scheduled_* conversation it spawned.
@@ -223,11 +235,25 @@ pub const Poller = struct {
         if (resp.status >= 200 and resp.status < 300) {
             const conv = jstr(resp.body, "conv") orelse "";
             self.store.pushNotif("Run started", if (conv.len > 0) conv else id, 1);
+            // OPEN the run: park the conv id in the store hand-off; the render thread consumes it, selects the
+            // conversation in Chat, and switches tabs — so "run now" visibly RUNS instead of just toasting.
+            if (conv.len > 0) {
+                self.store.lock();
+                const cn = @min(conv.len, self.store.goto_conv.len);
+                @memcpy(self.store.goto_conv[0..cn], conv[0..cn]);
+                self.store.goto_conv_len = @intCast(cn);
+                self.store.unlock();
+            }
             self.last_sched_s = 0; // pick up runs/last_conv promptly
         } else if (resp.status == 401 or resp.status == 403) {
             self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+        } else if (resp.status == 409) {
+            // the run is ALREADY going (same-minute re-click while a long run streams) — say so instead of a
+            // bare "rejected" that reads as "the scheduler is broken" and invites more clicking
+            self.store.pushNotif("Already running", "this task's run is still going - open its conversation to watch it", 1);
         } else {
-            self.store.pushNotif("Run rejected", id, 2);
+            const err = jstr(resp.body, "err") orelse "";
+            self.store.pushNotif("Run rejected", if (err.len > 0) err else id, 2);
         }
     }
 

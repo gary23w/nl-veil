@@ -168,7 +168,9 @@ pub const ChatMsg = struct {
 };
 
 pub const ConvRow = struct {
-    id: [32]u8 = [_]u8{0} ** 32, // file basename under .veil-desk/chats (no extension)
+    // 64: the server conv-id ceiling (safeSeg). 32 TRUNCATED scheduled_* run ids (34-39 chars) in the list, so
+    // selecting one loaded an empty chat and deleting one deleted a nonexistent id — "cannot delete" live bug.
+    id: [64]u8 = [_]u8{0} ** 64, // file basename under .veil-desk/chats (no extension)
     id_len: u8 = 0,
     title: [64]u8 = [_]u8{0} ** 64,
     title_len: u8 = 0,
@@ -371,7 +373,7 @@ pub const Store = struct {
     // --- chat (chat thread writes, UI reads; UI writes the command ring) ---
     convs: [MAX_CONVS]ConvRow = undefined,
     conv_count: usize = 0,
-    conv_active: [32]u8 = [_]u8{0} ** 32,
+    conv_active: [64]u8 = [_]u8{0} ** 64, // 64 = the conv-id ceiling (a scheduled_* run id is 34-39 chars)
     conv_active_len: u8 = 0,
     msgs: [MAX_CHAT_MSGS]ChatMsg = undefined,
     msg_count: usize = 0,
@@ -389,6 +391,8 @@ pub const Store = struct {
     //                              DONE, failures, caps, cast pauses, and questions all reset their budget
     //                              instead of stopping; runs until the user clicks it off or hits Stop
     //                              (runtime only; afk implies chat_loop armed)
+    goto_conv: [64]u8 = undefined, // POLLER→RENDER hand-off: open this conversation in Chat (a run-now's minted
+    goto_conv_len: u8 = 0, //         scheduled_* conv); the render loop consumes it once per set
     chat_status: [96]u8 = [_]u8{0} ** 96, // "thinking…" / "casting…" / "watching r3 42%"
     chat_status_len: u8 = 0,
     // Chat FILES inner tab — files produced inside THIS chat's own build dir ({conv}/work). The chat worker scans
