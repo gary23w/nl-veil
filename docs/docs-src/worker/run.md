@@ -22,11 +22,11 @@ Main worker execution loop: reads tasks from the queue, dispatches to the approp
 - `worker/agi` — agent execution
 - `worker/llm` — inference dispatch
 - `worker/tools` — tool execution
-- `orchestrate/neuron_client` — task queue
+- `worker/neuron/client` — the neuron-db memory bridge
 
 ## Usage Context
 
-Entry point for the worker process. Instantiated by supervisor or started as a standalone binary.
+Entry point for the worker process. Instantiated by `worker/control/supervisor` (as a detached process) or started as a standalone binary.
 
 ## Notable Implementation Details
 
