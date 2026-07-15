@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const httpc = @import("worker/httpc.zig");
+const exec_tool = @import("cli/exec_tool.zig");
 
 const VEIL_EXE = if (builtin.os.tag == .windows) "veil.exe" else "veil";
 
@@ -54,7 +55,7 @@ pub fn isCommand(sub: []const u8) bool {
         "cast",  "deploy", "list",   "ls",      "ps",        "stop",
         "rm",    "delete", "events", "logs",    "watch",     "chat",
         "sched", "hub",    "doctor", "health",  "desktop",   "desk",
-        "help",  "--help", "-h",     "version", "--version",
+        "help",  "--help", "-h",     "version", "--version", "exec-tool",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -83,6 +84,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "hub")) return cmdHub(ctx, args);
     if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx);
     if (std.mem.eql(u8, sub, "desktop") or std.mem.eql(u8, sub, "desk")) return cmdDesktop(ctx);
+    if (std.mem.eql(u8, sub, "exec-tool")) return exec_tool.cmd(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -563,12 +565,51 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status == 200 and resp.body.len > 0) {
             renderConvFrames(ctx, resp.body);
+            runDelegatedTools(ctx, conv, resp.body); // CLIENT MODE: execute any tool_request the server sent
             from += resp.body.len;
             idle = 0;
             if (std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null) return;
         } else idle += 1;
         ctx.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
     }
+}
+
+/// CLIENT MODE: the server delegated tool calls back to us. Run each with the shared executor (in this
+/// process, so file/shell/code act on the user's machine) and post the result so the blocked turn continues.
+fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \r\t");
+        if (ln.len == 0) continue;
+        const kind = jsonStr(ctx.gpa, ln, "kind") orelse continue;
+        defer ctx.gpa.free(kind);
+        if (!std.mem.eql(u8, kind, "tool_request")) continue;
+        const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
+        defer ctx.gpa.free(id);
+        const tool = jsonStr(ctx.gpa, ln, "tool") orelse continue;
+        defer ctx.gpa.free(tool);
+        const args = jsonStr(ctx.gpa, ln, "args") orelse ctx.gpa.dupe(u8, "{}") catch continue;
+        defer ctx.gpa.free(args);
+        std.debug.print("\n  [running {s} on this machine...]\n", .{tool});
+        const result = exec_tool.runTool(ctx, ".", tool, args); // workdir = the CLI's current directory
+        defer ctx.gpa.free(result);
+        postToolResult(ctx, conv, id, result);
+    }
+}
+
+/// POST the delegated tool's result back to the blocked server turn.
+fn postToolResult(ctx: *Ctx, conv: []const u8, id: []const u8, result: []const u8) void {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(ctx.gpa);
+    body.appendSlice(ctx.gpa, "{\"id\":") catch return;
+    jstr(ctx.gpa, &body, id);
+    body.appendSlice(ctx.gpa, ",\"result\":") catch return;
+    jstr(ctx.gpa, &body, result);
+    body.append(ctx.gpa, '}') catch return;
+    var pb: [220]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/api/v1/chat/convs/{s}/tool_result", .{conv}) catch return;
+    const resp = call(ctx, "POST", path, body.items, 8, false) catch return;
+    if (resp.body.len > 0) ctx.gpa.free(resp.body);
 }
 
 /// Render the chat event frames a terminal cares about: assistant tokens (streamed inline), tool starts, and
