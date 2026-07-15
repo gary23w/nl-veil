@@ -802,7 +802,7 @@ pub const Chat = struct {
     /// (→ leave it), or null when it can't decide (no endpoint / call or parse failure) so the caller falls back
     /// to the announcesAction heuristic FLOOR. Bounded + SYNCHRONOUS (briefly blocks this settle) — the
     /// acknowledged cost trade for correctness. See ACT_ROUTER_SYS.
-    fn routeMeantToAct(self: *Chat, dd: []const u8, reply: []const u8) ?bool {
+    fn routeMeantToAct(self: *Chat, dd: []const u8, reply: []const u8, hive_done: bool) ?bool {
         const body = std.mem.trim(u8, reply, " \r\n\t");
         if (body.len == 0) return false; // said nothing → nothing to follow through on
         var bb: [256]u8 = undefined;
@@ -818,6 +818,11 @@ pub const Chat = struct {
         msgs.appendSlice(self.gpa, "\"},{\"role\":\"user\",\"content\":\"") catch return null;
         escJson(&msgs, self.gpa, "USER INSTRUCTION:\n");
         escJson(&msgs, self.gpa, self.last_user[0..@min(self.last_user_len, 700)]);
+        // A collect reply follows a FINISHED hive run: the work was already performed (by the swarm, its files
+        // verified on disk in the fold above the reply). Without this line the router reads a completed-work
+        // REPORT ("the file is in your workdir — ready to read") as an unperformed promise and forces a redo
+        // spiral: nudge → re-enter → (any) file-check hiccup → the veil rebuilds the hive's whole deliverable.
+        if (hive_done) escJson(&msgs, self.gpa, "\n\nCONTEXT: a worker hive ALREADY completed this task in this same turn and saved its output files to disk (verified). A reply that reports or summarizes that finished work is a genuine answer, NOT an unperformed action. Only answer true if the reply promises a NEW action beyond the hive's completed work.");
         escJson(&msgs, self.gpa, "\n\nASSISTANT REPLY (no tool call was made this turn):\n");
         escJson(&msgs, self.gpa, body[0..@min(body.len, 1400)]);
         escJson(&msgs, self.gpa, "\n\nDid the assistant intend an action it did not perform? Reply only the JSON.");
@@ -1557,7 +1562,45 @@ pub const Chat = struct {
             self.runDelegatedTool(dd, id, tool, line); // extracts args off `line`, runs, posts to /tool_result
             return;
         }
+        if (std.mem.eql(u8, kind, "file_sync")) {
+            // CLIENT MODE: a finished hive's output file, pushed down by the server so this machine has it. Frames
+            // are processed in order, so these land BEFORE the delegated read_file that gathers them.
+            self.applyFileSync(dd, line);
+            return;
+        }
         // any other kind: not rendered.
+    }
+
+    /// Materialize one server-pushed hive file ({kind:"file_sync",path,content}) into this conv's local build
+    /// workdir — emitted after a cast completes so delegated file tools (and the Files tab) see the swarm's
+    /// output on THIS machine, not just the server's disk. Path is workdir-relative and sanitized; nested
+    /// parents are created. On a local (same-disk) install this rewrites identical bytes — harmless, the run
+    /// is already terminal when the server emits these.
+    fn applyFileSync(self: *Chat, dd: []const u8, line: []const u8) void {
+        var pb: [512]u8 = undefined;
+        const rawp = scRawField(line, "path") orelse return;
+        const path = scUnescape(rawp, &pb);
+        if (!safeSyncPath(path)) {
+            log.warn("file_sync: rejected unsafe path {s}", .{path[0..@min(path.len, 120)]});
+            return;
+        }
+        const rawc = scRawField(line, "content") orelse return;
+        const cbuf = self.gpa.alloc(u8, rawc.len + 1) catch return; // decoded is never longer than the escaped raw
+        defer self.gpa.free(cbuf);
+        const content = scUnescape(rawc, cbuf);
+        var relb: [180]u8 = undefined;
+        const rel = self.chatBuildRel(&relb);
+        if (rel.len == 0) return;
+        var fb: [1100]u8 = undefined;
+        const full = std.fmt.bufPrint(&fb, "{s}/{s}/work/{s}", .{ dd, rel, path }) catch return;
+        if (std.fs.path.dirname(full)) |parent| _ = Io.Dir.cwd().createDirPathStatus(self.io, parent, .default_dir) catch {};
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full, .data = content }) catch {
+            log.warn("file_sync: could not write {s}", .{path[0..@min(path.len, 120)]});
+            return;
+        };
+        log.info("file_sync: wrote {s} ({d}b)", .{ path[0..@min(path.len, 120)], content.len });
+        // the workdir just gained hive files — bind the console/git to it if this conv had none yet
+        if (self.build_dir_len == 0) self.syncBuildDir(dd);
     }
 
     /// Resolve the `veil` server binary to invoke as `veil exec-tool` — it hosts the ONE tool executor, so the desk
@@ -1822,6 +1865,11 @@ pub const Chat = struct {
             return;
         };
         // Run in the chat's build workdir if one has been set (so `dir`/`ls`/`python app.py` see the AI's files).
+        // LATE BIND if unbound: syncBuildDir only binds on chat SELECTION (dir must exist then) and setBuildDir
+        // only on a build-tool response — a workdir created by a CAST after selection left the console in the app
+        // cwd, so `type <hive file>` failed while the file sat right there and the veil concluded it was never
+        // written (then re-did the hive's work inline). One cheap openDir probe per unbound console command.
+        if (self.build_dir_len == 0) self.syncBuildDir(dd);
         // Set the child's CWD via a DIR HANDLE rather than prepending `cd /d …`: a prepended `cd` runs in the
         // spawned cmd's own initial directory (which differed from ours → "The system cannot find the path
         // specified" even though the AI's files were right there). Opening the build dir with the same
@@ -3217,7 +3265,12 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"chat_server\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat }) catch return;
+        // Server chat persists as an OPT-OUT flag under `chat_local` (true = user chose the local fallback).
+        // Written this way so the DEFAULT (server) needs no key: older files, whatever they carry, read as
+        // server-on. The previous `chat_server` key is dead — the old default-local build wrote
+        // `"chat_server":false` for every user, which the new absent=on reader misread as an explicit opt-out
+        // and silently pinned existing installs to the retired local brain.
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"chat_local\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3266,9 +3319,10 @@ pub const Chat = struct {
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
         // stays a thin client. The local engine survives only as a break-glass fallback when the server is
-        // unreachable. Persisted under `chat_server`; absent (fresh or upgraded install) = ON. A user opts OUT via
-        // the Settings toggle, which writes `"chat_server":false`.
-        s.server_chat = std.mem.indexOf(u8, data, "\"chat_server\":false") == null;
+        // unreachable. Persisted as the OPT-OUT key `chat_local` (absent = server on). The old `chat_server` key
+        // is deliberately ignored: the default-local build wrote `"chat_server":false` on every save, so reading
+        // it would pin upgraded installs — users who never touched the toggle — to the retired local brain.
+        s.server_chat = std.mem.indexOf(u8, data, "\"chat_local\":true") == null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {
@@ -4250,7 +4304,7 @@ pub const Chat = struct {
             // it can't decide.
             if (self.act_nudges < 2 and !self.in_veil_work and !self.castPending() and !cast_owed and
                 castGoal(full) == null and // a literal CAST: IS the performed action — it dispatches below
-                (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
+                (self.routeMeantToAct(dd, if (full.len > 0) full else reason, false) orelse
                     (announcesAction(full) or (full.len == 0 and announcesAction(reason)))))
             {
                 self.act_nudges += 1;
@@ -4376,8 +4430,10 @@ pub const Chat = struct {
             // and the chat sat idle on a broken deliverable. Decide off the live stream slices, commit the
             // answer, then re-enter as a .tool_follow turn (a kind that CAN act) with the same bounded
             // follow-through directive the plain-answer path uses.
+            // hive_done=true: this is the collect settle — the hive completed and its files were just verified
+            // in the fold, so the router must not read a completed-work report as an unperformed promise.
             const fizzled = self.act_nudges < 2 and
-                (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
+                (self.routeMeantToAct(dd, if (full.len > 0) full else reason, true) orelse
                     (announcesAction(full) or (full.len == 0 and announcesAction(reason))));
             self.appendVeil(dd, reason, full);
             if (fizzled) {
@@ -6331,6 +6387,10 @@ pub const Chat = struct {
         // NOTE: a pending Stop is deliberately NOT cleared here — Stop during a cast means "do not post-process
         // this into my chat" (it also bumps conv_epoch, so castFinished already refuses the collect).
         self.updateCastRow(.done, m.round, m.pct, "", rel);
+        // The hive just created/filled this conv's build workdir — bind the console/git to it NOW, so the
+        // follow-up turn's `RUN:`/meant-to-act checks run where the hive's files actually are (unbound before
+        // this cast when the dir didn't exist at chat selection).
+        if (self.build_dir_len == 0) self.syncBuildDir(dd);
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         if (self.cast_forced) {
@@ -8776,6 +8836,33 @@ fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const
 fn fileExists(io: Io, path: []const u8) bool {
     _ = Io.Dir.cwd().statFile(io, path, .{}) catch return false;
     return true;
+}
+
+/// A server-pushed file_sync path must stay INSIDE the conv workdir: relative, forward slashes only (the
+/// server's walker emits '/'), no "."/".." segments, no drive letters or ADS colons.
+fn safeSyncPath(p: []const u8) bool {
+    if (p.len == 0 or p.len > 400) return false;
+    if (p[0] == '/' or p[0] == '\\') return false;
+    if (std.mem.indexOfScalar(u8, p, ':') != null) return false;
+    if (std.mem.indexOfScalar(u8, p, '\\') != null) return false;
+    var it = std.mem.splitScalar(u8, p, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return false; // "//" or a trailing '/'
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    }
+    return true;
+}
+
+test "safeSyncPath accepts workdir-relative files and rejects escapes" {
+    try std.testing.expect(safeSyncPath("canada_wildfire_update.md"));
+    try std.testing.expect(safeSyncPath("journal/ada.md"));
+    try std.testing.expect(!safeSyncPath("../outside.txt"));
+    try std.testing.expect(!safeSyncPath("a/../../b"));
+    try std.testing.expect(!safeSyncPath("/abs/path"));
+    try std.testing.expect(!safeSyncPath("C:/windows/evil"));
+    try std.testing.expect(!safeSyncPath("a\\b"));
+    try std.testing.expect(!safeSyncPath(""));
+    try std.testing.expect(!safeSyncPath("a//b"));
 }
 
 fn scRawField(s: []const u8, key: []const u8) ?[]const u8 {

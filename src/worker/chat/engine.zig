@@ -522,7 +522,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 // hive is still working. Await it, then demote to FREE-FORM and gather.
                 var plan_break = true;
                 if (armed) {
-                    if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                    if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                         .stopped => {
                             finishTurn(app, conv_dir, usage_t0);
                             return;
@@ -673,7 +673,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                     if (!afk) {
                         // Idle over a RUNNING cast hive isn't idleness — it's the veil narrating "the hive is
                         // working". Await the hive (cheap, stop-checked), then inject the gather step and continue.
-                        if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                        if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                             .stopped => {
                                 finishTurn(app, conv_dir, usage_t0);
                                 return;
@@ -725,7 +725,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             } else if (armed) {
                 // ARMED (on or afk): never accept DONE while this conversation's cast hive is still working —
                 // await it (cheap, stop-checked), then gather its results instead of settling over them.
-                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                     .stopped => {
                         finishTurn(app, conv_dir, usage_t0);
                         return;
@@ -754,7 +754,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             } else if (armed) {
                 // ARMED repeat while the hive runs = "the hive is working" narrated twice — that's a wait, not
                 // a stall. Await + gather; a genuine no-progress repeat (no hive) still ends the loop.
-                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
+                if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor, tool_client)) |w| switch (w) {
                     .stopped => {
                         finishTurn(app, conv_dir, usage_t0);
                         return;
@@ -1259,8 +1259,10 @@ const AwaitVerdict = enum { finished, stopped, timeout };
 
 /// Block (cheaply — file probes + stop checks, NO inference) until this conversation's cast hive finishes, a stop
 /// lands, or the hive outlives its budget. null = no live hive (nothing to wait for). Emits a status frame every
-/// ~15s so the desk shows the wait honestly.
-fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize) ?AwaitVerdict {
+/// ~15s so the desk shows the wait honestly. In client mode, a .finished verdict pushes the hive's files down to
+/// the client BEFORE the gather step runs, so the delegated list_dir/read_file that follows finds them locally.
+/// (.timeout leaves the hive running — files sync via the pre-delegation hook once a stop_swarm makes it terminal.)
+fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, tool_client: bool) ?AwaitVerdict {
     const cast = liveConvCast(app, uid, conv) orelse return null;
     const t0 = nowSecs(app.io);
     var last_frame: i64 = 0;
@@ -1280,8 +1282,14 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
             if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return .stopped;
             sleepMsRaw(app.io, 250);
         }
-        const sw = app.sup.resolve(conv) orelse return .finished;
-        if (sw.uid != uid or swarmTerminal(app, sw.run_dir, sw.created)) return .finished;
+        const sw = app.sup.resolve(conv) orelse {
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
+            return .finished;
+        };
+        if (sw.uid != uid or swarmTerminal(app, sw.run_dir, sw.created)) {
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
+            return .finished;
+        }
     }
 }
 
@@ -1575,6 +1583,121 @@ fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u
     return gpa.dupe(u8, "(the client did not return a result in time — is the desk/CLI still connected?)") catch emptyRes();
 }
 
+// ------------------------------------------------------------------ CLIENT-MODE FILE SYNC (hive → client)
+
+const SYNC_FILE_CAP: usize = 512 << 10; // per-file ceiling — an oversized file is skipped, not clipped
+const SYNC_TOTAL_CAP: usize = 4 << 20; // total content budget per sync
+const SYNC_MAX_FILES: usize = 64; // frame-count ceiling per sync
+const SYNC_MAX_DEPTH: usize = 4; // work/-relative recursion bound
+
+/// CLIENT MODE: a finished cast's files exist only in the SERVER's run dir, but every file tool is delegated to
+/// the CLIENT, which reads its own disk — so without a push the veil reads "no such file" over work the hive
+/// verifiably produced (then wastefully redoes it), and a remote client never receives the deliverables at all.
+/// Called before each delegated tool: once this conversation's cast is terminal and not yet synced, emit every
+/// work file as a {kind:"file_sync",path,content} frame; the client writes each into its local workdir BEFORE it
+/// executes the next delegated tool (frames are processed in order). Marker-deduped per swarm id; no-op while
+/// the hive still runs or when there is no cast.
+fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8) void {
+    var run_buf: [1280]u8 = undefined;
+    var run_dir: []const u8 = "";
+    if (app.sup.resolve(conv)) |sw| {
+        if (sw.uid != uid) return;
+        if (!swarmTerminal(app, sw.run_dir, sw.created)) return; // sync once it finishes
+        run_dir = copyTo(&run_buf, sw.run_dir) orelse return; // sw points into the registry; copy before slow IO
+    } else {
+        // Registry entry gone (server restarted after the cast) — fall back to the conventional run dir this
+        // conversation's casts always use, and require its terminal DONE marker before syncing anything.
+        const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return;
+        run_dir = std.fmt.bufPrint(&run_buf, "{s}/builds/{s}", .{ conv_dir[0..at], conv }) catch return;
+        var db: [1400]u8 = undefined;
+        const done = std.fmt.bufPrint(&db, "{s}/DONE", .{run_dir}) catch return;
+        _ = std.Io.Dir.cwd().access(app.io, done, .{}) catch return; // never sync a half-written run
+    }
+    // Dedup marker lives in the RUN dir: a re-cast resets that dir, so the fresh run re-syncs naturally.
+    var mb: [1400]u8 = undefined;
+    const marker = std.fmt.bufPrint(&mb, "{s}/.filesync_done", .{run_dir}) catch return;
+    if (std.Io.Dir.cwd().access(app.io, marker, .{})) |_| return else |_| {}
+    // Marker FIRST: a sync that trips a persistent walk error must not re-fire before every future tool call.
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = marker, .data = "" }) catch {};
+    const sent = emitRunFiles(app, conv_dir, run_dir);
+    if (sent > 0) {
+        var sb: [96]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "synced {d} hive file(s) to your workdir", .{sent}) catch "synced hive files");
+    }
+}
+
+/// Bounded copy of `s` into `buf` (null when it doesn't fit) — for slices whose owner may mutate under us.
+fn copyTo(buf: []u8, s: []const u8) ?[]const u8 {
+    if (s.len > buf.len) return null;
+    @memcpy(buf[0..s.len], s);
+    return buf[0..s.len];
+}
+
+/// Emit every regular file under {run_dir}/work as a file_sync frame (recursive, bounded; dot-entries and
+/// binaries skipped — a NUL byte can't ride a JSON string). Returns how many frames were emitted.
+fn emitRunFiles(app: *App, conv_dir: []const u8, run_dir: []const u8) usize {
+    var wb: [1400]u8 = undefined;
+    const work = std.fmt.bufPrint(&wb, "{s}/work", .{run_dir}) catch return 0;
+    var sent: usize = 0;
+    var budget: usize = SYNC_TOTAL_CAP;
+    emitRunDirFiles(app, conv_dir, work, "", 0, &sent, &budget);
+    return sent;
+}
+
+fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []const u8, depth: usize, sent: *usize, budget: *usize) void {
+    const gpa = app.gpa;
+    if (depth > SYNC_MAX_DEPTH or sent.* >= SYNC_MAX_FILES or budget.* == 0) return;
+    var dir = std.Io.Dir.cwd().openDir(app.io, abs_dir, .{ .iterate = true }) catch return;
+    defer dir.close(app.io);
+    var it = dir.iterate();
+    while (it.next(app.io) catch null) |ent| {
+        if (sent.* >= SYNC_MAX_FILES or budget.* == 0) return;
+        if (ent.name.len == 0 or ent.name[0] == '.') continue; // engine scratch (.search_health…) stays server-side
+        var ab: [1800]u8 = undefined;
+        const child_abs = std.fmt.bufPrint(&ab, "{s}/{s}", .{ abs_dir, ent.name }) catch continue;
+        var rb: [512]u8 = undefined;
+        const child_rel = (if (rel.len == 0)
+            std.fmt.bufPrint(&rb, "{s}", .{ent.name})
+        else
+            std.fmt.bufPrint(&rb, "{s}/{s}", .{ rel, ent.name })) catch continue;
+        switch (ent.kind) {
+            .directory => emitRunDirFiles(app, conv_dir, child_abs, child_rel, depth + 1, sent, budget),
+            .file => {
+                const data = std.Io.Dir.cwd().readFileAlloc(app.io, child_abs, gpa, .limited(SYNC_FILE_CAP)) catch continue;
+                defer gpa.free(data);
+                if (data.len == 0 or data.len > budget.*) continue;
+                // TEXT ONLY: skip anything with control bytes beyond \n\r\t — binaries can't ride a JSON string,
+                // and \uXXXX escapes would round-trip lossily through the clients' small unescapers.
+                const probe = data[0..@min(data.len, 1024)];
+                var binary = false;
+                for (probe) |b| {
+                    if (b < 0x20 and b != '\n' and b != '\r' and b != '\t') {
+                        binary = true;
+                        break;
+                    }
+                }
+                if (binary) continue;
+                scrubUtf8(data);
+                var ev: std.ArrayListUnmanaged(u8) = .empty;
+                defer ev.deinit(gpa);
+                const ok = blk: {
+                    ev.appendSlice(gpa, "{\"kind\":\"file_sync\",\"path\":") catch break :blk false;
+                    http.jstr(gpa, &ev, child_rel) catch break :blk false;
+                    ev.appendSlice(gpa, ",\"content\":") catch break :blk false;
+                    http.jstr(gpa, &ev, data) catch break :blk false;
+                    ev.append(gpa, '}') catch break :blk false;
+                    break :blk true;
+                };
+                if (!ok) continue;
+                emitEvent(app, conv_dir, ev.items);
+                budget.* -= data.len;
+                sent.* += 1;
+            },
+            else => {},
+        }
+    }
+}
+
 /// Scan tool_results.jsonl for the line whose "id" matches; return its "result" (gpa-owned) or null (not yet).
 fn readToolResult(app: *App, conv_dir: []const u8, id: []const u8) ?[]u8 {
     const gpa = app.gpa;
@@ -1760,6 +1883,10 @@ fn runInnerAgentic(
                 emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "steer received — skipped {d} queued tool call(s)", .{skipped}) catch "steer received");
                 break;
             }
+            // CLIENT MODE: if this conversation's cast just finished, push its files down FIRST — the frames land
+            // before this tool's tool_request, and the client processes frames in order, so a delegated
+            // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
             // via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes as a mind tool:
