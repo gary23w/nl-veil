@@ -188,6 +188,12 @@ pub const ToolCtx = struct {
     vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
     reject_notes: ?*std.ArrayListUnmanaged(u8) = null, // per-round write-refusal ledger (owned by the Worker) — folded into the fitness block so refusals are visible, not silent
     patch_root: []const u8 = "", // DEFAULT engine source root for patch_system when NL_PATCH_SYSTEM_ROOT is unset — a mind is root of its own VM (resolved once from the executable path by the worker)
+    // CLIENT-EXECUTOR privilege (`veil exec-tool` only): READ-ONLY tools (read_file/list_dir) may take an
+    // ABSOLUTE or ~-prefixed path anywhere the user's own account can read, and stage_file may copy such a
+    // file INTO the workdir (so a cast's sync can carry it to a hive). The user asked their own machine's
+    // assistant to act on their own files — the workdir jail is a SWARM-mind boundary, not a client one.
+    // Writes (write_file/edit_file/delete_file) stay workdir-locked everywhere. Never set for minds.
+    roam: bool = false,
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -430,8 +436,9 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; also accepts an ABSOLUTE path (C:/data) or ~/dir on the user's machine; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir (default '.'), or an absolute/~ path on the user's machine"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"delete_file","description":"Delete a file you created in your build workdir (clean up a dead end, a wrong scaffold, or junk).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
@@ -509,6 +516,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
     if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, args_json);
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);
+    if (std.mem.eql(u8, name, "stage_file")) return stageFile(ctx, args_json);
     if (std.mem.eql(u8, name, "patch_system")) return patchSystem(ctx, args_json);
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, args_json);
     if (std.mem.eql(u8, name, "ask_veil")) return askVeil(ctx, args_json);
@@ -891,7 +899,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
@@ -1435,6 +1443,23 @@ fn readLineWindow(gpa: std.mem.Allocator, text: []const u8, start_in: usize, end
 /// A directory listing for read_file-on-a-directory (names, sizes, subdirs marked with '/'). Returns null
 /// when `full` isn't an openable directory (the caller falls through to its file handling). Capped so a
 /// giant tree can't flood a reply; the cap is NAMED so the model knows the view is partial.
+/// CLIENT ROAM: resolve an ABSOLUTE ("C:/data/x.csv", "/home/u/x") or HOME ("~/notes.txt") path a roaming
+/// ToolCtx may READ. Returns the resolved path (gpa-owned) or null when the path isn't roamable (relative,
+/// contains "..", or roam is off — swarm minds always). ".." stays rejected even when roaming: an absolute
+/// path needs no traversal tricks, so any ".." is a smell, not a need.
+fn roamPath(ctx: *ToolCtx, p: []const u8) ?[]u8 {
+    if (!ctx.roam or p.len == 0) return null;
+    if (std.mem.indexOf(u8, p, "..") != null) return null;
+    const gpa = ctx.gpa;
+    if (p[0] == '~' and (p.len == 1 or p[1] == '/' or p[1] == '\\')) {
+        const home = ctx.environ.get("USERPROFILE") orelse ctx.environ.get("HOME") orelse return null;
+        return std.fmt.allocPrint(gpa, "{s}{s}", .{ home, p[1..] }) catch null;
+    }
+    const abs = (p[0] == '/' or p[0] == '\\') or (p.len > 2 and p[1] == ':' and (p[2] == '/' or p[2] == '\\'));
+    if (!abs) return null;
+    return gpa.dupe(u8, p) catch null;
+}
+
 fn dirListing(ctx: *ToolCtx, full: []const u8, rpath: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
     var d = std.Io.Dir.cwd().openDir(ctx.io, full, .{ .iterate = true }) catch return null;
@@ -1480,14 +1505,26 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".") or std.mem.eql(u8, p.value.path, "./")) {
         return dirListing(ctx, ctx.workdir, ".") orelse dupe(gpa, "the workdir is empty");
     }
-    if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
-    const rpath = blk_rp: {
+    // CLIENT ROAM: on the user's own machine an ABSOLUTE (or ~) path outside the workdir is a READ the user's
+    // assistant may make ("analyze C:/data/report.csv") — the content returns as this tool's result, no copy,
+    // no sync. Swarm minds (roam=false) keep the hard workdir jail and the original error.
+    const roamed: ?[]u8 = if (!safeRel(p.value.path)) roamPath(ctx, p.value.path) else null;
+    defer if (roamed) |r| gpa.free(r);
+    if (!safeRel(p.value.path) and roamed == null)
+        return dupe(gpa, if (ctx.roam)
+            "bad path — a workdir-RELATIVE path (index.html), an ABSOLUTE path on this machine (C:/data/x.csv), or ~/file"
+        else
+            "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
+    const rpath = if (roamed != null) p.value.path else blk_rp: {
         const wb = std.fs.path.basename(ctx.workdir);
         if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
             break :blk_rp p.value.path[wb.len + 1 ..];
         break :blk_rp p.value.path;
     };
-    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, rpath }) catch return dupe(gpa, "oom");
+    const full = if (roamed) |r|
+        (gpa.dupe(u8, r) catch return dupe(gpa, "oom"))
+    else
+        (std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, rpath }) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch blk_big: {
         // Not a plain small file. A DIRECTORY gets its listing; a file BIGGER than the slurp cap gets read
@@ -1513,6 +1550,39 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // spirals on tail-verification. Name the cut, the real size, AND how to see the rest (a line range), so the
     // reader windows the tail instead of re-reading the head.
     return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ clean[0..cap], cap, clean.len, p.value.path }) catch dupe(gpa, clean[0..cap]);
+}
+
+/// stage_file — copy a file from ANYWHERE the user's account can read INTO the conversation workdir, so a
+/// hive cast from this conversation can build on it (the cast-time sync carries the workdir to the server; it
+/// never syncs the client's machine — the workdir is the share, like an SMB share: you put IN it what you
+/// mean to share). Client executor only (roam); a swarm mind calling this gets a plain refusal.
+fn stageFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { path: []const u8 = "", as: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    if (!ctx.roam) return dupe(gpa, "stage_file runs only on a client machine (it copies a file from the user's disk into the shared workdir)");
+    const src = roamPath(ctx, p.value.path) orelse return dupe(gpa, "stage_file needs an ABSOLUTE source path on this machine (e.g. C:/data/report.csv or ~/notes.txt)");
+    defer gpa.free(src);
+    const name = if (p.value.as.len > 0) p.value.as else std.fs.path.basename(src);
+    if (name.len == 0 or !safeRel(name)) return dupe(gpa, "bad 'as' name — give a workdir-relative file name (e.g. report.csv or data/report.csv)");
+    const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, src, gpa, .limited(32 << 20)) catch return dupe(gpa, "could not read the source file (missing, unreadable, or larger than 32MB)");
+    defer gpa.free(data);
+    const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, name }) catch return dupe(gpa, "oom");
+    defer gpa.free(full);
+    if (!writeWorkFileAtomic(ctx, full, data)) return dupe(gpa, "could not write into the workdir");
+    ctx.files_written.* += 1;
+    // remote-hive caveat: the sync lane is text-only and capped — name the limit NOW, not as a silent drop later
+    var bin = false;
+    for (data[0..@min(data.len, 1024)]) |b| {
+        if (b < 0x20 and b != '\n' and b != '\r' and b != '\t') {
+            bin = true;
+            break;
+        }
+    }
+    if (bin or data.len > (512 << 10))
+        return std.fmt.allocPrint(gpa, "staged {s} into the workdir ({d} bytes). NOTE: it is {s}, so a REMOTE hive's sync will not carry it — a same-machine hive sees it directly.", .{ name, data.len, if (bin) "binary" else "larger than the 512KB sync lane" }) catch dupe(gpa, "staged");
+    return std.fmt.allocPrint(gpa, "staged {s} into the workdir ({d} bytes) — a hive cast from this conversation can now use it", .{ name, data.len }) catch dupe(gpa, "staged");
 }
 
 fn patchSystem(ctx: *ToolCtx, args_json: []const u8) []u8 {
@@ -1632,8 +1702,20 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer p.deinit();
     const base = if (std.mem.eql(u8, p.value.root, "system")) (patchSystemRoot(ctx) orelse return dupe(gpa, "root=system needs NL_PATCH_SYSTEM_ROOT set")) else ctx.workdir;
     const rel = if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".")) "" else p.value.path;
-    if (rel.len > 0 and !safeRel(rel)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
-    const full = if (rel.len > 0) (std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, rel }) catch return dupe(gpa, "oom")) else (gpa.dupe(u8, base) catch return dupe(gpa, "oom"));
+    // CLIENT ROAM: listing an absolute/~ directory on the user's own machine is a read (see readFile's twin).
+    const roamed: ?[]u8 = if (rel.len > 0 and !safeRel(rel)) roamPath(ctx, rel) else null;
+    defer if (roamed) |r| gpa.free(r);
+    if (rel.len > 0 and !safeRel(rel) and roamed == null)
+        return dupe(gpa, if (ctx.roam)
+            "bad path — a workdir-RELATIVE path, an ABSOLUTE path on this machine (C:/data), or ~/dir"
+        else
+            "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
+    const full = if (roamed) |r|
+        (gpa.dupe(u8, r) catch return dupe(gpa, "oom"))
+    else if (rel.len > 0)
+        (std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, rel }) catch return dupe(gpa, "oom"))
+    else
+        (gpa.dupe(u8, base) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
     forcePyUtf8(&env);
@@ -3773,9 +3855,25 @@ fn replaceOne(gpa: std.mem.Allocator, src: []const u8, find: []const u8, repl: [
 }
 
 fn safeRel(p: []const u8) bool {
-    if (p.len == 0 or p[0] == '/' or p[0] == '\\') return false;
+    if (p.len == 0 or p[0] == '/' or p[0] == '\\' or p[0] == '~') return false;
+    // a drive colon ("C:/...") or NTFS ADS colon is NOT workdir-relative — without this a Windows absolute
+    // path slipped past as "relative", got joined under the workdir, and read as a confusing "not found"
+    // (and the roam branch for client-side absolute reads never fired).
+    if (std.mem.indexOfScalar(u8, p, ':') != null) return false;
     if (std.mem.indexOf(u8, p, "..") != null) return false;
     return true;
+}
+
+test "safeRel: relative only — rejects absolute, drive-colon, home, traversal" {
+    try std.testing.expect(safeRel("index.html"));
+    try std.testing.expect(safeRel("css/style.css"));
+    try std.testing.expect(!safeRel("/abs/path"));
+    try std.testing.expect(!safeRel("\\abs"));
+    try std.testing.expect(!safeRel("C:/data/x.csv"));
+    try std.testing.expect(!safeRel("C:\\data\\x.csv"));
+    try std.testing.expect(!safeRel("~/notes.txt"));
+    try std.testing.expect(!safeRel("a/../b"));
+    try std.testing.expect(!safeRel(""));
 }
 
 /// run.zig's builtInManifest key convention, mirrored: a probe carrying a directory ('/' or '\\') matches
