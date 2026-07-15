@@ -1,4 +1,4 @@
-//! Neuron ledger — the metered-AI budget that makes multi-tenant Workers AI safe to deploy. 1 user-neuron = 1
+//! Neuron ledger — the metered-AI budget that makes multi-tenant Workers AI safe to deploy (per-user grant + usage).
 
 const std = @import("std");
 const Neuron = @import("../worker/neuron/client.zig").Neuron;

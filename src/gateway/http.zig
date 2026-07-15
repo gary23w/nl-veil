@@ -1,4 +1,4 @@
-//! HTTP layer shared context — the `App` wiring struct plus the small helpers every handler reaches for:
+//! HTTP layer shared context — the `App` wiring struct plus the auth / JSON / error helpers every handler uses.
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -71,21 +71,14 @@ pub fn sessionToken(req: *httpz.Request) ?[]const u8 {
     return null;
 }
 
-/// Append `data` to `path` as a TRUE O(1) append: open-or-create WITHOUT truncating, then a single positioned
-/// write at the current end-of-file. The file grows monotonically (never rewritten), so:
-///   * a byte-cursor reader (the chat events poller streams events.jsonl by offset) never sees the file shrink,
-///   * a streaming turn emitting hundreds of token frames no longer pays an O(n²) whole-file rewrite per frame
-///     (the old read-modify-write was the throttle that made streaming feel chunky), and
-///   * the 8/64 MiB read-cap "amnesia cliff" is gone — nothing reads the existing content.
-/// Open+close per call (like the worker's emit) so the file is never held locked against a concurrent reader.
-/// Serializes ALL gateway-side appends (chat events/messages + control.jsonl) so the stat→write pair below is
-/// atomic across threads. appendFile has NO O_APPEND available (Zig 0.16 CreateFileOptions has no append mode),
-/// so it emulates append with statFile-then-writePositionalAll — which is only correct for a single writer at a
-/// time. control.jsonl in particular has multiple writers (the /control endpoint on an httpz thread + orchestration
-/// tools on the detached turn thread); without this lock two racing appends read the same offset and clobber each
-/// other (a torn/lost control op the reader silently drops). The lock is process-wide but each append is a few
-/// microseconds of metadata+write, so contention is negligible even with many concurrent streaming convs. (The
-/// worker has its OWN appendFile — this covers only the gateway/chat/control_writer callers.)
+/// Append `data` to `path` as an O(1) positioned write at end-of-file: open-or-create WITHOUT truncating, no
+/// whole-file rewrite. The file grows monotonically, so a byte-cursor reader (the events poller) never sees it
+/// shrink. Zig 0.16 has no O_APPEND (CreateFileOptions has no append mode), so this emulates it with
+/// statFile-then-writePositionalAll — correct only for ONE writer at a time. The process-wide mutex makes the
+/// stat→write pair atomic across threads: control.jsonl in particular has multiple writers (the /control
+/// endpoint + the detached turn thread), and without the lock two racing appends read the same offset and
+/// clobber each other. Each append is a few microseconds, so contention is negligible. (The worker has its own
+/// appendFile; this covers only the gateway/chat/control callers.)
 var append_mtx: std.Io.Mutex = .init;
 
 pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
@@ -93,13 +86,12 @@ pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: 
     append_mtx.lockUncancelable(io);
     defer append_mtx.unlock(io);
     const dir = std.Io.Dir.cwd();
-    // The true end-of-file offset MUST come from a stat of the path, NOT from `f.length()` on a freshly
-    // createFile(.truncate=false) handle — that returns 0 here (Windows/Io), so every positioned write landed at
-    // offset 0 and clobbered the previous frame from the front (events.jsonl held only garbled tails). ONLY
-    // FileNotFound legitimately means offset 0 (a new file); any OTHER stat error (a transient sharing violation,
-    // an AV scan window, a READ-denied ACL) must NOT collapse to 0 — that would write at the head and clobber an
-    // EXISTING file. On such an error, skip this append (callers do `catch {}`): a dropped frame is recoverable,
-    // a clobbered durable-log head is not.
+    // The end-of-file offset MUST come from statFile of the path, NOT `f.length()` on a freshly
+    // createFile(.truncate=false) handle — that returns 0 here (Windows/Io), so every write would land at offset
+    // 0 and clobber the previous frame. ONLY FileNotFound legitimately means offset 0 (a new file); any OTHER
+    // stat error (transient sharing violation, AV scan window, READ-denied ACL) must NOT collapse to 0 — that
+    // clobbers an existing file. Skip the append on such an error (callers `catch {}`): a dropped frame is
+    // recoverable, a clobbered durable-log head is not.
     const end: u64 = if (dir.statFile(io, path, .{})) |st| st.size else |e| switch (e) {
         error.FileNotFound => 0,
         else => return e,

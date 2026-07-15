@@ -1,4 +1,4 @@
-//! Per-IP login throttle — after MAX_FAILS failed logins from one IP inside a sliding window, that IP is
+//! Per-IP login throttle — MAX_FAILS failed logins from one IP within a sliding window locks it out for LOCK_SECS.
 
 const std = @import("std");
 const IpAddress = std.Io.net.IpAddress;

@@ -3,8 +3,7 @@
 //! recall_hive, observe, …) dispatch straight to the worker's `tools.execute()` through a minimal
 //! ToolCtx; orchestration verbs (list_swarms / stop_swarm / kill_swarm / swarm_status / swarm_findings)
 //! wrap the supervisor + run-dir so a chat can drive its own swarms. Hive and chat share this ONE
-//! registry — as the tool set grows, both surfaces grow with it (the user's ask: "add a single chat
-//! endpoint api to the server side tools … then as we scale tools both hive and chat share the same").
+//! registry — as the tool set grows, both surfaces grow with it.
 //!
 //!   POST /api/v1/chat/tool
 //!     { "tool":"web_search",     "args":"{\"query\":\"...\"}" }   // args = JSON string, tool-call style
@@ -35,9 +34,8 @@ const unauth = http.unauth;
 // process with its OWN such mutex (see run.zig's files_mtx) — the two lock domains can't rendezvous across a
 // process boundary, so a genuinely-simultaneous chat-edit and hive-edit to the same file has a narrow
 // (microseconds) race window between commitEdit's HEAD-read and its atomic write. Both sides still rebase
-// their ops onto whatever HEAD they read and land it via a same-dir atomic rename, so this is far safer than
-// the old design (a separate, unmerged veil build reconciled by an LLM after the fact): edits route through
-// the SAME version-control mechanic the swarm's own minds use, instead of inventing a second one.
+// their ops onto whatever HEAD they read and land it via a same-dir atomic rename — edits route through the
+// SAME version-control mechanic the swarm's own minds use.
 var chat_vcs_mtx: std.Io.Mutex = .init;
 
 const ToolReq = struct {
@@ -47,7 +45,7 @@ const ToolReq = struct {
     dir: []const u8 = "", // conversation id → a per-conversation build workdir (sanitized server-side)
 };
 
-// FULL TOOL CONVERGENCE — the chat AI gets the SAME tool surface a hive mind has (the user's ask). The tools
+// FULL TOOL CONVERGENCE — the chat AI gets the SAME tool surface a hive mind has. The tools
 // route to the identical tools.execute() the swarm uses; they split by RISK, not by capability:
 //
 // SAFE_TOOLS run for ANY authed user — research + memory + persona + coordination + files. The file tools are
@@ -103,7 +101,7 @@ fn argId(body: ToolReq) []const u8 {
 pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     // a malformed body must come back as a readable 400 the calling model can react to — propagating the
-    // parse error turned one bad byte into an opaque 500 (the live `{"tool":"line"."…}` turn)
+    // parse error would turn one bad byte into an opaque 500
     const body = (req.json(ToolReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const tool = std.mem.trim(u8, body.tool, " \r\n\t");
     if (tool.len == 0) return badReq(res, "missing tool");
@@ -291,8 +289,8 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
     // console into); no/blank conv id falls back to the shared _chat/work. `conv` is already safeSeg'd.
     // `run_root` is deliberately the SAME dir a cast for this conversation spawns with as its run_dir
     // (`.../builds/{conv}`, worker builds in `{run_dir}/work`) — so the chat's OWN build tools and a hive cast
-    // co-edit ONE tree (the user's ask: "work inside the SAME/targeted directory"), and vcs.zig's `.vcs` history
-    // for that tree lives in the SAME place the worker process would put it.
+    // co-edit ONE tree, and vcs.zig's `.vcs` history for that tree lives in the SAME place the worker process
+    // would put it.
     const run_root = if (conv.len > 0)
         try std.fmt.allocPrint(res.arena, "{s}/builds/{s}", .{ base, conv })
     else
@@ -334,7 +332,7 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
     scrubUtf8(result);
     defer if (result.len > 0) app.gpa.free(result);
     // workdir_rel lets the desktop cd its micro-console into the SAME folder the build tools write to, so the
-    // user + the AI share one working directory (the user's ask: "cd the user's console to the same folder").
+    // user + the AI share one working directory.
     try res.json(.{ .ok = true, .tool = tool, .result = result, .workdir = workdir_rel }, .{});
 }
 

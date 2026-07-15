@@ -1,4 +1,4 @@
-//! API keys — programmatic auth for the public API (alongside the session cookie the SPA uses). A user mints a key
+//! API keys — programmatic auth for the public API (alongside the SPA session cookie); only SHA-256 hashes are stored.
 
 const std = @import("std");
 const Neuron = @import("../worker/neuron/client.zig").Neuron;

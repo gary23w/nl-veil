@@ -1,9 +1,7 @@
-//! The worker's LLM client. Transport is split by destination: a LOOPBACK plain-http backend (a local
-//! Ollama) goes through the in-process raw-socket client (httpc.zig) — no curl child for Defender's
-//! behavior/ML models to kill, no scratch files, no per-call process cost. A hosted backend needs TLS,
-//! which the Zig control plane doesn't have in-process yet, so those calls still shell out to curl —
-//! its overhead is noise next to the model latency, and the API key rides a curl config file (-K), so
-//! it never appears on the process argv.
+//! The worker's LLM client. Transport splits by destination: a loopback plain-http backend (a local
+//! Ollama) uses the in-process raw-socket client (httpc.zig) — no curl child (Defender kills those), no
+//! scratch files. A hosted backend needs TLS, which the Zig control plane lacks in-process, so those calls
+//! shell out to curl; the API key rides a curl config file (-K) so it never appears on the process argv.
 //!
 //! Two entry points: chat() for a one-shot system+user completion, and complete() for the agentic tool loop
 //! (a pre-built messages array + a tools array → content OR parsed tool_calls).
@@ -16,25 +14,23 @@ pub const Reply = struct {
 };
 
 /// PROCESS-WIDE TOKEN METER. The provider reports exact prompt/completion token counts in every response's
-/// `usage` block; we accumulate them here at the single call choke-point (completeBody) so the engine can report
-/// REAL cost per round/run instead of guessing from request byte sizes (which are noisy — a moment's last request
-/// depends on how many tool turns it ran). Atomic because minds call concurrently. One worker = one swarm = one process.
+/// `usage` block; we fold them in at the single call choke-point (completeBody) for REAL per-round/run cost.
+/// Atomic because minds call concurrently. One worker = one swarm = one process.
 pub var tokens_in: std.atomic.Value(u64) = .init(0);
 pub var tokens_out: std.atomic.Value(u64) = .init(0);
 pub var tokens_in_free: std.atomic.Value(u64) = .init(0);
 pub var tokens_out_free: std.atomic.Value(u64) = .init(0);
 pub var calls_made: std.atomic.Value(u64) = .init(0);
 /// Of tokens_in, how many the provider served from its prompt cache (OpenAI usage.prompt_tokens_details.
-/// cached_tokens — billed at a steep discount). Measuring this is what makes prompt-prefix churn VISIBLE:
-/// a run whose cached share is ~0 is paying full price for re-sending the same doctrine every call.
+/// cached_tokens — billed at a steep discount). A run whose cached share is ~0 is re-sending the same
+/// prompt prefix uncached every call.
 pub var tokens_cached: std.atomic.Value(u64) = .init(0);
 
 pub const TokUsage = struct { in: u64, out: u64 };
 
 /// Per-THREAD token totals (paid + free summed). Each chat turn runs on its OWN detached thread (spawnTurn), so a
 /// thread-local total read as a delta across the turn is exactly THAT turn's usage — correct even when several
-/// conversations' turns run concurrently in the gateway (the process-global atomics above would cross-count them).
-/// The swarm reports cost from the global atomics in its own worker process and never touches these.
+/// conversations' turns run concurrently (the process-global atomics above would cross-count them).
 threadlocal var tl_tokens_in: u64 = 0;
 threadlocal var tl_tokens_out: u64 = 0;
 
@@ -44,8 +40,8 @@ fn meterTL(in: u64, out: u64) void {
     tl_tokens_out += out;
 }
 
-/// Snapshot the CALLING THREAD's token totals. A chat turn reads it before + after its work and reports the delta
-/// as that turn's usage. Thread-local, so concurrent turns on other threads don't inflate the number.
+/// Snapshot the CALLING THREAD's token totals. A chat turn reads it before + after its work and reports the
+/// delta as that turn's usage.
 pub fn tokensSnapshot() TokUsage {
     return .{ .in = tl_tokens_in, .out = tl_tokens_out };
 }
@@ -57,7 +53,7 @@ pub const Caps = struct {
     /// From /api/show model_info "<arch>.context_length": the model's REAL maximum context window. 0 = unknown.
     ctx_tokens: u32 = 0,
     /// capabilities[] from /api/show parsed OK — when true, `tools`/`thinking` are authoritative and replace
-    /// the model-NAME heuristics entirely (a new model needs no code change to be classified correctly).
+    /// the model-NAME heuristics entirely.
     caps_listed: bool = false,
     tools: bool = false,
     thinking: bool = false,
@@ -66,12 +62,11 @@ pub const Caps = struct {
     /// One-shot startup probe: can this backend PARSE a file-sized tool call? Ollama's chat templates on some
     /// small non-thinking models return a large call as raw text / a parse error — every full-file write_file
     /// would be lost. Defaults to trusted; only clear parse-failure evidence flips it (the runtime adaptive
-    /// fence flip remains the safety net for anything the probe misses).
+    /// fence flip is the safety net for anything the probe misses).
     tools_ok_large: bool = true,
     /// HOSTED (OpenAI-style) backends: does a chat completion carrying a tools array come back as STRUCTURED
-    /// tool_calls, or does the model emit the call as text markup (DeepSeek's ｜DSML｜ emission — observed
-    /// live as tool_writes=0 with every file riding the narrated-write salvage)? Measured by a real startup
-    /// completion, cached per model. Defaults to trusted; only clear text-emission evidence flips it.
+    /// tool_calls, or does the model emit the call as text markup (e.g. DeepSeek's ｜DSML｜ emission)? Measured
+    /// by a real startup completion, cached per model. Defaults to trusted; only clear text-emission evidence flips it.
     tools_native_ok: bool = true,
 };
 var caps: Caps = .{};
@@ -93,8 +88,7 @@ pub const Step = struct {
     ok: bool,
     // The provider CUT this reply at the output-token limit (done_reason/finish_reason == "length").
     // Load-bearing for the narrated-write salvage: a fenced file body inside a cut reply is INCOMPLETE
-    // even though it reads as a clean prefix — committing it silently was the truncated-deliverable bug
-    // (a mid-CSS varieties.html scored 100% and finalized the cast).
+    // even though it reads as a clean prefix, so committing it silently ships a truncated deliverable.
     truncated: bool = false,
 
     pub fn deinit(self: *Step, gpa: std.mem.Allocator) void {
@@ -110,9 +104,9 @@ pub const Step = struct {
 };
 
 /// A LOCAL model endpoint (Ollama / LM Studio / llama.cpp on this machine) — detected from the base_url. Local
-/// inference behaves differently from a hosted API: it is much SLOWER (seconds–minutes, CPU/partial-GPU) and it
-/// never rate-limits, so the client must NOT use the short hosted timeout + transient-retry, and a THINKING model
-/// (e.g. DeepSeek-R1) spends part of its token budget on hidden reasoning — so tiny max_tokens calls return empty.
+/// inference is much SLOWER (seconds–minutes, CPU/partial-GPU) and never rate-limits, so the client must NOT
+/// use the short hosted timeout + transient-retry; and a THINKING model spends part of its token budget on
+/// hidden reasoning, so tiny max_tokens calls return empty.
 fn isLocal(base_url: []const u8) bool {
     return std.mem.indexOf(u8, base_url, "localhost") != null or
         std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
@@ -123,16 +117,15 @@ fn isOllama(base_url: []const u8) bool {
     if (caps.probed) return caps.ollama_native;
     return isLocal(base_url) and std.mem.indexOf(u8, base_url, "11434") != null;
 }
-/// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer, so a
-/// 160-token retro/gap call would come back empty. Give those calls room to think AND answer.
+/// Floor on max_tokens for a LOCAL **thinking** model: its hidden reasoning eats the budget before the answer,
+/// so a small-budget call would come back empty. Give those calls room to think AND answer.
 const LOCAL_MIN_TOKENS: u32 = 2048;
 const NATIVE_THINK_TOKENS: u32 = 24576;
 const NATIVE_CTX: u32 = 32768;
 
-/// Is this a THINKING/reasoning model (hidden chain-of-thought before the answer)? Only those need the token floor.
-/// A plain relay model (llama3.1, qwen-instruct, mistral, gemma, phi) answers fine at a small max_tokens — and
-/// flooring IT to 2048 forces it to GENERATE 2048 tokens for a 200-token task, which turned the local relay into a
-/// multi-minute stall. So the floor must be gated on the model, not just on "is it local".
+/// Is this a THINKING/reasoning model (hidden chain-of-thought before the answer)? Only those need the token
+/// floor. A plain relay model answers fine at a small max_tokens — and flooring it to 2048 forces it to GENERATE
+/// 2048 tokens for a small task, a multi-minute stall. So the floor is gated on the model, not just "is it local".
 fn isThinking(model: []const u8) bool {
     if (caps.probed and caps.caps_listed) return caps.thinking or caps.reasoning;
     if (caps.probed and caps.ollama_native) return caps.reasoning;
@@ -149,9 +142,8 @@ fn isThinking(model: []const u8) bool {
 
 pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
     if (!isOllama(base_url)) {
-        // hosted OpenAI-style backend: fence ONLY on measured text-emission evidence from the startup
-        // probe (structured tool_calls confirmed or unprobed → trust the native channel; the runtime
-        // adaptive flip still covers whatever the probe misses)
+        // hosted OpenAI-style backend: fence ONLY on measured text-emission evidence (unprobed → trust the
+        // native channel; the runtime adaptive flip covers whatever the probe misses)
         return caps.probed and !caps.tools_native_ok;
     }
     if (isThinking(model)) return true;
@@ -159,15 +151,15 @@ pub fn fenceWrites(base_url: []const u8, model: []const u8) bool {
     return caps.probed and caps.caps_listed and !caps.tools_ok_large;
 }
 
-/// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or a
-/// local NON-thinking relay model) uses the caller's value verbatim — so the relay generates only what it needs.
+/// The effective max_tokens: a LOCAL thinking model gets the floor (room to reason); everything else (hosted, or
+/// a local NON-thinking relay) uses the caller's value verbatim, so the relay generates only what it needs.
 fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
     return if (isLocal(base_url) and isThinking(model)) @max(max_tokens, LOCAL_MIN_TOKENS) else max_tokens;
 }
 
 /// POST a fully-formed request body to {base_url}/chat/completions. Returns the raw response JSON (caller
 /// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv. `tag`
-/// makes the scratch request/config files per-caller (per-mind) so concurrent minds don't clobber each other.
+/// makes the scratch request/config files per-caller so concurrent minds don't clobber each other.
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Reply {
     const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
     defer gpa.free(url);
@@ -175,10 +167,9 @@ fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8
 }
 
 fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, url: []const u8, key: []const u8, body: []const u8, local: bool) Reply {
-    // Loopback plain-http (a local Ollama): in-process socket. No curl child, and none of the scratch
-    // files below — the key and body never touch disk or an argv on this path. Mirrors curl semantics:
-    // any HTTP status with a body is returned ok=true (callers parse {"error":...} out of the JSON),
-    // and the timeout matches the curl --max-time this path used.
+    // Loopback plain-http (a local Ollama): in-process socket. No curl child, none of the scratch files
+    // below — the key and body never touch disk or an argv on this path. Mirrors curl semantics: any HTTP
+    // status with a body is returned ok=true (callers parse {"error":...} out of the JSON).
     if (httpc.parseLoopbackUrl(url)) |t| {
         switch (httpc.request(io, gpa, .{
             .method = "POST",
@@ -227,8 +218,7 @@ pub fn chat(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []cons
 
 /// As `chat`, but PINS the sampling temperature. `temperature < 0` omits it (backend default = `chat`).
 /// The mechanical classifiers (the emotional-flare read, the constitution screens) pass 0 so their verdicts
-/// are DETERMINISTIC: the same hive state yields the same label instead of resampling a fresh emotion — the
-/// old default-temperature call let an identical round replay as intensity 4–9 across runs.
+/// are DETERMINISTIC: the same hive state yields the same label instead of resampling a fresh emotion.
 pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, system: []const u8, user: []const u8, max_tokens: u32, temperature: f32) Reply {
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -290,14 +280,13 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
 
 /// The num_ctx actually requested: never MORE than the model's probed maximum (asking beyond it is silently
 /// clamped or errors depending on backend), and never more than the engine budget (NATIVE_CTX). Unprobed
-/// keeps the engine budget verbatim (the titan1 truncation fix).
+/// keeps the engine budget verbatim.
 fn effectiveCtx() u32 {
     return if (caps.ctx_tokens > 0) @min(NATIVE_CTX, caps.ctx_tokens) else NATIVE_CTX;
 }
 
-// keep_alive "2m": once a cast finishes and the worker exits, the local model is released a couple minutes
-// later instead of Ollama's 5-min default — so a partly-CPU model stops spinning llama-server soon after the
-// swarm is done. During the run, every request resets the timer, so it stays loaded.
+// keep_alive "2m": once the worker exits, the local model is released a couple minutes later instead of
+// Ollama's 5-min default. During the run, every request resets the timer, so it stays loaded.
 const OLLAMA_KEEP_ALIVE = "2m";
 fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, ctx: u32, temp_frag: []const u8) ![]u8 {
     return if (tools_json.len > 0)
@@ -430,7 +419,7 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
     if (caps.ollama_native) {
         // /api/show is the backend's own capability record: capabilities[] ("tools"/"thinking") replaces the
         // model-NAME heuristics, and model_info's "<arch>.context_length" bounds num_ctx so the engine never
-        // requests a window the model cannot actually serve. Cheap (no model load) and exact.
+        // requests a window the model cannot serve. Cheap (no model load) and exact.
         const show_url = std.fmt.allocPrint(gpa, "{s}/api/show", .{host}) catch return;
         defer gpa.free(show_url);
         var sbody: std.ArrayListUnmanaged(u8) = .empty;
@@ -445,9 +434,9 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
 
     // LARGE-TOOL-CALL PROBE: only the ambiguous case is probed (native + tools listed + non-thinking) —
     // thinking models already get fenced writes, and a model without the tools capability never sends
-    // structured calls at all. The verdict is a MODEL property, so it is CACHED across runs (the echo
-    // round-trip costs ~75s of wall on a slow local model), and a runtime-observed wall overwrites a
-    // false pass via recordLargeToolWall — measured behavior always outranks the synthetic probe.
+    // structured calls. The verdict is a MODEL property, so it is CACHED across runs (the echo round-trip
+    // costs ~75s on a slow local model); a runtime-observed wall overwrites a false pass via
+    // recordLargeToolWall — measured behavior always outranks the synthetic probe.
     if (caps.ollama_native and caps.caps_listed and caps.tools and !caps.thinking) {
         if (cachedLargeVerdict(gpa, io, run_dir, model)) |v| {
             caps.tools_ok_large = v;
@@ -458,10 +447,10 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
     }
 
     if (!caps.ollama_native) {
-        // OpenAI-style hosted backend: measure whether a tools-array completion comes back as
-        // STRUCTURED tool_calls or as text markup (DeepSeek-style emission). The fence decision must
-        // ride measured transport behavior, never the provider's name. Cached per model (a model
-        // property), same trust bias as the large-call probe: only clear text-emission flips it.
+        // OpenAI-style hosted backend: measure whether a tools-array completion comes back as STRUCTURED
+        // tool_calls or as text markup (DeepSeek-style emission). The fence decision must ride measured
+        // transport behavior, never the provider's name. Cached per model, same trust bias as the
+        // large-call probe: only clear text-emission flips it.
         var kb: [160]u8 = undefined;
         const nkey = std.fmt.bufPrint(&kb, "native:{s}", .{model}) catch model;
         if (cachedLargeVerdict(gpa, io, run_dir, nkey)) |v| {
@@ -497,7 +486,7 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
 
 /// Fold an /api/show response into the caps record. capabilities[] is the authoritative tools/thinking
 /// classification; model_info's "<arch>.context_length" is the model's real maximum window — the rope-scaling
-/// "…original_context_length" sibling (the PRE-scaling window, e.g. gpt-oss's 4096-of-131072) is ignored.
+/// "…original_context_length" sibling (the PRE-scaling window) is ignored.
 fn parseShowCaps(raw: []const u8) void {
     const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, raw, .{}) catch return;
     defer parsed.deinit();
@@ -575,9 +564,9 @@ fn storeLargeVerdict(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mo
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = out.items }) catch {};
 }
 
-/// The RUNTIME fence flip observed a real large-tool-call wall the startup probe missed. Persist the verdict —
-/// it is a model property — so every FUTURE run of this model fences from round 1 instead of re-learning it.
-/// The native-transport verdict is flipped + persisted too: on a hosted backend the wall IS the evidence that
+/// The RUNTIME fence flip observed a real large-tool-call wall the startup probe missed. Persist the verdict
+/// (a model property) so every FUTURE run of this model fences from round 1 instead of re-learning it. The
+/// native-transport verdict is flipped + persisted too: on a hosted backend the wall IS the evidence that
 /// structured tool_calls cannot be trusted, and fenceWrites' hosted branch reads tools_native_ok.
 pub fn recordLargeToolWall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, model: []const u8) void {
     caps.tools_ok_large = false;
@@ -589,10 +578,10 @@ pub fn recordLargeToolWall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const 
     } else |_| {}
 }
 
-/// One real chat completion against a HOSTED OpenAI-style backend carrying a minimal tools array:
-/// does the call come back as structured tool_calls? Trust-biased like probeLargeToolCall — a network
-/// flake, an unrelated provider error, or a model that just answers in prose stays trusted; ONLY the
-/// clear failure signature (the tool call emitted as text/markup in `content`) reports false.
+/// One real chat completion against a HOSTED OpenAI-style backend carrying a minimal tools array: does the
+/// call come back as structured tool_calls? Trust-biased like probeLargeToolCall — a network flake, an
+/// unrelated provider error, or a model that just answers in prose stays trusted; ONLY the clear failure
+/// signature (the tool call emitted as text/markup in `content`) reports false.
 fn probeHostedToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, base_url: []const u8, key: []const u8, model: []const u8) bool {
     var msg: std.ArrayListUnmanaged(u8) = .empty;
     defer msg.deinit(gpa);
@@ -647,8 +636,8 @@ fn hostedToolCallVerdict(raw: []const u8) bool {
 
 /// Ask the model to echo a file-sized payload through ONE write_file call, and judge whether the backend
 /// returned it as a STRUCTURED tool call. The bias is trust: only clear parse-failure evidence (an error
-/// naming the tool-call parse, or the call emitted as raw text) reports false — an uncooperative model or a
-/// transport flake stays trusted, and the runtime adaptive fence flip covers whatever the probe misses.
+/// naming the tool-call parse, or the call emitted as raw text) reports false; the runtime adaptive fence
+/// flip covers whatever the probe misses.
 fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, host: []const u8, key: []const u8, model: []const u8) bool {
     const chat_url = std.fmt.allocPrint(gpa, "{s}/api/chat", .{host}) catch return true;
     defer gpa.free(chat_url);
@@ -671,8 +660,8 @@ fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, h
     jstr(gpa, &msg, umsg.items) catch return true;
     msg.appendSlice(gpa, "}") catch return true;
     const tool_def = "{\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"description\":\"write a file\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}}";
-    // temperature 0: the probe must measure the backend's MODAL behavior, not a sampling coin-flip — at the
-    // default temperature the same model alternates between a structured call and the text-emission failure.
+    // temperature 0: measure the backend's MODAL behavior, not a sampling coin-flip (at the default temperature
+    // the same model alternates between a structured call and the text-emission failure).
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":2048,\"temperature\":0}}}}", .{ model, msg.items, tool_def }) catch return true;
     defer gpa.free(body);
     const r = postUrl(gpa, io, run_dir, "probe-write", chat_url, key, body, true);
@@ -768,16 +757,13 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 }
 
 // ============================================================================
-// STREAMING (chat only) — an ADDITIVE path parallel to complete(). The swarm's
-// complete() / completeBody() / completeOllamaNative() above are UNTOUCHED. This variant
-// asks the backend for "stream":true, curl-streams the SSE (hosted) / NDJSON (Ollama
-// native) response to a scratch file that we TAIL line-by-line, firing on_delta for each
-// incremental content/reasoning chunk, and accumulates the full content + reasoning
-// (+ tool_calls) into the SAME Step complete() returns — so the agentic loop downstream is
-// byte-identical. ANY streaming trouble (spawn/setup failure, an error line, a body that
-// never streamed, or a hosted SSE tool call whose fragmented deltas aren't worth
-// reassembling) transparently FALLS BACK to complete(): the turn still works, it just
-// doesn't type out. This mirrors desk/src/llm.zig's transport (curl -N to a scratch file).
+// STREAMING (chat only) — an ADDITIVE path parallel to complete(); complete() / completeBody() /
+// completeOllamaNative() above are UNTOUCHED. Asks the backend for "stream":true, curl-streams the SSE
+// (hosted) / NDJSON (Ollama native) response to a scratch file that we TAIL line-by-line, firing on_delta
+// for each content/reasoning chunk, and accumulates the full content + reasoning (+ tool_calls) into the
+// SAME Step complete() returns. ANY streaming trouble (spawn/setup failure, an error line, a body that
+// never streamed, or a hosted SSE tool call whose fragments can't be reassembled) FALLS BACK to complete():
+// the turn still works, it just doesn't type out.
 // ============================================================================
 
 /// Which channel a streamed delta belongs to. `.content` is the visible reply; `.reasoning`
@@ -788,8 +774,8 @@ const STREAM_STAT = "\n__VEILSTAT__"; // curl -w appends this + the 3-digit HTTP
 
 /// A hosted (OpenAI/DeepSeek) SSE tool call assembled across streamed deltas. The first delta for an `index`
 /// carries id + function.name (+ maybe an args head); later deltas append raw fragments to `args`. Assembling
-/// these lets a hosted tool-calling step return its call(s) FROM THE STREAM instead of throwing the whole
-/// streamed generation away and paying a second complete() inference to reparse.
+/// these lets a hosted tool-calling step return its call(s) FROM THE STREAM instead of paying a second
+/// complete() inference to reparse.
 const ToolAccum = struct {
     index: i64,
     id: std.ArrayListUnmanaged(u8) = .empty,
@@ -925,8 +911,8 @@ fn handleNativeStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []cons
         if (m.content) |c| st.fire(gpa, .content, c);
         if (m.tool_calls) |tcs| {
             if (tcs.len > 0) {
-                // Ollama emits the parsed tool_calls array complete in a single NDJSON line (arguments as a
-                // whole JSON value) — capture that line; parseNativeToolCalls reconstructs the calls at the end.
+                // Ollama emits the parsed tool_calls array complete in a single NDJSON line — capture that
+                // line; parseNativeToolCalls reconstructs the calls at the end.
                 st.saw_tool_calls = true;
                 st.tool_line.clearRetainingCapacity();
                 st.tool_line.appendSlice(gpa, t) catch {};
@@ -1054,20 +1040,19 @@ fn freeCalls(gpa: std.mem.Allocator, calls: []ToolCall) void {
     gpa.free(calls);
 }
 
-/// Build ToolCall[] from the hosted SSE fragments assembled in st.tool_accum (see ToolAccum) — the streaming twin
-/// of completeBody's tool_calls parse. A fragment with no function name is dropped (unusable); empty arguments
-/// become "{}". Owned slice (freeCalls to release); empty on none, so streamAttempt falls back to complete() to
-/// reparse authoritatively. Mirrors completeBody: id + name + args carried through verbatim (id matters for the
-/// hosted tool-result correlation the agentic loop builds).
+/// Build ToolCall[] from the hosted SSE fragments assembled in st.tool_accum (see ToolAccum). A fragment with no
+/// function name is dropped (unusable); empty arguments become "{}". Owned slice (freeCalls to release); empty on
+/// none, so streamAttempt falls back to complete() to reparse. id + name + args carried through verbatim (id
+/// matters for the hosted tool-result correlation the agentic loop builds).
 fn reconstructSseToolCalls(gpa: std.mem.Allocator, st: *const StreamState) []ToolCall {
     var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
     for (st.tool_accum.items) |a| {
         if (a.name.items.len == 0) continue; // no function name → not a usable call
         const args_src = if (a.args.items.len > 0) a.args.items else "{}";
-        // The streamed path TRUSTS these bytes (unlike the old flow, which re-parsed via complete()), so validate
-        // the assembled arguments are WELL-FORMED JSON. A garbled assembly — e.g. a non-spec provider that omits
-        // `index` and folds two parallel calls onto one slot, concatenating their args into invalid JSON — is
-        // dropped, so the step falls back to complete() to reparse rather than executing a tool with corrupt args.
+        // The streamed path TRUSTS these bytes, so validate the assembled arguments are WELL-FORMED JSON. A
+        // garbled assembly — e.g. a non-spec provider that omits `index` and folds two parallel calls onto one
+        // slot, concatenating their args into invalid JSON — is dropped, so the step falls back to complete()
+        // rather than executing a tool with corrupt args.
         if (!(std.json.validate(gpa, args_src) catch false)) continue;
         const args = gpa.dupe(u8, args_src) catch continue;
         const name = gpa.dupe(u8, a.name.items) catch {
@@ -1105,10 +1090,10 @@ fn meterStream(st: *const StreamState, local: bool) void {
 }
 
 /// STREAMING agentic step (chat only). Same request as complete() but "stream":true; curl streams the
-/// response to a scratch file that we tail, firing on_delta(ctx, .content|.reasoning, chunk) for each
-/// incremental delta and accumulating the full Step (content + reasoning + tool_calls). ANY failure — or a
-/// case we can't stream cleanly (hosted SSE tool-call fragments) — FALLS BACK to complete(), and on_delta
-/// simply never fires. The returned Step is caller-owned (step.deinit) and identical in shape to complete()'s.
+/// response to a scratch file that we tail, firing on_delta(ctx, .content|.reasoning, chunk) for each delta
+/// and accumulating the full Step (content + reasoning + tool_calls). ANY failure — or a case we can't stream
+/// cleanly — FALLS BACK to complete(), and on_delta never fires. The returned Step is caller-owned
+/// (step.deinit) and identical in shape to complete()'s.
 pub fn completeStream(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -1123,10 +1108,10 @@ pub fn completeStream(
     temperature: f32,
     ctx: *anyopaque,
     on_delta: *const fn (ctx: *anyopaque, kind: DeltaKind, text: []const u8) void,
-    // Optional cooperative ABORT: the poll loop calls this (~every 40ms) with `ctx`; returning true kills the curl
-    // child and returns the PARTIAL stream immediately (NOT a fallback to complete(), which would re-run the whole
-    // inference). This is what makes a chat Stop interrupt a long in-flight streaming reply promptly instead of
-    // waiting out the whole ~15s generation. null ⇒ never aborts (unchanged behavior for any non-abortable caller).
+    // Optional cooperative ABORT: the poll loop calls this with `ctx`; returning true kills the curl child and
+    // returns the PARTIAL stream immediately (NOT a fallback to complete(), which would re-run the whole
+    // inference). This is what lets a chat Stop interrupt a long in-flight streaming reply promptly instead of
+    // waiting out the whole generation. null ⇒ never aborts.
     should_abort: ?*const fn (ctx: *anyopaque) bool,
 ) Step {
     return streamAttempt(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature, ctx, on_delta, should_abort) orelse
@@ -1233,14 +1218,13 @@ fn streamAttempt(
     defer st.deinit(gpa);
 
     // ---- tail the sink until curl exits (STAT sentinel) or the stream self-completes ----
-    // POSITIONAL read from a byte cursor — NOT a whole-file re-read every poll. curl only ever APPENDS to the .sse
-    // scratch, so a growing `offset` stays valid; each poll reads just the new bytes into a reused buffer and feeds
-    // them to feedStream (which keeps its own partial-line carry). This turns the old O(final_size^2) read+rescan
-    // (readFileAlloc from byte 0 + lastIndexOf over the whole buffer every 20ms, plus a growing alloc/free per poll)
-    // into O(total_bytes), and dissolves the latent 8MB cliff: a native reasoning stream at NATIVE_THINK_TOKENS can
-    // exceed the old .limited(8<<20), which readFileAlloc then misread as "file not created yet" → spin to the wall
-    // and return a silently truncated partial. curl -w appends "\n__VEILSTAT__<http_code>"; we scan for the core
-    // MARK "__VEILSTAT__" (never present in SSE/NDJSON data) so a body-terminating '\n' feeds with zero delay, and
+    // POSITIONAL read from a byte cursor — NOT a whole-file re-read every poll. curl only ever APPENDS to the
+    // .sse scratch, so a growing `offset` stays valid; each poll reads just the new bytes into a reused buffer
+    // and feeds them to feedStream (which keeps its own partial-line carry). This is O(total_bytes), not the old
+    // O(final_size^2) read+rescan, and it has no fixed size cap: a native reasoning stream at NATIVE_THINK_TOKENS
+    // can exceed 8MB, which the old readFileAlloc misread as "file not created yet" → spin to the wall and return
+    // a silently truncated partial. curl -w appends "\n__VEILSTAT__<http_code>"; we scan for the core MARK
+    // "__VEILSTAT__" (never present in SSE/NDJSON data) so a body-terminating '\n' feeds with zero delay, and
     // hold back only a trailing suffix that is a strict prefix of MARK (a sentinel straddling a read boundary).
     const MARK = "__VEILSTAT__";
     const read_cap: usize = 256 << 10;
@@ -1264,31 +1248,29 @@ fn streamAttempt(
         var f = std.Io.Dir.cwd().openFile(io, outpath, .{}) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-            io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast so frames reach the desk's ~30Hz poll promptly
+            io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
             continue;
         };
         {
             defer f.close(io);
-            // Read ACTUAL bytes from the cursor — do NOT gate on f.length(): on Windows a freshly-opened read handle's
-            // length does not reflect curl's in-progress appends from the OTHER process (the metadata lags the write),
-            // so gating on it stalls the stream until curl exits — the reply then lands all-at-once and, with st.content
-            // still empty, falls back to complete() (no live tokens at all). readPositionalAll reads up to rbuf.len
-            // bytes and stops at the CURRENT end of file (a regular file's positional read returns 0 at EOF, it never
-            // blocks), i.e. exactly the old readFileAlloc read-to-current-end, but bounded and from the cursor (no
-            // whole-file re-read, no 8MB cap). More than rbuf.len pending just drains across the next polls.
+            // Read ACTUAL bytes from the cursor — do NOT gate on f.length(): on Windows a freshly-opened read
+            // handle's length does not reflect curl's in-progress appends from the OTHER process (the metadata
+            // lags the write), so gating on it stalls the stream until curl exits — the reply then lands
+            // all-at-once and, with st.content still empty, falls back to complete() (no live tokens). A regular
+            // file's positional read returns 0 at EOF and never blocks; more than rbuf.len pending just drains
+            // across the next polls.
             const n = f.readPositionalAll(io, rbuf, offset) catch 0;
             if (n > 0) {
                 vbuf.appendSlice(gpa, rbuf[0..n]) catch {};
                 offset += n;
             }
         }
-        // resolve vbuf (== last poll's carry ++ this poll's new bytes): feed body up to curl's end-marker, hold back a
-        // straddled marker prefix. After this, vbuf holds exactly the still-unfed carry again. curl's real marker is
-        // ALWAYS newline-anchored ("\n__VEILSTAT__<code>") and last in the file, so we only treat a MARK match as the
-        // sentinel when the byte before it is '\n' (from this window, else `last_fed` — the byte fed in a prior poll).
-        // A bare "__VEILSTAT__" the model itself emits sits inside a JSON string (preceded by '"', a letter, …, never
-        // a raw '\n'), so it is fed as ordinary body instead of silently truncating the reply — the newline anchor is
-        // what the old STREAM_STAT match relied on, restored here without holding back a body-terminating '\n'.
+        // resolve vbuf (== last poll's carry ++ this poll's new bytes): feed body up to curl's end-marker, hold
+        // back a straddled marker prefix. curl's real marker is ALWAYS newline-anchored ("\n__VEILSTAT__<code>")
+        // and last in the file, so we treat a MARK match as the sentinel only when the byte before it is '\n'
+        // (from this window, else `last_fed` — the byte fed in a prior poll). A bare "__VEILSTAT__" the model
+        // itself emits sits inside a JSON string (never preceded by a raw '\n'), so it feeds as ordinary body
+        // instead of silently truncating the reply.
         if (vbuf.items.len > 0) {
             var did_sentinel = false;
             if (std.mem.lastIndexOf(u8, vbuf.items, MARK)) |m| { // last occurrence — curl's marker is always last in the file
@@ -1324,12 +1306,12 @@ fn streamAttempt(
             break;
         }
         if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-        io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast so frames reach the desk's ~30Hz poll promptly
+        io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
     }
 
     // ABORTED mid-stream (chat Stop): return whatever already streamed as a partial Step — do NOT fall back to
-    // complete() (that re-runs the whole inference, defeating the abort) and do NOT take the empty→null path below.
-    // ok=true with partial (possibly empty) content; the caller's next stop check ends the turn, committing this.
+    // complete() (that re-runs the whole inference, defeating the abort) and do NOT take the empty→null path
+    // below. ok=true with partial (possibly empty) content; the caller's next stop check commits this.
     if (aborted) {
         const c_owned = gpa.dupe(u8, st.content.items) catch return null;
         const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
@@ -1344,8 +1326,8 @@ fn streamAttempt(
 
     if (st.saw_tool_calls) {
         // Assemble the call(s) FROM THE STREAM — native from the single captured NDJSON line, hosted from the
-        // per-index SSE fragments (ToolAccum). Returning them here is what avoids the second complete() inference
-        // that every hosted tool-calling step used to pay (it re-ran the whole generation just to reparse the call).
+        // per-index SSE fragments (ToolAccum). Returning them here avoids a second complete() inference just to
+        // reparse the call.
         const calls = if (native) parseNativeToolCalls(gpa, st.tool_line.items) else reconstructSseToolCalls(gpa, &st);
         if (calls.len > 0) {
             const c_owned = gpa.dupe(u8, st.content.items) catch {
@@ -1388,12 +1370,11 @@ fn stepErr(gpa: std.mem.Allocator, msg: []const u8) Step {
     return .{ .content = gpa.dupe(u8, msg) catch @constCast("error"), .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
 }
 
-/// Append a JSON-escaped, quoted string. Multibyte runs are copied verbatim only when they decode as
-/// valid UTF-8; any invalid, lone, or truncated byte is replaced with U+FFFD. This matters because the
-/// body is shipped raw by `curl --data-binary`: a single bad byte makes it invalid UTF-8 and OpenAI
-/// answers `400 ... error parsing the body`. Such bytes turn up when `max_tokens` truncates model output
-/// (or tool arguments) mid-codepoint, or when a tool result carries arbitrary bytes — both of which are
-/// echoed back into the next request, producing the intermittent 400-then-recover we saw on live swarms.
+/// Append a JSON-escaped, quoted string. Multibyte runs are copied verbatim only when they decode as valid
+/// UTF-8; any invalid, lone, or truncated byte is replaced with U+FFFD. This matters because the body is
+/// shipped raw by `curl --data-binary`: a single bad byte makes it invalid UTF-8 and OpenAI answers
+/// `400 ... error parsing the body`. Such bytes turn up when `max_tokens` truncates output mid-codepoint or a
+/// tool result carries arbitrary bytes — both echoed back into the next request.
 pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     try list.append(gpa, '"');
     var i: usize = 0;

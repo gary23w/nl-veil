@@ -1,4 +1,4 @@
-//! BYOK key-vault HTTP handlers — POST a provider key (sealed + stored write-only), GET the metadata list
+//! BYOK key-vault HTTP handlers — POST a provider key (sealed, write-only), GET the metadata list, DELETE by provider.
 
 const std = @import("std");
 const httpz = @import("httpz");

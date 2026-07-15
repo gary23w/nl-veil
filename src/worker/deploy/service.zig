@@ -1,4 +1,4 @@
-//! Deploy + swarm-lifecycle HTTP handlers — the validate → run_dir + swarm.json → spawn pipeline, plus the
+//! Deploy + swarm-lifecycle HTTP handlers — the validate → run_dir + swarm.json → spawn pipeline, plus cast/run and the file/bundle/archive endpoints.
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -41,8 +41,7 @@ const DeployReq = struct {
     breakout: bool = false,
     observe_psyche: bool = false,
     // NEWS DESK — when true the swarm runs in discourse mode and composes a grounded, screened briefing each
-    // round; `post` (default on) additionally publishes it to a public Telegraph page. Both were Manifest
-    // fields the worker read but no request ever wrote, so Telegraph publishing was unreachable from the API.
+    // round; `post` (default on) additionally publishes it to a public Telegraph page.
     publish: bool = false,
     post: bool = true,
     // CAST marker — set by the /cast path (quick strike AND sustained "continuous" casts) so the worker
@@ -59,8 +58,8 @@ const DeployReq = struct {
 const Spawned = struct { id: []const u8, state: []const u8, minds: usize, run_dir: []const u8 };
 
 /// Response-decoupled result of a deploy/cast so the same validate→manifest→spawn core serves BOTH the HTTP
-/// handlers (which translate a `.fail` back through badReq/capErr/serverErr — byte-identical to before) and the
-/// in-process server chat turn (the veil casting its own swarm). `msg` lives in the arena the caller passed.
+/// handlers (which translate a `.fail` through badReq/capErr/serverErr) and the in-process server chat turn
+/// (the veil casting its own swarm). `msg` lives in the arena the caller passed.
 pub const FailKind = enum { bad_request, capped, server_error };
 pub const DeployOutcome = union(enum) {
     ok: Spawned,
@@ -75,7 +74,7 @@ fn failCap(msg: []const u8) DeployOutcome {
 fn failSrv(msg: []const u8) DeployOutcome {
     return .{ .fail = .{ .kind = .server_error, .msg = msg } };
 }
-/// Send a `.fail` outcome through the matching HTTP helper (preserves the exact status each error used before).
+/// Send a `.fail` outcome through the matching HTTP helper (bad_request→400, capped→429, server_error→500).
 fn sendFail(res: *httpz.Response, f: anytype) !void {
     switch (f.kind) {
         .bad_request => try badReq(res, f.msg),
@@ -102,8 +101,8 @@ pub fn deploy(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// fresh random hex (URLs + supervisor tracking key off it), but the on-disk run_dir — and therefore the
 /// worker's `{run_dir}/work` build dir — is redirected to a caller-chosen, already-sanitized absolute path.
 /// This is how a chat cast builds IN the chat's conversation dir instead of its own throwaway folder.
-/// Response-decoupled deploy core (was deployCore): validate → run_dir + swarm.json → spawn. Returns a
-/// DeployOutcome the caller renders (HTTP handlers via sendFail; the chat turn reads .ok/.fail directly). All
+/// Response-decoupled deploy core: validate → run_dir + swarm.json → spawn. Returns a DeployOutcome the caller
+/// renders (HTTP handlers via sendFail; the chat turn reads .ok/.fail directly). All
 /// short-lived allocations use `arena` (HTTP passes res.arena; the chat turn passes a per-cast ArenaAllocator).
 pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: DeployReq, run_dir_override: []const u8) DeployOutcome {
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
@@ -197,8 +196,7 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     return .{ .ok = .{ .id = sw.id, .state = @tagName(sw.state), .minds = sw.minds, .run_dir = run_dir } };
 }
 
-/// Build the swarm.json manifest bytes into `arena` (freed with the arena). Byte-for-byte the same manifest the
-/// HTTP deploy path wrote before the refactor — only the allocator moved from app.gpa to the caller's arena.
+/// Build the swarm.json manifest bytes into `arena` (freed with the arena).
 fn buildManifest(arena: std.mem.Allocator, body: DeployReq, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool) ![]u8 {
     var mani: std.ArrayListUnmanaged(u8) = .empty;
     try mani.appendSlice(arena, "{\"swarm\":");
@@ -272,7 +270,7 @@ fn buildManifest(arena: std.mem.Allocator, body: DeployReq, workdir: []const u8,
 }
 
 /// Write keys.env (or keys.env.enc when encrypted) for the worker. Only a SEAL failure is fatal (returns an
-/// error the caller maps to a failure); a plaintext write error is best-effort silent, matching the prior code.
+/// error the caller maps to a failure); a plaintext write error is best-effort silent.
 fn writeKeysEnv(app: *App, arena: std.mem.Allocator, run_dir: []const u8, eff_key: []const u8, eff_base: []const u8, encrypted: bool) !void {
     var kbuf: std.ArrayListUnmanaged(u8) = .empty;
     try kbuf.appendSlice(arena, "NL_LLM_KEY=");
@@ -447,9 +445,9 @@ pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
 }
 
-/// The server-owned CAST pipeline (was inlined in the `cast` handler): server cast defaults, mind naming, the
-/// workload-time floor, and the conversation build-dir redirect — then deploySwarm. Response-decoupled so BOTH
-/// the HTTP cast route and the in-process server chat turn (the veil casting its own swarm) call it.
+/// The server-owned CAST pipeline: server cast defaults, mind naming, the workload-time floor, and the
+/// conversation build-dir redirect — then deploySwarm. Response-decoupled so BOTH the HTTP cast route and the
+/// in-process server chat turn (the veil casting its own swarm) call it.
 pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq) DeployOutcome {
     if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0)
         return failBad("a goal is required, e.g. {\"goal\":\"research X and report findings\"}");
@@ -486,11 +484,10 @@ pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq)
         .api_key = rq.api_key,
         .base_url = rq.base_url,
         // Quick strike: hard-capped short so it finishes fast. Sustained hivemind: a real budget (default 20,
-        // capped at 60) for work that genuinely needs the time. WORKLOAD FLOOR: when the caller DECLARED the
-        // deliverables, the time budget must fit the declared workload — a 2-minute strike against 14 declared
-        // files is structurally impossible (observed live: budget expired at 4/14 docs). ~1 minute per 3
-        // deliverables (a round lands ~3 files and takes ~1 min), floor 2, ceiling 20. The MODEL declares the
-        // workload; the engine grants time proportional to it — a capacity fact, not a use-case condition.
+        // capped at 60) for work that needs the time. WORKLOAD FLOOR: when the caller DECLARED the deliverables,
+        // the time budget must fit the declared workload — a 2-minute strike against 14 declared files can't
+        // finish. ~1 minute per 3 deliverables (a round lands ~3 files in ~1 min), floor 2, ceiling 20. The MODEL
+        // declares the workload; the engine grants time proportional to it — a capacity fact, not a use-case condition.
         .minutes = blk_min: {
             const declared: u32 = if (rq.files.len > 0) declCount(rq.files) else 0;
             const wfloor: u32 = if (declared > 0) @min(20, @max(2, (declared + 2) / 3)) else 0;
@@ -583,7 +580,7 @@ fn enforceBudget(app: *App) void {
 
 pub fn listSwarms(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    // (retention GC now runs on the supervisor's background thread, not on this request path)
+    // retention GC runs on the supervisor's background thread, not on this request path
     enforceBudget(app);
     const swarms = try app.sup.listForUser(u.id);
     defer app.gpa.free(swarms);
@@ -860,8 +857,7 @@ pub fn swarmDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
     // resolve(), not get(): the desktop Swarm tab addresses a LIVE cast by its run-dir BASENAME while the
-    // registry keys it by the spawn-time hex id — the mismatch 404'd every delete until a server restart
-    // re-adopted the dir under its basename. Mutate via the swarm's OWN registry id.
+    // registry keys it by the spawn-time hex id — get() would 404 the mismatch. Mutate via the swarm's OWN id.
     const sw = app.sup.resolve(id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
     app.sup.remove(sw.id);

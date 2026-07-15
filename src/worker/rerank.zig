@@ -1,35 +1,27 @@
 //! rerank.zig — SECOND-STAGE relevance reranking over first-stage retrieval, through the run's SELECTED
-//! (BYOK / gateway) chat endpoint. No local model, no weights, no sidecar: it rides whatever API the run is
-//! already configured with — the same `gw_base`/`gw_key`/`gateway_model` that `screenPass` and `gapToQuery`
-//! use — so it works on ANY machine a BYOK download lands on.
+//! (BYOK / gateway) chat endpoint. No local model, weights, or sidecar: it rides the same `gw_base`/`gw_key`/
+//! `gateway_model` that `screenPass` and `gapToQuery` use, so it works on ANY machine a BYOK download lands on.
 //!
-//! Why an LLM reranker and not a cross-encoder: a cross-encoder (bge-reranker et al.) is more precise per call,
-//! but needs downloaded weights + compute + a sidecar — it cannot be the DEFAULT when the product ships BYOK to
-//! arbitrary hardware. Zero-shot LLM reranking through the already-configured endpoint is the any-machine path.
-//! (A local reranker stays available as an opt-in for a caller that points a sidecar at it — this is just the
-//! portable default.)
+//! Why an LLM reranker, not a cross-encoder: a cross-encoder (bge-reranker et al.) is more precise per call but
+//! needs downloaded weights + compute + a sidecar, so it can't be the DEFAULT under BYOK. Zero-shot LLM
+//! reranking through the configured endpoint is the any-machine default; a local reranker stays an opt-in.
 //!
-//! DESIGN — grounded in the 2026 zero-shot-reranking literature, adapted to a COST-DISCIPLINED per-recall step:
-//!   * SINGLE-CALL LISTWISE-SELECT. One gateway inference over the whole (small) candidate window — the RankGPT
-//!     permutation family — NOT pointwise (N calls), pairwise (~N·logN calls), or setwise/tournament
-//!     (multi-call sorts). Those buy marginal ordering quality at several× the inferences; a step that runs on
-//!     every grounded recall can afford exactly one call.
+//! DESIGN — zero-shot listwise reranking, cost-disciplined to one call per recall:
+//!   * SINGLE-CALL LISTWISE-SELECT. One gateway inference over the whole (small) candidate window — NOT
+//!     pointwise (N calls), pairwise, or setwise/tournament (multi-call sorts). A step that runs on every
+//!     grounded recall can afford exactly one call.
 //!   * KEEP + ABSTAIN, not just permute. The model returns ONLY the ids that genuinely answer the query, best
-//!     first — or NONE. Fusing the listwise order with a relevance keep-judgment gives RAG its missing abstain
-//!     floor: an empty return means "nothing here is relevant", so the caller can SAY that instead of injecting
-//!     the retriever's argmax noise (the "surfaces a top match even when nothing truly matches" failure).
+//!     first — or NONE. The empty return is RAG's missing abstain floor: the caller can SAY "nothing relevant"
+//!     instead of injecting the retriever's argmax noise.
 //!   * POSITION-BIAS AWARE. Candidates are id-labelled [1..N] and the model answers with IDS (never positions);
-//!     temperature is pinned to 0 for determinism; the window is capped to ONE pass (no sliding window, so no
-//!     cross-window incoherence and no multi-call cost). Permuting an identical set can still nudge a decoder
-//!     LLM's ranking — the 2026 position-invariance caveat — so a caller needing maximum robustness can run a
-//!     second shuffled pass and intersect; that is left to the caller because it doubles the cost.
+//!     temperature is pinned to 0 for determinism; the window is ONE pass (no sliding window). A caller needing
+//!     more robustness can run a second shuffled pass and intersect; left to the caller because it doubles cost.
 //!   * TOKEN BUDGET for reasoning models. A reasoning gateway model spends its completion budget on hidden
-//!     reasoning first; too small a cap returns an EMPTY answer (the exact bug that silently held every news
-//!     desk edition until SCREEN_MAX_TOKENS was raised). The budget here is generous so the id list always fits
-//!     after the reasoning.
-//!   * GRACEFUL. Any transport/parse ambiguity returns .passthrough (the retriever's original order). The
-//!     reranker can only improve or no-op — it NEVER regresses below first-stage retrieval, and it never
-//!     abstains (drops all context) on a mere parse failure — abstain fires ONLY on an explicit NONE.
+//!     reasoning first; too small a cap returns an EMPTY answer. The budget here is generous so the id list
+//!     always fits after the reasoning.
+//!   * GRACEFUL. Any transport/parse ambiguity returns .passthrough (retrieval order): the reranker can only
+//!     improve or no-op, NEVER regress below first-stage retrieval. Abstain (drops all context) fires ONLY on
+//!     an explicit NONE, never on a mere parse failure.
 
 const std = @import("std");
 const llm = @import("llm.zig");
@@ -40,7 +32,7 @@ pub const MAX_CANDIDATES: usize = 20;
 /// Per-candidate clip — the judge needs enough to judge relevance, not the whole document.
 const CANDIDATE_CLIP: usize = 240;
 /// Completion budget: room for a REASONING gateway model to think, THEN emit the (short) id list. Too small and
-/// a reasoning model burns the budget on hidden reasoning and returns empty content (the SCREEN_MAX_TOKENS trap).
+/// a reasoning model burns the budget on hidden reasoning and returns empty content.
 const RERANK_MAX_TOKENS: u32 = 1024;
 
 const SYS =

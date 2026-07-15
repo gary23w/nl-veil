@@ -14,11 +14,10 @@ pub const Loc = struct {
     pack: []const u8 = "", // nl-rag PACK index url — pre-normalized AI markdown (fetch-first when set)
 };
 
-/// nl-rag (github.com/gary23w/nl-rag) mirrors curated doc pages as pre-normalized markdown packs:
-/// no HTML, no site chrome, frontmattered provenance, split to fetch-sized parts. For a small model
-/// that's strictly better input than the raw doc site, and raw.githubusercontent bodies ride the
-/// existing 7-day fetch cache — so a pack page costs one GET ever. The INDEX lists every page of the
-/// pack (plus a distilled pack.facts) as absolute raw urls. Seeds stay listed: the pack is a fast
+/// nl-rag (github.com/gary23w/nl-rag) mirrors curated doc pages as pre-normalized markdown packs — no HTML,
+/// no site chrome, frontmattered provenance, split to fetch-sized parts — better input for a small model than
+/// the raw doc site. Pack bodies ride the existing 7-day fetch cache, so a page costs one GET. The INDEX lists
+/// every pack page (plus a distilled pack.facts) as absolute raw urls. Seeds stay listed: the pack is a fast
 /// mirror, not a replacement, and freshness-critical topics should still hit the origin.
 fn packUrl(comptime domain: []const u8) []const u8 {
     return "https://raw.githubusercontent.com/gary23w/nl-rag/main/packs/" ++ domain ++ "/INDEX.md";

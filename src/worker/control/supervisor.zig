@@ -5,10 +5,10 @@ const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
 
-// Native process liveness/termination — NO subprocess. tasklist/taskkill spawned a child process ON THE
-// httpz REQUEST THREAD for every reconcile-probe and every kill; under load those spawns starve the worker
-// pool and wedge (then a stale-pid recycle used to taskkill the server itself). These call the Win32 API
-// directly instead, so the checks are cheap and never touch the process table via a shell.
+// Native process liveness/termination via the Win32 API directly — NO subprocess. Spawning tasklist/taskkill
+// on the httpz request thread for every reconcile-probe and kill starves the worker pool under load; and a
+// recycled stale pid handed to taskkill could target the server itself. Direct API calls are cheap and
+// never touch the process table via a shell.
 const winproc = if (builtin.os.tag == .windows) struct {
     const HANDLE = *anyopaque;
     const BOOL = c_int; // Win32 BOOL is a 32-bit int at the ABI; plain c_int lets `0` coerce cleanly
@@ -108,8 +108,8 @@ pub const Supervisor = struct {
     mu: std.Io.Mutex = .init,
     // Serializes worker CreateProcess/spawn calls. On Windows, std.process.spawn calls CreateProcessW with
     // bInheritHandles=TRUE and no HANDLE_LIST, so two spawns racing on different threads cross-inherit each
-    // other's inheritable pipe handles — which under a concurrent-cast burst wedged the pipe reads and hard-died
-    // the server. Spawns are ~2-6ms, so serializing them is negligible latency and closes the race.
+    // other's inheritable pipe handles, wedging the pipe reads. Spawns are ~2-6ms, so serializing them is
+    // negligible latency and closes the race.
     launch_mu: std.Io.Mutex = .init,
     swarms: std.StringHashMapUnmanaged(*Swarm) = .empty,
     server_key: [32]u8 = undefined,
@@ -125,9 +125,9 @@ pub const Supervisor = struct {
     }
 
     /// Background maintenance thread: reconcile swarm states + prune old runs every ~5s, OFF the httpz request
-    /// threads. reconcile() probes worker liveness and can respawn (spawn a worker subprocess) — doing that
-    /// inline in a /fleet or list handler starves the pool and wedges the server (esp. with a live swarm).
-    /// Request handlers now just read the in-memory map; this loop keeps it fresh. Fire-and-forget (detached).
+    /// threads. reconcile() probes worker liveness and can respawn a worker; doing that inline in a request
+    /// handler starves the pool and wedges the server. Request handlers just read the in-memory map; this loop
+    /// keeps it fresh. Fire-and-forget (detached).
     pub fn bgLoop(self: *Supervisor) void {
         while (!self.bg_stop.load(.monotonic)) {
             self.reconcile();
@@ -299,12 +299,12 @@ pub const Supervisor = struct {
     }
 
     /// Hard-kill a swarm's worker WITHOUT touching its run dir (unlike remove(), nothing is deleted): write
-    /// the STOP file (so a worker that somehow survives the kill still stops cooperatively), then terminate
-    /// the process — the owned Child handle if we hold one, else via the pid file. killByPidFile routes
-    /// through terminateVeilPid, which refuses our own pid and any pid that isn't a LIVE veil worker — a
-    /// stale/recycled worker.pid once taskkilled the server itself, so that check is load-bearing. A run dir
-    /// whose worker already wrote DONE skips the pid-file path entirely (clean exit; nothing left to kill).
-    /// State goes to .stopping; reconcile confirms the death and flips it to .stopped. False = unknown id.
+    /// the STOP file (so a worker that survives the kill still stops cooperatively), then terminate the process
+    /// — the owned Child handle if we hold one, else via the pid file. killByPidFile routes through
+    /// terminateVeilPid, which refuses our own pid and any pid that isn't a LIVE veil worker (a stale/recycled
+    /// worker.pid could otherwise target the server itself — that check is load-bearing). A run dir whose worker
+    /// already wrote DONE skips the pid-file path (clean exit; nothing left to kill). State goes to .stopping;
+    /// reconcile confirms the death and flips it to .stopped. False = unknown id.
     pub fn kill(self: *Supervisor, id: []const u8) bool {
         var rd_buf: [1024]u8 = undefined;
         var run_dir: []const u8 = "";
@@ -329,11 +329,10 @@ pub const Supervisor = struct {
         } else if (!self.hasDoneMarker(run_dir)) {
             self.killByPidFile(run_dir);
         }
-        // A hard TerminateProcess gives the worker no chance to run its own writeDone, so the run dir was left
-        // WITHOUT a DONE marker, WITHOUT a "stopped" event, and with a stale worker.pid — desktop watchers key
-        // off the "stopped" event and so never saw the cast finish (the user got locked in the chat). Stamp the
-        // terminal state ourselves now that the process is dead: append a "stopped" event, write DONE, drop the
-        // pid file. (No-op if the worker already exited cleanly and wrote its own DONE.)
+        // A hard TerminateProcess never runs the worker's own writeDone, leaving no DONE marker, no terminal
+        // "stopped" event, and a stale worker.pid — and desktop watchers key off "stopped" to see a cast finish.
+        // Stamp the terminal state ourselves now the process is dead: append a "stopped" event, write DONE, drop
+        // the pid file. No-op if the worker already exited cleanly and wrote its own DONE.
         if (!self.hasDoneMarker(run_dir)) self.writeKillMarker(run_dir);
         return true;
     }
@@ -405,19 +404,18 @@ pub const Supervisor = struct {
             return true;
         }
         // Native recursive delete — NO PowerShell/rm subprocess. Spawning a shell per delete on the httpz
-        // request thread starves the worker pool under load (the DELETE-flood wedge). deleteTree is idempotent
-        // (an already-absent tree is success); a locked file (a still-dying worker) errors -> caller retries.
+        // request thread starves the worker pool under load. deleteTree is idempotent (an already-absent tree is
+        // success); a locked file (a still-dying worker) errors -> caller retries.
         std.Io.Dir.cwd().deleteTree(self.io, path) catch return false;
         return true;
     }
 
     /// Remove a cast's own bookkeeping from a chat-owned build dir without touching the deliverables. Deleting
-    /// events.jsonl + swarm.json is what actually matters for lifecycle: retention GC lists by events.jsonl age
-    /// and reconcile rediscovers by swarm.json, so pulling both stops the dir from being re-swept — while work/
-    /// and any user files stay put for the chat (and the next cast into the same conversation). Crucially it also
-    /// sweeps the per-mind curl scratch: `.curlcfg-<mind>` embeds the API key in an `Authorization: Bearer …`
-    /// line, so a normal swarm's full-tree wipe scrubs it — for a chat dir we must scrub it explicitly or the
-    /// key would be stranded on disk. `.build_manifest` and DELIVERY/ are deliberately kept (the chat reads them).
+    /// events.jsonl + swarm.json is what matters for lifecycle: retention GC lists by events.jsonl age and
+    /// reconcile rediscovers by swarm.json, so pulling both stops the dir being re-swept, while work/ and user
+    /// files stay put. SECURITY: it must also sweep the per-mind curl scratch — `.curlcfg-<mind>` embeds the API
+    /// key in an `Authorization: Bearer …` line; a normal swarm's full-tree wipe scrubs it, but a chat dir is not
+    /// wiped, so the key would be stranded on disk. `.build_manifest` and DELIVERY/ are kept (the chat reads them).
     fn cleanCastMeta(self: *Supervisor, run_dir: []const u8) void {
         const meta = [_][]const u8{ "swarm.json", "worker.pid", "STOP", "DONE", "events.jsonl", "events.prev.jsonl", "control.jsonl", "mind.sqlite", ".usage", ".round_writes", ".explore_seen", "keys.env", "keys.env.enc" };
         var buf: [1200]u8 = undefined;

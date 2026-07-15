@@ -1,4 +1,4 @@
-//! Admin (god-mode) HTTP handlers — list users, set plan, moderate (ban/unban/delete), list every swarm,
+//! Admin (god-mode) HTTP handlers — list users, moderate (ban/unban/delete), list/kill swarms, read the audit log.
 
 const std = @import("std");
 const httpz = @import("httpz");

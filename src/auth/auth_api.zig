@@ -1,4 +1,4 @@
-//! Auth HTTP handlers — register / login / logout / me. Thin shims over auth_core (the Auth library) that
+//! Auth HTTP handlers — register / login / logout / me, plus API-key create/list/revoke — thin shims over auth_core.
 
 const std = @import("std");
 const httpz = @import("httpz");

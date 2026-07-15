@@ -21,7 +21,6 @@ fn ksb(seed: u64, i: u64) u8 {
 
 const sd: u64 = 0x6a09e667f3bcc908;
 
-/// what this? this is da soul. yeahhh
 const pz = [_]u8{
     0x0a, 0xcb, 0x1a, 0x95, 0xbf, 0x9f, 0x74, 0x43, 0xa0, 0x0d, 0xc9, 0x64, 0x5f, 0xf8, 0x12, 0x77,
     0x1a, 0xec, 0x70, 0xb7, 0x11, 0x46, 0xf2, 0x1e, 0x07, 0x7d, 0xa5, 0xb1, 0x20, 0xae, 0x55, 0xa8,
@@ -383,10 +382,9 @@ pub const Mem = struct {
         return std.fmt.parseFloat(f32, rest[0..j]) catch 0.0;
     }
 
-    /// Associative SPREADING-ACTIVATION recall: the CHAINED facts a multi-hop query needs — facts that may
-    /// share no words with the query but are reached by following shared-entity links (e.g. EmberOak ->
-    /// Portland -> roasting district). This is the closed-loop "self-RAG" the product promises; flat `recall`
-    /// returns one fact, `assoc` returns the whole reachable neighborhood. Newline-joined facts; caller frees.
+    /// Associative spreading-activation recall: the chained facts a multi-hop query needs — facts that may
+    /// share no words with the query but are reached by following shared-entity links. Flat `recall` returns
+    /// one fact; `assoc` returns the whole reachable neighborhood. Newline-joined facts; caller frees.
     pub fn assoc(self: Mem, scope: []const u8, query: []const u8, hops: u32, k: u32) []u8 {
         const out = if (self.trust)
             self.runEnv(&.{ "assoc", scope, query, "--trust" }, hops, k)
@@ -547,9 +545,8 @@ pub const Mem = struct {
         if (self.run(&.{ "mood", scope, m })) |o| self.gpa.free(o);
     }
 
-    /// The dynamic persona directive: a vivid "you are not a neutral assistant — here's how you feel and how
-    /// it shows in your voice" line that fuses the mind's Big-Five persona with its ACCUMULATED stances + mood.
-    /// This is what makes a mind's personality actually emerge over a run. Caller frees; empty on failure.
+    /// The dynamic persona directive: fuses the mind's Big-Five persona with its accumulated stances + mood
+    /// into a voice line. Caller frees; empty on failure.
     pub fn affect(self: Mem, scope: []const u8) []u8 {
         return self.run(&.{ "affect", scope }) orelse (self.gpa.dupe(u8, "") catch @constCast(""));
     }
@@ -583,9 +580,7 @@ pub const Mem = struct {
         if (self.run(args[0..])) |o| self.gpa.free(o);
     }
 
-    /// Real total facts under a scope, from `stats --json` ({"facts":N,...}). The old impl shelled a
-    /// nonexistent `count` subcommand and always returned 0, so the worker fell back to the round number —
-    /// i.e. the UI "facts" metric was fake. This reports the true stored count. 0 on failure.
+    /// Real total facts under a scope, from `stats --json` ({"facts":N,...}). 0 on failure.
     pub fn factCount(self: Mem, scope: []const u8) u32 {
         const out = self.run(&.{ "--json", "stats", scope }) orelse return 0;
         defer self.gpa.free(out);
