@@ -128,7 +128,15 @@ const SYSTEM_PROMPT =
     "(b) LEARN FIRST -- if you're missing knowledge for a part, research it (web_search / read_url / recall_hive) " ++
     "BEFORE acting instead of guessing. (c) DO IT YOURSELF -- for a small, direct change, build it inline " ++
     "(write_file / edit_file / run_python). Revise the plan as you learn. Keep coordinating -- casting, steering, " ++
-    "researching, building -- and narrate each move so the user can follow the work, until the goal is truly met.";
+    "researching, building -- and narrate each move so the user can follow the work, until the goal is truly met.\n" ++
+    "DURABLE MEMORY. Anything PERSONAL to THIS user that should persist across conversations -- a key, login, " ++
+    "credential, preference, or a fact about them or their environment -- record with a `REMEMBER:` line, NOT " ++
+    "observe (observe is the shared hive's knowledge). Format, one per line, alongside your normal reply:\n" ++
+    "REMEMBER: [category] the fact to keep   (category is one word: key, login, preference, or fact)\n" ++
+    "To drop a fact that is now wrong: `FORGET: <a few words identifying it>`. These lines are STRIPPED from what " ++
+    "the user sees, so do NOT also write a prose header like \"I've remembered:\" -- just emit the bare REMEMBER:/" ++
+    "FORGET: line(s). Use them proactively when the user reveals a durable fact (e.g. they mention deploying to " ++
+    "us-west-2 -> `REMEMBER: [preference] deploys to us-west-2`). Facts already under YOUR MEMORY need no repeat.";
 
 /// The chat turn's tool surface = the shared mind-tool SCHEMA + the veil's ORCHESTRATION verbs (cast / steer /
 /// stop / status). The orchestration verbs are handled in-process by orchTool (deploy_service + app.sup), NOT by
@@ -344,6 +352,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             conv_buf.append(gpa, '}') catch return;
         }
     }
+    // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
+    // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
+    injectDurableMemory(app, &conv_buf);
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + a recency window of the newest turns. The durable log stays whole.
@@ -538,6 +549,29 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             emitAssistant(app, conv_dir, note);
             finishTurn(app, conv_dir, usage_t0);
             return;
+        }
+
+        // DURABLE MEMORY: act on any REMEMBER:/FORGET: lines the reply carries (store/forget in the shared
+        // memories.jsonl) and STRIP them so they never leak as literal text — the desk's processMemory, ported.
+        // Runs BEFORE reflect so the self-critique sees the clean prose. A reply that was ONLY directives strips to
+        // empty → show a short confirmation instead of committing a blank message.
+        {
+            var mem_saved: usize = 0;
+            if (processMemoryDirectives(app, answer, &mem_saved)) |stripped| {
+                if (std.mem.trim(u8, stripped, " \r\n\t").len == 0 and mem_saved > 0) {
+                    if (gpa.dupe(u8, "(noted — saved to your memory)")) |note| {
+                        gpa.free(stripped);
+                        gpa.free(answer);
+                        answer = note;
+                    } else |_| {
+                        gpa.free(answer);
+                        answer = stripped;
+                    }
+                } else {
+                    gpa.free(answer);
+                    answer = stripped;
+                }
+            }
         }
 
         // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
@@ -1713,6 +1747,212 @@ const CtlResult = enum { none, stop };
 /// Drain the conv's control.jsonl from *cursor (between drive steps): a `stop` op ENDS the turn; a `steer`/`say`
 /// op INJECTS the user's text as a mid-turn user message so the next inference incorporates it — this is the user
 /// "posting to steer" a running turn without stopping it. Advances *cursor past everything read.
+// ---- DURABLE USER MEMORY (migrated from the desk): the user's cross-conversation facts (keys/logins/preferences)
+// live in {data}/.veil-desk/memories.jsonl — one {"cat","text"} JSON line each. The DESK writes this file; the
+// server shares the same localhost data dir, so reading + appending it keeps ONE durable store (no split-brain).
+// Before this, a server-served conv never injected the user's saved facts, and a reply's REMEMBER:/FORGET: lines
+// were neither acted on nor stripped (they leaked as literal text). ----
+const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
+
+fn memoriesPath(app: *App, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/.veil-desk/memories.jsonl", .{app.data}) catch null;
+}
+
+/// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
+/// absent/empty store leaves conv_buf unchanged.
+fn injectDurableMemory(app: *App, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+    const gpa = app.gpa;
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, &pb) orelse return;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
+    defer gpa.free(data);
+    // gather non-empty JSON lines, keep the NEWEST cap (append order = oldest first)
+    var slices: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer slices.deinit(gpa);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len > 0 and ln[0] == '{') slices.append(gpa, ln) catch break;
+    }
+    if (slices.items.len == 0) return;
+    const from = slices.items.len -| MEM_INJECT_CAP;
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    block.appendSlice(gpa, "YOUR MEMORY (durable facts this user asked you to keep across conversations — keys, logins, preferences, environment). Use them; do not re-REMEMBER what's already here:\n") catch return;
+    const M = struct { cat: []const u8 = "", text: []const u8 = "" };
+    var any = false;
+    for (slices.items[from..]) |ln| {
+        const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        const tx = std.mem.trim(u8, p.value.text, " \r\n\t");
+        if (tx.len == 0) continue;
+        block.append(gpa, '-') catch break;
+        block.append(gpa, ' ') catch break;
+        if (p.value.cat.len > 0) {
+            block.append(gpa, '[') catch break;
+            block.appendSlice(gpa, p.value.cat) catch break;
+            block.appendSlice(gpa, "] ") catch break;
+        }
+        block.appendSlice(gpa, tx) catch break;
+        block.append(gpa, '\n') catch break;
+        any = true;
+    }
+    if (!any) return;
+    conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+    http.jstr(gpa, conv_buf, block.items) catch return;
+    conv_buf.append(gpa, '}') catch return;
+}
+
+/// True if `fact` (trimmed) is already stored — exact text match against the durable store (dedup).
+fn durableMemoryHas(app: *App, fact: []const u8) bool {
+    const gpa = app.gpa;
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, &pb) orelse return false;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return false;
+    defer gpa.free(data);
+    const M = struct { text: []const u8 = "" };
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0 or ln[0] != '{') continue;
+        const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (std.mem.eql(u8, std.mem.trim(u8, p.value.text, " \r\n\t"), fact)) return true;
+    }
+    return false;
+}
+
+/// Append one durable memory {cat,text} to the shared store (dedup on exact text). Category clamped to one short word.
+fn storeDurableMemory(app: *App, cat_in: []const u8, fact_in: []const u8) void {
+    const gpa = app.gpa;
+    const fact = std.mem.trim(u8, fact_in, " \r\n\t");
+    if (fact.len < 2) return;
+    const fact_clip = fact[0..@min(fact.len, 260)];
+    if (durableMemoryHas(app, fact_clip)) return;
+    var cat = std.mem.trim(u8, cat_in, " \r\n\t[]");
+    if (cat.len == 0) cat = "fact";
+    if (cat.len > 20) cat = cat[0..20];
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, &pb) orelse return;
+    var jb: std.ArrayListUnmanaged(u8) = .empty;
+    defer jb.deinit(gpa);
+    jb.appendSlice(gpa, "{\"cat\":") catch return;
+    http.jstr(gpa, &jb, cat) catch return;
+    jb.appendSlice(gpa, ",\"text\":") catch return;
+    http.jstr(gpa, &jb, fact_clip) catch return;
+    jb.appendSlice(gpa, "}\n") catch return;
+    http.appendFile(app.io, gpa, path, jb.items) catch {};
+}
+
+/// Drop durable memories whose text contains `match` (case-insensitive) — whole-file rewrite.
+fn forgetDurableMemory(app: *App, match_in: []const u8) void {
+    const gpa = app.gpa;
+    const match = std.mem.trim(u8, match_in, " \r\n\t");
+    if (match.len < 2) return;
+    var pb: [700]u8 = undefined;
+    const path = memoriesPath(app, &pb) orelse return;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
+    defer gpa.free(data);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var removed = false;
+    const M = struct { text: []const u8 = "" };
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        var drop = false;
+        if (ln[0] == '{') {
+            if (std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true })) |p| {
+                defer p.deinit();
+                if (std.ascii.indexOfIgnoreCase(p.value.text, match) != null) drop = true;
+            } else |_| {}
+        }
+        if (drop) {
+            removed = true;
+            continue;
+        }
+        out.appendSlice(gpa, ln) catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    if (removed) std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// Parse a REMEMBER: body: an optional leading `[category]` then the fact. Returns cat+fact (cat defaults "fact").
+fn parseRemember(body_in: []const u8) struct { cat: []const u8, fact: []const u8 } {
+    const body = std.mem.trim(u8, body_in, " \t");
+    if (body.len > 0 and body[0] == '[') {
+        if (std.mem.indexOfScalar(u8, body, ']')) |cb| {
+            const cat = std.mem.trim(u8, body[1..cb], " \t");
+            return .{ .cat = if (cat.len > 0) cat else "fact", .fact = std.mem.trim(u8, body[cb + 1 ..], " \t") };
+        }
+    }
+    return .{ .cat = "fact", .fact = body };
+}
+
+/// Act on a reply's REMEMBER:/FORGET: lines (store/forget in the shared durable memory) and return the reply with
+/// those lines STRIPPED — the desk's processMemory ported. Returns an owned copy when it changed anything, else
+/// null (caller keeps the original). `saved` receives the number of directives applied.
+fn processMemoryDirectives(app: *App, text: []const u8, saved: *usize) ?[]u8 {
+    const gpa = app.gpa;
+    saved.* = 0;
+    if (std.mem.indexOf(u8, text, "REMEMBER:") == null and std.mem.indexOf(u8, text, "FORGET:") == null) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var first = true;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const ln = std.mem.trim(u8, line, " \r\t");
+        if (std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) {
+            const spec = parseRemember(ln["REMEMBER:".len..]);
+            if (spec.fact.len >= 2) {
+                storeDurableMemory(app, spec.cat, spec.fact);
+                saved.* += 1;
+            }
+            continue; // strip
+        }
+        if (std.ascii.startsWithIgnoreCase(ln, "FORGET:")) {
+            const m = std.mem.trim(u8, ln["FORGET:".len..], " \t");
+            if (m.len >= 2) {
+                forgetDurableMemory(app, m);
+                saved.* += 1;
+            }
+            continue; // strip
+        }
+        if (!first) out.append(gpa, '\n') catch return null;
+        out.appendSlice(gpa, std.mem.trimEnd(u8, line, "\r")) catch return null;
+        first = false;
+    }
+    // trim + drop a now-dangling intro line ("Saved:", "I've remembered:") left pointing at stripped directives
+    var s = std.mem.trim(u8, out.items, " \r\n\t");
+    if (saved.* > 0) s = stripDanglingMemoryIntro(s);
+    const owned = gpa.dupe(u8, s) catch {
+        out.deinit(gpa);
+        return null;
+    };
+    out.deinit(gpa);
+    return owned;
+}
+
+/// Drop a trailing intro line ("Saved preferences:", "I've remembered:") left dangling after directives were
+/// stripped. Ported from the desk stripDanglingMemoryIntro.
+fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
+    const nl = std.mem.lastIndexOfScalar(u8, text, '\n');
+    const last_raw = if (nl) |i| text[i + 1 ..] else text;
+    const ll = std.mem.trim(u8, last_raw, " \t*_#>`-");
+    if (ll.len == 0 or ll.len > 48 or ll[ll.len - 1] != ':') return text;
+    var lb: [64]u8 = undefined;
+    const n = @min(ll.len, lb.len);
+    for (ll[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const low = lb[0..n];
+    const intro = std.mem.indexOf(u8, low, "sav") != null or std.mem.indexOf(u8, low, "remember") != null or
+        std.mem.indexOf(u8, low, "prefer") != null or std.mem.indexOf(u8, low, "memor") != null or
+        std.mem.indexOf(u8, low, "stored") != null or std.mem.indexOf(u8, low, "noted") != null or
+        std.mem.indexOf(u8, low, "keep") != null;
+    if (!intro) return text;
+    return std.mem.trimEnd(u8, if (nl) |i| text[0..i] else "", " \r\n\t*_#>`-");
+}
+
 fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, conv_buf: *std.ArrayListUnmanaged(u8)) CtlResult {
     const gpa = app.gpa;
     const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return .none;
