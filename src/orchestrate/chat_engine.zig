@@ -733,9 +733,10 @@ const InnerResult = struct {
 /// Batch streamed deltas to ~this many chars per emitted frame. Streaming one FRAME per model TOKEN produced
 /// thousands of frames per turn (8400 reasoning frames observed) — each is a file append + a desk poll-parse,
 /// which overwhelmed the client ("the chat is dying"). Coalescing cuts frames while the reply still visibly types
-/// out. 60 felt chunky (≈300 chars/s visible); now that appendFile is a TRUE O(1) positioned append (frames are
-/// cheap), 28 chars/frame types out ~2x smoother without flooding the desk poller.
-const FLUSH_CHARS: usize = 28;
+/// out. 60 felt chunky; now that appendFile is a TRUE O(1) positioned append (frames are cheap) and the desk pumps
+/// its event poll at ~30Hz during a stream, 12 chars/frame keeps the reply flowing continuously (like the local
+/// client rendering its raw scratch) rather than arriving in visible ~28-char steps.
+const FLUSH_CHARS: usize = 12;
 
 const StreamCtx = struct {
     app: *App,

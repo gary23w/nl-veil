@@ -1151,7 +1151,7 @@ fn streamAttempt(
         const data = std.Io.Dir.cwd().readFileAlloc(io, outpath, gpa, .limited(8 << 20)) catch {
             // file not created yet — curl still connecting (or it died before writing)
             if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-            io.sleep(.{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+            io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast so frames reach the desk's ~30Hz poll promptly
             continue;
         };
         var body_bytes = data;
@@ -1177,7 +1177,7 @@ fn streamAttempt(
             break;
         }
         if (std.Io.Timestamp.now(io, .real).toSeconds() - t0 > wall) break;
-        io.sleep(.{ .nanoseconds = 40 * std.time.ns_per_ms }, .awake) catch {};
+        io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast so frames reach the desk's ~30Hz poll promptly
     }
 
     // ABORTED mid-stream (chat Stop): return whatever already streamed as a partial Step — do NOT fall back to
