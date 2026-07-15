@@ -526,12 +526,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, ctrl_cursor);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, &steer_cursor);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
                 // poller disarms + clears busy instead of hanging forever (the "kept streaming after an error").
                 planStepInterrupted(app, conv_dir, plan, task_idx);
+                salvageSteers(app, conv_dir, &steer_cursor); // an errored turn must not eat a pending steer
                 finishTurn(app, conv_dir, usage_t0);
                 return;
             },
@@ -570,6 +571,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             const note = "(no reply — the model returned an empty or malformed response this turn)";
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
+            salvageSteers(app, conv_dir, &steer_cursor); // an empty-reply end must not eat a pending steer
             finishTurn(app, conv_dir, usage_t0);
             return;
         }
@@ -756,6 +758,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
     // The drive loop ended (plan complete / DONE / repeat / step cap / an OOM append) — every settled answer is
     // already durable. A plan run gets a closing summary (all done, or paused at N/M — say "continue" to resume).
+    // LAST-CALL STEER SALVAGE: a steer that landed during the final settle (after the last drain point) would
+    // otherwise be dropped forever — the next turn re-snapshots the control cursor past it. Drain once more:
+    // drainChatControl persists each pending steer as a durable user message, so the NEXT turn replays it.
+    salvageSteers(app, conv_dir, &steer_cursor);
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
     // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
     // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
@@ -1524,7 +1530,7 @@ fn runInnerAgentic(
     conv_buf: *std.ArrayListUnmanaged(u8),
     ctx: *tools.ToolCtx,
     mem_scope: []const u8,
-    ctrl_cursor: usize,
+    steer_cursor: *usize,
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -1539,15 +1545,19 @@ fn runInnerAgentic(
 
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
-        // COOPERATIVE STOP (before each inference): abort with whatever narration we have; the caller commits it.
-        if (stopRequestedSince(app, conv_dir, ctrl_cursor))
-            return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty };
+        // COOPERATIVE CONTROL (before each inference): a stop aborts with whatever narration we have; a steer is
+        // folded straight into conv_buf as a user turn so THIS upcoming inference already honors it — steering
+        // used to wait for the outer drive-step boundary, which a long tool loop pushed out by many minutes.
+        switch (drainChatControl(app, conv_dir, steer_cursor, conv_buf)) {
+            .stop => return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty },
+            .none => {},
+        }
 
         // STREAMING: the model's reply + reasoning type out via streamOnDelta as {kind:token|reasoning,delta}
         // frames. The returned Step is the SAME accumulated shape complete() gives (content + reasoning +
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
-        var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
+        var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, TURN_TOOLS, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
@@ -1555,7 +1565,7 @@ fn runInnerAgentic(
         // STOP DURING STREAMING: the abort hook killed the stream mid-generation. Commit the partial that already
         // streamed to the user (step.content) as the stopped narration and end the turn — don't fall through to
         // treat the truncated reply as a settled answer or drive on it.
-        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
+        if (stopRequestedSince(app, conv_dir, steer_cursor.*)) {
             const partial = if (step.content.len > 0) step.content else last_content;
             return .{ .outcome = .stopped, .content = gpa.dupe(u8, partial) catch empty };
         }
@@ -1640,17 +1650,43 @@ fn runInnerAgentic(
         }
         conv_buf.appendSlice(gpa, "]}") catch return .{ .outcome = .hard_error, .content = empty };
 
-        // ... then run each call, narrate + observe its result, and append its result turn.
-        for (step.calls) |c| {
-            // COOPERATIVE STOP (between tool calls): a single inference can request many tools (66 web_searches in
-            // one live run), each taking seconds — checking stop only per-inference let a Stop wait minutes. Check
-            // before EACH tool so a Stop lands promptly; abort with the narration so far.
-            if (stopRequestedSince(app, conv_dir, ctrl_cursor))
-                return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty };
+        // ... then run each call, narrate + observe its result, and append its result turn. A steer that lands
+        // mid-batch is drained into `pending_steer` (a user turn may NOT sit between an assistant tool_calls turn
+        // and its tool results — providers 400 on that) and spliced in AFTER the batch, before the next inference.
+        var pending_steer: std.ArrayListUnmanaged(u8) = .empty;
+        defer pending_steer.deinit(gpa);
+        for (step.calls, 0..) |c, ci| {
+            // COOPERATIVE CONTROL (between tool calls): a single inference can request many tools (66 web_searches
+            // in one live run), each taking seconds — checking only per-inference let a Stop (or a steer) wait
+            // minutes. A stop aborts with the narration so far; a steer SKIPS the still-queued calls (each still
+            // gets a result row — the shape requires one per call id) so the next inference honors it in seconds.
+            switch (drainChatControl(app, conv_dir, steer_cursor, &pending_steer)) {
+                .stop => return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty },
+                .none => {},
+            }
+            if (pending_steer.items.len > 0) {
+                var skipped: usize = 0;
+                for (step.calls[ci..]) |sk| {
+                    var skobj: std.ArrayListUnmanaged(u8) = .empty;
+                    defer skobj.deinit(gpa);
+                    const sk_ok = blk: {
+                        skobj.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch break :blk false;
+                        http.jstr(gpa, &skobj, sk.id) catch break :blk false;
+                        skobj.appendSlice(gpa, ",\"content\":\"(skipped — the user steered the conversation mid-batch; honor their newest message first)\"}") catch break :blk false;
+                        conv_buf.appendSlice(gpa, skobj.items) catch break :blk false;
+                        break :blk true;
+                    };
+                    if (!sk_ok) return .{ .outcome = .hard_error, .content = empty };
+                    skipped += 1;
+                }
+                var nb: [96]u8 = undefined;
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "steer received — skipped {d} queued tool call(s)", .{skipped}) catch "steer received");
+                break;
+            }
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
             // via deploy_service + app.sup, NOT the mind-tool executor. Everything else falls through to tools.execute.
-            const result = orchTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
+            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
@@ -1679,6 +1715,10 @@ fn runInnerAgentic(
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
         compactWorking(app, run_root, base_url, key, model, conv_buf, base_len);
+        // MID-BATCH STEER SPLICE — after compaction, so the literal user instruction can never be folded into a
+        // summary note. The next completion sees: assistant tool_calls → results (real + skipped) → user steer.
+        if (pending_steer.items.len > 0)
+            conv_buf.appendSlice(gpa, pending_steer.items) catch return .{ .outcome = .hard_error, .content = empty };
         // loop: feed the tool results back for the next completion
     }
 
@@ -1976,7 +2016,21 @@ fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, if (nl) |i| text[0..i] else "", " \r\n\t*_#>`-");
 }
 
-fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, conv_buf: *std.ArrayListUnmanaged(u8)) CtlResult {
+/// One last control drain that persists any still-unconsumed steer as a durable user message (drainChatControl
+/// does the persisting). The scratch fragments are discarded — no inference follows; the NEXT turn's history
+/// replay carries the text instead. Called on every turn-completion path that isn't an explicit user stop.
+fn salvageSteers(app: *App, conv_dir: []const u8, cursor: *usize) void {
+    var scratch: std.ArrayListUnmanaged(u8) = .empty;
+    defer scratch.deinit(app.gpa);
+    if (drainChatControl(app, conv_dir, cursor, &scratch) == .none and scratch.items.len > 0)
+        emitKV(app, conv_dir, "status", "text", "steer noted — it will lead the next turn");
+}
+
+/// Drain control.jsonl past `cursor`: a `stop` op returns .stop (cursor consumed to EOF); each `steer`/`say` op
+/// is appended to `buf` as a `,{"role":"user","content":…}` fragment (the CALLER decides when that buffer is in
+/// a position where a user turn is legal — directly conv_buf before an inference, or a pending list mid-tool-batch)
+/// AND persisted as a durable user message. Emits a "steering:" status frame per folded op so the client sees it land.
+fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.ArrayListUnmanaged(u8)) CtlResult {
     const gpa = app.gpa;
     const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return .none;
     defer gpa.free(path);
@@ -1995,9 +2049,13 @@ fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, conv_buf: *
             return .stop;
         }
         if ((std.mem.eql(u8, p.value.op, "steer") or std.mem.eql(u8, p.value.op, "say")) and std.mem.trim(u8, p.value.text, " \r\n\t").len > 0) {
-            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch continue;
-            http.jstr(gpa, conv_buf, p.value.text) catch {};
-            conv_buf.append(gpa, '}') catch {};
+            buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch continue;
+            http.jstr(gpa, buf, p.value.text) catch {};
+            buf.append(gpa, '}') catch {};
+            // DURABLE: a folded steer is a real user turn — persist it so the NEXT turn's history replay (and a
+            // turn that ends before acting on it) still carries the user's course correction instead of dropping
+            // it when the next turn re-snapshots the control cursor past it (the "steer sent, nothing happened").
+            appendMsg(app, conv_dir, "user", p.value.text, "user", nowSecs(app.io));
             var sb: [200]u8 = undefined;
             emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "steering: {s}", .{clipBytes(p.value.text, 120)}) catch "steering");
         }
