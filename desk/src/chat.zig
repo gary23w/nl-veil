@@ -1568,6 +1568,18 @@ pub const Chat = struct {
             self.applyFileSync(dd, line);
             return;
         }
+        if (std.mem.eql(u8, kind, "sync_request")) {
+            // workdir-sync manifest exchange (server diffs before transferring; the probe detects a shared disk)
+            const id = scRawField(line, "id") orelse return;
+            self.answerSyncRequest(dd, id);
+            return;
+        }
+        if (std.mem.eql(u8, kind, "file_pull")) {
+            // the server wants these files for a hive it is about to cast — send only what it asked for
+            const id = scRawField(line, "id") orelse return;
+            self.answerFilePull(dd, id, line);
+            return;
+        }
         // any other kind: not rendered.
     }
 
@@ -1601,6 +1613,65 @@ pub const Chat = struct {
         log.info("file_sync: wrote {s} ({d}b)", .{ path[0..@min(path.len, 120)], content.len });
         // the workdir just gained hive files — bind the console/git to it if this conv had none yet
         if (self.build_dir_len == 0) self.syncBuildDir(dd);
+    }
+
+    /// Resolve this conv's delegated workdir (the same path runDelegatedTool roots tools at), creating it.
+    fn delegatedWorkdir(self: *Chat, dd: []const u8, buf: []u8) []const u8 {
+        var relb: [180]u8 = undefined;
+        const rel = self.chatBuildRel(&relb);
+        const wd = if (rel.len > 0)
+            (std.fmt.bufPrint(buf, "{s}/{s}/work", .{ dd, rel }) catch dd)
+        else
+            dd;
+        _ = Io.Dir.cwd().createDirPathStatus(self.io, wd, .default_dir) catch {};
+        return wd;
+    }
+
+    /// Answer a {kind:"sync_request"} frame: spawn `veil sync-manifest` on this conv's workdir and post the
+    /// manifest (+ probe echo) it prints. On ANY failure post an EMPTY manifest — the server then degrades to
+    /// a full push instead of stalling to its timeout. The desk stays a dumb pipe: hashing, caps, and the
+    /// probe read all live in the shared sync module the spawned verb calls.
+    fn answerSyncRequest(self: *Chat, dd: []const u8, id: []const u8) void {
+        var wdb: [820]u8 = undefined;
+        const workdir = self.delegatedWorkdir(dd, &wdb);
+        var binb: [1100]u8 = undefined;
+        const bin = self.veilBinPath(&binb);
+        const argv = [_][]const u8{ bin, "sync-manifest", "--workdir", workdir };
+        const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(8 << 10) }) catch {
+            self.postToolResult(id, "{\"probe\":\"\",\"files\":[]}");
+            return;
+        };
+        defer self.gpa.free(r.stdout);
+        defer self.gpa.free(r.stderr);
+        self.postToolResult(id, if (r.stdout.len > 0) r.stdout else "{\"probe\":\"\",\"files\":[]}");
+    }
+
+    /// Answer a {kind:"file_pull"} frame: stage the frame as the args file, spawn `veil sync-read`, and post
+    /// the batched contents it prints. Empty batch on any failure — the hive casts with what the server has.
+    fn answerFilePull(self: *Chat, dd: []const u8, id: []const u8, line: []const u8) void {
+        var wdb: [820]u8 = undefined;
+        const workdir = self.delegatedWorkdir(dd, &wdb);
+        var afb: [900]u8 = undefined;
+        const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-sync-pull.json", .{workdir}) catch {
+            self.postToolResult(id, "{\"files\":[]}");
+            return;
+        };
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = args_file, .data = line }) catch {
+            self.postToolResult(id, "{\"files\":[]}");
+            return;
+        };
+        defer Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
+        var binb: [1100]u8 = undefined;
+        const bin = self.veilBinPath(&binb);
+        self.setStatus("sending your files to the hive...");
+        const argv = [_][]const u8{ bin, "sync-read", "--workdir", workdir, "--args-file", args_file };
+        const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 20), .stderr_limit = .limited(8 << 10) }) catch {
+            self.postToolResult(id, "{\"files\":[]}");
+            return;
+        };
+        defer self.gpa.free(r.stdout);
+        defer self.gpa.free(r.stderr);
+        self.postToolResult(id, if (r.stdout.len > 0) r.stdout else "{\"files\":[]}");
     }
 
     /// Resolve the `veil` server binary to invoke as `veil exec-tool` — it hosts the ONE tool executor, so the desk

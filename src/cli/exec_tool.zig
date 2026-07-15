@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const cli = @import("../cli.zig");
 const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
+const cync = @import("../worker/chat/sync.zig");
 
 const NEURON_EXE = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
 
@@ -91,4 +92,46 @@ pub fn cmd(ctx: *cli.Ctx, args: []const []const u8) u8 {
     defer ctx.gpa.free(result);
     cli.out("{s}", .{result}); // result to STDOUT so the caller captures it
     return 0;
+}
+
+/// `veil sync-manifest [--workdir DIR]` — print the workdir's sync manifest response (probe echo + file
+/// hashes; see worker/chat/sync.zig). The subprocess form the desk uses to answer a {kind:"sync_request"}
+/// frame — same one implementation the CLI chat calls in-process.
+pub fn cmdSyncManifest(ctx: *cli.Ctx, args: []const []const u8) u8 {
+    const resp = cync.manifestResponse(ctx.gpa, ctx.io, argWorkdir(args));
+    defer ctx.gpa.free(resp);
+    cli.out("{s}", .{resp});
+    return 0;
+}
+
+/// `veil sync-read --args-file PATH [--workdir DIR]` — read the files a {kind:"file_pull"} frame names (the
+/// frame JSON is the args file) and print the batched contents response. Desk twin of the CLI's in-process
+/// handler.
+pub fn cmdSyncRead(ctx: *cli.Ctx, args: []const []const u8) u8 {
+    var frame: []const u8 = "{}";
+    var owned: ?[]u8 = null;
+    defer if (owned) |o| ctx.gpa.free(o);
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--args-file") and i + 1 < args.len) {
+            i += 1;
+            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, args[i], ctx.gpa, .limited(1 << 20)) catch null) |data| {
+                owned = data;
+                frame = data;
+            }
+        }
+    }
+    const resp = cync.readResponse(ctx.gpa, ctx.io, argWorkdir(args), frame);
+    defer ctx.gpa.free(resp);
+    cli.out("{s}", .{resp});
+    return 0;
+}
+
+/// The `--workdir DIR` argument, defaulting to the current directory.
+fn argWorkdir(args: []const []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--workdir") and i + 1 < args.len) return args[i + 1];
+    }
+    return ".";
 }

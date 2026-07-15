@@ -22,6 +22,7 @@ const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const cctx = @import("context.zig");
 const cplan = @import("plan.zig");
+const cync = @import("sync.zig");
 const deploy_service = @import("../deploy/service.zig");
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
@@ -1290,18 +1291,18 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
             sleepMsRaw(app.io, 250);
         }
         const sw = app.sup.resolve(conv) orelse {
-            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, ctrl_cursor);
             return .finished;
         };
         if (sw.uid != uid or swarmTerminal(app, sw.run_dir, sw.created)) {
-            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, ctrl_cursor);
             return .finished;
         }
     }
 }
 
-fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8) ?[]u8 {
-    if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, base_url, key, model, args);
+fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
+    if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, args, tool_client);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
@@ -1313,7 +1314,7 @@ fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
 /// cast — deploy a swarm into THIS conversation's build dir, using the chat turn's own model/creds so the hive
 /// runs on the same backend the user is chatting with. Reuses deploy_service.castSwarm (the exact server cast
 /// pipeline the HTTP /cast route uses). gpa-owned result.
-fn castTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8) []u8 {
+fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8, tool_client: bool) []u8 {
     const gpa = app.gpa;
     const A = struct { goal: []const u8 = "", minds: u32 = 3, minutes: u32 = 0, mode: []const u8 = "cast", files: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "cast: could not parse args JSON");
@@ -1321,6 +1322,20 @@ fn castTool(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []
     const a = p.value;
     if (std.mem.trim(u8, a.goal, " \r\n\t").len == 0) return orchErr(gpa, "cast: a goal is required");
     const user = app.auth.userById(uid) orelse return orchErr(gpa, "cast: user not found");
+
+    // CLIENT MODE (client→server): the hive is about to build in the SERVER's copy of this conversation's
+    // workdir, but the veil's files (and any client-side script output / user-dropped assets) live on the
+    // CLIENT. Pull the difference down first — one manifest round-trip, then only changed files; same-disk
+    // installs detect via the probe and transfer nothing. See chat/sync.zig.
+    if (tool_client) {
+        const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/");
+        if (at) |i| {
+            var wb: [1400]u8 = undefined;
+            if (std.fmt.bufPrint(&wb, "{s}/builds/{s}/work", .{ conv_dir[0..i], conv })) |work| {
+                pullClientFiles(app, conv_dir, work, ctrl_cursor);
+            } else |_| {}
+        }
+    }
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1580,31 +1595,168 @@ fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u
     if (built) emitEvent(app, conv_dir, ev.items);
 
     const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // a client run_python / long shell can take a while
+    return awaitClientResult(app, conv_dir, id, ctrl_cursor, CLIENT_TOOL_TIMEOUT_S) orelse
+        gpa.dupe(u8, "(the client did not return a result in time — is the desk/CLI still connected?)") catch emptyRes();
+}
+
+/// Block until the client posts a result for `id` to /tool_result (or a stop lands / the timeout passes).
+/// The one wait primitive under every client round-trip: delegated tools AND the sync protocol's manifest /
+/// file-pull exchanges. gpa-owned result; null = stopped or timed out (callers degrade, never wedge).
+fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, timeout_s: i64) ?[]u8 {
     const t0 = nowSecs(app.io);
-    while (nowSecs(app.io) - t0 < CLIENT_TOOL_TIMEOUT_S) {
-        if (stopRequestedSince(app, conv_dir, ctrl_cursor))
-            return gpa.dupe(u8, "(stopped before the client returned a result)") catch emptyRes();
+    while (nowSecs(app.io) - t0 < timeout_s) {
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return null;
         if (readToolResult(app, conv_dir, id)) |r| return r;
         sleepMsRaw(app.io, 150);
     }
-    return gpa.dupe(u8, "(the client did not return a result in time — is the desk/CLI still connected?)") catch emptyRes();
+    return null;
 }
 
-// ------------------------------------------------------------------ CLIENT-MODE FILE SYNC (hive → client)
+// ------------------------------------------------------------------ CLIENT-MODE WORKDIR SYNC (see chat/sync.zig)
 
-const SYNC_FILE_CAP: usize = 512 << 10; // per-file ceiling — an oversized file is skipped, not clipped
-const SYNC_TOTAL_CAP: usize = 4 << 20; // total content budget per sync
-const SYNC_MAX_FILES: usize = 64; // frame-count ceiling per sync
-const SYNC_MAX_DEPTH: usize = 4; // work/-relative recursion bound
+/// How long a sync round-trip (manifest / file-pull) waits for the client. Short vs the tool timeout: a client
+/// that answers delegated tools answers these instantly; a vanished client must not stall a cast for minutes.
+const SYNC_WAIT_S: i64 = 60;
 
-/// CLIENT MODE: a finished cast's files exist only in the SERVER's run dir, but every file tool is delegated to
-/// the CLIENT, which reads its own disk — so without a push the veil reads "no such file" over work the hive
-/// verifiably produced (then wastefully redoes it), and a remote client never receives the deliverables at all.
-/// Called before each delegated tool: once this conversation's cast is terminal and not yet synced, emit every
-/// work file as a {kind:"file_sync",path,content} frame; the client writes each into its local workdir BEFORE it
-/// executes the next delegated tool (frames are processed in order). Marker-deduped per swarm id; no-op while
+const SyncInfo = struct {
+    shared: bool, // the probe token round-tripped: both sides read the SAME directory — no transfer ever needed
+    parsed: ?std.json.Parsed(cync.ManifestResp), // the client's manifest (null when it never answered)
+
+    fn deinit(si: *SyncInfo) void {
+        if (si.parsed) |p| p.deinit();
+    }
+    fn manifest(si: *const SyncInfo) ?*const cync.ManifestResp {
+        return if (si.parsed) |*p| &p.value else null;
+    }
+};
+
+/// One manifest round-trip with the client (+ same-disk probe): write a token into the SERVER's copy of the
+/// workdir, ask the client for its manifest, and see whether the token came back. null = the client never
+/// answered (no client attached / gone) — callers degrade to their no-manifest behavior, never wedge.
+fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize) ?SyncInfo {
+    const gpa = app.gpa;
+    _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+    // the probe token: random hex, written server-side, echoed by the client only if it sees the same disk
+    var rnd: [8]u8 = undefined;
+    app.io.random(&rnd);
+    var tokb: [16]u8 = undefined;
+    const token = std.fmt.bufPrint(&tokb, "{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return null;
+    var pb: [1500]u8 = undefined;
+    const probe_path = std.fmt.bufPrint(&pb, "{s}/{s}", .{ workdir, cync.PROBE_NAME }) catch return null;
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = probe_path, .data = token }) catch {};
+    defer std.Io.Dir.cwd().deleteFile(app.io, probe_path) catch {};
+
+    var idb: [24]u8 = undefined;
+    const id = std.fmt.bufPrint(&idb, "sync{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return null;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    const built = blk: {
+        ev.appendSlice(gpa, "{\"kind\":\"sync_request\",\"id\":") catch break :blk false;
+        http.jstr(gpa, &ev, id) catch break :blk false;
+        ev.append(gpa, '}') catch break :blk false;
+        break :blk true;
+    };
+    if (!built) return null;
+    emitEvent(app, conv_dir, ev.items);
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return null;
+    defer gpa.free(resp);
+    const parsed = std.json.parseFromSlice(cync.ManifestResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return null;
+    const shared = std.mem.eql(u8, std.mem.trim(u8, parsed.value.probe, " \r\n\t"), token);
+    return .{ .shared = shared, .parsed = parsed };
+}
+
+/// Does the client's manifest already carry `rel` with this exact content hash? (Linear scan — manifests are
+/// capped at MAX_FILES entries.)
+fn clientHasFile(m: ?*const cync.ManifestResp, rel: []const u8, hash: []const u8) bool {
+    const mm = m orelse return false;
+    for (mm.files) |e| {
+        if (std.mem.eql(u8, e.p, rel) and std.mem.eql(u8, e.h, hash)) return true;
+    }
+    return false;
+}
+
+/// CLIENT MODE, cast time (client→server): the hive is about to build in the SERVER's builds/{conv}/work, but
+/// in client mode every file the veil wrote — and anything a client-side script generated or the user dropped
+/// in — exists only on the CLIENT. Pull the difference down first: one manifest round-trip, then only the
+/// files whose hash differs from the server's copy. Same-disk installs short-circuit on the probe (zero
+/// transfers); a client that never answers degrades to casting with what the server has.
+fn pullClientFiles(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_cursor: usize) void {
+    const gpa = app.gpa;
+    var si = syncExchange(app, conv_dir, workdir, ctrl_cursor) orelse return;
+    defer si.deinit();
+    if (si.shared) return; // same directory — the hive already sees the client's files
+    const m = si.manifest() orelse return;
+
+    // want-list: every client file the server's copy is missing or has different bytes for
+    var paths: std.ArrayListUnmanaged(u8) = .empty;
+    defer paths.deinit(gpa);
+    var want: usize = 0;
+    for (m.files) |e| {
+        if (!cync.safeSyncPath(e.p)) continue;
+        var fb: [1700]u8 = undefined;
+        const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ workdir, e.p }) catch continue;
+        var same = false;
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, full, gpa, .limited(cync.FILE_CAP)) catch null) |cur| {
+            var hb: [16]u8 = undefined;
+            same = std.mem.eql(u8, cync.hashHex(cur, &hb), e.h);
+            gpa.free(cur);
+        }
+        if (same) continue;
+        const ok = blk: {
+            if (want > 0) paths.append(gpa, ',') catch break :blk false;
+            http.jstr(gpa, &paths, e.p) catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return;
+        want += 1;
+    }
+    if (want == 0) return;
+
+    // pull the batch and materialize it into the server's workdir
+    var rnd: [8]u8 = undefined;
+    app.io.random(&rnd);
+    var idb: [24]u8 = undefined;
+    const id = std.fmt.bufPrint(&idb, "pull{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    const built = blk: {
+        ev.appendSlice(gpa, "{\"kind\":\"file_pull\",\"id\":") catch break :blk false;
+        http.jstr(gpa, &ev, id) catch break :blk false;
+        ev.appendSlice(gpa, ",\"paths\":[") catch break :blk false;
+        ev.appendSlice(gpa, paths.items) catch break :blk false;
+        ev.appendSlice(gpa, "]}") catch break :blk false;
+        break :blk true;
+    };
+    if (!built) return;
+    emitEvent(app, conv_dir, ev.items);
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return;
+    defer gpa.free(resp);
+    const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    var got: usize = 0;
+    for (parsed.value.files) |f| {
+        if (!cync.safeSyncPath(f.p) or f.c.len == 0 or f.c.len > cync.FILE_CAP) continue;
+        var fb: [1700]u8 = undefined;
+        const full = std.fmt.bufPrint(&fb, "{s}/{s}", .{ workdir, f.p }) catch continue;
+        if (std.fs.path.dirname(full)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(app.io, parent, .default_dir) catch {};
+        std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = full, .data = f.c }) catch continue;
+        got += 1;
+    }
+    if (got > 0) {
+        var sb: [96]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "pulled {d} file(s) from your machine for the hive", .{got}) catch "pulled your files for the hive");
+    }
+}
+
+/// CLIENT MODE, hive done (server→client): a finished cast's files exist only in the SERVER's run dir, but every
+/// file tool is delegated to the CLIENT, which reads its own disk — so without a push the veil reads "no such
+/// file" over work the hive verifiably produced (then wastefully redoes it), and a remote client never receives
+/// the deliverables at all. Called before each delegated tool: once this conversation's cast is terminal and not
+/// yet synced, exchange manifests and emit only the CHANGED files as {kind:"file_sync"} frames — the client
+/// writes each into its local workdir BEFORE it executes the next delegated tool (frames are processed in
+/// order). A same-disk install detects via the probe and transfers nothing. Marker-deduped per run; no-op while
 /// the hive still runs or when there is no cast.
-fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8) void {
+fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize) void {
     var run_buf: [1280]u8 = undefined;
     var run_dir: []const u8 = "";
     if (app.sup.resolve(conv)) |sw| {
@@ -1626,7 +1778,17 @@ fn maybeSyncCastFiles(app: *App, uid: u64, conv: []const u8, conv_dir: []const u
     if (std.Io.Dir.cwd().access(app.io, marker, .{})) |_| return else |_| {}
     // Marker FIRST: a sync that trips a persistent walk error must not re-fire before every future tool call.
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = marker, .data = "" }) catch {};
-    const sent = emitRunFiles(app, conv_dir, run_dir);
+
+    var wb: [1400]u8 = undefined;
+    const work = std.fmt.bufPrint(&wb, "{s}/work", .{run_dir}) catch return;
+    // manifest exchange: shared disk → nothing to push; no answer → push everything (the pre-manifest behavior)
+    var si_opt = syncExchange(app, conv_dir, work, ctrl_cursor);
+    defer if (si_opt) |*si| si.deinit();
+    if (si_opt) |si| {
+        if (si.shared) return; // the client reads the same directory the hive wrote — already "synced"
+    }
+    const manifest: ?*const cync.ManifestResp = if (si_opt) |*si| si.manifest() else null;
+    const sent = emitRunFiles(app, conv_dir, work, manifest);
     if (sent > 0) {
         var sb: [96]u8 = undefined;
         emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "synced {d} hive file(s) to your workdir", .{sent}) catch "synced hive files");
@@ -1640,25 +1802,24 @@ fn copyTo(buf: []u8, s: []const u8) ?[]const u8 {
     return buf[0..s.len];
 }
 
-/// Emit every regular file under {run_dir}/work as a file_sync frame (recursive, bounded; dot-entries and
-/// binaries skipped — a NUL byte can't ride a JSON string). Returns how many frames were emitted.
-fn emitRunFiles(app: *App, conv_dir: []const u8, run_dir: []const u8) usize {
-    var wb: [1400]u8 = undefined;
-    const work = std.fmt.bufPrint(&wb, "{s}/work", .{run_dir}) catch return 0;
+/// Emit files under `work` as file_sync frames (recursive, bounded; dot-entries and binaries skipped — a NUL
+/// byte can't ride a JSON string). With a client manifest, only files the client is missing (or holds with
+/// different bytes) are emitted. Returns how many frames were emitted.
+fn emitRunFiles(app: *App, conv_dir: []const u8, work: []const u8, manifest: ?*const cync.ManifestResp) usize {
     var sent: usize = 0;
-    var budget: usize = SYNC_TOTAL_CAP;
-    emitRunDirFiles(app, conv_dir, work, "", 0, &sent, &budget);
+    var budget: usize = cync.TOTAL_CAP;
+    emitRunDirFiles(app, conv_dir, work, "", 0, &sent, &budget, manifest);
     return sent;
 }
 
-fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []const u8, depth: usize, sent: *usize, budget: *usize) void {
+fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []const u8, depth: usize, sent: *usize, budget: *usize, manifest: ?*const cync.ManifestResp) void {
     const gpa = app.gpa;
-    if (depth > SYNC_MAX_DEPTH or sent.* >= SYNC_MAX_FILES or budget.* == 0) return;
+    if (depth > cync.MAX_DEPTH or sent.* >= cync.MAX_FILES or budget.* == 0) return;
     var dir = std.Io.Dir.cwd().openDir(app.io, abs_dir, .{ .iterate = true }) catch return;
     defer dir.close(app.io);
     var it = dir.iterate();
     while (it.next(app.io) catch null) |ent| {
-        if (sent.* >= SYNC_MAX_FILES or budget.* == 0) return;
+        if (sent.* >= cync.MAX_FILES or budget.* == 0) return;
         if (ent.name.len == 0 or ent.name[0] == '.') continue; // engine scratch (.search_health…) stays server-side
         var ab: [1800]u8 = undefined;
         const child_abs = std.fmt.bufPrint(&ab, "{s}/{s}", .{ abs_dir, ent.name }) catch continue;
@@ -1668,22 +1829,15 @@ fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []
         else
             std.fmt.bufPrint(&rb, "{s}/{s}", .{ rel, ent.name })) catch continue;
         switch (ent.kind) {
-            .directory => emitRunDirFiles(app, conv_dir, child_abs, child_rel, depth + 1, sent, budget),
+            .directory => emitRunDirFiles(app, conv_dir, child_abs, child_rel, depth + 1, sent, budget, manifest),
             .file => {
-                const data = std.Io.Dir.cwd().readFileAlloc(app.io, child_abs, gpa, .limited(SYNC_FILE_CAP)) catch continue;
+                const data = std.Io.Dir.cwd().readFileAlloc(app.io, child_abs, gpa, .limited(cync.FILE_CAP)) catch continue;
                 defer gpa.free(data);
                 if (data.len == 0 or data.len > budget.*) continue;
-                // TEXT ONLY: skip anything with control bytes beyond \n\r\t — binaries can't ride a JSON string,
-                // and \uXXXX escapes would round-trip lossily through the clients' small unescapers.
-                const probe = data[0..@min(data.len, 1024)];
-                var binary = false;
-                for (probe) |b| {
-                    if (b < 0x20 and b != '\n' and b != '\r' and b != '\t') {
-                        binary = true;
-                        break;
-                    }
-                }
-                if (binary) continue;
+                if (!cync.isTextContent(data)) continue; // binaries can't ride a JSON string
+                // DIFF: the client already holds these exact bytes → nothing to transfer
+                var hb: [16]u8 = undefined;
+                if (clientHasFile(manifest, child_rel, cync.hashHex(data, &hb))) continue;
                 scrubUtf8(data);
                 var ev: std.ArrayListUnmanaged(u8) = .empty;
                 defer ev.deinit(gpa);
@@ -1893,13 +2047,13 @@ fn runInnerAgentic(
             // CLIENT MODE: if this conversation's cast just finished, push its files down FIRST — the frames land
             // before this tool's tool_request, and the client processes frames in order, so a delegated
             // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
-            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir);
+            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, steer_cursor.*);
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
             // via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes as a mind tool:
             // in CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code tools
             // act on the USER's machine, not the server's sandbox; otherwise it runs here (a hive/server turn).
-            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args) orelse
+            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
                 (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
