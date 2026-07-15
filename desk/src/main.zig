@@ -4472,6 +4472,26 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     t.text(t.z("CHAT MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
     t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x + 100), @intFromFloat(y), 11, t.comment);
     y += 22;
+
+    // CHAT ENGINE: local (this machine) vs the server. Local runs the AI's tools in the client's own
+    // environment with no round-trip; the server path centralizes the turn (and is what scheduled tasks always
+    // use, since the desk may be closed). Default is local — the natural fit for acting on your own machine.
+    {
+        const cur = blk_ce: {
+            store.lock();
+            defer store.unlock();
+            break :blk_ce store.settings.server_chat;
+        };
+        const nv = t.checkbox(.{ .x = x, .y = y, .width = 22, .height = 22 }, t.z("run chat on the server (default: on this machine, tools in your environment)", .{}), cur);
+        if (nv != cur) {
+            store.lock();
+            store.settings.server_chat = nv;
+            store.unlock();
+            store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+            store.pushNotif(if (nv) "Chat: server" else "Chat: local (this machine)", if (nv) "interactive chat runs server-side" else "interactive chat runs on this machine - tools act in your environment", 1);
+        }
+        y += 30;
+    }
     const half = (colw - 10) / 2;
 
     // PROVIDER dropdown: Local / BYOK / Custom URL

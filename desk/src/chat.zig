@@ -3092,7 +3092,7 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"server_chat\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"chat_server\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3138,7 +3138,11 @@ pub const Chat = struct {
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
-        s.server_chat = std.mem.indexOf(u8, data, "\"server_chat\":false") == null; // absent = default ON (prefer backend, fall back to local)
+        // Persisted under a NEW key `chat_server` (absent = LOCAL). The old `server_chat` key is deliberately
+        // ignored: it had no UI toggle, so every persisted value was just the old server-default — reading it
+        // would pin existing installs to the server. The new default is local; a user opts into the server via
+        // the Settings toggle, which writes `chat_server`.
+        s.server_chat = std.mem.indexOf(u8, data, "\"chat_server\":true") != null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {

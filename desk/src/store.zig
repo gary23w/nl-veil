@@ -87,10 +87,11 @@ pub const Settings = struct {
     // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long
     // set-and-forget hiveminds (the original swarm design) for builds and deep work.
     speed_mode: bool = true,
-    // SERVER CHAT: when ON, a user send routes to the SERVER-side chat turn
-    // (POST /api/v1/chat/convs/:id/messages) and the desk renders the turn's event frames by polling
-    // /events, instead of running the local turn loop. The brain moves into the backend.
-    server_chat: bool = true, // default ON: prefer the backend chat turn, fall back to the local engine on any problem
+    // CHAT ENGINE: default LOCAL. Interactive chat runs IN THE DESK (in-process, no poll round-trip), so the
+    // AI's tools execute in the client's environment on this machine — not the server's buried sandbox. When ON,
+    // a send instead routes to the SERVER-side chat turn (POST /api/v1/chat/convs/:id/messages, rendered by
+    // polling /events). Scheduled tasks always run server-side regardless of this — the desk may be closed.
+    server_chat: bool = false, // default OFF: interactive chat runs locally (the client's built-in engine)
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
