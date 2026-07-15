@@ -1,0 +1,79 @@
+//! cli/exec_tool.zig — the SHARED client-side tool executor. `veil exec-tool <name>` reads a tool's arguments
+//! JSON from stdin, runs it through the server's own tools.execute (so there is ONE implementation of every
+//! tool), and prints the result to stdout. It executes in the invoker's working directory, so a client that
+//! delegates a server tool_request runs the tool on the USER's machine — the CLI calls runTool in-process, the
+//! desk (a separate package) spawns this subcommand. No tool is reimplemented per client.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const cli = @import("../cli.zig");
+const tools = @import("../worker/tools.zig");
+const osc = @import("../worker/oscillation.zig");
+
+const NEURON_EXE = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
+
+/// Run one tool with a client-side context rooted at `workdir` (file/shell/code act there). Returns the
+/// gpa-owned result string tools.execute produces (always a string, even on error, so it feeds back cleanly).
+pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ ctx.home, NEURON_EXE }) catch "";
+    var db: [700]u8 = undefined;
+    const mem_db = std.fmt.bufPrint(&db, "{s}/.veil-client-mem.sqlite", .{ctx.data}) catch "";
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var tctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = ctx.io,
+        .environ = ctx.environ,
+        .run_dir = workdir,
+        .workdir = workdir,
+        .scope = "client",
+        .mind = "client",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, ctx.io, neuron_bin, mem_db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+        .vcs_enabled = false,
+    };
+    return tools.execute(&tctx, name, args_json);
+}
+
+/// `veil exec-tool <name> [--workdir DIR]` — args JSON on stdin, result on stdout. The subprocess form a
+/// non-Zig client (the desk) uses to reach the shared executor; defaults the workdir to the current directory.
+pub fn cmd(ctx: *cli.Ctx, args: []const []const u8) u8 {
+    if (args.len == 0) {
+        std.debug.print("usage: veil exec-tool <tool-name> [--workdir DIR]   (tool args JSON on stdin)\n", .{});
+        return 1;
+    }
+    const name = args[0];
+    var workdir: []const u8 = ".";
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--workdir") and i + 1 < args.len) {
+            i += 1;
+            workdir = args[i];
+        }
+    }
+    // read the whole args JSON from stdin (a write_file payload can be large)
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(ctx.gpa);
+    const stdin = std.Io.File.stdin();
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        var bufs = [_][]u8{&chunk};
+        const n = stdin.readStreaming(ctx.io, &bufs) catch break;
+        if (n == 0) break;
+        body.appendSlice(ctx.gpa, chunk[0..n]) catch break;
+    }
+    const args_json = if (body.items.len > 0) body.items else "{}";
+    const result = runTool(ctx, workdir, name, args_json);
+    defer ctx.gpa.free(result);
+    cli.out("{s}", .{result}); // result to STDOUT so the caller captures it
+    return 0;
+}

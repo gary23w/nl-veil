@@ -86,7 +86,8 @@ pub fn run(
         appendJsonStr(ctx.gpa, &jb, model);
         jb.appendSlice(ctx.gpa, ",\"api_key\":") catch continue;
         appendJsonStr(ctx.gpa, &jb, api_key);
-        jb.appendSlice(ctx.gpa, ",\"loop\":0}") catch continue;
+        // client mode: the server delegates tool calls back to us and we run them locally.
+        jb.appendSlice(ctx.gpa, ",\"tool_client\":true,\"loop\":0}") catch continue;
 
         var pb: [220]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "/api/v1/chat/convs/{s}/messages", .{conv}) catch continue;
