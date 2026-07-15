@@ -1418,6 +1418,17 @@ pub const Chat = struct {
     /// End a server-chat exchange, optionally leaving a one-line notice (unreachable / poll failure). An empty
     /// note just disarms silently. Clears the busy/status the send set.
     fn abortServerChat(self: *Chat, dd: []const u8, note: []const u8) void {
+        // A still-live server turn — especially a persistent afk loop — must be told to STOP before we disarm the
+        // poller: once sc_active is false the Stop button won't reach it, so a server that is UP but whose polls we
+        // gave up on (transient failures / a stuck cursor) would keep driving forever with no desk control. Best
+        // effort — if the server is genuinely down the POST just fails (and nothing is running to strand).
+        const conv = self.sc_conv[0..self.sc_conv_len];
+        if (conv.len > 0) {
+            if (self.runner().chatControl(self.io, self.gpa, conv, "{\"op\":\"stop\"}")) |r| {
+                if (r.body.len > 0) self.gpa.free(r.body);
+            }
+        }
+        self.sc_serving = false; // no longer server-served → the local auto-loop may take over
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
         self.setServerActive(false);

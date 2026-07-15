@@ -52,8 +52,17 @@ const LOOP_MAX_STEPS: usize = 30;
 /// runaway backstop, not a functional limit.
 const AFK_MAX_STEPS: usize = 100_000;
 /// What loop=AFK injects as the next drive step when the driver declares DONE — the afk tier never accepts an end
-/// state, so "done" becomes a re-verify + extend (desk AFK_DRIVE_MSG). Only the user's Stop ends afk.
-const AFK_DRIVE_MSG = "keep going: re-verify the latest work end-to-end, then pick the most valuable next improvement or extension toward the goal and do it.";
+/// state, so "done" becomes a re-verify + extend (desk AFK_DRIVE_MSG). RE-GROUNDED to the goal at runtime so the
+/// persistent loop can't drift off onto an unrelated task. Only the user's Stop ends afk.
+const AFK_DRIVE_TMPL = "Keep going toward the goal: \"{s}\". Re-verify the latest work end-to-end, then pick the single most valuable next improvement or extension TOWARD THAT GOAL and do it now.";
+/// What an AFK loop injects when its next step just REPEATS the last one (afk skips the repeat-guard that ends a
+/// non-afk loop, so instead of churning the same failing step it steps back, re-grounds, and researches the blocker
+/// — the light server-side form of the desk's stuck->research escalation, using the model's own recall/search tools.
+const AFK_STUCK_TMPL = "You just repeated the previous step — that is not making progress. STOP repeating it: re-read the goal, and try a DIFFERENT approach. If you're blocked, first recall_hive / web_search the ACTUAL error or unknown, then act on what you learn. Goal: \"{s}\".";
+/// TERMINAL BUILD-VERIFY (desk fireTerminalVerify): an armed loop must not accept a bare DONE right after writing
+/// files — a model can ANNOUNCE a build it didn't finish. One completeness check (run the tests / write any missing
+/// file) is injected before the loop ends; it fires at most once per turn and only when files were actually written.
+const TERMINAL_VERIFY_PROMPT = "Before calling this done, VERIFY the deliverable actually works: run_tests (or run the code with run_python) to confirm it runs, and if any file the goal requires is missing or empty, write it NOW (write_file). If everything is present and works, give your FINAL summary to the user with no further tool calls — do not rewrite files that are already correct.";
 
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
@@ -375,8 +384,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
     const armed = loop >= LOOP_ON;
     const afk = loop >= LOOP_AFK;
-    const max_steps = if (has_plan) PLAN_STEPS_PER_TURN else if (afk) AFK_MAX_STEPS else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
+    // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
+    // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
+    const max_steps = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
     var idle_steps: usize = 0; // consecutive no-tool drive steps — the armed (non-afk) anti-spin bound (desk loop_idle)
+    var verified_done = false; // TERMINAL BUILD-VERIFY fires at most once per turn (desk arc_final_verified)
+    // afk re-drive / stuck messages, re-grounded to THIS turn's goal (the user message that started the loop) so the
+    // persistent loop can't drift onto an unrelated task. Fixed stack buffers (no alloc/free on the hot path).
+    var afk_buf: [800]u8 = undefined;
+    var stuck_buf: [800]u8 = undefined;
+    const goal_clip = clipBytes(user_text, 300);
+    const afk_msg = std.fmt.bufPrint(&afk_buf, AFK_DRIVE_TMPL, .{goal_clip}) catch "Keep going toward the goal — re-verify the latest work, then do the single most valuable next improvement.";
+    const afk_stuck_msg = std.fmt.bufPrint(&stuck_buf, AFK_STUCK_TMPL, .{goal_clip}) catch "You repeated the last step — try a DIFFERENT approach; recall_hive / web_search the actual blocker first.";
     if (armed) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
     var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
     var drive: usize = 0;
@@ -401,18 +420,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // (already the last turn) and later steps work the free-form next-step inferred at the bottom of the loop.
         var task_idx: ?usize = null;
         if (has_plan) {
-            const ti = cplan.nextPending(plan) orelse break :outer; // whole plan done
-            task_idx = ti;
-            cplan.setStatus(gpa, &plan[ti], cplan.STATUS_ACTIVE);
-            persistPlan(app, conv_dir, plan);
-            var sb: [220]u8 = undefined;
-            emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "subtask {d}/{d} ({s}): {s}", .{ ti + 1, plan.len, plan[ti].route, clipBytes(plan[ti].text, 80) }) catch "subtask");
-            if (subtaskInstruction(gpa, plan[ti], ti, plan.len)) |instr| {
-                defer gpa.free(instr);
-                conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-                http.jstr(gpa, &conv_buf, instr) catch break :outer;
-                conv_buf.append(gpa, '}') catch break :outer;
+            if (cplan.nextPending(plan)) |ti| {
+                task_idx = ti;
+                cplan.setStatus(gpa, &plan[ti], cplan.STATUS_ACTIVE);
+                persistPlan(app, conv_dir, plan);
+                var sb: [220]u8 = undefined;
+                emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "subtask {d}/{d} ({s}): {s}", .{ ti + 1, plan.len, plan[ti].route, clipBytes(plan[ti].text, 80) }) catch "subtask");
+                if (subtaskInstruction(gpa, plan[ti], ti, plan.len)) |instr| {
+                    defer gpa.free(instr);
+                    conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+                    http.jstr(gpa, &conv_buf, instr) catch break :outer;
+                    conv_buf.append(gpa, '}') catch break :outer;
+                }
+            } else if (!afk) {
+                break :outer; // whole plan done — end the turn (non-afk)
             }
+            // afk + plan complete → task_idx stays null → the loop keeps driving FREE-FORM (afk ends only on Stop)
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
@@ -488,8 +511,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         if (task_idx) |ti| {
             cplan.setStatus(gpa, &plan[ti], cplan.STATUS_DONE);
             persistPlan(app, conv_dir, plan);
-            if (cplan.nextPending(plan) == null) break :outer; // plan complete
-            continue :outer;
+            if (cplan.nextPending(plan) == null and !afk) break :outer; // plan complete (non-afk ends here)
+            continue :outer; // next subtask, OR (afk + plan done) loop back so the top transitions to free-form drive
         }
 
         // ANTI-SPIN / FAST-PATH: a step that ran NO tools did no agentic work this pass.
@@ -528,23 +551,34 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         if (!next.ok or trimmed.len == 0) break :outer;
         const is_done = loopIsDone(next.content);
         const is_repeat = nearlySame(trimmed, prev_drive) or cctx.looksLikeToolMarkup(trimmed);
-        // DONE: OFF/ON end (goal achieved); AFK NEVER accepts an end state — DONE folds into a re-verify+extend
-        // drive so the conversation keeps working (only the user's Stop ends afk).
-        if (is_done and !afk) break :outer;
-        // REPEAT / leaked markup: OFF/ON stop (no progress — the "janked back and forth" churn); AFK skips the
-        // repeat guard and churns forward.
-        if (is_repeat and !afk) break :outer;
 
-        // CONTINUE: the inferred step (or, when afk reached DONE, the extend message) becomes the next (synthetic)
-        // user turn in the LLM context — NOT written to messages.jsonl (only real user + assistant turns persist).
-        const next_step = if (is_done and afk) AFK_DRIVE_MSG else trimmed;
+        // Choose the next synthetic drive step, or break, honoring: TERMINAL VERIFY (an armed loop never accepts a
+        // bare DONE right after building — one completeness check first), re-ground (afk anchors to the goal), and
+        // stuck-recovery (afk re-grounds + researches on a repeat instead of churning).
+        var next_step: []const u8 = trimmed;
+        if (is_done) {
+            if (armed and ctx.files_written.* > 0 and !verified_done) {
+                verified_done = true; // TERMINAL BUILD-VERIFY (once): confirm the build before letting DONE stand
+                next_step = TERMINAL_VERIFY_PROMPT;
+            } else if (afk) {
+                next_step = afk_msg; // afk never accepts DONE — re-verify + extend, re-grounded to the goal
+            } else {
+                break :outer; // off/on: goal achieved (verified, or nothing was built)
+            }
+        } else if (is_repeat) {
+            if (!afk) break :outer; // off/on: a no-progress repeat ends the loop
+            next_step = afk_stuck_msg; // afk: don't churn the same step — re-ground + research the blocker
+        }
         conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
         http.jstr(gpa, &conv_buf, next_step) catch break :outer;
         conv_buf.append(gpa, '}') catch break :outer;
         var sbuf: [128]u8 = undefined;
         const status = std.fmt.bufPrint(&sbuf, "continuing: {s}", .{clipBytes(next_step, 80)}) catch "continuing";
         emitKV(app, conv_dir, "status", "text", status);
-        const nd: []u8 = gpa.dupe(u8, next_step) catch &[_]u8{};
+        // The repeat guard tracks the MODEL's actual last step (`trimmed`), NOT any synthetic steering we injected
+        // (TERMINAL_VERIFY / afk_msg / afk_stuck_msg) — else a model that keeps repeating its real action would slip
+        // past nearlySame because prev_drive held our injected text instead of its output.
+        const nd: []u8 = gpa.dupe(u8, trimmed) catch &[_]u8{};
         if (prev_drive.len > 0) gpa.free(prev_drive);
         prev_drive = nd;
     }

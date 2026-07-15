@@ -159,14 +159,30 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     std.Io.Dir.cwd().access(app.io, dir, .{}) catch return notFound(res);
 
     const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{dir});
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(4 << 20)) catch "";
     var from: usize = 0;
     const q = try req.query();
     if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
-    const slice = if (from <= data.len) data[from..] else data[0..0];
-    res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{data.len}));
+    // POSITIONAL read from the client's cursor `from` — NOT the whole file. A persistent afk turn appends
+    // events.jsonl indefinitely; reading the whole file under a fixed cap returned EMPTY once it crossed the cap
+    // (the desk view froze + a Stopped turn stayed 'busy' forever on a long run). The file only grows, so `from`
+    // stays valid; one poll's payload is bounded (the desk catches up across polls by advancing its cursor).
+    var body: []const u8 = "";
+    var next_off: usize = from;
+    if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
+        defer f.close(app.io);
+        const size: usize = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
+        if (size > from) {
+            const want = @min(size - from, 8 << 20); // cap one response; the client re-polls for the rest
+            if (res.arena.alloc(u8, want)) |buf| {
+                const n = f.readPositionalAll(app.io, buf, from) catch 0;
+                body = buf[0..n];
+                next_off = from + n;
+            } else |_| {} // OOM → empty this poll; the client re-polls (cursor unchanged)
+        }
+    } else |_| {} // no events.jsonl yet → empty body (a fresh conv)
+    res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{next_off}));
     res.content_type = .EVENTS;
-    res.body = slice;
+    res.body = body;
 }
 
 /// POST /api/v1/chat/convs/:id/messages — run ONE server-side agentic turn for this conversation. ON by default
@@ -212,7 +228,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
-    const loop_mode: u8 = if (b.loop > 2) 2 else b.loop; // clamp to the known tiers
+    const loop_mode: u8 = switch (b.loop) { 0, 1, 2 => b.loop, else => 0 }; // only the known tiers; garbage → OFF (never the most-expensive afk tier)
 
     // ONE in-flight turn per conversation. A turn does an unlocked read-modify-write of messages.jsonl / context.json
     // on a detached thread, so a second concurrent turn for the same conv would lost-update the durable log. Reject
