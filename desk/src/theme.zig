@@ -630,10 +630,11 @@ test "foldAscii collapses newlines and transliterates Unicode punctuation (fixes
         const n = foldAscii(&buf, "line one\nline two\tend");
         try std.testing.expectEqualStrings("line one line two end", buf[0..n]);
     }
-    // em/en dash + smart quotes + nbsp + bullet + ellipsis -> ASCII (no '?')
+    // em/en dash + smart quotes + nbsp + ellipsis -> ASCII (no '?'); the bullet is in the font atlas
+    // (see main.glyph_set), so it passes through verbatim instead of folding to '*'
     {
         const n = foldAscii(&buf, "Clean\u{2011}Code \u{201c}Tips\u{201d}\u{a0}here\u{2014}now\u{2022}\u{2026}");
-        try std.testing.expectEqualStrings("Clean-Code \"Tips\" here-now*...", buf[0..n]);
+        try std.testing.expectEqualStrings("Clean-Code \"Tips\" here-now\u{2022}...", buf[0..n]);
     }
     // printable Latin-1 (accents) survive; emoji/other are dropped, never tofu
     {

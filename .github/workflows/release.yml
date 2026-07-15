@@ -27,8 +27,18 @@ jobs:
         with: { version: 0.16.0 }
       - name: zig build (server)
         run: zig build
-      - name: zig test (engine)
-        run: zig test src/worker/run.zig
+      # `zig build test` runs src/tests.zig, which references EVERY test-bearing file; the old
+      # `zig test src/worker/run.zig` only collected the tests reachable from run.zig.
+      - name: zig build test (full server suite)
+        run: zig build test
+      - name: Linux desktop deps (raylib GL/X11/wayland)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
+      - name: zig build test (desk suite)
+        working-directory: desk
+        run: zig build test
 
   # full bundles: only on a tag or a manual dispatch
   bundle:
