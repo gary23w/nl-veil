@@ -1449,6 +1449,7 @@ fn scheduleTool(app: *App, uid: u64, base_url: []const u8, key: []const u8, mode
     var at: i64 = 0;
     if (std.mem.eql(u8, a.kind, "once")) {
         if (a.in_min > 0) {
+            if (a.in_min > sched.EVERY_MIN_MAX) return orchErr(gpa, "schedule_task: in_min is capped at 527040 (one year)"); // model-authored i64: unbounded would overflow the epoch math
             at = now + a.in_min * 60;
         } else if (sched.parseHm(a.at_hm) != null) {
             // next local occurrence of HH:MM — the exact math the daily tick uses

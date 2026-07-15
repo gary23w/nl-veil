@@ -2789,7 +2789,7 @@ pub const Chat = struct {
     }
 
     pub fn cmdNewConv(self: *Chat, dd: []const u8) void {
-        var idb: [32]u8 = undefined;
+        var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         const now = self.nowS();
         const id = std.fmt.bufPrint(&idb, "c{x}", .{@as(u64, @intCast(now))}) catch return;
         // collision (two in one second) → suffix
@@ -2855,11 +2855,11 @@ pub const Chat = struct {
     }
 
     fn renameActive(self: *Chat, dd: []const u8, title: []const u8) void {
-        var idb: [32]u8 = undefined;
+        var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         var idn: usize = 0;
         {
             self.store.lock();
-            idn = self.store.conv_active_len;
+            idn = @min(self.store.conv_active_len, idb.len);
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             self.store.unlock();
         }
@@ -3667,14 +3667,14 @@ pub const Chat = struct {
     /// appendMsg with the hippocampus observe optional — a reflect DRAFT commits without observing (only the
     /// FINAL text should become a neuron; a superseded draft in recall would poison future prompts).
     fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool) void {
-        var idb: [32]u8 = undefined;
+        var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         var idn: usize = 0;
         var evicted = false; // ring eviction shifted rows → the file must be fully rewritten, not appended
         var tn: usize = 0; // the STORED (possibly clipped) text length — the file must match the store byte-for-byte
         {
             self.store.lock();
             defer self.store.unlock();
-            idn = self.store.conv_active_len;
+            idn = @min(self.store.conv_active_len, idb.len);
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             evicted = self.store.msg_count >= store_mod.MAX_CHAT_MSGS;
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
@@ -3729,13 +3729,13 @@ pub const Chat = struct {
     /// store rewrites the whole conversation file per append anyway, so replacement costs the same. Never
     /// observes (callers observe the FINAL text exactly once, at finalize).
     fn replaceMsg(self: *Chat, dd: []const u8, idx: usize, role: store_mod.ChatRole, text: []const u8) void {
-        var idb: [32]u8 = undefined;
+        var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         var idn: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
             if (idx >= self.store.msg_count) return;
-            idn = self.store.conv_active_len;
+            idn = @min(self.store.conv_active_len, idb.len);
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             var m: store_mod.ChatMsg = .{ .role = role };
             const tn = @min(text.len, m.text.len);
@@ -3750,13 +3750,13 @@ pub const Chat = struct {
     /// Open a slot directly BEFORE `idx` and put a message there (the reasoning trace lands above the answer
     /// it produced, without re-posting the answer). Evicts the oldest message first when at capacity.
     fn insertMsgBefore(self: *Chat, dd: []const u8, idx_in: usize, role: store_mod.ChatRole, text: []const u8) void {
-        var idb: [32]u8 = undefined;
+        var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         var idn: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
             var idx = idx_in;
-            idn = self.store.conv_active_len;
+            idn = @min(self.store.conv_active_len, idb.len);
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             if (idx > self.store.msg_count) return;
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
@@ -10283,7 +10283,7 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     try std.testing.expect(saw_reply or saw_cast_flow);
     // and it persisted: the conversation file holds both messages
     var pb: [700]u8 = undefined;
-    var idb: [32]u8 = undefined;
+    var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
     const idn: usize = store.conv_active_len;
     @memcpy(idb[0..idn], store.conv_active[0..idn]);
     const path = Chat.convPath(dd, idb[0..idn], &pb).?;
