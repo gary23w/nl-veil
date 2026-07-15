@@ -358,9 +358,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     conv_buf.append(gpa, '}') catch return;
 
     // HIPPOCAMPUS (recall): pull the facts most relevant to THIS user text from the conversation's own neuron-db
-    // — earlier turns + tool findings, including ones evicted from the visible history — and inject them as a
-    // grounded-context system message RIGHT AFTER the base prompt (before the replayed history). Additive: an
-    // empty/failed recall leaves conv_buf byte-identical to the history-only seed, so it can only help.
+    // — earlier turns + tool findings, including ones evicted from the visible history. Built into a standalone
+    // fragment and handed to assembleHistory, which places it AFTER the stable prefix (system + durable memory +
+    // summary + goal) and right before the recency window: recall varies with every message, and injecting it
+    // early invalidated the provider's prompt-prefix cache for everything behind it (the whole window re-billed
+    // as fresh prefill on every inference). Additive: empty/failed recall changes nothing.
+    var recall_frag: std.ArrayListUnmanaged(u8) = .empty;
+    defer recall_frag.deinit(gpa);
     {
         const recalled = ctx.mem.recall(mem_scope, user_text);
         defer gpa.free(recalled);
@@ -370,9 +374,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             defer mem_content.deinit(gpa);
             mem_content.appendSlice(gpa, "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
             mem_content.appendSlice(gpa, recalled) catch return;
-            conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
-            http.jstr(gpa, &conv_buf, mem_content.items) catch return;
-            conv_buf.append(gpa, '}') catch return;
+            recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+            http.jstr(gpa, &recall_frag, mem_content.items) catch return;
+            recall_frag.append(gpa, '}') catch return;
         }
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
@@ -380,13 +384,29 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     injectDurableMemory(app, &conv_buf);
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
-    // scrolled-out turns + the pinned goal + a recency window of the newest turns. The durable log stays whole.
-    assembleHistory(app, conv_dir, user_text, &conv_buf);
+    // scrolled-out turns + the pinned goal + the recall fragment + a recency window of the newest turns.
+    assembleHistory(app, conv_dir, user_text, &conv_buf, recall_frag.items);
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
     // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
     // text then recalling it as "grounded context" is the parrot/confabulation loop the desk fix removed.
-    _ = ctx.mem.observe(mem_scope, user_text);
+    // DEFERRED to turn exit (a `defer` covers every completion path): the observe is a subprocess spawn that sat
+    // between prefix assembly and the first inference — pure write-side durability nothing in THIS turn reads
+    // (recall already ran above), so it must not tax the first token.
+    defer _ = ctx.mem.observe(mem_scope, user_text);
+
+    // TOOL-FINDING OBSERVES, BATCHED: each observe is a subprocess spawn, and doing one between every tool call
+    // serialized big tool batches (a 40-tool storm paid ~40 spawns inline). The tool loop appends preformatted
+    // notes here; the defer flushes them at turn exit — off every hot path. Nothing within this turn could have
+    // read them anyway: recall runs once, at turn start.
+    var tool_obs: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (tool_obs.items) |note| {
+            _ = ctx.mem.observe(mem_scope, note);
+            gpa.free(note);
+        }
+        tool_obs.deinit(gpa);
+    }
 
     // The assembled, bounded PREFIX (system + recall + summary + goal + recency window). Everything appended past
     // this by the drive loop (settled answers, synthetic drive steps, per-pass tool notes) is compacted against it
@@ -526,7 +546,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, mem_scope, &steer_cursor);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -1529,8 +1549,8 @@ fn runInnerAgentic(
     model: []const u8,
     conv_buf: *std.ArrayListUnmanaged(u8),
     ctx: *tools.ToolCtx,
-    mem_scope: []const u8,
     steer_cursor: *usize,
+    tool_obs: *std.ArrayListUnmanaged([]u8),
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -1692,8 +1712,13 @@ fn runInnerAgentic(
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
             // — "(...)" notes and `"ok":false` payloads — and never observe assistant reply content (confab fix).
-            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null)
-                observeToolResult(app, ctx, mem_scope, c.name, result);
+            // QUEUED, not observed inline: each observe spawns a subprocess, which serialized big tool batches.
+            // runTurn flushes the queue at turn exit (bounded — a runaway afk turn can't hoard notes forever).
+            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and tool_obs.items.len < 200) {
+                if (std.fmt.allocPrint(gpa, "tool {s}: {s}", .{ c.name, clipBytes(result, 200) })) |note| {
+                    tool_obs.append(gpa, note) catch gpa.free(note);
+                } else |_| {}
+            }
 
             // Build the whole tool-result object in a scratch list, then append it to conv_buf in ONE shot. A
             // mid-object OOM must never leave conv_buf as a partial/unterminated object — that malformed JSON would
@@ -1776,33 +1801,46 @@ fn reflectAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []c
 }
 
 /// Observe a SHORT durable note of a successful tool result into the conversation's neuron-db: `tool <name>: <=200b`.
-fn observeToolResult(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, name: []const u8, result: []const u8) void {
-    const gpa = app.gpa;
-    const note = std.fmt.allocPrint(gpa, "tool {s}: {s}", .{ name, clipBytes(result, 200) }) catch return;
-    defer gpa.free(note);
-    _ = ctx.mem.observe(mem_scope, note);
-}
-
 /// Current byte length of control.jsonl (0 if absent/unreadable) — the cursor past which a later stop op counts.
+/// A stat, not a read: this and the pollers below used to read the WHOLE file, and the stop poll fires ~50×/s
+/// during a stream — O(control-size) forever on a file that only grows across a long conversation's steers.
 fn controlLen(app: *App, conv_dir: []const u8) usize {
     const gpa = app.gpa;
     const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return 0;
     defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return 0;
-    defer gpa.free(data);
-    return data.len;
+    const st = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch return 0;
+    return std.math.cast(usize, st.size) orelse 0;
+}
+
+/// The bytes of control.jsonl past `cursor` (gpa-owned; null = nothing new / unreadable). POSITIONAL tail read,
+/// mirroring convEvents — never the whole file.
+fn readControlTail(app: *App, conv_dir: []const u8, cursor: usize) ?[]u8 {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return null;
+    defer gpa.free(path);
+    const f = std.Io.Dir.cwd().openFile(app.io, path, .{}) catch return null;
+    defer f.close(app.io);
+    const size: usize = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
+    if (size <= cursor) return null;
+    const want = @min(size - cursor, 1 << 20);
+    const buf = gpa.alloc(u8, want) catch return null;
+    const n = f.readPositionalAll(app.io, buf, cursor) catch {
+        gpa.free(buf);
+        return null;
+    };
+    if (n == 0) {
+        gpa.free(buf);
+        return null;
+    }
+    return buf[0..n];
 }
 
 /// True if control.jsonl carries a `"op":"stop"` in the bytes appended AFTER `cursor` (i.e. since the turn began).
 /// Best-effort: any read error means "no stop" (never block the turn on a control-file hiccup).
 fn stopRequestedSince(app: *App, conv_dir: []const u8, cursor: usize) bool {
-    const gpa = app.gpa;
-    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return false;
-    defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return false;
-    defer gpa.free(data);
-    if (data.len <= cursor) return false;
-    return std.mem.indexOf(u8, data[cursor..], "\"op\":\"stop\"") != null;
+    const tail = readControlTail(app, conv_dir, cursor) orelse return false;
+    defer app.gpa.free(tail);
+    return std.mem.indexOf(u8, tail, "\"op\":\"stop\"") != null;
 }
 
 const CtlResult = enum { none, stop };
@@ -2032,12 +2070,9 @@ fn salvageSteers(app: *App, conv_dir: []const u8, cursor: *usize) void {
 /// AND persisted as a durable user message. Emits a "steering:" status frame per folded op so the client sees it land.
 fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.ArrayListUnmanaged(u8)) CtlResult {
     const gpa = app.gpa;
-    const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return .none;
-    defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(1 << 20)) catch return .none;
-    defer gpa.free(data);
-    if (data.len <= cursor.*) return .none;
-    var it = std.mem.splitScalar(u8, data[cursor.*..], '\n');
+    const tail = readControlTail(app, conv_dir, cursor.*) orelse return .none;
+    defer gpa.free(tail);
+    var it = std.mem.splitScalar(u8, tail, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t");
         if (ln.len == 0) continue;
@@ -2045,7 +2080,7 @@ fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.A
         const p = std.json.parseFromSlice(C, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
         if (std.mem.eql(u8, p.value.op, "stop")) {
-            cursor.* = data.len;
+            cursor.* += tail.len;
             return .stop;
         }
         if ((std.mem.eql(u8, p.value.op, "steer") or std.mem.eql(u8, p.value.op, "say")) and std.mem.trim(u8, p.value.text, " \r\n\t").len > 0) {
@@ -2060,7 +2095,7 @@ fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.A
             emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "steering: {s}", .{clipBytes(p.value.text, 120)}) catch "steering");
         }
     }
-    cursor.* = data.len;
+    cursor.* += tail.len;
     return .none;
 }
 
@@ -2166,7 +2201,7 @@ fn seedLines(app: *App, conv_buf: *std.ArrayListUnmanaged(u8), bytes: []const u8
 /// of turns that have scrolled out of the recency window, the pinned original goal, and the recency window itself.
 /// Replaces "replay the whole transcript". Best-effort: any read/parse/summary failure degrades to less context,
 /// never a crash — the turn still runs on the system prompt + recall + whatever seeded.
-fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), recall_frag: []const u8) void {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return;
     defer gpa.free(mpath);
@@ -2198,6 +2233,10 @@ fn assembleHistory(app: *App, conv_dir: []const u8, user_text: []const u8, conv_
 
     // PINNED GOAL: the conversation's first user message anchors the arc even after it scrolls out of the window.
     if (view.goal_line.len > 0) seedLines(app, conv_buf, view.goal_line, cctx.GOAL_PIN_CAP);
+
+    // RELEVANCE RECALL (varies per message): placed here — after the stable prefix, before the window — so the
+    // provider's prompt-prefix cache keeps hitting on system + memory + summary + goal across inferences.
+    if (recall_frag.len > 0) conv_buf.appendSlice(gpa, recall_frag) catch {};
 
     // RECENCY WINDOW: replay the newest complete turns verbatim (includes the just-appended user message).
     seedLines(app, conv_buf, view.window, cctx.HISTORY_WINDOW_BYTES);
