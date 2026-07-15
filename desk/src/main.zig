@@ -1333,6 +1333,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var tail: [store_mod.CAST_TAIL]scan.Ev = undefined;
     const tail_n = store.cast_tail_count;
     @memcpy(tail[0..tail_n], store.cast_tail[0..tail_n]);
+    var plan: [store_mod.MAX_PLAN]store_mod.PlanRow = undefined;
+    const plan_n = store.plan_count;
+    @memcpy(plan[0..plan_n], store.plan[0..plan_n]);
     if (store.console_show_veil) { // the AI just ran a command — surface its tab once, then clear the flag
         ui.con_tab = 1;
         store.console_show_veil = false;
@@ -1365,17 +1368,18 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var inflight_buf: [18432]u8 = undefined;
     const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
 
+    // Only the NEWEST row can be the live cast (updateCastRow only ever writes casts[n-1]) — scanning ALL rows let
+    // one historical row orphaned mid-"running" (a conv-switch/stop seam that dropped the watch) pin the green
+    // "the hive is working" bar forever, even in a brand-new conversation.
     var cast_live = false;
-    for (casts[0..cast_n]) |*c| {
-        if (c.status == .deploying or c.status == .running or c.status == .collecting) {
-            cast_live = true;
-            break;
-        }
+    if (cast_n > 0) {
+        const c = &casts[cast_n - 1];
+        cast_live = c.status == .deploying or c.status == .running or c.status == .collecting;
     }
 
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live);
-    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n]);
+    drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy);
 }
 
@@ -2174,16 +2178,37 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
     };
 }
 
-/// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking.
+/// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Now shows
+/// an inline PREVIEW of the first line of the thinking (dim italic-feel) so the user sees WHAT is being reasoned
+/// without expanding every trace ("the user should see what is being reasoned"). Click to expand the full text.
 /// Returns true on click (expand/collapse).
-fn thoughtChip(view: t.Rect, y0: f32, expanded: bool) bool {
+fn thoughtChip(view: t.Rect, y0: f32, expanded: bool, preview: []const u8) bool {
     const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
     const hot = t.hovering(r) and t.hovering(view);
     t.fillRect(@intFromFloat(r.x + 2), @intFromFloat(y0 + 11), 6, 6, t.comment); // dim marker dot
-    t.text(t.z("reasoning", .{}), @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.comment);
+    const lbl = t.z("reasoning", .{});
+    t.text(lbl, @intFromFloat(r.x + 16), @intFromFloat(y0 + 8), 12, if (hot or expanded) t.fg else t.comment);
+    // one-line preview of the thinking, after the label, clipped to leave room for the view/hide affordance
+    const first = firstLine(preview);
+    if (first.len > 0) {
+        const lw: f32 = @floatFromInt(t.measure(lbl, 12));
+        const px = r.x + 16 + lw + 12;
+        const pmax: i32 = @intFromFloat(@max(20, (r.x + r.width - 42) - px));
+        t.textClip(first, @intFromFloat(px), @intFromFloat(y0 + 8), 12, t.comment, pmax);
+    }
     t.text(if (expanded) t.z("hide", .{}) else t.z("view", .{}), @intFromFloat(r.x + r.width - 34), @intFromFloat(y0 + 9), 10, if (hot) t.blue else t.comment);
     if (hot) t.wantCursor(.pointing_hand);
     return hot and rl.isMouseButtonPressed(.left);
+}
+
+/// The first non-empty line of `s`, trimmed — the reasoning preview snippet.
+fn firstLine(s: []const u8) []const u8 {
+    var it = std.mem.splitScalar(u8, s, '\n');
+    while (it.next()) |ln| {
+        const t2 = std.mem.trim(u8, ln, " \r\t");
+        if (t2.len > 0) return t2;
+    }
+    return "";
 }
 
 /// A single clean 'the hive is working' status line in the chat flow while a cast runs, so the chat isn't dead
@@ -2439,6 +2464,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (ui.chat_scroll > max_scroll) ui.chat_scroll = max_scroll;
     if (ui.chat_scroll >= max_scroll - 1) ui.chat_follow = true;
 
+    // floating "scroll to bottom" (drawn after endScissorMode below): visible only while scrolled away from the
+    // bottom — follow force-re-arms at the bottom (the line above), so !chat_follow IS "away from bottom".
+    const show_jump = !ui.chat_follow;
+    const jump_r = t.Rect{ .x = view.x + view.width - 40, .y = view.y + view.height - 40, .width = 28, .height = 28 };
+
     rl.beginScissorMode(@intFromFloat(view.x + 1), @intFromFloat(view.y + 1), @intFromFloat(view.width - 2), @intFromFloat(view.height - 2));
     sel_line_n = 0; // rebuild this frame's selection line-geometry as we draw
     var yy: f32 = view.y + 8 - ui.chat_scroll;
@@ -2466,7 +2496,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
                 if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
-            } else if (thoughtChip(view, y0, false)) {
+            } else if (thoughtChip(view, y0, false, m.textStr())) {
                 ui.tool_open = i;
             }
             continue;
@@ -2514,7 +2544,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // line geometry captured above. A plain click (no drag) clears the selection. Ctrl+C (handled in handleKeys)
     // copies sel_text. Gated on hovering the chat view + not on a tool/copy chip row.
     const mp = rl.getMousePosition();
-    if (t.hovering(view) and rl.isMouseButtonPressed(.left)) {
+    // (the jump button owns its press — a click on it must not also set an empty selection)
+    if (t.hovering(view) and rl.isMouseButtonPressed(.left) and !(show_jump and t.hovering(jump_r))) {
         if (selHit(mp.x, mp.y)) |h| {
             ui.sel_msg = h.msg;
             ui.sel_anchor = h.flat;
@@ -2532,19 +2563,29 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     drawSelection();
     rl.endScissorMode();
 
-    // status line
-    var sy = view.y + view.height + 4;
-    if (busy) {
-        const dots: usize = @intFromFloat(@mod(rl.getTime() * 2.5, 4.0));
-        const dstr = [_][]const u8{ "", ".", "..", "..." };
-        t.text(t.z("{s}{s}", .{ if (status.len > 0) status else "working", dstr[dots] }), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.cyan);
-    } else if (status.len > 0) {
-        t.text(t.zs(status), @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment);
+    // floating "scroll to bottom": small, minimal, semi-transparent — only while scrolled away from the bottom.
+    // Drawn OUTSIDE the scissor so it floats above the messages; click snaps to the bottom + re-arms sticky
+    // follow (line ~2441 keeps it pinned as new frames stream in).
+    if (show_jump) {
+        const jhot = t.hovering(jump_r);
+        rl.drawRectangleRounded(jump_r, 1.0, 12, t.withAlpha(if (jhot) t.bg_sel else t.bg_hl, if (jhot) 235 else 170));
+        rl.drawRectangleRoundedLinesEx(jump_r, 1.0, 12, 1.0, t.withAlpha(if (jhot) t.blue else t.border, 200));
+        const g = t.z("v", .{});
+        const gw: f32 = @floatFromInt(t.measure(g, 14));
+        t.text(g, @intFromFloat(jump_r.x + (jump_r.width - gw) / 2), @intFromFloat(jump_r.y + (jump_r.height - 14) / 2 - 1), 14, if (jhot) t.fg else t.fg_dim);
+        if (jhot) {
+            t.wantCursor(.pointing_hand);
+            if (rl.isMouseButtonPressed(.left)) {
+                ui.chat_follow = true; // sticky follow re-armed; takes visual effect next frame (immediate-mode)
+                ui.chat_scroll = max_scroll;
+            }
+        }
     }
-    // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
-    // 12-step cap). Plain clickable label — no button chrome; the TEXT alone turns green when engaged.
-    // DOUBLE-CLICK escalates to the THIRD TIER, auto-loop-afk (orange): the loop NEVER backs itself out —
-    // no DONE, no failure, no cap, no cast pause ends it; it runs until the user clicks it off or hits Stop.
+
+    // status line — CLIPPED to leave room for the auto-loop label at the right (a long "subtask 5/6 (inline): ..."
+    // status used to run under/over the toggle). The auto-loop label geometry is computed FIRST so the clip width
+    // subtracts it; both sit on the same status row.
+    var sy = view.y + view.height + 4;
     const loop_state = blk: {
         store.lock();
         defer store.unlock();
@@ -2554,6 +2595,20 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const loop_on = loop_state[0] or afk_on;
     const ltxt: [:0]const u8 = if (afk_on) t.z("auto-loop: afk", .{}) else if (loop_on) t.z("auto-loop: on", .{}) else t.z("auto-loop: off", .{});
     const ltw: f32 = @floatFromInt(t.measure(ltxt, 12));
+    const status_clip_w: i32 = @intFromFloat(@max(60, r.width - ltw - 24)); // never overlap the auto-loop label
+    if (busy) {
+        const dots: usize = @intFromFloat(@mod(rl.getTime() * 2.5, 4.0));
+        const dstr = [_][]const u8{ "", ".", "..", "..." };
+        var sb: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&sb, "{s}{s}", .{ if (status.len > 0) status else "working", dstr[dots] }) catch "working";
+        t.textClip(line, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.cyan, status_clip_w);
+    } else if (status.len > 0) {
+        t.textClip(status, @intFromFloat(r.x + 4), @intFromFloat(sy), 12, t.comment, status_clip_w);
+    }
+    // AUTO-LOOP toggle (full-auto: the AI writes + sends its own next message toward the goal until DONE or the
+    // 12-step cap). Plain clickable label — no button chrome; the TEXT alone turns green when engaged.
+    // DOUBLE-CLICK escalates to the THIRD TIER, auto-loop-afk (orange): the loop NEVER backs itself out —
+    // no DONE, no failure, no cap, no cast pause ends it; it runs until the user clicks it off or hits Stop.
     const ltog = t.Rect{ .x = r.x + r.width - ltw - 8, .y = sy - 3, .width = ltw + 10, .height = 17 };
     const lhot = t.hovering(ltog);
     t.text(ltxt, @intFromFloat(ltog.x + 3), @intFromFloat(sy), 12, if (afk_on) t.orange else if (loop_on) t.green else if (lhot) t.fg_dim else t.comment);
@@ -2615,21 +2670,30 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
     // deriving y/height from input_h keeps the two aligned even if the row height changes later.
     const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
-    // While a turn is generating (or auto-loop is driving), the send button becomes a red STOP that aborts the
-    // in-flight turn + halts auto-loop, so the user can always take back control.
+    // While a turn is generating (or auto-loop is driving), the send column offers control. For a SERVER turn
+    // (steerable) it SPLITS into two stacked buttons — POST (blue: send the typed text as a live steer the running
+    // turn folds in) over STOP (red: abort + halt auto-loop). This makes steering an explicit, discoverable action
+    // (the old invisible Enter-to-steer read as "steering does not work"). A local-engine turn has no steer sink,
+    // so it shows Stop alone.
     if (busy or loop_on) {
-        if (t.buttonSolid(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
-        // POST-TO-STEER: while a SERVER turn is running, Enter sends the typed text as a LIVE steer — the server turn
-        // reads it between steps and folds it in. Gated on chat_server_turn so a local-loop turn doesn't clear +
-        // discard the user's text (there's no local steer sink); the Stop button still aborts either way.
-        if (store.chat_server_turn) {
-            const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
-            const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
-            if (ui.c_input.len > 0 and ui.focus == .c_input and enter) {
+        const server_steerable = store.chat_server_turn;
+        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+        const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift and ui.focus == .c_input;
+        if (server_steerable) {
+            const g: f32 = 6;
+            const bh = (input_h - g) / 2;
+            const postb = t.Rect{ .x = sendb.x, .y = sy, .width = send_w, .height = bh };
+            const stopb = t.Rect{ .x = sendb.x, .y = sy + bh + g, .width = send_w, .height = bh };
+            const can_post = ui.c_input.len > 0;
+            const post_click = t.buttonSolid(postb, t.z("Post", .{}), t.blue, can_post);
+            if (t.buttonSolid(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
+            if (can_post and (post_click or enter)) {
                 store.pushChatCmd(store_mod.mkChatCmd(.steer_turn, "", ui.c_input.str()));
                 ui.c_input.clear();
                 ui.chat_follow = true;
             }
+        } else {
+            if (t.buttonSolid(sendb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.stop_turn, "", ""));
         }
     } else {
         const can_send = ui.c_input.len > 0;
@@ -2910,7 +2974,7 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     }
 }
 
-fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev) void {
+fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.CastRow, tail: []const scan.Ev, plan: []const store_mod.PlanRow) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
         // collapsed rail: a status dot when a cast is live so the user knows to expand it
@@ -2932,13 +2996,50 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
 
     var yy: f32 = r.y + 40;
 
+    // ---- PLAN CHECKLIST: the ACTIVE conv's server plan-board, so plan progress is visible throughout the chat
+    // (not just in the plan message that scrolls away). Done/active/pending per subtask + a mini route tag. ----
+    if (plan.len > 0) {
+        var done_n: usize = 0;
+        for (plan) |*p| {
+            if (p.status == .done) done_n += 1;
+        }
+        t.text(t.z("plan {d}/{d}", .{ done_n, plan.len }), @intFromFloat(r.x + 12), @intFromFloat(yy), 11, t.comment);
+        yy += 18;
+        const max_rows: usize = 10; // cap so the cast card + console keep room; the tail count says what's hidden
+        const shown = @min(plan.len, max_rows);
+        for (plan[0..shown]) |*p| {
+            const pc = switch (p.status) {
+                .done => t.green,
+                .active => t.cyan,
+                .pending => t.comment,
+            };
+            t.statusDot(@intFromFloat(r.x + 16), @intFromFloat(yy + 8), pc);
+            const route = t.z("{s}", .{p.routeStr()});
+            const rc = if (std.mem.eql(u8, p.routeStr(), "hive")) t.blue else if (std.mem.eql(u8, p.routeStr(), "research")) t.magenta else t.fg_dim;
+            const rw: f32 = @floatFromInt(t.measureMono(route, 10));
+            t.textMono(route, @intFromFloat(r.x + r.width - rw - 10), @intFromFloat(yy + 3), 10, rc);
+            t.textClip(p.textStr(), @intFromFloat(r.x + 26), @intFromFloat(yy + 1), 12, if (p.status == .done) t.fg_dim else t.fg, @intFromFloat(r.width - 26 - rw - 20));
+            yy += 17;
+        }
+        if (plan.len > shown) {
+            t.text(t.z("+{d} more", .{plan.len - shown}), @intFromFloat(r.x + 26), @intFromFloat(yy + 1), 11, t.comment);
+            yy += 17;
+        }
+        t.hline(@intFromFloat(r.x + 8), @intFromFloat(yy + 6), @intFromFloat(r.width - 16), t.border);
+        yy += 14;
+    }
+
     if (casts.len == 0) {
-        t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
-        t.text(t.z("when a message needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment);
-        t.text(t.z("- research, current facts, web", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment);
-        t.text(t.z("- building or fixing code", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment);
-        t.text(t.z("the veil casts the hive and its", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment);
-        t.text(t.z("live progress appears here.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment);
+        if (plan.len == 0) {
+            t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 13, t.comment);
+            t.text(t.z("when a message needs real work", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 28), 11, t.comment);
+            t.text(t.z("- research, current facts, web", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 44), 11, t.comment);
+            t.text(t.z("- building or fixing code", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 60), 11, t.comment);
+            t.text(t.z("the veil casts the hive and its", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 84), 11, t.comment);
+            t.text(t.z("live progress appears here.", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 100), 11, t.comment);
+        } else {
+            t.text(t.z("no casts yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(yy + 6), 11, t.comment);
+        }
         return;
     }
 

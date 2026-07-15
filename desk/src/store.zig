@@ -202,6 +202,26 @@ pub const CastRow = struct {
     }
 };
 
+pub const PlanStatus = enum(u8) { pending, active, done };
+
+/// One subtask of the ACTIVE conversation's server plan-board ({conv}/plan.jsonl), for the right-hand activity
+/// pane's checklist. Chat thread writes (watchPlan), UI reads — the same one-writer/one-reader discipline as casts.
+pub const PlanRow = struct {
+    text: [160]u8 = [_]u8{0} ** 160,
+    text_len: u8 = 0,
+    route: [12]u8 = [_]u8{0} ** 12, // "hive" | "research" | "inline"
+    route_len: u8 = 0,
+    status: PlanStatus = .pending,
+
+    pub fn textStr(p: *const PlanRow) []const u8 {
+        return p.text[0..p.text_len];
+    }
+    pub fn routeStr(p: *const PlanRow) []const u8 {
+        return p.route[0..p.route_len];
+    }
+};
+pub const MAX_PLAN = 32; // == the server plan-board's MAX_TASKS cap
+
 pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
@@ -352,6 +372,8 @@ pub const Store = struct {
     cast_count: usize = 0,
     cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast
     cast_tail_count: usize = 0,
+    plan: [MAX_PLAN]PlanRow = undefined, // the ACTIVE conv's plan-board checklist (chat watchPlan writes, UI reads)
+    plan_count: usize = 0,
     // per-turn chat performance ring (chat worker appends, Metrics tab reads)
     turn_metrics: [METRIC_RING]TurnMetric = undefined,
     turn_metric_count: usize = 0, // total turns recorded (may exceed the ring; @min with METRIC_RING to iterate)
