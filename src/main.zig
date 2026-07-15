@@ -21,6 +21,7 @@ const tail_fanout = @import("worker/control/fanout.zig");
 const control_writer = @import("worker/control/writer.zig");
 const chat_tools = @import("worker/chat/tools.zig");
 const chat_service = @import("worker/chat/service.zig");
+const sched = @import("worker/sched.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
@@ -194,6 +195,11 @@ pub fn main(init: std.process.Init) !void {
     else
         false;
     var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys };
+    // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
+    // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
+    // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
+    // main's stack for the life of the process (listen() below never returns in normal operation).
+    if (std.Thread.spawn(.{}, sched.bgLoop, .{&app})) |t| t.detach() else |_| {}
     std.debug.print("billing: {s} (NL_PRODUCTION)\n", .{if (production) "PRODUCTION — non-admins metered by neuron plan" else "BETA — unmetered full use"});
     if (!open_reg) std.debug.print("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups\n", .{});
     if (cf_account.len > 0 and wai_token.len > 0) std.debug.print("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint\n", .{}) else std.debug.print("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)\n", .{});
@@ -266,6 +272,11 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
     router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
     router.post("/api/v1/chat/convs/:id/control", chat_service.chatControl, .{});
+    router.get("/api/v1/sched", sched.listTasks, .{});
+    router.post("/api/v1/sched", sched.createTask, .{});
+    router.post("/api/v1/sched/:id", sched.updateTask, .{});
+    router.delete("/api/v1/sched/:id", sched.deleteTask, .{});
+    router.post("/api/v1/sched/:id/run", sched.runTaskNow, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
