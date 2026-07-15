@@ -1422,7 +1422,7 @@ pub const Chat = struct {
     }
 
     /// Render ONE server event frame line. Frames are one flat JSON object per line, keyed by "kind" (see
-    /// src/orchestrate/chat_engine.zig): token/reasoning (streamed deltas → the live preview) | message (the
+    /// src/worker/chat/engine.zig): token/reasoning (streamed deltas → the live preview) | message (the
     /// authoritative final reply, seals the stream) | tool | status | error | done.
     fn renderScFrame(self: *Chat, dd: []const u8, line_raw: []const u8) void {
         const line = std.mem.trim(u8, line_raw, " \r\n\t");

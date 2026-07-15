@@ -5,9 +5,9 @@ const builtin = @import("builtin");
 const httpz = @import("httpz");
 
 const NEURON_EXE = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
-const Neuron = @import("orchestrate/neuron_client.zig").Neuron;
+const Neuron = @import("worker/neuron/client.zig").Neuron;
 const Auth = @import("auth/auth_core.zig").Auth;
-const Supervisor = @import("orchestrate/supervisor.zig").Supervisor;
+const Supervisor = @import("worker/control/supervisor.zig").Supervisor;
 const crypto = @import("config/key_vault.zig");
 const KeyVault = crypto.KeyVault;
 const AuditLog = @import("obs/audit_log.zig").AuditLog;
@@ -16,11 +16,11 @@ const http = @import("gateway/http.zig");
 const App = http.App;
 
 const auth_api = @import("auth/auth_api.zig");
-const deploy_service = @import("orchestrate/deploy_service.zig");
-const tail_fanout = @import("orchestrate/tail_fanout.zig");
-const control_writer = @import("orchestrate/control_writer.zig");
-const chat_tools = @import("orchestrate/chat_tools.zig");
-const chat_service = @import("orchestrate/chat_service.zig");
+const deploy_service = @import("worker/deploy/service.zig");
+const tail_fanout = @import("worker/control/fanout.zig");
+const control_writer = @import("worker/control/writer.zig");
+const chat_tools = @import("worker/chat/tools.zig");
+const chat_service = @import("worker/chat/service.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");

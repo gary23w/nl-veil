@@ -1,7 +1,7 @@
 //! AES-256-GCM at-rest sealing + a write-only BYOK key vault. The seal/open primitives protect per-swarm
 
 const std = @import("std");
-const Neuron = @import("../orchestrate/neuron_client.zig").Neuron;
+const Neuron = @import("../worker/neuron/client.zig").Neuron;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const NL = Aes256Gcm.nonce_length;
 const TL = Aes256Gcm.tag_length;

@@ -1,7 +1,7 @@
 //! API keys — programmatic auth for the public API (alongside the session cookie the SPA uses). A user mints a key
 
 const std = @import("std");
-const Neuron = @import("../orchestrate/neuron_client.zig").Neuron;
+const Neuron = @import("../worker/neuron/client.zig").Neuron;
 
 pub const PREFIX = "nlk_";
 

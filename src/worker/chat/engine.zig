@@ -16,13 +16,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const http = @import("../gateway/http.zig");
-const tools = @import("../worker/tools.zig");
-const osc = @import("../worker/oscillation.zig");
-const llm = @import("../worker/llm.zig");
-const cctx = @import("chat_context.zig");
-const cplan = @import("chat_plan.zig");
-const deploy_service = @import("deploy_service.zig");
+const http = @import("../../gateway/http.zig");
+const tools = @import("../tools.zig");
+const osc = @import("../oscillation.zig");
+const llm = @import("../llm.zig");
+const cctx = @import("context.zig");
+const cplan = @import("plan.zig");
+const deploy_service = @import("../deploy/service.zig");
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
 // (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.

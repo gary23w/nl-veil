@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const httpz = @import("httpz");
-const http = @import("../gateway/http.zig");
+const http = @import("../../gateway/http.zig");
 const App = http.App;
 const requireUser = http.requireUser;
 const badReq = http.badReq;

@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const crypto = @import("../config/key_vault.zig");
-const NeuronLedger = @import("../plan/neurons.zig").NeuronLedger;
+const crypto = @import("../../config/key_vault.zig");
+const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
 
 // Native process liveness/termination — NO subprocess. tasklist/taskkill spawned a child process ON THE
 // httpz REQUEST THREAD for every reconcile-probe and every kill; under load those spawns starve the worker

@@ -1,7 +1,7 @@
 //! Auth — register / login / sessions, with neuron-db as the durable store (dogfooded) and an in-memory
 
 const std = @import("std");
-const Neuron = @import("../orchestrate/neuron_client.zig").Neuron;
+const Neuron = @import("../worker/neuron/client.zig").Neuron;
 
 pub const Plan = @import("../plan/entitlements.zig").Plan;
 

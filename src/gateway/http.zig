@@ -6,7 +6,7 @@ const auth_core = @import("../auth/auth_core.zig");
 
 pub const Auth = auth_core.Auth;
 pub const User = auth_core.User;
-pub const Supervisor = @import("../orchestrate/supervisor.zig").Supervisor;
+pub const Supervisor = @import("../worker/control/supervisor.zig").Supervisor;
 pub const AuditLog = @import("../obs/audit_log.zig").AuditLog;
 pub const LoginGuard = @import("../auth/login_guard.zig").LoginGuard;
 pub const KeyVault = @import("../config/key_vault.zig").KeyVault;
