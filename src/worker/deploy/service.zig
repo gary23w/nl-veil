@@ -541,10 +541,7 @@ pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         std.mem.eql(u8, body.provider, "workers-ai") or std.mem.eql(u8, body.provider, "cloudflare");
     const has_key = app.vault.has(u.id, body.provider);
     const blocked: ?[]const u8 =
-        if (minds > e.per_swarm_minds) "exceeds this plan's minds-per-swarm"
-        else if (live + minds > e.max_minds) "would exceed your live-mind limit"
-        else if (active >= e.max_swarms) "concurrent-swarm limit reached"
-        else null;
+        if (minds > e.per_swarm_minds) "exceeds this plan's minds-per-swarm" else if (live + minds > e.max_minds) "would exceed your live-mind limit" else if (active >= e.max_swarms) "concurrent-swarm limit reached" else null;
     const ns: neurons.Status = if (app.ledger) |l| l.status(u.id, u.plan) else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
     const out_of_neurons = http.metered(app, u) and ns.balance <= 0;
     try res.json(.{

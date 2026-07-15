@@ -3958,15 +3958,15 @@ pub const Chat = struct {
                     if (std.mem.eql(u8, lt.name, "kill_swarm") and !userWantsKill(self.last_user[0..self.last_user_len])) break :blk_loose null;
                     break :blk_loose lt;
                 } else null) orelse toolCallFenced(full) orelse toolCallJsonInferred(full) orelse blk_nr: {
-                    // NATURAL-LANGUAGE READ: `read_file <path> [start_line N] [end_line M]` with no JSON/XML/fence —
-                    // deepseek drops to this bare form and it never dispatched, so the model re-announced the read
-                    // forever (the c6a54da12 stall). read_file is NON-DESTRUCTIVE, so recover it even ungated. OWNED.
-                    if (naturalReadCall(self.gpa, full)) |nc| {
-                        synth_args = @constCast(nc.args);
-                        break :blk_nr ToolCall{ .name = nc.name, .args = nc.args };
-                    }
-                    break :blk_nr null;
-                } orelse blk: {
+                // NATURAL-LANGUAGE READ: `read_file <path> [start_line N] [end_line M]` with no JSON/XML/fence —
+                // deepseek drops to this bare form and it never dispatched, so the model re-announced the read
+                // forever (the c6a54da12 stall). read_file is NON-DESTRUCTIVE, so recover it even ungated. OWNED.
+                if (naturalReadCall(self.gpa, full)) |nc| {
+                    synth_args = @constCast(nc.args);
+                    break :blk_nr ToolCall{ .name = nc.name, .args = nc.args };
+                }
+                break :blk_nr null;
+            } orelse blk: {
                 // observed live: "cast a swarm to finish the two-page site" answered with a pasted
                 // index.html, this rescue synthesized a write_file, and the veil silently self-built
                 // for the rest of the arc while the hive never existed — the cast recovery owns this
@@ -6506,8 +6506,8 @@ fn knownChatTool(name: []const u8) bool {
     const names = [_][]const u8{
         "list_swarms", "stop_swarm", "kill_swarm",  "swarm_status", "swarm_findings", "web_search",
         "web_fetch",   "fetch_json", "recall_hive", "observe",      "write_file",     "edit_file",
-        "read_file",   "list_dir",   "run_tests",   "run_python",   "delete_file",
-        "git_status",  "git_commit", "git_push",    "git_log",      "repo_create",
+        "read_file",   "list_dir",   "run_tests",   "run_python",   "delete_file",    "git_status",
+        "git_commit",  "git_push",   "git_log",     "repo_create",
     };
     for (names) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;
@@ -7496,7 +7496,7 @@ fn looksLikeFailedToolCall(text: []const u8) bool {
         "\u{FF5C}tool", "tool\u{FF5C}", "tool_calls>", "tool_call>", "invoke name=", "function_calls>", "antml:invoke",
         // square-bracket render-label dialect: reached only when toolCallBracket/runCall did NOT dispatch (an
         // unknown/garbled bracketed name), so flagging it turns a silent leak into one corrective retry.
-        "[tool:", "[TOOL:", "[RUN:",
+        "[tool:",       "[TOOL:",       "[RUN:",
     };
     for (markers) |m| if (std.mem.indexOf(u8, text, m) != null) return true;
     return false;
@@ -8869,11 +8869,9 @@ test "lessonRelevant: an executable match alone never surfaces a lesson (the 403
     // file ...") must not count as a second piece of evidence on top of the executable score — that
     // double-count let a pytest-cwd lesson ride in on an unrelated missing-file failure
     const pytest_lesson = "fix: `cd /d \"C:\\w\" && where pytest && python -c \"import pytest\"` failed (exit code 1) — works as: `cd /d \"C:\\w\" && python -m pytest minimal_test.py -v`";
-    try std.testing.expect(!lessonRelevant(pytest_lesson, "python missing_probe_xyz.py --check-auth",
-        "python: can't open file 'C:\\x\\missing_probe_xyz.py': [Errno 2] No such file or directory"));
+    try std.testing.expect(!lessonRelevant(pytest_lesson, "python missing_probe_xyz.py --check-auth", "python: can't open file 'C:\\x\\missing_probe_xyz.py': [Errno 2] No such file or directory"));
     // ...but a real shared token (the same script name in the error) still carries it over the bar
-    try std.testing.expect(lessonRelevant(pytest_lesson, "python -m pytest minimal_test.py",
-        "python: error collecting minimal_test.py"));
+    try std.testing.expect(lessonRelevant(pytest_lesson, "python -m pytest minimal_test.py", "python: error collecting minimal_test.py"));
 }
 
 test "stripWorkdirChdir removes stale build-dir cd prefixes, keeps the transferable command" {

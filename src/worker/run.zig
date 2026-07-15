@@ -848,7 +848,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 // AND being required to fetch a real primary source each round is what lets a publish cast clear
                 // the independent-source gate on its own, instead of leaning on the engine's seed retrieval.
                 "RESEARCH — take a distinct facet of the topic and go OUT to the live web: web_search to find leads, then read_url/fetch_json the ACTUAL pages (papers, journal/press sites, primary docs) to gather concrete facts, data, and quotes WITH their URLs. Every round fetch at least one NEW real source; form a view and note where you AGREE or DISAGREE with the hive. Your output is grounded, cited KNOWLEDGE — never files."
-            else LANES[i % LANES.len];
+            else
+                LANES[i % LANES.len];
         }
     }
 
@@ -8401,9 +8402,9 @@ fn isPlainWord(w: []const u8) bool {
 /// modifies ("game.js FOR the shooter", "util.js AND main.js"), so the token stays a deliverable.
 fn isStopWord(w: []const u8) bool {
     const sw = [_][]const u8{
-        "the", "a",  "an",  "and",  "or",  "nor",  "but",  "for", "in",   "to",  "with",
-        "of",  "on", "at",  "from", "into", "onto", "as",   "that","this", "it",  "its",
-        "is",  "are","be",  "then", "plus", "also", "by",   "that","which","who",
+        "the", "a",   "an", "and",  "or",   "nor",  "but", "for",  "in",    "to",  "with",
+        "of",  "on",  "at", "from", "into", "onto", "as",  "that", "this",  "it",  "its",
+        "is",  "are", "be", "then", "plus", "also", "by",  "that", "which", "who",
     };
     for (sw) |s| if (std.ascii.eqlIgnoreCase(w, s)) return true;
     return false;

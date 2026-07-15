@@ -228,7 +228,10 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
-    const loop_mode: u8 = switch (b.loop) { 0, 1, 2 => b.loop, else => 0 }; // only the known tiers; garbage → OFF (never the most-expensive afk tier)
+    const loop_mode: u8 = switch (b.loop) {
+        0, 1, 2 => b.loop,
+        else => 0,
+    }; // only the known tiers; garbage → OFF (never the most-expensive afk tier)
 
     // ONE in-flight turn per conversation. A turn does an unlocked read-modify-write of messages.jsonl / context.json
     // on a detached thread, so a second concurrent turn for the same conv would lost-update the durable log. Reject

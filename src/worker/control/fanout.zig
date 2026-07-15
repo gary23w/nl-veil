@@ -76,8 +76,7 @@ const winSleep = if (builtin.os.tag == .windows)
     struct {
         extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
     }.Sleep
-else
-    {};
+else {};
 
 fn tickSleep(io: std.Io) void {
     if (builtin.os.tag == .windows) {
