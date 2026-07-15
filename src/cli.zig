@@ -576,6 +576,8 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
 
 /// CLIENT MODE: the server delegated tool calls back to us. Run each with the shared executor (in this
 /// process, so file/shell/code act on the user's machine) and post the result so the blocked turn continues.
+/// Also materializes {kind:"file_sync"} frames — a finished hive's output pushed down so it exists HERE —
+/// in the same ordered pass, so a synced file always lands before the delegated tool that reads it.
 fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| {
@@ -583,6 +585,10 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
         if (ln.len == 0) continue;
         const kind = jsonStr(ctx.gpa, ln, "kind") orelse continue;
         defer ctx.gpa.free(kind);
+        if (std.mem.eql(u8, kind, "file_sync")) {
+            applyFileSync(ctx, ln);
+            continue;
+        }
         if (!std.mem.eql(u8, kind, "tool_request")) continue;
         const id = jsonStr(ctx.gpa, ln, "id") orelse continue;
         defer ctx.gpa.free(id);
@@ -595,6 +601,33 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
         defer ctx.gpa.free(result);
         postToolResult(ctx, conv, id, result);
     }
+}
+
+/// Write one server-pushed hive file into the CLI's workdir (the same "." the delegated tools run in).
+fn applyFileSync(ctx: *Ctx, line: []const u8) void {
+    const path = jsonStr(ctx.gpa, line, "path") orelse return;
+    defer ctx.gpa.free(path);
+    if (!safeSyncPath(path)) return;
+    const content = jsonStr(ctx.gpa, line, "content") orelse return;
+    defer ctx.gpa.free(content);
+    if (std.fs.path.dirname(path)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, parent, .default_dir) catch {};
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch return;
+    std.debug.print("  [synced {s} from the hive — {d}b]\n", .{ path, content.len });
+}
+
+/// A server-pushed file_sync path must stay INSIDE the workdir: relative, forward slashes only, no "."/".."
+/// segments, no drive letters or ADS colons. Twin of the desk's checker.
+fn safeSyncPath(p: []const u8) bool {
+    if (p.len == 0 or p.len > 400) return false;
+    if (p[0] == '/' or p[0] == '\\') return false;
+    if (std.mem.indexOfScalar(u8, p, ':') != null) return false;
+    if (std.mem.indexOfScalar(u8, p, '\\') != null) return false;
+    var it = std.mem.splitScalar(u8, p, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) return false;
+        if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return false;
+    }
+    return true;
 }
 
 /// POST the delegated tool's result back to the blocked server turn.
