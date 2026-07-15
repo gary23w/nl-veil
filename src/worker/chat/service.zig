@@ -224,6 +224,10 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // goal until DONE / no-progress / cap), 2=afk (persistent — never accept DONE, only Stop ends it). Absent =
         // 0. The server drive loop owns the loop now, so the desk stops running its own local loop for served convs.
         loop: u8 = 0,
+        // CLIENT MODE: a desk/CLI turn sets this so the brain DELEGATES tool calls back to the client's harness
+        // (file/shell/code run on the USER's machine) instead of executing in the server's sandbox. Absent =
+        // false ⇒ server-side execution, exactly as a hive/API turn runs today.
+        tool_client: bool = false,
     };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
@@ -261,11 +265,35 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, eff_base, eff_key, b.model, text, loop_mode);
+    chat_engine.spawnTurn(app, u.id, seg, eff_base, eff_key, b.model, text, loop_mode, b.tool_client);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
     try res.json(.{ .ok = true, .conv = seg, .turn = "running", .events_url = events_url }, .{});
+}
+
+/// POST /api/v1/chat/convs/:id/tool_result — a CLIENT-MODE turn delegated a tool to the client; the client runs
+/// it with its harness and posts the result here. Appended to tool_results.jsonl, which the blocked turn reads
+/// by call id and feeds back into the model. Body: {"id":"<call id>","result":"<tool output>"}.
+pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const id = req.param("id") orelse return badReq(res, "no id");
+    const seg = safeSeg(id);
+    if (seg.len == 0) return notFound(res);
+    const Body = struct { id: []const u8 = "", result: []const u8 = "" };
+    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    if (b.id.len == 0) return badReq(res, "tool call id required");
+    const dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg });
+    const path = try std.fmt.allocPrint(res.arena, "{s}/tool_results.jsonl", .{dir});
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(app.gpa);
+    try line.appendSlice(app.gpa, "{\"id\":");
+    try http.jstr(app.gpa, &line, b.id);
+    try line.appendSlice(app.gpa, ",\"result\":");
+    try http.jstr(app.gpa, &line, b.result);
+    try line.appendSlice(app.gpa, "}\n");
+    http.appendFile(app.io, app.gpa, path, line.items) catch return http.serverErr(res, "could not record tool result");
+    try res.json(.{ .ok = true }, .{});
 }
 
 /// POST /api/v1/chat/convs/:id/control — append a cooperative control op to the conv's control.jsonl. The running

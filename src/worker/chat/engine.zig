@@ -286,7 +286,7 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, loop: u8) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, loop: u8, tool_client: bool) void {
     const gpa = app.gpa;
 
     // ---- store + build paths (conv store under convs/, build tree under builds/ — same split as runMindTool) ----
@@ -302,6 +302,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
     const ctrl_cursor = controlLen(app, conv_dir);
+
+    // CLIENT-MODE: truncate the delegated-tool-results channel so this turn's readToolResult scan starts clean
+    // (results are keyed by call id, but resetting keeps the file from growing across a long conversation).
+    if (tool_client) {
+        if (std.fmt.allocPrint(gpa, "{s}/tool_results.jsonl", .{conv_dir})) |trp| {
+            defer gpa.free(trp);
+            std.Io.Dir.cwd().deleteFile(app.io, trp) catch {};
+        } else |_| {}
+    }
 
     // ---- record the user's message BEFORE anything else, so it's durable even if the LLM call dies ----
     appendMsg(app, conv_dir, "user", user_text, "user", nowSecs(app.io));
@@ -545,7 +554,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, tool_client);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -849,12 +858,13 @@ pub const TurnArgs = struct {
     model: []const u8,
     text: []const u8,
     loop: u8,
+    tool_client: bool,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text, args.loop);
+    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text, args.loop, args.tool_client);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     const gpa = args.app.gpa;
     gpa.free(args.blob);
@@ -866,20 +876,20 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8, loop: u8) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8, loop: u8, tool_client: bool) void {
     const gpa = app.gpa;
     const total = conv.len + base_url.len + key.len + model.len + text.len;
     // The caller (postMessage) already claimed the per-conv turn slot via tryBeginTurn; EVERY completion path here
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, base_url, key, model, text, loop);
+        runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
         endTurn(app.io, conv);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, base_url, key, model, text, loop);
+        runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
         endTurn(app.io, conv);
         return;
     };
@@ -898,7 +908,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, ke
     o += model.len;
     const tx = blob[o..][0..text.len];
     @memcpy(tx, text);
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx, .loop = loop };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx, .loop = loop, .tool_client = tool_client };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |t| {
         t.detach();
     } else |_| {
@@ -1534,6 +1544,56 @@ fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
     return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"answer_swarm\",\"note\":\"answer delivered to the mind's inbox; it reads it on its next round\"}") catch emptyRes();
 }
 
+/// CLIENT-MODE tool execution: emit a {kind:"tool_request"} frame and BLOCK the turn until the client posts
+/// the result back (POST .../tool_result → tool_results.jsonl). This is how a desk/CLI turn runs file/shell/
+/// code tools with ITS OWN harness on the user's machine while the brain stays server-side. Stop-checked and
+/// timed out so a disconnected client can't wedge the turn — a timeout returns an error the model then sees.
+fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u8, args: []const u8, ctrl_cursor: usize) []u8 {
+    const gpa = app.gpa;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    const built = blk: {
+        ev.appendSlice(gpa, "{\"kind\":\"tool_request\",\"id\":") catch break :blk false;
+        http.jstr(gpa, &ev, id) catch break :blk false;
+        ev.appendSlice(gpa, ",\"tool\":") catch break :blk false;
+        http.jstr(gpa, &ev, name) catch break :blk false;
+        ev.appendSlice(gpa, ",\"args\":") catch break :blk false;
+        http.jstr(gpa, &ev, args) catch break :blk false; // raw args JSON carried as a string; the client parses it
+        ev.append(gpa, '}') catch break :blk false;
+        break :blk true;
+    };
+    if (built) emitEvent(app, conv_dir, ev.items);
+
+    const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // a client run_python / long shell can take a while
+    const t0 = nowSecs(app.io);
+    while (nowSecs(app.io) - t0 < CLIENT_TOOL_TIMEOUT_S) {
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor))
+            return gpa.dupe(u8, "(stopped before the client returned a result)") catch emptyRes();
+        if (readToolResult(app, conv_dir, id)) |r| return r;
+        sleepMsRaw(app.io, 150);
+    }
+    return gpa.dupe(u8, "(the client did not return a result in time — is the desk/CLI still connected?)") catch emptyRes();
+}
+
+/// Scan tool_results.jsonl for the line whose "id" matches; return its "result" (gpa-owned) or null (not yet).
+fn readToolResult(app: *App, conv_dir: []const u8, id: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/tool_results.jsonl", .{conv_dir}) catch return null;
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(8 << 20)) catch return null;
+    defer gpa.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        const R = struct { id: []const u8 = "", result: []const u8 = "" };
+        const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (std.mem.eql(u8, p.value.id, id)) return gpa.dupe(u8, p.value.result) catch null;
+    }
+    return null;
+}
+
 fn runInnerAgentic(
     app: *App,
     uid: u64,
@@ -1547,6 +1607,7 @@ fn runInnerAgentic(
     ctx: *tools.ToolCtx,
     steer_cursor: *usize,
     tool_obs: *std.ArrayListUnmanaged([]u8),
+    tool_client: bool,
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -1701,8 +1762,11 @@ fn runInnerAgentic(
             }
             emitToolState(app, conv_dir, c.name, "start", "");
             // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
-            // via deploy_service + app.sup, NOT the mind-tool executor. Everything else falls through to tools.execute.
-            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args) orelse tools.execute(ctx, c.name, c.args);
+            // via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes as a mind tool:
+            // in CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code tools
+            // act on the USER's machine, not the server's sandbox; otherwise it runs here (a hive/server turn).
+            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args) orelse
+                (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
