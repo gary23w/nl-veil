@@ -4088,8 +4088,12 @@ pub const Chat = struct {
                 fencedShellCall(self.stream.content.items) != null;
             if (action_tail) self.draft_latched = false;
             self.store.stream_draft = self.turn == .reflect or self.draft_latched;
-            // show the TAIL of the reasoning if it exceeds the buffer (the newest thinking matters most)
-            const rsrc = self.stream.reasoning.items;
+            // show the TAIL of the reasoning if it exceeds the buffer (the newest thinking matters most).
+            // DE-FLAIL THE LIVE VIEW: a degenerating reasoning channel (one sentence looped dozens of times)
+            // otherwise fills the whole preview with the same line — commit-time already dedups (appendVeil),
+            // but the wall the user WATCHES is this buffer, so collapse it here too.
+            var live_db: [16384]u8 = undefined; // dedupSentences passes anything larger through verbatim — size for a long think
+            const rsrc = dedupSentences(self.stream.reasoning.items, &live_db);
             const rn = @min(rsrc.len, self.store.stream_reason.len);
             @memcpy(self.store.stream_reason[0..rn], rsrc[rsrc.len - rn ..]);
             self.store.stream_reason_len = rn;
