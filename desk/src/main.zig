@@ -46,7 +46,14 @@ fn writeCrashLine(msg: []const u8, ra: ?usize) void {
     // (lock-free VirtualAlloc, no shared state). A single writeFile runs inline — no pool thread is spawned.
     // Skip deinit: we abort in defaultPanic immediately after, so there's nothing to clean up.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = "data/desk-panic.log", .data = line }) catch {};
+    const io = threaded.io();
+    // The desk's cwd varies (repo root, zig-out/bin, Explorer double-click) and writeFile creates no parent
+    // dirs — a single hardcoded "data/..." path made every panic INVISIBLE from the wrong cwd (a live crash
+    // went undiagnosed for exactly this reason). Try each known data location, then the cwd itself.
+    for ([_][]const u8{ "data/desk-panic.log", "../data/desk-panic.log", "../../data/desk-panic.log", "desk-panic.log" }) |p| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = line }) catch continue;
+        return;
+    }
 }
 
 const WIN_W = 1220;
@@ -1344,8 +1351,10 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var convs: [store_mod.MAX_CONVS]store_mod.ConvRow = undefined;
     const conv_n = store.conv_count;
     @memcpy(convs[0..conv_n], store.convs[0..conv_n]);
-    var active: [32]u8 = undefined;
-    const active_n: usize = store.conv_active_len;
+    // sized FROM the store field (a stale [32] literal here missed the conv-id widening and made selecting
+    // any scheduled_* conversation an out-of-bounds render-thread panic — the click-to-view crash)
+    var active: @TypeOf(store.conv_active) = undefined;
+    const active_n: usize = @min(store.conv_active_len, active.len);
     @memcpy(active[0..active_n], store.conv_active[0..active_n]);
     var msgs: [store_mod.MAX_CHAT_MSGS]store_mod.ChatMsg = undefined;
     const msg_n = store.msg_count;

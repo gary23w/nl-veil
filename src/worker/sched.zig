@@ -57,6 +57,10 @@ fn validKind(k: []const u8) bool {
     return std.mem.eql(u8, k, "once") or std.mem.eql(u8, k, "every") or std.mem.eql(u8, k, "daily");
 }
 
+/// Interval ceiling: one year in minutes. Bounds `every_min * 60` (and the tool's in_min) safely inside i64 —
+/// no schedule anyone means outlasts it, and an absurd value can't overflow-panic the tick loop.
+pub const EVERY_MIN_MAX: i64 = 527040;
+
 // ---- small local twins of private helpers elsewhere (kept verbatim so behavior can never drift) -------------
 
 /// Sanitize an id into ONE safe path segment (alnum / - / _ only, no separators, no "..", bounded). Empty /
@@ -174,9 +178,10 @@ pub fn parseHm(hm: []const u8) ?Hm {
 pub fn computeNextDue(kind: []const u8, at: i64, every_min: i64, hm: []const u8, created: i64, last_run: i64, now: i64, tz_off: i64) i64 {
     if (std.mem.eql(u8, kind, "every")) {
         const base = if (last_run > 0) last_run else created;
-        // A garbled interval (hand-edited file; the API validates >= 1) clamps to 1 minute — the floor bounds a
-        // misconfigured task to at most one run per minute instead of one per scheduler tick.
-        const step = (if (every_min >= 1) every_min else 1) * 60;
+        // Clamp BOTH ways (hand-edited file; the API validates 1..EVERY_MIN_MAX): the floor bounds a garbled
+        // task to one run per minute; the CEILING keeps `every_min * 60` inside i64 — an absurd interval would
+        // otherwise overflow-panic the scheduler thread on every tick, killing scheduling for the whole server.
+        const step = std.math.clamp(every_min, 1, EVERY_MIN_MAX) * 60;
         return base + step;
     }
     if (std.mem.eql(u8, kind, "daily")) {
@@ -339,13 +344,20 @@ pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSp
     if (name.len == 0) return .{ .err = "name is required" };
     if (prompt.len == 0) return .{ .err = "prompt is required" };
     if (!validKind(s.kind)) return .{ .err = "kind must be \"once\", \"every\", or \"daily\"" };
-    if (std.mem.eql(u8, s.kind, "every") and s.every_min < 1) return .{ .err = "every_min must be >= 1" };
+    // ceiling as well as floor: every_min rides i64 math (every_min * 60) in computeNextDue — an absurd value
+    // from the API/tool would overflow the tick loop's arithmetic (a crash on every scheduler pass, forever).
+    if (std.mem.eql(u8, s.kind, "every") and (s.every_min < 1 or s.every_min > EVERY_MIN_MAX)) return .{ .err = "every_min must be between 1 and 527040 (one year)" };
     if (std.mem.eql(u8, s.kind, "daily") and parseHm(s.hm) == null) return .{ .err = "hm must be \"HH:MM\"" };
 
     const now = nowSecs(app.io);
     var idb: [64]u8 = undefined;
     var id = mintTaskId(&idb, name, now + localOffsetSecs());
     var idb2: [64]u8 = undefined;
+    // Collision probe + save under ONE lock hold: probing outside it was a TOCTOU — two same-second creates
+    // with the same slug both saw "no file", both minted the same id, and the second silently overwrote the
+    // first (the exact loss the random suffix exists to prevent).
+    sched_mtx.lockUncancelable(app.io);
+    defer sched_mtx.unlock(app.io);
     {
         const existing = std.fmt.allocPrint(alloc, "{s}/u{d}/_sched/{s}.json", .{ app.data, uid, id }) catch null;
         if (existing) |p| {
@@ -375,8 +387,6 @@ pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSp
         .model = s.model,
         .api_key = s.api_key,
     };
-    sched_mtx.lockUncancelable(app.io);
-    defer sched_mtx.unlock(app.io);
     if (!saveTask(app, alloc, uid, t)) return .{ .err = "could not write the task file" };
     return .{ .id = alloc.dupe(u8, id) catch return .{ .err = "out of memory" } };
 }
@@ -460,6 +470,12 @@ fn resolveProvider(app: *App, alloc: std.mem.Allocator, uid: u64, t: *const Task
 /// Returns the conv id (duped into `alloc`) or null when the turn could not start (that conv already has a
 /// live turn, or all 16 turn slots are busy). On null NOTHING is persisted — the task stays due and the next
 /// tick retries, so a busy engine delays a schedule rather than eating a run.
+///
+/// LOCKING: callers must NOT hold sched_mtx here. The spawn path can degrade to running the turn INLINE on
+/// this thread (spawnTurn's alloc-failure fallback), and a turn's model may call schedule_task — which takes
+/// sched_mtx. Held across the spawn, that is a self-deadlock on a non-reentrant mutex. launchRun instead
+/// takes the lock only around its own bookkeeping, RE-LOADING the task fresh so a concurrent update between
+/// the caller's read and the save is never clobbered.
 fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) ?[]const u8 {
     var cb: [64]u8 = undefined;
     const conv = convIdFor(&cb, t.id, now + localOffsetSecs());
@@ -490,14 +506,22 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // a stack buffer here) and owns releasing the turn slot on every completion path.
     chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
 
-    // Bookkeeping AFTER the spawn is committed. last_run = now first, so the "every" recompute re-anchors the
-    // interval to NOW (the catch-up policy: an overdue task runs once, never once per missed interval).
-    t.last_run = now;
-    t.runs += 1;
-    t.last_conv = alloc.dupe(u8, conv) catch t.last_conv;
-    t.next_due = computeNextDue(t.kind, t.at, t.every_min, t.hm, t.created, t.last_run, now, localOffsetSecs());
-    if (std.mem.eql(u8, t.kind, "once")) t.enabled = false; // a one-shot consumed itself
-    _ = saveTask(app, alloc, uid, t.*); // a failed save can double-fire later — visible + recoverable, unlike a lost run
+    // Bookkeeping AFTER the spawn is committed, under the sched lock with a FRESH re-load: a concurrent
+    // update (rename, toggle, prompt edit) between the caller's read and this save must not be clobbered by
+    // our stale copy. last_run = now first, so the "every" recompute re-anchors the interval to NOW (the
+    // catch-up policy: an overdue task runs once, never once per missed interval).
+    {
+        sched_mtx.lockUncancelable(app.io);
+        defer sched_mtx.unlock(app.io);
+        var fresh = loadTask(app, alloc, uid, t.id) orelse t.*;
+        fresh.last_run = now;
+        fresh.runs += 1;
+        fresh.last_conv = alloc.dupe(u8, conv) catch fresh.last_conv;
+        fresh.next_due = computeNextDue(fresh.kind, fresh.at, fresh.every_min, fresh.hm, fresh.created, fresh.last_run, now, localOffsetSecs());
+        if (std.mem.eql(u8, fresh.kind, "once")) fresh.enabled = false; // a one-shot consumed itself
+        _ = saveTask(app, alloc, uid, fresh); // a failed save can double-fire later — visible + recoverable, unlike a lost run
+        t.* = fresh;
+    }
     return alloc.dupe(u8, conv) catch null;
 }
 
@@ -549,11 +573,18 @@ fn tickUser(app: *App, arena: std.mem.Allocator, uid: u64, now: i64) void {
         const id = safeSeg(ent.name[0 .. ent.name.len - 5]);
         if (id.len == 0) continue; // stray/unsafe filename — never surface it into a conv id
         const id_dup = arena.dupe(u8, id) catch continue; // ent.name is only valid for this iteration step
-        // Lock per task, re-reading under the lock: an update/run-now handler may be rewriting this same file.
-        sched_mtx.lockUncancelable(app.io);
-        defer sched_mtx.unlock(app.io);
-        var t = loadTask(app, arena, uid, id_dup) orelse continue;
-        if (!t.enabled or t.next_due > now) continue;
+        // Read the task + due-check under the lock, then RELEASE before launching: launchRun must never run
+        // under sched_mtx (its spawn can degrade to an inline turn whose model calls schedule_task — a
+        // self-deadlock; see launchRun's LOCKING note). A racing run-now in the same minute is benign:
+        // both mint the same conv id and tryBeginTurn lets exactly one spawn.
+        var due: ?Task = null;
+        {
+            sched_mtx.lockUncancelable(app.io);
+            defer sched_mtx.unlock(app.io);
+            const t = loadTask(app, arena, uid, id_dup) orelse continue;
+            if (t.enabled and t.next_due <= now) due = t;
+        }
+        var t = due orelse continue;
         _ = launchRun(app, arena, uid, &t, now); // null = engine busy → task stays due, next tick retries
     }
 }
@@ -728,7 +759,7 @@ pub fn updateTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // Validate the FINAL shape, not just the touched fields — switching kind to "daily" must fail here unless
     // a parseable hm is stored (from this update or an earlier one), or the tick loop would inherit a task it
     // can only guess at.
-    if (std.mem.eql(u8, t.kind, "every") and t.every_min < 1) return badReq(res, "every_min must be >= 1 for kind \"every\"");
+    if (std.mem.eql(u8, t.kind, "every") and (t.every_min < 1 or t.every_min > EVERY_MIN_MAX)) return badReq(res, "every_min must be between 1 and 527040 (one year) for kind \"every\"");
     if (std.mem.eql(u8, t.kind, "daily") and parseHm(t.hm) == null) return badReq(res, "hm must be \"HH:MM\" for kind \"daily\"");
 
     if (sched_changed)
@@ -767,9 +798,14 @@ pub fn runTaskNow(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
 
-    sched_mtx.lockUncancelable(app.io);
-    defer sched_mtx.unlock(app.io);
-    var t = loadTask(app, res.arena, u.id, seg) orelse return notFound(res);
+    // Load under the lock, launch OUTSIDE it — launchRun must never run under sched_mtx (self-deadlock via
+    // the inline-spawn fallback + the turn's schedule_task tool; see launchRun's LOCKING note).
+    var t: Task = undefined;
+    {
+        sched_mtx.lockUncancelable(app.io);
+        defer sched_mtx.unlock(app.io);
+        t = loadTask(app, res.arena, u.id, seg) orelse return notFound(res);
+    }
     const conv = launchRun(app, res.arena, u.id, &t, nowSecs(app.io)) orelse {
         res.status = 409;
         return res.json(.{ .ok = false, .err = "a turn is already running for this task's conversation (or all turn slots are busy) — try again shortly" }, .{});

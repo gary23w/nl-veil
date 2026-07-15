@@ -944,7 +944,7 @@ fn jint(body: []const u8, key: []const u8) i32 {
     return if (any) v else 0;
 }
 
-var jstr_buf: [32]u8 = undefined;
+var jstr_buf: [128]u8 = undefined; // conv ids run to 64 bytes — a [32] buffer TRUNCATED run-now's minted conv id
 fn jstr(body: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [40]u8 = undefined;
     if (key.len + 3 > kbuf.len) return null;

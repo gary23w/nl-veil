@@ -4018,7 +4018,10 @@ fn clip(s: []const u8, n: usize) []const u8 {
     return if (s.len > n) s[0..n] else s;
 }
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
-    return gpa.dupe(u8, s) catch @constCast("error");
+    // OOM fallback must be ZERO-LENGTH: callers free any result with len > 0, and the old @constCast("error")
+    // handed them a 5-byte STATIC string — gpa.free on read-only data (an invalid free / UB) exactly when the
+    // allocator was already failing.
+    return gpa.dupe(u8, s) catch @constCast(s[0..0]);
 }
 
 /// ask_veil — the mind's question to the overseer. It never blocks. The question is appended to
