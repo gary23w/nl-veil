@@ -9862,6 +9862,7 @@ test "terminal verify: a build that reaches DONE gets one whole-build check; a n
     const ask = "build a 3-file site: dashboard + two games";
     chat.last_user_len = ask.len;
     @memcpy(chat.last_user[0..ask.len], ask);
+    store.msgs[0] = .{}; // msgs is undefined storage — claiming a slot without writing it leaves 0xaa in text_len, and the verify-note scan below reads every slot
     store.msg_count = 1;
     store.chat_loop = true;
 
@@ -9934,6 +9935,7 @@ test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settl
     const ask = "build a tiny two-page site: index.html and about.html";
     chat.last_user_len = ask.len;
     @memcpy(chat.last_user[0..ask.len], ask);
+    store.msgs[0] = .{}; // msgs is undefined storage — initialize the slot the count claims
     store.msg_count = 1; // maybeLoop needs something to continue from
 
     // (1) the chain WROTE a file earlier (arc_acted), then settled on prose announcing the next one
@@ -10004,6 +10006,7 @@ test "auto-loop-afk: the third tier never backs itself out — idle settles, DON
     const ask = "build a tiny two-page site: index.html and about.html";
     chat.last_user_len = ask.len;
     @memcpy(chat.last_user[0..ask.len], ask);
+    store.msgs[0] = .{}; // msgs is undefined storage — initialize the slot the count claims
     store.msg_count = 1;
     store.chat_loop = true;
     store.chat_loop_afk = true;
