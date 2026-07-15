@@ -786,6 +786,22 @@ pub const DeltaKind = enum { content, reasoning };
 
 const STREAM_STAT = "\n__VEILSTAT__"; // curl -w appends this + the 3-digit HTTP code once the transfer ends
 
+/// A hosted (OpenAI/DeepSeek) SSE tool call assembled across streamed deltas. The first delta for an `index`
+/// carries id + function.name (+ maybe an args head); later deltas append raw fragments to `args`. Assembling
+/// these lets a hosted tool-calling step return its call(s) FROM THE STREAM instead of throwing the whole
+/// streamed generation away and paying a second complete() inference to reparse.
+const ToolAccum = struct {
+    index: i64,
+    id: std.ArrayListUnmanaged(u8) = .empty,
+    name: std.ArrayListUnmanaged(u8) = .empty,
+    args: std.ArrayListUnmanaged(u8) = .empty,
+    fn deinit(a: *ToolAccum, gpa: std.mem.Allocator) void {
+        a.id.deinit(gpa);
+        a.name.deinit(gpa);
+        a.args.deinit(gpa);
+    }
+};
+
 const StreamState = struct {
     native: bool,
     ctx: *anyopaque,
@@ -794,6 +810,7 @@ const StreamState = struct {
     reasoning: std.ArrayListUnmanaged(u8) = .empty,
     carry: std.ArrayListUnmanaged(u8) = .empty, // partial trailing line held between polls
     tool_line: std.ArrayListUnmanaged(u8) = .empty, // the native NDJSON line that carried tool_calls (owned)
+    tool_accum: std.ArrayListUnmanaged(ToolAccum) = .empty, // hosted SSE tool calls assembled by index (see ToolAccum)
     saw_tool_calls: bool = false,
     truncated: bool = false,
     failed: bool = false,
@@ -808,6 +825,21 @@ const StreamState = struct {
         st.reasoning.deinit(gpa);
         st.carry.deinit(gpa);
         st.tool_line.deinit(gpa);
+        for (st.tool_accum.items) |*a| a.deinit(gpa);
+        st.tool_accum.deinit(gpa);
+    }
+    /// Merge one streamed hosted tool-call fragment (from an SSE delta) into the accumulator, keyed by `index`.
+    fn accumToolCall(st: *StreamState, gpa: std.mem.Allocator, index: i64, id: ?[]const u8, name: ?[]const u8, args: ?[]const u8) void {
+        st.saw_tool_calls = true;
+        var slot: *ToolAccum = for (st.tool_accum.items) |*a| {
+            if (a.index == index) break a;
+        } else blk: {
+            st.tool_accum.append(gpa, .{ .index = index }) catch return;
+            break :blk &st.tool_accum.items[st.tool_accum.items.len - 1];
+        };
+        if (id) |v| if (v.len > 0 and slot.id.items.len == 0) slot.id.appendSlice(gpa, v) catch {};
+        if (name) |v| if (v.len > 0 and slot.name.items.len == 0) slot.name.appendSlice(gpa, v) catch {};
+        if (args) |v| slot.args.appendSlice(gpa, v) catch {};
     }
     /// Emit one non-empty delta (borrowed — the callback copies it) and accumulate it.
     fn fire(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
@@ -929,7 +961,13 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
                 content: ?[]const u8 = null,
                 reasoning: ?[]const u8 = null,
                 reasoning_content: ?[]const u8 = null,
-                tool_calls: ?[]const std.json.Value = null,
+                // Streamed hosted tool calls arrive as fragments: the first for an `index` carries id + name,
+                // later ones append raw `arguments` string pieces. Typed so we can ASSEMBLE (not just flag) them.
+                tool_calls: ?[]const struct {
+                    index: i64 = 0,
+                    id: ?[]const u8 = null,
+                    function: ?struct { name: ?[]const u8 = null, arguments: ?[]const u8 = null } = null,
+                } = null,
             } = null,
             finish_reason: ?[]const u8 = null,
         } = &.{},
@@ -953,7 +991,11 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
             if (d.reasoning_content) |r| st.fire(gpa, .reasoning, r);
             if (d.content) |c| st.fire(gpa, .content, c);
             if (d.tool_calls) |tcs| {
-                if (tcs.len > 0) st.saw_tool_calls = true;
+                for (tcs) |tc| {
+                    const fname = if (tc.function) |f| f.name else null;
+                    const fargs = if (tc.function) |f| f.arguments else null;
+                    st.accumToolCall(gpa, tc.index, tc.id, fname, fargs);
+                }
             }
         }
         if (ch.finish_reason) |fr| {
@@ -1010,6 +1052,40 @@ fn freeCalls(gpa: std.mem.Allocator, calls: []ToolCall) void {
         gpa.free(c.args);
     }
     gpa.free(calls);
+}
+
+/// Build ToolCall[] from the hosted SSE fragments assembled in st.tool_accum (see ToolAccum) — the streaming twin
+/// of completeBody's tool_calls parse. A fragment with no function name is dropped (unusable); empty arguments
+/// become "{}". Owned slice (freeCalls to release); empty on none, so streamAttempt falls back to complete() to
+/// reparse authoritatively. Mirrors completeBody: id + name + args carried through verbatim (id matters for the
+/// hosted tool-result correlation the agentic loop builds).
+fn reconstructSseToolCalls(gpa: std.mem.Allocator, st: *const StreamState) []ToolCall {
+    var calls: std.ArrayListUnmanaged(ToolCall) = .empty;
+    for (st.tool_accum.items) |a| {
+        if (a.name.items.len == 0) continue; // no function name → not a usable call
+        const args_src = if (a.args.items.len > 0) a.args.items else "{}";
+        // The streamed path TRUSTS these bytes (unlike the old flow, which re-parsed via complete()), so validate
+        // the assembled arguments are WELL-FORMED JSON. A garbled assembly — e.g. a non-spec provider that omits
+        // `index` and folds two parallel calls onto one slot, concatenating their args into invalid JSON — is
+        // dropped, so the step falls back to complete() to reparse rather than executing a tool with corrupt args.
+        if (!(std.json.validate(gpa, args_src) catch false)) continue;
+        const args = gpa.dupe(u8, args_src) catch continue;
+        const name = gpa.dupe(u8, a.name.items) catch {
+            gpa.free(args);
+            continue;
+        };
+        const id = gpa.dupe(u8, a.id.items) catch {
+            gpa.free(args);
+            gpa.free(name);
+            continue;
+        };
+        calls.append(gpa, .{ .id = id, .name = name, .args = args }) catch {
+            gpa.free(args);
+            gpa.free(name);
+            gpa.free(id);
+        };
+    }
+    return calls.toOwnedSlice(gpa) catch &.{};
 }
 
 /// Fold a streamed step's token counts into the process meters — the SAME local/hosted split completeBody
@@ -1267,24 +1343,25 @@ fn streamAttempt(
     if (st.failed) return null; // an error line — let complete() surface the exact error
 
     if (st.saw_tool_calls) {
-        if (native) {
-            const calls = parseNativeToolCalls(gpa, st.tool_line.items);
-            if (calls.len > 0) {
-                const c_owned = gpa.dupe(u8, st.content.items) catch {
-                    freeCalls(gpa, calls);
-                    return null;
-                };
-                const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
-                    gpa.free(c_owned);
-                    freeCalls(gpa, calls);
-                    return null;
-                };
-                meterStream(&st, local);
-                return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
-            }
-            freeCalls(gpa, calls); // couldn't reconstruct — fall through to complete()
+        // Assemble the call(s) FROM THE STREAM — native from the single captured NDJSON line, hosted from the
+        // per-index SSE fragments (ToolAccum). Returning them here is what avoids the second complete() inference
+        // that every hosted tool-calling step used to pay (it re-ran the whole generation just to reparse the call).
+        const calls = if (native) parseNativeToolCalls(gpa, st.tool_line.items) else reconstructSseToolCalls(gpa, &st);
+        if (calls.len > 0) {
+            const c_owned = gpa.dupe(u8, st.content.items) catch {
+                freeCalls(gpa, calls);
+                return null;
+            };
+            const r_owned = gpa.dupe(u8, st.reasoning.items) catch {
+                gpa.free(c_owned);
+                freeCalls(gpa, calls);
+                return null;
+            };
+            meterStream(&st, local);
+            return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
         }
-        return null; // hosted SSE tool-call fragments (or a native miss): complete() reparses cleanly
+        freeCalls(gpa, calls); // couldn't reconstruct (native miss, or hosted fragments with no usable name) → complete()
+        return null;
     }
 
     if (st.content.items.len == 0 and st.reasoning.items.len == 0) return null; // nothing streamed → complete()
@@ -1648,4 +1725,47 @@ test "completeStream native parser: content-only reply accumulates and done:true
     try std.testing.expect(st.done and !st.failed and !st.saw_tool_calls);
     try std.testing.expectEqualStrings("Hi there", st.content.items);
     try std.testing.expectEqualStrings("Hi there", cap.content.items);
+}
+
+test "completeStream SSE parser: hosted tool_calls assemble from streamed fragments (no complete() re-run)" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    // call 0 (web_search): id+name+empty args, then arguments in TWO fragments ({\"q\": | \"x\"}); one SSE line is
+    // split mid-way across two feeds to exercise the partial-line carry. call 1 (read_file): whole. Then finish+DONE.
+    feedStream(&st, gpa, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"web_search\",\"arguments\":\"\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"argum");
+    try std.testing.expect(st.saw_tool_calls);
+    feedStream(&st, gpa, "ents\":\"\\\"x\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n");
+    try std.testing.expect(st.done and !st.failed and st.saw_tool_calls);
+
+    const calls = reconstructSseToolCalls(gpa, &st);
+    defer freeCalls(gpa, calls);
+    try std.testing.expectEqual(@as(usize, 2), calls.len);
+    try std.testing.expectEqualStrings("web_search", calls[0].name);
+    try std.testing.expectEqualStrings("call_a", calls[0].id);
+    try std.testing.expectEqualStrings("{\"q\":\"x\"}", calls[0].args); // two arg fragments concatenated verbatim
+    try std.testing.expectEqualStrings("read_file", calls[1].name);
+    try std.testing.expectEqualStrings("call_b", calls[1].id);
+    try std.testing.expect(std.mem.indexOf(u8, calls[1].args, "a.txt") != null);
+}
+
+test "reconstructSseToolCalls: a fragment with no name is dropped; empty args become {}" {
+    const gpa = std.testing.allocator;
+    var cap: StreamCapture = .{};
+    defer cap.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = StreamCapture.onDelta };
+    defer st.deinit(gpa);
+    // index 0 has a name but never any args; index 1 has args but NEVER a name (unusable → dropped).
+    feedStream(&st, gpa, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c0\",\"function\":{\"name\":\"run_tests\"}}]}}]}\n\n" ++
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n");
+    const calls = reconstructSseToolCalls(gpa, &st);
+    defer freeCalls(gpa, calls);
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("run_tests", calls[0].name);
+    try std.testing.expectEqualStrings("{}", calls[0].args); // no args fragments → defaulted
 }
