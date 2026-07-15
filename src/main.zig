@@ -26,6 +26,7 @@ const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
 const worker = @import("worker/run.zig");
+const cli = @import("cli.zig");
 
 pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
@@ -117,6 +118,11 @@ pub fn main(init: std.process.Init) !void {
     defer threaded.deinit();
     const io = threaded.io();
 
+    // Collect the subcommand + its remaining argv up front. `worker` short-circuits to the worker entry (that
+    // is how the supervisor spawns a mind); a recognized CLI verb (cli.isCommand) runs the command-line client
+    // and returns; `--desk` arms desktop hosting; anything else falls through to booting the server daemon.
+    var cli_sub: []const u8 = "";
+    var cli_args: std.ArrayListUnmanaged([]const u8) = .empty;
     if (std.process.Args.Iterator.initAllocator(init.minimal.args, gpa)) |it_const| {
         var it = it_const;
         defer it.deinit();
@@ -128,9 +134,11 @@ pub fn main(init: std.process.Init) !void {
                 const model = try gpa.dupe(u8, it.next() orelse "mock");
                 return worker.run(gpa, io, init.environ_map, run_dir, nbin, model);
             }
+            cli_sub = try gpa.dupe(u8, sub);
             if (std.mem.eql(u8, sub, "--desk")) desktop_mode = true;
             while (it.next()) |arg| {
                 if (std.mem.eql(u8, arg, "--desk")) desktop_mode = true;
+                cli_args.append(gpa, try gpa.dupe(u8, arg)) catch {};
             }
         }
     } else |_| {}
@@ -140,6 +148,19 @@ pub fn main(init: std.process.Init) !void {
         if (d.len > 0) paths.data = try gpa.dupe(u8, d);
     }
     _ = std.Io.Dir.cwd().createDirPathStatus(io, paths.data, .default_dir) catch {};
+
+    // The one place the port is resolved (CLI client + server bind share it): NL_PORT else 8787.
+    const cli_port: u16 = if (init.environ_map.get("NL_PORT")) |v|
+        (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
+    else
+        8787;
+
+    // CLI CLIENT: a recognized verb dispatches to the command-line client (a thin /api/v1/* caller) and exits.
+    // This is the surface that retires the Python launcher — the server is the daemon, the CLI is its client.
+    if (cli_sub.len > 0 and cli.isCommand(cli_sub)) {
+        var cctx = cli.Ctx{ .gpa = gpa, .io = io, .data = paths.data, .home = paths.home, .port = cli_port, .environ = init.environ_map };
+        return std.process.exit(cli.dispatch(&cctx, cli_sub, cli_args.items));
+    }
 
     // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
     tuneOllama(gpa, io, init.environ_map);
@@ -204,10 +225,7 @@ pub fn main(init: std.process.Init) !void {
     if (!open_reg) std.debug.print("registration: CLOSED (private beta) — set NL_OPEN_REGISTRATION=1 to open public signups\n", .{});
     if (cf_account.len > 0 and wai_token.len > 0) std.debug.print("Workers AI: ENABLED (backbone) — provider \"workers-ai\" runs on the Cloudflare account's inference endpoint\n", .{}) else std.debug.print("Workers AI: not configured (set NL_CF_ACCOUNT_ID + NL_WORKERS_AI_TOKEN to enable the backbone)\n", .{});
 
-    const port: u16 = if (init.environ_map.get("NL_PORT")) |v|
-        (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
-    else
-        8787;
+    const port = cli_port; // resolved once above (NL_PORT else 8787), shared with the CLI client
     // On Windows httpz runs the BLOCKING thread-per-connection worker (one pool thread per live socket),
     // and its ONLY idle/half-open reaping is SO_RCVTIMEO — which is never set unless we pass timeouts here.
     // Without these, a keep-alive connection that dies without a clean FIN (laptop sleep, tab crash, network
