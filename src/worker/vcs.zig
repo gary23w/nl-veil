@@ -20,10 +20,8 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("out of memory");
 }
 
-// guidance FIRST, bufedit's reject LAST: on a stale anchor the reject now ends with the current file's
-// closest region ("The file NOW reads ..."), and the copyable lines must be the final thing the mind sees —
-// the old shape buried them mid-sentence and cost a whole read_file turn per lost repair attempt (observed
-// live, openai_splash_test_4 r4-6 on digest/__init__.py and digest/rank.py).
+// guidance FIRST, bufedit's reject LAST: on a stale anchor the reject ends with the current file's closest
+// region ("The file NOW reads ..."), and the copyable lines must be the final thing the mind sees.
 fn conflictMsg(gpa: std.mem.Allocator, reject: []const u8, rebased: bool) []u8 {
     // Only blame a concurrent writer when HEAD actually advanced under the mind (rebased). Otherwise the apply
     // failed because the SEARCH anchor doesn't match the current file — the common single-editor (chat) case,
@@ -107,9 +105,8 @@ fn appendLine(io: std.Io, gpa: std.mem.Allocator, path: []const u8, line: []cons
 
 /// Optional pre-commit content gate, called IN-LOCK with (HEAD, candidate) right before the write. A non-null
 /// return is an owned reject message: the commit is abandoned and the file stays untouched. This is how the
-/// language gates (py-compile, duplicate-definition) reach the CONCURRENT path — without it every team>1 run
-/// bypassed edit_file's own gate entirely (the VCS branch returned before the gate ran), which is how a
-/// SEARCH/REPLACE spliced a full second copy of users.py into the file with no rejection.
+/// language gates (py-compile, duplicate-definition) reach the concurrent path — without it the VCS branch
+/// commits without ever running edit_file's own gate.
 pub const Validator = struct {
     ctx: *anyopaque,
     check: *const fn (vctx: *anyopaque, head: []const u8, candidate: []const u8) ?[]u8,

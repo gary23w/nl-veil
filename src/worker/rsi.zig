@@ -5,8 +5,7 @@
 //!   * the GOVERNOR (proposal accept/rollback by trial confidence + token-utility) and its score helpers, and
 //!   * the multi-timescale RSI MEMORY distill, the weakness-driven CURRICULUM, the end-of-round RETROSPECTIVE,
 //!     and the role ORCHESTRATOR (the swarm authors its own division of labor each round).
-//! All of this operates on the `*run.Worker` god-object; the shared types/helpers live in run.zig and are
-//! aliased below so the function bodies read exactly as they did in run.zig.
+//! All of this operates on the `*run.Worker` god-object; shared types/helpers live in run.zig, aliased below.
 const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");
@@ -111,11 +110,10 @@ pub fn adaptCapacity(w: *Worker, round: u32, results: []const Moment) void {
     const drowning = narrated > 0 or tool_ok < 60;
     if (!drowning) {
         w.cap_streak = 0;
-        // PROMOTE (the seed comment above always promised this; now it is real): two consecutive rounds of
-        // full GENUINE tool competence (every live moment made structured tool calls, nothing narrated) lift
-        // the tier one step, so a capable model seeded low gets its full toolset back. Guards against the
-        // false-positive flap measured in review: a FENCED worker's strong signal is the lean regime
-        // carrying it (read-only calls still parse; its file lands via salvage) — promoting it to author
+        // PROMOTE: two consecutive rounds of full GENUINE tool competence (every live moment made structured
+        // tool calls, nothing narrated) lift the tier one step, so a capable model seeded low gets its full
+        // toolset back. Guards against a false-positive flap: a FENCED worker's strong signal is the lean
+        // regime carrying it (read-only calls still parse; its file lands via salvage) — promoting it to author
         // strips exactly that machinery, so fence mode blocks promotion; and one promote->demote round-trip
         // proves the higher tier drowns this model, locking further promotion for the run.
         const stronger: ?Tier = switch (w.cap.tier) {
@@ -342,14 +340,13 @@ pub fn updateRsiCurriculum(w: *Worker, goal: []const u8, round: u32, stalled: bo
     w.emit("curriculum", std.fmt.allocPrint(w.a(), ",\"round\":{d},\"stalled\":{},\"challenge\":\"{s}\"", .{ round, stalled, w.esc(clip(challenge, 260)) }) catch ",\"round\":0");
 }
 
-/// End-of-round RETROSPECTIVE — the engine-owned half of recursive self-improvement. Builder minds, heads-down
-/// on the deliverable, essentially never volunteer a process change, so we make reflection a deterministic step:
-/// once per round, look at what actually happened + the rules already in force, and let the model add ONE new
-/// operating rule to the self-authored playbook (or decline). Those rules are injected into every mind's system
-/// prompt next round, so the swarm's PROCESS compounds over time exactly like its artifact does — without the
-/// engine hard-wiring any particular behaviour. Best-effort: any failure just skips this round's reflection.
-/// Runs inside the CONCURRENT meta group (run.zig): gpa-only, no w.a()/w.esc(); its writes (playbook scope via
-/// the locked mem, act/emit via the locked emitter) are disjoint from every other grouped faculty.
+/// End-of-round RETROSPECTIVE — the engine-owned half of recursive self-improvement. Builder minds rarely
+/// volunteer a process change, so reflection is a deterministic step: once per round, look at what happened +
+/// the rules already in force, and let the model add ONE new operating rule to the self-authored playbook (or
+/// decline). Those rules are injected into every mind's system prompt next round, so the swarm's PROCESS
+/// compounds over time. Best-effort: any failure just skips this round's reflection.
+/// CONCURRENCY: runs in the CONCURRENT meta group (run.zig) — gpa-only, no w.a()/w.esc(); its writes (playbook
+/// scope via the locked mem, act/emit via the locked emitter) are disjoint from every other grouped faculty.
 pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: []const u8, bench: BenchResult) void {
     const gpa = w.gpa;
     const playbook = w.mem.list(tools.PLAYBOOK_SCOPE);
@@ -427,18 +424,15 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     w.emit("growth", std.fmt.bufPrint(&gbuf, ",\"mind\":\"retro\",\"round\":{d},\"age\":{d},\"facts\":0,\"skills\":0,\"directives\":{d},\"recalled\":0,\"built\":false,\"stances\":[]", .{ round, round, w.mem.factCount(tools.PLAYBOOK_SCOPE) }) catch ",\"round\":0");
 }
 
-/// BACKGROUND REVIEW FORK — a per-round learning pass that runs OUT-OF-BAND from the building minds (its
-/// own gateway-model stream, inside the concurrent meta group) and is WHITELISTED to exactly two hive
-/// stores: verified LESSONS and reusable SKILLS. It reads THIS round's real tool TRACE (act executions
-/// with their real results — never a mind's self-report) and mints/patches trace-grounded lessons + skills
-/// into the LIVE scopes so the NEXT round's minds recall them. It is the counterpart to two neighbours:
-/// `roundRetrospective` steers from self-report (one playbook rule); `runJudge` grades the WHOLE run into
-/// QUARANTINE at the end. This fork fills the gap between them — trace-grounded learning that lands DURING
-/// the run and can outrank the deterministic `mintLesson` pairer's blind spots (a fix across different
-/// tools, or a SKILL a rising score proves). Safety is the same discipline runJudge uses: only where the
-/// trace PROVES a transition, never a negative/environment claim, dedup against what's already learned,
-/// and a hard cap so a chatty model can't flood the hive. Cost-bounded by the caller's cadence gate.
-/// Silent no-op when the trace is thin or the model is unreachable. General — no use-case branch.
+/// BACKGROUND REVIEW FORK — a per-round learning pass that runs OUT-OF-BAND from the building minds (its own
+/// gateway-model stream, inside the concurrent meta group), WHITELISTED to exactly two hive stores: verified
+/// LESSONS and reusable SKILLS. It reads THIS round's real tool TRACE (act executions with their real results
+/// — never a mind's self-report) and mints/patches trace-grounded lessons + skills into the LIVE scopes so the
+/// NEXT round's minds recall them. Sits between `roundRetrospective` (steers the live run from self-report) and
+/// `runJudge` (grades the whole run into QUARANTINE at the end): trace-grounded learning that lands DURING the
+/// run. Safety discipline: only where the trace PROVES a transition, never a negative/environment claim, dedup
+/// against what's already learned, and a hard cap so a chatty model can't flood the hive. Cost-bounded by the
+/// caller's cadence gate. Silent no-op when the trace is thin or the model is unreachable.
 pub fn reviewFork(w: *Worker, goal: []const u8, round: u32, round_trace: []const u8) void {
     const gpa = w.gpa;
     if (round_trace.len < 120) { // nothing substantial happened to review
@@ -509,15 +503,14 @@ pub fn reviewFork(w: *Worker, goal: []const u8, round: u32, round_trace: []const
     w.emit("review", std.fmt.bufPrint(&rbuf, ",\"round\":{d},\"minted\":{d}", .{ round, minted }) catch ",\"round\":0");
 }
 
-/// END-OF-RUN JUDGE — the learning gate for durable promotion. Reads the run's TRACE (events.jsonl act
-/// rows: real tool executions with their real results, plus the engine's measured score rows — never the
-/// minds' monologues or "thinking" rows, which are self-report, and never the retrospective's own
-/// set_directive writes) on the GATEWAY model (already the engine's judging slot, distinct from the minds'
-/// primary) and PROPOSES durable lessons/skills into QUARANTINE scopes only. Nothing recalls those scopes
-/// into prompts — promotion is a separate, reviewed step. This is the counterweight to roundRetrospective:
-/// the retro steers the live run from self-report (useful, but it once wrote a phantom syntax-error
-/// "lesson" into binding directives for 8 rounds); anything that would OUTLIVE steering must survive a
-/// trace-grounded judge instead. Silent no-op when the trace is thin or the model unreachable.
+/// END-OF-RUN JUDGE — the learning gate for durable promotion. Reads the run's TRACE (events.jsonl act rows:
+/// real tool executions with their real results, plus the engine's measured score rows — never the minds'
+/// monologues or "thinking" rows, which are self-report, and never the retrospective's own set_directive
+/// writes) on the GATEWAY model (the engine's judging slot, distinct from the minds' primary) and PROPOSES
+/// durable lessons/skills into QUARANTINE scopes only. Nothing recalls those scopes into prompts — promotion is
+/// a separate, reviewed step. Counterweight to roundRetrospective (which steers the live run from self-report):
+/// anything that would OUTLIVE steering must survive a trace-grounded judge first, never bind straight from
+/// self-report. Silent no-op when the trace is thin or the model unreachable.
 pub fn runJudge(w: *Worker) void {
     const gpa = w.gpa;
     const ev = std.Io.Dir.cwd().readFileAlloc(w.io, w.ev_path, gpa, .limited(1 << 20)) catch return;
@@ -645,15 +638,15 @@ pub fn matchArchetype(role: []const u8) ?Archetype {
 
 /// The ROLE PLANNER — the engine-owned driver of adaptive division of labor (roles self-improve in real time).
 /// Once per round it asks the model to assign EVERY mind one archetype role given the goal + score + build +
-/// authored tools, and re-plans toward the gap when the score stalls. This is the structural driver that makes
-/// make_tool fire organically (it can assign a capability-builder). Round-1's static seed is a strong prior;
-/// the planner only overrides from round 2+, caps churn at half the swarm (anti-thrash), and never strips the
-/// learning floor (>=1 scout at n>=4; an omitted mind keeps its prior role, so the seed reviewer persists).
+/// authored tools, and re-plans toward the gap when the score stalls. The structural driver that makes make_tool
+/// fire organically (it can assign a capability-builder). Round-1's static seed is a strong prior; the planner
+/// only overrides from round 2+, caps churn at half the swarm (anti-thrash), and never strips the learning floor
+/// (>=1 scout at n>=4; an omitted mind keeps its prior role, so the seed reviewer persists).
 /// Best-effort: on any failure roles are left untouched. Single-threaded (between rounds) — moments read fresh.
-/// The ONE blueprint basename `focus` names, or null when it names zero or several. Exactly-one is the
-/// ownership signal: "fix users.py" targets a file; "write test_users.py covering users.py" is coordination
-/// prose spanning two, and treating a mere MENTION as a claim let an early assignment steal a file from the
-/// mind the plan explicitly sent to it (audit finding). Word-bounded, so `store.py` never claims test_store.py.
+/// The ONE blueprint basename `focus` names, or null when it names zero or several. Exactly-one is the ownership
+/// signal: "fix users.py" targets a file; "write test_users.py covering users.py" is prose spanning two —
+/// treating a mere MENTION as a claim would let one assignment steal a file from the mind the plan sent it to.
+/// Word-bounded, so `store.py` never claims test_store.py.
 fn focusClaimFile(blueprint: []const u8, focus: []const u8) ?[]const u8 {
     if (blueprint.len == 0) return null;
     var match: ?[]const u8 = null;
@@ -777,11 +770,10 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
     defer plan_ev.deinit(gpa);
     // PER-FILE EXCLUSIVITY: at most ONE mind may hold a task naming a given blueprint file. Within this plan
     // the first LANDED claim wins; after the plan lands, a STALE lane (a mind not reassigned this round) that
-    // names a file claimed this round is RELEASED. Without this, tasks piled up — observed live (sim_forum4):
-    // round 7 held two minds' tasks on users.py, round 8 three; the collision spliced a second copy of the
-    // module into the file. A claim = an assignment that (a) resolves to a REAL mind (a hallucinated name
-    // must not evict anybody), (b) is not research-only (a scout cannot write, so it cannot own a file), and
-    // (c) names exactly ONE blueprint file (a multi-file mention is prose, not ownership).
+    // names a file claimed this round is RELEASED. Without this, parallel tasks pile up on one file and splice
+    // duplicate copies of a module into it. A claim = an assignment that (a) resolves to a REAL mind (a
+    // hallucinated name must not evict anybody), (b) is not research-only (a scout cannot write, so it cannot
+    // own a file), and (c) names exactly ONE blueprint file (a multi-file mention is prose, not ownership).
     var claimed: std.ArrayListUnmanaged([]const u8) = .empty; // slices into w.blueprint — stable this round
     defer claimed.deinit(gpa);
     const reassigned = gpa.alloc(bool, minds.len) catch null;
@@ -863,8 +855,8 @@ pub fn planRoles(w: *Worker, minds: []MindState, goal: []const u8, round: u32, b
 
 /// Does the goal read like a GATHER/RESEARCH task (needs real, current, external knowledge) rather than a
 /// pure build? Used as the research FLOOR: such a cast must field at least one scout or it will hallucinate
-/// its "findings" from the model's memory (the exact bug seen in the Iran-news casts: 0 web fetches, files
-/// written from thin air). Case-insensitive substring scan — cheap and good enough as a floor.
+/// its "findings" from the model's memory (0 web fetches, files written from thin air). Case-insensitive
+/// substring scan — cheap and good enough as a floor.
 pub fn looksLikeResearch(goal: []const u8) bool {
     const cues = [_][]const u8{ "research", "gather", "find ", "latest", "news", "search", "look up", "current ", "recent", "report on", "reports on", "compile", "investigate", "discover", "what is happening", "up to date", "up-to-date", "state of the art", "state-of-the-art" };
     var buf: [1024]u8 = undefined;

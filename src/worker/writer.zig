@@ -1,17 +1,16 @@
-//! writer.zig — the small-model WRITING faculty. The "writing affect": a grounding scaffold that makes a weak/8b
-//! model produce COHERENT, GROUNDED written artifacts instead of fabricating. The engine seeds real source material,
-//! NUMBERS it so the model cites by [N] (never typing a URL it could invent), has the model write citing only those
-//! [N], then RESOLVES each [N] back to its verified source and strips anything invented.
+//! writer.zig — the small-model WRITING faculty: a grounding scaffold that makes a weak/8b model produce
+//! COHERENT, GROUNDED artifacts instead of fabricating. The engine seeds real source material, NUMBERS it so the
+//! model cites by [N] (never typing a URL it could invent), then RESOLVES each [N] back to its verified source
+//! and strips anything invented.
 //!
-//! This is GENERAL MACHINERY — NO use-case is baked in. `compose(ground, …)` either grounds in fetched sources or
-//! synthesizes the hive's own knowledge; the prompts are about grounding MECHANICS only (cite the sources, don't
-//! invent). The SUBJECT, persona, tone, and structure come from the swarm's GOAL (the manifest the operator wrote) —
-//! a news desk, a research desk, a status report all use the same compose and differ only in that goal text. The
-//! `ETL NORMALIZATION` section below is the same affect applied to a weak model's lexical writes (memory, messages).
+//! GENERAL MACHINERY — NO use-case is baked in. `compose(ground, …)` either grounds in fetched sources or
+//! synthesizes the hive's own knowledge; the prompts cover grounding MECHANICS only. Subject, persona, tone, and
+//! structure come from the swarm's GOAL — a news/research/status desk all use the same compose, differing only in
+//! that goal text. The ETL NORMALIZATION section below applies the same affect to a weak model's lexical writes
+//! (memory, messages).
 //!
-//! Publishing is NOT a writing concern: the public-post capability is `tools.telegraphPublish`, and the orchestration
-//! (grounding gates + the GENERAL constitution safety screen + the post call) lives in run.zig. writer.zig never
-//! references telegraph and carries no use-case persona or policy.
+//! Publishing is NOT a writing concern: the public-post capability is `tools.telegraphPublish` and its
+//! orchestration lives in run.zig. writer.zig never references telegraph and carries no use-case persona or policy.
 const std = @import("std");
 const llm = @import("llm.zig");
 const tools = @import("tools.zig");

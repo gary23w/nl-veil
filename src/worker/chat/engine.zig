@@ -39,16 +39,15 @@ fn sleepMsRaw(io: std.Io, ms: u64) void {
 
 const App = http.App;
 
-/// Hard ceiling on tool-calling round-trips per ONE settled answer. 12 was too low — a real build (e.g. a
-/// three.js game: many write_file + read_file + edit_file rounds) exhausted it MID-BUILD and committed a raw
-/// "(reached the step limit)" string as the reply even though the build succeeded. 24 comfortably fits a big
-/// single-turn build; the outer DRIVE_MAX still bounds the whole turn, and a genuine runaway summarizes (below).
+/// Hard ceiling on tool-calling round-trips per ONE settled answer. 24 comfortably fits a big single-turn build
+/// (a three.js game is many write_file + read_file + edit_file rounds); the outer DRIVE_MAX still bounds the whole
+/// turn, and a genuine runaway summarizes (below) rather than committing a raw step-limit string.
 const MAX_ITERS: usize = 24;
 
-/// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Lowered 30 -> 6: at 30 a
-/// thorough model would "verify" and re-read forever after a fix (observed: a fix-the-bug turn drove endlessly,
-/// thousands of frames). 6 is enough for a build + a couple of follow-through steps; a plain Q&A still stops after
-/// one (DONE). The user's Stop reaches the turn (control.jsonl), and MAX_ITERS bounds each step's tool rounds.
+/// Hard ceiling on AUTO-LOOP drive steps in one turn when the loop is OFF (loop=0). Kept low (6): a higher cap
+/// lets a thorough model "verify" and re-read forever after a fix, while 6 still fits a build + a couple of
+/// follow-through steps and a plain Q&A stops after one (DONE). The user's Stop reaches the turn (control.jsonl),
+/// and MAX_ITERS bounds each step's tool rounds.
 const DRIVE_MAX: usize = 6;
 
 /// AUTO-LOOP mode (the desk's chat_loop / chat_loop_afk tiers, now driven SERVER-side). off = a normal bounded
@@ -389,7 +388,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
     // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
-    // text then recalling it as "grounded context" is the parrot/confabulation loop the desk fix removed.
+    // text then recalling it as "grounded context" is a parrot/confabulation loop.
     // DEFERRED to turn exit (a `defer` covers every completion path): the observe is a subprocess spawn that sat
     // between prefix assembly and the first inference — pure write-side durability nothing in THIS turn reads
     // (recall already ran above), so it must not tax the first token.
@@ -429,10 +428,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         cplan.freeTasks(gpa, resumed);
         // No unfinished plan → decompose a fresh message into a new board, but ONLY when it reads like a genuine
         // multi-step BUILD/RESEARCH task (shouldPlan). A question, greeting, ack, or one-liner skips the whole
-        // decomposition ROUND-TRIP — that sequential inference added ~3-4s to time-to-first-token even when the
-        // model correctly returned an empty plan (measured: 6.7s TTFT on a plain "explain rainbows"), and weak
-        // models over-decomposed greetings into swarm plans. Real tasks still plan + coordinate; chat stays fast.
-        // This persistPlan only overwrites a completed/absent plan, so no in-progress work is lost.
+        // decomposition ROUND-TRIP — that sequential inference adds seconds to time-to-first-token even when the
+        // model correctly returns an empty plan, and weak models over-decompose greetings into swarm plans. Real
+        // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
+        // so no in-progress work is lost.
         if (shouldPlan(user_text)) {
             const fresh = planTask(app, run_root, base_url, key, model, user_text);
             if (fresh.len > 0) {
@@ -510,8 +509,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 }
             } else if (!afk) {
                 // Whole plan done (non-afk). ARMED: don't settle over a RUNNING cast hive — a hive-routed final
-                // subtask is marked done the pass right after casting, which used to end the turn while the hive
-                // was still working (live conv c6a56f844). Await it, then demote to FREE-FORM and gather.
+                // subtask is marked done the pass right after casting, which would otherwise end the turn while the
+                // hive is still working. Await it, then demote to FREE-FORM and gather.
                 var plan_break = true;
                 if (armed) {
                     if (awaitConvCast(app, uid, conv, conv_dir, steer_cursor)) |w| switch (w) {
@@ -550,7 +549,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
-                // poller disarms + clears busy instead of hanging forever (the "kept streaming after an error").
+                // poller disarms + clears busy instead of hanging forever.
                 planStepInterrupted(app, conv_dir, plan, task_idx);
                 salvageSteers(app, conv_dir, &steer_cursor); // an errored turn must not eat a pending steer
                 finishTurn(app, conv_dir, usage_t0);
@@ -644,7 +643,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             cplan.setStatus(gpa, &plan[ti], cplan.STATUS_DONE);
             persistPlan(app, conv_dir, plan);
             // Plan complete (non-afk): a plain (unarmed) turn ends here; an ARMED one loops back so the top-of-loop
-            // plan-complete branch can await a still-running cast hive before settling (the c6a56f844 premature-end).
+            // plan-complete branch can await a still-running cast hive before settling over it.
             if (cplan.nextPending(plan) == null and !afk and !armed) break :outer;
             continue :outer; // next subtask, OR (afk/armed + plan done) loop back — the top transitions or awaits
         }
@@ -864,7 +863,7 @@ fn turnThread(args: *TurnArgs) void {
 
 /// Launch a turn for (uid, conv) on a DETACHED background thread with owned copies of every arg, so the HTTP
 /// handler can return 202 at once and the client streams the turn's event frames live (a synchronous turn would
-/// block the client's /events poll for the whole turn — the "shows only 'server thinking'" bug). On an
+/// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
 pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8, loop: u8) void {
@@ -926,13 +925,10 @@ const InnerResult = struct {
     tools_ran: bool = false,
 };
 
-/// Borrowed handle the streaming callback needs to emit live deltas into this turn's event log.
-/// Batch streamed deltas to ~this many chars per emitted frame. Streaming one FRAME per model TOKEN produced
-/// thousands of frames per turn (8400 reasoning frames observed) — each is a file append + a desk poll-parse,
-/// which overwhelmed the client ("the chat is dying"). Coalescing cuts frames while the reply still visibly types
-/// out. 60 felt chunky; now that appendFile is a TRUE O(1) positioned append (frames are cheap) and the desk pumps
-/// its event poll at ~30Hz during a stream, 12 chars/frame keeps the reply flowing continuously (like the local
-/// client rendering its raw scratch) rather than arriving in visible ~28-char steps.
+/// Batch streamed deltas to ~this many chars per emitted frame. One frame per model TOKEN produces thousands of
+/// frames per turn — each a file append + a desk poll-parse — which overwhelms the client. Coalescing cuts frames
+/// while the reply still visibly types out; at 12 chars/frame (appendFile is an O(1) positioned append and the
+/// desk polls its event stream at ~30Hz) the reply flows continuously rather than arriving in visible chunks.
 const FLUSH_CHARS: usize = 12;
 
 const StreamCtx = struct {
@@ -1193,13 +1189,13 @@ fn orchErr(gpa: std.mem.Allocator, msg: []const u8) []u8 {
 
 /// Dispatch the veil's orchestration verbs. Returns a gpa-owned result string, or null when `name` is not an
 /// orchestration verb (the caller then routes to the normal mind-tool executor).
-// ---- AWAIT-SWARM: the engine-level "wait for the hive" the model can't do itself. Ground truth (live conv
-// c6a56f844): the veil cast a hive, spin-polled swarm_status ~20x back-to-back at inference speed (the only move
-// it had), grew impatient, stop_swarm'd the hive early and did the work itself — then the armed loop accepted
-// DONE while a hive was still running, settling the turn over its half-finished work. Two mechanisms fix it:
-// (1) statusTool BLOCKS while the swarm runs (cheap file probes + stop checks, no inference) so one call replaces
-// a poll storm; (2) an ARMED drive loop refuses to settle while this conversation's cast hive is still working —
-// it awaits, then injects a gather step so the results fold into the turn. Loop OFF keeps fire-and-forget.
+// ---- AWAIT-SWARM: the engine-level "wait for the hive" the model can't do itself. Without it a cast leaves the
+// model only inference-speed polling, so it spin-polls swarm_status, grows impatient, stops the hive early, and
+// the armed loop then accepts DONE while the hive is still running — settling over half-finished work. Two
+// mechanisms prevent that: (1) statusTool BLOCKS while the swarm runs (cheap file probes + stop checks, no
+// inference) so one call replaces a poll storm; (2) an ARMED drive loop refuses to settle while this
+// conversation's cast hive is still working — it awaits, then injects a gather step so the results fold into the
+// turn. Loop OFF keeps fire-and-forget.
 
 /// The gather step injected when the awaited hive finishes: fold its results into the turn instead of settling.
 const SWARM_GATHER_MSG = "The hive you cast has finished. Collect its results NOW: call swarm_status, then list_dir / read_file its deliverable files, verify they satisfy the goal, and fold them into your answer — then continue toward the goal or give the final summary.";
@@ -1377,9 +1373,9 @@ fn stopTool(app: *App, uid: u64, args: []const u8) []u8 {
 /// swarm_status — compact liveness for the veil to decide keep-going / steer / collect: supervisor state, whether
 /// the worker process is alive, mind count, and whether a terminal DONE marker exists yet. While the swarm is
 /// STILL RUNNING this call BLOCKS (cheap file probes + stop checks, up to SWARM_STATUS_WAIT_S) — the engine-level
-/// "wait" the model can't express itself. Without it the model's only move was to re-poll at inference speed
-/// (observed: ~20 back-to-back swarm_status calls burning the pass's iterations, then an impatient stop_swarm).
-/// One blocking call replaces the storm; the result says how long it waited. gpa-owned result.
+/// "wait" the model can't express itself. Without it the model's only move is to re-poll at inference speed,
+/// burning the pass's iterations. One blocking call replaces the storm; the result says how long it waited.
+/// gpa-owned result.
 fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, args: []const u8) []u8 {
     const gpa = app.gpa;
     const A = struct { id: []const u8 = "" };
@@ -1566,8 +1562,8 @@ fn runInnerAgentic(
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
         // COOPERATIVE CONTROL (before each inference): a stop aborts with whatever narration we have; a steer is
-        // folded straight into conv_buf as a user turn so THIS upcoming inference already honors it — steering
-        // used to wait for the outer drive-step boundary, which a long tool loop pushed out by many minutes.
+        // folded straight into conv_buf as a user turn so THIS upcoming inference already honors it — folding only
+        // at the outer drive-step boundary would delay it by however long a tool loop runs (minutes).
         switch (drainChatControl(app, conv_dir, steer_cursor, conv_buf)) {
             .stop => return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty },
             .none => {},
@@ -1603,8 +1599,8 @@ fn runInnerAgentic(
         // MARKUP TOOL-CALL RECOVERY: a local gpt-oss/DeepSeek model sometimes emits its tool call as Claude-style
         // XML markup in the CONTENT channel (<｜｜DSML｜｜invoke name="…">) instead of a structured tool_calls entry.
         // The transport then returns it as plain content with NO calls, so no tool runs, the markup leaks into the
-        // reply, and the drive loop churns on it ("bad tool requests / janked back and forth"). Recover the call(s)
-        // from the markup + strip it from the content, so the tool actually executes and the turn makes progress.
+        // reply, and the drive loop churns on it. Recover the call(s) from the markup + strip it from the content,
+        // so the tool actually executes and the turn makes progress.
         if (step.calls.len == 0 and cctx.looksLikeToolMarkup(step.content)) {
             if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
                 var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
@@ -1676,10 +1672,10 @@ fn runInnerAgentic(
         var pending_steer: std.ArrayListUnmanaged(u8) = .empty;
         defer pending_steer.deinit(gpa);
         for (step.calls, 0..) |c, ci| {
-            // COOPERATIVE CONTROL (between tool calls): a single inference can request many tools (66 web_searches
-            // in one live run), each taking seconds — checking only per-inference let a Stop (or a steer) wait
-            // minutes. A stop aborts with the narration so far; a steer SKIPS the still-queued calls (each still
-            // gets a result row — the shape requires one per call id) so the next inference honors it in seconds.
+            // COOPERATIVE CONTROL (between tool calls): a single inference can request many tools, each taking
+            // seconds — checking only per-inference lets a Stop (or a steer) wait minutes. A stop aborts with the
+            // narration so far; a steer SKIPS the still-queued calls (each still gets a result row — the shape
+            // requires one per call id) so the next inference honors it in seconds.
             switch (drainChatControl(app, conv_dir, steer_cursor, &pending_steer)) {
                 .stop => return .{ .outcome = .stopped, .content = gpa.dupe(u8, last_content) catch empty },
                 .none => {},
@@ -1748,8 +1744,8 @@ fn runInnerAgentic(
     }
 
     // Ran out of tool iterations mid-loop: ask for a brief no-tools SUMMARY so the reply is a real closing message
-    // ("here's what I built…") rather than a raw step-limit string (the shooter turn committed exactly that). Fall
-    // back to the last narration, then a friendly note, only if the summary itself fails.
+    // ("here's what I built…") rather than a raw step-limit string. Fall back to the last narration, then a
+    // friendly note, only if the summary itself fails.
     // These salvage returns follow a full tool loop, so tools_ran reflects the real work (any_tool) — the drive
     // loop must keep its multi-step continuation, not be short-circuited by the no-tools fast path.
     if (summarizeTurn(app, run_root, base_url, key, model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum, .tools_ran = any_tool };
@@ -1800,10 +1796,9 @@ fn reflectAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     return gpa.dupe(u8, t) catch null;
 }
 
-/// Observe a SHORT durable note of a successful tool result into the conversation's neuron-db: `tool <name>: <=200b`.
 /// Current byte length of control.jsonl (0 if absent/unreadable) — the cursor past which a later stop op counts.
-/// A stat, not a read: this and the pollers below used to read the WHOLE file, and the stop poll fires ~50×/s
-/// during a stream — O(control-size) forever on a file that only grows across a long conversation's steers.
+/// A stat, not a read: the stop poll fires ~50×/s during a stream, so reading the whole file (O(control-size) on a
+/// file that only grows across a long conversation's steers) would be a hot-path cost.
 fn controlLen(app: *App, conv_dir: []const u8) usize {
     const gpa = app.gpa;
     const path = std.fmt.allocPrint(gpa, "{s}/control.jsonl", .{conv_dir}) catch return 0;
@@ -1848,11 +1843,9 @@ const CtlResult = enum { none, stop };
 /// Drain the conv's control.jsonl from *cursor (between drive steps): a `stop` op ENDS the turn; a `steer`/`say`
 /// op INJECTS the user's text as a mid-turn user message so the next inference incorporates it — this is the user
 /// "posting to steer" a running turn without stopping it. Advances *cursor past everything read.
-// ---- DURABLE USER MEMORY (migrated from the desk): the user's cross-conversation facts (keys/logins/preferences)
-// live in {data}/.veil-desk/memories.jsonl — one {"cat","text"} JSON line each. The DESK writes this file; the
-// server shares the same localhost data dir, so reading + appending it keeps ONE durable store (no split-brain).
-// Before this, a server-served conv never injected the user's saved facts, and a reply's REMEMBER:/FORGET: lines
-// were neither acted on nor stripped (they leaked as literal text). ----
+// ---- DURABLE USER MEMORY: the user's cross-conversation facts (keys/logins/preferences) live in
+// {data}/.veil-desk/memories.jsonl — one {"cat","text"} JSON line each. The DESK writes this file; the server
+// shares the same localhost data dir, so reading + appending it keeps ONE durable store (no split-brain). ----
 const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
 
 fn memoriesPath(app: *App, buf: []u8) ?[]const u8 {
@@ -2089,7 +2082,7 @@ fn drainChatControl(app: *App, conv_dir: []const u8, cursor: *usize, buf: *std.A
             buf.append(gpa, '}') catch {};
             // DURABLE: a folded steer is a real user turn — persist it so the NEXT turn's history replay (and a
             // turn that ends before acting on it) still carries the user's course correction instead of dropping
-            // it when the next turn re-snapshots the control cursor past it (the "steer sent, nothing happened").
+            // it when the next turn re-snapshots the control cursor past it.
             appendMsg(app, conv_dir, "user", p.value.text, "user", nowSecs(app.io));
             var sb: [200]u8 = undefined;
             emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "steering: {s}", .{clipBytes(p.value.text, 120)}) catch "steering");

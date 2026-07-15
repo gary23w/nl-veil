@@ -1,4 +1,4 @@
-//! Billing seam — POST /billing/checkout. Today it's the NoopBilling upgrade nudge (returns the Pro pitch);
+//! Billing seam — POST /billing/checkout returns the Pro upgrade pitch (billing goes live with the Cloudflare deploy).
 
 const std = @import("std");
 const httpz = @import("httpz");

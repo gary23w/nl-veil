@@ -1,4 +1,4 @@
-//! Control writer — POST /swarms/:id/control turns operator input (say / broadcast / set_goal / stop) into
+//! Control writer — POST /swarms/:id/control: `stop` acts immediately, every other op is appended to the worker's control.jsonl.
 
 const std = @import("std");
 const httpz = @import("httpz");

@@ -1,4 +1,5 @@
-//! Entry point + wiring. main() resolves the install paths, brings up Auth + the Supervisor, builds the
+//! Entry point + wiring. main() resolves the install paths, brings up Auth + the Supervisor, and starts the HTTP
+//! server — or dispatches a CLI verb / the worker entry when invoked as a subcommand.
 
 const std = @import("std");
 const builtin = @import("builtin");

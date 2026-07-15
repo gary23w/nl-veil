@@ -4,9 +4,8 @@ const std = @import("std");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
 
-// Per-mind field capacity — bounds BOTH RAM (~250B/fact typical) AND the O(N^2) settle. Tunable per hardware
-// via NL_HYPERSPACE_CAP: a lean IoT/appliance profile sets ~32-64 (~10-20KB/mind, sub-ms settle); a server can
-// raise it for richer grounding. Clamped to [MIN_FACTS, MAX_FACTS_CAP].
+// Per-mind field capacity — bounds BOTH RAM (~250B/fact typical) AND the O(N^2) settle. Tunable via
+// NL_HYPERSPACE_CAP; clamped to [MIN_FACTS, MAX_FACTS_CAP].
 pub const DEFAULT_MAX_FACTS: usize = 160;
 pub const MIN_FACTS: usize = 16;
 pub const MAX_FACTS_CAP: usize = 4096;
@@ -276,7 +275,7 @@ pub const Field = struct {
 pub fn recall(gpa: std.mem.Allocator, mem: Mem, scope: []const u8, focus: []const u8, budget: usize) []u8 {
     var field = Field.init(gpa);
     defer field.deinit();
-    const wide = mem.assoc(scope, focus, 4, 48); // one bulk pull (vs the legacy k=8)
+    const wide = mem.assoc(scope, focus, 4, 48); // one bulk pull
     defer gpa.free(wide);
     field.ingest(wide);
     return field.pack(focus, budget);

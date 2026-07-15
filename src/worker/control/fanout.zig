@@ -1,4 +1,4 @@
-//! Event delivery to the browser, two ways over the SAME events.jsonl cursor:
+//! Event delivery to the browser over events.jsonl — offset polling (swarmEvents) and an SSE stream (swarmStream).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -61,17 +61,15 @@ pub fn startStream(app: *App, res: *httpz.Response, id: []const u8, run_dir: []c
     try res.startEventStream(ctx, streamLoop);
 }
 
-// SSE hygiene. This loop is disowned onto a detached thread and never READS the socket, so it can't see
-// a client's FIN between writes — a departed browser's socket sits in CLOSE_WAIT until the next write
-// fails, and a half-open peer (laptop sleep, crashed tab, dropped network — no FIN/RST ever arrives)
-// would pin this thread + fd forever. Two portable guards: ping often enough that a CLEAN close is caught
-// in seconds (the ping write fails), and cap the total lifetime so a HALF-OPEN peer is recycled — the
-// browser's EventSource just auto-reconnects. httpz's keepalive timeout can't help here (the connection
-// is disowned out of httpz's worker), so the stream has to police itself.
-// This loop runs on a RAW, detached std.Thread (response.zig startEventStream), NOT an Io-managed task.
-// io.sleep throws on such a thread; swallowing that error turns the loop into a 100%-CPU spin that pins a
-// core and thrashes the events.jsonl re-read until the http pool starves and /health wedges — the exact
-// footgun supervisor.zig already fixed. Sleep via the OS directly instead.
+// SSE hygiene. This loop is disowned onto a detached thread and never reads the socket, so it can't see a
+// client's FIN between writes: a cleanly-closed socket lingers in CLOSE_WAIT until the next write fails, and
+// a half-open peer (laptop sleep, crashed tab, dropped network — no FIN/RST arrives) would pin this thread +
+// fd forever. Two guards: ping often enough that a clean close is caught in seconds (the write fails), and
+// cap total lifetime so a half-open peer is recycled (the browser's EventSource auto-reconnects). httpz's
+// keepalive timeout can't help — the connection is disowned out of its worker, so the stream self-polices.
+// The loop runs on a RAW, detached std.Thread (response.zig startEventStream), NOT an Io-managed task: io.sleep
+// throws there, and swallowing that error spins the loop at 100% CPU until the http pool starves. Sleep via
+// the OS directly instead.
 const winSleep = if (builtin.os.tag == .windows)
     struct {
         extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
@@ -119,9 +117,8 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
         // thread + socket (CLOSE_WAIT) indefinitely. Break WITHOUT an `event: gone` frame — that would tell
         // the browser the swarm is gone and stop its EventSource; a plain drop makes it reconnect instead.
         if (ticks >= MAX_STREAM_TICKS) break;
-        // Cheap size check FIRST: only re-read the (growing, multi-MB) log when it has actually grown past what
-        // we've already streamed. Without this, every 500ms tick did an O(filesize) readFileAlloc even when no
-        // new event arrived — several such streams turned into the multi-core burn during a watched cast.
+        // Cheap size check FIRST: only re-read the (growing, multi-MB) log once it has grown past what we've
+        // already streamed — otherwise every 500ms tick pays an O(filesize) readFileAlloc, burning cores.
         const cur_size: usize = if (std.Io.Dir.cwd().statFile(ctx.io, ev_path, .{})) |st| @intCast(st.size) else |_| 0;
         if (cur_size < cursor) cursor = cur_size;
         if (cur_size > cursor) {

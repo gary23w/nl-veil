@@ -123,13 +123,12 @@ fn firstNonEmpty(lines: []const []const u8) []const u8 {
     return "";
 }
 
-/// A stale anchor is usually a TEAMMATE'S rewrite, not a typo: under concurrency a mind reads, a teammate
-/// commits, and the mind's SEARCH lines no longer exist verbatim (observed live, openai_splash_test_4 r4-6:
-/// several repair attempts per round lost on digest/__init__.py and digest/rank.py, each costing a full
-/// re-read turn). So on anchor-not-found we hand back the CURRENT file's closest region — exact trimmed match
-/// on the anchor's first line first, else longest shared prefix of trimmed text — so the mind can re-anchor in
-/// the SAME turn. Returns gpa-owned bytes (folded into the reject string and freed by the caller); when nothing
-/// scores above a trivial threshold the region is gone and the hint says to read_file instead.
+/// A stale anchor is usually a teammate's rewrite, not a typo: under concurrency a mind reads, a teammate
+/// commits, and the mind's SEARCH lines no longer exist verbatim. So on anchor-not-found we hand back the
+/// current file's closest region — exact trimmed match on the anchor's first line first, else longest shared
+/// prefix of trimmed text — so the mind can re-anchor in the same turn. Returns gpa-owned bytes (folded into
+/// the reject string and freed by the caller); when nothing scores above a trivial threshold the region is
+/// gone and the hint says to read_file instead.
 fn regionHint(gpa: std.mem.Allocator, lines: []const []const u8, anchor_first: []const u8) []u8 {
     const removed = "The anchored region appears to have been removed from the current file entirely — read_file it before retrying.";
     const want = trimBoth(anchor_first);
@@ -356,14 +355,11 @@ pub fn hasSearchReplace(reply: []const u8) bool {
     return std.mem.indexOf(u8, reply, "<<<<<<< SEARCH") != null;
 }
 
-/// Line-anchored edit-protocol / merge-conflict markers INSIDE file content — always corruption, in any
+/// Line-anchored edit-protocol / merge-conflict markers inside file content — always corruption, in any
 /// language: a line starting `<<<<<<<` or `>>>>>>>` never belongs in a real file body. A bare `=======`
 /// line alone deliberately does NOT trigger (a legitimate markdown H1 underline). Broader than
-/// hasSearchReplace on purpose: it also catches partial RESIDUE (a lone `>>>>>>> REPLACE` left behind
-/// after a cleanup consumed the opening fence). Observed live (sim_synapse r10): an edit op whose `text`
-/// carried a whole multi-file SEARCH/REPLACE script was committed into src/lib.rs — the crate root — and
-/// the repeated marker lines then defeated every follow-up edit_file's anchoring for five straight rounds
-/// while `cargo build` pinned the swarm at 0%.
+/// hasSearchReplace on purpose: it also catches partial residue (a lone `>>>>>>> REPLACE` left behind
+/// after a cleanup consumed the opening fence).
 pub fn editMarkerCorruption(body: []const u8) bool {
     var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |raw| {

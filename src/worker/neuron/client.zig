@@ -1,4 +1,4 @@
-//! Thin client over the `neuron.exe` CLI — Neuron-loops dogfoods neuron-db as its own datastore
+//! Thin client over the `neuron.exe` CLI — the app dogfoods neuron-db as its own datastore.
 
 const std = @import("std");
 const Io = std.Io;

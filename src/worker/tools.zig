@@ -1,8 +1,6 @@
-//! The mind's toolbelt, in Zig — the keyless, single-purpose tools a mind calls during a moment to build,
-//! research, and remember. These mirror the core of the Python kit/sandbox: run_python (a sandboxed Python
-//! script), write_file/read_file (build artifacts in the workdir), web_fetch (research via curl), and the
-//! memory ops (observe/recall/note_stance). The model is given SCHEMA as the `tools` array; execute() runs
-//! a parsed tool_call and returns a text result to feed back into the conversation.
+//! The mind's toolbelt: the keyless, single-purpose tools a mind calls during a moment to build, research,
+//! and remember. The model is given SCHEMA as the `tools` array; execute() runs a parsed tool_call and
+//! returns a text result to feed back into the conversation.
 const std = @import("std");
 const builtin = @import("builtin");
 const oscillation = @import("oscillation.zig");
@@ -62,10 +60,8 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
 /// read back whatever body arrived. Caller frees. `json` adds the Accept header; `limit` caps the read.
 ///
 /// FETCH CACHE: successful bodies persist to data/_fetch_cache (7-day TTL, keyed by url+accept, timestamp
-/// header line + body) so a documentation page is fetched ONCE across all minds, rounds, and runs — the
-/// raw-latency lever behind the source atlas: the atlas tells scouts WHERE, the cache makes going there
-/// again ~free. Deliberately NOT on the search path (crawlSearch has its own fetch — search freshness is
-/// load-bearing for automation/live-event tasks) and BYPASSED under an active egress allowlist (cached
+/// header line + body) so a page is fetched ONCE across all minds, rounds, and runs. Deliberately NOT on the
+/// search path (search freshness is load-bearing) and BYPASSED under an active egress allowlist (cached
 /// off-allowlist content must never leak into a gated run). A torn concurrent write self-heals: the header
 /// parse fails, we refetch, we rewrite.
 fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limit: usize) []u8 {
@@ -292,8 +288,8 @@ pub const LESSON_SCOPE = "lessons";
 
 /// QUARANTINE for the end-of-run judge's proposals. Nothing recalls these scopes into prompts — they wait
 /// for review/promotion. The judge (a trace reader on the gateway model) never writes a live scope: an
-/// ungrounded "lesson" written straight into binding context is the documented round-8 phantom-directive
-/// failure this split exists to prevent.
+/// ungrounded "lesson" written straight into binding context is the phantom-directive failure this split
+/// exists to prevent.
 pub const LESSON_PROPOSED_SCOPE = "lessons-proposed";
 pub const SKILL_PROPOSED_SCOPE = "skills-proposed";
 
@@ -303,10 +299,9 @@ pub const SKILL_PROPOSED_SCOPE = "skills-proposed";
 /// back into every mind's prompt as the gradient to raise.
 pub const SCORE_SCOPE = "score";
 
-/// Shared HIVE KNOWLEDGE — facts any mind learns FOR THE TEAM (not just for itself). A scout that observes into
-/// its OWN scope is a hoarder: it learns, but the hive never sees it. Routing the scout's observe here (and
-/// injecting this scope into every mind's prompt) makes the learner a real contributor — knowledge brought BACK
-/// to the hive, not held. Swarm-shared, like SKILL_SCOPE.
+/// Shared HIVE KNOWLEDGE — facts any mind learns FOR THE TEAM, not just for itself. Routing the scout's
+/// observe here (and injecting this scope into every mind's prompt) makes the learner a contributor: knowledge
+/// is brought back to the hive, not held. Swarm-shared, like SKILL_SCOPE.
 pub const KNOWLEDGE_SCOPE = "knowledge";
 
 /// The EXTERNAL / runtime-LEARNED cache: facts the swarm acquired from the live web at runtime (scout/web tools)
@@ -338,7 +333,7 @@ pub const SIM_SCOPE = "simulations";
 pub const OPERATE_SCOPE = "operate";
 // The two scopes the read-only traversal map accumulates into: MAP_SCOPE holds edge-facts ("<node> <rel>
 // <next>") that chain/assoc walk; NODE_SCOPE holds per-node attribute facts ("[scheme] <node> attrs"). Kept
-// separate so a chain over the map can never collide with node descriptions (verified: scopes isolate).
+// separate so a chain over the map can never collide with node descriptions.
 pub const MAP_SCOPE = "map";
 pub const NODE_SCOPE = "node";
 pub const EPISODE_SCOPE = "episodes";
@@ -358,10 +353,9 @@ pub const CANARY_SCOPE = "canary";
 /// Explicit autonomy stack snapshots: mission, strategy, execution, governor checks.
 pub const AUTONOMY_SCOPE = "autonomy";
 
-/// The hive's shared SPATIAL MAP — discovered cells of a hidden grid, written by `probe`. A hive's structural
-/// superpower is PARALLEL REGION-SEARCH: when a space is too big for one mind to perceive at once, the minds
-/// partition it, each probes a DIFFERENT region, and the findings accumulate HERE as one shared map every mind
-/// can read — ant-colony style (this scope is the pheromone trail). Injected in full each moment so the
+/// The hive's shared SPATIAL MAP — discovered cells of a hidden grid, written by `probe`. When a space is too
+/// big for one mind to perceive at once, the minds partition it, each probes a DIFFERENT region, and the
+/// findings accumulate HERE as one shared map every mind can read. Injected in full each moment so the
 /// collective map (not any one mind's local view) drives reconstruction. Empty unless a deploy supplies `space`.
 pub const SPACE_SCOPE = "space";
 
@@ -423,17 +417,15 @@ pub const ASK_VEIL_TOOL =
 /// itself). Joined with ",\n" so ask_veil is its OWN line for the newline-split tool droppers (offlineSchema etc.).
 pub const FULL_SCHEMA = SCHEMA ++ ",\n" ++ ASK_VEIL_TOOL;
 
-/// The CHAT veil's tool set — the subset of SCHEMA a solo, top-level chat turn can actually reach. The full ~33-tool
-/// SCHEMA carries swarm-mind / host-sim / RSI-only verbs (patch_system, host_command/status, osint_scan, deep_crawl,
-/// make_tool, propose_change, simulate_change, send_message, add_task, complete_task, stage_delivery,
-/// propose_plan_change, note_stance, save_skill, journal, set_directive, share, probe) that a chat veil has no teammate
-/// bus, no host, no spatial grid, and no RSI governance loop to use — carrying them only inflates the per-turn prefill
-/// (~7k tokens re-sent every drive step, re the note above) and, worse, invites the model to emit an off-surface tool
-/// call that burns a whole agentic round-trip. This keeps exactly the tools SYSTEM_PROMPT (chat_engine.zig) names:
-/// the web trio (web_search/web_fetch/read_url, + fetch_json for JSON APIs), the build set (read/write/edit/list_dir/
-/// run_python/run_tests/delete_file), and memory (observe/recall/recall_hive). The veil's orchestration verbs
-/// (cast/steer_swarm/…) are concatenated separately in chat_engine.zig (ORCH_TOOLS), not here. Defs are copied
-/// VERBATIM from SCHEMA above so the block stays byte-identical (stable provider prefix cache); keep them in sync.
+/// The CHAT veil's tool set — the subset of SCHEMA a solo, top-level chat turn can actually reach. The full
+/// SCHEMA carries swarm-mind / host-sim / RSI-only verbs (patch_system, host_command/status, make_tool, share,
+/// probe, …) that a chat veil has no teammate bus, host, spatial grid, or governance loop to use; carrying them
+/// only inflates the per-turn prefill (~7k tokens re-sent every drive step) and invites an off-surface tool
+/// call that burns a whole agentic round-trip. Keeps exactly the tools SYSTEM_PROMPT (chat_engine.zig) names:
+/// the web trio (web_search/web_fetch/read_url, + fetch_json for JSON APIs), the build set (read/write/edit/
+/// list_dir/run_python/run_tests/delete_file), and memory (observe/recall/recall_hive). Orchestration verbs
+/// (cast/steer_swarm/…) are concatenated separately in chat_engine.zig (ORCH_TOOLS). Defs are copied VERBATIM
+/// from SCHEMA above so the block stays byte-identical (stable provider prefix cache); keep them in sync.
 pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
@@ -474,14 +466,12 @@ pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"send_message","description":"Send the single most useful thing you learned to a teammate (or 'all').","parameters":{"type":"object","properties":{"to":{"type":"string"},"text":{"type":"string"}},"required":["to","text"]}}}
 ;
 
-/// The ASSEMBLER's tool set — the minimal authoring set for a small model (8B) in scaffold-and-fill mode. The full
-/// 28-tool SCHEMA (~6k tokens, re-sent every turn) drowns a weak model and confuses weak tool-calling, so the
-/// assembler is given ONLY what it needs: read what exists, write the fill, record a fact, recall_hive — so it can
-/// PULL the exact concept/pattern the hive already learned before it builds (without recall, learned knowledge is
-/// stored-and-forgotten) — AND send_message, so parallel minds building separate files can agree on the interfaces
-/// between them. save_skill is here too: the lean tier is where techniques are actually WORKED OUT (every local
-/// model lands in this regime), and without a save path the skill-development RSI loop is structurally dead for
-/// exactly the minds doing the developing. No web/search (the scout's job), no run_python/run_tests, and no
+/// The ASSEMBLER's tool set — the minimal authoring set for a small model (8B) in scaffold-and-fill mode. The
+/// full SCHEMA (~6k tokens, re-sent every turn) drowns a weak model and confuses weak tool-calling, so the
+/// assembler gets ONLY what it needs: read what exists, write the fill, observe, recall_hive (PULL the exact
+/// pattern the hive already learned before building), send_message (parallel minds agree on interfaces), and
+/// save_skill (the lean tier is where techniques get worked out — without a save path the skill-development loop
+/// is dead for the minds doing the developing). No web/search (the scout's job), no run_python/run_tests, and no
 /// make_tool (authoring+invoking dynamic tools needs the full schema a lean model can't carry). Keep defs in
 /// sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
@@ -604,11 +594,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             out.appendSlice(gpa, part) catch {};
         }
         // SECOND-STAGE RERANK: first-stage assoc always returns its argmax even when nothing truly matches the
-        // query (the "surfaces a top match even when nothing matches" failure). When a gateway (BYOK) endpoint
-        // is configured and there's a real field to reorder, judge the hits against the query through the
-        // selected API: reorder+filter to the genuinely-relevant ones, or ABSTAIN so the mind is told the hive
-        // has nothing relevant instead of being handed off-topic facts to chase. Falls through to the raw
-        // recall on any failure — never worse than first-stage. (See rerank.zig for the algorithm.)
+        // query. When a gateway (BYOK) endpoint is configured and there's a real field to reorder, judge the
+        // hits against the query through the selected API: reorder+filter to the genuinely-relevant ones, or
+        // ABSTAIN so the mind is told the hive has nothing relevant instead of chasing off-topic facts. Falls
+        // through to the raw recall on any failure — never worse than first-stage. (See rerank.zig.)
         var cands: std.ArrayListUnmanaged([]const u8) = .empty;
         defer cands.deinit(gpa);
         var lit = std.mem.splitScalar(u8, out.items, '\n');
@@ -672,10 +661,9 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer p.deinit();
         if (std.mem.trim(u8, p.value.skill, " \r\n\t").len == 0) return dupe(gpa, "empty skill, nothing saved");
         if (p.value.name.len >= 3) {
-            // Exact-name dedup FIRST, via the mirrored skills/<slug>.md — deterministic where semantic
-            // recall is not: the recall guard alone let 7 parallel minds re-save the same skill every
-            // round (recall abstains on path-shaped names like 'veil/data/links.json', and concurrent
-            // minds race the observe). 39 saves → ~10 distinct skills, observed live (open_ai_test_3).
+            // Exact-name dedup FIRST, via the mirrored skills/<slug>.md — deterministic where semantic recall
+            // is not: recall abstains on path-shaped names like 'veil/data/links.json', and concurrent minds
+            // race the observe, so the recall guard alone lets parallel minds re-save the same skill.
             var slug_buf: [64]u8 = undefined;
             const slug = slugify(&slug_buf, p.value.name);
             const mirrored = std.fmt.allocPrint(gpa, "{s}/skills/{s}.md", .{ ctx.workdir, slug }) catch "";
@@ -1000,8 +988,7 @@ fn ciLastIndexOf(hay: []const u8, needle: []const u8) ?usize {
 /// The byte offset to splice appended BODY content in FRONT of, for a file that already closed an HTML/XML
 /// document: before the last </body> (else the last </html>). null when there is no such closing tag (a code
 /// file → tail-append as usual). A naive tail-append onto an already-closed page lands the next chunk AFTER
-/// </html>, outside the document (the observed "second chunk injected outside the html context" bug). Only the
-/// tail is scanned — closers live at the end.
+/// </html>, outside the document. Only the tail is scanned — closers live at the end.
 fn htmlCloseInsert(prior: []const u8) ?usize {
     const from = if (prior.len > 8192) prior.len - 8192 else 0;
     const tail = prior[from..];
@@ -1067,10 +1054,8 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (ctx.one_slot and ctx.blueprint.len > 0 and blueprintHas(ctx.blueprint, wpath) and !pathKeyMatch(ctx.slot_path, wpath)) {
         // r2+ FRONTIER RESCUE, mirroring the teammate-guard rescue below: the first still-unbuilt
         // blueprint file IS the team's current piece — writing it cannot jump ahead, and with nothing
-        // in the manifest there is nothing to clobber. Without this valve the guard composed with the
-        // salvage length floor into a deadlock no mind could escape (sim_atlas_kotlin2: 6 straight
-        // rounds stuck on a 2-char expenses.json — the owner's every salvage was floor-rejected while
-        // every teammate's correct write bounced HERE).
+        // in the manifest there is nothing to clobber. Without this valve the guard composes with the
+        // salvage length floor into a deadlock no mind can escape.
         const frontier_rescue = ctx.round > 1 and !builtAlready(ctx, wpath) and isFrontierFile(ctx, wpath);
         if (!frontier_rescue) {
             noteWriteReject(ctx, wpath, " — write refused: single-author ordered file, not this mind's slot; ");
@@ -1083,8 +1068,8 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(full);
     // A write into the mind's OWN engine-assigned slot always stands: a strategy-override slot (a built file
     // being FIXED) can simultaneously sit in a teammate's deepen-phase my_files list, and without this
-    // exemption the pinned mind's every write_file was rejected as "a teammate's file" — write_file fully dead
-    // for exactly the mind the orchestrator sent to fix the bottleneck.
+    // exemption the pinned mind's every write_file is rejected as "a teammate's file" — dead for exactly the
+    // mind the orchestrator sent to fix the bottleneck.
     const is_own_slot = ctx.slot_path.len > 0 and pathKeyMatch(ctx.slot_path, wpath);
     if (!is_own_slot and ctx.owned_by_others.len > 0 and fileOwnedBy(ctx.owned_by_others, wpath) and !fileOwnedBy(ctx.my_files, wpath)) {
         const rescue = ctx.round > 1 and !builtAlready(ctx, wpath);
@@ -1094,12 +1079,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         }
     }
     // SAME-ROUND SERIALIZATION — ownership decides who MAY write, this checks who already DID: a full
-    // overwrite of a file a teammate LANDED this round throws their finished repair away wholesale
-    // (observed live, open_ai_advanced_test: repeated pairs of legitimate same-round writes on one hot
-    // file — a rescue plus an owner, or two minds sharing an incomplete file — each pair costing one
-    // mind-round of work). First landed write wins the round; a latecomer is routed to read + edit_file
-    // (the VCS merge path, anchor-guarded against staleness) or to a different failing point. Appends
-    // stay open (additive), and the ledger is round-scoped so the file is freely rewritable next round.
+    // overwrite of a file a teammate LANDED this round throws their finished repair away wholesale. First
+    // landed write wins the round; a latecomer is routed to read + edit_file (the VCS merge path, anchor-
+    // guarded against staleness) or to a different failing point. Appends stay open (additive), and the
+    // ledger is round-scoped so the file is freely rewritable next round.
     if (!std.mem.eql(u8, p.value.mode, "append")) {
         lockFiles(ctx);
         const landed = sameRoundWriter(ctx, wpath);
@@ -1124,11 +1107,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         const prior = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch &[_]u8{};
         defer if (prior.len > 0) gpa.free(prior);
         // A .py append that RE-DEFINES a top-level name the file already has can NOT be glued (it doubles the
-        // definition — observed live: users.py doubled end to end via an append whose first line differed, so
-        // the restart guard missed it) and can NOT be trusted as a whole-file rewrite either (a chunked build's
-        // next part often sloppily re-emits one earlier def; replacing the file would destroy chunk 1's other
-        // definitions). The only safe move is REJECT with the exact conflicting name and route the model to
-        // edit_file / a clean append / an explicit overwrite.
+        // definition) and can NOT be trusted as a whole-file rewrite either (a chunked build's next part often
+        // sloppily re-emits one earlier def; replacing the file would destroy chunk 1's other definitions). The
+        // only safe move is REJECT with the exact conflicting name and route the model to edit_file / a clean
+        // append / an explicit overwrite.
         const redef: ?[]const u8 = if (std.mem.endsWith(u8, wpath, ".py")) pyAppendRedefines(prior, clean) else null;
         if (appendRestartsFile(prior, clean)) {
             restarted = true;
@@ -1140,9 +1122,8 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             defer joined.deinit(gpa);
             // STRUCTURED APPEND: if the prior chunk already CLOSED an HTML/XML document, splice the new body
             // content in BEFORE the closing </body> (else </html>) so a chunked page assembles into ONE valid
-            // document — a naive tail-append lands the next section AFTER </html>, outside the page (the
-            // observed bug: "the second chunk injected outside the html context"). Code files (no closing tag)
-            // append at the end as before.
+            // document — a naive tail-append lands the next section AFTER </html>, outside the page. Code files
+            // (no closing tag) append at the end as before.
             if (htmlCloseInsert(prior)) |ins| {
                 joined.appendSlice(gpa, prior[0..ins]) catch {};
                 if (ins > 0 and prior[ins - 1] != '\n') joined.append(gpa, '\n') catch {};
@@ -1185,12 +1166,11 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
 }
 
 /// An "append" whose body RE-OPENS the file (the same first meaningful line as the existing head — the same
-/// shebang or the same first import) is a fresh ATTEMPT, not a continuation: gluing it on produced files like
-/// cli.py = two half-programs (a truncated `if` followed by a second `import argparse`) that can never parse.
-/// Treat it as the rewrite the model actually meant. Lines shorter than 6 chars (`}`, `"""`) never match.
-/// SIZE GUARD: a real re-attempt is a whole file, so the body must be at least HALF the prior — a 15-line
-/// fragment that merely re-emits the import line is a sloppy continuation, and replacing a 200-line module
-/// with it would be silent data loss (a repeated import mid-file is a harmless no-op; glue it instead).
+/// shebang or the same first import) is a fresh ATTEMPT, not a continuation: gluing it on produces two half-
+/// programs that can never parse. Treat it as the rewrite the model actually meant. Lines shorter than 6 chars
+/// (`}`, `"""`) never match. SIZE GUARD: a real re-attempt is a whole file, so the body must be at least HALF
+/// the prior — a fragment that merely re-emits the import line is a sloppy continuation, and replacing a
+/// 200-line module with it would be silent data loss (a repeated import mid-file is a harmless no-op; glue it).
 fn appendRestartsFile(prior: []const u8, body: []const u8) bool {
     const a = firstMeaningfulLine(prior);
     if (a.len < 6) return false;
@@ -1249,8 +1229,8 @@ fn pyAppendRedefines(prior: []const u8, body: []const u8) ?[]const u8 {
 /// can't run — fail-open), else an owned "line N: message" / "duplicate top-level definition(s): ..." string
 /// (caller frees). Beyond the SyntaxError gate, it AST-checks that the edit did not paste a SECOND copy of a
 /// top-level def/class the file already had — valid Python, so compile() passes it, but it is the signature
-/// corruption of a REPLACE whose text re-emits the whole module (observed live: users.py doubled end to end).
-/// The pre-edit source rides NL_CHK_ORIG so a file that ALREADY carries duplicates stays editable — only
+/// corruption of a REPLACE whose text re-emits the whole module. The pre-edit source rides NL_CHK_ORIG so a
+/// file that ALREADY carries duplicates stays editable — only
 /// NEWLY-introduced duplicates reject. Sources ride env vars so no scratch file is needed.
 fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
@@ -1264,7 +1244,7 @@ fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     env.put("NL_CHK_ORIG", if (orig.len > 80_000) source else orig) catch return null;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     // dup check counts only UNDECORATED defs: @overload / @singledispatch.register / @property setters
-    // legitimately repeat a top-level name (verified live) — a decorator means "not a plain redefinition".
+    // legitimately repeat a top-level name — a decorator means "not a plain redefinition".
     const code = "import os,sys,ast\nsrc=os.environ.get('NL_CHK_SRC','')\ntry:\n compile(src,'<edit>','exec')\nexcept SyntaxError as e:\n sys.stdout.write('line %s: %s'%(getattr(e,'lineno','?'),(e.msg or 'syntax error')));sys.exit(7)\nexcept Exception:\n sys.exit(0)\ntry:\n def tops(s):\n  seen=set();d=set()\n  for n in ast.parse(s).body:\n   if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and not n.decorator_list:\n    if n.name in seen: d.add(n.name)\n    seen.add(n.name)\n  return d\n nd=sorted(tops(src)-tops(os.environ.get('NL_CHK_ORIG','')))\n if nd:\n  sys.stdout.write('duplicate top-level definition(s): '+', '.join(nd));sys.exit(8)\nexcept Exception:\n pass\nsys.exit(0)\n";
     const argv = [_][]const u8{ py, "-c", code };
     // TIMEOUT: this gate can run while vcs.commitEdit holds the ONE worker file mutex — an unbounded child
@@ -1290,9 +1270,9 @@ fn editRejectMsg(gpa: std.mem.Allocator, npath: []const u8, perr: []const u8) ?[
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // Accept BOTH edit dialects: the hive prompt teaches {op, anchor, text}; the chat prompt teaches
-    // {search, replace} (no op). Parsing only anchor/text silently DROPPED search/replace → every chat
-    // edit ran with an EMPTY anchor and failed as a phantom "edit conflict" (the file never changed while
-    // the model declared DONE). `search`/`replace` are aliases; `op` defaults to "replace".
+    // {search, replace} (no op). Parsing only anchor/text silently drops search/replace, so every chat edit
+    // runs with an EMPTY anchor and fails as a phantom "edit conflict". `search`/`replace` are aliases; `op`
+    // defaults to "replace".
     const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", search: []const u8 = "", text: []const u8 = "", replace: []const u8 = "", at: usize = 0 };
     // Top-level `search`/`replace` too: a FLAT {path, search, replace} call (no ops array) is what an XML-shaped
     // tool call converts to, and some models emit it directly — treat it as a single replace op.
@@ -1314,10 +1294,8 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         return std.fmt.allocPrint(gpa, "{s} does not exist (or is over 1MiB) — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
     defer gpa.free(original);
     // A marker-corrupted file is structurally edit-hostile: its repeated `<<<<<<<`/`=======`/`>>>>>>>` lines
-    // make anchors ambiguous ("matches more than one place") and partial cleanups strand residue — observed
-    // live (sim_synapse r10-r14): five straight rounds of correctly-targeted fix attempts all bounced off
-    // anchoring while the corrupted crate root held the build at 0%. The only reliable repair is a clean
-    // full rewrite, so route there instead of letting ops fight the markers.
+    // make anchors ambiguous ("matches more than one place") and partial cleanups strand residue. The only
+    // reliable repair is a clean full rewrite, so route there instead of letting ops fight the markers.
     if (bufedit.editMarkerCorruption(original))
         return std.fmt.allocPrint(gpa, "{s} currently contains unresolved SEARCH/REPLACE / merge-conflict marker lines from an earlier bad edit — anchors are unreliable in it and partial cleanups leave broken residue. Do NOT edit it: REWRITE it clean in full with write_file path:\"{s}\" mode:\"overwrite\", sending the complete final code with ZERO marker lines.", .{ npath, npath }) catch dupe(gpa, "file is marker-corrupted — rewrite it in full with write_file mode:\"overwrite\"");
     var ops: std.ArrayListUnmanaged(bufedit.EditOp) = .empty;
@@ -1375,10 +1353,10 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // case already returned above), so a single-mind run gets identical protection.
     if (bufedit.editMarkerCorruption(res.bytes))
         return dupe(gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
-    // POST-EDIT COMPILE GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py unparseable —
-    // observed live: an edit dropped a function body, users.py:85 IndentationError, and edit_file reported
-    // "edited" so the mind only learned two rounds later via the global scan. Reject a parse-breaking edit and
-    // name the error NOW, in the same turn, keeping the last good file. Fail-open (a broken python env = no gate).
+    // POST-EDIT COMPILE GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py unparseable while
+    // edit_file still reports "edited", so the mind only learns rounds later via the global scan. Reject a
+    // parse-breaking edit and name the error NOW, in the same turn, keeping the last good file. Fail-open (a
+    // broken python env = no gate).
     if (std.mem.endsWith(u8, npath, ".py")) {
         if (pyCompileError(ctx, res.bytes, original)) |perr| {
             defer gpa.free(perr);
@@ -1480,15 +1458,13 @@ fn dirListing(ctx: *ToolCtx, full: []const u8, rpath: []const u8) ?[]u8 {
 fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // start_line/end_line (1-indexed, inclusive) let the reader window a big file — without them the read is
-    // clipped to the HEAD, so a model asking for lines near the end of a >8KB file got the top forever and
-    // spiralled (observed live: a chat re-reading the top 8KB of a 17KB shooter.html it needed to fix at
-    // ~line 300). `offset`/`limit` are accepted as line-based aliases (offset = first line, limit = count).
+    // clipped to the HEAD, so a model asking for lines near the end of a >8KB file gets the top forever and
+    // spirals. `offset`/`limit` are accepted as line-based aliases (offset = first line, limit = count).
     const A = struct { path: []const u8 = "", start_line: usize = 0, end_line: usize = 0, offset: usize = 0, limit: usize = 0 };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     // "look around" floor: reading the workdir root (or any directory) returns a LISTING instead of "not
-    // found" — without it minds have no way to see what exists and write _ls.py scripts they can't run
-    // (observed live, c6a50258c: 7 rewrites of a listing script, zero executions, zero real work).
+    // found" — without it minds have no way to see what exists and write _ls.py scripts they can't run.
     if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".") or std.mem.eql(u8, p.value.path, "./")) {
         return dirListing(ctx, ctx.workdir, ".") orelse dupe(gpa, "the workdir is empty");
     }
@@ -1503,8 +1479,8 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(full);
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch blk_big: {
         // Not a plain small file. A DIRECTORY gets its listing; a file BIGGER than the slurp cap gets read
-        // with a raised ceiling — the old bare "not found" was a LIE for both (a 469KB source read as
-        // nonexistent, so the one file that mattered most was reported missing — observed live, c6a50258c).
+        // with a raised ceiling — a bare "not found" would be a LIE for both (a large source would read as
+        // nonexistent, hiding the file that mattered most).
         if (dirListing(ctx, full, rpath)) |listing| return listing;
         const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch return dupe(gpa, "not found");
         if (st.size > (4 << 20)) return std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large to read whole — read it in pieces with a line range: {{\"path\":\"{s}\",\"start_line\":1,\"end_line\":400}}", .{ rpath, st.size, p.value.path }) catch dupe(gpa, "file too large");
@@ -1522,9 +1498,8 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const cap: usize = if (owned) 32000 else 8000;
     if (clean.len <= cap) return dupe(gpa, clean);
     // A silently-cut read looks EXACTLY like a truncated file — the reader then "fixes" a healthy file or
-    // spirals on tail-verification (observed live: the chat veil burned its whole follow-through budget
-    // re-reading a complete index.html because the view ended mid-markup). Name the cut, the real size, AND
-    // how to see the rest (a line range), so the reader windows the tail instead of re-reading the head.
+    // spirals on tail-verification. Name the cut, the real size, AND how to see the rest (a line range), so the
+    // reader windows the tail instead of re-reading the head.
     return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ clean[0..cap], cap, clean.len, p.value.path }) catch dupe(gpa, clean[0..cap]);
 }
 
@@ -2130,7 +2105,7 @@ test "urlAllowed SSRF guard: IPv6 literals fail closed; private v4 + metadata st
 }
 
 test "looksLikeJsShell flags unrendered SPA pages so webFetch falls back to the reader" {
-    // the exact shapes the moltbook docs spiral kept re-fetching
+    // unrendered SPA placeholders a plain fetch returns instead of real content
     try std.testing.expect(looksLikeJsShell("Loading... Getting Started on Moltbook"));
     try std.testing.expect(looksLikeJsShell("<div id=\"__next\"></div>"));
     try std.testing.expect(looksLikeJsShell("You need to enable JavaScript to run this app."));
@@ -2226,10 +2201,10 @@ fn decodeEntity(s: []const u8) ?Entity {
     return null;
 }
 
-/// curl a page with a BROWSER user-agent. The bot UA in curlToText is exactly why sites block a plain curl and the
-/// codebase leaned on the jina reader; a browser UA makes a direct fetch work on most sites (and is what SERPs need).
-/// primitive (no ToolCtx): browser-UA curl into `tmp`, guarded, read back. Lets non-tool callers (the engine's
-/// retrieval seed) reuse the exact same fetch. Caller frees the returned body.
+/// curl a page with a BROWSER user-agent. The bot UA in curlToText is what makes sites block a plain curl; a
+/// browser UA makes a direct fetch work on most sites (and is what SERPs need). Primitive (no ToolCtx):
+/// browser-UA curl into `tmp`, guarded, read back. Lets non-tool callers (the engine's retrieval seed) reuse
+/// the exact same fetch. Caller frees the returned body.
 fn curlBrowserTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
@@ -2290,13 +2265,12 @@ fn queryEncode(gpa: std.mem.Allocator, q: []const u8) []u8 {
 /// now serves a consent-gated JS shell with zero harvestable results. Bing stays as a secondary in case DDG
 /// rate-limits. Both put the query last in the URL, so a single prefix+enc concat builds each (allocPrint needs a
 /// comptime fmt string, which a runtime engine list can't provide).
-/// SELF-HEALING CRAWL-AS-SEARCH (no ToolCtx) so the engine's retrieval seed can reuse it. `dir`+`tag` key the
-/// per-caller temp file. No single keyless engine is reliable everywhere — a residential IP gets clean results from
-/// DuckDuckGo while a datacenter/container IP is bounced to its homepage; Bing serves a JS consent-shell; Mojeek
-/// rate-limits to a captcha. So we ROTATE a list of keyless HTML engines and use whichever returns real results THIS
-/// time, harvested + decoded by OUR crawler (no jina/firecrawl/key). A per-engine COOLDOWN persisted to disk skips an
-/// engine that just bounced/captcha'd, so we neither re-hammer it nor waste a fetch every search — the "it fixes
-/// itself" property: as one engine goes down the rotation routes around it, and recovers it when the cooldown lapses.
+/// SELF-HEALING (no ToolCtx) so the engine's retrieval seed can reuse it. `dir`+`tag` key the per-caller temp
+/// file. No single keyless engine is reliable everywhere — a residential IP gets clean results from DuckDuckGo
+/// while a datacenter/container IP is bounced to its homepage; Bing serves a JS consent-shell; Mojeek captchas.
+/// So we ROTATE a list of keyless HTML engines and use whichever returns real results THIS time, harvested +
+/// decoded by OUR crawler. A per-engine COOLDOWN persisted to disk skips an engine that just bounced/captcha'd,
+/// so the rotation routes around a down engine and recovers it when the cooldown lapses.
 pub fn crawlSearchPrim(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag: []const u8, query: []const u8, max: usize) []const u8 {
     const enc = queryEncode(gpa, query);
     defer gpa.free(enc);
@@ -2491,7 +2465,7 @@ fn jsonChunk(s: []const u8) []const u8 {
 /// A plain fetch of a client-rendered SPA (React/Next/etc.) comes back as an empty shell — a "Loading…" /
 /// "enable JavaScript" placeholder plus cookie/ToS boilerplate — with none of the real content. Detect that so
 /// webFetch can retry through the JS-rendering reader instead of handing the model an unreadable page it then
-/// loops re-fetching (the live moltbook docs spiral: every fetch returned "Loading…" + a Terms banner).
+/// loops re-fetching.
 fn looksLikeJsShell(text: []const u8) bool {
     const t = std.mem.trim(u8, text, " \r\n\t");
     if (t.len < 64) return true; // too little to be real page content
@@ -2837,10 +2811,9 @@ fn isQueryDecoration(word: []const u8) bool {
 }
 
 /// True when the local RAG hits actually COVER the query — at least half of its significant (>=5 char,
-/// non-decoration) terms appear in them. Without this, three GENERIC facts short-circuit a SPECIFIC question:
-/// observed live, a "Zig comptime official documentation" query got answered from the pack's generic intro page
-/// and the scout never fetched comptime docs. Skipping the web is only justified when the hive is on-topic for
-/// THIS query; a thin/off-topic match must fall through to the web (with the local hits still prepended).
+/// non-decoration) terms appear in them. Without this, a few GENERIC facts short-circuit a SPECIFIC question.
+/// Skipping the web is only justified when the hive is on-topic for THIS query; a thin/off-topic match must
+/// fall through to the web (with the local hits still prepended).
 fn localCoversQuery(local: []const u8, query: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, query, " \t\r\n,.;:!?()[]{}\"'`-/");
     var sig: u32 = 0;
@@ -2859,9 +2832,9 @@ fn localCoversQuery(local: []const u8, query: []const u8) bool {
 /// engine consults the swarm's OWN knowledge — the prefetched nl-rag pack facts plus every teammate finding
 /// in the KNOWLEDGE/INTEL hive — with a spreading-activation recall on the same query. If the hive already
 /// answers it AND the query isn't asking for something fresh, those grounded facts are returned and the web is
-/// SKIPPED (the RAG database is genuinely consulted first, and a redundant scrape — the 404-march source — is
-/// avoided). Otherwise the local hits are PREPENDED to the live web results, so the model always sees what is
-/// already known before it reads the open web. A weak/empty hive degrades cleanly to the prior web-only path.
+/// SKIPPED (a redundant scrape is avoided). Otherwise the local hits are PREPENDED to the live web results, so
+/// the model always sees what is already known before it reads the open web. A weak/empty hive degrades cleanly
+/// to the prior web-only path.
 /// This is a general retrieval-order floor, not a per-task rule.
 fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
@@ -3193,11 +3166,10 @@ const PATCH_SYSTEM_PATCH_PY =
 /// [truncation-shaped breakage], non-empty otherwise — no content opinions; the
 /// goal-parameterized word-coverage path applies only when NL_DOC_TARGET_WORDS is set). The failure extractor
 /// ff() reads BOTH runners' native formats — unittest `FAIL:`/`ERROR:` blocks AND pytest's
-/// `FAILED node - reason` summary lines (a 0/7 round once reported "FAILING: (none)" because only the
-/// unittest shape was parsed, starving the steering loop of the very messages that named the fixes) — and
-/// malformed non-Python layer files (a broken config.json) ride along in `failures` even when tests score,
-/// so a multi-layer build hears about every layer. Model-uneditable: it runs via `python -c BENCH_PY`, so
-/// the swarm cannot fake or dodge its own fitness function.
+/// `FAILED node - reason` summary lines (parsing only one shape starves the steering loop of the messages that
+/// name the fixes) — and malformed non-Python layer files (a broken config.json) ride along in `failures` even
+/// when tests score, so a multi-layer build hears about every layer. Model-uneditable: it runs via
+/// `python -c BENCH_PY`, so the swarm cannot fake or dodge its own fitness function.
 pub const BENCH_PY =
     \\import sys,json,os,glob,subprocess,re,py_compile
     \\def out(d):
@@ -3514,9 +3486,8 @@ pub const SMOKE_PY =
 ///
 /// The contract is SIGNATURE-level, not just name-level: exports publish each function as `name(a, b=?, *args)`
 /// so builders see the real parameter list, and every cross-module CALL is checked against the def's arity and
-/// keyword names (observed live, sim_forum4 endgame: every remaining failure was a call-shape mismatch on a name
-/// that exists — start_server(host=..) vs def start_server(), init_db() vs def init_db(db_path)). The def stays
-/// canonical; a call with extra positionals, an unknown keyword, or a missing required argument is reported.
+/// keyword names (e.g. start_server(host=..) vs def start_server(), init_db() vs def init_db(db_path)). The def
+/// stays canonical; a call with extra positionals, an unknown keyword, or a missing required argument is reported.
 pub const INTERFACES_PY =
     \\import ast,os,glob,json,sys,difflib
     \\def out(d): sys.stdout.write(json.dumps(d)+"\n"); sys.exit(0)
@@ -3832,10 +3803,8 @@ fn builtAlready(ctx: *ToolCtx, path: []const u8) bool {
 /// The teammate (not this mind) whose write already LANDED on `path` THIS round, per the
 /// run_dir/.round_writes ledger ("round|mind|path" lines, appended on every successful write/edit).
 /// null when nobody has. This is the same-round serialization record: ownership guards decide who MAY
-/// write, this records who DID — observed live (open_ai_advanced_test r1-r8), two minds with an equally
-/// legitimate claim on one hot file kept landing full rewrites seconds apart, and every such pair threw
-/// one mind's whole repair away (r8: sol's 1909-byte index.py fix clobbered by nova's parallel 1753-byte
-/// rewrite). gpa-owned name when non-null; caller frees.
+/// write, this records who DID, so two minds with an equally legitimate claim on one hot file don't clobber
+/// each other's landed repair by landing full rewrites seconds apart. gpa-owned name when non-null; caller frees.
 fn sameRoundWriter(ctx: *ToolCtx, path: []const u8) ?[]u8 {
     const gpa = ctx.gpa;
     const rp = std.fmt.allocPrint(gpa, "{s}/.round_writes", .{ctx.run_dir}) catch return null;
@@ -4018,7 +3987,7 @@ test "isNumeric detects a bare PID target (drives the interlock identifier resol
 }
 
 test "appendRestartsFile: a restarted attempt is caught; a real continuation appends" {
-    // the observed cli.py failure: a truncated first attempt + a second attempt glued on via append
+    // a truncated first attempt + a second attempt glued on via append — a re-attempt, not a continuation
     const attempt1 = "import argparse\nimport json\n\ndef load_tasks():\n    if\n";
     const attempt2 = "import argparse\nimport json\nfrom pathlib import Path\n\ndef main():\n    pass\n";
     try std.testing.expect(appendRestartsFile(attempt1, attempt2));
@@ -4037,8 +4006,8 @@ test "appendRestartsFile: a restarted attempt is caught; a real continuation app
 }
 
 test "pyAppendRedefines: a re-attempt that re-defines existing top-level names is caught even with a different opening line" {
-    // the sim_forum4 users.py corruption: a second full copy of the module, opening with a DIFFERENT first
-    // line (a comment), glued below the first — the first-line restart guard missed it.
+    // a second full copy of the module, opening with a DIFFERENT first line (a comment) glued below the
+    // first — the first-line restart guard alone would miss it.
     const prior = "\"\"\"User auth.\"\"\"\nimport hashlib\n\ndef register(u, p):\n    pass\n\ndef verify(u, p):\n    pass\n";
     const reattempt = "# src/auth/users.py\nimport os\nimport hashlib\n\ndef register(u, p):\n    pass\n\ndef verify(u, p):\n    return True\n";
     try std.testing.expectEqualStrings("register", pyAppendRedefines(prior, reattempt).?);

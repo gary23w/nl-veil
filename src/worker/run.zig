@@ -76,10 +76,8 @@ pub const MindState = struct {
     persona: [6]f32 = .{ 0.5, 0.5, 0.5, 0.5, 0.5, 1.0 },
     lane: []const u8 = "",
     lane_owned: bool = false,
-    // TOOL-LOOP GUARD: identical calls that keep returning identical results are a loop, not work — the
-    // dominant waste in observed runs (12 recall_hive echoes returning one irrelevant fact; repeated dead
-    // read probes). Mind-local (moments for one mind are sequential), survives rounds so a cross-round echo
-    // is caught too.
+    // TOOL-LOOP GUARD: identical calls that keep returning identical results are a loop, not work. Mind-local
+    // (moments for one mind are sequential), survives rounds so a cross-round echo is caught too.
     guard: [24]GuardRec = @splat(.{}),
     scout: bool = false,
     stances: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -196,7 +194,7 @@ pub const Worker = struct {
     depgraph_str: []const u8 = "",
     smoke_ok: bool = true,
     smoke_str: []const u8 = "",
-    gov_calm: u8 = 0, // consecutive rounds the governor measured a LOWER level than current — relax needs 2 (hysteresis; observed live: 0->1->0->1 flap on a meta-share hovering at the boundary)
+    gov_calm: u8 = 0, // consecutive rounds the governor measured a LOWER level than current — relax needs 2 (hysteresis against boundary flap)
     build_str: []const u8 = "",
     iface_str: []const u8 = "",
     exports_str: []const u8 = "", // per-module public export contract (from the live import graph) — the shared
@@ -477,13 +475,11 @@ fn factRelevant(sent: []const u8, goal: []const u8) bool {
 /// nl-rag PACK PREFETCH — the engine does the two-hop a weak model won't. On an atlas match, pull the matched
 /// domain's distilled `pack.facts` (deterministic raw.githubusercontent url derived from the pack INDEX url;
 /// rides the shared 7-day fetch cache, so it costs one GET ever) and seed GOAL-RELEVANT facts straight into the
-/// shared KNOWLEDGE hive as grounded canonical neurons. This is the "give a low-budget model strength" floor:
-/// a scout STARTS grounded on real documentation facts instead of firing blind web_searches that 404 on the
-/// search scrape's mangled breadcrumb urls (observed live — casts fetched pack urls ZERO times, then 404-marched
-/// the open web). Two passes: (1) seed facts that match the goal's own words — so a "comptime" goal gets comptime
-/// facts, not just the pack's generic intro page (the earlier "first 8 lines" version seeded ONLY page 1, which
-/// made RAG-first answer specific questions from generic material); (2) if the goal barely matched, top up with a
-/// stride sample across the file for a diverse floor. Pure additive; skipped under an egress allowlist.
+/// shared KNOWLEDGE hive as grounded canonical neurons — a scout STARTS grounded on real documentation instead
+/// of firing blind web_searches that 404 on mangled breadcrumb urls. Two passes: (1) seed facts matching the
+/// goal's own words so a "comptime" goal gets comptime facts, not just the pack's generic intro page; (2) if the
+/// goal barely matched, top up with a stride sample across the file for a diverse floor. Pure additive; skipped
+/// under an egress allowlist.
 fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
     if (!w.internet or egress_allow.len > 0) return;
     const gpa = w.gpa;
@@ -713,12 +709,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     {
         const envv = if (environ.get("NL_AUTONOMY")) |v| v else "";
         w.autonomy_full = std.ascii.eqlIgnoreCase(std.mem.trim(u8, m.autonomy, " \t"), "full") or std.ascii.eqlIgnoreCase(std.mem.trim(u8, envv, " \t"), "full");
-        // FULL autonomy IS self-direction. w.autonomous gates self-origination (empty goal → pick a purpose)
-        // and goal-chaining (completed → evolve to the next self-chosen goal); it was a separate config bool
-        // that no CLI path ever set, so both were dead — sim_freeroam1 ran its whole life on an EMPTY goal
-        // and self-completed in 5 rounds without ever originating OR chaining. The operator's "--autonomy full"
-        // grant is exactly the permission those two behaviors need, so derive it here. Bounded stays
-        // autonomous=false (propose-and-hold via goal_growth), preserving the human-in-the-loop path.
+        // FULL autonomy IS self-direction, so derive w.autonomous from it here. w.autonomous gates
+        // self-origination (empty goal → pick a purpose) and goal-chaining (completed → evolve to the next
+        // self-chosen goal); the "--autonomy full" grant is exactly the permission those behaviors need.
+        // Bounded stays autonomous=false (propose-and-hold via goal_growth), preserving human-in-the-loop.
         if (w.autonomy_full) w.autonomous = true;
         if (live) w.act("engine", 0, "autonomy", if (w.autonomy_full) "full" else "bounded", if (w.autonomy_full) "FULL self-direction — the hive may act on discovered powers, approve its own work, ORIGINATE its own purpose from an empty goal, and CHAIN to a new self-chosen goal after each completion (operator-set, dev environment)" else "bounded — the hive discovers + proposes capability growth, but flags risky self-expansion for the operator");
     }
@@ -890,9 +884,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     // Skip the LLM goal-rewrite ("intent brief") for quick AND every cast-originated run (w.cast_run): a cast
     // goal is composed by the caller (the chat mind, or an explicit CAST: line) and is ALREADY the precise
     // instruction — re-interpreting it through the gateway model DRIFTS a specific request into a paraphrase the
-    // swarm then chases instead of the actual ask (user: "the swarm is incapable of following basic prompts …
-    // maybe the intuition feature … especially inside a casting event"). Only free-roam Deploy-tab swarms, which
-    // get a raw human goal that may be vague, still get the brief.
+    // swarm then chases instead of the actual ask. Only free-roam Deploy-tab swarms, which get a raw human goal
+    // that may be vague, still get the brief.
     if (live and !w.quick and !w.cast_run) {
         w.goal_brief = rsi.interpretGoal(&w, goal);
         if (w.goal_brief.len > 0) {
@@ -939,11 +932,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.discourse = discourseMode(&w, goal);
         }
         // NEWS DESK is AUTHORITATIVE over every branch above: a publish run is a research/briefing hive
-        // whatever the mode/style classifier decided. This is the load-bearing line for "the hive posts its
-        // thesis to Telegraph" — without it a LONG (continuous) publish cast has w.cast=false (mode is
-        // "continuous", not "cast"), falls to discourseMode(), which answers BUILD when unsure and reads
-        // "write a thesis / publish it" as a document artifact — so the minds scaffold files and
-        // consolidateBriefing/publishArtifact (both gated on w.discourse) never fire and nothing is posted.
+        // whatever the mode/style classifier decided. Without it a LONG (continuous) publish cast has
+        // w.cast=false (mode is "continuous", not "cast"), falls to discourseMode() which answers BUILD when
+        // unsure — the minds scaffold files and consolidateBriefing/publishArtifact (both gated on w.discourse)
+        // never fire, so nothing is posted.
         if (w.publish_on and !w.discourse) {
             w.discourse = true;
             w.internet = true; // a news desk with no web access can't ground a single citation → nothing passes the gate
@@ -952,8 +944,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     }
     // DECLARED DELIVERABLES: the caller named the exact output files (the chat's veil REASONS them out of
     // the user's ask and sends them with the cast — model-declared, engine-carried). Adopt them verbatim
-    // and skip every guessing path: goal-prose extraction misread inputs as outputs (observed live,
-    // c6a50258c — the blueprint graded the 12 source files the goal said to READ).
+    // and skip every guessing path: goal-prose extraction can misread inputs as outputs (the files the goal
+    // says to READ graded as deliverables).
     if (live and !w.operating and m.files.len > 0 and !w.publish_on) {
         // (a PUBLISH cast is a news desk, not a file build — declared files must not flip it back to build
         // mode and strand the briefing/publish path; such a cast should simply not declare files)
@@ -985,10 +977,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         }
     } else if (live and !w.discourse and !w.operating and w.cast and w.blueprint.len == 0) {
         // A quick CAST gets no PLANNED blueprint (by design — no scaffolding over --embed), but when the
-        // GOAL ITSELF names the deliverable files, adopt exactly those, verbatim, as the blueprint.
-        // Without it the assembler one-slot pin sends EVERY mind to the first goal-named file — the
-        // observed cast failure: three minds all assigned index.html, varieties.html never owned by
-        // anyone, while the coverage benchmark demanded it. Zero model calls; goal-named files only.
+        // GOAL ITSELF names the deliverable files, adopt exactly those, verbatim, as the blueprint. Without it
+        // the assembler one-slot pin sends EVERY mind to the first goal-named file, leaving other required
+        // files unowned. Zero model calls; goal-named files only.
         w.blueprint = goalNamedFiles(gpa, goal);
         if (w.blueprint.len > 0) {
             w.emit("blueprint", std.fmt.allocPrint(w.a(), ",\"files\":\"{s}\"", .{w.esc(clip(w.blueprint, 1600))}) catch ",\"files\":\"\"");
@@ -1312,11 +1303,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.reject_notes.clearRetainingCapacity(); // folded into this round's fitness — start the next round's ledger clean
             // ZERO-GRADIENT SENTINEL — when the failing checks produce SHAPE-IDENTICAL failures for three
             // straight rounds while the file tree changed every round, the minds' edits are not reaching the
-            // failure, and the diagnostic itself becomes poison: open_ai_advanced_test spent 8/8 rounds
-            // "fixing" a phantom SyntaxError that was really the check runner tearing a quoted row, and the
-            // round-8 retrospective wrote that false lesson into persistent directives. Signal-level and
-            // language-blind: failure-text hash constant (digits stripped, so timings/counts don't defeat
-            // equality) × tree hash changing. Purely advisory — scoring is untouched.
+            // failure, and the diagnostic itself becomes poison (the swarm "fixes" a phantom whose real cause is
+            // the check runner, then a retrospective writes that false lesson into persistent directives).
+            // Signal-level and language-blind: failure-text hash constant (digits stripped, so timings/counts
+            // don't defeat equality) × tree hash changing. Purely advisory — scoring is untouched.
             if (w.last_bench.status == .ok and w.last_bench.total > 0 and w.last_bench.passed < w.last_bench.total) {
                 var fpb: std.ArrayListUnmanaged(u8) = .empty;
                 defer fpb.deinit(gpa);
@@ -1374,8 +1364,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
         // ADAPTIVE FENCE flip (single-threaded here): a backend that failed to PARSE large tool calls twice
-        // will keep failing on every full-file write_file (llama3.1:8b lost 6/6 writes this way) — switch the
-        // whole worker to fenced writes, exactly what a probed thinking model gets from the start.
+        // will keep failing on every full-file write_file — switch the whole worker to fenced writes, exactly
+        // what a probed thinking model gets from the start.
         if (live and !w.operating and !w.fence_writes and w.tool_parse_fails.load(.monotonic) >= 2) {
             w.fence_writes = true;
             llm.recordLargeToolWall(gpa, w.io, w.run_dir, w.model); // persist: future runs of this model fence from round 1
@@ -1395,10 +1385,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             rsi.updateRsiCurriculum(&w, goal, round, stalled);
         }
 
-        // CONCURRENT META GROUP — measured live (open_ai_advanced_test / splash_test_4): the minds phase runs
-        // parallel at 24-38s/round while these between-round faculties ran back-to-back at 251-285s/round —
-        // 85-90% of wall-clock was one LLM call waiting on the next for no reason. The five below are
-        // independent: every read is frozen before the group starts (retro_in, last_bench, blueprint, now_str,
+        // CONCURRENT META GROUP — the minds phase runs parallel while these between-round faculties otherwise
+        // ran back-to-back, so most of the wall-clock was one LLM call waiting on the next for no reason. The
+        // five below are independent: every read is frozen before the group starts (retro_in, last_bench, blueprint, now_str,
         // minds' names/personas), every write lands in a DISJOINT place (playbook scope / breakouts /
         // digest_str / state_str — digest vs briefing are mutually exclusive on w.discourse, state runs only
         // !discourse so it can never race the briefing), act/emit are emit_mtx-locked and mem writes are
@@ -1478,13 +1467,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         // INTERACTIVE one-shot: after the single edit moment ran, stop — do not loop continuous.
         if (w.quick and live and any_llm_ok and !w.stop_now) {
             // A CAST strike that produced an INCOMPLETE multi-file deliverable keeps working while its
-            // minutes budget lasts — finalizing quick_done at 50% coverage with minutes still on the
-            // clock was the observed cast failure (the missing file's round never came). The bound is
-            // unchanged: the deadline/budget wall still ends the run; this only spends time the caller
-            // already granted. Research casts (no scored file deliverable) stop after one moment as before.
+            // minutes budget lasts — finalizing quick_done at 50% coverage with minutes still on the clock
+            // stranded the missing file. The bound is unchanged: the deadline/budget wall still ends the run;
+            // this only spends time the caller already granted. Research casts (no scored file deliverable)
+            // stop after one moment as before.
             const budget_left = w.deadline_s == 0 or w.nowSecs() < w.deadline_s;
             // anyTruncPending: a file landed from a CUT emission reads complete to every byte-count check —
-            // finalizing on it is how a mid-CSS varieties.html shipped as a 100% "quick_done" cast
+            // finalizing on it ships a partial file as a "100%" deliverable
             const incomplete = w.deliverable_missing or anyTruncPending(&w) or (w.last_bench.status == .ok and w.last_bench.pct < 100);
             if (!(w.cast and budget_left and incomplete)) {
                 // A CAST must RETURN something: the scouts gathered findings into hive memory but (being
@@ -1656,7 +1645,7 @@ pub fn govLevelFrom(ema_mind_s: f32, ema_meta_s: f32, budget_left_s: f32, flat_r
     var lvl: u8 = 0;
     const total = ema_mind_s + ema_meta_s;
     if (total > 30 and ema_meta_s > total * 0.35) lvl = 1; // measured: meta eats over a third of the round
-    if (flat_rounds >= 3) lvl = @max(lvl, 1); // plateau: reflect less, keep recovering (the freeroam2 12-stalled-rounds lesson)
+    if (flat_rounds >= 3) lvl = @max(lvl, 1); // plateau: reflect less, keep recovering
     if (budget_left_s >= 0) {
         const round_cost: f32 = if (total > 30) total else 240; // pre-measurement estimate for round 1
         if (budget_left_s < round_cost * 2.5) {
@@ -1863,7 +1852,7 @@ fn addIndexLabel(gpa: std.mem.Allocator, labels: *std.ArrayListUnmanaged([]const
     labels.append(gpa, d) catch gpa.free(d);
 }
 
-/// FIX 1 — the KNOWLEDGE INDEX: a compact, deduped table-of-contents of what the hive KNOWS, so a mind is aware of
+/// The KNOWLEDGE INDEX: a compact, deduped table-of-contents of what the hive KNOWS, so a mind is aware of
 /// its own inventory and can recall_hive the right topic. Sources: the (clean, explicitly-named) skill library, then
 /// non-junk knowledge-fact headers. Capped (~40 labels / ~1200 chars). Caller frees. This is the "directory that
 /// directs recall" — without it the cortex has no way to know a stored fact exists.
@@ -1919,9 +1908,8 @@ fn pathEq(a: []const u8, b: []const u8) bool {
 }
 
 /// A `key` carrying a '/' (a full blueprint-relative path) must match the manifest line's FULL path —
-/// basename matching collapsed every same-named file into one (observed live, sim_forum6: once ONE package
-/// __init__.py existed, the frontier believed all five were built and coverage stalled at 15/19 forever;
-/// a Rust mod.rs layout makes that collision the NORM, not the edge). A bare key keeps whole-basename
+/// basename matching collapses every same-named file (package __init__.py, Rust mod.rs layouts) into one, so
+/// the frontier would believe all siblings are built once one exists. A bare key keeps whole-basename
 /// matching for callers that only hold a filename token (LLM-derived deps, task-text file mentions).
 fn builtInManifest(data: []const u8, key: []const u8) bool {
     const want_full = std.mem.indexOfScalar(u8, key, '/') != null or std.mem.indexOfScalar(u8, key, '\\') != null;
@@ -1941,9 +1929,9 @@ fn builtInManifest(data: []const u8, key: []const u8) bool {
             const sz = std.fmt.parseInt(u64, tail, 10) catch 0;
             // A "valve"-flagged entry is credited at ANY size: the length-floor valve only commits after
             // the slot was floor-rejected twice with the file still missing — the engine's own evidence
-            // that this file is INTENTIONALLY tiny. Without the credit, a complete 2-byte deliverable
-            // re-pins its slot every round (kotlin4 r3/r7, collider1 r3: wasted attempts, no deadlock).
-            // The >=40 floor still guards every ordinary write against stub-retiring a slot.
+            // that this file is INTENTIONALLY tiny. Without the credit, a complete tiny deliverable re-pins
+            // its slot every round (wasted attempts). The >=40 floor still guards every ordinary write
+            // against stub-retiring a slot.
             if (sz >= 40 or std.mem.eql(u8, flag, "valve")) return true;
         }
     }
@@ -2321,8 +2309,8 @@ fn mintLesson(w: *Worker, round: u32, fail: *const LessonRec, ok: *const LessonR
 /// RSI CAPACITY — the model-capacity self-tuner (DEMOTE-ONLY). The engine does NOT trust the model's name; each
 /// round it MEASURES how the model actually behaved (did its moments USE tools, or just narrate code as text?) and,
 /// if the model is DROWNING in its current tier, leans the tier down a rung. It only demotes: "doing well in a lean
-/// tier" can't prove a model handles the richer tier's full schema, and promoting on that makes the loop oscillate
-/// (proven live on an 8B). The model name seeds the starting rung; the operator PINS a tier to force a richer one.
+/// tier" can't prove a model handles the richer tier's full schema, and promoting on that makes the loop
+/// oscillate. The model name seeds the starting rung; the operator PINS a tier to force a richer one.
 /// So a model that behaves weaker than its name self-corrects downward within ~2 rounds and then SETTLES. Bounded to
 /// the engine's three tier knob-sets (the minds never control it); a no-op when pinned. Single-threaded, so next
 /// round's parallel moments read the fresh tier.
@@ -3085,7 +3073,7 @@ fn netFlip(w: *Worker, round: u32, online: bool) void {
 /// everything the scouts gathered into shared hive memory (KNOWLEDGE_SCOPE) and writes ONE final report to
 /// work/synthesis.md, grounded ONLY in those findings. Without this a research cast (an all-scout team, which
 /// can't write files) leaves its findings stranded in memory with no artifact — so the chat/Deploy tab shows
-/// an empty result (the "collected via web but returned nothing" bug). Best-effort: on any failure, no file.
+/// an empty result. Best-effort: on any failure, no file.
 /// The raw (still-escaped) value of a top-level "key":"..." string in one JSON line; null if absent.
 fn jsonFieldRaw(line: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [48]u8 = undefined;
@@ -3171,14 +3159,14 @@ fn gatherBuiltFiles(w: *Worker, cap: usize) []u8 {
         if (out.items.len >= cap) break;
         const fpath = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, p }) catch continue;
         defer gpa.free(fpath);
-        // .limited ERRORS past the cap (it never truncates) — the old 8KB limit made every larger
-        // deliverable VANISH from the synthesis prompt entirely, so the lead reported it "not built"
-        // (observed live: a complete 15.9KB recipes.html). Read generously, excerpt below.
+        // .limited ERRORS past the cap (it never truncates) — a too-small cap makes every larger deliverable
+        // VANISH from the synthesis prompt entirely, so the lead reports it "not built". Read generously,
+        // excerpt below.
         const content = std.Io.Dir.cwd().readFileAlloc(w.io, fpath, gpa, .limited(256 << 10)) catch continue;
         defer gpa.free(content);
         const shown = @min(content.len, 1800);
         // A silently-cut excerpt reads EXACTLY like a truncated file, and the synthesis prompt demands
-        // honesty — so the lead kept reporting complete files as "cut off mid-declaration". Name the view.
+        // honesty — otherwise the lead reports complete files as "cut off mid-declaration". Name the view.
         const hdr = if (content.len > shown)
             (std.fmt.allocPrint(gpa, "=== FILE: {s} ({d} bytes — EXCERPT: first {d} shown; the file on disk is longer, judge completeness ONLY by the ENGINE VERIFICATION) ===\n", .{ p, content.len, shown }) catch continue)
         else
@@ -3194,8 +3182,7 @@ fn gatherBuiltFiles(w: *Worker, cap: usize) []u8 {
 /// The engine's MEASURED verdict on the run's deliverables — benchmark score, goal-file coverage, and any
 /// still-pending truncated emissions — composed deterministically (zero model calls). This block heads the
 /// synthesis so completeness claims come from ground truth, never from the model re-judging clipped views
-/// (the observed failure: a 100% run whose synthesis called every complete file "truncated/not built",
-/// which then sent the chat's collect turn on a whole re-verification spiral).
+/// (which can misjudge a complete file as truncated and spiral the chat's collect turn into re-verification).
 fn buildEngineVerification(w: *Worker, goal: []const u8) []u8 {
     const gpa = w.gpa;
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -3236,8 +3223,8 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
         return;
     }
     // Build-aware: if the team wrote files, the report must describe the DELIVERED code (grounded in its real
-    // content), not an abstract plan — the old research-only prompt made a good build's synthesis read as
-    // "here's what you should implement" and even offer to "provide code" it had already written.
+    // content), not an abstract plan — a research-only prompt makes a good build's synthesis read as "here's
+    // what you should implement" and offer to "provide code" it already wrote.
     const verif = buildEngineVerification(w, goal);
     defer gpa.free(verif);
     const sys = "You are the LEAD of a strike team reporting the FINAL result of this run to the user. Ground your report ONLY in the material below: the FILES YOUR TEAM ACTUALLY BUILT (their real contents are shown), plus anything the scouts retrieved and the team notes. The ENGINE VERIFICATION block is MEASURED ground truth — file excerpts below may be CLIPPED VIEWS, so NEVER judge a file complete or truncated from where its excerpt ends; completeness comes from the ENGINE VERIFICATION alone. Report WHAT WAS DELIVERED — describe each built file by what the code ACTUALLY does (you can SEE the code, so state it plainly — never hedge with 'likely'/'should'), how to run it, and HONESTLY name anything the ENGINE VERIFICATION lists as missing or failing. NEVER claim a file exists that is not in the list, and NEVER offer to 'provide code' or 'example snippets' — the code is already built and shown above. If the run was research-only (no files), report the findings + name the sources instead. This report is exactly what the user receives.";
@@ -3368,10 +3355,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     ctx.one_slot = w.cap.one_slot;
     // COVERAGE FIRST. The frontier assigner (slotPath over my_files) hands each mind its next UNBUILT required
     // file; a strategy override only claims a mind the frontier left WITHOUT unbuilt work — a surplus mind, or
-    // the lead aimlessly re-deepening a finished file. Without this gate the override pinned 3 of 4 minds to
-    // re-polish already-built src files while 9 required files (all 3 tests + 5 __init__.py + README) never got
-    // a builder — coverage crawled 3→5→6→7 over 5 rounds and the score froze at the tier-3 floor (sim_forum5).
-    // A mind you cannot test a file that does not exist: build everything, THEN redirect surplus minds to fix.
+    // the lead aimlessly re-deepening a finished file. Without this gate the override pins minds to re-polish
+    // already-built files while other required files never get a builder, freezing coverage. You cannot test a
+    // file that does not exist: build everything, THEN redirect surplus minds to fix.
     const frontier_slot = if (!w.quick and w.cap.one_slot) slotPath(gpa, w.io, w.run_dir, my_files) else "";
     const frontier_has_unbuilt = frontier_slot.len > 0 and !slotIsBuilt(w, frontier_slot);
     // STRATEGY-FIX OVERRIDE: the orchestrator's task naming one BUILT blueprint file becomes this (otherwise
@@ -3380,8 +3366,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer if (lane_slot.len > 0) gpa.free(@constCast(lane_slot));
     // Quick runs WITHOUT a blueprint keep the goal-derived pin (the interactive one-shot --embed path).
     // Quick runs WITH one (a cast whose goal names its files) use the same rank-spread frontier as every
-    // other build — the goal-derived pin sent EVERY mind to the first goal file (three minds, one
-    // index.html, varieties.html unowned every round: the observed cast failure).
+    // other build — the goal-derived pin sent EVERY mind to the first goal file, leaving the other named
+    // files unowned every round.
     const assembler_slot = if (w.quick and w.blueprint.len == 0) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else frontier_slot;
     defer if (w.quick and w.blueprint.len == 0 and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // the goal-derived quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
@@ -3497,17 +3483,15 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         }
         // the assembler scout's SLOT is its entire task spec — the lean prompt carries no gap_str, so
         // the gap directive (and the atlas sources riding it) must arrive HERE or it reaches no model
-        // at all in this regime (found live: sim_atlas_kotlin r1 scout searched blind while the atlas
-        // block sat in the event log only).
+        // at all in this regime.
         if (mi.scout and w.last_gap_str.len > 0)
             break :blk_slot std.fmt.allocPrint(gpa, "{s} THIS ROUND'S RESEARCH TARGET — the hive's gap audit found these SPECIFIC holes; close THESE, not generic reading: {s}{s}", .{ clip(mi.lane, 480), clip(w.last_gap_str, 700), w.last_src_str }) catch (gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast(""));
         if (mi.lane.len > 0) break :blk_slot gpa.dupe(u8, clip(mi.lane, 280)) catch @constCast("");
         const ff = firstPath(my_files);
         if (ff.len > 0) break :blk_slot std.fmt.allocPrint(gpa, "write or extend the ONE file `{s}` toward its blueprint purpose", .{ff}) catch (gpa.dupe(u8, "") catch @constCast(""));
-        // SLOTLESS mind (fewer unbuilt files than minds). The old generic "create or extend ONE next
-        // unbuilt file" sent every surplus mind to the same obvious file — five full drafts authored in
-        // parallel, four discarded by last-writer-wins (observed live, c6a5037b6: ~4/5 of round-1 output
-        // thrown away). A surplus mind's job is DEPTH on what exists, never a rival copy of an owned slot.
+        // SLOTLESS mind (fewer unbuilt files than minds). A generic "create or extend ONE next unbuilt file"
+        // sends every surplus mind to the same obvious file — parallel full drafts, all but one discarded by
+        // last-writer-wins. A surplus mind's job is DEPTH on what exists, never a rival copy of an owned slot.
         if (others_files.len > 0)
             break :blk_slot std.fmt.allocPrint(gpa, "every unbuilt file is already OWNED by a teammate this round ({s}) — do NOT write any of those (a rival copy gets discarded). Instead: pick the WEAKEST existing file in the tree above, read_file it, and write back a meaningfully DEEPER version (more complete sections, real content, fixes); or run the checks and repair what actually fails.", .{clip(others_files, 200)}) catch (gpa.dupe(u8, "deepen the weakest existing file — never a rival copy of a teammate's slot") catch @constCast(""));
         break :blk_slot (gpa.dupe(u8, "create or extend ONE next unbuilt file from the project tree above (just one)") catch @constCast(""));
@@ -3580,7 +3564,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer gpa.free(exports_block);
     // THE DEMAND SIDE: names teammates import FROM the mind's own slot module that it doesn't define yet. The
     // export contract fixes callers who guessed the wrong name; this fixes the definer who never provided a name
-    // the callers agree they need (observed: 3 files import `authenticate` from sessions, sessions lacks it).
+    // the callers agree they need.
     const demand_block = if (assembler and assembler_slot.len > 0 and w.demanded_str.len > 0) blk_dm: {
         const base = std.fs.path.basename(assembler_slot);
         const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |d| base[0..d] else base;
@@ -3655,10 +3639,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         break :blk (sb.toOwnedSlice(gpa) catch (gpa.dupe(u8, score_base) catch @constCast("")));
     };
     defer gpa.free(score_str);
-    // 2400 covers the interpreter's full output (bounded at 400 tokens): the OLD 1000-byte clip cut most
-    // briefs mid-structure, silently dropping exactly the sections that steer minds — success criteria and
-    // verbatim hard constraints sit at the TAIL of the brief (the kotlin run's 1478-byte brief lost both).
-    // Same failure class as the atlas-sources clip: a composed directive must not lose its tail to a budget.
+    // 2400 covers the interpreter's full output (bounded at 400 tokens): a smaller clip cuts most briefs
+    // mid-structure, silently dropping exactly the sections that steer minds — success criteria and verbatim
+    // hard constraints sit at the TAIL of the brief. A composed directive must not lose its tail to a budget.
     const intent_str = if (w.goal_brief.len > 0) clip(w.goal_brief, 2400) else "(take the goal above at face value)";
     const authored_names = authoredToolNames(gpa, w.mem);
     defer gpa.free(authored_names);
@@ -3840,8 +3823,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const op_turns: u32 = if (operate) @max(w.cap.max_turns, 6) else w.cap.max_turns;
     while (turn < op_turns) : (turn += 1) {
         if (w.stopRequested()) break;
-        // HARD WALL-CLOCK: the minutes budget used to be checked only at round boundaries, so one long
-        // moment (slow provider, deep tool chain) sailed far past it. Break at the deadline mid-moment.
+        // HARD WALL-CLOCK: a round-boundary-only budget check lets one long moment (slow provider, deep tool
+        // chain) sail far past the deadline. Break at the deadline mid-moment.
         if (w.deadline_s != 0 and w.nowSecs() >= w.deadline_s) break;
         if (turn >= 2 and conv.items.len > conv_limit) break;
         // NEAR-LIMIT WARNING: tell the model the window is closing instead of silently cutting the moment
@@ -3937,7 +3920,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             // the moment — never a standing instruction), mirroring the parse-failure retry idiom above.
             // (a) VERIFY-BEFORE-DONE (per-mind): the moment mutated real state, nothing read it back, and
             //     the reply claims success. Unchecked, that narrative feeds affect and the retrospective as
-            //     if it were ground truth — the documented round-8 phantom-directive class. Demand ONE
+            //     if it were ground truth — the phantom-directive failure class. Demand ONE
             //     read-only check; its REAL result lands in conv before the moment settles.
             if (!verify_nudged and mutated_unverified and turn + 1 < op_turns and
                 conv.items.len < conv_limit and claimsSuccess(step.content))
@@ -4006,7 +3989,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             // TOOL-LOOP GUARD: a call whose (name, args) signature has already returned the
             // IDENTICAL result multiple times is refused before it burns another round-trip; the 2nd
             // identical repeat gets an in-band warning appended to its result so the model self-corrects
-            // with context. This kills the observed recall-echo/dead-probe class of waste.
+            // with context. This kills the recall-echo/dead-probe class of waste.
             var sigh = std.hash.Wyhash.init(0);
             sigh.update(c.name);
             sigh.update(c.args);
@@ -4121,10 +4104,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                     if (urlDomain(u)) |dom| _ = w.mem.observe(tools.SOURCES_SCOPE, dom);
                     // INDEPENDENT SOURCE (the publish gate's load-bearing signal): a mind fetched a real URL
                     // ITSELF (read_url/fetch_json/web_fetch — NOT web_search, which serves the local seed RAG).
-                    // round_independent_sources was declared + read by publishArtifact but NEVER incremented, so
-                    // the NEWS DESK gate was unsatisfiable (independent 0 < 1, seed_dependency pinned at 100%) —
-                    // every edition held "seed_only" and nothing could ever post. Count only a fetch that
-                    // returned real content, so a blocked/empty/error result doesn't inflate the tally.
+                    // The NEWS DESK gate needs independent >= 1 and seed_dependency < 100% to post. Count only a
+                    // fetch that returned real content, so a blocked/empty/error result doesn't inflate the tally.
                     if (fetchSucceeded(result)) w.round_independent_sources += 1;
                 }
             }
@@ -4179,7 +4160,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     // ENGINE-DRIVEN RAG: the gap loop only WORKS if the low-param model does not have to choose to search. When the
     // scout produced no memory of its own this round, the engine closes the loop itself — search the detected gap,
     // READ the top result page, and observe its REAL content into the shared hive so every builder is grounded next
-    // round instead of re-deriving from weak weights. A snippet-only save (the old behavior) grounds nobody.
+    // round instead of re-deriving from weak weights. A snippet-only save grounds nobody.
     // CONTINUOUS, PROVENANCE-GATED SCOUTING: while the goal's hive coverage is below target, the scout searches the
     // gap, reads the top result, and a distilled note enters the hive ONLY if it quotes a verbatim page span (so
     // garbage/boilerplate/hallucination is refused mechanically — no domain blocklist). Ingests the NOTE, not the page.
@@ -4196,7 +4177,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         w.act(mi.name, round, "scout_search", qstr, clip(sres, 200));
         const topic_src = if (w.goal_brief.len > 0) w.goal_brief else qstr;
         if (resultOnTopic(topic_src, sres)) {
-            if (pickTrustedUrl(w, sres)) |url| { // v1b: prefer a SOURCE the swarm has learned to trust
+            if (pickTrustedUrl(w, sres)) |url| { // prefer a SOURCE the swarm has learned to trust
                 var uargs: std.ArrayListUnmanaged(u8) = .empty;
                 defer uargs.deinit(gpa);
                 uargs.appendSlice(gpa, "{\"url\":") catch {};
@@ -4206,7 +4187,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                 defer gpa.free(page);
                 const dom = urlDomain(url) orelse "web";
                 // the trust class MUST equal what class_of derives from the note tag (first token, lowercased),
-                // so tag notes `[src:<dom>] …` and reward the same `src:<dom>` — v1a's mismatch made trust a no-op.
+                // so tag notes `[src:<dom>] …` and reward the same `src:<dom>` (a mismatch makes trust a no-op).
                 var domlc_buf: [128]u8 = undefined;
                 const dom_lc = if (dom.len <= domlc_buf.len) blk: {
                     for (dom, 0..) |ch, k| domlc_buf[k] = std.ascii.toLower(ch);
@@ -4242,8 +4223,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             w.act(mi.name, round, "scout_learn", url, clip(d.note, 220));
                         } else {
                             // a fooled/empty judge only UNDER-ingests; a reject does NOT demote the source (judge-competence, not source-quality).
-                            // Name the FIRST failing check: 8 fetches across the two atlas-kotlin runs produced 7 rejects
-                            // under one catch-all message, and diagnosing WHY required re-deriving the whole gate by hand.
+                            // Name the FIRST failing check so a reject is diagnosable instead of collapsing into one catch-all message.
                             const why = if (!d.applicable)
                                 "screen: applicable=false — no concrete span in the shown page window"
                             else if (d.evidence_span.len < 40)
@@ -4273,9 +4253,9 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
 
     if (!mi.scout and files == 0 and !operate) editblk: {
         const salvage_slot0 = if (assembler_slot.len > 0) assembler_slot else slotPath(gpa, w.io, w.run_dir, my_files);
-        // SLOTLESS RESCUE: a surplus-rank mind sometimes narrates a COMPLETE missing blueprint file (observed
-        // live: a correct test_store.py, dropped with zero trace because it had no slot). If the reply's head
-        // names exactly ONE unbuilt blueprint file and carries a fenced body, salvage into that file.
+        // SLOTLESS RESCUE: a surplus-rank mind sometimes narrates a COMPLETE missing blueprint file dropped
+        // with zero trace because it had no slot. If the reply's head names exactly ONE unbuilt blueprint file
+        // and carries a fenced body, salvage into that file.
         const derived = if (salvage_slot0.len == 0) deriveSlotFromReply(w, monologue, others_files) else "";
         defer if (derived.len > 0) gpa.free(@constCast(derived)); // gpa-owned per its contract; salvage_slot only borrows it
         const salvage_slot = if (salvage_slot0.len > 0) salvage_slot0 else derived;
@@ -4456,10 +4436,10 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     }
     const facts = w.mem.factCount(mi.scope);
     if (!is_placeholder) {
-        // The recorded feeling is driven by THIS round's measured work signals — and it can now go NEGATIVE.
-        // The old three-way map (wrote→satisfied / learned→energized / else→focused) was positively CLAMPED:
-        // a mind that spun its wheels or kept getting its work rejected still logged "focused and determined",
-        // so the affect layer could never record frustration. Negatives come first (a bad round sets the tone).
+        // The recorded feeling is driven by THIS round's measured work signals — and it can go NEGATIVE. A
+        // positively-clamped map (wrote→satisfied / learned→energized / else→focused) would log a mind that
+        // spun its wheels or kept getting rejected as "focused and determined", so affect could never record
+        // frustration. Negatives come first (a bad round sets the tone).
         const failed = llm_fatal or !llm_ok;
         const positive = files > 0 or facts > recalled_n;
         const feeling = if (failed)
@@ -4472,14 +4452,13 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             "energized by what I'm learning"
         else
             "focused and determined";
-        // MOOD (instantaneous): set every round so affect() carries a live mood line. It was NEVER set before,
-        // so directive_body had no mood clause and affect() collapsed toward the bare boilerplate FRAME.
+        // MOOD (instantaneous): set every round so affect() carries a live mood line; without it directive_body
+        // has no mood clause and affect() collapses toward the bare boilerplate FRAME.
         const mood = if (failed or had_reject) "frustrated" else if (files > 0) "satisfied" else if (facts > recalled_n) "energized" else "focused";
         w.mem.mood(mi.scope, mood);
-        // STANCE (accumulated): key by a STABLE, valence-bucketed topic so restatement HARDENS. The old key was
-        // a unique per-round code snippet — it never recurred, so no stance ever crossed the 1.5 threshold and
-        // affect() showed no hardened view (every mind's "accumulated affect" was identical). Positive and
-        // negative rounds accumulate on SEPARATE keys now; whichever the run actually earns wins by strength.
+        // STANCE (accumulated): key by a STABLE, valence-bucketed topic so restatement HARDENS — a unique
+        // per-round key never recurs, so no stance crosses the 1.5 threshold and affect() shows no hardened
+        // view. Positive and negative rounds accumulate on SEPARATE keys; whichever the run earns wins by strength.
         const stance_topic = if (failed or had_reject) "the work is fighting me" else if (positive) "the work is moving" else "the work is steady";
         w.mem.stance(mi.scope, stance_topic, feeling);
         w.act(mi.name, round, "stance", stance_topic, feeling);
@@ -4490,8 +4469,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
 }
 
 /// Index of the end of the first real sentence: a '.'/'!'/'?' FOLLOWED by whitespace or end-of-string, so a
-/// dotted token like "index.html" or "3.5" is NOT treated as a sentence boundary (the old first-'.' cut
-/// stored mangled fragments like "...responsive index.").
+/// dotted token like "index.html" or "3.5" is NOT treated as a sentence boundary (a naive first-'.' cut would
+/// store mangled fragments like "...responsive index.").
 fn firstSentenceEnd(s: []const u8) usize {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
@@ -4563,9 +4542,9 @@ fn embeddedWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
 /// (`<invoke name="write_file"> <parameter name="content"> <the raw file> …`). The JSON-args form is
 /// handled by embeddedWriteContent; this covers providers whose native markup carries parameters as
 /// tagged blocks emitted as TEXT (the transport hiccup class). RECOVER the file instead of rejecting the
-/// whole reply — a round where all three minds' docs bounced as "raw tool-call fragment" produced zero
-/// output (observed live, c6a503e07 r3). Dialect-blind: find the content parameter marker, take the
-/// payload up to the next tag/special-token delimiter. Returned slice is gpa-owned.
+/// whole reply — otherwise a round whose minds all bounced as "raw tool-call fragment" produces zero output.
+/// Dialect-blind: find the content parameter marker, take the payload up to the next tag/special-token
+/// delimiter. Returned slice is gpa-owned.
 fn markupWriteContent(gpa: std.mem.Allocator, monologue: []const u8) ?[]u8 {
     if (std.mem.indexOf(u8, monologue, "write_file") == null) return null;
     const at = std.mem.indexOf(u8, monologue, "name=\"content\"") orelse return null;
@@ -4714,9 +4693,9 @@ fn reconcileTruncated(w: *Worker) void {
 }
 
 /// Record a write-path refusal for this round's fitness block — the lead can only route around a stall it
-/// can SEE (sim_atlas_kotlin2: the same file bounced off the length floor 16 times across 6 rounds while
-/// the bench text only ever said "CREATE the missing file"). Minds run CONCURRENTLY (grp.concurrent), so
-/// this shared list is appended under the same files mutex that guards every other shared-state write.
+/// can SEE (else the same file bounces off the length floor round after round while the bench text only says
+/// "CREATE the missing file"). Minds run CONCURRENTLY (grp.concurrent), so this shared list is appended under
+/// the same files mutex that guards every other shared-state write.
 fn noteReject(w: *Worker, path: []const u8, why: []const u8) void {
     w.files_mtx.lockUncancelable(w.io);
     defer w.files_mtx.unlock(w.io);
@@ -4754,9 +4733,9 @@ fn markValveBuilt(w: *Worker, slot: []const u8, n: usize) void {
 fn slotFileMissing(w: *Worker, slot: []const u8) bool {
     const fp = std.fmt.allocPrint(w.gpa, "{s}/work/{s}", .{ w.run_dir, slot }) catch return false;
     defer w.gpa.free(fp);
-    // stat, not read: the old read-based probe treated ANY read error (file bigger than the cap, a
-    // transient AV/sync lock) as "missing" — a fail-open that let salvage overwrite real files. Only a
-    // confirmed not-found counts as missing; an unverifiable file is treated as present (fail closed).
+    // stat, not read: a read-based probe would treat ANY read error (file bigger than the cap, a transient
+    // AV/sync lock) as "missing" — a fail-open that lets salvage overwrite real files. Only a confirmed
+    // not-found counts as missing; an unverifiable file is treated as present (fail closed).
     _ = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch |e| return e == error.FileNotFound;
     return false;
 }
@@ -4771,10 +4750,10 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     if (body.len < 80) {
         // ESCALATION VALVE (r1 strict, later rescue — same precedent as the ownership guard's r2+ rescue).
         // The floor exists to stop vacuous fragment replies, but some required files are CORRECT at under
-        // 80 chars (observed live, sim_atlas_kotlin2: expenses.json's right content is "[]", refused every
-        // round for 6 rounds — the build never escaped). Open the valve ONLY when the SAME slot has been
-        // floor-rejected twice already AND the file STILL does not exist on disk; then a >=2-char body
-        // falls through to the remaining salvage gates (markers, chatter, tool fragments) and commits.
+        // 80 chars (e.g. an "[]" JSON file), which the floor would refuse every round. Open the valve ONLY
+        // when the SAME slot has been floor-rejected twice already AND the file STILL does not exist on disk;
+        // then a >=2-char body falls through to the remaining salvage gates (markers, chatter, tool fragments)
+        // and commits.
         const trimmed = std.mem.trim(u8, body, " \r\n\t");
         const valve_open = trimmed.len >= 2 and shortRejects(w, salvage_slot) >= 2 and slotFileMissing(w, salvage_slot);
         if (!valve_open) {
@@ -4795,9 +4774,8 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     defer if (existing) |e| if (e.len > 0) gpa.free(e);
     if (existing == null) {
         // The slot could not be READ (bigger than the cap, or a transient AV/sync lock). If it EXISTS on
-        // disk we cannot verify what a commit would destroy — refuse (fail CLOSED). The old `catch ""`
-        // fail-open is how 393 bytes of unparsed tool markup overwrote a real 7.6KB source file
-        // (observed live, c6a50258c r6: catalog.zig).
+        // disk we cannot verify what a commit would destroy — refuse (fail CLOSED). A fail-open here lets a
+        // few hundred bytes of unparsed tool markup overwrite a real multi-KB source file.
         if (std.Io.Dir.cwd().statFile(w.io, full, .{})) |st| {
             if (st.size > 0) return "slot exists on disk but could not be read/verified — refusing to overwrite it";
         } else |_| {}
@@ -4812,8 +4790,7 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
 /// Conservative: requires a fenced body, and exactly one distinct unbuilt basename match — ambiguity means no
 /// derivation (better to drop one rescue than to write the wrong file). A file ASSIGNED to a teammate this
 /// round is never derived into — the slot owner is building it in parallel and last-writer-wins would eat one
-/// side's work (observed live, sim_forum4 r2: a slotless mind salvaged users.py over the owner's in-flight
-/// build). Returned slice is gpa-owned ("" = none).
+/// side's work. Returned slice is gpa-owned ("" = none).
 fn deriveSlotFromReply(w: *Worker, monologue: []const u8, others_files: []const u8) []const u8 {
     const gpa = w.gpa;
     if (w.blueprint.len == 0) return "";
@@ -4842,11 +4819,11 @@ fn deriveSlotFromReply(w: *Worker, monologue: []const u8, others_files: []const 
 
 /// The no-clobber rule must not LOCK IN a failing file: when a FAILURE signal names THIS slot (a failing
 /// import or test implicating it), a valid replacement may shrink the file — that is the fix converging, not
-/// a clobber. (Observed live: a wrong class-shaped store.py could never be replaced by the corrected
-/// function-shaped rewrite because the bad version was longer.) Only FAILURE-shaped text counts: the
-/// benchmark's FAILING tail, a smoke that actually failed, and interface mismatches — a "RUNTIME OK:
-/// `app.py` boots" success line must NOT hold the escape hatch open for the healthy entry file. Matches are
-/// word-boundary (so `store.py` inside `test_store.py` does not implicate store.py by substring accident).
+/// a clobber (else a wrong longer version can never be replaced by a shorter correct rewrite). Only
+/// FAILURE-shaped text counts: the benchmark's FAILING tail, a smoke that actually failed, and interface
+/// mismatches — a "RUNTIME OK: `app.py` boots" success line must NOT hold the escape hatch open for the
+/// healthy entry file. Matches are word-boundary (so `store.py` inside `test_store.py` does not implicate
+/// store.py by substring accident).
 fn slotImplicatedInFailure(w: *Worker, salvage_slot: []const u8) bool {
     const base = std.fs.path.basename(salvage_slot);
     var qbuf: [140]u8 = undefined;
@@ -4889,7 +4866,7 @@ test "slot implication: failure text implicates, success text and substring cous
 
 test "extractGoalPaths: a tool-attributed name (with/using X.js) is never a required file" {
     const gpa = std.testing.allocator;
-    // the sim_freeroam2 goal-2 shape: a library named after "with" + real deliverable paths
+    // a goal shape: a library named after "with" + real deliverable paths
     const goal = "Extend the app by adding an interactive world-map layer with Leaflet.js that renders sites; write static/js/map.js and tests/test_map.py, and document it in README.md using pytest.ini conventions.";
     var n: u32 = 0;
     const tree = extractGoalPaths(gpa, goal, &n);
@@ -4904,7 +4881,7 @@ test "extractGoalPaths: a tool-attributed name (with/using X.js) is never a requ
 
 test "extractGoalPaths adopts data files (config.json) and expands a bare __init__.py into the package dirs, never the root" {
     const gpa = std.testing.allocator;
-    // the sim_forum4 goal shape: nested src tree + slashless config.json + a bare __init__.py token
+    // a goal shape: nested src tree + slashless config.json + a bare __init__.py token
     const goal = "Build agora. Structure: src/main/app.py (reads config.json), src/db/store.py, static/style.css, config.json, test_db.py (pytest), README.md. Every package dir under src/ needs __init__.py; do NOT put __init__.py at the project root.";
     var n: u32 = 0;
     const tree = extractGoalPaths(gpa, goal, &n);
@@ -4937,11 +4914,9 @@ test "extractGoalPaths adopts data files (config.json) and expands a bare __init
 
 /// STRATEGY-FIX SLOT OVERRIDE — when the orchestrator's task for this mind names exactly ONE blueprint file
 /// that is already BUILT (and not mid-chunk), that file becomes the mind's slot this round: the deliberated
-/// bottleneck fix outranks frontier order. Observed live (sim_forum4): the strategy named the exact one-function
-/// fix in round 4, but coverage-first pinning kept every mind on missing files until round 6, and the fix
-/// finally landed in round 8 — two rounds starved, then corrupted. Unbuilt/incomplete files stay with the
-/// frontier assigner (someone gets them by rank), and planRoles' per-file exclusivity guarantees at most one
-/// mind holds a task naming any file. Returned slice is gpa-owned ("" = none).
+/// bottleneck fix outranks frontier order. Unbuilt/incomplete files stay with the frontier assigner (someone
+/// gets them by rank), and planRoles' per-file exclusivity guarantees at most one mind holds a task naming
+/// any file. Returned slice is gpa-owned ("" = none).
 /// Does the frontier's chosen slot point at a file already BUILT (≥40 bytes in the manifest)? True ⇒ the
 /// frontier has no unbuilt required work for this mind (it fell back to a deepen/firstPath pick), so a
 /// strategy override may claim it; false ⇒ the mind has real coverage work and the override must stand aside.
@@ -5013,10 +4988,9 @@ fn salvageHasToolFragment(body: []const u8) bool {
         if (containsKeyValue(t, "name", "write_file")) return true;
         if (std.mem.indexOf(u8, t, "\"tool_call\":") != null) return true;
     }
-    // INVOCATION MARKUP of ANY dialect: a file body must never begin with tool-call syntax. The old
-    // JSON-only prefixes let a provider's native markup emitted as TEXT pass as a "valid file body" and
-    // get committed over real source files (observed live, c6a50258c: unparsed tool_calls markup salvaged
-    // into chat.zig + catalog.zig). General signals, no provider list:
+    // INVOCATION MARKUP of ANY dialect: a file body must never begin with tool-call syntax. JSON-only
+    // prefixes let a provider's native markup emitted as TEXT pass as a "valid file body" and get committed
+    // over real source files. General signals, no provider list:
     const nl = std.mem.indexOfScalar(u8, t, '\n') orelse t.len;
     const first_line = t[0..nl];
     // an invoke/tool-call tag with a named parameter on the opening line (XML-ish, Hermes, or vendor forms)
@@ -5063,10 +5037,9 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
     {
         // DEPTH-AWARE fence pairing: a ``` carrying an info string (```python, ```bash) always OPENS a
         // block; a bare ``` closes the innermost open block (or opens an anonymous one at depth 0). A
-        // markdown FILE with embedded code examples therefore stays ONE top-level block — the old
-        // first-close scan paired the outer ```markdown with the first INNER example fence and cut
-        // every README at its first code sample (kotlin2/3/4 + collider1 all ended mid-document at
-        // "### add" / "prints a table:" / "## Installation"; only example-free READMEs survived).
+        // markdown FILE with embedded code examples therefore stays ONE top-level block — a naive first-close
+        // scan pairs the outer ```markdown with the first INNER example fence and cuts every README at its
+        // first code sample.
         var best: []const u8 = "";
         var scan: usize = 0;
         var depth: u32 = 0;
@@ -5089,9 +5062,8 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
             scan = eol;
         }
         // A fenced block is the mind's EXPLICIT file-body signal — return it whatever its size and let
-        // salvageRejectReason's floor+valve own the length policy. A pre-floor here starved the valve of
-        // the very bodies it exists to admit (sim_atlas_kotlin3: expenses.json's "[]" fence was extracted
-        // as "" every round, so the slot deadlocked exactly as before the valve shipped).
+        // salvageRejectReason's floor+valve own the length policy. A pre-floor here would starve the valve of
+        // the very small bodies it exists to admit (e.g. an "[]" fence extracted as "" every round).
         if (best.len > 0) return gpa.dupe(u8, best) catch "";
     }
     const t = std.mem.trim(u8, monologue, " \r\n\t");
@@ -5106,7 +5078,7 @@ fn salvageFileBody(gpa: std.mem.Allocator, monologue: []const u8) []const u8 {
 
 /// Gate a salvaged full-file .py body: 0 = ok (or the check can't run — fail-open), 7 = SyntaxError, 8 = the
 /// body defines the same top-level name twice (two glued copies of the module — valid Python, so compile()
-/// alone passed it; observed live as users.py doubled end to end).
+/// alone passes it).
 fn pySalvageCheck(w: *Worker, source: []const u8) u8 {
     const gpa = w.gpa;
     if (source.len > 80_000) return 0; // Linux per-env-string cap — beyond it the spawn E2BIGs; fail open explicitly
@@ -5423,8 +5395,8 @@ fn assessGap(w: *Worker, goal: []const u8, round: u32, stalled: bool) void {
         defer if (probe_txt.len > 0) gpa.free(@constCast(probe_txt));
         const srcs = locs.sourcesBlock(gpa, if (probe_txt.len > 0) probe_txt else goal, 3);
         // held apart from the gaps text, NOT joined: every consumer clips the gaps to its own prompt
-        // budget, and a joined string put the sources at the clipped-off tail — the directive LOGGED
-        // the atlas block while no model prompt ever contained it (found live, sim_atlas_kotlin r1).
+        // budget, and a joined string would put the sources at the clipped-off tail — logged but never
+        // reaching any model prompt.
         if (srcs.len > 0) w.last_src_str = srcs;
     }
     _ = w.mem.observe(tools.GAP_SCOPE, std.fmt.allocPrint(w.a(), "round {d}: coverage {d}% gaps {s}", .{ round, @as(u32, @intFromFloat(cov * 100)), clip(gaps, 200) }) catch "round");
@@ -5462,12 +5434,12 @@ fn importGraph(w: *Worker, run_dir: []const u8) []u8 {
 /// a free port, probes GET /, and tears it down. Sets w.smoke_ok (true = no server, or it started+served; false =
 /// a server exists but crashed on launch / didn't serve) and w.smoke_str (the human line minds read). smoke_ok
 /// gates "completed" so the swarm can't declare victory on a build that passes tests but doesn't actually run.
-/// DELIVERABLE FOCUS for CODE projects (the metric-driven fix for the 8B corpus-growth retreat). When a project
-/// manifest (Cargo.toml/go.mod/package.json/pyproject) exists but markdown/notes drown the source, inject a strong
-/// "the deliverable is CODE — write a source file, not another doc" line into every mind, and emit a `build` event
-/// (code vs notes counts) so the deliverable finally has a visible GRADIENT — a Rust/Go/etc. build emitted ZERO
-/// score events, so the weak model had no signal that 216 .md files ≠ progress. No-op for doc/notes builds (no
-/// project file) and prose builds (doc_target>0) — those legitimately WANT markdown.
+/// DELIVERABLE FOCUS for CODE projects. When a project manifest (Cargo.toml/go.mod/package.json/pyproject)
+/// exists but markdown/notes drown the source, inject a strong "the deliverable is CODE — write a source file,
+/// not another doc" line into every mind, and emit a `build` event (code vs notes counts) so the deliverable
+/// has a visible GRADIENT — a Rust/Go/etc. build otherwise emits ZERO score events and the weak model has no
+/// signal that piling up .md files ≠ progress. No-op for doc/notes builds (no project file) and prose builds
+/// (doc_target>0) — those legitimately WANT markdown.
 fn deliverableGate(w: *Worker, run_dir: []const u8) void {
     const gpa = w.gpa;
     if (w.build_str.len > 0) gpa.free(@constCast(w.build_str));
@@ -5585,7 +5557,7 @@ fn smokeTest(w: *Worker, run_dir: []const u8, round: u32) void {
         // Report the EXACT invocation the engine used (a package-nested entry with relative imports is launched
         // as `python -m dotted.path`, not `python file.py`), so a stderr like ModuleNotFoundError points the
         // model at the real wiring bug (a wrong-depth relative import, a missing sibling package) instead of a
-        // phantom "relative import with no parent" the raw-script launch used to manufacture.
+        // phantom "relative import with no parent".
         const how = if (s.how.len > 0) s.how else s.entry;
         w.smoke_str = std.fmt.allocPrint(gpa, "RUNTIME FAIL: your server entry `{s}` does NOT start — `python {s}` crashes on launch, so the app does not run at all (passing the unit tests is not enough). The stderr below is the REAL wiring error — fix THAT (a wrong-depth relative import, a name the imported module never defines, a missing config file). Read the port from the AINET_PORT/PORT env. stderr: {s}", .{ clip(s.entry, 80), clip(how, 80), clip(std.mem.trim(u8, s.stderr, " \r\n\t"), 300) }) catch "";
     }
@@ -5790,9 +5762,8 @@ fn checkDiag(out: []const u8) []const u8 {
 
 /// EVERY failing point, not just the first: up to 12 lines starting with "error" (rustc/go/tsc/gcc/pytest
 /// headers), each clipped, joined compactly. "" when fewer than two — the single-error case is already
-/// covered by checkDiag's full first diagnostic. Observed live (sim_synapse2): each round's fitness showed
-/// only the next E0583 while TEN errors existed — four parallel minds were serialized onto one error per
-/// round when each could have taken a different one. gpa-owned when non-empty.
+/// covered by checkDiag's full first diagnostic. Surfacing only the next error serializes parallel minds onto
+/// one fix per round when each could take a different one. gpa-owned when non-empty.
 fn errorHeaders(gpa: std.mem.Allocator, out: []const u8) []const u8 {
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(gpa);
@@ -5833,15 +5804,13 @@ test "checkDiag: slices from the first error line; falls back to the tail when n
 
 /// Windows: a shell row that CONTAINS double quotes cannot ride through `cmd /C <row>` as one argv
 /// element — the argv encoder backslash-escapes the embedded quotes for CreateProcess, but cmd.exe does
-/// not read backslash escapes, so the row reaches the toolchain torn. Observed live (open_ai_advanced_test,
-/// gpt-4.1-mini): both `python -c "..."` VERIFY rows failed EVERY round with `SyntaxError: unterminated
-/// string literal (detected at line 1)` while the same rows ran fine typed at a prompt — the swarm spent
-/// all 8 rounds "fixing" phantom syntax errors in its own files and the retrospective wrote the false
-/// lesson into its persistent directives. Fix: materialize such a row VERBATIM into a one-shot .cmd script
-/// in run_dir and hand cmd the script path instead — expressed relative to the row's workdir (run_dir/work),
-/// so `..\<name>`. Quote-free rows keep the direct argv path, which is proven fine (`python -m pytest -q`
-/// ran verbatim all run). Batch semantics caveat: inside a .cmd a literal `%` is a metachar — strictly
-/// better than every quoted row failing. Returns the gpa-owned argv replacement, or "" for the direct path.
+/// not read backslash escapes, so the row reaches the toolchain torn (a `python -c "..."` row fails with a
+/// phantom `SyntaxError: unterminated string literal` while the same row runs fine typed at a prompt). Fix:
+/// materialize such a row VERBATIM into a one-shot .cmd script in run_dir and hand cmd the script path
+/// instead — expressed relative to the row's workdir (run_dir/work), so `..\<name>`. Quote-free rows keep the
+/// direct argv path, which is proven fine (`python -m pytest -q` ran verbatim all run). Batch semantics
+/// caveat: inside a .cmd a literal `%` is a metachar — strictly better than every quoted row failing. Returns
+/// the gpa-owned argv replacement, or "" for the direct path.
 fn winRowViaScript(w: *Worker, run_dir: []const u8, row: []const u8, name: []const u8) []const u8 {
     if (builtin.os.tag != .windows) return "";
     if (std.mem.indexOfScalar(u8, row, '"') == null) return "";
@@ -5974,8 +5943,8 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return;
     defer gpa.free(workdir);
     // The declared command rides to the shell VERBATIM with the workdir set via .cwd — never a `cd`-prefix
-    // wrapper (embedded path quotes inside a `cmd /C` argument misparse under CreateProcess quoting; the
-    // probe silently saw status 0 forever when the wrapper ate the boot command).
+    // wrapper (embedded path quotes inside a `cmd /C` argument misparse under CreateProcess quoting, and the
+    // probe then silently sees status 0 forever).
     const posix_boot = if (builtin.os.tag != .windows) std.fmt.allocPrint(gpa, "exec {s}", .{w.smoke_cmd}) catch return else "";
     defer if (posix_boot.len > 0) gpa.free(@constCast(posix_boot));
     // A quoted smoke row tears under cmd /C argv quoting exactly like a quoted VERIFY row — same
@@ -5987,10 +5956,9 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
     const boot_arg: []const u8 = if (via.len > 0) via else w.smoke_cmd;
     const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", boot_arg } else .{ "/bin/sh", "-c", posix_boot };
     // BOOT STDERR CAPTURE — when the declared boot dies before binding, "status 0 = nothing listening"
-    // told the minds NOTHING about why (observed live, splash_test_4: the server crashed at startup on a
-    // cross-file TypeError for four straight rounds while the smoke reported only dead probes). The
-    // child's stderr lands in run_dir/.smoke_stderr and its tail rides the RUNTIME FAIL message — a
-    // crash traceback IS the actionable diagnostic. Best-effort: capture failure degrades to .ignore.
+    // tells the minds NOTHING about why. The child's stderr lands in run_dir/.smoke_stderr and its tail rides
+    // the RUNTIME FAIL message — a crash traceback IS the actionable diagnostic. Best-effort: capture failure
+    // degrades to .ignore.
     const sep = std.fmt.allocPrint(gpa, "{s}/.smoke_stderr", .{run_dir}) catch "";
     defer if (sep.len > 0) gpa.free(sep);
     const sef: ?std.Io.File = if (sep.len > 0) (std.Io.Dir.cwd().createFile(w.io, sep, .{}) catch null) else null;
@@ -6152,10 +6120,10 @@ const Coverage = struct { present: u32 = 0, total: u32 = 0, missing: []const u8 
 fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
     const gpa = w.gpa;
     var n: u32 = 0;
-    // THE BLUEPRINT IS THE REQUIRED SET. Coverage used to re-extract paths from the goal PROSE, so
-    // caller-DECLARED deliverables (the FILES: list) never gated the score — a cast with 19 declared docs
-    // and 2 on disk quick_done'd at "100%" (observed live, c6a503995). When a blueprint exists (declared
-    // verbatim, goal-named, or planned), IT is what "required" means; prose extraction is the fallback.
+    // THE BLUEPRINT IS THE REQUIRED SET. Coverage keyed on goal PROSE lets caller-DECLARED deliverables (the
+    // FILES: list) escape the score — a cast with 19 declared docs and 2 on disk would quick_done at "100%".
+    // When a blueprint exists (declared verbatim, goal-named, or planned), IT is what "required" means; prose
+    // extraction is the fallback.
     var tree: []const u8 = "";
     if (w.blueprint.len > 0) {
         var rows: u32 = 0;
@@ -6171,8 +6139,8 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
     if (n == 0) tree = extractGoalPaths(gpa, goal, &n);
     // An ORIGINATED goal states its purpose in prose; the REQUIRED DELIVERABLES the intent
     // interpreter minted live in the brief. Without this fallback a free-roam run has no
-    // deliverable floor at all (observed live, open_ai_test_3: 1 of 7 required files existed
-    // at a 100% fitness that never mentioned coverage).
+    // deliverable floor at all — a fraction of the required files can sit on disk at a 100%
+    // fitness that never mentions coverage.
     if (n == 0 and w.goal_brief.len > 0) {
         gpa.free(@constCast(tree));
         tree = extractGoalPaths(gpa, w.goal_brief, &n);
@@ -6189,10 +6157,9 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
         const fp = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, bp }) catch continue;
         defer gpa.free(fp);
         // Presence must never depend on slurping the file: readFileAlloc(.limited) ERRORS on a file larger
-        // than the cap, and `catch ""` turned "too big to read" into "missing" — a >64KB required file
-        // pinned the score at 50% forever AND told every mind to re-CREATE a file that exists (observed
-        // live, c6a50258c: main.zig 209KB read as MISSING all 7 rounds). Read for the substance check when
-        // it fits; fall back to stat for size when it doesn't.
+        // than the cap, and treating that error as "missing" pins the score while telling every mind to
+        // re-CREATE a file that already exists (a >64KB required file read as MISSING). Read for the
+        // substance check when it fits; fall back to stat for size when it doesn't.
         const data: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch null;
         defer if (data) |d| if (d.len > 0) gpa.free(d);
         const substantive = if (data) |d| std.mem.trim(u8, d, " \r\n\t").len > 40 else blk: {
@@ -6205,7 +6172,7 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
         } else {
             if (miss.items.len > 0) miss.appendSlice(gpa, ", ") catch {};
             // FULL path, not basename: "create __init__.py, __init__.py, __init__.py" names no directory
-            // and the minds cannot act on it (observed live, sim_forum6)
+            // and the minds cannot act on it
             miss.appendSlice(gpa, bp) catch {};
             if (cut) miss.appendSlice(gpa, " (on disk but CUT OFF mid-emission — finish its tail, do not restart it)") catch {};
         }
@@ -6217,10 +6184,8 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
 /// instruction. gpa-owned (caller frees on replace + teardown).
 fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, declared: bool, doc_target: u32, prev_pct: u32, cov: Coverage, rejects: []const u8, runtime_fail: []const u8) []const u8 {
     // A green score line must never read "all green" while the runtime smoke gate is red. The minds
-    // optimize THIS line and will trust it over a separate contradicting RUNTIME FAIL block (observed
-    // live, open_ai_test_3: swarm-declared checks held 100% "all green" for 30+ rounds while pytest
-    // errored every one of them — no mind ever prioritized the fix). Fold the red gate into FAILING so
-    // the per-mind "fix the one in YOUR file" routing applies to the real failure.
+    // optimize THIS line and will trust it over a separate contradicting RUNTIME FAIL block. Fold the red
+    // gate into FAILING so the per-mind "fix the one in YOUR file" routing applies to the real failure.
     const green_note: ?[]const u8 = if (runtime_fail.len > 0)
         std.fmt.allocPrint(gpa, "(the declared checks pass, BUT the runtime gate is RED — treat THIS as the failing check and fix it first: {s})", .{clip(runtime_fail, 700)}) catch null
     else
@@ -6249,8 +6214,7 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, de
     }
     // DECLARED checks outrank every inferred build-shape heuristic (doc-target included): when the goal
     // states its own acceptance interface, that score IS the fitness — nothing the engine guessed may
-    // re-narrate it (observed live: an all-.txt LLM blueprint doc-classified a run whose goal declared
-    // VERIFY rows, and the prose nudge buried the real gradient).
+    // re-narrate it (else a misclassified build's prose nudge buries the real gradient).
     const base: []const u8 = if (declared and b.status == .ok)
         // wider failure budget than the legacy 900: the multi-error header list is the parallelism lever —
         // each mind takes a DIFFERENT failing point instead of the whole team serializing on the first
@@ -6467,12 +6431,10 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
 }
 
 /// The safety screen's token budget. A REASONING gateway model (deepseek-v4-flash, o-series, etc.) spends its
-/// completion budget on hidden reasoning FIRST, then the answer — at the old 120 the reasoning alone hit the cap
-/// (finish_reason "length"), the `content` verdict came back EMPTY, jsonSlice found no JSON, and screenPass
-/// fail-closed on EVERY publish: the first edition to ever clear the grounding gate was held "screen" purely
-/// because the verdict never fit. The screen is a rare (per-publish) call, so a generous budget that comfortably
-/// holds reasoning + the one-line JSON verdict is the right trade. Verified live: 120 -> empty content; 2048 ->
-/// {"ok":true,"reason":"…"} for the same post.
+/// completion budget on hidden reasoning FIRST, then the answer — a small budget lets the reasoning alone hit
+/// the cap (finish_reason "length"), the `content` verdict comes back EMPTY, jsonSlice finds no JSON, and
+/// screenPass fail-closes on EVERY publish. The screen is a rare (per-publish) call, so a generous budget that
+/// comfortably holds reasoning + the one-line JSON verdict is the right trade.
 const SCREEN_MAX_TOKENS: u32 = 2048;
 
 /// One safety-screen pass: ask the gateway model the `ssys` review about `suser`; returns ok. Logs the verdict.
@@ -7023,9 +6985,9 @@ fn isDocExt(base: []const u8) bool {
 }
 
 /// Config/data formats a goal legitimately names as DELIVERABLES (the bench already scores these by their own
-/// parsers) — without this list the extractor silently dropped them (observed live, sim_forum4: the goal listed
-/// `config.json` explicitly; it never entered the blueprint, so app.py's FileNotFoundError on boot was a failure
-/// no amount of coverage could fix). Runtime artifacts (.db/.sqlite/.log/.pid) stay excluded on purpose.
+/// parsers) — without this list the extractor silently drops an explicitly-named `config.json`, so a boot-time
+/// FileNotFoundError is a failure no amount of coverage can fix. Runtime artifacts (.db/.sqlite/.log/.pid) stay
+/// excluded on purpose.
 fn isDataExt(base: []const u8) bool {
     const ext = [_][]const u8{ ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml", ".csv", ".tsv", ".svg" };
     for (ext) |e| if (std.mem.endsWith(u8, base, e)) return true;
@@ -7037,11 +6999,10 @@ fn stripPathPunct(tok: []const u8) []const u8 {
 }
 
 /// True when `prev` is a tool-attribution word: "add a map layer WITH Leaflet.js" names the LIBRARY
-/// the work is done with, not a file to create. Observed live (sim_freeroam2 goal #2): the library
-/// name became a required file and pinned COVERAGE at 0/1 for 12 straight rounds — a swarm can never
-/// satisfy a "file" that is actually a technology's name, so it burned ~90 minutes at a floor. The
-/// error costs are asymmetric: a falsely-SKIPPED real file only loses one coverage line (the
-/// architect's blueprint still carries the whole goal), while a false REQUIRED file wedges the run.
+/// the work is done with, not a file to create. A library name adopted as a required file pins COVERAGE at a
+/// floor forever — a swarm can never satisfy a "file" that is a technology's name. The error costs are
+/// asymmetric: a falsely-SKIPPED real file only loses one coverage line (the architect's blueprint still
+/// carries the whole goal), while a false REQUIRED file wedges the run.
 fn toolAttributed(prev: []const u8) bool {
     const words = [_][]const u8{ "with", "using", "use", "via", "through", "like", "leveraging", "leverage", "powered", "atop" };
     for (words) |w| if (std.ascii.eqlIgnoreCase(prev, w)) return true;
@@ -7088,8 +7049,7 @@ fn extractGoalPaths(gpa: std.mem.Allocator, goal: []const u8, out_n: *u32) []con
     // PACKAGE-INIT PLACEMENT: a bare `__init__.py` token in a goal whose tree nests .py files in directories
     // means "the packages need inits" — the project ROOT is the working dir, not a package, so a root init is
     // (nearly) always wrong. Expand the bare token into `<dir>/__init__.py` for EVERY directory on the adopted
-    // .py paths and drop the root copy (observed live, sim_forum4: the goal said "every package dir under src/
-    // needs __init__.py; do NOT put it at the project root" and the adopted tree did exactly the opposite).
+    // .py paths and drop the root copy.
     var inits: std.ArrayListUnmanaged([]const u8) = .empty; // gpa-owned "<dir>/__init__.py" strings
     defer {
         for (inits.items) |s| gpa.free(@constCast(s));
@@ -7323,8 +7283,8 @@ fn isToolParseError(msg: []const u8) bool {
 /// setup) so the swarm keeps thinking instead of losing the turn. The fallback is degraded (a weaker model) but alive;
 /// the mind emits a 'fallback' event so the adaptation is visible. A dead key (fatal) is NOT retried — the failsafe
 /// owns that. No distinct gateway configured ⇒ behaves exactly like a plain primary call (no change).
-/// Classify WHY a primary call failed, for an HONEST fallback event. Operators were mis-tuning for 429 rate-limits
-/// that never occurred — every fallback in the novel run was a 30s curl timeout ("curl: (28) ... 0 bytes").
+/// Classify WHY a primary call failed, for an HONEST fallback event — most fallbacks are a curl timeout ("curl:
+/// (28) … 0 bytes"), not the 429 rate-limit operators tend to tune for.
 fn fallbackReason(content: []const u8) []const u8 {
     if (std.mem.indexOf(u8, content, "curl: (28)") != null or std.mem.indexOf(u8, content, "timed out") != null or std.mem.indexOf(u8, content, "timeout") != null)
         return "primary timed out (no first byte) — WAF/network hold or slow long-form generation";
@@ -7621,7 +7581,7 @@ fn parseOracleScore(s: []const u8) ?u32 {
     return out;
 }
 
-// ---- RSI data-acquisition: provenance-gated screen-distill (DVG-Scout v1a) ------------------------------------
+// ---- RSI data-acquisition: provenance-gated screen-distill ---------------------------------------------------
 // A fetched page becomes hive knowledge only if the model can quote a VERBATIM span of the page bytes (provenance)
 // that its note derives from. The model cannot forge bytes it never received, so a hallucinated / boilerplate /
 // keyword-stuffed page is refused mechanically — no domain blocklist. Cost knob, not a use-case:
@@ -7665,12 +7625,10 @@ fn screenDistill(w: *Worker, goal: []const u8, gap: []const u8, dom: []const u8,
     const gpa = w.gpa;
     const sys = "You are a strict extractor. Output ONLY one JSON object: {\"applicable\":true|false,\"evidence_span\":\"...\",\"note\":\"...\",\"code\":\"...\"}. evidence_span = copied VERBATIM from the page: the exact sentence or code line (at least 40 chars) that states the concrete technique/API/config/value; it MUST appear in the page character-for-character. note = at most 3 lines a builder can act on, derived ONLY from evidence_span, quoting the exact API/signature/value. code = OPTIONAL: when the page shows actual CODE (a signature, call, or config line), copy the single most reusable code line(s) VERBATIM from the page (max ~200 chars); otherwise an empty string — builders paste this directly, so never invent or paraphrase it. If the page has no concrete span, set applicable=false with empty strings. No preamble, no markdown, no phrases like 'see above'.";
     // Show the judge the MOST GAP-RELEVANT ~4KB, not the raw first 4KB. On long reference/research pages the
-    // concrete technique sits below the fold, so a head-clip made the judge truthfully report applicable=false
-    // on pages that DID answer the gap (freeroam1 r1-r4: four straight frontiersin/scispace rejects, and the
-    // hive posted a public "knowledge trapped behind doors that stay shut" meditation — its frustration WAS
-    // this window). fitToQuery BM25-ranks the page's chunks against goal+gap and re-joins the top ones in
-    // document order; the provenance gate still verifies every span against the WHOLE page, so a tighter
-    // window only changes what the judge SEES, never what can be admitted. Empty query → doc head (old behavior).
+    // concrete technique sits below the fold, so a head-clip makes the judge truthfully report applicable=false
+    // on pages that DID answer the gap. fitToQuery BM25-ranks the page's chunks against goal+gap and re-joins
+    // the top ones in document order; the provenance gate still verifies every span against the WHOLE page, so
+    // a tighter window only changes what the judge SEES, never what can be admitted. Empty query → doc head.
     const query = std.fmt.allocPrint(gpa, "{s} {s}", .{ clip(goal, 300), clip(gap, 200) }) catch "";
     defer if (query.len > 0) gpa.free(query);
     const window = crawl.fitToQuery(gpa, page, query, 4000);
@@ -7754,7 +7712,7 @@ fn rememberSpan(w: *Worker, span: []const u8) void {
     w.seen_spans_n +%= 1;
 }
 
-// ---- v1b: trust-ranked source routing + the grounded application reward (neuron-db classTrust / trust_reward) ----
+// ---- trust-ranked source routing + the grounded application reward (neuron-db classTrust / trust_reward) ----
 const EXPLORE_C: f32 = 0.6; // cost knob: a mild bias to the search engine's own rank so a fresh source is still tried
 
 // Pick a result URL, preferring a SOURCE the swarm has learned to trust (classTrust), with a small rank prior so an
@@ -8039,9 +7997,8 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.stop_why = "completed";
         }
         // Graduation holds the SAME floor as completion: a red smoke gate or missing declared
-        // deliverables must block the chain, not just the "completed" stop. (Observed live,
-        // open_ai_test_3: the swarm's self-written checks pinned 100%, flat_rounds accrued, and
-        // the hive graduated goal after goal on a build whose pytest had been red for 30 rounds.)
+        // deliverables must block the chain, not just the "completed" stop (else the hive graduates
+        // goal after goal on a build whose runtime gate has been red for many rounds).
         if (!w.stop_now and w.autonomous and !w.open_ended and w.best_pct >= GRADUATE_PCT and w.flat_rounds >= GRADUATE_FLAT and w.smoke_ok and !w.deliverable_missing) {
             w.stop_now = true;
             w.stop_why = "graduated";
@@ -8144,9 +8101,8 @@ fn fnv1a(data: []const u8) u64 {
 
 const FilesView = struct { json: []u8, count: usize, bytes: u64 };
 /// The build's file list (path + size) as a JSON array for the UI build tree, read from .build_manifest
-/// (one `path|bytes` line per write, last write wins per path). The Zig worker had only ever sent the file
-/// COUNT with an empty `files:[]`, so the build tab's file tree stayed empty even while files were being built;
-/// this restores the real list so the tree populates. `arena` is the per-round arena (allocations freed at round end).
+/// (one `path|bytes` line per write, last write wins per path). `arena` is the per-round arena (allocations
+/// freed at round end).
 fn filesJson(arena: std.mem.Allocator, io: std.Io, run_dir: []const u8) FilesView {
     const empty = FilesView{ .json = arena.dupe(u8, "[]") catch @constCast("[]"), .count = 0, .bytes = 0 };
     const mpath = std.fmt.allocPrint(arena, "{s}/.build_manifest", .{run_dir}) catch return empty;
@@ -8414,8 +8370,8 @@ fn isStopWord(w: []const u8) bool {
 /// by GRAMMAR, name-agnostic: it's a modifier when the previous word is a dependency preposition
 /// (using/with/via/powered) or the next word is a CONTENT word it qualifies — "three.js game", "react.js
 /// dashboard". A standalone or list/prepositional-phrase JS token ("game.js", "main.js and util.js", "game.js
-/// for the shooter") is a deliverable. This generalizes to ANY library with no baked-in framework list (the
-/// earlier fix hardcoded one, which is exactly what the engine's general-floor / RSI design forbids).
+/// for the shooter") is a deliverable. This generalizes to ANY library with no baked-in framework list (a
+/// hardcoded framework list is what the engine's general-floor / RSI design forbids).
 fn jsTokenIsDependency(toks: []const []const u8, i: usize) bool {
     if (i > 0) {
         const deps = [_][]const u8{ "using", "with", "via", "powered" };
@@ -8434,7 +8390,7 @@ fn jsTokenIsDependency(toks: []const []const u8, i: usize) bool {
 /// precedes it (a fronted phrase: "For the larger files (a.zig) read them in chunks"), the nearest verb AHEAD
 /// decides. No verb found either way → NOT consumed (the token stays a deliverable, today's behavior). This is
 /// the symmetric twin of jsTokenIsDependency: closed-class grammatical machinery, no use-case conditions —
-/// without it the c6a50258c cast adopted its 14 INPUT sources as the blueprint and graded the wrong files.
+/// without it a cast adopts its INPUT sources as the blueprint and grades the wrong files.
 fn tokenIsConsumed(toks: []const []const u8, i: usize) bool {
     const verdict = struct {
         // true = consumed (input), false = produced (deliverable), null = this word decides nothing
@@ -8506,8 +8462,8 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
     while (tit.next()) |t| (toks.append(gpa, t) catch {});
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
-    // 32, not 12: the old cap silently dropped the tail of a long goal's file list — in the c6a50258c cast
-    // the first 12 tokens were all INPUT sources, so the real output paths never entered the blueprint.
+    // 32, not 12: a small cap silently drops the tail of a long goal's file list — if the early tokens are all
+    // INPUT sources, the real output paths never enter the blueprint.
     var seen: [32][]const u8 = undefined;
     var n: usize = 0;
     for (toks.items, 0..) |tok0, i| {
@@ -8516,16 +8472,16 @@ fn goalNamedFiles(gpa: std.mem.Allocator, goal: []const u8) []const u8 {
         if (tok.len < 3 or tok.len > 120) continue;
         if (!fileShapedToken(tok)) continue;
         // A DELIVERABLE is a FILE — not a directory and not a repo/URL reference. `fileShapedToken` accepts any
-        // token with a '/', so a goal's SUBJECT ("gary23w/nl-veil", the repo to explore) and its OUTPUT DIR
-        // ("details/") got adopted as files to CREATE — every mind was pinned to a phantom deliverable and built
-        // nothing (observed live). A real file has a filename with an extension; a directory ends in '/'.
+        // token with a '/', so a goal's SUBJECT (a repo to explore) and its OUTPUT DIR ("details/") can get
+        // adopted as files to CREATE, pinning every mind to a phantom deliverable. A real file has a filename
+        // with an extension; a directory ends in '/'.
         if (tok[tok.len - 1] == '/' or tok[tok.len - 1] == '\\') continue; // a directory, not a file
         if (std.mem.indexOfScalar(u8, std.fs.path.basename(tok), '.') == null) continue; // no extension → repo/namespace/dir, not a file
         // a JS token used as a dependency ("a three.js game", "using d3.js") is a library, not a file to create —
-        // adopting it as the blueprint pinned every mind to a phantom "Three.js" deliverable (observed live)
+        // adopting it as the blueprint pins every mind to a phantom "Three.js" deliverable
         if (jsFamilyExt(tok) and jsTokenIsDependency(toks.items, i)) continue;
-        // a file in a READ/CONSUME clause is an INPUT, not a deliverable — adopting the sources pinned every
-        // mind to files that already exist and graded the run on the wrong tree (observed live, c6a50258c)
+        // a file in a READ/CONSUME clause is an INPUT, not a deliverable — adopting the sources pins every
+        // mind to files that already exist and grades the run on the wrong tree
         if (tokenIsConsumed(toks.items, i)) continue;
         if (bpPath(tok) == null) continue; // must survive the blueprint parser or the slot never assigns
         var dup = false;
@@ -8581,8 +8537,8 @@ test "goalNamedFiles adopts real deliverables but never a library named like a f
         try std.testing.expect(std.mem.indexOf(u8, bp, "details/architecture.md") != null);
         try std.testing.expect(std.mem.indexOf(u8, bp, "details/api.md") != null);
     }
-    // the c6a50258c docs cast: files in a READ clause are INPUTS — the blueprint must adopt the OUTPUT
-    // paths, never the sources (the old behavior graded the run on files that already existed)
+    // a docs cast: files in a READ clause are INPUTS — the blueprint must adopt the OUTPUT
+    // paths, never the sources (adopting sources grades the run on files that already existed)
     {
         const bp = goalNamedFiles(gpa, "Read all 14 .zig files in the workdir (catalog.zig, chat.zig, tray.zig) and for each one write a detailed Markdown documentation file into docs/desktop/ with signatures. For the larger files (main.zig, store.zig) read them in chunks of 200-300 lines. The final output should be 14 markdown files at paths like docs/desktop/main.zig.md, docs/desktop/chat.zig.md, etc., each covering one source file completely.");
         defer if (bp.len > 0) gpa.free(@constCast(bp));
@@ -8624,8 +8580,8 @@ fn assignSlot(gpa: std.mem.Allocator, data: []const u8, blueprint: []const u8, d
     if (files.items.len == 0) return gpa.dupe(u8, "") catch @constCast("");
     const isDone = struct {
         fn f(d: []const u8, inc: []const u8, p: []const u8) bool {
-            // full-path keys: basename keying read five __init__.py as ONE file — once the first was
-            // built the frontier believed all five were, and coverage stalled (sim_forum6, 15/19).
+            // full-path keys: basename keying reads five __init__.py as ONE file — once the first is
+            // built the frontier believes all five are, and coverage stalls.
             return builtInManifest(d, p) and !inSpaceList(inc, p);
         }
     }.f;
@@ -9110,9 +9066,8 @@ test "assignSlot: surplus builders get no slot, and a fully-built project deepen
         try std.testing.expectEqualStrings("", s2);
     }
     {
-        // b.py is deps-blocked on c.py, which is NOT a blueprint file and can never be built. The old code
-        // masked this deadlock by re-pinning the lead to the DONE a.py forever (observed live: test_store.py
-        // frozen out while the benchmark demanded it every round). The deadlock break now treats the blocked
+        // b.py is deps-blocked on c.py, which is NOT a blueprint file and can never be built. Re-pinning the
+        // lead to the DONE a.py would deadlock the build forever. The deadlock break treats the blocked
         // unbuilt file as the frontier — the stale dep cannot hold the build hostage.
         const m = "a.py|500\n";
         const dps = "b.py: c.py\n";

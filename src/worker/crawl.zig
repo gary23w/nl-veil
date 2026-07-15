@@ -1,11 +1,7 @@
-//! crawl.zig: parse HTML, strip boilerplate,
-//! prune to the meaningful content with PruningContentFilter density heuristic, and emit
-//! clean, LLM-ready markdown with link citations ([N] + a References list). This is the FIRST thing
-//! the AI's web-reading tools reach for; the r.jina.ai reader + curl remain as fallbacks underneath.
-//!
-//! (content_filter_strategy.py PruningContentFilter,
-//! markdown_generation_strategy.py DefaultMarkdownGenerator, content_scraping_strategy.py). No browser
-//! / JS rendering (that path falls back to the jina reader); everything here is a string/tree algorithm.
+//! crawl.zig: parse HTML, prune to the meaningful content with a density heuristic, and emit clean
+//! LLM-ready markdown with link citations ([N] + a References list). First choice for the AI's
+//! web-reading tools; the r.jina.ai reader + curl remain as fallbacks underneath. No browser / JS
+//! rendering (that path falls back to the jina reader) — everything here is a string/tree algorithm.
 
 const std = @import("std");
 
@@ -607,9 +603,8 @@ fn aText(node: *const Node, out: *std.ArrayListUnmanaged(u8), a: std.mem.Allocat
     for (node.children.items) |c| aText(c, out, a);
 }
 
-/// A harvested link is the engine's OWN chrome (nav / promo / proxy), not a result, if it points at a known search
-/// engine's domain OR at the SERP's own host. Excluding these is what keeps a multi-engine crawl-as-search clean
-/// across environments — every engine wraps its results in its own navigation, and we must drop all of it.
+/// A harvested link is the engine's own chrome (nav / promo / proxy), not a result, if it points at a known
+/// search-engine domain or at the SERP's own host. Dropping these keeps a multi-engine crawl-as-search clean.
 fn isEngineLink(real: []const u8, base: []const u8) bool {
     const engines = [_][]const u8{ "bing.com", "duckduckgo.com", "microsoft.com", "msn.com", "mojeek.com", "marginalia.nu", "marginalia-search.com", "startpage.com", "yandex.com", "yandex.ru", "ecosia.org", "brave.com", "4get.ca", "google.com", "googleusercontent.com", "gstatic.com" };
     for (engines) |e| if (std.mem.indexOf(u8, real, e) != null) return true;
@@ -631,7 +626,7 @@ fn isChromeTag(tag: []const u8) bool {
 
 fn walkAnchors(node: *const Node, base: []const u8, gpa: std.mem.Allocator, ta: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), seen: *std.StringHashMapUnmanaged(void), max: usize, n: *usize) void {
     if (n.* >= max) return;
-    if (!node.is_text and isChromeTag(node.tag)) return; // skip nav/footer/header chrome
+    if (!node.is_text and isChromeTag(node.tag)) return;
     if (!node.is_text and std.mem.eql(u8, node.tag, "a") and node.href.len > 0) {
         var tb: std.ArrayListUnmanaged(u8) = .empty;
         aText(node, &tb, ta);
@@ -880,8 +875,8 @@ pub fn extractLinks(gpa: std.mem.Allocator, html: []const u8, base_url: []const 
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
-// Unit tests for the pure crawl/search surface. std.testing.allocator is leak-checking — these guard the
-// search hot path against allocation leaks (caught the walkAnchors `real` leak).
+// Unit tests for the pure crawl/search surface. std.testing.allocator is leak-checking, so these guard the
+// search hot path against allocation leaks.
 
 test "hostOf extracts the host (or empty when there's no scheme)" {
     try std.testing.expectEqualStrings("www.example.com", hostOf("https://www.example.com/path?q=1"));

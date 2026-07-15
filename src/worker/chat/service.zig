@@ -5,10 +5,9 @@
 //!         messages.jsonl   // one JSON object per line: {role,content,kind,ts}
 //!         events.jsonl     // SSE frames, the SAME per-line JSON shape swarm events.jsonl uses
 //!
-//! These four handlers only READ (and DELETE) that tree — no turn loop, no LLM, no live SSE stream, no
-//! message writes; those land in later phases that populate the store. Until a writer phase lands the tree
-//! is EMPTY, so every read path degrades gracefully: a missing convs root → empty list, a missing conv dir
-//! → 404, a missing messages.jsonl/events.jsonl → empty body. Ownership is STRUCTURAL: every path is built
+//! The read routes only READ (and DELETE) that tree — no turn loop, no LLM, no live SSE stream. Every read path
+//! degrades gracefully when the store is empty: a missing convs root → empty list, a missing conv dir → 404, a
+//! missing messages.jsonl/events.jsonl → empty body. Ownership is STRUCTURAL: every path is built
 //! from the authenticated user's own uid (`u{uid}`), so a caller can only ever reach its own conversations —
 //! the per-uid prefix IS the `owner.uid != u.id` check the swarm routes make against the registry.
 //!
@@ -51,7 +50,7 @@ pub fn listConvs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer arr.deinit(app.gpa);
     try arr.appendSlice(app.gpa, "{\"ok\":true,\"convs\":[");
 
-    // No convs dir yet (the store is empty until a writer phase lands) → return an empty list, never crash.
+    // No convs dir yet → return an empty list, never crash.
     if (std.Io.Dir.cwd().openDir(app.io, root, .{ .iterate = true })) |dir_const| {
         var dir = dir_const;
         defer dir.close(app.io);
@@ -163,9 +162,9 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const q = try req.query();
     if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
     // POSITIONAL read from the client's cursor `from` — NOT the whole file. A persistent afk turn appends
-    // events.jsonl indefinitely; reading the whole file under a fixed cap returned EMPTY once it crossed the cap
-    // (the desk view froze + a Stopped turn stayed 'busy' forever on a long run). The file only grows, so `from`
-    // stays valid; one poll's payload is bounded (the desk catches up across polls by advancing its cursor).
+    // events.jsonl indefinitely; reading the whole file under a fixed cap returns EMPTY once it crosses the cap.
+    // The file only grows, so `from` stays valid; one poll's payload is bounded (the desk catches up across polls
+    // by advancing its cursor).
     var body: []const u8 = "";
     var next_off: usize = from;
     if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
@@ -243,9 +242,9 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
 
     // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames
-    // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes — the
-    // "shows only 'server thinking'" symptom. The turn writes frames to events.jsonl as it runs. spawnTurn owns
-    // releasing the per-conv slot (via turnThread / its inline paths) on every completion path.
+    // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
+    // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
+    // inline paths) on every completion path.
     chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text, loop_mode);
 
     res.status = 202;

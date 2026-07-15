@@ -1,4 +1,4 @@
-//! AES-256-GCM at-rest sealing + a write-only BYOK key vault. The seal/open primitives protect per-swarm
+//! AES-256-GCM at-rest sealing + a write-only BYOK key vault (seal/open primitives + per-user provider keys).
 
 const std = @import("std");
 const Neuron = @import("../worker/neuron/client.zig").Neuron;

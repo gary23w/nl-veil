@@ -1,26 +1,23 @@
 //! chat_context.zig — bounded LLM-context assembly for the server chat turn.
 //!
 //! The durable conversation log (messages.jsonl) grows without bound, but what we FEED the model each inference
-//! must stay inside its context window. The old server turn replayed the ENTIRE transcript every inference, which
-//! silently overflowed the model window after a few dozen turns and hit a hard 8 MiB read cliff (total amnesia)
-//! on very long chats. This module projects the full history into a fixed budget instead of replaying it:
+//! must stay inside its context window. This module projects the full history into a fixed budget rather than
+//! replaying the whole transcript (which overflows the model window and hits a hard 8 MiB read cliff on long chats):
 //!
 //!   * pin the original goal (the first user message) — it anchors the whole arc,
 //!   * replay only a RECENCY WINDOW of the newest turns (the bulk of what the model needs),
 //!   * report the GAP so the caller can cover the dropped middle with a rolling summary + relevance recall.
 //!
-//! Storage stays full (the durable log is never truncated); only the CONTEXT is windowed. This file is pure +
-//! std-only so the windowing math is unit-tested directly; the impure file reads use std.Io and are tested
-//! against a temp file (like supervisor.readTail). The caller (chat_engine.zig) parses the windowed JSON lines
-//! and owns the LLM-backed summary generation.
+//! Storage stays full (the durable log is never truncated); only the CONTEXT is windowed. Pure + std-only so the
+//! windowing math is unit-tested directly; impure file reads use std.Io. The caller (chat_engine.zig) parses the
+//! windowed JSON lines and owns the LLM-backed summary generation.
 
 const std = @import("std");
 
 /// Recency window: the newest ~this many bytes of messages.jsonl are replayed verbatim. ~28 KiB ≈ ~7k tokens at
 /// ~4 bytes/token — with the system prompt (~1 KiB), a capped summary (≤6 KiB), and recall (~a few hundred B),
 /// the assembled base is ~9k tokens, leaving ample room under a 32k-token model for this turn's working context
-/// and the output reservation. Chosen to match the desk engine's 24 KiB tail window (which worked well live),
-/// with a little more headroom now that a rolling summary carries the older context recall can't.
+/// and the output reservation.
 pub const HISTORY_WINDOW_BYTES: usize = 28 * 1024;
 
 /// Head read: enough to always capture the first (goal) line even when the file is large. A goal message longer
@@ -65,8 +62,8 @@ pub const HeadTail = struct {
 };
 
 /// Read the head and tail of a (possibly large) file with positioned reads — never loads the whole middle, so
-/// cost is O(head+tail) regardless of how big the conversation grows (no more 8 MiB whole-file cliff). Returns
-/// slices into the caller-owned buffers, or null on any error / empty file (caller: treat as "no history").
+/// cost is O(head+tail) regardless of how big the conversation grows. Returns slices into the caller-owned
+/// buffers, or null on any error / empty file (caller: treat as "no history").
 /// The tail slice may begin MID-LINE when the file is larger than tail_buf — computeView trims that.
 pub fn readHeadTail(io: std.Io, path: []const u8, head_buf: []u8, tail_buf: []u8) ?HeadTail {
     const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
@@ -426,7 +423,7 @@ test "isBareScalar: accepts real JSON numbers/bools, rejects IPs/versions/malfor
     try std.testing.expect(isBareScalar("1e10"));
     try std.testing.expect(isBareScalar("-2.5e-3"));
     try std.testing.expect(isBareScalar("true") and isBareScalar("false") and isBareScalar("null"));
-    // must be REJECTED (→ quoted) — these are the args-corrupting cases from the review:
+    // must be REJECTED (→ quoted) — these are the args-corrupting cases:
     try std.testing.expect(!isBareScalar("10.0.0.1"));
     try std.testing.expect(!isBareScalar("1.2.3"));
     try std.testing.expect(!isBareScalar("+5"));
@@ -485,7 +482,7 @@ test "readHeadTail: null on a missing file" {
 
 test "recoverMarkupCalls: parses the real DeepSeek/gpt-oss DSML tool-call markup, strips it from content" {
     const gpa = std.testing.allocator;
-    // EXACT format captured from a live gpt-oss run (conv c6a566d24): narration + a Claude-style invoke block.
+    // EXACT format a local gpt-oss run emits: narration + a Claude-style invoke block.
     const content =
         "I see the issue.\n\n" ++
         "<｜｜DSML｜｜tool_calls>\n" ++

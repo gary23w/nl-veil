@@ -6,12 +6,10 @@
 //! separate Zig packages by design, so they can't share a module without cross-package build wiring).
 //! Fix a bug in one → apply it to the other.
 //!
-//! WHY not curl: every request used to spawn curl.exe with the bearer token and the full JSON body on
-//! the command line. Process command lines are readable by any same-user process on Windows, and the
-//! spawn pattern itself (self-built binary forking curl to POST bearer JSON at localhost, on the
-//! poller's few-second cadence) is exactly what Defender's behavior/ML models flag — it killed the app
-//! outright on unexcluded machines. In-process sockets have no argv, no child process, and no per-call
-//! process cost.
+//! WHY not curl: spawning curl.exe put the bearer token and full JSON body on the command line — readable
+//! by any same-user process on Windows — and the spawn pattern (a self-built binary forking curl to POST
+//! bearer JSON at localhost on a few-second cadence) is exactly what Defender's behavior/ML models flag; it
+//! killed the app on unexcluded machines. In-process sockets have no argv, no child, and no per-call cost.
 //!
 //! WHY this doesn't reintroduce the "casting hangs" bug that motivated curl: the previous raw-socket
 //! client trusted `Connection: close` and read to EOF with NO time bound, so a server that kept the

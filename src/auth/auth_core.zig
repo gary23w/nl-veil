@@ -1,4 +1,4 @@
-//! Auth — register / login / sessions, with neuron-db as the durable store (dogfooded) and an in-memory
+//! Auth — register / login / sessions, backed by neuron-db (dogfooded) with an in-memory user + session cache.
 
 const std = @import("std");
 const Neuron = @import("../worker/neuron/client.zig").Neuron;
