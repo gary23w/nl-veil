@@ -204,6 +204,13 @@ pub fn oauthCfStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/status", token, null, 6);
 }
 
+/// GET /api/v1/oauth/cloudflare/models — the account's live Workers AI text-generation models
+/// ({connected, models:[...]}). Polled while connected so the model dropdown reflects the live catalog.
+pub fn oauthCfModels(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfModels port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/models", token, null, 15);
+}
+
 /// POST /api/v1/oauth/cloudflare/logout — forget this user's stored Cloudflare credential.
 pub fn oauthCfLogout(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
     log.trace("netcli.oauthCfLogout port={d}", .{port});

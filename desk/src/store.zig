@@ -219,6 +219,7 @@ pub const PlanRow = struct {
 pub const MAX_PLAN = 32; // == the server plan-board's MAX_TASKS cap
 
 pub const MAX_SCHED = 32;
+pub const MAX_CF_MODELS = 64; // live Workers AI models fetched from the connected Cloudflare account
 
 /// One scheduled task (poller writes from GET /api/v1/sched; the Scheduled tab reads). Raw schedule
 /// fields are kept — the UI composes the human summary ("every 30m" / "daily 09:00") at draw time, so
@@ -434,6 +435,11 @@ pub const Store = struct {
     cf_oauth_pending: bool = false, //    a login was started; waiting for the browser callback to complete
     cf_oauth_account: [64]u8 = undefined, // the connected account id (for display)
     cf_oauth_account_len: usize = 0,
+    // Live Workers AI model list, fetched from the connected account (the catalog changes fast). The model
+    // dropdown uses these for the Cloudflare provider when non-empty; empty → catalog defaults.
+    cf_models: [MAX_CF_MODELS][96]u8 = undefined,
+    cf_model_lens: [MAX_CF_MODELS]u8 = undefined,
+    cf_model_count: usize = 0,
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

@@ -282,6 +282,7 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
     router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
     router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
+    router.get("/api/v1/oauth/cloudflare/models", cf_oauth.models, .{});
     router.post("/api/v1/oauth/cloudflare/logout", cf_oauth.logout, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
