@@ -4860,6 +4860,13 @@ pub const Chat = struct {
             // the nearlySame repeat-guard below ends the streak — so the rescue is bounded, not a spin.
             if (self.fireTerminalVerify(dd)) return;
             text = "continue";
+        } else if (stepIsToolMarkup(text)) {
+            // The drive inference answered with a TOOL-CALL FRAGMENT, not an instruction (observed live: a
+            // "tool\nread_file" step committed as a user message, which the NEXT turn read back as a confusing
+            // user demand — "the user says 'tool read_file'??" — and derailed on). Markup carries no direction:
+            // substitute a plain "continue"; the nearlySame repeat guard below bounds the streak exactly as it
+            // bounds the empty-inference rescue.
+            text = "continue";
         }
         if (loopIsDone(text)) {
             // Don't take the model's word for "done" on a build it may have only ANNOUNCED — run the
@@ -7766,6 +7773,10 @@ fn buildBatchScript(buf: []u8, cmd: []const u8) ?[]const u8 {
     }
     var w = H.put(buf, 0, "@echo off\r\n") orelse return null;
     if (non_ascii) w = H.put(buf, w, "chcp 65001>nul\r\n") orelse return null;
+    // Python in this console must speak UTF-8: Windows Python defaults stdout to the ANSI codepage, so a
+    // script printing '→' (or any non-ASCII) dies with UnicodeEncodeError: 'charmap' — observed live when a
+    // build's own verification script printed an arrow. Harmless for non-Python commands.
+    w = H.put(buf, w, "set PYTHONUTF8=1\r\nset PYTHONIOENCODING=utf-8\r\n") orelse return null;
     var i: usize = 0;
     while (i < cmd.len) : (i += 1) {
         const c = cmd[i];
@@ -8351,6 +8362,36 @@ fn substantialTokens(s: []const u8, within: []const u8) usize {
 /// analyses aren't acks) that doesn't hand the turn back with a question. The ack must sit in the reply's
 /// TAIL — announcements come as closings; an opening "I'll check X" followed by the finished work reads
 /// differently. "let me know" (the classing closing) is explicitly not an ack. Pure — unit-tested.
+/// True when an auto-loop DRIVE STEP is really a tool-call FRAGMENT the model leaked instead of an instruction
+/// — "tool\nread_file", a fenced "```tool" block (the fence chars are trimmed before this sees it), or a bare
+/// tool name. Committing one as a user message pollutes the transcript AND the next turn reads it back as a
+/// confusing user demand. Trimmed input expected.
+fn stepIsToolMarkup(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (std.mem.startsWith(u8, t, "```")) return true;
+    const names = [_][]const u8{ "read_file", "write_file", "edit_file", "run_python", "run_tests", "list_dir", "web_search", "web_fetch", "delete_file", "fetch_json" };
+    if (std.mem.eql(u8, t, "tool")) return true;
+    if (std.mem.startsWith(u8, t, "tool\n") or std.mem.startsWith(u8, t, "tool ")) {
+        const rest = std.mem.trim(u8, t["tool".len..], " \r\n\t");
+        if (rest.len == 0) return true;
+        for (names) |n| if (std.mem.startsWith(u8, rest, n)) return true;
+    }
+    for (names) |n| if (std.mem.eql(u8, t, n)) return true; // a bare tool name is not an instruction
+    return false;
+}
+
+test "stepIsToolMarkup: catches leaked tool fragments, passes real instructions" {
+    try std.testing.expect(stepIsToolMarkup("tool\nread_file"));
+    try std.testing.expect(stepIsToolMarkup("tool write_file"));
+    try std.testing.expect(stepIsToolMarkup("```tool\nwrite_file"));
+    try std.testing.expect(stepIsToolMarkup("read_file"));
+    try std.testing.expect(stepIsToolMarkup("tool"));
+    try std.testing.expect(!stepIsToolMarkup("append the second chunk: enemies, waves, game loop"));
+    try std.testing.expect(!stepIsToolMarkup("use read_file to verify the tail, then append part B"));
+    try std.testing.expect(!stepIsToolMarkup("retool the pipeline for speed"));
+    try std.testing.expect(!stepIsToolMarkup("continue"));
+}
+
 pub fn announcesAction(text: []const u8) bool {
     const t = std.mem.trim(u8, text, " \r\n\t");
     if (t.len == 0 or t.len > 1600) return false;
@@ -10749,12 +10790,14 @@ test "composeConsoleResult keeps stdout then stderr, and always the status note 
 }
 
 test "buildBatchScript: echo-off prelude, CRLF normalization, chcp only for non-ASCII, NUL/overflow rejected" {
-    var buf: [256]u8 = undefined;
+    var buf: [384]u8 = undefined;
+    // every script carries the Python-UTF8 prelude (Windows Python otherwise dies on the first non-ASCII print)
+    const PRE = "@echo off\r\nset PYTHONUTF8=1\r\nset PYTHONIOENCODING=utf-8\r\n";
     // quotes pass through VERBATIM — the whole point of the batch carrier (cmd /c argv mangled them)
-    try std.testing.expectEqualStrings("@echo off\r\npowershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"\r\n", buildBatchScript(&buf, "powershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"").?);
+    try std.testing.expectEqualStrings(PRE ++ "powershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"\r\n", buildBatchScript(&buf, "powershell -Command \"(Get-Date).ToString('yyyy-MM-dd HH:mm')\"").?);
     // lone \n and pre-normalized \r\n both land as CRLF
-    try std.testing.expectEqualStrings("@echo off\r\necho a\r\necho b\r\n", buildBatchScript(&buf, "echo a\necho b").?);
-    try std.testing.expectEqualStrings("@echo off\r\necho a\r\necho b\r\n", buildBatchScript(&buf, "echo a\r\necho b").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo a\r\necho b\r\n", buildBatchScript(&buf, "echo a\necho b").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo a\r\necho b\r\n", buildBatchScript(&buf, "echo a\r\necho b").?);
     // a non-ASCII byte pulls in the UTF-8 codepage prelude; pure ASCII must not
     try std.testing.expect(std.mem.indexOf(u8, buildBatchScript(&buf, "echo caf\xc3\xa9").?, "chcp 65001>nul\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, buildBatchScript(&buf, "echo cafe").?, "chcp") == null);
@@ -10764,11 +10807,11 @@ test "buildBatchScript: echo-off prelude, CRLF normalization, chcp only for non-
     try std.testing.expect(buildBatchScript(&tiny, "dir") == null);
     // percent rules: batch parameter refs (%digit/%*) and a line-trailing lone % are doubled back to
     // literals (they worked literally under cmd /c); %VAR% env pairs and pre-escaped %% pass through
-    try std.testing.expectEqualStrings("@echo off\r\ncurl https://x/a%%20b\r\n", buildBatchScript(&buf, "curl https://x/a%20b").?);
-    try std.testing.expectEqualStrings("@echo off\r\necho %%* stays\r\n", buildBatchScript(&buf, "echo %* stays").?);
-    try std.testing.expectEqualStrings("@echo off\r\necho 50%%\r\n", buildBatchScript(&buf, "echo 50%").?);
-    try std.testing.expectEqualStrings("@echo off\r\necho %PATH% ok\r\n", buildBatchScript(&buf, "echo %PATH% ok").?);
-    try std.testing.expectEqualStrings("@echo off\r\nfor %%i in (a) do echo %%i\r\n", buildBatchScript(&buf, "for %%i in (a) do echo %%i").?);
+    try std.testing.expectEqualStrings(PRE ++ "curl https://x/a%%20b\r\n", buildBatchScript(&buf, "curl https://x/a%20b").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo %%* stays\r\n", buildBatchScript(&buf, "echo %* stays").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo 50%%\r\n", buildBatchScript(&buf, "echo 50%").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo %PATH% ok\r\n", buildBatchScript(&buf, "echo %PATH% ok").?);
+    try std.testing.expectEqualStrings(PRE ++ "for %%i in (a) do echo %%i\r\n", buildBatchScript(&buf, "for %%i in (a) do echo %%i").?);
 }
 
 test "announcesAction: catches the narrate-without-act fizzles, never final answers" {

@@ -849,6 +849,15 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name}) catch dupe(gpa, "unknown tool");
 }
 
+/// Force Python children to UTF-8 IO. Windows Python defaults stdout/stderr to the ANSI codepage (cp1252),
+/// so the first non-ASCII char a script prints ('→', '·', any emoji) kills it with UnicodeEncodeError:
+/// 'charmap' — observed live when a build's own test runner printed an arrow. Harmless on POSIX and for
+/// non-Python children, so every tool spawn sets it.
+fn forcePyUtf8(env: *std.process.Environ.Map) void {
+    env.put("PYTHONUTF8", "1") catch {};
+    env.put("PYTHONIOENCODING", "utf-8") catch {};
+}
+
 fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { code: []const u8 = "" };
@@ -866,6 +875,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = script, .data = src }) catch return dupe(gpa, "could not write script");
 
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
 
@@ -927,6 +937,7 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     defer gpa.free(script);
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = script, .data = src }) catch return dupe(gpa, "could not write tool script");
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
@@ -1240,6 +1251,7 @@ fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     if (source.len > 80_000) return null;
     var env = ctx.environ.clone(gpa) catch return null;
     defer env.deinit();
+    forcePyUtf8(&env);
     env.put("NL_CHK_SRC", source) catch return null;
     env.put("NL_CHK_ORIG", if (orig.len > 80_000) source else orig) catch return null;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
@@ -1624,6 +1636,7 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const full = if (rel.len > 0) (std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, rel }) catch return dupe(gpa, "oom")) else (gpa.dupe(u8, base) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
@@ -1659,6 +1672,7 @@ fn runTests(ctx: *ToolCtx, args_json: []const u8) []u8 {
     _ = args_json;
     const gpa = ctx.gpa;
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
@@ -2027,6 +2041,7 @@ fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
 fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
     const gpa = ctx.gpa;
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
@@ -2644,6 +2659,7 @@ fn osintScan(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (!urlAllowed(p.value.url)) return dupe(gpa, "blocked url (only public http/https; no local/internal hosts)");
     if (ctx.egress_allow.len > 0) return dupe(gpa, "osint_scan is disabled under an egress allowlist (it fans out to arbitrary hosts) — use web_fetch/fetch_json on a specific allowlisted URL");
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
@@ -2678,6 +2694,7 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const same = if (p.value.same_host) "1" else "0";
 
     var env = ctx.environ.clone(gpa) catch return dupe(gpa, "oom");
+    forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
@@ -2779,6 +2796,7 @@ pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process
         gpa.free(@constCast(links));
         var env = environ.clone(gpa) catch return dupe(gpa, "");
         defer env.deinit();
+        forcePyUtf8(&env);
         inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
         var lbuf: [8]u8 = undefined;
         const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";

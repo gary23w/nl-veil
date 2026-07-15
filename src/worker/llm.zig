@@ -768,7 +768,11 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 
 /// Which channel a streamed delta belongs to. `.content` is the visible reply; `.reasoning`
 /// is the hidden thinking channel (reasoning models).
-pub const DeltaKind = enum { content, reasoning };
+/// .tool_progress carries a short human line ("writing index.html — 12 KB...") fired every ~TP_NOTIFY_BYTES
+/// while a hosted stream composes a tool call's arguments — the ONE generation phase with no content/reasoning
+/// deltas, which otherwise leaves the user staring at a silent status for the whole compose (observed: a 27s+
+/// write_file with nothing on screen but "writing...").
+pub const DeltaKind = enum { content, reasoning, tool_progress };
 
 const STREAM_STAT = "\n__VEILSTAT__"; // curl -w appends this + the 3-digit HTTP code once the transfer ends
 
@@ -788,6 +792,35 @@ const ToolAccum = struct {
     }
 };
 
+/// Emit one .tool_progress line per this many streamed tool-args bytes (~2-4 updates on a typical 20KB
+/// write_file — enough to show life without spamming status frames).
+const TP_NOTIFY_BYTES: usize = 6 << 10;
+
+/// Human verb for a composing tool call's progress line.
+fn toolVerb(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "write_file")) return "writing";
+    if (std.mem.eql(u8, name, "edit_file")) return "editing";
+    if (std.mem.eql(u8, name, "read_file")) return "preparing to read";
+    if (name.len == 0) return "composing a tool call";
+    return "composing";
+}
+
+/// Pull the "path" value out of a PARTIALLY-streamed args JSON head (path is emitted before the big content
+/// value in practice). Display-only best effort: looks in the first 300 bytes, takes the raw span to the next
+/// quote (an escaped path would clip — fine for a status line).
+fn argsPathHead(args: []const u8) ?[]const u8 {
+    const head = args[0..@min(args.len, 300)];
+    const at = std.mem.indexOf(u8, head, "\"path\"") orelse return null;
+    var i = at + "\"path\"".len;
+    while (i < head.len and (head[i] == ' ' or head[i] == ':' or head[i] == '\t')) i += 1;
+    if (i >= head.len or head[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < head.len and head[i] != '"' and head[i] != '\\') i += 1;
+    if (i <= start) return null;
+    return head[start..i];
+}
+
 const StreamState = struct {
     native: bool,
     ctx: *anyopaque,
@@ -797,6 +830,8 @@ const StreamState = struct {
     carry: std.ArrayListUnmanaged(u8) = .empty, // partial trailing line held between polls
     tool_line: std.ArrayListUnmanaged(u8) = .empty, // the native NDJSON line that carried tool_calls (owned)
     tool_accum: std.ArrayListUnmanaged(ToolAccum) = .empty, // hosted SSE tool calls assembled by index (see ToolAccum)
+    tp_total: usize = 0, // total tool-args bytes streamed so far (drives the .tool_progress throttle)
+    tp_notified: usize = 0, // tp_total at the last .tool_progress notification
     saw_tool_calls: bool = false,
     truncated: bool = false,
     failed: bool = false,
@@ -825,7 +860,23 @@ const StreamState = struct {
         };
         if (id) |v| if (v.len > 0 and slot.id.items.len == 0) slot.id.appendSlice(gpa, v) catch {};
         if (name) |v| if (v.len > 0 and slot.name.items.len == 0) slot.name.appendSlice(gpa, v) catch {};
-        if (args) |v| slot.args.appendSlice(gpa, v) catch {};
+        if (args) |v| {
+            slot.args.appendSlice(gpa, v) catch {};
+            st.tp_total += v.len;
+        }
+        // PROGRESS: while a big tool call composes (a 20KB write_file takes many seconds with ZERO content
+        // deltas), tell the consumer what's being written every ~TP_NOTIFY_BYTES so the user isn't staring at
+        // a silent status. The consumer surfaces it as a status line, never as transcript content.
+        if (st.tp_total - st.tp_notified >= TP_NOTIFY_BYTES) {
+            st.tp_notified = st.tp_total;
+            var lb: [200]u8 = undefined;
+            const verb = toolVerb(slot.name.items);
+            const line = if (argsPathHead(slot.args.items)) |p|
+                std.fmt.bufPrint(&lb, "{s} {s} — {d} KB...", .{ verb, p[0..@min(p.len, 120)], st.tp_total / 1024 }) catch return
+            else
+                std.fmt.bufPrint(&lb, "{s} — {d} KB...", .{ verb, st.tp_total / 1024 }) catch return;
+            st.on_delta(st.ctx, .tool_progress, line);
+        }
     }
     /// Emit one non-empty delta (borrowed — the callback copies it) and accumulate it.
     fn fire(st: *StreamState, gpa: std.mem.Allocator, kind: DeltaKind, text: []const u8) void {
@@ -834,6 +885,7 @@ const StreamState = struct {
         switch (kind) {
             .content => st.content.appendSlice(gpa, text) catch {},
             .reasoning => st.reasoning.appendSlice(gpa, text) catch {},
+            .tool_progress => {}, // status-only; emitted directly from accumToolCall, never accumulated
         }
     }
 };
@@ -1637,6 +1689,7 @@ const StreamCapture = struct {
         const dst = switch (kind) {
             .content => &self.content,
             .reasoning => &self.reasoning,
+            .tool_progress => return, // status-only signal; never part of the reply text
         };
         dst.appendSlice(std.testing.allocator, text) catch {};
     }
@@ -1733,6 +1786,37 @@ test "completeStream SSE parser: hosted tool_calls assemble from streamed fragme
     try std.testing.expectEqualStrings("read_file", calls[1].name);
     try std.testing.expectEqualStrings("call_b", calls[1].id);
     try std.testing.expect(std.mem.indexOf(u8, calls[1].args, "a.txt") != null);
+}
+
+test "tool-compose progress: .tool_progress fires past the byte threshold and names the path" {
+    const gpa = std.testing.allocator;
+    const Cap = struct {
+        lines: std.ArrayListUnmanaged(u8) = .empty,
+        fn onDelta(cx: *anyopaque, kind: DeltaKind, text: []const u8) void {
+            if (kind != .tool_progress) return;
+            const self: *@This() = @ptrCast(@alignCast(cx));
+            self.lines.appendSlice(std.testing.allocator, text) catch {};
+            self.lines.append(std.testing.allocator, '\n') catch {};
+        }
+    };
+    var cap: Cap = .{};
+    defer cap.lines.deinit(gpa);
+    var st = StreamState{ .native = false, .ctx = &cap, .on_delta = Cap.onDelta };
+    defer st.deinit(gpa);
+    // head fragment carries the path; then pump > TP_NOTIFY_BYTES of content fragments → at least one progress line.
+    st.accumToolCall(gpa, 0, "c0", "write_file", "{\"path\":\"index.html\",\"content\":\"");
+    var i: usize = 0;
+    while (i < (TP_NOTIFY_BYTES / 64) + 2) : (i += 1) st.accumToolCall(gpa, 0, null, null, "x" ** 64);
+    try std.testing.expect(cap.lines.items.len > 0); // fired
+    try std.testing.expect(std.mem.indexOf(u8, cap.lines.items, "writing index.html") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.lines.items, "KB") != null);
+}
+
+test "argsPathHead: extracts the path from a partial args head, null when absent" {
+    try std.testing.expectEqualStrings("index.html", argsPathHead("{\"path\":\"index.html\",\"content\":\"<!doct").?);
+    try std.testing.expectEqualStrings("journal/a.md", argsPathHead("{ \"path\": \"journal/a.md\"").?);
+    try std.testing.expect(argsPathHead("{\"query\":\"no path here\"}") == null);
+    try std.testing.expect(argsPathHead("{\"path\":\"") == null); // value not started
 }
 
 test "reconstructSseToolCalls: a fragment with no name is dropped; empty args become {}" {
