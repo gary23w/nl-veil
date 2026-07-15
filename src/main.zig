@@ -306,6 +306,7 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
     router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
     router.post("/api/v1/chat/convs/:id/control", chat_service.chatControl, .{});
+    router.post("/api/v1/chat/convs/:id/tool_result", chat_service.toolResult, .{});
     router.get("/api/v1/sched", sched.listTasks, .{});
     router.post("/api/v1/sched", sched.createTask, .{});
     router.post("/api/v1/sched/:id", sched.updateTask, .{});

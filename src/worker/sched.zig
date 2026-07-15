@@ -370,7 +370,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // loop=0: one bounded turn — a schedule fires a task, it must not arm an open-ended auto-loop unattended.
     // spawnTurn copies every arg into its own blob (conv lives in a stack buffer here) and owns releasing the
     // turn slot on every completion path.
-    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 0);
+    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 0, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
 
     // Bookkeeping AFTER the spawn is committed. last_run = now first, so the "every" recompute re-anchors the
     // interval to NOW (the catch-up policy: an overdue task runs once, never once per missed interval).
