@@ -35,4 +35,21 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run veil-desk");
     run_step.dependOn(&run_cmd.step);
+
+    // ---- unit tests ----
+    // src/tests.zig references every test-bearing desk file; without a build-graph test step these tests
+    // were not runnable at all (chat.zig pulls theme.zig → raylib, so a bare `zig test src/chat.zig` cannot
+    // compile). Debug on purpose: tests want every safety check; ReleaseSafe is a shipping concern.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    tests.root_module.addImport("raylib", raylib_dep.module("raylib"));
+    tests.root_module.linkLibrary(raylib_dep.artifact("raylib"));
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run veil-desk unit tests");
+    test_step.dependOn(&run_tests.step);
 }

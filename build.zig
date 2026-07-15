@@ -59,4 +59,20 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run the veil hive-mind control plane");
     run_step.dependOn(&run_cmd.step);
+
+    // ---- unit tests ----
+    // src/tests.zig references every test-bearing file; a bare `zig test src/worker/run.zig` only collects
+    // the tests reachable from run.zig and silently skips the rest of the suite. Tests build Debug on
+    // purpose: the exe defaults to ReleaseFast, which strips the safety checks tests exist to exercise.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = .Debug,
+        }),
+    });
+    tests.root_module.addImport("httpz", httpz.module("httpz"));
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run all unit tests");
+    test_step.dependOn(&run_tests.step);
 }
