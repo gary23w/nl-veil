@@ -920,6 +920,18 @@ pub fn tryBeginTurn(io: std.Io, conv: []const u8) bool {
     return true;
 }
 
+/// Is a turn executing for `conv` RIGHT NOW? Read-only scan of the per-conv turn table — the liveness bit the
+/// conv GET carries so a client can attach its live poller to a server-born run (a scheduled task's turn).
+pub fn isTurnLive(io: std.Io, conv: []const u8) bool {
+    if (conv.len == 0 or conv.len > 64) return false;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) return true;
+    }
+    return false;
+}
+
 /// Release the in-flight slot for `conv` (matches tryBeginTurn). Copies nothing — safe to call before freeing any
 /// backing storage `conv` points into.
 fn endTurn(io: std.Io, conv: []const u8) void {
