@@ -1051,18 +1051,18 @@ fn shouldPlan(user_text: []const u8) bool {
     // A clear question / explanation / lookup opener → answer directly, never plan (even if a build verb like
     // "write" appears later, as in "write 200 words explaining X" — that's Q&A, not a build).
     const q_openers = [_][]const u8{
-        "what ", "what's", "whats ", "why ", "how ", "how's", "hows ", "when ", "who ", "where ", "which ",
-        "whose ", "is ", "are ", "am ", "was ", "were ", "do ", "does ", "did ", "can you tell", "could you tell",
-        "will ", "would ", "should ", "explain", "tell me", "describe", "summar", "define", "what is", "what are",
+        "what ",  "what's", "whats ",  "why ",    "how ",    "how's",    "hows ",  "when ",  "who ",    "where ",       "which ",
+        "whose ", "is ",    "are ",    "am ",     "was ",    "were ",    "do ",    "does ",  "did ",    "can you tell", "could you tell",
+        "will ",  "would ", "should ", "explain", "tell me", "describe", "summar", "define", "what is", "what are",
     };
     for (q_openers) |q| if (std.mem.startsWith(u8, low, q)) return false;
     // Strong multi-step build / research task intent anywhere → plan + coordinate.
     const task_markers = [_][]const u8{
-        "build ", "create ", "implement ", "develop ", "scaffold", "set up a", "set up the", "make me a",
-        "make a ", "write me a", "write a ", "write the ", "code me", "refactor ", "migrate ", "port the",
-        "port it", "deploy ", "generate a", "research ", "investigate ", "analyze ", "gather ", "scrape ",
-        "crawl ", "design a", "design and", "from scratch", "step by step", "step-by-step", "and then ",
-        "an app", "a website", "a web app", "a cli", "a rest api", "a full ", "end to end", "end-to-end",
+        "build ",    "create ",    "implement ", "develop ",     "scaffold",     "set up a",     "set up the", "make me a",
+        "make a ",   "write me a", "write a ",   "write the ",   "code me",      "refactor ",    "migrate ",   "port the",
+        "port it",   "deploy ",    "generate a", "research ",    "investigate ", "analyze ",     "gather ",    "scrape ",
+        "crawl ",    "design a",   "design and", "from scratch", "step by step", "step-by-step", "and then ",  "an app",
+        "a website", "a web app",  "a cli",      "a rest api",   "a full ",      "end to end",   "end-to-end",
     };
     for (task_markers) |m| if (std.mem.indexOf(u8, low, m) != null) return true;
     return false; // ambiguous / conversational → fast direct answer (no decomposition round-trip)
