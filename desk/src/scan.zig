@@ -1,8 +1,7 @@
-//! scan.zig — the filesystem data layer. veil-desk is a same-machine companion to the veil server, so
-//! reads go straight to the run directories under <home>/data (no HTTP, no auth, no latency) exactly as
-//! the engine writes them: each swarm is a subdir with events.jsonl (the event stream), .goal_brief,
-//! .blueprint, control.jsonl (the operator bus). Everything here runs on the POLLER thread only and
-//! publishes into the mutex-guarded Store; the UI thread never touches io.
+//! scan.zig — the filesystem data layer. veil-desk reads the veil server's run dirs under <home>/data
+//! directly (no HTTP/auth): each swarm is a subdir with events.jsonl, .goal_brief, .blueprint, and
+//! control.jsonl (the operator bus). Runs on the POLLER thread only; publishes into the mutex-guarded
+//! Store. The UI thread never touches io.
 
 const std = @import("std");
 const Io = std.Io;
@@ -169,8 +168,7 @@ fn jsonInt(line: []const u8, key: []const u8) ?i64 {
 }
 
 /// Yield the next top-level {...} object of a JSON array, advancing `cur` past it. STRING-AWARE: quotes,
-/// escapes, and braces inside string values never fool the depth count (a needle-only scan truncated
-/// write_file bodies on their first '}' once — same class of bug). Callers point `cur` just past the
+/// escapes, and braces inside string values never fool the depth count. Callers point `cur` just past the
 /// opening `[` of the array (e.g. after indexOf("\"tasks\":[")) and loop until null.
 pub fn nextJsonObj(body: []const u8, cur: *usize) ?[]const u8 {
     var i = cur.*;
@@ -290,8 +288,7 @@ pub fn tailEvents(io: Io, gpa: std.mem.Allocator, path: []const u8, out: []Ev, m
 
 /// tailEvents that folds only bytes past `from` — a cast records the file size when it detects a STALE
 /// prior run's events in a reused dir, so the old run's "stopped"/score lines can never complete the new
-/// cast. Reads a bounded window (never the whole multi-MB file — this used to be an 8MB read + full
-/// two-pass parse EVERY SECOND on the chat thread, a real slice of the local cast thrash).
+/// cast. Reads a bounded window, never the whole multi-MB file (this runs every second).
 const TAIL_WINDOW: u64 = 256 << 10;
 pub fn tailEventsFrom(io: Io, gpa: std.mem.Allocator, path: []const u8, from: u64, out: []Ev, metrics: *Metrics) usize {
     log.trace("scan.tailEvents path={s} from={d}", .{ path, from });
@@ -360,7 +357,7 @@ fn foldMetrics(line: []const u8, m: *Metrics) void {
     } else if (std.mem.eql(u8, kind, "phase")) {
         // RESEARCH/discourse casts never emit a "score" (no benchmark) — their per-round progress is a
         // "phase" event carrying now/best. Reading it here is what makes the hive-running label move instead
-        // of sitting at 0% for the whole cast (the reported bug).
+        // of sitting at 0% for the whole cast.
         if (jsonInt(line, "round")) |r| m.round = r;
         if (jsonInt(line, "now")) |p| {
             m.pct = @intCast(p);
@@ -407,8 +404,8 @@ fn parseEv(line: []const u8, ev: *Ev) bool {
     if (jsonStr(line, "mind", &mb)) |mn| setBuf(&ev.mind, &ev.mind_len, mn);
 
     // Compose a readable line per event kind so the console reads like a narrated log, not raw JSON.
-    // Each kind surfaces its SPECIFICS (the user asked for more than bare tool names): an act carries the
-    // tool + the argument gist (path/query/fact) + the result; a tick shows the mind's actual tool trace.
+    // Each kind surfaces its SPECIFICS: an act carries the tool + the argument gist (path/query/fact) +
+    // the result; a tick shows the mind's actual tool trace.
     if (std.mem.eql(u8, kind, "act")) {
         var tb: [256]u8 = undefined;
         var ab: [256]u8 = undefined;
@@ -418,8 +415,8 @@ fn parseEv(line: []const u8, ev: *Ev) bool {
         const res = jsonStr(line, "result", &rb) orelse "";
         composeAct(ev, tool, argGist(args), res);
     } else if (std.mem.eql(u8, kind, "tick")) {
-        // A mind's moment: no monologue field in the stream anymore — narrate the TRACE (the tools it
-        // actually ran) + its cadence, so a "thinking" round is visible as real work, not a blank line.
+        // A mind's moment: with no monologue field, narrate the TRACE (the tools it actually ran) + its
+        // cadence, so a "thinking" round is visible as real work, not a blank line.
         var rb: [256]u8 = undefined;
         if (jsonStr(line, "monologue", &rb)) |mono| {
             composeAct(ev, "think", "", mono);
@@ -580,9 +577,9 @@ pub fn listSwarms(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, out: []S
             var rbuf: [96]u8 = undefined;
             const rel = std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ name, ce.name }) catch continue;
             if (addSwarm(io, gpa, data_dir, rel, out, &n, now_s, live_window_s)) continue;
-            // A chat CAST builds in u<uid>/_chat/builds/<conv> (the v27 build-in-place change), which is one level
-            // deeper than a normal u<uid>/<hex> swarm — descend into _chat/builds/* so the chat can watch + collect
-            // its own casts (else it never sees the run dir and hangs on "watching").
+            // A chat CAST builds in u<uid>/_chat/builds/<conv>, one level deeper than a normal u<uid>/<hex>
+            // swarm — descend into _chat/builds/* so the chat can watch + collect its own casts (else it
+            // never sees the run dir and hangs on "watching").
             if (std.mem.eql(u8, ce.name, "_chat")) {
                 var bbuf: [512]u8 = undefined;
                 const builds = std.fmt.bufPrint(&bbuf, "{s}/{s}/_chat/builds", .{ data_dir, name }) catch continue;
@@ -640,8 +637,7 @@ fn readSwarmName(io: Io, gpa: std.mem.Allocator, data_dir: []const u8, rel: []co
 }
 
 /// Roster summary: the latest score + stopped marker. Reads only the LAST 64KB of events.jsonl — the
-/// latest score and any "stopped" sit at the end, and this runs for EVERY run dir on disk every second
-/// (the old whole-file read, up to 16MB per dir per tick, was the poller's slice of the local thrash).
+/// latest score and any "stopped" sit at the end, and this runs for EVERY run dir on disk every second.
 fn summarizeTail(io: Io, gpa: std.mem.Allocator, ev_path: []const u8, s: *SwarmSummary) void {
     const CAP: u64 = 64 << 10;
     const st = Io.Dir.cwd().statFile(io, ev_path, .{}) catch return;

@@ -1,8 +1,7 @@
 //! store.zig — the single source of truth shared between the UI thread (raylib, draw + input) and the
-//! poller thread (io, filesystem + net). Every field behind one std.Thread.Mutex; the UI copies what it
-//! needs under lock and never blocks on io, the poller writes under lock and never touches raylib. This
-//! hard split is what keeps raylib single-threaded (its hard requirement) while the machine's state is
-//! read off-thread.
+//! poller thread (io, filesystem + net). Every field behind one lock; the UI copies what it needs under
+//! lock and never blocks on io, the poller writes under lock and never touches raylib. This hard split
+//! keeps raylib single-threaded (its requirement) while the machine's state is read off-thread.
 
 const std = @import("std");
 const scan = @import("scan.zig");
@@ -88,9 +87,9 @@ pub const Settings = struct {
     // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long
     // set-and-forget hiveminds (the original swarm design) for builds and deep work.
     speed_mode: bool = true,
-    // SERVER CHAT (default OFF ⇒ zero behavior change): when ON, a user send routes to the SERVER-side chat
-    // turn (POST /api/v1/chat/convs/:id/messages) and the desk renders the turn's event frames by polling
-    // /events, instead of running the local turn loop. The brain moves into the backend. (P0-6.)
+    // SERVER CHAT: when ON, a user send routes to the SERVER-side chat turn
+    // (POST /api/v1/chat/convs/:id/messages) and the desk renders the turn's event frames by polling
+    // /events, instead of running the local turn loop. The brain moves into the backend.
     server_chat: bool = true, // default ON: prefer the backend chat turn, fall back to the local engine on any problem
 
     pub fn dataDir(s: *const Settings) []const u8 {
@@ -120,13 +119,10 @@ pub const MAX_CONVS = 32;
 pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
 pub const STREAM_CAP = 16384; // in-flight reply buffer — UI-side snapshot buffers MUST use this same constant
-//                               (a hardcoded 8192 copy in drawChat crashed the app the first time a streaming
-//                               reply crossed 8KB: "index out of bounds: index 8194, len 8192")
 pub const MAX_OLLAMA_MODELS = 48;
 pub const METRIC_RING = 60; // per-turn performance samples for the chat Metrics tab
 
-/// One completed chat turn's performance sample — the raw material for the Metrics tab's live graphs and the
-/// "how is this model performing" read (the same numbers you'd use to compare open-source models fairly).
+/// One completed chat turn's performance sample — the raw material for the Metrics tab's live graphs.
 pub const TurnMetric = struct {
     first_byte_ms: u32 = 0, // latency to the first streamed token
     total_ms: u32 = 0, // wall-clock for the whole turn
@@ -154,7 +150,7 @@ pub const ChatRole = enum(u8) { user, veil, cast_note, thought };
 /// thread owns the full history on disk, this is the render copy.
 pub const ChatMsg = struct {
     role: ChatRole = .user,
-    text: [12288]u8 = [_]u8{0} ** 12288, // 12K: LLM answers (esp. reasoning + tables/code) blew past 3K and clipped
+    text: [12288]u8 = [_]u8{0} ** 12288, // 12K: long LLM answers (reasoning + tables/code) need the headroom
     text_len: u16 = 0,
 
     pub fn textStr(m: *const ChatMsg) []const u8 {

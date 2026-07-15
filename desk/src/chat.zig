@@ -1,12 +1,11 @@
-//! chat.zig — the chat worker thread: the third thread beside the UI and the poller, same discipline
-//! (owns its own std.Io, talks to the UI only through the Store). It runs the Chat tab's brain:
+//! chat.zig — the chat worker thread: a third thread beside the UI and the poller, same discipline (owns its
+//! own std.Io, talks to the UI only through the Store). It runs the Chat tab's brain:
 //!   - model turns: streams /chat/completions through llm.zig, deltas land in Store.stream_text
-//!   - swarm casting: a reply whose first line is "CAST: <goal>" fires the EXISTING casting mechanism —
-//!     POST /api/v1/swarms via netcli (the same door the Deploy tab uses) — then this thread WATCHES the
-//!     run's events.jsonl (scan.tailEvents, filesystem-first) for the right-hand activity pane, and when
-//!     the swarm stops it folds the findings back into the conversation and asks the model to answer.
-//!   - persistence: conversations are JSONL files under <data>/.veil-desk/chats/, chat settings JSON at
-//!     <data>/.veil-desk/settings.json, the API key sealed via secrets.zig. All chat-side io lives here.
+//!   - swarm casting: a reply whose first line is "CAST: <goal>" fires a cast (POST /api/v1/swarms via netcli,
+//!     the same door the Deploy tab uses), then WATCHES the run's events.jsonl (scan.tailEvents) for the
+//!     activity pane; when the swarm stops it folds the findings back into the conversation for the model.
+//!   - persistence: conversations as JSONL under <data>/.veil-desk/chats/, settings JSON alongside, the API
+//!     key via secrets.zig. All chat-side io lives here.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,11 +24,9 @@ const neurondb = @import("neuron.zig");
 const Store = store_mod.Store;
 
 // The CASTING POLICY is mode-dependent; everything from TOOLS on (SYSTEM_REST) is shared.
-// SPEED MODE (default ON): building an app from a chat-cast proved a HARD orchestration (observed live:
-// a 5-game suite where the swarm "graduated" at 100% with three games missing, then the chat's own
-// per-file ceremony died on announcements) — while swarms excel at what they were designed for:
-// autonomous set-and-forget runs and parallel RESEARCH. So in speed mode the VEIL is the builder and a
-// cast is a short research sub-agent; autonomy mode keeps the original long-hivemind posture.
+// SPEED MODE (default ON): the VEIL is the builder and a cast is a short research sub-agent — swarms are
+// unreliable at multi-file builds but excel at autonomous set-and-forget runs and parallel research.
+// Autonomy mode keeps the original long-hivemind posture.
 const CAST_POLICY_SPEED =
     "You are the Veil, the chat mind of this nl-veil host — a hands-on BUILDER with a real workdir, file " ++
     "tools, a terminal, and a hive-mind swarm engine you can cast as a research SUB-AGENT.\n" ++
@@ -270,12 +267,10 @@ const JUDGE_EVERY_TURNS: u32 = 10; // cadence trigger: grade the trace every ~N 
 const JUDGE_COOLDOWN_S: i64 = 240; // ...and never more than one pass per 4 minutes (outcome trigger included)
 const JUDGE_MAX_TOKENS: u32 = 800;
 // ACT-INTENT ROUTER — the language-model replacement for the hardcoded announcesAction verb/ack whitelist.
-// A lexical list can only ever match a FIXED vocabulary of how intent is phrased ("I'll…"/"let me…"); it missed
-// the gerund/imperative header style ("**Writing X:**", "**Running Python now:**") the veil actually uses, so the
-// act-follow-through never fired and, under auto-loop-afk, the same instruction re-prompted forever. This asks the
-// model itself: given a reply that dispatched NO tool call, did it INTEND an action it failed to perform? The
-// heuristic stays as the FALLBACK FLOOR (no endpoint / call fails / unparseable → announcesAction), so it is
-// never worse than before. Generous token budget so a reasoning gateway model emits the verdict (the SCREEN trap).
+// A lexical list only matches a fixed vocabulary of intent phrasing ("I'll…"/"let me…") and misses gerund/
+// imperative headers ("**Writing X:**") the veil actually uses, so it asks the model itself: given a reply
+// that dispatched NO tool call, did it INTEND an action it failed to perform? The heuristic stays as the
+// FALLBACK FLOOR (no endpoint / call fails / unparseable → announcesAction), so it is never worse than before.
 const ROUTER_MAX_TOKENS: u32 = 1024;
 const ACT_ROUTER_SYS =
     "You are a strict intent classifier inside an autonomous coding assistant's control loop. You are given the " ++
@@ -288,10 +283,9 @@ const ACT_ROUTER_SYS =
     "explanation, or a task it has legitimately completed. Reply with ONLY compact JSON: {\"meant_to_act\":true} " ++
     "or {\"meant_to_act\":false} — no prose.";
 // The judge reads TRACES, never self-report — an agent asked "did you do well?" produces a confident,
-// self-flattering narrative as a structural property of the model, so grading must rest on real exit
-// codes, verify outcomes and user contradictions alone. The STRICT RULES are anti-poisoning invariants:
-// each one is a failure mode where a plausible "lesson" hardens into something the agent later cites
-// against itself.
+// self-flattering narrative, so grading rests on real exit codes, verify outcomes, and user contradictions
+// alone. The STRICT RULES are anti-poisoning invariants: each guards a failure mode where a plausible
+// "lesson" hardens into something the agent later cites against itself.
 const JUDGE_SYSTEM =
     "You are an EXTERNAL REVIEWER for a desktop AI agent, reading a trace of what actually happened. " ++
     "Line meanings: 'USER:' = what the user really said. 'RESULT:' = real command/tool output with real exit codes. " ++
@@ -311,8 +305,8 @@ const JUDGE_SYSTEM =
     "- every proposal must be provable from the trace alone; a proposal without concrete evidence is discarded.";
 
 const CAST_MINUTES: u32 = 8; // v1 fixed budget; the engine self-crunches to fit
-const MAX_TOKENS: u32 = 16384; // 2048→4096→8192→16384: a typical one-pager now writes in ONE call (no chunk assembly);
-//                                append-chunking (KNOW YOUR LIMITS prompt + looksTruncatedWrite + structured append) handles bigger still
+const MAX_TOKENS: u32 = 16384; // a typical one-pager writes in ONE call; append-chunking (KNOW YOUR LIMITS
+//                                prompt + looksTruncatedWrite + structured append) handles bigger files still
 
 const Turn = enum { idle, user, collect, tool_follow, reflect, loop_infer, consolidate };
 
@@ -347,7 +341,7 @@ const MAX_TOOL_ITERS: u32 = 20;
 // THIRD TIER — auto-loop-afk (chat_loop_afk, entered by double-clicking the toggle): NONE of those stop
 // conditions end the loop. DONE folds into a fresh drive, the repeat-guard is skipped, the caps wrap, a
 // question is answered on the away user's behalf, and failures re-plan. Only the user ends it (toggle/Stop).
-const LOOP_MAX_ITERS: u32 = 30; // was 12 — too low; a long autonomous task needs many steps
+const LOOP_MAX_ITERS: u32 = 30; // a long autonomous task needs many steps
 /// SERVER CHAT (P0-6): consecutive failed/unreachable event polls before pumpServerChat gives up and un-sticks
 /// the busy UI. The poller runs ~1Hz, so ~180 ≈ 3 minutes of a genuinely down/wedged server (a healthy turn's
 /// polls all return 200 and reset the count long before this).
@@ -362,10 +356,9 @@ const SC_COOLDOWN_S: i64 = 45;
 const SC_POLL_FAST_MS: i64 = 33;
 const SC_POLL_SLOW_MS: i64 = 120;
 const SC_POLL_EMPTY_BACKOFF: u16 = 3;
-/// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast —
-/// delegating a scoped sub-task to a hive is the veil doing its job (the "second swarm never fired" bug was the
-/// loop stopping itself the moment the veil wanted to cast) — but bounded so a weak model can't runaway-deploy
-/// hives unattended (the original post-kill runaway). A manual message resets the count.
+/// How many swarms ONE auto-loop session may fire before it pauses for the user. The loop is ALLOWED to cast
+/// (delegating a scoped sub-task to a hive is the veil doing its job), but bounded so a weak model can't
+/// runaway-deploy hives unattended. A manual message resets the count.
 const MAX_LOOP_CASTS: u32 = 4;
 /// Autonomous ESCALATION research casts one arc may fire (the stuck→research→cast ladder's top rung). This is a
 /// HARD, loop-INDEPENDENT bound: loop_casts only counts in an auto-loop (loop_iter>0), so a stuck MANUAL chat
@@ -374,7 +367,7 @@ const MAX_LOOP_CASTS: u32 = 4;
 const MAX_ESCALATE_CASTS: u8 = 2;
 /// Consecutive web-lookup tool calls (search/fetch/read_url/…) with no other progress before the STALL GUARD
 /// fires one corrective steer. High enough that genuine multi-source research doesn't trip it, low enough to
-/// break the busy-but-getting-nowhere spiral (the moltbook docs loop: ~15 fetches over unreadable JS pages).
+/// break the busy-but-getting-nowhere spiral.
 const LOOKUP_STALL_LIMIT: u32 = 8;
 const LOOP_SYSTEM =
     "You are the autonomous DRIVER of this conversation. The user has enabled full-auto mode: rather than typing " ++
@@ -405,14 +398,11 @@ const REFLECT_MAX_PASSES: u8 = 3; // hard ceiling on self-check iterations (each
 const REFLECT_MIN_ANSWER: usize = 500;
 
 // Concurrent Veil: while a cast runs, the primary Veil ALSO works the SAME goal, in parallel, directly inside
-// the hive's own shared build dir — it JOINS the swarm rather than building a rival copy. A separate isolated
-// workdir + a post-hoc AI "pick the better one or merge them" pass never worked: two independently-evolving
-// trees are two version histories, and reconciling divergent builds is exactly the merge problem the swarm's
-// OWN micro-VCS (vcs.zig, see chat_tools.zig's vcs_enabled) already exists to solve — running a SECOND ad-hoc
-// merge on top of it just breaks builds instead of fixing them. So there is no separate veil dir and no compare
-// step: the veil's tool calls target the identical dir the hive is building in, and the swarm's own concurrent-
-// edit safety is what reconciles the two streams of edits. Costs extra model calls per cast (the veil's own
-// attempt), so it's a single flag to disable if a run should be cast-only.
+// the hive's own shared build dir — it JOINS the swarm rather than building a rival copy. A separate workdir +
+// a post-hoc "pick the better one or merge them" pass reconciles two divergent version histories, which is
+// exactly the merge problem the swarm's OWN micro-VCS (vcs.zig, chat_tools.zig's vcs_enabled) already solves;
+// so the veil's tool calls target the identical dir and the swarm's concurrent-edit safety reconciles both
+// streams. Costs extra model calls per cast, so it's a single flag to disable for cast-only runs.
 const CONCURRENT_VEIL: bool = true;
 
 // MEMORY INSIDE RECURSIVE THOUGHT: mirror the veil's reasoning-time `observe` tool into the durable per-user
@@ -558,7 +548,7 @@ pub const Chat = struct {
     cast_rel: [96]u8 = [_]u8{0} ** 96, // resolved run path relative to data dir
     cast_rel_len: usize = 0,
     cast_conv: [64]u8 = [_]u8{0} ** 64, // the conv this cast was fired for — its run dir is _chat/builds/<conv>
-    // (widened 40->64 to match sc_conv[64]: startServerCastWatch copies sc_conv here, and a >40-byte conv id would
+    // (must match sc_conv[64]: startServerCastWatch copies sc_conv here, and a >40-byte conv id would
     //  otherwise silently no-op the server-cast display.)
     cast_conv_len: usize = 0, // (chat casts build in the conv dir, so the run-dir basename is <conv>, not the hex)
     cast_deadline_s: i64 = 0,
@@ -611,9 +601,8 @@ pub const Chat = struct {
     acted: bool = false,
     // Did ANY dispatch fire since this loop step / user message began? `acted` is reset at EVERY settle, so
     // a build chain that wrote three files and then ANNOUNCED the fourth read as "just replied" and the
-    // auto-loop disarmed — the observed game-suite death: one file per user prod ("did you do it?"),
-    // twelve prods for twelve files. The loop must keep driving while the ARC is working; each loop step
-    // re-earns continuation by acting (reset in loopContinue), so an announce-only step still ends it.
+    // auto-loop disarmed. The loop must keep driving while the ARC is working; each loop step re-earns
+    // continuation by acting (reset in loopContinue), so an announce-only step still ends it.
     arc_acted: bool = false,
     // AGENTIC FLOOR (the announced-but-never-performed death spiral + verify-before-done + lesson loop):
     act_nudges: u8 = 0, // act-followthrough nudges fired this arc (capped — never competes with real
@@ -625,9 +614,9 @@ pub const Chat = struct {
     // WHOLE-ARC build debt (survives loop steps; arc_mutated/verify_done are per-step and reset in
     // loopContinue). The auto-loop can end via loop_infer emitting DONE right after a settle that ANNOUNCED
     // more work (or falsely claimed a write) — the per-step verify was skipped and the loop finished with
-    // files missing (observed live: a 3-file game suite declared "complete" with only 1 file on disk).
-    // arc_built stays true from the first real write/edit to the arc's end; when the loop tries to finish,
-    // fireTerminalVerify runs ONE whole-build check (list_dir + write anything missing) before it stops.
+    // files missing. arc_built stays true from the first real write/edit to the arc's end; when the loop
+    // tries to finish, fireTerminalVerify runs ONE whole-build check (list_dir + write anything missing)
+    // before it stops.
     arc_built: bool = false, // this arc wrote/edited at least one file (sticky across loop steps)
     arc_final_verified: bool = false, // the one terminal whole-build verify already fired for this arc
     arc_fail_cmd: [900]u8 = undefined, // the last console command that FAILED this arc (lesson capture pairs
@@ -645,15 +634,15 @@ pub const Chat = struct {
     consolidate_pending: bool = false, // an internal re-entry (act nudge / verify turn) preempted a settle that
     //                                    WOULD have consolidated memory — the arc's eventual settle owes one
     //                                    consolidation pass (otherwise mutating arcs silently never save facts)
-    stream_retried: bool = false, // one transient stream-death retry per arc: a dead stream used to settle
-    //                               the whole arc as an error and the chat "stopped trying" (user report)
+    stream_retried: bool = false, // one transient stream-death retry per arc (a dead stream otherwise settles
+    //                               the whole arc as an error and the chat stops trying)
     pending_directive: [3600]u8 = undefined, // ephemeral machine directive (act nudge / verify / format retry).
     //                                 Sized for the terminal-verify directive: ground-truth file listing
-    //                                 (≤2000b) + the arc goal quote (≤300b) + instructions — at the old 640
-    //                                 the instruction tail was silently truncated off any real listing.
+    //                                 (≤2000b) + the arc goal quote (≤300b) + instructions — too small and the
+    //                                 instruction tail is silently truncated off a real listing.
     pending_directive_len: usize = 0, // for the NEXT turn's prompt ONLY — never persisted. Directives written
-    //                                   into history re-fed as user rows on every later turn and poisoned the
-    //                                   conversation's NEXT task (the confirmed "second task fails" report)
+    //                                   into history re-feed as user rows on every later turn and poison the
+    //                                   conversation's NEXT task.
     // EXTERNAL JUDGE (decoupled learning pass — its OWN stream + side dir, never the chat turn slot):
     judge_stream: llm.Stream = .{},
     judge_live: bool = false,
@@ -685,9 +674,8 @@ pub const Chat = struct {
     sc_active: bool = false, // a server turn is in flight for sc_conv → pumpServerChat renders its NEW frames
     // The LAST send was routed to the server (persists after the turn ends). The local auto-loop (maybeLoop) checks
     // this: when the conv is served by the server, the SERVER drives its own loop, so the desk must not also run
-    // the local loop (the "enabling auto-loop falls back to the client-side engine" bug). A fallback to local sets
-    // it false so the local loop resumes — and it isn't tied to the 45s serverChatOn() cooldown, which would else
-    // strand a >45s local fallback build mid-loop.
+    // the local loop. A fallback to local sets it false so the local loop resumes — and it isn't tied to the 45s
+    // serverChatOn() cooldown, which would else strand a >45s local fallback build mid-loop.
     sc_serving: bool = false,
     sc_from: usize = 0, //      byte cursor into the conv's events.jsonl — only frames past here are new
     sc_conv: [64]u8 = [_]u8{0} ** 64, // the conv the server turn was fired for (its id doubles as the /events path)
@@ -742,8 +730,8 @@ pub const Chat = struct {
             const dd = self.dataDir(&db);
             self.drainCommands(dd);
             self.pumpStream(dd);
-            self.pumpServerChat(dd); // EVERY tick (10Hz), matching the local pumpStream — a SERVER turn's streamed
-            //                          frames type out smoothly instead of the old ~1Hz burst. No-op unless sc_active.
+            self.pumpServerChat(dd); // EVERY tick (10Hz), matching pumpStream, so a SERVER turn's streamed frames
+            //                          type out smoothly. No-op unless sc_active.
             self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
             // ~1Hz auto-loop backstop: a .loop_kick that lands the instant a turn is finishing hits maybeLoop's
             // `turn != .idle` guard and is lost — the settle-point call can't recover it if the turn had already
@@ -1125,8 +1113,8 @@ pub const Chat = struct {
                 .steer_turn => self.cmdSteerTurn(dd, c.textStr()),
                 // Guard a chat switch/new-chat while ANY work is pending (a streaming reply, a running cast, or an
                 // AI console command): switching would repoint conv_active and the settling output would land in —
-                // and overwrite — the wrong chat (the "old chat bleeds into the new chat" bug). Mirror the
-                // cmdDeleteConv precedent: refuse with a clear notice instead of corrupting state.
+                // and overwrite — the wrong chat. Mirror the cmdDeleteConv precedent: refuse with a clear notice
+                // instead of corrupting state.
                 .new_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before starting a new chat", 2) else self.cmdNewConv(dd),
                 .select_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before switching chats", 2) else self.cmdSelectConv(dd, c.idStr()),
                 .rename_conv => self.cmdRenameConv(dd, c.idStr(), c.textStr()),
@@ -1139,7 +1127,7 @@ pub const Chat = struct {
                 .console_approve => self.cmdConsoleApprove(dd, std.mem.eql(u8, c.idStr(), "always")), // Approve / Bypass a parked veil command
                 .console_deny => self.cmdConsoleDeny(dd), // Deny the parked veil command
                 // user just enabled auto-loop while idle → start it now. A SERVER-served conv needs its own kick
-                // (maybeLoop stands down via sc_serving, so the old path armed the toggle silently and did NOTHING).
+                // because maybeLoop stands down via sc_serving (arming the toggle alone would do nothing).
                 .loop_kick => if (self.sc_serving) self.serverLoopKick(dd) else self.maybeLoop(dd),
                 .stop_turn => self.stopTurn(dd), // Stop button by the input: abort the in-flight turn + halt auto-loop
                 .chat_open_file => self.cmdChatOpenFile(dd, c.textStr()), // Files tab: load a file into the viewer
@@ -1277,9 +1265,9 @@ pub const Chat = struct {
             self.sc_tools = 0;
             self.sc_tokens_out = 0;
             // Commit to the server for this turn. The SERVER now owns the loop (we passed loop_mode in the body), so
-            // the desk's LOCAL auto-loop must NOT also drive turns — but we no longer CLEAR the toggle (that discarded
-            // the user's auto-loop/afk intent): sc_serving standing down the local maybeLoop (its guard at the top)
-            // keeps the desk from double-driving while the toggle stays visibly armed and the server drives it.
+            // the desk's LOCAL auto-loop must NOT also drive turns — but do NOT clear the toggle (that would discard
+            // the user's auto-loop/afk intent): sc_serving standing down the local maybeLoop keeps the desk from
+            // double-driving while the toggle stays visibly armed and the server drives it.
             @memcpy(self.sc_conv[0..conv.len], conv);
             self.sc_conv_len = conv.len;
             self.sc_from = from0;
@@ -1792,7 +1780,7 @@ pub const Chat = struct {
     /// a .tool_follow turn so the model reads the result and continues (the AI RUN: door only).
     fn foldConsoleAi(self: *Chat, dd: []const u8, cmd: []const u8, result: []const u8) void {
         // a console command (e.g. a registration POST) is where the claim_url/verification_code first appears —
-        // capture it durably before the ring evicts it (the moltbook loss originated in exactly such a result)
+        // capture it durably before the ring evicts it
         self.captureOneTimeSecrets(dd, result);
         var fb: [7168]u8 = undefined;
         const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ cmd, result }) catch result;
@@ -1900,9 +1888,9 @@ pub const Chat = struct {
             // or a successful build step while the real failure persists, is not progress and must not walk the
             // ladder back down (that residual kept a stuck build from ever reaching the research/cast rungs).
             if (hard_fail) {
-                // afk stall breaker: the SAME command failing over and over (the observed ~20x encoding/quoting
-                // spiral) must force a change of approach, not loop forever. Compare against the prior failing
-                // command BEFORE it is overwritten below; escalate a nudge on a sustained streak.
+                // afk stall breaker: the SAME command failing over and over must force a change of approach, not
+                // loop forever. Compare against the prior failing command BEFORE it is overwritten below;
+                // escalate a nudge on a sustained streak.
                 if (self.arc_fail_cmd_len > 0 and nearlySame(p.cmdStr(), self.arc_fail_cmd[0..self.arc_fail_cmd_len]))
                     self.console_fail_streak += 1
                 else
@@ -1968,8 +1956,8 @@ pub const Chat = struct {
             // Hebbian close of the loop: a lesson was injected this turn and the command came back clean —
             // STRENGTHEN the precise lessons that were injected so the ones that keep fixing things out-rank
             // stale ones. Strengthen-only (never mints): keyed on the recalled LESSON text, not the raw user
-            // prompt. The old code reinforce()d on last_user, which minted "<user prompt>: worked" straight into
-            // the lesson scope — that garbage then surfaced as bogus "RECALLED LESSON" blocks on later failures.
+            // prompt — reinforcing on last_user would mint "<user prompt>: worked" into the lesson scope and
+            // surface it as a bogus "RECALLED LESSON" on later failures.
             // ONE strengthen per injection (stash cleared here): repetition without new evidence just inflates.
             if (self.playbook_hit and clean_ok and self.playbook_hit_lesson_len > 0) {
                 var lit = std.mem.tokenizeScalar(u8, self.playbook_hit_lesson[0..self.playbook_hit_lesson_len], '\n');
@@ -1985,7 +1973,7 @@ pub const Chat = struct {
             // TRUNCATION MARKER, keyed to what the MODEL actually sees. composeConsoleResult copies out+err into rb
             // and keeps the HEAD up to a ~6KB body cap (rb minus the note), so anything past that is dropped from
             // the model's view — NOT readSink's 40KB sink. Detect at THIS layer and say so, or the model re-runs the
-            // same dump thinking the file "didn't show" (the observed `type core.py` spiral: a 15KB dump → ~6KB).
+            // same dump thinking the file "didn't show".
             const vis_budget = if (rb.len > note.len + 280) rb.len - note.len - 280 else 0;
             const vis_clipped = out_slice.len + err_slice.len > vis_budget;
             var note_buf: [640]u8 = undefined;
@@ -2402,9 +2390,9 @@ pub const Chat = struct {
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
         if (text.len == 0) return;
         if (self.turn != .idle or self.consoleAiBusy() or self.sc_active) {
-            // Don't silently drop the message (the "new chat fails to deploy / nothing happens" report) — tell the
-            // user why. Sending DURING a cast is fine (cast_active isn't blocked here); only a live turn/console is.
-            // sc_active: a server-chat turn is rendering — a second send would clobber its poll cursor/conv.
+            // Don't silently drop the message — tell the user why. Sending DURING a cast is fine (cast_active
+            // isn't blocked here); only a live turn/console is. sc_active: a server-chat turn is rendering — a
+            // second send would clobber its poll cursor/conv.
             self.store.pushNotif("Busy", "finish or Stop the current reply before sending", 2);
             return;
         }
@@ -2494,13 +2482,12 @@ pub const Chat = struct {
             return;
         }
         // QUESTION-YOUR-KNOWLEDGE POSTURE (user directive): a fresh, substantive task in builder (speed) mode
-        // should treat its training as a STARTING POINT to improve on, not a ceiling. This is broader than the
-        // old gap-based gate ("research only if the domain is unfamiliar") — the user's point was that even a
-        // FAMILIAR task ("build a website") is done BETTER by first checking CURRENT methods/best-practices and
-        // RAG'ing them in, rather than building from memory alone. Still engine-injected as a directive (the weak
-        // model won't reliably question itself) and still scaled to SUBSTANCE — a trivial edit or a plain-general
-        // answer proceeds directly; the model self-gates that. (The reactive ladder above handles getting STUCK;
-        // this is the proactive front of the same instinct: check current methods before, escalate research after.)
+        // should treat its training as a STARTING POINT to improve on, not a ceiling — even a FAMILIAR task
+        // ("build a website") is done BETTER by first checking CURRENT methods/best-practices and RAG'ing them
+        // in, rather than building from memory alone. Engine-injected as a directive (the weak model won't
+        // reliably question itself) and scaled to SUBSTANCE — a trivial edit or a plain-general answer proceeds
+        // directly; the model self-gates that. (The reactive ladder above handles getting STUCK; this is the
+        // proactive front of the same instinct.)
         if (fresh and text.len >= 40) {
             const speed_on = blk_sg: {
                 self.store.lock();
@@ -2837,11 +2824,10 @@ pub const Chat = struct {
     }
 
     /// Durably remember any one-time claim/verification secret a tool/console RESULT carried — the MOMENT it
-    /// arrives, before the 64-message ring evicts it or end-of-run consolidation drops it. This is the fix for
-    /// the moltbook loss: the registration response's claim_url + verification_code were kept only in the ring,
-    /// aged out, and the agent then looped forever re-discovering a claim step it already had. Idempotent
-    /// (storeMemory dedups); skipped during the veil's parallel research work (that store is the user's private
-    /// memory, not a research scratchpad).
+    /// arrives, before the 64-message ring evicts it or end-of-run consolidation drops it. Without this, a
+    /// one-time claim_url / verification_code kept only in the ring ages out and the agent loops re-discovering
+    /// a claim step it already had. Idempotent (storeMemory dedups); skipped during the veil's parallel research
+    /// work (that store is the user's private memory, not a research scratchpad).
     fn captureOneTimeSecrets(self: *Chat, dd: []const u8, result: []const u8) void {
         if (self.in_veil_work) return;
         if (result.len < 8 or result[0] == '(') return; // an error/empty note carries nothing worth keeping
@@ -2856,8 +2842,7 @@ pub const Chat = struct {
     }
 
     /// STALL GUARD. A busy-but-getting-nowhere spiral is invisible to loop_idle (which only catches NO action):
-    /// the auto-loop keeps firing web lookups, so `acted` stays true while progress is zero (the moltbook docs
-    /// loop — ~15 fetches over unreadable JS pages, chasing a claim step that isn't an API). Count consecutive
+    /// the auto-loop keeps firing web lookups, so `acted` stays true while progress is zero. Count consecutive
     /// web-lookup calls; a non-lookup tool (a real build/read action) resets it. At the limit, inject ONE
     /// corrective steer: stop repeating, change approach, or — if the step needs a human/UI action the API can't
     /// do — say so to the user and move on. It NEVER stops the loop (afk is user-ended by design); it makes a
@@ -3352,10 +3337,9 @@ pub const Chat = struct {
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
             evicted = self.store.msg_count >= store_mod.MAX_CHAT_MSGS;
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
-                // PIN THE GOAL: slot 0 is the conversation's original user request — evicting it erased the
-                // assignment from both the model's context and the persisted file mid-build (the live neuronet
-                // drift: twenty tool rounds in, the model no longer knew which web framework it was asked
-                // for). Keep it; evict the second-oldest instead.
+                // PIN THE GOAL: slot 0 is the conversation's original user request — evicting it erases the
+                // assignment from both the model's context and the persisted file mid-build (deep into a run the
+                // model no longer knows what it was asked to build). Keep it; evict the second-oldest instead.
                 const lo: usize = if (self.store.msgs[0].role == .user) 1 else 0;
                 std.mem.copyForwards(store_mod.ChatMsg, self.store.msgs[lo .. store_mod.MAX_CHAT_MSGS - 1], self.store.msgs[lo + 1 .. store_mod.MAX_CHAT_MSGS]);
                 self.store.msg_count = store_mod.MAX_CHAT_MSGS - 1;
@@ -3669,8 +3653,8 @@ pub const Chat = struct {
             defer self.store.unlock();
             // include from the tail while the budget lasts (the newest matter most) — but PIN the goal:
             // msgs[0] is the user's assignment, and once a long tool arc pushed it out of the tail window the
-            // model worked from tool chatter alone (the live neuronet drift to a different web framework).
-            // Reserve its cost up front and always emit it first when the window would otherwise drop it.
+            // model worked from tool chatter alone and drifted off the original request. Reserve its cost up
+            // front and always emit it first when the window would otherwise drop it.
             var budget: usize = 24 * 1024;
             const pin_goal = self.store.msg_count > 0 and self.store.msgs[0].role == .user;
             const floor: usize = if (pin_goal) 1 else 0;
@@ -3696,10 +3680,10 @@ pub const Chat = struct {
                 const m = &self.store.msgs[k];
                 // Thoughts and most machine notes are UI-only breadcrumbs: re-fed as user rows, past
                 // nudge/verify directives and "(status)" chatter read as STANDING INSTRUCTIONS the model
-                // keeps obeying on every later task in the same conversation (the confirmed second-task
-                // failure). Only bracketed RESULT rows ([console]/[tool:...]/[cast]/[build]) flow back —
-                // those are the ground truth the model genuinely needs — and the [orchestrator] brief only
-                // while its cast is actually live (see rowRefeeds for the post-cast poisoning it caused).
+                // keeps obeying on every later task in the same conversation. Only bracketed RESULT rows
+                // ([console]/[tool:...]/[cast]/[build]) flow back — those are the ground truth the model
+                // genuinely needs — and the [orchestrator] brief only while its cast is actually live (see
+                // rowRefeeds).
                 if (!rowRefeeds(m.role, m.textStr(), cast_live)) continue;
                 const role = switch (m.role) {
                     .veil => "assistant",
@@ -3792,13 +3776,12 @@ pub const Chat = struct {
             @memcpy(self.store.stream_text[0..n], src[0..n]);
             self.store.stream_len = n;
             // DRAFT MODE: while the answer is still pre-final it must read as the veil THINKING, not as a
-            // delivered answer that later vanishes and re-lands ("output > revise > correct" — the reported
-            // annoyance). Approximate mirror of the settle-time reflect gate: once a plain answer's stream
-            // crosses REFLECT_MIN_ANSWER a self-check will follow UNLESS the reply turns out to be an
-            // action (TOOL:/RUN:/CAST: dispatch precedes the reflect gate at settle) — so drafting mode is
-            // LATCHED once crossed (no flicker if a tool tail is momentarily stripped mid-delta) and dropped
-            // again the moment an action tail is visible. The UI renders draft-mode content as a quote
-            // block, so the committed final answer is the only thing that ever looks like the reply.
+            // delivered answer that later vanishes and re-lands. Approximate mirror of the settle-time reflect
+            // gate: once a plain answer's stream crosses REFLECT_MIN_ANSWER a self-check will follow UNLESS the
+            // reply turns out to be an action (TOOL:/RUN:/CAST: dispatch precedes the reflect gate at settle) —
+            // so drafting mode is LATCHED once crossed (no flicker if a tool tail is momentarily stripped
+            // mid-delta) and dropped again the moment an action tail is visible. The UI renders draft-mode
+            // content as a quote block, so the committed final answer is the only thing that looks like the reply.
             const gate = REFLECT_PASSES > 0 and (self.turn == .user or self.turn == .tool_follow) and
                 !self.in_veil_work and src.len >= REFLECT_MIN_ANSWER and
                 !isSmallTalk(self.last_user[0..self.last_user_len]);
@@ -3929,13 +3912,11 @@ pub const Chat = struct {
             defer if (synth_args) |s| self.gpa.free(s); // freed AFTER runToolAndContinue dupes it (returns at 1446)
             var synthesized = false; // code-block rescue: the "prose" is the pasted file — never narrate it
             // Reasoning-channel recovery fires when content is EMPTY — and also when content merely
-            // ANNOUNCES the action ("I'll check the task now") while the literal call sits stranded in
-            // the thinking. The announced-then-fizzle transcript showed non-empty narration was the
-            // common case, and the old full.len==0 gate made the reasoning invisible exactly then.
-            // A literal CAST: in content vetoes recovery outright — the reply DID act (cast dispatches
-            // below the reflect gate); hijacking it with a TOOL/RUN dug out of the thinking was a
-            // confirmed review finding. When the reasoning holds BOTH a TOOL: and a RUN:, the LATER one
-            // is the model's final decision (looseRunWins) — fixed TOOL-first picked the discarded option.
+            // ANNOUNCES the action ("I'll check the task now") while the literal call sits stranded in the
+            // thinking (non-empty narration is the common case, so a full.len==0-only gate misses it).
+            // A literal CAST: in content vetoes recovery outright — the reply DID act (cast dispatches below
+            // the reflect gate); hijacking it with a TOOL/RUN dug out of the thinking is wrong. When the
+            // reasoning holds BOTH a TOOL: and a RUN:, the LATER one is the model's final decision (looseRunWins).
             const loose_ok = reason.len > 0 and castGoal(full) == null and
                 (full.len == 0 or announcesAction(full));
             var tc_opt = toolCall(full) orelse toolCallXml(full) orelse toolCallTagXml(full) orelse toolCallBracket(full) orelse blk_xn: {
@@ -3951,25 +3932,22 @@ pub const Chat = struct {
                 (if (loose_ok and !looseRunWins(reason)) blk_loose: {
                     const lt = toolCallLoose(reason) orelse break :blk_loose null;
                     // A DESTRUCTIVE call may never dispatch off the hidden reasoning channel — musing
-                    // about the toolbox is not a decision. Observed live: the orchestrator narrated a
-                    // status check, its thinking mentioned kill_swarm, and the loose recovery hard-killed
-                    // the very cast the user had just requested (seq-5 death; the veil then apologized
-                    // for an action it never chose). A kill still recovers when the USER asked for one.
+                    // about the toolbox is not a decision (a loose kill_swarm dug out of the thinking would
+                    // hard-kill a cast the user never asked to stop). A kill still recovers when the USER asked for one.
                     if (std.mem.eql(u8, lt.name, "kill_swarm") and !userWantsKill(self.last_user[0..self.last_user_len])) break :blk_loose null;
                     break :blk_loose lt;
                 } else null) orelse toolCallFenced(full) orelse toolCallJsonInferred(full) orelse blk_nr: {
                 // NATURAL-LANGUAGE READ: `read_file <path> [start_line N] [end_line M]` with no JSON/XML/fence —
                 // deepseek drops to this bare form and it never dispatched, so the model re-announced the read
-                // forever (the c6a54da12 stall). read_file is NON-DESTRUCTIVE, so recover it even ungated. OWNED.
+                // forever. read_file is NON-DESTRUCTIVE, so recover it even ungated. OWNED.
                 if (naturalReadCall(self.gpa, full)) |nc| {
                     synth_args = @constCast(nc.args);
                     break :blk_nr ToolCall{ .name = nc.name, .args = nc.args };
                 }
                 break :blk_nr null;
             } orelse blk: {
-                // observed live: "cast a swarm to finish the two-page site" answered with a pasted
-                // index.html, this rescue synthesized a write_file, and the veil silently self-built
-                // for the rest of the arc while the hive never existed — the cast recovery owns this
+                // when a cast is owed, the code-block write rescue must stand aside — otherwise a pasted-file
+                // answer gets synthesized into a self-build and the requested hive never fires (cast recovery owns it)
                 if (cast_owed) break :blk null;
                 if (codeBlockWrite(self.gpa, self.last_user[0..self.last_user_len], full)) |s| {
                     synth_args = s;
@@ -3981,8 +3959,8 @@ pub const Chat = struct {
             };
             // EMPTY-ARGS write rescue: findToolCall matched `TOOL: write_file` but the args never yielded a
             // usable path. A non-empty (but pathless) match PRE-EMPTS the code-block rescue in the orelse chain
-            // above, so without this the empty {} call bounces off the server as "bad path" forever (observed
-            // live: deepseek looped ~10x on one index.html). Two distinct causes, handled differently:
+            // above, so without this the empty {} call bounces off the server as "bad path" forever. Two distinct
+            // causes, handled differently:
             if (tc_opt) |tc0| {
                 if (synth_args == null and !cast_owed and !argsHasPath(tc0.args) and std.mem.eql(u8, tc0.name, "write_file")) {
                     // (1) TRUNCATION — the file was too big and got cut off mid-content by the reply length cap,
@@ -4034,10 +4012,9 @@ pub const Chat = struct {
             }
             // RUN: <shell command> — the AI's micro-console door. Same agentic loop as TOOL (shared iteration
             // budget), output streams into the Veil console tab and folds back so the model reads the result.
-            // Same reasoning-channel recovery as TOOL (this asymmetry was half the fizzle: a RUN: narrated in
-            // the thinking had NO recovery path at all, so the turn settled as prose and the app went idle).
-            // ...and, last, a shell command the model left in a ```<shell> fence instead of a RUN: line — the
-            // observed `type core.py` spiral was exactly this (never dispatched → re-emitted → stalled). Gated on
+            // Same reasoning-channel recovery as TOOL (a RUN: narrated only in the thinking would otherwise have
+            // no recovery path and the turn would settle as idle prose).
+            // ...and, last, a shell command the model left in a ```<shell> fence instead of a RUN: line. Gated on
             // announcesAction (like the loose term) so a fence that merely ILLUSTRATES a command in a plain answer
             // is never run — only a reply that announces it is about to act recovers its fenced command.
             const fenced = if (announcesAction(full)) fencedShellCall(full) else null;
@@ -4061,10 +4038,9 @@ pub const Chat = struct {
             // force=true") instead of a real TOOL: line, so nothing dispatched and the swarm kept running. If a
             // cast is in flight and the user's message is a kill request, run kill_swarm ourselves — the exact
             // recovery pattern userWantsCast uses for a flaked CAST. (kind==.user only; not on tool-follow loops.)
-            // !in_veil_work: the orchestrator turn runs with last_user REPLACED by the [orchestrator]
-            // brief — which contains "narrate and stop" + "hive", so userWantsKill read the cast's own
-            // job description as a standing kill order and hard-killed two freshly-deployed casts the
-            // moment an orchestrator reply had no tool call. Kill recovery serves REAL user messages only.
+            // !in_veil_work: the orchestrator turn runs with last_user REPLACED by the [orchestrator] brief
+            // (which mentions "hive"), so userWantsKill would read that as a kill order and stop a fresh cast.
+            // Kill recovery serves REAL user messages only.
             if (kind == .user and !self.in_veil_work and self.castPending() and userWantsKill(self.last_user[0..self.last_user_len])) {
                 log.info("kill recovery: user asked to kill; model emitted no tool — dispatching kill_swarm", .{});
                 if (full.len > 0 or reason.len > 0) self.appendVeil(dd, reason, stripToolTail(full));
@@ -4095,17 +4071,15 @@ pub const Chat = struct {
             // ACT FOLLOW-THROUGH: the reply ANNOUNCED an action ("I'll re-create the task with the full
             // path...") but performed none — no TOOL:/RUN: line in content OR reasoning (the literal-line
             // cases were recovered above). Left alone this settles as a final answer, acted stays false, the
-            // auto-loop silently disarms, and the app sits idle on a promise — the observed death spiral
-            // (narrate → fizzle → user prods → narrate again). Re-enter with a hard directive to act — up
-            // to TWICE per arc: the live replay showed a narrating model often answers the first nudge
-            // with another announcement, and the second one converts it (still bounded, still cheap).
-            // Own capped counter: narration nudges must never spend the real tool budget. Placed BEFORE
-            // the reflect gate — reflect's critique prompt forbids action lines, so it would launder the
-            // announced intent into more polished prose instead of an action.
+            // auto-loop silently disarms, and the app sits idle on a promise. Re-enter with a hard directive to
+            // act — up to TWICE per arc: a narrating model often answers the first nudge with another
+            // announcement, and the second converts it (still bounded, still cheap). Own capped counter:
+            // narration nudges must never spend the real tool budget. Placed BEFORE the reflect gate — reflect's
+            // critique prompt forbids action lines, so it would launder the announced intent into polished prose.
             // AI ROUTER decides "announced an action but performed none" (replacing the hardcoded verb/ack list
-            // that missed the gerund/imperative announcements); the short-circuit ordering means the gateway call
+            // that missed gerund/imperative announcements); the short-circuit ordering means the gateway call
             // fires ONLY inside this decision window (≤2/arc), and it falls back to the announcesAction floor when
-            // it can't decide — never worse than the old heuristic, and it catches the styles the list can't.
+            // it can't decide.
             if (self.act_nudges < 2 and !self.in_veil_work and !self.castPending() and !cast_owed and
                 castGoal(full) == null and // a literal CAST: IS the performed action — it dispatches below
                 (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
@@ -4130,8 +4104,8 @@ pub const Chat = struct {
         }
         // !internal_turn: a machine-continuation answer (verify turns, follow-through re-entries, the
         // post-cast repair chain) reports tool evidence — polishing its prose costs 2-3 model calls of pure
-        // latency (measured ~30s per settle) and once reflected an APOLOGY into three drafts. Real user
-        // answers still reflect; the drafting pass of the original turn already did before any nudge fired.
+        // latency (measured ~30s per settle) for no benefit. Real user answers still reflect; the drafting pass
+        // of the original turn already did before any nudge fired.
         if (REFLECT_PASSES > 0 and !self.in_veil_work and !cast_owed and !self.internal_turn and shouldReflectPass(kind, self.last_user[0..self.last_user_len], full)) {
             self.reflect_pass = 0; // fresh iterative-critique budget for this answer
             self.reflect_dirty = false; // no pass has changed anything yet
@@ -4145,10 +4119,10 @@ pub const Chat = struct {
             self.reflect_trace_has_reason = false;
             self.traceAddPass("- drafting -", if (reason.len > 0 and reflectChanged(full, reason)) reason else "");
             self.stream.deinit(self.gpa);
-            // NOTHING is committed while the self-check runs. The draft used to be posted here and then
-            // rewritten in place each pass — the veil visibly "deleting and replacing its own answer", which
-            // the user called out as annoying. Instead the answer stays hidden; the user watches the live
-            // reasoning stream during refinement, and revealReflect lands the FINAL answer once at the end.
+            // NOTHING is committed while the self-check runs — posting the draft and rewriting it in place each
+            // pass makes the veil visibly "delete and replace its own answer". Instead the answer stays hidden;
+            // the user watches the live reasoning stream during refinement, and revealReflect lands the FINAL
+            // answer once at the end.
             self.reflect_msg_idx = null;
             self.setStatus("refining the answer...");
             self.startTurn(dd, .reflect);
@@ -4231,9 +4205,9 @@ pub const Chat = struct {
             // A collect answer that only ANNOUNCES follow-up work ("the file is truncated — let me fix
             // it") used to settle as the FINAL answer: collect turns are gated out of the TOOL/RUN/
             // act-nudge block above, so the promise fizzled, acted stayed false, the auto-loop disarmed,
-            // and the chat sat idle on a broken deliverable — the observed post-cast dead chat. Decide off
-            // the live stream slices, commit the answer, then re-enter as a .tool_follow turn (a kind that
-            // CAN act) with the same bounded follow-through directive the plain-answer path uses.
+            // and the chat sat idle on a broken deliverable. Decide off the live stream slices, commit the
+            // answer, then re-enter as a .tool_follow turn (a kind that CAN act) with the same bounded
+            // follow-through directive the plain-answer path uses.
             const fizzled = self.act_nudges < 2 and
                 (self.routeMeantToAct(dd, if (full.len > 0) full else reason) orelse
                     (announcesAction(full) or (full.len == 0 and announcesAction(reason))));
@@ -4288,17 +4262,17 @@ pub const Chat = struct {
             } else if (self.loop_iter > 0 and self.loop_casts >= MAX_LOOP_CASTS and !self.afkOn()) {
                 // The auto-loop MAY cast — delegating a scoped sub-task to a hive is the veil doing its job, and the
                 // loop is the inference fail-safe that must STAY ON (user directive). But it's bounded: after several
-                // swarms in one loop session, pause for the user so a weak model can't runaway-deploy hives unattended
-                // (the original post-kill runaway). castPending above already refuses a *concurrent* second cast.
-                // In afk the pause is waived — the user opted into forever, swarm runs included (user directive).
+                // swarms in one loop session, pause for the user so a weak model can't runaway-deploy hives
+                // unattended. castPending above already refuses a *concurrent* second cast. In afk the pause is
+                // waived — the user opted into forever, swarm runs included (user directive).
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
-                self.stream.deinit(self.gpa); // this early return skipped the shared settle deinit — confirmed leak
+                self.stream.deinit(self.gpa); // this early return skips the shared settle deinit — free here
                 self.stopLoop(dd, "auto-loop paused: the veil cast several swarms in a row — say 'continue' to keep going.");
                 return;
             } else {
                 // Fire the cast and KEEP THE LOOP ARMED: after the hive's result folds back in, the loop resumes and
-                // the veil keeps working the goal (this is what fixes the "second swarm never fired" bug — the old
-                // guard stopped the loop the instant the veil wanted to delegate). Count it toward the runaway bound.
+                // the veil keeps working the goal (stopping the loop the instant the veil wants to delegate would
+                // prevent a follow-up cast). Count it toward the runaway bound.
                 if (self.loop_iter > 0) self.loop_casts += 1;
                 if (note.len > 0 or reason.len > 0) self.appendVeil(dd, reason, note);
                 self.fireCast(dd, spec);
@@ -4328,8 +4302,8 @@ pub const Chat = struct {
         // recalled for it proved useful — STRENGTHEN the stored turn for that topic so it out-ranks the
         // alternatives in later trust-weighted recall. Strengthen-only: the user's message was already observed
         // into this scope (appendMsgFull), so a fragment of it substring-matches that stored fact and bumps it;
-        // it NEVER mints (the old reinforce() minted "<prompt>: answered" stance facts that then surfaced as
-        // spurious "relevant memory"). The chat's hippocampus LEARNS from engagement instead of only accumulating.
+        // it NEVER mints (minting "<prompt>: answered" stance facts would surface them as spurious "relevant
+        // memory"). The chat's hippocampus LEARNS from engagement instead of only accumulating.
         if ((kind == .user or kind == .collect or kind == .reflect) and full.len > 0 and self.last_user_len > 3 and self.mind().enabled()) {
             var scope_buf: [40]u8 = undefined;
             const scope = self.convScope(&scope_buf);
@@ -4345,12 +4319,12 @@ pub const Chat = struct {
         const consolidate = self.shouldConsolidate(kind, full);
         // VERIFY BEFORE DONE: this arc performed side-effecting actions and the model is now settling on a
         // prose answer (typically "done!"). "The command printed Ready" is not the same as "the thing works"
-        // — the observed failure registered a task that looked fine and silently failed later (LastTaskResult
-        // 0x80070002, found only when the user complained). One bounded verification turn: the model must
-        // check the OUTCOME with a read-only command whose result folds back through the real console (exit
-        // codes and output are ground truth — the model picks WHAT to check, never what the check returned).
-        // A failed check re-enters the normal fix loop (bounded by MAX_TOOL_ITERS). Skipped when the answer
-        // hands the turn to the user with a question, on Stop/epoch moves, and during casts/veil work.
+        // — a task that looked fine can silently fail later (e.g. a scheduled task's LastTaskResult 0x80070002).
+        // One bounded verification turn: the model must check the OUTCOME with a read-only command whose result
+        // folds back through the real console (exit codes and output are ground truth — the model picks WHAT to
+        // check, never what the check returned). A failed check re-enters the normal fix loop (bounded by
+        // MAX_TOOL_ITERS). Skipped when the answer hands the turn to the user with a question, on Stop/epoch
+        // moves, and during casts/veil work.
         // The reply hands the turn to the user with a question. Read the text ACTUALLY COMMITTED as the
         // reply: gpt-oss commonly leaves content empty and answers in the reasoning channel (shown AS the
         // reply below), so a content-only check missed the common local-model case — a "…add a dark theme?"
@@ -4358,10 +4332,10 @@ pub const Chat = struct {
         const committed_reply = if (full.len > 0) full else reason;
         const asks_user = committed_reply.len > 0 and committed_reply[committed_reply.len - 1] == '?';
         // !announcesAction: a reply that says MORE work is coming is not claiming done — verifying after
-        // every landed file inserted a whole ceremony turn mid-build (the game-suite arcs burned their
-        // budgets on it); the auto-loop carries the work forward and the TRUE final settle verifies once.
+        // every landed file inserts a whole ceremony turn mid-build (burning the budget); the auto-loop
+        // carries the work forward and the TRUE final settle verifies once.
         const want_verify = (kind == .user or kind == .tool_follow or kind == .reflect) and self.arc_mutated and !self.verify_done and
-            !self.arc_final_verified and // the whole-build check already ran; a write it prompted must not re-trigger per-step verify (the observed post-fix thrash)
+            !self.arc_final_verified and // the whole-build check already ran; a write it prompted must not re-trigger per-step verify
             !self.in_veil_work and !self.castPending() and
             !asks_user and !announcesAction(committed_reply) and
             self.turn_epoch == self.conv_epoch and !self.abort_turn.load(.monotonic) and
@@ -4378,7 +4352,7 @@ pub const Chat = struct {
             self.tool_iters += 1; // the verify turn spends from the arc's real budget
             // This settle WOULD have consolidated — the verify re-entry is machine-authored (internal_turn),
             // which suppresses shouldConsolidate for the rest of the arc, so carry the debt to the arc's
-            // eventual settle (the confirmed swallow otherwise dropped durable facts on every mutating arc).
+            // eventual settle (otherwise durable facts are dropped on every mutating arc).
             if (consolidate) self.consolidate_pending = true;
             self.appendMsgFull(dd, .cast_note, "(verifying the outcome before calling it done)", false);
             self.setDirective("Before we call this done: VERIFY the outcome OBJECTIVELY. One short sentence, then exactly ONE read-only RUN: or TOOL: line that checks the thing you just changed actually exists and behaves (query the created task/file/service/state — e.g. a scheduled task's LastTaskResult, a file's content, a service's status). When the result arrives: if it proves the work, report done WITH the evidence; if it exposes a failure, FIX it now and verify again. Only if this exchange truly changed nothing, restate your final answer instead.");
@@ -4412,10 +4386,9 @@ pub const Chat = struct {
         if (self.in_veil_work or self.castPending()) return false; // don't consolidate the veil's parallel research
         if (full.len == 0 and self.last_user_len == 0) return false;
         if (isSmallTalk(self.last_user[0..self.last_user_len])) return false; // "hi"/"thanks" carry nothing durable
-        // Durable-signal gate (kept as a cost guard — one model call per hit — but WIDENED per the user's report
-        // that the veil "doesn't know when to save data": it now also fires on commitments/plans/schedule the
-        // user states in passing (the missed "therapy at 12pm today" case), and scans the ANSWER too, since the
-        // veil often re-states a durable fact it just learned. Pure-technical Q&A still matches nothing → no call.
+        // Durable-signal gate (a cost guard — one model call per hit). Fires on keys/logins/prefs AND on
+        // commitments/plans/schedules the user states in passing, and scans the ANSWER too (the veil often
+        // re-states a durable fact it just learned). Pure-technical Q&A still matches nothing → no call.
         return exchangeHasDurableSignal(self.last_user[0..self.last_user_len]) or
             (full.len > 0 and exchangeHasDurableSignal(full));
     }
@@ -4535,8 +4508,8 @@ pub const Chat = struct {
     fn maybeLoop(self: *Chat, dd: []const u8) void {
         // SERVER CHAT owns the loop. When the conv is SERVED by the server (sc_serving — set on a successful route,
         // cleared on a fallback to local), the SERVER turn drives its own multi-step loop, so the desk must NOT run
-        // its LOCAL auto-loop — doing so is the "enabling auto-loop falls back to the client-side engine" bug. Keyed
-        // on sc_serving (not the 45s serverChatOn() cooldown) so a >45s local fallback build isn't stranded mid-loop.
+        // its LOCAL auto-loop. Keyed on sc_serving (not the 45s serverChatOn() cooldown) so a >45s local fallback
+        // build isn't stranded mid-loop.
         if (self.sc_serving) return;
         // wait for any turn/cast/console AND for a concurrent-veil attempt or its pending finish (else auto-loop
         // would grab the shared turn slot out from under the veil work / finish).
@@ -4554,15 +4527,15 @@ pub const Chat = struct {
         if (!on) return;
         // Only KEEP LOOPING while the veil is actually working. `acted` reflects just the FINAL reply of a
         // chain (every settle resets it), so a build chain that wrote files and then ANNOUNCED the next one
-        // read as "just replied" and the loop disarmed mid-build — the game-suite death (one file per user
-        // prod). arc_acted carries "this loop step DID work"; a step with zero dispatches (a plain
-        // conversational answer, or announce-only after both nudges) still ends the loop — that is the
-        // anti-spin bound (re-earned per step in loopContinue), alongside nearlySame + LOOP_MAX_ITERS.
+        // read as "just replied" and the loop disarmed mid-build. arc_acted carries "this loop step DID work";
+        // a step with zero dispatches (a plain conversational answer, or announce-only after both nudges) still
+        // ends the loop — that is the anti-spin bound (re-earned per step in loopContinue), alongside
+        // nearlySame + LOOP_MAX_ITERS.
         if (!self.acted and !self.arc_acted) {
             if (self.fireTerminalVerify(dd)) return; // a build that stalled on a no-work step still gets checked
-            // ONE announce-only step must not silently disconnect the loop (user verdict: the quiet disarm
-            // "was a bad move" — persistence IS the feature). The loop keeps driving through a single idle
-            // settle; only a SECOND consecutive no-action step ends it (that's a conversation, not work).
+            // ONE announce-only step must not silently disconnect the loop — persistence IS the feature. The
+            // loop keeps driving through a single idle settle; only a SECOND consecutive no-action step ends it
+            // (that's a conversation, not work).
             self.loop_idle += 1;
             if (self.loop_idle >= 2) {
                 if (!afk) {
@@ -4611,9 +4584,9 @@ pub const Chat = struct {
         self.tool_iters += 1;
         // The ENGINE lists the build tree deterministically and hands the model GROUND TRUTH — a weak model
         // asked to "run list_dir" tends to ANNOUNCE the check without emitting the tool call, which spins the
-        // act-nudge loop and reads as thrashing (observed live). With the real listing in hand the model
-        // needs no read-only tool: it either WRITES a file the inventory shows missing (a real action) or
-        // gives its final summary. Same discipline as the swarm's engine-stamped verification.
+        // act-nudge loop and reads as thrashing. With the real listing in hand the model needs no read-only
+        // tool: it either WRITES a file the inventory shows missing (a real action) or gives its final summary.
+        // Same discipline as the swarm's engine-stamped verification.
         var listing: std.ArrayListUnmanaged(u8) = .empty;
         defer listing.deinit(self.gpa);
         var rb: [700]u8 = undefined;
@@ -4628,10 +4601,9 @@ pub const Chat = struct {
         const files_full = if (listing.items.len > 0) listing.items else "  (the build workdir is EMPTY — nothing was actually written)\n";
         const files_block = files_full[0..@min(files_full.len, 2000)];
         self.appendMsgFull(dd, .cast_note, "(before finishing: checking every file the build needs is actually on disk)", false);
-        // The check is scoped to THIS ARC'S GOAL, quoted verbatim: without it the model fills the
-        // vacuum from whatever else is in its prompt — observed live, a durable-memory fact about a
-        // PAST session's build ("...built and verified — files at ...") read as a deliverable list
-        // and a findstr-only conversation re-landed a whole file tree unprompted.
+        // The check is scoped to THIS ARC'S GOAL, quoted verbatim: without it the model fills the vacuum
+        // from whatever else is in its prompt (a durable-memory fact about a PAST session's build can read
+        // as a deliverable list and re-land a whole file tree unprompted).
         const goal = self.last_user[0..@min(self.last_user_len, 300)];
         var db: [3400]u8 = undefined;
         const directive = std.fmt.bufPrint(&db, "Before we call this build done, here is EXACTLY what is on disk right now (the engine listed it — this is ground truth, do NOT run a tool to re-list it):\n{s}\nTHIS conversation's goal — the ONLY source of required files:\n\"{s}\"\nCompare the listing against the files THIS goal itself asked you to build. Memories or notes about other sessions' builds are background, NEVER deliverables here; if this goal asked for no files, nothing is missing. If a file THIS goal requires is MISSING or shows 0/near-0 bytes, WRITE it NOW this turn (one write_file — a missing file is not done). If every required file is present with real content, give your FINAL summary to the user (no tool call) — do not re-write files that are already there.", .{ files_block, goal }) catch "Compare the on-disk files above against what THIS conversation's goal asked you to build (nothing else is a deliverable); write any that are missing, else give your final summary.";
@@ -4659,10 +4631,9 @@ pub const Chat = struct {
         }
         if (text.len == 0) {
             // An EMPTY inference (model hiccup, dead stream, null next-step) must not disconnect the loop —
-            // the loop is the inference fail-safe (user directive: ending it here "was a bad move").
-            // Substitute a plain "continue" so the veil takes another real turn; a SECOND consecutive
-            // empty inference substitutes "continue" again and the nearlySame repeat-guard below ends the
-            // streak — so the rescue is bounded, not a spin.
+            // the loop is the inference fail-safe (user directive). Substitute a plain "continue" so the veil
+            // takes another real turn; a SECOND consecutive empty inference substitutes "continue" again and
+            // the nearlySame repeat-guard below ends the streak — so the rescue is bounded, not a spin.
             if (self.fireTerminalVerify(dd)) return;
             text = "continue";
         }
@@ -4680,13 +4651,11 @@ pub const Chat = struct {
             self.appendMsg(dd, .cast_note, "(auto-loop-afk: the goal looks achieved — continuing anyway)");
             text = AFK_DRIVE_MSG;
         }
-        // REPEAT GUARD: a weak model in auto-loop can spin, re-emitting a near-identical next step ("check the
-        // status to confirm" twice in a row). If the inferred message basically repeats the last one, the loop
-        // isn't making progress — stop instead of churning. Skipped in afk: churn beats stopping there, and the
-        // DONE fold above re-sends the same drive message by design.
-        // REPEAT / STALL GUARD. Non-afk: a near-identical next step means no progress — stop. afk never stops by
-        // design, so a sustained spiral instead forces a CHANGE OF APPROACH: re-ground the next step to the
-        // original goal rather than re-sending the same stuck step forever (the observed ~20x index.html spiral).
+        // REPEAT / STALL GUARD: a weak model in auto-loop can spin, re-emitting a near-identical next step
+        // ("check the status to confirm" twice in a row) that makes no progress. Non-afk: stop instead of
+        // churning. Skipped in afk (churn beats stopping there, and the DONE fold above re-sends the same drive
+        // message by design); a sustained afk spiral instead forces a CHANGE OF APPROACH — re-ground the next
+        // step to the original goal rather than re-sending the same stuck step forever.
         const rep = nearlySame(text, self.last_user[0..self.last_user_len]);
         self.loop_repeat_streak = if (rep) self.loop_repeat_streak + 1 else 0;
         if (!afk and rep) {
@@ -4768,8 +4737,7 @@ pub const Chat = struct {
         if (self.sc_active) {
             // Reach the SERVER turn: POST {"op":"stop"} to its control channel (the turn checks control.jsonl
             // between drive steps + before each inference and aborts). WITHOUT this, the detached background turn
-            // keeps running + streaming forever — the "killed the loop but it kept going" bug. Then disarm the
-            // desk poller + drop any half-streamed preview.
+            // keeps running + streaming forever. Then disarm the desk poller + drop any half-streamed preview.
             const conv = self.sc_conv[0..self.sc_conv_len];
             if (conv.len > 0) {
                 if (self.runner().chatControl(self.io, self.gpa, conv, "{\"op\":\"stop\"}")) |r| {
@@ -4946,15 +4914,15 @@ pub const Chat = struct {
         // is already re-fed into the visible window (rowRefeeds→assistant), so storing it for recall is redundant
         // AND is a confabulation vector: the per-conversation recall re-injects the model's own ephemeral narration
         // as "grounded context", so a stuck phrase gets parroted → re-observed → amplified from a one-off into a
-        // runaway loop (observed: "The tests failed on the import…" ×17 in c6a5523f7). The hippocampus keeps DURABLE
-        // facts — user turns, cast findings, tool/console results — not the veil's own chatter.
+        // runaway loop. The hippocampus keeps DURABLE facts — user turns, cast findings, tool/console results —
+        // not the veil's own chatter.
         if (reasoning.len == 0) {
             self.appendMsgFull(dd, .veil, text, false);
             return;
         }
-        // Reasoning lands as its OWN collapsed .thought message above the answer. It used to be baked into the
-        // answer text as "> " blockquote lines, which re-fed the model its own prior reasoning as assistant
-        // history every turn (.thought is excluded from the prompt) and cluttered the visible answer.
+        // Reasoning lands as its OWN collapsed .thought message above the answer (.thought is excluded from the
+        // prompt). Baking it into the answer text as "> " blockquote lines would re-feed the model its own prior
+        // reasoning as assistant history every turn and clutter the visible answer.
         var buf: [4096]u8 = undefined;
         var w: usize = 0;
         const cap = @min(reasoning.len, 4000);
@@ -5031,8 +4999,8 @@ pub const Chat = struct {
     }
 
     /// One labeled section per pass: "- drafting -" / "- self-check pass N: revised -" + that pass's reasoning
-    /// (capped per pass so several passes fit the trace buffer). Intermediate passes' reasoning used to be
-    /// DISCARDED entirely; this is where it survives.
+    /// (capped per pass so several passes fit the trace buffer), so intermediate passes' reasoning survives
+    /// instead of being discarded.
     fn traceAddPass(self: *Chat, label: []const u8, reason: []const u8) void {
         if (self.reflect_trace_len > 0) self.traceAppend("\n");
         self.traceAppend(label);
@@ -5047,10 +5015,10 @@ pub const Chat = struct {
     }
 
     /// REVEAL the reflected answer — ONE clean commit at the end of refinement. Nothing is shown while the
-    /// self-check passes run (the draft used to be committed then rewritten in place, which read as the veil
-    /// "deleting and replacing its answer" — the reported annoyance). During refinement the user watches the
-    /// live reasoning stream; here the final answer lands once, with the full reasoning trace collapsed above
-    /// it (the "reasoning locker" the user opens if curious). Clears all reflect state.
+    /// self-check passes run (committing the draft then rewriting it in place reads as the veil "deleting and
+    /// replacing its answer"). During refinement the user watches the live reasoning stream; here the final
+    /// answer lands once, with the full reasoning trace collapsed above it (the "reasoning locker" the user
+    /// opens if curious). Clears all reflect state.
     fn revealReflect(self: *Chat, dd: []const u8, answer: []const u8) void {
         if (answer.len > 0) {
             self.appendMsgFull(dd, .veil, answer, false); // not observed into the hippocampus (see appendVeil's note)
@@ -5099,14 +5067,14 @@ pub const Chat = struct {
         // is what reconciles the two streams of edits. veil_join just gates whether maybeVeilWork fires.
         // GATED ON DECLARED FILES: a files-less RESEARCH cast (the escalation strike, or any "go find out X")
         // must NOT tie the veil up in an isolated parallel BUILD — there's nothing to build, and the isolated
-        // work + its merge-wait is exactly the punitive freeze that made a 2-minute swarm read as a dead end
-        // (user: "do 2-minute swarms still lock it?"). Only a BUILD cast (declared deliverables) gets the
-        // concurrent veil-build; a research cast just runs, folds its findings back, and the loop resumes.
+        // work + its merge-wait is exactly the punitive freeze that made a 2-minute swarm read as a dead end.
+        // Only a BUILD cast (declared deliverables) gets the concurrent veil-build; a research cast just runs,
+        // folds its findings back, and the loop resumes.
         const veil_join = CONCURRENT_VEIL and spec.files.len > 0 and conv.len > 0 and conv.len <= self.cast_conv.len;
         const hive_dir = conv;
         const minds: u32 = if (spec.minds > 0) std.math.clamp(spec.minds, 1, 30) else 3;
-        // SPEED MODE ceiling: a chat cast is a 2-minute research sub-agent — the observed failure was the
-        // model dispatching 10-100 minute hiveminds for 3-5 minute jobs. Autonomy mode keeps the full range.
+        // SPEED MODE ceiling: a chat cast is a 2-minute research sub-agent — without the cap the model
+        // dispatches 10-100 minute hiveminds for 3-5 minute jobs. Autonomy mode keeps the full range.
         const speed = blk_sm: {
             self.store.lock();
             defer self.store.unlock();
@@ -5115,9 +5083,9 @@ pub const Chat = struct {
         const minutes = blk_wf: {
             const base = castMinutes(spec.minutes, spec.long, speed);
             // WORKLOAD FLOOR: when the veil DECLARED the deliverables, the time budget must fit them —
-            // a 2-minute speed cap against 14 declared files just kills the run at 4/14 (observed live).
-            // ~1 min per 3 declared files, floor 2, ceiling 20. Mirrors the server's identical floor so
-            // the desktop's own deadline watchdog doesn't kill a cast the server granted more time.
+            // a 2-minute speed cap against 14 declared files kills the run at 4/14. ~1 min per 3 declared
+            // files, floor 2, ceiling 20. Mirrors the server's identical floor so the desktop's own deadline
+            // watchdog doesn't kill a cast the server granted more time.
             if (spec.files.len == 0) break :blk_wf base;
             var nf: u32 = 0;
             var fit = std.mem.tokenizeAny(u8, spec.files, ",\n\r");
@@ -5201,8 +5169,7 @@ pub const Chat = struct {
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         log.info("cast: POST -> status={d} body={s}", .{ resp.status, resp.body[0..@min(resp.body.len, 160)] });
         if (resp.status != 200 and resp.status != 201) {
-            // 404 specifically means the RUNNING veil.exe predates the /api/v1/cast route — a stale server binary
-            // (also the usual cause of the on/offline flapping, since it predates the crash + httpz-spin fixes).
+            // 404 specifically means the RUNNING veil.exe predates the /api/v1/cast route — a stale server binary.
             var nb: [280]u8 = undefined;
             const msg = if (resp.status == 404)
                 std.fmt.bufPrint(&nb, "[cast] the veil server is out of date — its build predates the cast endpoint (HTTP 404). Rebuild + restart it (`zig build --release=fast` then relaunch `veil`). I'll answer directly from chat in the meantime.", .{}) catch "[cast] server out of date (404) — rebuild + restart it"
@@ -5368,12 +5335,11 @@ pub const Chat = struct {
 
     /// Keep the GitHub PAT usable by BOTH the git tools (which read the local store) and the veil ITSELF (which
     /// reads its durable memory and can curl / set an authenticated remote directly when a tool can't reach an
-    /// org). LOCAL, login-gated app: the token is plaintext-local by design — never sealed, never scrubbed. This
-    /// replaces the old auto-seal, which locked the token in a DPAPI blob the veil couldn't read (so its curl/gh
-    /// fallback had no credential). Bidirectional + idempotent:
+    /// org). LOCAL, login-gated app: the token is plaintext-local by design — never sealed, never scrubbed.
+    /// Bidirectional + idempotent:
     ///   - a token freely supplied in memory but not in the local store  → copy it to the store so the tools work.
     ///   - a token in the store (incl. one just auto-unsealed from a legacy blob) but not in memory → restore it
-    ///     as a durable "key" memory so the veil can recall + use it (reverses the old build's [sealed] scrub).
+    ///     as a durable "key" memory so the veil can recall + use it.
     fn ensurePatUsable(self: *Chat, dd: []const u8, side: []const u8) void {
         var mp: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&mp, "{s}/.veil-desk/memories.jsonl", .{dd}) catch return;
@@ -5480,10 +5446,9 @@ pub const Chat = struct {
         }
 
         // LAYOUT GUARD while a cast runs: the hive owns the project structure — a chat write_file that would
-        // START a new top-level file/package beside it (the "rival build" failure: app.py + app/ +
-        // social_network/ in one tree) is deflected ONCE with the blueprint so the model redirects into the
-        // hive's layout (or STEERs the hive). An insistent second attempt at the same top segment runs anyway —
-        // the guard is a nudge, never a hard wall.
+        // START a new top-level file/package beside it is deflected ONCE with the blueprint so the model
+        // redirects into the hive's layout (or STEERs the hive). An insistent second attempt at the same top
+        // segment runs anyway — the guard is a nudge, never a hard wall.
         if (self.cast_active and std.mem.eql(u8, name, "write_file")) {
             self.loadBlueprint(dd);
             var wpb: [300]u8 = undefined;
@@ -5515,9 +5480,9 @@ pub const Chat = struct {
         const conv = self.convScope(&convb);
 
         // body = {"tool":NAME,"args":"<escaped raw json>","dir":"<conv>"} — args ride as a JSON string (tool-call
-        // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope. A
-        // fixed [2048] used to reject any write_file over ~1.5KB ("arguments were too long to send"). netcli
-        // sends the body in-process over a socket (no cap), and a reply is bounded by MAX_TOKENS.
+        // convention). HEAP-sized to hold the whole (escaped) args: wesc doubles at most, so 2x + envelope (a
+        // fixed buffer would reject any write_file over ~1.5KB). netcli sends the body in-process over a socket
+        // (no cap), and a reply is bounded by MAX_TOKENS.
         const body = self.gpa.alloc(u8, args.len * 2 + name.len * 2 + conv.len + 64) catch {
             self.appendMsg(dd, .cast_note, "[tool] out of memory building the request");
             self.setBusy(false);
@@ -5526,9 +5491,9 @@ pub const Chat = struct {
         defer self.gpa.free(body);
         var w = Io.Writer.fixed(body);
         const bok = blk: {
-            // the NAME is escaped too: a recovered name carrying a quote shipped as malformed JSON the
-            // server could only 500 on (the live `line".` turn) — escaping keeps the envelope well-formed
-            // no matter what the parsers let through
+            // the NAME is escaped too: a recovered name carrying a quote would ship as malformed JSON the
+            // server could only 500 on — escaping keeps the envelope well-formed no matter what the parsers
+            // let through
             w.writeAll("{\"tool\":\"") catch break :blk false;
             wesc(&w, name);
             w.writeAll("\",\"args\":\"") catch break :blk false;
@@ -5560,11 +5525,11 @@ pub const Chat = struct {
                 }
             }
             if (std.mem.eql(u8, name, "stop_swarm") and resp.status == 200) self.cast_stop_sent = true;
-            // KILL unlocks the user immediately. The bug: kill_swarm terminated the worker but the desktop kept
-            // cast_active=true (nothing here cleared it), and a hard kill emits no "stopped" event, so watchCast
-            // never converged — the next cast bounced with "a cast is already running" and the user was locked in
-            // the chat until the minutes-long deadline. Clear the cast trio locally now (mirrors failCast), so
-            // castPending() goes false and a new cast can fire. The run dir + findings stay on disk.
+            // KILL unlocks the user immediately. kill_swarm terminates the worker but nothing here cleared
+            // cast_active, and a hard kill emits no "stopped" event, so watchCast never converged — the next
+            // cast bounced with "a cast is already running" and the user was locked in the chat until the
+            // minutes-long deadline. Clear the cast trio locally now (mirrors failCast), so castPending() goes
+            // false and a new cast can fire. The run dir + findings stay on disk.
             if (std.mem.eql(u8, name, "kill_swarm") and resp.status == 200) {
                 self.cast_active = false;
                 self.cast_stop_sent = true;
@@ -5668,8 +5633,8 @@ pub const Chat = struct {
 
         // APPROVAL GATE: the veil runs commands in the USER'S real dev environment (powershell/cmd/sh). Unless
         // the user has chosen "Bypass" (shell_always_allow), PARK the command and ask for approval instead of
-        // spawning it — the evidence was the veil firing 6 mangled powershell commands unattended. The turn is
-        // held busy (awaitingShellApproval) until the user Approves / Bypasses / Denies from the Veil tab.
+        // spawning it. The turn is held busy (awaitingShellApproval) until the user Approves / Bypasses / Denies
+        // from the Veil tab.
         const always = blk: {
             self.store.lock();
             defer self.store.unlock();
@@ -5768,10 +5733,10 @@ pub const Chat = struct {
     fn startServerCastWatch(self: *Chat) void {
         const conv = self.sc_conv[0..self.sc_conv_len];
         if (conv.len == 0 or conv.len > self.cast_conv.len) return; // no resolvable conv → nothing to watch
-        // IDEMPOTENT: a server turn can cast more than once (observed live: cast → stop → re-cast). While a watch
-        // is already armed on this conv's run dir, a second cast "start" frame must NOT push a second CastRow —
-        // updateCastRow only ever touches the newest row, so the first would freeze mid-"running" forever (a
-        // stuck-green-bar maker). Same run dir either way (build-in-place), so the existing watch covers it.
+        // IDEMPOTENT: a server turn can cast more than once (cast → stop → re-cast). While a watch is already
+        // armed on this conv's run dir, a second cast "start" frame must NOT push a second CastRow — updateCastRow
+        // only ever touches the newest row, so the first would freeze mid-"running" forever. Same run dir either
+        // way (build-in-place), so the existing watch covers it.
         if (self.cast_server_owned) return;
         self.cast_server_owned = true;
         self.cast_active = false; // the desk does NOT run the local collect/compose lifecycle for this cast
@@ -5892,7 +5857,7 @@ pub const Chat = struct {
                 const id = sw.idStr();
                 const base = if (std.mem.lastIndexOfScalar(u8, id, '/')) |sl| id[sl + 1 ..] else id;
                 // A chat cast builds in the conversation dir, so its run-dir basename is <conv>, NOT the hex id
-                // (the v27 build-in-place change) — match that first; fall back to the hex for any legacy path.
+                // — match that first; fall back to the hex for any legacy path.
                 if ((conv.len > 0 and std.mem.eql(u8, base, conv)) or std.mem.eql(u8, base, hex)) {
                     self.cast_rel_len = @min(id.len, self.cast_rel.len);
                     @memcpy(self.cast_rel[0..self.cast_rel_len], id[0..self.cast_rel_len]);
@@ -5999,8 +5964,8 @@ pub const Chat = struct {
                 // DISPLAY-ONLY: the swarm ended on its own; the row is already .done. The SERVER veil composes the
                 // answer via swarm_status — the desk must NOT run castFinished (which would compose a DUPLICATE).
                 // Clear the "hive running" status line we own — leaving it froze the green "the hive is working"
-                // bar forever after the hive finished (the stuck-bar bug). A LIVE server turn (sc_active) owns the
-                // status itself and its {done} frame clears it, so only touch it once the turn has settled.
+                // bar forever after the hive finished. A LIVE server turn (sc_active) owns the status itself and
+                // its {done} frame clears it, so only touch it once the turn has settled.
                 if (!self.sc_active) self.setStatus("the hive finished — results in Swarm activity");
                 self.cast_server_owned = false;
                 self.cast_active = false; // belt-and-suspenders; was already false
@@ -6042,10 +6007,9 @@ pub const Chat = struct {
     fn castFinished(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         if (self.cast_epoch != self.conv_epoch) {
             // The epoch moved since this cast was scheduled. If the user is STILL IN this conversation, the
-            // results belong here — re-stamp and collect normally (the old passive "ask me to summarize"
-            // note disconnected the auto-loop at its most valuable moment: the collect is what feeds the
-            // next step; user verdict — that auto-looping was a feature). Only a genuine conversation
-            // SWITCH leaves the passive note (never hijack a DIFFERENT chat with old post-processing).
+            // results belong here — re-stamp and collect normally (going passive here would disconnect the
+            // auto-loop at its most valuable moment: the collect feeds the next step). Only a genuine
+            // conversation SWITCH leaves the passive note (never hijack a DIFFERENT chat with old post-processing).
             if (self.castIsForCurrentConv()) {
                 self.cast_epoch = self.conv_epoch;
             } else {
@@ -6140,10 +6104,9 @@ pub const Chat = struct {
             self.reflect_pass = 0;
             self.reflect_dirty = false;
             self.abort_turn.store(false, .monotonic);
-            // THE VEIL IS THE HIVE'S ORCHESTRATOR while a cast runs — never a rival builder. The old [parallel]
-            // prompt had it build the same goal blind in the same dir, which produced competing top-level
-            // structures beside the hive's (the "chat went off and did its own thing" report). Now it gets the
-            // hive's OWN blueprint and a narrate / steer / gap-fill-within-the-layout job description.
+            // THE VEIL IS THE HIVE'S ORCHESTRATOR while a cast runs — never a rival builder. Building the same
+            // goal blind in the same dir produces competing top-level structures beside the hive's, so it gets
+            // the hive's OWN blueprint and a narrate / steer / gap-fill-within-the-layout job description.
             self.loadBlueprint(dd);
             const bp: []const u8 = if (self.cast_bp_len > 0) self.cast_bp[0..self.cast_bp_len] else "(not planned yet — inspect with list_dir before touching anything)";
             var pb: [4096]u8 = undefined;
@@ -6197,8 +6160,8 @@ pub const Chat = struct {
     /// answer from it.
     fn collectCast(self: *Chat, dd: []const u8, rel: []const u8, m: *const scan.Metrics, ev_n: usize) void {
         self.cast_active = false;
-        // NOTE: a pending Stop is deliberately NOT cleared here anymore — Stop during a cast now means "do not
-        // post-process this into my chat" (it also bumps conv_epoch, so castFinished already refuses the collect).
+        // NOTE: a pending Stop is deliberately NOT cleared here — Stop during a cast means "do not post-process
+        // this into my chat" (it also bumps conv_epoch, so castFinished already refuses the collect).
         self.updateCastRow(.done, m.round, m.pct, "", rel);
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
@@ -6404,7 +6367,7 @@ fn personalFact(fact: []const u8) ?[]const u8 {
             H.has(low, "signing key") or H.has(low, "private key") or H.has(low, "credential") or H.has(low, "access key")) return "key";
         if (H.has(low, "login") or H.has(low, "email") or H.has(low, "username") or H.has(low, "account")) return "login";
     }
-    // Preferences — first-person only (dropped bare "prefer to", which matched "most teams prefer to use postgres").
+    // Preferences — first-person only (a bare "prefer to" would match "most teams prefer to use postgres").
     if (H.has(low, "i prefer") or H.has(low, "i like") or H.has(low, "i always") or H.has(low, "i use") or
         H.has(low, "my preference")) return "preference";
     return null; // general knowledge → hive-only (unchanged)
@@ -6436,9 +6399,8 @@ fn stripDanglingMemoryIntro(text: []const u8) []const u8 {
 /// than an occasional NONE-returning call. Case-insensitive substring scan; cheap.
 fn exchangeHasDurableSignal(text: []const u8) bool {
     // Markers of a fact worth keeping across conversations: first-person identity/preference/setup, explicit
-    // remember/forget directives, credentials, AND commitments/schedule/plans the user states in passing (the
-    // "we have to go to therapy at 12pm today" case the narrow first-person-only gate missed). Still tight
-    // enough that ordinary technical questions ("explain tokenization", "how does X work") match nothing.
+    // remember/forget directives, credentials, AND commitments/schedule/plans the user states in passing. Still
+    // tight enough that ordinary technical questions ("explain tokenization", "how does X work") match nothing.
     const sigs = [_][]const u8{
         // identity / preference / setup (first person)
         "my ",      "i'm",          "i am",           "i use",       "i prefer",   "i like",   "i always",
@@ -6526,12 +6488,11 @@ const FoundCall = struct { name: []const u8, args: []const u8, at: usize };
 
 /// Locate the opening '{' of a tool call's JSON args, starting at `from` (just past the tool NAME). Args
 /// usually sit on the SAME line (`TOOL: web_search {..}`), but a capable model writing a big file routinely
-/// puts the JSON on the NEXT line, or wraps it in a ```json fence — the old scan skipped only spaces/tabs, so
-/// it missed those, defaulted args to "{}", and sent an EMPTY call the server rejected as "bad path" (the model
-/// then looped forever, unable to write its file — the live deepseek write_file bug). Skip inter-token
-/// whitespace INCLUDING newlines and at most a leading ```lang fence line, then return the first '{'. Returns
-/// null the instant real prose appears first, so a bare no-arg call (`TOOL: stop_swarm` then narration) still
-/// parses as "{}".
+/// puts the JSON on the NEXT line, or wraps it in a ```json fence — a scan that skips only spaces/tabs misses
+/// those, defaults args to "{}", and sends an EMPTY call the server rejects as "bad path" (the model then loops,
+/// unable to write its file). Skip inter-token whitespace INCLUDING newlines and at most a leading ```lang fence
+/// line, then return the first '{'. Returns null the instant real prose appears first, so a bare no-arg call
+/// (`TOOL: stop_swarm` then narration) still parses as "{}".
 fn findArgsBrace(text: []const u8, from: usize) ?usize {
     var k = from;
     while (k < text.len) {
@@ -6553,11 +6514,11 @@ fn findArgsBrace(text: []const u8, from: usize) ?usize {
 
 /// Scan a JSON object beginning at `open` (which MUST index the opening '{'), returning the index JUST
 /// PAST its matching '}'. STRING-AWARE: a '{'/'}' inside a JSON string value (respecting \" and \\ escapes)
-/// does NOT count toward brace depth. A raw byte counter truncated a `write_file` whose `content` held an
-/// unbalanced '}' — a code chunk closing a block ("  return x;\n}\n", every CSS/JS/JSON tail, and exactly
-/// what the chunked-append recovery asks the model to emit) — shipping invalid JSON the server rejected as
-/// a bad path, and the model looped. Returns null if the object never closes before end-of-text (a reply
-/// cut off mid-args — which is also the truncated-write signal looksTruncatedWrite wants).
+/// does NOT count toward brace depth. A raw byte counter truncates a `write_file` whose `content` holds an
+/// unbalanced '}' (a code chunk closing a block — every CSS/JS/JSON tail, exactly what the chunked-append
+/// recovery asks the model to emit), shipping invalid JSON the server rejects as a bad path. Returns null if
+/// the object never closes before end-of-text (a reply cut off mid-args — also the truncated-write signal
+/// looksTruncatedWrite wants).
 fn jsonObjEnd(text: []const u8, open: usize) ?usize {
     var depth: i32 = 0;
     var in_str = false;
@@ -6621,9 +6582,9 @@ fn looksTruncatedWrite(text: []const u8) bool {
 }
 
 /// THE one TOOL: predicate — dispatch (toolCall), the display stripper (stripToolTail) and the reflect
-/// gate all use this same scan, so a call can never be hidden-but-not-run or run-but-shown (the old
-/// dispatcher was line-start-only while the stripper matched mid-line; anything between the two anchors
-/// was silently dropped or leaked verbatim into the chat). Finds the FIRST "TOOL:" that is a real call:
+/// gate all use this same scan, so a call can never be hidden-but-not-run or run-but-shown (a line-start-only
+/// dispatcher paired with a mid-line stripper would silently drop or leak anything between the two anchors).
+/// Finds the FIRST "TOOL:" that is a real call:
 /// - at a line start (markdown wrappers like `**` tolerated): any name within the first few substantive
 ///   lines, a known chat tool below them (a deep line-start mention of an unknown name is narration);
 /// - mid-line ("...let me stop it. TOOL: stop_swarm"): only a known chat tool name.
@@ -6728,8 +6689,7 @@ pub fn toolCall(full: []const u8) ?ToolCall {
 
 /// Many models emit tool calls as `<tool:NAME>{json-args}</tool:NAME>` (or just `<tool:NAME>{...}`) instead of
 /// the `TOOL:` convention — even inline in prose. Find the FIRST such call anywhere in the reply and return
-/// name+args. Without this those calls render as inert text and the model loops forever re-issuing them (the
-/// Mario walkthrough failure: every `<tool:read_file>` was dropped, so the model never saw the files).
+/// name+args. Without this those calls render as inert text and the model loops forever re-issuing them.
 pub fn toolCallXml(text: []const u8) ?ToolCall {
     const open = std.mem.indexOf(u8, text, "<tool:") orelse return null;
     var i = open + "<tool:".len;
@@ -6752,10 +6712,9 @@ pub fn toolCallXml(text: []const u8) ?ToolCall {
 
 /// deepseek (and others) ALSO emit a call as a BARE tool-named XML tag — `<edit_file>{json}</edit_file>`,
 /// `<read_file>{json}</read_file>` — with NO `tool:` prefix, so toolCallXml misses it. Dropped, it reads as a
-/// hallucinated tool call and the model loops re-issuing it (observed live: the chat "couldn't make edits" while
-/// spraying `<edit_file>` blocks that never ran). Find the FIRST `<name>` whose name is a KNOWN chat tool and is
-/// followed by a balanced {...}. The known-tool gate is what stops a built page's own `<section>`/`<div>`/`<html>`
-/// markup from ever matching.
+/// hallucinated tool call and the model loops re-issuing it. Find the FIRST `<name>` whose name is a KNOWN chat
+/// tool and is followed by a balanced {...}. The known-tool gate is what stops a built page's own
+/// `<section>`/`<div>`/`<html>` markup from ever matching.
 pub fn toolCallTagXml(text: []const u8) ?ToolCall {
     var search: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, search, '<')) |lt| {
@@ -6780,9 +6739,9 @@ const BracketTool = struct { at: usize, name_off: usize };
 /// Locate a `[tool:NAME …]` / `[TOOL: NAME …]` call — the SQUARE-bracket dialect the model falls into when it
 /// mimics the desk's own `[tool:…]`/`[console]` result-render labels (fed back to it as history) as if they
 /// were the invocation syntax. No angle-tag/TOOL: parser matches the square form, so the call leaked as inert
-/// text and nothing ran (the moltbook-claim deadlock). Case-insensitive on the marker; gated to a KNOWN chat
-/// tool so a `[note]` / `[1]` citation / `[tooltip]` never matches. Returns the `[` offset (for stripToolTail)
-/// and where the tool NAME begins (for the parser).
+/// text and nothing ran. Case-insensitive on the marker; gated to a KNOWN chat tool so a `[note]` / `[1]`
+/// citation / `[tooltip]` never matches. Returns the `[` offset (for stripToolTail) and where the tool NAME
+/// begins (for the parser).
 fn bracketToolAt(text: []const u8) ?BracketTool {
     var search: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, search, '[')) |lb| {
@@ -6998,10 +6957,10 @@ fn trimTrailingPathPunct(s: []const u8) []const u8 {
 
 /// Recover the model's NATURAL-LANGUAGE read form — `read_file <path> [start_line N] [end_line M]` with no JSON,
 /// XML, or fence — into a real read_file call with OWNED JSON args. deepseek repeatedly drops to this bare form
-/// and it never dispatched (every structured parser needs a `{`), so the model re-announced the read forever (the
-/// c6a54da12 stall). Scoped to read_file ONLY, which is NON-DESTRUCTIVE, so recovering even a prose mention is
-/// harmless (a stray read, never a write) — hence no action gate. Skips the `{`/`(` forms the real parsers own.
-/// Args are heap-OWNED (caller frees via synth_args).
+/// and it never dispatched (every structured parser needs a `{`), so the model re-announced the read forever.
+/// Scoped to read_file ONLY, which is NON-DESTRUCTIVE, so recovering even a prose mention is harmless (a stray
+/// read, never a write) — hence no action gate. Skips the `{`/`(` forms the real parsers own. Args are heap-OWNED
+/// (caller frees via synth_args).
 fn naturalReadCall(gpa: std.mem.Allocator, text: []const u8) ?ToolCall {
     const Spec = struct { name: []const u8, ranged: bool, require_sep: bool };
     const specs = [_]Spec{
@@ -7058,11 +7017,10 @@ fn naturalReadCall(gpa: std.mem.Allocator, text: []const u8) ?ToolCall {
 
 /// A bare JSON args block with NO tool name — ```json {"path":..,"content":..} ``` — is how deepseek emits its
 /// tool CALLS, expecting the harness to infer the tool. Dropped, the model "announces" an action that never runs
-/// and the act-nudge loops forever (observed live: a chat burned its whole budget emitting json blocks to write
-/// details/main.md, none dispatching → the chat "stopped responding"). Infer the tool from the arg KEYS. This is
-/// the LAST-resort parser — reached only when no named form (TOOL:/<tool:>/<name>/nested-XML) matched, so it can't
-/// steal a real call. `content`+`path`⇒write_file, `ops`/`search`+`replace`⇒edit_file, `code`⇒run_python,
-/// `query`⇒web_search, a lone/`start_line` `path`⇒read_file. Args are a slice into `text` (no allocation).
+/// and the act-nudge loops forever. Infer the tool from the arg KEYS. This is the LAST-resort parser — reached
+/// only when no named form (TOOL:/<tool:>/<name>/nested-XML) matched, so it can't steal a real call.
+/// `content`+`path`⇒write_file, `ops`/`search`+`replace`⇒edit_file, `code`⇒run_python, `query`⇒web_search, a
+/// lone/`start_line` `path`⇒read_file. Args are a slice into `text` (no allocation).
 pub fn toolCallJsonInferred(text: []const u8) ?ToolCall {
     var search: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, search, '{')) |astart| { // scan every { for a balanced tool-args object
@@ -7088,8 +7046,8 @@ const FencedCall = struct { name: []const u8, args: []const u8, at: usize, open:
 /// (the `name(` function wrapper is optional; the args may open directly with '{'; a `tool_code`-style
 /// header carries no name, the wrapper then owns it). No named parser spoke this dialect, so the call only
 /// dispatched when the args' KEYS were inferable (toolCallJsonInferred) — and the display stripper cut at
-/// the args '{', stranding the fence header + `write_file(` as a broken unclosed code block in the chat
-/// (the observed neuronet-build artifact, persisted into the transcript). Name from the fence header,
+/// the args '{', stranding the fence header + `write_file(` as a broken unclosed code block in the chat.
+/// Name from the fence header,
 /// falling back to the wrapper; args = the first balanced JSON object in the body. Mirrors findToolCall's
 /// truncation contract: args that OPEN but never close still return the call with "{}" (`open` says where),
 /// so the oversized-write chunked-append rescue can own it. `at` = the fence opener, for the stripper.
@@ -7193,8 +7151,8 @@ fn layoutAllows(blueprint: []const u8, path: []const u8) bool {
     return false;
 }
 
-/// The filename extensions every build-rescue scan recognizes. (.toml matters: the old list couldn't name a
-/// pasted Cargo.toml at all, so Rust builds lost their manifest to the fallback path.)
+/// The filename extensions every build-rescue scan recognizes. (.toml matters so a pasted Cargo.toml is named,
+/// not lost to the fallback path.)
 const FILE_EXTS = [_][]const u8{ ".html", ".js", ".py", ".css", ".json", ".ts", ".tsx", ".md", ".txt", ".c", ".cpp", ".h", ".hpp", ".go", ".rs", ".java", ".rb", ".php", ".sh", ".toml", ".yml", ".yaml", ".zig", ".sql", ".xml", ".jsx", ".svg", ".ini", ".cfg" };
 
 /// The filename token around an extension hit at `at`, or null when the hit isn't a real filename
@@ -7213,9 +7171,8 @@ fn filenameAt(text: []const u8, at: usize, ext: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Recover a filename token (foo.html, src/game.js) from a build request — the EARLIEST one in the text.
-/// The old scan was extension-priority (.html first), so ANY .html mention anywhere beat the file the text
-/// was actually about.
+/// Recover a filename token (foo.html, src/game.js) from a build request — the EARLIEST one in the text
+/// (position-priority, not extension-priority, so a stray .html mention can't beat the file the text is about).
 fn recoverFilename(text: []const u8) ?[]const u8 {
     var best: ?[]const u8 = null;
     var best_at: usize = text.len;
@@ -7361,9 +7318,8 @@ fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u
     // Name the paste by the STRONGEST signal first: (1) a file-header comment on the block's first line
     // ("// src/routes.rs" is the file stating its own name); (2) the narration right before the fence,
     // nearest name last ("Writing src/routes.rs: ```rust…"); (3) the user's request; (4) the content-type
-    // default. Each candidate must agree with the fence's language tag. The old order consulted the REQUEST
-    // first, so a multi-file build task that mentioned static/index.html sent every pasted Rust module into
-    // index.html (the live neuronet corruption: eight routes.rs attempts, all clobbering the page).
+    // default. Each candidate must agree with the fence's language tag. Consulting the REQUEST first would send
+    // every pasted module of a multi-file build into whatever single file the request happened to mention.
     var lb: [24]u8 = undefined;
     const lang = fenceLangTag(&lb, full, open);
     const cands = [_]?[]const u8{
@@ -7391,7 +7347,7 @@ fn codeBlockWrite(gpa: std.mem.Allocator, last_user: []const u8, full: []const u
 }
 
 /// A name every parser agrees could be a tool: an identifier ([A-Za-z0-9_-], 1..40). Quotes, dots, or
-/// brackets inside the token mean quoted prose, not a call (the live `line".` dispatch that 500'd).
+/// brackets inside the token mean quoted prose, not a call.
 fn plausibleToolName(name: []const u8) bool {
     if (name.len == 0 or name.len > 40) return false;
     for (name) |c| {
@@ -7475,8 +7431,8 @@ fn valueForKey(text: []const u8, key: []const u8) ?[]const u8 {
 }
 
 /// Keys of a tool/console RESULT that carry a ONE-TIME secret the agent needs later but that end-of-run memory
-/// consolidation drops and the 64-message ring evicts (the moltbook loss: claim_url + verification_code
-/// vanished, so the agent looped forever re-discovering a claim step it already had).
+/// consolidation drops and the 64-message ring evicts (a claim_url / verification_code vanishing makes the agent
+/// loop re-discovering a claim step it already had).
 const ONE_TIME_SECRET_KEYS = [_][]const u8{
     "claim_url",        "claim_link",     "verification_code", "verify_code",      "claim_code",
     "verification_url", "verify_url",     "magic_link",        "confirmation_url", "confirm_url",
@@ -7544,8 +7500,8 @@ fn composeConsoleResult(buf: []u8, out: []const u8, err: []const u8, note: []con
         w += 1;
     }
     w += copyInto(buf[w..body_cap], err).len;
-    // A clean command with no output is SUCCESS, not failure — say so explicitly. The model kept re-running the
-    // same probe because a bare "(no output)" read as "it didn't work" (the therapy-alarm evidence).
+    // A clean command with no output is SUCCESS, not failure — say so explicitly. A bare "(no output)" reads as
+    // "it didn't work", so the model kept re-running the same probe.
     if (w == 0 and body_cap > 0 and note.len == 0) w += copyInto(buf[w..body_cap], "(command completed successfully — no output)").len;
     if (w == 0 and body_cap > 0) w += copyInto(buf[w..body_cap], "(no output)").len;
     if (note.len > 0 and w + note.len < buf.len) {
@@ -7667,8 +7623,8 @@ fn looksLikeTranscript(body: []const u8) bool {
 
 /// Recover a shell command the model put in a ```<shell> fenced block instead of a `RUN:` line. RUN: is what it
 /// SHOULD use, but it inconsistently drops to a bare fence (```powershell\ntype core.py) and the command then
-/// never dispatches — so the model re-emits it and spirals (observed: ~6x `type core.py` reading nothing). This
-/// is a pure EXTRACTOR; the caller gates it on an action signal (announcesAction) so an illustrative fence in a
+/// never dispatches — so the model re-emits it and spirals. This is a pure EXTRACTOR; the caller gates it on
+/// an action signal (announcesAction) so an illustrative fence in a
 /// plain answer never runs, and the approval gate still governs execution. Only a SHELL-tagged fence counts
 /// (powershell/pwsh/bash/sh/cmd/bat/zsh — NOT `console`/`shell`, which usually tag a transcript, nor untagged /
 /// ```python / ```md content). Returns the LAST valid shell fence's body (mirrors runCallLoose's last-wins: the
@@ -7702,8 +7658,8 @@ fn fencedShellCall(text: []const u8) ?[]const u8 {
 }
 
 /// The reasoning holds BOTH recoverable action forms — which is the model's FINAL decision? The one that
-/// appears LATER wins (mirrors each parser's own last-match rule); fixed TOOL-before-RUN priority was a
-/// confirmed way to dispatch the option the reasoning had discarded. True = the RUN should dispatch.
+/// appears LATER wins (mirrors each parser's own last-match rule); a fixed TOOL-before-RUN priority would
+/// dispatch the option the reasoning had discarded. True = the RUN should dispatch.
 fn looseRunWins(text: []const u8) bool {
     const r = runCallLooseAt(text) orelse return false;
     const t = std.mem.lastIndexOf(u8, text, "TOOL:") orelse return true;
@@ -8177,9 +8133,9 @@ pub fn announcesAction(text: []const u8) bool {
     const tail_from = n - @min(n, 280);
     const tail = lb[tail_from..n];
     // A commitment phrase must be followed CLOSELY by an action verb ("I'll check the task...") — matching
-    // verbs anywhere in the tail made the gate near-vacuous ("test" inside "latest"), so courtesy closings
-    // gated command dispatch (a confirmed review finding). Curly-apostrophe variants included: reasoning
-    // models emit typographic quotes and the ASCII-only list missed every contraction ack.
+    // verbs anywhere in the tail makes the gate near-vacuous ("test" inside "latest"), so courtesy closings
+    // would gate command dispatch. Curly-apostrophe variants included: reasoning models emit typographic
+    // quotes, and an ASCII-only list misses every contraction ack.
     const acks = [_][]const u8{ "i'll ", "i\u{2019}ll ", "i will ", "i'm going to ", "i\u{2019}m going to ", "let's ", "let\u{2019}s ", "let me ", "we'll ", "we\u{2019}ll " };
     const verbs = [_][]const u8{ "run", "execut", "check", "verif", "regist", "creat", "schedul", "install", "writ", "updat", "delet", "quer", "inspect", "fix", "test", "set ", "look", "apply", "launch", "restart", "retry", "re-run", "rerun", "re-creat", "re-regist", "start", "open", "read", "list", "search", "add ", "remove", "correct", "adjust", "do " };
     for (acks) |a| {
@@ -8202,8 +8158,8 @@ pub fn announcesAction(text: []const u8) bool {
 /// are ground truth. The one bracketed INSTRUCTION row is the [orchestrator] brief: a job description
 /// scoped to ONE live cast ("when in doubt, narrate and stop", "never output CAST:", "never create a new
 /// top-level file"). Re-fed after that cast ended, it kept the veil orchestrating a hive that no longer
-/// existed — narrating instead of acting and refusing casts for the REST of the conversation (the observed
-/// post-cast dead chat) — so it flows only while a cast is actually live. Pure — unit-tested.
+/// existed — narrating instead of acting and refusing casts for the REST of the conversation — so it flows
+/// only while a cast is actually live. Pure — unit-tested.
 pub fn rowRefeeds(role: store_mod.ChatRole, text: []const u8, cast_live: bool) bool {
     if (role == .thought) return false;
     if (role == .cast_note) {
@@ -8223,7 +8179,7 @@ fn lessonPair(fail: []const u8, ok: []const u8) bool {
     if (std.mem.eql(u8, f, o)) return false; // identical retry that worked — transient at ANY length
     if (nearlySame(f, o)) return false; //      (nearlySame alone silently gave up past 400 chars)
     // a read-only probe succeeding after a failed MUTATION is diagnosis, not the fix — pairing it would
-    // mint a lesson whose "working form" changes nothing (the confirmed playbook-poisoning path)
+    // mint a lesson whose "working form" changes nothing
     if (looksReadOnlyCommand(o) and !looksReadOnlyCommand(f)) return false;
     var fi = std.mem.tokenizeAny(u8, f, " \t");
     var oi = std.mem.tokenizeAny(u8, o, " \t");
@@ -8346,8 +8302,7 @@ pub fn runCall(full: []const u8) ?[]const u8 {
         if (seen > 4) return null;
         // Unwrap a single `[…]` wrapper: the model echoes the desk's OWN render-label — `[RUN: cmd]` — back as
         // if it were the call syntax (the desk re-feeds its `[console]`/`[tool:…]` result rows as history, and
-        // the model imitates that bracketed render). Bracketed, the command leaked as inert text and never ran
-        // — the moltbook-claim deadlock, where every claim POST was silently dropped.
+        // the model imitates that bracketed render). Bracketed, the command leaked as inert text and never ran.
         if (line.len > 1 and line[0] == '[') {
             line = line[1..];
             if (line.len > 0 and line[line.len - 1] == ']') line = line[0 .. line.len - 1];
@@ -8379,7 +8334,7 @@ pub fn userWantsCast(msg: []const u8) bool {
 }
 
 /// Does the user's message ask to KILL/STOP the running hive? Used to dispatch kill_swarm even when a weak
-/// model narrates "kill_swarm force=true" as prose instead of emitting a real TOOL: line (the observed miss).
+/// model narrates "kill_swarm force=true" as prose instead of emitting a real TOOL: line.
 /// Two messages are "nearly the same" if, lowercased and whitespace-trimmed, one contains the other (or they
 /// match) — a cheap loop-spin detector (a model re-issuing "check the status" as "check status now").
 fn nearlySame(a_in: []const u8, b_in: []const u8) bool {
@@ -8397,9 +8352,9 @@ fn nearlySame(a_in: []const u8, b_in: []const u8) bool {
 }
 
 /// Collapse a tightly-repeated sentence WITHIN one reply. A weak model under stress "flails" — re-emitting the
-/// same sentence ("I am going to check the file." … "I am going to check the file.") several times in a row (the
-/// observed "reasoning bounces back and forth with 'I am'"). Splits `in` on sentence terminators (. ! ? \n) and
-/// drops a substantial (>=8-char) fragment ONLY when it near-duplicates the fragment IMMEDIATELY before it — a
+/// same sentence ("I am going to check the file." … "I am going to check the file.") several times in a row.
+/// Splits `in` on sentence terminators (. ! ? \n) and drops a substantial (>=8-char) fragment ONLY when it
+/// near-duplicates the fragment IMMEDIATELY before it — a
 /// window of one, deliberately, so a decimal / version / abbreviation split ("98." then "6.", "Fig." then "1.")
 /// or two matching sentences that are not adjacent are NEVER fused into wrong output. Skips any reply carrying a
 /// code fence outright (identical adjacent code lines are legitimate). Returns `in` unchanged when nothing was
@@ -8470,11 +8425,11 @@ pub fn userWantsKill(msg: []const u8) bool {
 /// Strip a leading cast-request preamble ("cast a swarm to ", "have the hive ", "run a swarm that ")
 /// from the user's message to get a clean one-line goal. Returns a slice into `buf`.
 /// The cast's time budget under the mode ceiling: SPEED MODE caps the chat's DEFAULT/auto cast at 2 minutes (a
-/// research sub-agent strike — the observed failure was 10-100 minute hiveminds dispatched for 3-5 minute jobs),
-/// BUT an EXPLICIT sustained request (LONG, or a specific minutes count) is honored up to 120: a genuinely big
-/// job the user asked the hive to commit to (deep-dive + document a whole repo) can't be done in a 2-minute
-/// strike, and forcing it there was the "delve-deep task fails" report. Autonomy mode keeps the full range.
-/// The distinction is EXPLICIT vs default — not a hardcoded use case. Pure — unit-tested.
+/// research sub-agent strike — without it, 10-100 minute hiveminds get dispatched for 3-5 minute jobs), BUT an
+/// EXPLICIT sustained request (LONG, or a specific minutes count) is honored up to 120: a genuinely big job the
+/// user asked the hive to commit to (deep-dive + document a whole repo) can't be done in a 2-minute strike.
+/// Autonomy mode keeps the full range. The distinction is EXPLICIT vs default — not a hardcoded use case.
+/// Pure — unit-tested.
 pub fn castMinutes(spec_minutes: u32, long: bool, speed: bool) u32 {
     const explicit = spec_minutes > 0 or long; // the user/veil asked for a specific / sustained duration
     const max: u32 = if (speed and !explicit) 2 else 120;
@@ -8730,7 +8685,7 @@ fn wesc(w: *Io.Writer, s: []const u8) void {
 }
 
 test "fenced tool-call dialect: name from the fence header or the function wrapper, args exact" {
-    // the observed neuronet-build form: ```tool: name header + name({...}) wrapper (braces in content)
+    // the fenced form: ```tool: name header + name({...}) wrapper (braces in content)
     const a = toolCallFenced("Writing the feed UI now.\n\n```tool: write_file\nwrite_file({\"path\":\"static/index.html\",\"content\":\"body{margin:0}\"})\n```").?;
     try std.testing.expectEqualStrings("write_file", a.name);
     try std.testing.expectEqualStrings("{\"path\":\"static/index.html\",\"content\":\"body{margin:0}\"}", a.args);
@@ -8849,8 +8804,8 @@ test "salientFailLine picks the exception off a traceback, falls back to stdout,
 }
 
 test "lessonRelevant: an executable match alone never surfaces a lesson (the 403-vs-cd false positive)" {
-    // The live incident: an HTTP 403 auth failure recalled a cd-into-the-repo fix because both commands
-    // said `python` under one long OneDrive path. Executable + path fragments must never be enough.
+    // An HTTP 403 auth failure must not recall a cd-into-the-repo fix just because both commands said
+    // `python` under one long path. Executable + path fragments must never be enough.
     const cd_lesson = "fix: `python probe.py` failed (exit code 1) — works as: `cd /d \"C:\\Users\\garys\\OneDrive\\Documents\\Claude\\Projects\\Garrett\\nl-veil\"`";
     const cmd_403 = "python discourse_check.py --topics";
     const sig_403 = "urllib.error.HTTPError: HTTP Error 403: Forbidden";
@@ -8865,9 +8820,9 @@ test "lessonRelevant: an executable match alone never surfaces a lesson (the 403
     try std.testing.expect(!lessonRelevant(findstr_lesson, "python build.py", "SyntaxError: invalid syntax"));
     // generic tokens (exit/code/error/failed) and small numbers are not evidence
     try std.testing.expect(!lessonRelevant(cd_lesson, "python other.py", "(exit code 1) error failed"));
-    // THE LIVE ESCAPE (2026-07-10): the executable's own name in the error line ("python: can't open
-    // file ...") must not count as a second piece of evidence on top of the executable score — that
-    // double-count let a pytest-cwd lesson ride in on an unrelated missing-file failure
+    // the executable's own name in the error line ("python: can't open file ...") must not count as a
+    // second piece of evidence on top of the executable score — that double-count let a pytest-cwd lesson
+    // ride in on an unrelated missing-file failure
     const pytest_lesson = "fix: `cd /d \"C:\\w\" && where pytest && python -c \"import pytest\"` failed (exit code 1) — works as: `cd /d \"C:\\w\" && python -m pytest minimal_test.py -v`";
     try std.testing.expect(!lessonRelevant(pytest_lesson, "python missing_probe_xyz.py --check-auth", "python: can't open file 'C:\\x\\missing_probe_xyz.py': [Errno 2] No such file or directory"));
     // ...but a real shared token (the same script name in the error) still carries it over the bar
@@ -8876,7 +8831,7 @@ test "lessonRelevant: an executable match alone never surfaces a lesson (the 403
 
 test "stripWorkdirChdir removes stale build-dir cd prefixes, keeps the transferable command" {
     var out: [700]u8 = undefined;
-    // the live pollution: a lesson whose working form cd's into a one-time build workdir
+    // a lesson whose working form cd's into a one-time build workdir
     const polluted = "fix: `cd /d \"C:\\Users\\g\\...\\builds\\c6a505cb1\\work\" && findstr swarm docs\\zzz.html` failed (exit code 1) — works as: `cd /d \"C:\\Users\\g\\...\\builds\\c6a505cb1\\work\" && findstr swarm docs\\index.html`";
     const cleaned = stripWorkdirChdir(polluted, &out);
     try std.testing.expect(std.mem.indexOf(u8, cleaned, "cd /d") == null);
@@ -8908,8 +8863,7 @@ test "emitLesson drops a lesson that cd-stripping collapsed to fail==fix (self-c
 
 test "lessonRelevantToRequest needs real shared vocabulary, not generic words" {
     const pytest_lesson = "fix: `pytest suite_x` failed (exit code 1) — works as: `python -m pytest suite_x`";
-    // an off-topic request that shares only generic words with the lesson -> NOT injected (the live bug:
-    // "run these two console commands and report exit codes" pulled in a cd-pytest fix)
+    // an off-topic request that shares only generic words with the lesson -> NOT injected
     try std.testing.expect(!lessonRelevantToRequest(pytest_lesson, "run these two console commands and report each exit code, nothing else"));
     // a request that genuinely names the thing (two shared informative tokens) -> injected
     try std.testing.expect(lessonRelevantToRequest(pytest_lesson, "the pytest run on suite_x keeps failing, help"));
@@ -8962,8 +8916,8 @@ test "firstStoredSentence keys what observe actually stored" {
 }
 
 test "looksReadOnlyCommand: compound of probes is read-only, mixed chain stays mutating" {
-    // the live false-positive: two read-only probes chained with & bought a build-verify turn, and the
-    // memory-contaminated verify re-landed another conversation's file tree (conv c6a505372)
+    // two read-only probes chained with & must stay read-only (a false mutating classification would buy an
+    // unwanted build-verify turn)
     try std.testing.expect(looksReadOnlyCommand("findstr playbook a\\ghost.log & findstr playbook b\\real.log"));
     try std.testing.expect(looksReadOnlyCommand("type a.txt | more"));
     try std.testing.expect(looksReadOnlyCommand("dir /b ; tasklist"));
@@ -8989,9 +8943,9 @@ test "stashLessonLines merges with dedup and never clobbers the fold's credit ta
 }
 
 test "playbook Hebbian close strengthens recalled lessons; a raw-prompt key mints nothing (pollution fix)" {
-    // Regression for the "RECALLED LESSON" pollution: outcome feedback used to reinforce() on the raw user
-    // prompt, minting "<prompt>: worked" facts straight into the lesson scope, which later surfaced as bogus
-    // lessons on command failures. The fix routes feedback through strengthen() (bump-only, never mints).
+    // Regression for the "RECALLED LESSON" pollution: reinforcing outcome feedback on the raw user prompt would
+    // mint "<prompt>: worked" facts into the lesson scope, which surface as bogus lessons on later command
+    // failures. Feedback must route through strengthen() (bump-only, never mints).
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
@@ -9008,7 +8962,7 @@ test "playbook Hebbian close strengthens recalled lessons; a raw-prompt key mint
     const db = neurondb.Db{ .gpa = std.testing.allocator, .io = io, .bin = bin, .db = dbp };
     // a real verified fail->fix lesson lands in the playbook (the deterministic minting path)
     db.observe(PLAYBOOK_SCOPE, "fix: `findstr features full-path` failed (exit code 1) works as: `findstr features index.html`");
-    // the OLD bug's key: outcome feedback on a raw user prompt. strengthen must touch/mint NOTHING.
+    // the pollution key: outcome feedback on a raw user prompt. strengthen must touch/mint NOTHING.
     db.strengthen(PLAYBOOK_SCOPE, "deep dive into the desk folder and write markdown documentation for every zig file");
     // and the intended close: strengthen the ACTUAL recalled lesson text (what the fix now does) — a no-op-safe
     // bump of the existing fact.
@@ -9071,7 +9025,7 @@ test "exchangeHasDurableSignal fires on personal facts + commitments, not ordina
     try std.testing.expect(exchangeHasDurableSignal("today we have to go to therapy at 12pm"));
     try std.testing.expect(exchangeHasDurableSignal("set an alarm to remind me before the meeting"));
     try std.testing.expect(exchangeHasDurableSignal("my dentist appointment is tomorrow"));
-    // pure-technical questions must NOT fire (the dropped bare-substring false positives)
+    // pure-technical questions must NOT fire
     try std.testing.expect(!exchangeHasDurableSignal("explain how tokenization works"));
     try std.testing.expect(!exchangeHasDurableSignal("what is a secret sharing scheme?"));
     try std.testing.expect(!exchangeHasDurableSignal("what does the @ decorator do in Python?"));
@@ -9081,7 +9035,7 @@ test "exchangeHasDurableSignal fires on personal facts + commitments, not ordina
 }
 
 test "stripDanglingMemoryIntro drops a dangling save-intro but keeps real prose" {
-    // the exact live artifact: a bold header pointing at the (stripped) REMEMBER: lines
+    // a dangling save-intro: a bold header pointing at the (stripped) REMEMBER: lines
     try std.testing.expectEqualStrings("Here is the plan.", stripDanglingMemoryIntro("Here is the plan.\n\n**Saved preferences:**"));
     try std.testing.expectEqualStrings("Done.", stripDanglingMemoryIntro("Done.\nI've remembered:"));
     // a real colon-terminated line that is NOT a memory intro is preserved
@@ -9093,7 +9047,7 @@ test "stripDanglingMemoryIntro drops a dangling save-intro but keeps real prose"
 test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)" {
     var buf: [96]u8 = undefined;
     var w = Io.Writer.fixed(&buf);
-    // a lone 0x97 (CP1252 em dash — INVALID utf8, the byte that 500'd every cast) + a REAL utf8 em dash + a quote
+    // a lone 0x97 (CP1252 em dash — INVALID utf8 that would 500 the server) + a REAL utf8 em dash + a quote
     wesc(&w, "a \x97 b \xe2\x80\x94 c \"q\"");
     const out = w.buffered();
     try std.testing.expect(std.unicode.utf8ValidateSlice(out)); // the whole body must be valid utf8
@@ -9305,8 +9259,8 @@ test "selecting a chat re-binds the console to ITS build dir; a chat without one
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
 
     // the restart case: reopening the chat that built something must cd the console back into its workdir
-    // (before the fix build_dir was only set from a live build-tool response, so the [build] note's promise
-    // — "the console is cd'd here" — was false for any conversation selected after an app restart)
+    // (build_dir is otherwise only set from a live build-tool response, so the [build] note's promise —
+    // "the console is cd'd here" — would be false for a conversation selected after an app restart)
     chat.cmdSelectConv(dd, "cbuilt");
     try std.testing.expectEqualStrings(dd ++ "/u1/_chat/builds/cbuilt/work", chat.build_dir[0..chat.build_dir_len]);
 
@@ -9338,8 +9292,8 @@ test "the 64-message eviction pins the conversation's original goal (slot 0 stay
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
     chat.cmdNewConv(dd);
     // a long build arc: the goal, then a flood of tool-result rows well past the ring's capacity —
-    // before the pin, row 0 (the assignment itself) was the FIRST thing evicted and the model spent
-    // the rest of the arc working from tool chatter alone
+    // without the pin, row 0 (the assignment itself) would be the FIRST thing evicted and the model would
+    // spend the rest of the arc working from tool chatter alone
     chat.appendMsgFull(dd, .user, "GOAL: build the neuronet app with axum 0.7", false);
     var i: usize = 0;
     while (i < store_mod.MAX_CHAT_MSGS + 20) : (i += 1) {
@@ -9480,7 +9434,7 @@ test "collect fizzle: a post-cast answer that only announces the repair re-enter
     chat.cmdNewConv(dd);
 
     // fabricate the settled .collect turn: the cast digest was folded, the model's answer only ANNOUNCES
-    // the repair (the observed c6a4ef643 death: "Let me inspect what's on disk now and fix it." → idle)
+    // the repair ("Let me inspect what's on disk now and fix it." would otherwise settle idle on the promise)
     chat.stream = .{ .done = true };
     chat.stream.content.appendSlice(std.testing.allocator, "The cast delivered an incomplete `varieties.html` — truncated mid-CSS. Let me inspect what's on disk now and fix it.") catch unreachable;
     chat.turn = .collect;
@@ -9533,8 +9487,8 @@ test "terminal verify: a build that reaches DONE gets one whole-build check; a n
     store.msg_count = 1;
     store.chat_loop = true;
 
-    // the live game-suite death: the arc BUILT a file earlier (arc_built sticky), then loop_infer emits DONE
-    // — the model may have only ANNOUNCED the remaining files. loopContinue must run ONE terminal verify.
+    // the arc BUILT a file earlier (arc_built sticky), then loop_infer emits DONE — the model may have only
+    // ANNOUNCED the remaining files. loopContinue must run ONE terminal verify.
     chat.arc_built = true;
     chat.turn_epoch = chat.conv_epoch;
     chat.loopContinue(dd, "DONE");
@@ -9604,8 +9558,8 @@ test "arc-driving auto-loop: a chain that ACTED keeps looping past a prose settl
     @memcpy(chat.last_user[0..ask.len], ask);
     store.msg_count = 1; // maybeLoop needs something to continue from
 
-    // (1) the game-suite death shape: the chain WROTE a file earlier (arc_acted), then settled on prose
-    // announcing the next one (acted=false after the settle reset) — the loop must KEEP DRIVING
+    // (1) the chain WROTE a file earlier (arc_acted), then settled on prose announcing the next one
+    // (acted=false after the settle reset) — the loop must KEEP DRIVING
     store.chat_loop = true;
     chat.acted = false;
     chat.arc_acted = true;
@@ -9808,7 +9762,7 @@ test "explicit cast request: a pasted-file reply falls through to the CAST recov
     chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
     chat.cmdNewConv(dd);
 
-    // the observed hijack: user explicitly asks for a swarm, the model pastes the whole file instead
+    // the hijack case: user explicitly asks for a swarm, the model pastes the whole file instead
     const ask = "cast a swarm to finish the two-page tea website: build a complete index.html, plain css.";
     chat.last_user_len = ask.len;
     @memcpy(chat.last_user[0..ask.len], ask);
@@ -9881,8 +9835,8 @@ test "LIVE chat turn: streams a real reply from local Ollama (best-effort, skips
     try std.testing.expect(store.msg_count >= 2);
     // This test owns the PIPE (a real stream parsed, settled idle, persisted) — not the live model's
     // CHOICE. Two legitimate outcomes: a prose reply (a non-empty .veil row), or the model chose to CAST
-    // (observed live: gpt-oss casts even on a trivia question, all prose in its reasoning channel) — then
-    // the visible outcome is the cast/loop-guard note, since this env has no authorized veil server.
+    // (gpt-oss may cast even on a trivia question, all prose in its reasoning channel) — then the visible
+    // outcome is the cast/loop-guard note, since this env has no authorized veil server.
     // Either way no row may carry a model error.
     var saw_reply = false;
     var saw_cast_flow = false;
@@ -10085,7 +10039,7 @@ test "shouldReflectPass: only substantive answers to real requests reflect (hell
     // substantive question + substantive answer -> reflect
     try std.testing.expect(shouldReflectPass(.user, q, long));
     try std.testing.expect(shouldReflectPass(.tool_follow, q, long));
-    // THE BUG: a greeting must NOT recurse
+    // a greeting must NOT recurse
     try std.testing.expect(!shouldReflectPass(.user, "hello", "Hi! How can I help you today?"));
     try std.testing.expect(!shouldReflectPass(.user, "hi there", long)); // small-talk user msg
     try std.testing.expect(!shouldReflectPass(.user, "thanks!", long));
@@ -10116,8 +10070,8 @@ test "toolCall parses name + raw json args" {
     try std.testing.expect(toolCall("just chatting") == null);
     try std.testing.expect(toolCall("TOOL:") == null);
     try std.testing.expect(toolCall("a\nb\nc\nd\ne\nf\nTOOL: too_deep {}") == null);
-    // MID-LINE calls now dispatch (same predicate as stripToolTail — the old dispatcher missed these
-    // while the stripper hid them, so the call was neither executed nor shown):
+    // MID-LINE calls dispatch (same predicate as stripToolTail — a line-start-only dispatcher would miss
+    // these while the stripper hides them, so the call would be neither executed nor shown):
     const m = toolCall("I compared both. Let me write it now.TOOL: write_file {\"path\":\"x.md\",\"content\":\"# X\"}").?;
     try std.testing.expectEqualStrings("write_file", m.name);
     try std.testing.expectEqualStrings("{\"path\":\"x.md\",\"content\":\"# X\"}", m.args);
@@ -10132,8 +10086,8 @@ test "toolCall parses name + raw json args" {
 }
 
 test "toolCall: braces inside a content string never truncate the args (jsonObjEnd)" {
-    // THE regression: a raw byte counter closed the args at the first '}' inside content, shipping invalid
-    // JSON the server rejected as a bad path. A JS/CSS/code tail closing a block is the common trigger.
+    // a raw byte counter would close the args at the first '}' inside content, shipping invalid JSON the
+    // server rejects as a bad path. A JS/CSS/code tail closing a block is the common trigger.
     const unbalanced = "TOOL: write_file {\"path\":\"a.js\",\"content\":\"  return x;\\n}\\n\"}";
     const a = toolCall(unbalanced).?;
     try std.testing.expectEqualStrings("write_file", a.name);
@@ -10177,8 +10131,8 @@ test "codeBlockWrite rescues a pasted file; ignores snippets + missing filenames
 
 test "codeBlockWrite names a paste from its own header/narration, never the request's stray filename" {
     const gpa = std.testing.allocator;
-    // THE live neuronet corruption: the build task mentions static/index.html; the model pastes
-    // src/routes.rs as a ```rust block. The old request-first order wrote the Rust into index.html.
+    // the build task mentions static/index.html; the model pastes src/routes.rs as a ```rust block. A
+    // request-first naming order would write the Rust into index.html.
     const task = "Build the app: Cargo.toml, then src/routes.rs, static/index.html, README.md - write every file";
     const body = "use actix_web::{web, HttpResponse};\n" ++ ("pub async fn feed() -> HttpResponse { HttpResponse::Ok().finish() }\n" ** 4);
     const reply = "Writing src/routes.rs — the web routes.\n\n```rust\n" ++ body ++ "```";
@@ -10224,7 +10178,7 @@ test "layout guard: topSegment + layoutAllows judge new top-level paths against 
 }
 
 test "toolCallLoose recovers a call narrated inside reasoning" {
-    // the exact gpt-oss failure: content empty, the decision lives mid-sentence in reasoning
+    // the gpt-oss shape: content empty, the decision lives mid-sentence in reasoning
     const r = "We must use web_search tool. That is not a cast. So we issue TOOL: web_search {\"query\":\"Zig 0.16 release highlights\"}";
     const a = toolCallLoose(r).?;
     try std.testing.expectEqualStrings("web_search", a.name);
@@ -10239,8 +10193,8 @@ test "toolCallLoose recovers a call narrated inside reasoning" {
 }
 
 test "toolCallLoose never mints a call from quoted protocol prose (the live `line\".` 500)" {
-    // reasoning QUOTING the protocol — the last TOOL: is part of a quoted sentence; the old parser
-    // dispatched a tool literally named `line".` and the server 500'd on the malformed envelope
+    // reasoning QUOTING the protocol — the last TOOL: is part of a quoted sentence; a naive parser would
+    // dispatch a tool literally named `line".` and the server would 500 on the malformed envelope
     try std.testing.expect(toolCallLoose("the protocol says to emit TOOL: line\". then we stop") == null);
     try std.testing.expect(toolCallLoose("we could use \"TOOL: <name> {json}\" as documented") == null);
     // the loose channel is recovery, not invention: non-snake names are prose
@@ -10335,7 +10289,7 @@ test "userWantsKill detects kill requests; nearlySame catches loop spin" {
     try std.testing.expect(!userWantsKill("what is the capital of France?"));
     try std.testing.expect(!userWantsKill("build me a website")); // no kill verb
     // the [orchestrator] brief ("narrate and stop; ... the cast finishes", "hive" everywhere) sits in
-    // last_user during every orchestrator turn — reading it as a kill order hard-killed two live casts
+    // last_user during every orchestrator turn — reading it as a kill order would stop a live cast
     try std.testing.expect(!userWantsKill("(4) never duplicate work the hive is mid-way through — when in doubt, narrate and stop; the full findings come to you when the cast finishes. You have no cast tool here; never output CAST:."));
     // verb far from any target is prose, not an order
     try std.testing.expect(!userWantsKill("we should stop adding features and instead document what the swarm already built"));
@@ -10556,7 +10510,7 @@ test "buildBatchScript: echo-off prelude, CRLF normalization, chcp only for non-
 }
 
 test "announcesAction: catches the narrate-without-act fizzles, never final answers" {
-    // the four real fizzle replies from the death-spiral transcript
+    // four real narrate-without-act fizzle replies
     try std.testing.expect(announcesAction("I'll re-create the task with the full path to msg.exe so the scheduler can find it, and set it 30 seconds from now again."));
     try std.testing.expect(announcesAction("Now I'll run the command to register it with the full path to `msg.exe`."));
     try std.testing.expect(announcesAction("You're right — let me check right now.\n\nI'll inspect the **ping** task's status and last run time."));
@@ -10571,7 +10525,7 @@ test "announcesAction: catches the narrate-without-act fizzles, never final answ
     try std.testing.expect(!announcesAction("I'll let you know if anything changes."));
     try std.testing.expect(!announcesAction("I'll be here if you need anything else."));
     try std.testing.expect(announcesAction("I\u{2019}ll check the task status now.")); // typographic apostrophe
-    // the observed post-cast collect fizzle (chat c6a4ef643): announced the repair, performed nothing
+    // a post-cast collect fizzle: announced the repair, performed nothing
     try std.testing.expect(announcesAction("The cast finished but delivered an **incomplete** result — `varieties.html` is truncated mid-CSS and missing all the tea content, preparation methods, and back link. Let me inspect what's on disk now and fix it."));
 }
 
@@ -10585,7 +10539,7 @@ test "rowRefeeds: the orchestrator brief flows only while its cast is live; resu
     try std.testing.expect(rowRefeeds(.cast_note, "[cast] finished run u1/x: rounds 1, score 100%", false));
     try std.testing.expect(rowRefeeds(.cast_note, "[build] working directory: u1/_chat/builds/x/work", false));
     // the [orchestrator] brief is an INSTRUCTION row scoped to one live cast: re-fed after the cast it
-    // kept the veil narrating-not-acting for the rest of the conversation (the post-cast dead chat)
+    // would keep the veil narrating-not-acting for the rest of the conversation
     try std.testing.expect(rowRefeeds(.cast_note, "[orchestrator] A hive swarm is building this goal RIGHT NOW...", true));
     try std.testing.expect(!rowRefeeds(.cast_note, "[orchestrator] A hive swarm is building this goal RIGHT NOW...", false));
     // user/veil rows always flow
@@ -10600,8 +10554,8 @@ test "findToolCall captures args on the next line / in a fence (the deepseek emp
         try std.testing.expectEqualStrings("web_search", tc.name);
         try std.testing.expectEqualStrings("{\"query\":\"zig\"}", tc.args);
     }
-    // BUG REPRO: args on the FOLLOWING line — old parser skipped only spaces/tabs, so it defaulted to "{}"
-    // (→ server "bad path"). Must now capture the real JSON.
+    // args on the FOLLOWING line — a parser that skips only spaces/tabs defaults to "{}" (→ server "bad
+    // path"). Must capture the real JSON.
     {
         const tc = toolCall("Writing it now.\nTOOL: write_file\n{\"path\":\"index.html\",\"content\":\"<html></html>\"}").?;
         try std.testing.expectEqualStrings("write_file", tc.name);
@@ -10721,8 +10675,8 @@ test "valueForKey captures one-time secrets from JSON and PowerShell result shap
         "https://www.moltbook.com/claim/moltbook_claim_NY5NMN1",
         valueForKey("{\"success\":true,\"claim_url\":\"https://www.moltbook.com/claim/moltbook_claim_NY5NMN1\"}", "claim_url").?,
     );
-    // PowerShell @{...} hashtable rendering (Invoke-RestMethod printed without ConvertTo-Json) — the exact shape
-    // the registration console output had, where the claim_url + verification_code were lost
+    // PowerShell @{...} hashtable rendering (Invoke-RestMethod printed without ConvertTo-Json) — the shape a
+    // registration console output takes, where the claim_url + verification_code can be lost
     const ps = "agent : @{id=e052369f; name=nl-veil; api_key=moltbook_sk_FTQK; claim_url=https://www.moltbook.com/claim/abc123; verification_code=splash-ZGZZ}";
     try std.testing.expectEqualStrings("https://www.moltbook.com/claim/abc123", valueForKey(ps, "claim_url").?);
     try std.testing.expectEqualStrings("splash-ZGZZ", valueForKey(ps, "verification_code").?);
@@ -10743,7 +10697,7 @@ test "valueForKey captures one-time secrets from JSON and PowerShell result shap
 
 test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read_file><path>..</path> form)" {
     const gpa = std.testing.allocator;
-    // the ACTUAL hanging form: name AND args are XML elements, digits become JSON numbers
+    // the nested form: name AND args are XML elements, digits become JSON numbers
     {
         const tc = toolCallXmlNested(gpa, "Let me read it.\n<read_file>\n<path>index.html</path>\n<start_line>100</start_line>\n<end_line>200</end_line>\n</read_file>").?;
         defer gpa.free(@constCast(tc.args));
@@ -10767,7 +10721,7 @@ test "toolCallXmlNested converts nested-XML tool calls to JSON (deepseek's <read
 }
 
 test "toolCallJsonInferred infers the tool from a bare json args block (deepseek's nameless tool-call form)" {
-    // the doc-write hang: a fenced json block with content+path is a write_file
+    // a fenced json block with content+path is a write_file
     {
         const tc = toolCallJsonInferred("Now I'll write it.\n```json\n{\"path\":\"details/main.md\",\"content\":\"# Doc\\ntext\"}\n```").?;
         try std.testing.expectEqualStrings("write_file", tc.name);
@@ -10795,7 +10749,7 @@ test "runCallLoose recovers only LINE-ANCHORED RUN: lines, keeping quotes and wi
 }
 
 test "fencedShellCall recovers only a SHELL-tagged command fence, last valid wins, never a transcript" {
-    // the observed `type core.py` spiral: the model dropped to a bare shell fence and it never dispatched
+    // the model dropped to a bare shell fence and it never dispatched
     try std.testing.expectEqualStrings("type core.py", fencedShellCall("Let me read it.\n```powershell\ntype core.py\n```").?);
     try std.testing.expectEqualStrings("type core.py", fencedShellCall("```powershell\ntype core.py").?); // unclosed (settled reply)
     try std.testing.expectEqualStrings("ls -la", fencedShellCall("```bash\nls -la\n```").?);
@@ -10958,7 +10912,7 @@ test "contentOverlap: near-duplicates true, distinct or thin entries false" {
 
 test "dedupSentences collapses a repeated flail but keeps distinct + prefix-longer sentences" {
     var buf: [1024]u8 = undefined;
-    // the exact "I am ..." flail this targets: the same sentence three times -> one survives
+    // the "I am ..." flail: the same sentence three times -> one survives
     const flail = "I am going to check the models file. I am going to check the models file. I am going to check the models file.";
     const out = dedupSentences(flail, &buf);
     try std.testing.expect(std.mem.count(u8, out, "I am going to check the models file") == 1);

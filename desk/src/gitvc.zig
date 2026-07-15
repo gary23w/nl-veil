@@ -1,9 +1,9 @@
-//! gitvc.zig — the chat's VERSION-CONTROL engine. Gives the Veil real git + GitHub, built for the constraint
-//! that matters where nl-veil actually runs: CLASSIC TOKENS ONLY. No SSH, no OAuth device flow, no dependence on
-//! the `gh` CLI (any of which are blocked or absent in restricted regions) — just a Personal Access Token over
+//! gitvc.zig — the chat's VERSION-CONTROL engine: real git + GitHub for the Veil, built for the constraint that
+//! matters where nl-veil actually runs: CLASSIC TOKENS ONLY. No SSH, no OAuth device flow, no dependence on the
+//! `gh` CLI (any of which are blocked or absent in restricted regions) — just a Personal Access Token over
 //! HTTPS, which works anywhere `git` + `curl` do.
 //!
-//! SECURITY is the whole point (the moltbook run pasted a PAT straight into the chat transcript). The token here:
+//! Keeping the token out of any readable surface is the whole point. The PAT here:
 //!   * is stored sealed via secrets.zig (DPAPI on Windows), never in settings.json or any repo-tracked file;
 //!   * NEVER rides on an argv (visible in the process list) — repo creation puts it in a curl `-K` config file
 //!     (the exact trick llm.zig uses for the model key), deleted immediately after the call;
@@ -64,10 +64,9 @@ fn git(gpa: std.mem.Allocator, io: Io, workdir: []const u8, args: []const []cons
 }
 
 /// Ensure `workdir` is its OWN git repo (isolated), so neither the git tools NOR the model's `RUN: git` shell
-/// can walk UP to a parent repo and commit into it. This is load-bearing: observed live, with the data dir
-/// living inside nl-veil's own source tree, a shell `git add -f` force-committed a workdir file past .gitignore
-/// straight into the source repo. An isolated `<workdir>/.git` makes git stop there. Idempotent — a no-op once
-/// the repo exists. Best-effort: a failure just leaves the pre-existing behavior.
+/// can walk UP to a parent repo and commit into it — with the data dir inside nl-veil's own source tree, a
+/// shell `git add -f` was observed force-committing a workdir file past .gitignore into the source repo. An
+/// isolated `<workdir>/.git` makes git stop there. Idempotent, best-effort: a failure leaves prior behavior.
 pub fn ensureRepo(gpa: std.mem.Allocator, io: Io, workdir: []const u8) void {
     if (isRepo(io, gpa, workdir)) return;
     const gi = git(gpa, io, workdir, &.{ "init", "-q", "-b", "main" });

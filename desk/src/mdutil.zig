@@ -55,9 +55,9 @@ fn isAlpha(c: u8) bool {
 
 // ---- math (LaTeX-ish -> unicode) --------------------------------------------------------------------------
 // Render formulas legibly WITHOUT a LaTeX engine: strip $ / $$ delimiters, map \greek + \operators to real
-// unicode (the font atlas + theme.foldAscii were extended to carry these), turn \frac{a}{b} into (a)/(b), and
-// convert ^/_ scripts to unicode super/subscripts. Everything unmappable degrades to readable ASCII — never a
-// raw backslash-command and never a corrupted word. All output is bounded to dst.len.
+// unicode (carried by the font atlas + theme.foldAscii), turn \frac{a}{b} into (a)/(b), and convert ^/_
+// scripts to unicode super/subscripts. Everything unmappable degrades to readable ASCII — never a raw
+// backslash-command and never a corrupted word. All output is bounded to dst.len.
 
 fn putB(dst: []u8, w: *usize, b: u8) void {
     if (w.* < dst.len) {
@@ -382,7 +382,7 @@ fn writeMath(dst: []u8, w: *usize, src: []const u8, depth: u8) void {
         }
         if (c == '^') {
             // superscript ONLY inside a math span ($...$ / \(...\)). Outside, a caret is literal so ordinary text
-            // like "2^32" or "a^b" is never split/garbled (the exponent-corruption bug).
+            // like "2^32" or "a^b" is never split/garbled.
             if (in_math) {
                 if (readScript(src, i + 1)) |sc| {
                     emitScript(dst, w, sc.arg, true);
@@ -444,13 +444,12 @@ pub fn hasMath(s: []const u8) bool {
 ///   **bold** / __bold__ / *em* / _em_ / `code` → the inner text (markers stripped)
 ///   <br> → a space
 /// Emphasis markers are stripped only when WORD-ADJACENT, so `a * b` (literal) and `file_name`
-/// (snake_case) survive intact — the old version stripped every '*' and no '_', which mangled math and
-/// left `_italic_`/`__bold__`/`[links](...)` showing raw (the "markdown fails" reports). Returns bytes written.
+/// (snake_case) survive intact. Returns bytes written.
 pub fn cleanInline(dst: []u8, src: []const u8) usize {
     const trimmed = std.mem.trim(u8, src, " \t\r");
-    // math pass FIRST (strips $, resolves \frac/\greek/operators/^/_ ) so the emphasis loop below runs on already
-    // de-math'd text and never sees a bare backslash-command. Bounded to a stack scratch; a huge line (rare — a
-    // whole paragraph on one line) skips math and renders as before rather than risk truncation.
+    // math pass FIRST (strips $, resolves \frac/\greek/operators/^/_ ) so the emphasis loop below runs on
+    // already de-math'd text and never sees a bare backslash-command. Bounded to a stack scratch; a huge
+    // line (rare — a whole paragraph on one line) skips math rather than risk truncation.
     var mbuf: [4096]u8 = undefined;
     const s = if (trimmed.len <= 3500 and hasMath(trimmed)) mbuf[0..mathToUnicode(&mbuf, trimmed)] else trimmed;
     var w: usize = 0;

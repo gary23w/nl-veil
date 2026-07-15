@@ -2,11 +2,10 @@
 //! later, spawning shell) directly. The engine reaches the outside world ONLY through a Runner, so when the
 //! chat brain later moves in-process into the backend, only the Runner implementation changes — no engine edits.
 //!
-//! P0 scope: the two SYNCHRONOUS server verbs (runTool, cast). `LocalRunner` forwards them verbatim to the
-//! loopback server via netcli, reading the CURRENT port + bearer token from the shared store on each call
-//! (faithful to how the call sites read them today — settings can change at runtime). A future RemoteRunner
-//! (cloud backend delegating to a desk-agent) or in-process ServerRunner (brain moved server-side) implements
-//! the same VTable. The async shell lifecycle is a later increment (P0-2), not part of this interface yet.
+//! `LocalRunner` forwards each verb verbatim to the loopback server via netcli, reading the CURRENT port +
+//! bearer token from the shared store on each call (settings can change at runtime, so it can't be cached).
+//! A future RemoteRunner (cloud backend delegating to a desk-agent) or in-process ServerRunner (brain moved
+//! server-side) implements the same VTable.
 
 const std = @import("std");
 const Io = std.Io;
@@ -24,7 +23,7 @@ pub const Runner = struct {
         runTool: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp,
         /// POST /api/v1/cast — deploy a swarm; returns the server reply (null = unreachable).
         cast: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp,
-        /// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn (brain-in-backend; P0-6).
+        /// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn.
         chatSend: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
         /// GET /api/v1/chat/convs/<conv>/events?from=N — byte-cursor poll over the conv's turn frames.
         chatEvents: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp,

@@ -1,10 +1,10 @@
 //! llm.zig — the desktop's chat-model client. ONE interface (base_url + key + model, OpenAI-compatible
 //! /chat/completions) behind which every provider plugs: local Ollama, a BYOK cloud provider, or a custom
-//! endpoint URL. Transport mirrors the ENGINE's own convention (src/worker/llm.zig): the key rides in a
-//! curl CONFIG FILE (never on argv), the body in a request file, and curl does the HTTP — which buys TLS
-//! for the hosted providers without betting on std.http in this Zig. Streaming is filesystem-first like
-//! the rest of veil-desk: curl -N writes the SSE stream to a scratch file and the chat thread TAILS it,
-//! appending deltas to the Store as they land. Runs on the CHAT thread only.
+//! endpoint URL. Transport mirrors the engine's convention (src/worker/llm.zig): the key rides in a curl
+//! CONFIG FILE (never on argv), the body in a request file, and curl does the HTTP — TLS for hosted
+//! providers without betting on std.http in this Zig. Streaming is filesystem-first: curl -N writes the
+//! SSE stream to a scratch file and the chat thread TAILS it, appending deltas to the Store. Runs on the
+//! CHAT thread only.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -162,9 +162,8 @@ pub fn start(s: *Stream, io: Io, gpa: std.mem.Allocator, dir: []const u8, prov: 
     defer gpa.free(data_at);
     var tt_buf: [16]u8 = undefined;
     const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{TOTAL_TIMEOUT_S}) catch "900";
-    // The stream sink (curl's stdout). createFile(truncate) clears any prior turn's stream — the
-    // stale-replay guard is now a truncation we own, not a swallowed deleteFile. Created last so no
-    // earlier error path leaks the handle.
+    // The stream sink (curl's stdout). createFile(truncate) clears any prior turn's stream (the
+    // stale-replay guard). Created last so no earlier error path leaks the handle.
     var sink = Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch |e| {
         log.err("chat llm: cannot create stream sink: {t}", .{e});
         return false;

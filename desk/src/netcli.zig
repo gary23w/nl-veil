@@ -3,15 +3,9 @@
 //! for the dashboard counters, and authenticated POST/DELETE to deploy/cast/remove a swarm. Everything the
 //! console/chat/stop needs comes from the filesystem (scan.zig).
 //!
-//! History, because this file has flip-flopped: the FIRST client was a raw socket that read to EOF with no
-//! time bound — a wedged server froze the chat turn that fired a cast ("casting hangs"). The SECOND shelled
-//! out to `curl` for its --max-time ceiling — which put the bearer token and the full JSON body on a child
-//! process's command line (readable by any same-user process) and fed Defender's behavior/ML models the
-//! exact spawn pattern they kill: a self-built binary forking curl.exe to POST bearer JSON at localhost,
-//! every few seconds, forever. THIS client (httpc.zig) is the synthesis: in-process sockets again, but with
-//! real HTTP framing (Content-Length/chunked) and the whole round trip raced against an Io sleeper, so the
-//! timeout is a hard ceiling exactly like curl's — a wedged/slow server surfaces as a clean null (caller
-//! shows "server unreachable") instead of an infinite hang, and nothing secret ever touches an argv.
+//! Transport is httpc.zig (in-process sockets with real HTTP framing and a hard timeout ceiling), so a
+//! wedged/slow server surfaces as a clean null — the caller shows "server unreachable" rather than hanging
+//! the chat turn that fired the request — and nothing secret ever touches an argv.
 
 const std = @import("std");
 const Io = std.Io;
@@ -33,8 +27,7 @@ const MAX_ATTEMPTS = 3;
 fn httpReq(io: Io, gpa: std.mem.Allocator, method: []const u8, port: u16, path: []const u8, token: []const u8, body_json: ?[]const u8, timeout_s: u32) ?Resp {
     log.trace("netcli.httpReq {s} {s} timeout={d}s has_body={}", .{ method, path, timeout_s, body_json != null });
 
-    // POST has side effects (deploy/cast) — an empty reply could mean the server already ran it, so retrying
-    // could deploy a duplicate. Only GET/DELETE (idempotent) are retried on a transient failure.
+    // POST has side effects (deploy/cast); only idempotent GET/DELETE are retried on a transient failure.
     const idempotent = !std.mem.eql(u8, method, "POST");
     var attempt: u8 = 0;
     while (attempt < MAX_ATTEMPTS) : (attempt += 1) {
@@ -109,8 +102,8 @@ pub fn chatTool(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, bo
     return httpReq(io, gpa, "POST", port, "/api/v1/chat/tool", token, body_json, 45);
 }
 
-/// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn for this conversation (the brain
-/// moved into the backend; P0-6). body_json = {"text":..,"base_url":..,"model":..,"api_key":..}. The turn runs
+/// POST /api/v1/chat/convs/<conv>/messages — run ONE server-side chat turn for this conversation.
+/// body_json = {"text":..,"base_url":..,"model":..,"api_key":..}. The turn runs
 /// SYNCHRONOUSLY server-side, so this blocks until it finishes or the ceiling is hit — the turn's frames are
 /// written to the conv's events.jsonl incrementally either way, and chatEvents renders them. `conv` is the
 /// safeSeg-clean conversation id (no URL-escaping needed). Generous ceiling: a full agentic turn (several tool
