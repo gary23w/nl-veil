@@ -62,6 +62,11 @@ pub const Settings = struct {
     data_dir: [512]u8 = [_]u8{0} ** 512,
     data_dir_len: u16 = 0,
     port: u16 = 8787,
+    // The veil server this desk drives. Empty = the local loopback default (the zero-config primary mode);
+    // a non-empty value (IP literal or DNS name) points every server call — poller, deploy, server chat —
+    // at a remote veil. Persisted with the settings.
+    host: [64]u8 = [_]u8{0} ** 64,
+    host_len: u8 = 0,
     token: [128]u8 = [_]u8{0} ** 128,
     token_len: u8 = 0,
     token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
@@ -95,6 +100,9 @@ pub const Settings = struct {
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
+    }
+    pub fn hostStr(s: *const Settings) []const u8 {
+        return s.host[0..s.host_len];
     }
     pub fn tokenStr(s: *const Settings) []const u8 {
         return s.token[0..s.token_len];
@@ -315,6 +323,10 @@ pub const Store = struct {
 
     // --- server / fleet (poller writes) ---
     server_online: bool = false,
+    // True once the chat thread finished loadSettings (whether or not a settings file existed) — the
+    // Settings tab seeds its editable host/port fields from persisted values exactly once, gated on this
+    // so a first render can't capture pre-load defaults.
+    settings_loaded: bool = false,
     server_version: [16]u8 = [_]u8{0} ** 16,
     server_version_len: u8 = 0,
     fleet_swarms: i32 = 0,

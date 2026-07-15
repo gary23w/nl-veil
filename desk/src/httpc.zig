@@ -37,6 +37,7 @@ pub const Result = union(enum) {
 
 pub const Req = struct {
     method: []const u8, // "GET" | "POST" | "DELETE"
+    host: []const u8 = "", // IP literal or DNS name; empty = the 127.0.0.1 loopback default
     port: u16,
     path: []const u8,
     bearer: []const u8 = "", // sent as Authorization: Bearer when non-empty — in-process only, never argv
@@ -45,7 +46,7 @@ pub const Req = struct {
     cap: usize = 1 << 20, // max body bytes; a bigger reply is a `.failed`, never unbounded memory
 };
 
-/// One bounded HTTP/1.1 round trip to 127.0.0.1:<port>. Never blocks past `timeout_s`.
+/// One bounded HTTP/1.1 round trip to <host>:<port> (default 127.0.0.1). Never blocks past `timeout_s`.
 pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     const req_bytes = buildRequest(gpa, req) orelse return .failed;
     defer gpa.free(req_bytes);
@@ -56,7 +57,7 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     const Race = union(enum) { rt: Inner, timer: void };
     var sbuf: [2]Race = undefined;
     var sel = Io.Select(Race).init(io, &sbuf);
-    sel.async(.rt, roundTrip, .{ io, gpa, req.port, req_bytes, req.cap });
+    sel.async(.rt, roundTrip, .{ io, gpa, req.host, req.port, req_bytes, req.cap });
     sel.async(.timer, sleeper, .{ io, req.timeout_s });
 
     const first = sel.await() catch { // our own task was cancelled — drain children, then bail
@@ -98,8 +99,13 @@ const Inner = union(enum) {
     failed,
 };
 
-fn roundTrip(io: Io, gpa: std.mem.Allocator, port: u16, req_bytes: []const u8, cap: usize) Inner {
-    const addr = Io.net.IpAddress{ .ip4 = .loopback(port) };
+fn roundTrip(io: Io, gpa: std.mem.Allocator, host: []const u8, port: u16, req_bytes: []const u8, cap: usize) Inner {
+    // Empty host = the loopback default. resolve() takes an IP literal or a DNS name, so a desk can drive
+    // a remote veil; a name that won't resolve maps to .failed, which callers already treat as unreachable.
+    const addr: Io.net.IpAddress = if (host.len == 0)
+        .{ .ip4 = .loopback(port) }
+    else
+        Io.net.IpAddress.resolve(io, host, port) catch return .failed;
     // No connect timeout option: this Zig's Windows backend panics on one (netConnectIpWindows TODO),
     // and loopback connects resolve immediately either way — the Select sleeper bounds the rest.
     var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |e| {
@@ -208,7 +214,7 @@ fn buildRequest(gpa: std.mem.Allocator, req: Req) ?[]u8 {
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
-    w.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\nAccept: application/json\r\n", .{ req.method, req.path, req.port }) catch return null;
+    w.print("{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\nAccept: application/json\r\n", .{ req.method, req.path, if (req.host.len == 0) "127.0.0.1" else req.host, req.port }) catch return null;
     if (req.bearer.len > 0) w.print("Authorization: Bearer {s}\r\n", .{req.bearer}) catch return null;
     if (req.body) |b| {
         w.print("Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{b.len}) catch return null;

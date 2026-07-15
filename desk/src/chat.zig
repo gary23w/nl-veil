@@ -3322,15 +3322,22 @@ pub const Chat = struct {
             server_chat = s.server_chat;
         }
         var port: u16 = 8787;
+        var host: [64]u8 = undefined;
+        var host_n: usize = 0;
         {
             self.store.lock();
             defer self.store.unlock();
             port = self.store.settings.port;
+            const h = self.store.settings.hostStr();
+            host_n = @min(h.len, host.len);
+            @memcpy(host[0..host_n], h[0..host_n]);
         }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         jb.appendSlice(self.gpa, "{\"kind\":") catch return;
-        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"base\":\"", .{ kind, port, byok, theme }) catch return;
+        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"host\":\"", .{ kind, port, byok, theme }) catch return;
+        escJson(&jb, self.gpa, host[0..host_n]);
+        jb.appendSlice(self.gpa, "\",\"base\":\"") catch return;
         escJson(&jb, self.gpa, base[0..base_n]);
         jb.appendSlice(self.gpa, "\",\"model\":\"") catch return;
         escJson(&jb, self.gpa, model[0..model_n]);
@@ -3352,6 +3359,14 @@ pub const Chat = struct {
     }
 
     fn loadSettings(self: *Chat, dd: []const u8) void {
+        // Runs LAST (registered before the body's lock/defer pair), on every path out — including the
+        // no-settings-file early return of a fresh install: "loaded" means "the load pass finished",
+        // which is what the Settings tab's field seeding waits for, not "a file existed".
+        defer {
+            self.store.lock();
+            self.store.settings_loaded = true;
+            self.store.unlock();
+        }
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(8 << 10)) catch return;
@@ -3359,10 +3374,16 @@ pub const Chat = struct {
         self.store.lock();
         defer self.store.unlock();
         const s = &self.store.settings;
-        // server port (absent = 8787): lets a desk instance target a non-default veil server — a second local
-        // server, a test instance, or a remapped install — without a rebuild.
+        // server host + port (absent host = local loopback, absent port = 8787): lets a desk instance
+        // target a non-default or REMOTE veil server without a rebuild.
         if (jInt(data, "port")) |v| {
             if (v >= 1 and v <= 65535) s.port = @intCast(v);
+        }
+        if (llm.jsonUnescape(self.gpa, data, "host")) |h| {
+            defer self.gpa.free(h);
+            const n = @min(h.len, s.host.len);
+            @memcpy(s.host[0..n], h[0..n]);
+            s.host_len = @intCast(n);
         }
         if (jInt(data, "kind")) |v| s.chat_kind = @intCast(@max(0, @min(v, 2)));
         if (jInt(data, "byok")) |v| s.chat_byok = @intCast(@max(0, @min(v, @as(i64, @intCast(catalog.providers.len - 1)))));

@@ -116,6 +116,10 @@ const Ui = struct {
     s_ckey: Field = .{},
     s_cfacct: Field = .{}, // Cloudflare account id (chat BYOK, when the provider needs one)
     s_seeded: bool = false, // provider fields copied from the store once (after the chat thread loads)
+    // Settings: server target (host empty = this machine)
+    s_host: Field = .{},
+    s_port: Field = .{},
+    srv_seeded: bool = false, // host/port copied from the store once (after loadSettings finishes)
     // deploy form
     d_name: Field = .{},
     d_key: Field = .{},
@@ -178,7 +182,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, con_input, sc_name, sc_prompt, sc_details };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_host, s_port, con_input, sc_name, sc_prompt, sc_details };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -1091,6 +1095,8 @@ fn focusedField() ?*Ui.Field {
         .s_url => &ui.s_url,
         .s_ckey => &ui.s_ckey,
         .s_cfacct => &ui.s_cfacct,
+        .s_host => &ui.s_host,
+        .s_port => &ui.s_port,
         .con_input => &ui.con_input,
         .sc_name => &ui.sc_name,
         .sc_prompt => &ui.sc_prompt,
@@ -4388,6 +4394,10 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const ddn = @min(dd.len, ddb.len);
     @memcpy(ddb[0..ddn], dd[0..ddn]);
     const portv = store.settings.port;
+    var hostb: [64]u8 = undefined;
+    const hostn: usize = store.settings.host_len;
+    @memcpy(hostb[0..hostn], store.settings.host[0..hostn]);
+    const settings_loaded = store.settings_loaded;
     const tok_n = store.settings.token_len;
     const notify_on = store.settings.notify;
     const speed_on = store.settings.speed_mode;
@@ -4413,10 +4423,40 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     t.panelBordered(dr, t.bg, t.border);
     t.textClip(ddb[0..ddn], @intFromFloat(x + 10), @intFromFloat(y + 9), 13, t.fg, @intFromFloat(colw - 20));
     y += 48;
-    flabel(x, y, "SERVER PORT");
+    flabel(x, y, "SERVER HOST : PORT - the veil this desk drives (empty host = this machine)");
     y += 20;
-    t.text(t.z("{d}   ({s})", .{ portv, if (online) "reachable" else "not reachable" }), @intFromFloat(x), @intFromFloat(y), 14, if (online) t.green else t.comment);
-    y += 40;
+    // Seed the editable fields from persisted values exactly once, after loadSettings finished — seeding
+    // earlier would capture the pre-load defaults and show a stale target until the tab is reopened.
+    if (!ui.srv_seeded and settings_loaded) {
+        setField(&ui.s_host, hostb[0..hostn]);
+        var spb: [8]u8 = undefined;
+        setField(&ui.s_port, std.fmt.bufPrint(&spb, "{d}", .{portv}) catch "8787");
+        ui.srv_seeded = true;
+    }
+    const ap_label = t.z("Apply", .{});
+    const apw = t.btnW(ap_label, t.BTN_MD);
+    const port_w: f32 = 76;
+    const host_w = colw - port_w - apw - t.GAP * 2;
+    textField(.{ .x = x, .y = y, .width = host_w, .height = t.FIELD_H }, &ui.s_host, ui.focus == .s_host, "127.0.0.1 (default - this machine)", .s_host);
+    textField(.{ .x = x + host_w + t.GAP, .y = y, .width = port_w, .height = t.FIELD_H }, &ui.s_port, ui.focus == .s_port, "8787", .s_port);
+    const apb = t.Rect{ .x = x + colw - apw, .y = y, .width = apw, .height = t.BTN_MD };
+    if (t.button(apb, ap_label, t.blue, true)) {
+        const hs = std.mem.trim(u8, ui.s_host.str(), " \t");
+        const p = std.fmt.parseInt(u16, std.mem.trim(u8, ui.s_port.str(), " \t"), 10) catch 0;
+        store.lock();
+        const s = &store.settings;
+        const hn2 = @min(hs.len, s.host.len);
+        @memcpy(s.host[0..hn2], hs[0..hn2]);
+        s.host_len = @intCast(hn2);
+        if (p >= 1) s.port = p; // 0/garbage = keep the current port rather than saving a dead target
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        store.pushNotif("Server target saved", if (hn2 == 0) "this machine (localhost)" else "remote veil - paste its nlk_ token below", 1);
+        ui.focus = .none;
+    }
+    y += 42;
+    t.text(t.z("{s}:{d}   ({s})", .{ if (hostn == 0) "127.0.0.1" else hostb[0..hostn], portv, if (online) "reachable" else "not reachable" }), @intFromFloat(x), @intFromFloat(y), 12, if (online) t.green else t.comment);
+    y += 34;
     flabel(x, y, "API TOKEN - an nlk_ key from the web UI (enables Deploy over the API)");
     y += 20;
     const sv_label = t.z("Save token", .{});

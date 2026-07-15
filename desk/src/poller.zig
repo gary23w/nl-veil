@@ -65,6 +65,7 @@ pub const Poller = struct {
     pub fn run(self: *Poller) void {
         log.trace("poller.run starting", .{});
         while (!self.stop.load(.monotonic)) {
+            self.syncHost();
             self.drainCommands();
             self.refresh();
             // ~1s cadence, but wake early to service commands responsively (10x100ms polls of the stop flag)
@@ -95,6 +96,22 @@ pub const Poller = struct {
         self.store.lock();
         defer self.store.unlock();
         return self.store.settings.port;
+    }
+
+    /// Re-point netcli at the Settings server host once per cycle: a Save in the Settings tab (or a
+    /// persisted remote target loading on the chat thread) takes effect within a tick, without threading
+    /// a host through every netcli caller. Copy under lock, release before the module call.
+    fn syncHost(self: *Poller) void {
+        var hb: [64]u8 = undefined;
+        var hn: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            const h = self.store.settings.hostStr();
+            hn = @min(h.len, hb.len);
+            @memcpy(hb[0..hn], h[0..hn]);
+        }
+        netcli.setHost(hb[0..hn]);
     }
 
     fn drainCommands(self: *Poller) void {
