@@ -53,6 +53,7 @@ pub const Poller = struct {
     // the list reflects it on the very next tick instead of up to SCHED_EVERY_S later.
     last_sched_s: i64 = 0,
     sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
+    last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
 
     // notification de-dup state (poller-local)
     grad_warned: bool = false,
@@ -114,6 +115,8 @@ pub const Poller = struct {
                 .sched_toggle => self.doSchedToggle(c.idStr(), c.textStr()),
                 .sched_delete => self.doSchedDelete(c.idStr()),
                 .sched_run => self.doSchedRun(c.idStr()),
+                .oauth_cf_login => self.doOauthCfLogin(),
+                .oauth_cf_logout => self.doOauthCfLogout(),
             }
         }
     }
@@ -485,6 +488,19 @@ pub const Poller = struct {
             self.refreshSched();
         }
 
+        // 1c) Cloudflare OAuth login status — one more cheap GET on the same cadence (faster while a login is
+        // pending so "connected" appears promptly after the browser grant).
+        {
+            self.store.lock();
+            const pending = self.store.cf_oauth_pending;
+            self.store.unlock();
+            const cf_every: i64 = if (pending) 2 else 6;
+            if (online and now_s - self.last_cf_s >= cf_every) {
+                self.last_cf_s = now_s;
+                self.refreshCfOAuth();
+            }
+        }
+
         // 2) roster
         const nsw = scan.listSwarms(self.io, self.gpa, dd, &self.swarm_scratch, now_s, 45);
 
@@ -606,6 +622,91 @@ pub const Poller = struct {
         self.store.sched_denied = false;
     }
 
+    /// Open a URL in the OS browser (best-effort). The Cloudflare consent page — the ONE place the desk opens
+    /// an external URL. `explorer.exe <url>` / `open <url>` / `xdg-open <url>`.
+    fn openUrl(self: *Poller, url: []const u8) void {
+        log.info("poller.openUrl {s}", .{url[0..@min(url.len, 80)]});
+        const argv: []const []const u8 = switch (builtin.os.tag) {
+            .windows => &.{ "explorer.exe", url },
+            .macos => &.{ "open", url },
+            else => &.{ "xdg-open", url },
+        };
+        _ = std.process.spawn(self.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+    }
+
+    /// Start a Cloudflare login: POST /start, open the returned consent URL in the browser, and arm the pending
+    /// flag so the Settings tab shows "waiting…" until the status poll flips to connected.
+    fn doOauthCfLogin(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfStart(self.io, self.gpa, self.port(), tok) orelse {
+            self.store.pushNotif("Cloudflare login", "server unreachable - is it running?", 2);
+            return;
+        };
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status == 501) {
+            self.store.pushNotif("Cloudflare login unavailable", "the server has no OAuth client configured - paste a token instead", 2);
+            return;
+        }
+        if (resp.status < 200 or resp.status >= 300) {
+            self.store.pushNotif("Cloudflare login failed", "the server rejected the request", 2);
+            return;
+        }
+        var ubuf: [1200]u8 = undefined;
+        const url = valueForKey(resp.body, "authorize_url", &ubuf);
+        if (url.len == 0) {
+            self.store.pushNotif("Cloudflare login failed", "no authorize URL in the reply", 2);
+            return;
+        }
+        self.openUrl(url);
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.cf_oauth_pending = true;
+        }
+        self.last_cf_s = 0; // poll status promptly so "connected" appears right after the browser grant
+        self.store.pushNotif("Cloudflare login", "granting access in your browser...", 1);
+    }
+
+    fn doOauthCfLogout(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfLogout(self.io, self.gpa, self.port(), tok);
+        if (resp) |r| if (r.body.len > 0) self.gpa.free(r.body);
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.cf_oauth_connected = false;
+            self.store.cf_oauth_pending = false;
+            self.store.cf_oauth_account_len = 0;
+        }
+        self.last_cf_s = 0;
+        self.store.pushNotif("Cloudflare", "disconnected", 1);
+    }
+
+    /// Poll GET /oauth/cloudflare/status and publish {configured, connected, account_id} to the store. Cheap
+    /// GET beside the fleet/sched polls; a pending login clears once connected flips true.
+    fn refreshCfOAuth(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.oauthCfStatus(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return; // transient — keep the last-known state
+        const configured = std.mem.indexOf(u8, resp.body, "\"configured\":true") != null;
+        const connected = std.mem.indexOf(u8, resp.body, "\"connected\":true") != null;
+        var abuf: [64]u8 = undefined;
+        const account = valueForKey(resp.body, "account_id", &abuf);
+        self.store.lock();
+        defer self.store.unlock();
+        self.store.cf_oauth_seen = true;
+        self.store.cf_oauth_configured = configured;
+        self.store.cf_oauth_connected = connected;
+        if (connected) self.store.cf_oauth_pending = false; // the browser grant landed
+        const n = @min(account.len, self.store.cf_oauth_account.len);
+        @memcpy(self.store.cf_oauth_account[0..n], account[0..n]);
+        self.store.cf_oauth_account_len = n;
+    }
+
     fn notifyTransitions(self: *Poller, online: bool, swarms: []const scan.SwarmSummary, sel: []const u8, sel_metrics: scan.Metrics) void {
         log.trace("poller.notifyTransitions online={} swarms={d}", .{ online, swarms.len });
         // server up/down
@@ -666,6 +767,25 @@ pub const Poller = struct {
         return false;
     }
 };
+
+/// Copy the string value of a top-level `"key":"..."` from a flat JSON object into `buf` (unescaping only \/
+/// which appears in the authorize URL). Empty when absent. Used for the OAuth status/start replies, whose
+/// shapes are simple and server-controlled.
+fn valueForKey(json: []const u8, key: []const u8, buf: []u8) []const u8 {
+    var kb: [40]u8 = undefined;
+    const pat = std.fmt.bufPrint(&kb, "\"{s}\":\"", .{key}) catch return "";
+    const at = std.mem.indexOf(u8, json, pat) orelse return "";
+    var i = at + pat.len;
+    var n: usize = 0;
+    while (i < json.len and json[i] != '"' and n < buf.len) : (i += 1) {
+        if (json[i] == '\\' and i + 1 < json.len) {
+            i += 1;
+            buf[n] = if (json[i] == '/') '/' else json[i];
+        } else buf[n] = json[i];
+        n += 1;
+    }
+    return buf[0..n];
+}
 
 /// Fill one SchedRow from a task object, walking it pair-by-pair (scan.nextJsonPair) so free-text values
 /// (a prompt containing `"at":`) can never be misread as fields. Unknown keys (created, details, base_url,

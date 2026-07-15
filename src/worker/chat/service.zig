@@ -252,7 +252,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         if (looks_cf or std.mem.startsWith(u8, b.model, "@cf/")) {
             if (cf_oauth.resolveToken(app, u.id, res.arena)) |cf| {
                 eff_key = cf.key;
-                if (eff_base.len == 0 or std.mem.indexOf(u8, eff_base, "{account}") != null) eff_base = cf.base_url;
+                eff_base = cf.base_url; // authoritative account base (the desk may have sent the "cloudflare" sentinel)
             }
         }
     }

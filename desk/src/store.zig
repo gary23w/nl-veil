@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, deploy, swarm, hub, scheduled, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_toggle, sched_delete, sched_run };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -426,6 +426,14 @@ pub const Store = struct {
     // wakes (sub-second) overwrites the first, same drop-tolerant discipline as the command ring itself.
     sched_create_json: [8192]u8 = undefined,
     sched_create_len: usize = 0,
+
+    // --- Cloudflare OAuth login state (poller writes from GET /oauth/cloudflare/status; Settings tab reads) ---
+    cf_oauth_seen: bool = false, //       a status fetch has landed at least once
+    cf_oauth_configured: bool = false, // the server has an OAuth client_id (else the login button is inert)
+    cf_oauth_connected: bool = false, //  this user has a stored Cloudflare credential
+    cf_oauth_pending: bool = false, //    a login was started; waiting for the browser callback to complete
+    cf_oauth_account: [64]u8 = undefined, // the connected account id (for display)
+    cf_oauth_account_len: usize = 0,
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

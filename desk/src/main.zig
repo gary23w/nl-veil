@@ -4544,9 +4544,55 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         y += 58;
     }
 
+    // LOG IN WITH CLOUDFLARE (OAuth) — the primary path when the provider needs a Cloudflare account. Grants
+    // Workers AI access once via the browser; the token lives server-side and auto-refreshes. The manual
+    // account-id + token fields below remain as a fallback.
+    if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
+        var cf_configured = false;
+        var cf_connected = false;
+        var cf_pending = false;
+        var cf_seen = false;
+        var acctbuf: [64]u8 = undefined;
+        var acct_len: usize = 0;
+        {
+            store.lock();
+            cf_configured = store.cf_oauth_configured;
+            cf_connected = store.cf_oauth_connected;
+            cf_pending = store.cf_oauth_pending;
+            cf_seen = store.cf_oauth_seen;
+            acct_len = @min(store.cf_oauth_account_len, acctbuf.len);
+            @memcpy(acctbuf[0..acct_len], store.cf_oauth_account[0..acct_len]);
+            store.unlock();
+        }
+        flabel(x, y, "CLOUDFLARE LOGIN");
+        y += 14;
+        if (cf_connected) {
+            t.text(t.z("connected", .{}), @intFromFloat(x), @intFromFloat(y + 8), 14, t.green);
+            if (acct_len > 0) t.text(t.z("account {s}", .{acctbuf[0..acct_len]}), @intFromFloat(x + 90), @intFromFloat(y + 10), 12, t.comment);
+            const dl = t.z("Disconnect", .{});
+            const dw = t.btnW(dl, t.BTN_MD);
+            if (t.button(.{ .x = x + colw - dw, .y = y, .width = dw, .height = t.BTN_MD }, dl, t.red, true)) {
+                store.pushCmd(store_mod.mkCmd(.oauth_cf_logout, "", ""));
+            }
+            y += 44;
+        } else if (cf_configured) {
+            const ll = t.z("Log in with Cloudflare", .{});
+            const lw = t.btnW(ll, t.BTN_MD) + 20;
+            if (t.button(.{ .x = x, .y = y, .width = lw, .height = t.BTN_MD }, ll, t.blue, !cf_pending)) {
+                store.pushCmd(store_mod.mkCmd(.oauth_cf_login, "", ""));
+            }
+            const sub: [:0]const u8 = if (cf_pending) t.z("waiting for the grant in your browser...", .{}) else t.z("opens Cloudflare in your browser - one click, no token to paste", .{});
+            t.text(sub, @intFromFloat(x + lw + 12), @intFromFloat(y + 10), 12, if (cf_pending) t.orange else t.comment);
+            y += 44;
+        } else if (cf_seen) {
+            t.text(t.z("Cloudflare login isn't set up on this server - paste a token below instead.", .{}), @intFromFloat(x), @intFromFloat(y + 6), 12, t.comment);
+            y += 30;
+        }
+    }
+
     // Cloudflare account id (only when the BYOK provider needs one) — built into the Workers AI base_url.
     if (chat_kind == 1 and catalog.providers[@min(chat_byok, catalog.providers.len - 1)].needs_account) {
-        flabel(x, y, "CLOUDFLARE ACCOUNT ID (from your Cloudflare dashboard - not a secret)");
+        flabel(x, y, "CLOUDFLARE ACCOUNT ID (paste manually - or use the login above)");
         y += 14;
         const sid_label = t.z("Save id", .{});
         const sidw = t.btnW(sid_label, t.BTN_MD);

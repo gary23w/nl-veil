@@ -190,6 +190,26 @@ pub fn schedRun(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id
     return httpReq(io, gpa, "POST", port, path, token, "{}", 15);
 }
 
+/// POST /api/v1/oauth/cloudflare/start — begin a Cloudflare login; the server answers {authorize_url,state}.
+/// The desk opens that URL in the system browser; the callback lands back on the server.
+pub fn oauthCfStart(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfStart port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/start", token, "{}", 8);
+}
+
+/// GET /api/v1/oauth/cloudflare/status — {configured,connected,account_id,expires_at}. Polled while the
+/// Settings tab shows the Cloudflare provider so the login state stays live.
+pub fn oauthCfStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfStatus port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/oauth/cloudflare/status", token, null, 6);
+}
+
+/// POST /api/v1/oauth/cloudflare/logout — forget this user's stored Cloudflare credential.
+pub fn oauthCfLogout(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.oauthCfLogout port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/logout", token, "{}", 8);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });
