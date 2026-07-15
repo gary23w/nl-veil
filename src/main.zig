@@ -26,6 +26,7 @@ const sched = @import("worker/sched.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
+const cf_oauth = @import("config/cf_oauth.zig");
 const worker = @import("worker/run.zig");
 const cli = @import("cli.zig");
 
@@ -216,7 +217,11 @@ pub fn main(init: std.process.Init) !void {
         (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "on"))
     else
         false;
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys };
+    // Cloudflare OAuth (self-managed public client): env-overridable so a deployment bakes only its public
+    // client_id. The redirect defaults to this server's loopback callback on the resolved port.
+    const cf_oauth_redirect = init.environ_map.get("NL_CF_OAUTH_REDIRECT") orelse
+        (std.fmt.allocPrint(gpa, "http://localhost:{d}/api/v1/oauth/cloudflare/callback", .{cli_port}) catch "http://localhost:8787/api/v1/oauth/cloudflare/callback");
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse "", .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts" };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -274,6 +279,10 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/keys", keys_api.putKey, .{});
     router.get("/api/v1/keys", keys_api.listKeys, .{});
     router.delete("/api/v1/keys/:provider", keys_api.delKey, .{});
+    router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
+    router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
+    router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
+    router.post("/api/v1/oauth/cloudflare/logout", cf_oauth.logout, .{});
     router.get("/api/v1/swarms/:id/events", tail_fanout.swarmEvents, .{});
     router.get("/api/v1/swarms/:id/stream", tail_fanout.swarmStream, .{});
     router.get("/api/v1/swarms/:id/files", deploy_service.swarmFiles, .{});

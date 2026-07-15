@@ -70,7 +70,24 @@ pub fn open(gpa: std.mem.Allocator, key: [32]u8, b64: []const u8) ?[]u8 {
     return pt;
 }
 
-const StoredKey = struct { key: []const u8 = "", base_url: []const u8 = "", created: i64 = 0 };
+const StoredKey = struct {
+    key: []const u8 = "",
+    base_url: []const u8 = "",
+    created: i64 = 0,
+    // OAuth-only fields (empty/0 for a plain BYOK key). ignore_unknown_fields keeps old blobs readable.
+    refresh_token: []const u8 = "",
+    expires_at: i64 = 0,
+    account_id: []const u8 = "",
+};
+
+/// The full OAuth bundle a logged-in provider stores (Cloudflare today). `key` is the current access token.
+pub const OAuthBundle = struct {
+    key: []const u8,
+    refresh_token: []const u8,
+    expires_at: i64,
+    account_id: []const u8,
+    base_url: []const u8,
+};
 
 pub const KeyMeta = struct {
     provider: []const u8,
@@ -116,6 +133,47 @@ pub const KeyVault = struct {
         defer self.gpa.free(sealed);
         var sb: [80]u8 = undefined;
         try self.nb.put(scopeKey(uid, provider, &sb), sealed);
+    }
+
+    /// Store an OAuth bundle (access + refresh token, expiry, account id) sealed under `provider`. Same
+    /// at-rest sealing as a BYOK key; the extra fields ride in the same JSON blob. Values are size/charset
+    /// checked like a key so a malformed token can't break the JSON.
+    pub fn putOAuth(self: *KeyVault, uid: u64, provider: []const u8, access: []const u8, refresh: []const u8, expires_at: i64, account_id: []const u8, base_url: []const u8) !void {
+        if (!validProvider(provider)) return error.BadProvider;
+        if (access.len == 0 or access.len > 4096 or !cleanValue(access)) return error.BadKey;
+        if (refresh.len > 4096 or !cleanValue(refresh)) return error.BadKey;
+        if (account_id.len > 64 or !cleanValue(account_id)) return error.BadKey;
+        if (base_url.len > 512 or !cleanValue(base_url)) return error.BadBaseUrl;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        const json = try std.fmt.allocPrint(self.gpa, "{{\"key\":\"{s}\",\"base_url\":\"{s}\",\"created\":{d},\"refresh_token\":\"{s}\",\"expires_at\":{d},\"account_id\":\"{s}\"}}", .{ access, base_url, std.Io.Timestamp.now(self.io, .real).toSeconds(), refresh, expires_at, account_id });
+        defer self.gpa.free(json);
+        const sealed = seal(self.gpa, self.io, self.server_key, json) catch return error.SealFailed;
+        defer self.gpa.free(sealed);
+        var sb: [80]u8 = undefined;
+        try self.nb.put(scopeKey(uid, provider, &sb), sealed);
+    }
+
+    /// Read back an OAuth bundle (null if absent/unsealable). `account_id`/`refresh_token` are empty for a
+    /// plain BYOK key stored under the same provider, so a caller can tell the two apart by refresh_token.len.
+    pub fn resolveOAuth(self: *KeyVault, uid: u64, provider: []const u8, alloc: std.mem.Allocator) ?OAuthBundle {
+        if (!validProvider(provider)) return null;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        var sb: [80]u8 = undefined;
+        const sealed = (self.nb.get(scopeKey(uid, provider, &sb)) catch return null) orelse return null;
+        defer self.gpa.free(sealed);
+        const pt = open(self.gpa, self.server_key, std.mem.trim(u8, sealed, " \r\n\t")) orelse return null;
+        defer self.gpa.free(pt);
+        const parsed = std.json.parseFromSlice(StoredKey, self.gpa, pt, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        return .{
+            .key = alloc.dupe(u8, parsed.value.key) catch return null,
+            .refresh_token = alloc.dupe(u8, parsed.value.refresh_token) catch "",
+            .expires_at = parsed.value.expires_at,
+            .account_id = alloc.dupe(u8, parsed.value.account_id) catch "",
+            .base_url = alloc.dupe(u8, parsed.value.base_url) catch "",
+        };
     }
 
     pub const Resolved = struct { key: []const u8, base_url: []const u8 };

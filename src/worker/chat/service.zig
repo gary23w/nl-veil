@@ -19,6 +19,7 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const http = @import("../../gateway/http.zig");
+const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
 
 const App = http.App;
@@ -241,11 +242,26 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
     }
 
+    // CLOUDFLARE LOGIN: when the desk sends an empty key against a Workers AI endpoint (or an @cf/ model), the
+    // user is relying on their Cloudflare OAuth login — resolve the (auto-refreshed) token + account base from
+    // the vault so the turn runs with no pasted key. Any other provider is untouched.
+    var eff_base = b.base_url;
+    var eff_key = b.api_key;
+    if (eff_key.len == 0) {
+        const looks_cf = std.mem.indexOf(u8, b.base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, b.base_url, "/ai/") != null;
+        if (looks_cf or std.mem.startsWith(u8, b.model, "@cf/")) {
+            if (cf_oauth.resolveToken(app, u.id, res.arena)) |cf| {
+                eff_key = cf.key;
+                if (eff_base.len == 0 or std.mem.indexOf(u8, eff_base, "{account}") != null) eff_base = cf.base_url;
+            }
+        }
+    }
+
     // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, b.base_url, b.api_key, b.model, text, loop_mode);
+    chat_engine.spawnTurn(app, u.id, seg, eff_base, eff_key, b.model, text, loop_mode);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});

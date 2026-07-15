@@ -19,7 +19,12 @@ pub const Neuron = struct {
         return res.stdout;
     }
 
+    /// Single-value UPSERT for a scope: forget any prior value, then store this one. neuron `observe` APPENDS,
+    /// and `get` (export → first line) returns the oldest — so without the forget, an update to an existing
+    /// scope never takes (the KV callers here — vault, sessions, api keys, ledger, user records — all want the
+    /// latest value, not an accumulation; the append-style memory use goes through Mem.observe, not this).
     pub fn put(self: Neuron, scope: []const u8, value: []const u8) !void {
+        self.del(scope);
         const argv = [_][]const u8{ self.bin, "--db", self.db, "observe", scope, value };
         const out = try self.exec(&argv);
         self.gpa.free(out);
