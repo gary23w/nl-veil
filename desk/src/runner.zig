@@ -30,6 +30,10 @@ pub const Runner = struct {
         chatEvents: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, from: usize) ?Resp,
         /// POST /api/v1/chat/convs/<conv>/control — a cooperative control op (e.g. {"op":"stop"}) the turn reads.
         chatControl: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp,
+        /// GET /api/v1/chat/convs — the server's conversation list (merged into the sidebar).
+        chatConvs: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator) ?Resp,
+        /// GET /api/v1/chat/convs/<conv> — one server conversation's message log (mirrored on select).
+        chatConv: *const fn (ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp,
     };
 
     pub fn runTool(self: Runner, io: Io, gpa: std.mem.Allocator, body_json: []const u8) ?Resp {
@@ -47,11 +51,17 @@ pub const Runner = struct {
     pub fn chatControl(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8, body_json: []const u8) ?Resp {
         return self.vt.chatControl(self.ctx, io, gpa, conv, body_json);
     }
+    pub fn chatConvs(self: Runner, io: Io, gpa: std.mem.Allocator) ?Resp {
+        return self.vt.chatConvs(self.ctx, io, gpa);
+    }
+    pub fn chatConv(self: Runner, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp {
+        return self.vt.chatConv(self.ctx, io, gpa, conv);
+    }
 };
 
 // ------------------------------------------------------------------ LocalRunner (today's behavior, verbatim)
 
-const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents, .chatControl = localChatControl };
+const local_vtable = Runner.VTable{ .runTool = localRunTool, .cast = localCast, .chatSend = localChatSend, .chatEvents = localChatEvents, .chatControl = localChatControl, .chatConvs = localChatConvs, .chatConv = localChatConv };
 
 /// A Runner backed by the loopback server. `ctx` is the shared Store — the live port + bearer token are read
 /// from it on each call (the settings can change at runtime), exactly as the old call sites did.
@@ -103,4 +113,18 @@ fn localChatControl(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []con
     var tokb: [128]u8 = undefined;
     const pt = portToken(store, &tokb);
     return netcli.chatControl(io, gpa, pt.port, pt.tok, conv, body_json);
+}
+
+fn localChatConvs(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatConvs(io, gpa, pt.port, pt.tok);
+}
+
+fn localChatConv(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []const u8) ?Resp {
+    const store: *store_mod.Store = @ptrCast(@alignCast(ctx));
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    return netcli.chatConv(io, gpa, pt.port, pt.tok, conv);
 }

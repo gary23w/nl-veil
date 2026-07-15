@@ -21,9 +21,9 @@ const SpinLock = struct {
     }
 };
 
-pub const Tab = enum { dashboard, chat, deploy, swarm, hub, settings };
+pub const Tab = enum { dashboard, chat, deploy, swarm, hub, scheduled, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_toggle, sched_delete, sched_run };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -222,6 +222,47 @@ pub const PlanRow = struct {
 };
 pub const MAX_PLAN = 32; // == the server plan-board's MAX_TASKS cap
 
+pub const MAX_SCHED = 32;
+
+/// One scheduled task (poller writes from GET /api/v1/sched; the Scheduled tab reads). Raw schedule
+/// fields are kept — the UI composes the human summary ("every 30m" / "daily 09:00") at draw time, so
+/// the row never goes stale against a clock the poller doesn't re-publish.
+pub const SchedRow = struct {
+    id: [64]u8 = [_]u8{0} ** 64,
+    id_len: u8 = 0,
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    kind: u8 = 0, // 0 once / 1 every / 2 daily — mirrors the task's "kind"
+    at: i64 = 0, // epoch of the one-shot run (kind once)
+    every_min: u32 = 0, // interval minutes (kind every)
+    hm: [8]u8 = [_]u8{0} ** 8, // "HH:MM" (kind daily)
+    hm_len: u8 = 0,
+    enabled: bool = true,
+    next_due: i64 = 0,
+    last_run: i64 = 0,
+    runs: u32 = 0,
+    last_conv: [64]u8 = [_]u8{0} ** 64, // the newest scheduled_* conversation this task produced
+    last_conv_len: u8 = 0,
+    prompt: [96]u8 = [_]u8{0} ** 96, // preview of the task's prompt, for the row subtitle
+    prompt_len: u8 = 0,
+
+    pub fn idStr(s: *const SchedRow) []const u8 {
+        return s.id[0..s.id_len];
+    }
+    pub fn nameStr(s: *const SchedRow) []const u8 {
+        return s.name[0..s.name_len];
+    }
+    pub fn hmStr(s: *const SchedRow) []const u8 {
+        return s.hm[0..s.hm_len];
+    }
+    pub fn lastConvStr(s: *const SchedRow) []const u8 {
+        return s.last_conv[0..s.last_conv_len];
+    }
+    pub fn promptStr(s: *const SchedRow) []const u8 {
+        return s.prompt[0..s.prompt_len];
+    }
+};
+
 pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
@@ -377,6 +418,18 @@ pub const Store = struct {
     // per-turn chat performance ring (chat worker appends, Metrics tab reads)
     turn_metrics: [METRIC_RING]TurnMetric = undefined,
     turn_metric_count: usize = 0, // total turns recorded (may exceed the ring; @min with METRIC_RING to iterate)
+
+    // --- scheduled tasks (poller writes from GET /api/v1/sched; Scheduled tab reads) ---
+    sched_rows: [MAX_SCHED]SchedRow = undefined,
+    sched_count: usize = 0,
+    sched_seen: bool = false, // the first successful list fetch landed ("loading…" vs "no tasks yet")
+    sched_denied: bool = false, // the list GET came back 401/403 — the tab shows "admin token required"
+    // Create-payload hand-off: the full create JSON (three 1200-byte form fields, worst-case 2x escaped)
+    // outgrows Command.text, so the UI writes it HERE under lock and pushes a bare .sched_create; the
+    // poller copies + clears it when it drains that command. One slot — a second create before the poller
+    // wakes (sub-second) overwrites the first, same drop-tolerant discipline as the command ring itself.
+    sched_create_json: [8192]u8 = undefined,
+    sched_create_len: usize = 0,
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

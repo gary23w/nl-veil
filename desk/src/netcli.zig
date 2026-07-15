@@ -141,6 +141,62 @@ pub fn chatControl(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8,
     return httpReq(io, gpa, "POST", port, path, token, body_json, 8);
 }
 
+/// GET /api/v1/chat/convs — the SERVER's conversation list (scheduled_* runs live only there). Short
+/// ceiling: the chat worker folds this into its ~5s sidebar refresh, so a slow server must not stall it.
+pub fn chatConvs(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.chatConvs port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/chat/convs", token, null, 6);
+}
+
+/// GET /api/v1/chat/convs/<conv> — one server conversation's full message log ({role,content,kind,ts}
+/// objects), fetched once to mirror a server-born conv into the local chats dir when it's selected.
+pub fn chatConv(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8) ?Resp {
+    log.trace("netcli.chatConv port={d} conv={s}", .{ port, conv });
+    var pbuf: [200]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/chat/convs/{s}", .{conv}) catch return null;
+    return httpReq(io, gpa, "GET", port, path, token, null, 8);
+}
+
+/// GET /api/v1/sched — the scheduled-task list (admin-gated: a non-admin token 403s and the caller
+/// surfaces it). Short ceiling: the poller refreshes this every few seconds beside the fleet poll.
+pub fn schedList(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.schedList port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/sched", token, null, 6);
+}
+
+/// POST /api/v1/sched — create one scheduled task. `body_json` is the complete task the UI built
+/// (name/prompt/details/kind/at/every_min/hm/enabled + the provider snapshot incl. api_key, which the
+/// server stores write-only). One shot like every POST here — a duplicate task beats a lost one never.
+pub fn schedCreate(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.schedCreate port={d} body_len={d}", .{ port, body_json.len });
+    return httpReq(io, gpa, "POST", port, "/api/v1/sched", token, body_json, 15);
+}
+
+/// POST /api/v1/sched/<id> — update any subset of a task's fields (commonly {"enabled":false}).
+pub fn schedUpdate(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8, body_json: []const u8) ?Resp {
+    log.trace("netcli.schedUpdate port={d} id={s}", .{ port, id });
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/sched/{s}", .{id}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, body_json, 15);
+}
+
+/// DELETE /api/v1/sched/<id> — remove one scheduled task.
+pub fn schedDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
+    log.trace("netcli.schedDelete port={d} id={s}", .{ port, id });
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/sched/{s}", .{id}) catch return null;
+    return httpReq(io, gpa, "DELETE", port, path, token, null, 15);
+}
+
+/// POST /api/v1/sched/<id>/run — fire one task NOW; the server answers {ok,conv:"scheduled_..."}. The
+/// body is an empty object (the server wants none, but a bodyless POST is ambiguous to some stacks).
+pub fn schedRun(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
+    log.trace("netcli.schedRun port={d} id={s}", .{ port, id });
+    var pbuf: [160]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "/api/v1/sched/{s}/run", .{id}) catch return null;
+    return httpReq(io, gpa, "POST", port, path, token, "{}", 15);
+}
+
 /// DELETE /api/v1/swarms/<id> — the server stops the worker and removes its run dir. Needs the bearer key.
 pub fn delete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, id: []const u8) ?Resp {
     log.trace("netcli.delete port={d} id={s}", .{ port, id });

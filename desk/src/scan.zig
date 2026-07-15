@@ -168,6 +168,119 @@ fn jsonInt(line: []const u8, key: []const u8) ?i64 {
     return if (neg) -v else v;
 }
 
+/// Yield the next top-level {...} object of a JSON array, advancing `cur` past it. STRING-AWARE: quotes,
+/// escapes, and braces inside string values never fool the depth count (a needle-only scan truncated
+/// write_file bodies on their first '}' once — same class of bug). Callers point `cur` just past the
+/// opening `[` of the array (e.g. after indexOf("\"tasks\":[")) and loop until null.
+pub fn nextJsonObj(body: []const u8, cur: *usize) ?[]const u8 {
+    var i = cur.*;
+    while (i < body.len and body[i] != '{') : (i += 1) {
+        if (body[i] == ']') break; // end of the array — between objects only ws/commas/']' occur
+    }
+    if (i >= body.len or body[i] != '{') {
+        cur.* = body.len;
+        return null;
+    }
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var j = i;
+    while (j < body.len) : (j += 1) {
+        const c = body[j];
+        if (esc) {
+            esc = false;
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) {
+                    cur.* = j + 1;
+                    return body[i .. j + 1];
+                }
+            },
+            else => {},
+        }
+    }
+    cur.* = body.len;
+    return null;
+}
+
+/// One "key":value pair of a FLAT JSON object. `raw` is the value bytes as they appear on the wire:
+/// for a string that's the STILL-ESCAPED inner slice (between the quotes) — pass it to unescapeInto (or
+/// re-emit it verbatim into another JSON document); for a number/bool it's the bare token.
+pub const JsonPair = struct { key: []const u8, raw: []const u8, is_str: bool };
+
+/// Walk a flat object pair by pair (`cur` starts at 0). Values are consumed token-wise, so a key-shaped
+/// needle INSIDE a free-text string value (a prompt containing `"at":`) can never be misread as a field —
+/// the failure mode that makes indexOf-based field extraction unsafe on user-authored content.
+pub fn nextJsonPair(obj: []const u8, cur: *usize) ?JsonPair {
+    var i = cur.*;
+    while (i < obj.len and obj[i] != '"') i += 1; // seek the next key's opening quote
+    if (i >= obj.len) return null;
+    i += 1;
+    const ks = i;
+    while (i < obj.len and obj[i] != '"') i += 1; // keys in these payloads are plain (no escapes)
+    if (i >= obj.len) return null;
+    const key = obj[ks..i];
+    i += 1;
+    while (i < obj.len and (obj[i] == ' ' or obj[i] == ':')) i += 1;
+    if (i >= obj.len) return null;
+    if (obj[i] == '"') {
+        i += 1;
+        const vs = i;
+        var esc = false;
+        while (i < obj.len) : (i += 1) {
+            if (esc) {
+                esc = false;
+                continue;
+            }
+            if (obj[i] == '\\') esc = true else if (obj[i] == '"') break;
+        }
+        const raw = obj[vs..@min(i, obj.len)];
+        cur.* = @min(i + 1, obj.len);
+        return .{ .key = key, .raw = raw, .is_str = true };
+    }
+    // number / bool / null — runs to the next comma or closing brace
+    const vs = i;
+    while (i < obj.len and obj[i] != ',' and obj[i] != '}') i += 1;
+    const raw = std.mem.trim(u8, obj[vs..i], " ");
+    cur.* = i;
+    return .{ .key = key, .raw = raw, .is_str = false };
+}
+
+/// Unescape a JsonPair's raw STRING slice into `out` (clipping at its cap): \n stays a newline, \t/\r
+/// soften to spaces, \uXXXX collapses to one space (these UI rows render single-line ASCII-ish anyway —
+/// same policy as jsonStr above). Returns the filled prefix of `out`.
+pub fn unescapeInto(raw: []const u8, out: []u8) []const u8 {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len and w < out.len) : (i += 1) {
+        var c = raw[i];
+        if (c == '\\' and i + 1 < raw.len) {
+            i += 1;
+            c = switch (raw[i]) {
+                'n' => '\n',
+                't', 'r' => ' ',
+                'u' => blk: {
+                    i = @min(i + 4, raw.len - 1); // skip the 4 hex digits
+                    break :blk ' ';
+                },
+                else => raw[i],
+            };
+        }
+        out[w] = c;
+        w += 1;
+    }
+    return out[0..w];
+}
+
 /// Read the last `want` newline-delimited records of a (possibly large, actively-written) events.jsonl by
 /// tailing only the final window of the file — the console never needs the whole history, and a swarm's
 /// stream grows to megabytes. Returns the number of Ev written into `out`, oldest-first.

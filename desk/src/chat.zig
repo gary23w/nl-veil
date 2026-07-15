@@ -1396,7 +1396,9 @@ pub const Chat = struct {
             @memcpy(rbuf[0..rlen], self.store.stream_reason[0..rlen]);
             self.store.stream_reason_len = 0;
         }
-        if (rlen > 0) self.appendMsg(dd, .thought, rbuf[0..rlen]);
+        // no observe: server frames are already observed into the SERVER's hippocampus; a desk-side subprocess
+        // observe per committed frame (dozens per turn) stalled the worker thread that pumps the 30Hz stream.
+        if (rlen > 0) self.appendMsgFull(dd, .thought, rbuf[0..rlen], false);
     }
 
     /// Commit the in-flight streamed REPLY as a durable .veil message and clear the live buffer (0 = no-op).
@@ -1410,7 +1412,7 @@ pub const Chat = struct {
             @memcpy(tbuf[0..tlen], self.store.stream_text[0..tlen]);
             self.store.stream_len = 0;
         }
-        if (tlen > 0) self.appendMsg(dd, .veil, tbuf[0..tlen]);
+        if (tlen > 0) self.appendMsgFull(dd, .veil, tbuf[0..tlen], false); // no observe — see scCommitReason
     }
 
     /// Discard any in-flight streamed reply/reasoning preview WITHOUT committing (both buffers).
@@ -1454,7 +1456,10 @@ pub const Chat = struct {
             if (scRawField(line, "content")) |raw| {
                 var buf: [store_mod.STREAM_CAP]u8 = undefined;
                 const content = scUnescape(raw, &buf);
-                if (content.len > 0) self.appendMsg(dd, .veil, content);
+                // no observe: the desk observing the server veil's replies re-creates the confabulation loop the
+                // server side already fixed (its own replies recalled later as "grounded context") — and each
+                // observe is a subprocess spawn on the streaming worker thread.
+                if (content.len > 0) self.appendMsgFull(dd, .veil, content, false);
             }
             return;
         }
@@ -1481,7 +1486,7 @@ pub const Chat = struct {
                 std.fmt.bufPrint(&nb, "[tool:{s}] {s} — {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)], preview[0..@min(preview.len, 220)] }) catch "[tool]"
             else
                 std.fmt.bufPrint(&nb, "[tool:{s}] {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)] }) catch "[tool]";
-            self.appendMsg(dd, .cast_note, note);
+            self.appendMsgFull(dd, .cast_note, note, false); // no observe — a "[tool:x] start" row is not knowledge
             return;
         }
         if (std.mem.eql(u8, kind, "error")) {
@@ -1491,7 +1496,7 @@ pub const Chat = struct {
             const err = if (scRawField(line, "err")) |raw| scUnescape(raw, &buf) else "";
             var nb: [600]u8 = undefined;
             const note = std.fmt.bufPrint(&nb, "(server error: {s})", .{err[0..@min(err.len, 500)]}) catch "(server error)";
-            self.appendMsg(dd, .veil, note);
+            self.appendMsgFull(dd, .veil, note, false); // no observe — an error string is not knowledge
             return;
         }
         if (std.mem.eql(u8, kind, "status")) {
@@ -1510,7 +1515,7 @@ pub const Chat = struct {
                 const t = scUnescape(raw, &buf);
                 if (t.len > 0) {
                     var nb: [160]u8 = undefined;
-                    self.appendMsg(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t);
+                    self.appendMsgFull(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t, false); // no observe
                 }
             }
             // METRICS: the backend's REAL output-token count — preferred over the char/4 proxy for tok/s.
@@ -3049,10 +3054,16 @@ pub const Chat = struct {
             speed = s.speed_mode;
             server_chat = s.server_chat;
         }
+        var port: u16 = 8787;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            port = self.store.settings.port;
+        }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         jb.appendSlice(self.gpa, "{\"kind\":") catch return;
-        jb.print(self.gpa, "{d},\"byok\":{d},\"theme\":{d},\"base\":\"", .{ kind, byok, theme }) catch return;
+        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"base\":\"", .{ kind, port, byok, theme }) catch return;
         escJson(&jb, self.gpa, base[0..base_n]);
         jb.appendSlice(self.gpa, "\",\"model\":\"") catch return;
         escJson(&jb, self.gpa, model[0..model_n]);
@@ -3074,6 +3085,11 @@ pub const Chat = struct {
         self.store.lock();
         defer self.store.unlock();
         const s = &self.store.settings;
+        // server port (absent = 8787): lets a desk instance target a non-default veil server — a second local
+        // server, a test instance, or a remapped install — without a rebuild.
+        if (jInt(data, "port")) |v| {
+            if (v >= 1 and v <= 65535) s.port = @intCast(v);
+        }
         if (jInt(data, "kind")) |v| s.chat_kind = @intCast(@max(0, @min(v, 2)));
         if (jInt(data, "byok")) |v| s.chat_byok = @intCast(@max(0, @min(v, @as(i64, @intCast(catalog.providers.len - 1)))));
         if (jInt(data, "theme")) |v| s.theme = @intCast(@max(0, @min(v, 1)));
@@ -3152,6 +3168,46 @@ pub const Chat = struct {
             rows[n] = row;
             n += 1;
         }
+        // SERVER MERGE: conversations born in the backend (a scheduled task's scheduled_* runs) have no
+        // local file yet — fold the server's list in so they reach the sidebar. A local row wins on id
+        // collision (its mirror may carry a user-edited title); server unreachable/denied → local list only.
+        if (self.runner().chatConvs(self.io, self.gpa)) |resp| {
+            defer if (resp.body.len > 0) self.gpa.free(resp.body);
+            if (resp.status == 200) {
+                if (std.mem.indexOf(u8, resp.body, "\"convs\":[")) |arr| {
+                    var cur = arr + "\"convs\":[".len;
+                    const n_local = n; // only local rows participate in the dup check — server rows can't self-collide
+                    while (n < rows.len) {
+                        const obj = scan.nextJsonObj(resp.body, &cur) orelse break;
+                        var row: store_mod.ConvRow = .{};
+                        var pc: usize = 0;
+                        while (scan.nextJsonPair(obj, &pc)) |p| {
+                            if (p.is_str and std.mem.eql(u8, p.key, "id")) {
+                                // an id the ConvRow can't hold verbatim can't round-trip a select — skip the row
+                                if (p.raw.len == 0 or p.raw.len > row.id.len) break;
+                                @memcpy(row.id[0..p.raw.len], p.raw); // safeSeg ids carry no escapes
+                                row.id_len = @intCast(p.raw.len);
+                            } else if (p.is_str and std.mem.eql(u8, p.key, "title")) {
+                                row.title_len = @intCast(scan.unescapeInto(p.raw, &row.title).len);
+                            } else if (!p.is_str and std.mem.eql(u8, p.key, "updated")) {
+                                row.mtime_s = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+                            }
+                        }
+                        if (row.id_len == 0) continue;
+                        var dup = false;
+                        for (rows[0..n_local]) |*r| {
+                            if (std.mem.eql(u8, r.idStr(), row.idStr())) {
+                                dup = true;
+                                break;
+                            }
+                        }
+                        if (dup) continue;
+                        rows[n] = row;
+                        n += 1;
+                    }
+                }
+            }
+        }
         std.mem.sort(store_mod.ConvRow, rows[0..n], {}, struct {
             fn lt(_: void, a: store_mod.ConvRow, b: store_mod.ConvRow) bool {
                 return a.mtime_s > b.mtime_s;
@@ -3170,7 +3226,13 @@ pub const Chat = struct {
     fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8) void {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return;
-        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch return;
+        const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch blk: {
+            // No local file: a SERVER-born conversation (a scheduled_* run merged into the sidebar by
+            // refreshConvs). Mirror it down once, then load through the unchanged local path — every
+            // later append/rename/delete works on the mirror exactly like a native chat.
+            if (!self.mirrorServerConv(dd, id)) return;
+            break :blk Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch return;
+        };
         defer self.gpa.free(data);
         self.store.lock();
         defer self.store.unlock();
@@ -3200,6 +3262,61 @@ pub const Chat = struct {
         }
     }
 
+    /// Fetch a SERVER conversation's message log (GET /api/v1/chat/convs/:id → {ok,id,messages:[{role,
+    /// content,kind,ts}]}) and lay down a local mirror in the exact persistConv format: the {"title"} header
+    /// line + one {"r":N,"t":"..."} line per message. Roles map user→.user, assistant→.veil, anything
+    /// tool-ish→.cast_note (loadMsgs' numeric codes). The server's content arrives ALREADY JSON-escaped and
+    /// is re-emitted verbatim — its escape repertoire (incl. \uXXXX) is exactly what loadMsgs' unescape
+    /// reads. Returns false when the server can't produce the conv (down / 404 / denied) — select no-ops.
+    fn mirrorServerConv(self: *Chat, dd: []const u8, id: []const u8) bool {
+        const resp = self.runner().chatConv(self.io, self.gpa, id) orelse return false;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return false;
+        const arr = std.mem.indexOf(u8, resp.body, "\"messages\":[") orelse return false;
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        // title: the sidebar row refreshConvs merged from the server list (or the id when it hasn't landed yet)
+        var titleb: [64]u8 = undefined;
+        var title_n: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            var i: usize = 0;
+            while (i < self.store.conv_count) : (i += 1) {
+                if (std.mem.eql(u8, self.store.convs[i].idStr(), id)) {
+                    title_n = self.store.convs[i].title_len;
+                    @memcpy(titleb[0..title_n], self.store.convs[i].title[0..title_n]);
+                    break;
+                }
+            }
+        }
+        jb.appendSlice(self.gpa, "{\"title\":\"") catch return false;
+        escJson(&jb, self.gpa, if (title_n > 0) titleb[0..title_n] else id);
+        jb.appendSlice(self.gpa, "\"}\n") catch return false;
+        var cur = arr + "\"messages\":[".len;
+        while (scan.nextJsonObj(resp.body, &cur)) |obj| {
+            var role: u8 = 2; // default: anything that isn't a user/assistant turn folds in as a .cast_note
+            var raw: []const u8 = "";
+            var pc: usize = 0;
+            while (scan.nextJsonPair(obj, &pc)) |p| {
+                if (p.is_str and std.mem.eql(u8, p.key, "role")) {
+                    role = if (std.mem.eql(u8, p.raw, "user")) 0 else if (std.mem.eql(u8, p.raw, "assistant") or std.mem.eql(u8, p.raw, "veil")) 1 else 2;
+                } else if (p.is_str and std.mem.eql(u8, p.key, "content")) {
+                    raw = p.raw;
+                }
+            }
+            if (raw.len == 0) continue;
+            jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{role}) catch return false;
+            jb.appendSlice(self.gpa, raw) catch return false; // still-escaped server JSON, byte-compatible with loadMsgs
+            jb.appendSlice(self.gpa, "\"}\n") catch return false;
+        }
+        var pb: [700]u8 = undefined;
+        const path = convPath(dd, id, &pb) orelse return false;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch return false;
+        log.info("chat: mirrored server conv {s} ({d}b)", .{ id, jb.items.len });
+        return true;
+    }
+
     fn rewriteTitle(self: *Chat, dd: []const u8, id: []const u8, title: []const u8) void {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return;
@@ -3226,11 +3343,14 @@ pub const Chat = struct {
     fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool) void {
         var idb: [32]u8 = undefined;
         var idn: usize = 0;
+        var evicted = false; // ring eviction shifted rows → the file must be fully rewritten, not appended
+        var tn: usize = 0; // the STORED (possibly clipped) text length — the file must match the store byte-for-byte
         {
             self.store.lock();
             defer self.store.unlock();
             idn = self.store.conv_active_len;
             @memcpy(idb[0..idn], self.store.conv_active[0..idn]);
+            evicted = self.store.msg_count >= store_mod.MAX_CHAT_MSGS;
             if (self.store.msg_count >= store_mod.MAX_CHAT_MSGS) {
                 // PIN THE GOAL: slot 0 is the conversation's original user request — evicting it erased the
                 // assignment from both the model's context and the persisted file mid-build (the live neuronet
@@ -3243,7 +3363,7 @@ pub const Chat = struct {
                 if (self.reflect_msg_idx) |mi| self.reflect_msg_idx = if (mi > lo) mi - 1 else if (mi == lo) null else mi;
             }
             var m: store_mod.ChatMsg = .{ .role = role };
-            const tn = @min(text.len, m.text.len);
+            tn = @min(text.len, m.text.len);
             @memcpy(m.text[0..tn], text[0..tn]);
             m.text_len = @intCast(tn);
             self.store.msgs[self.store.msg_count] = m;
@@ -3254,7 +3374,30 @@ pub const Chat = struct {
         // ring eviction and can be relevance-recalled into future prompts (esp. a cast's synthesis digest, which
         // otherwise ages out as one [cast] message). No-op when neuron-db is disabled.
         if (do_observe) self.mind().observe(idb[0..idn], text);
-        self.persistConv(dd, idb[0..idn]);
+        // FAST PATH: a plain append writes ONE line (O(1)). The full whole-file rewrite — which during a server
+        // turn ran per tool/status frame and scaled with history length, on sync-watched storage — is only needed
+        // when the ring evicted (rows shifted) or the file doesn't exist yet (fresh conv needs its title header).
+        if (evicted or !self.persistAppendMsg(dd, idb[0..idn], role, text[0..tn]))
+            self.persistConv(dd, idb[0..idn]);
+    }
+
+    /// Append ONE message line to the conv file. Returns false when the caller must do the full persistConv
+    /// instead: the file is missing (a fresh conv needs the {"title"} header line first) or the stat/write failed.
+    /// Single-writer (only this chat worker touches the file), so stat→positioned-write needs no lock here.
+    fn persistAppendMsg(self: *Chat, dd: []const u8, conv_id: []const u8, role: store_mod.ChatRole, text: []const u8) bool {
+        var pb: [700]u8 = undefined;
+        const path = convPath(dd, conv_id, &pb) orelse return false;
+        const st = Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
+        if (st.size == 0) return false; // header not written yet — let the full persist lay it down
+        var jb: std.ArrayListUnmanaged(u8) = .empty;
+        defer jb.deinit(self.gpa);
+        jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{@intFromEnum(role)}) catch return false;
+        escJson(&jb, self.gpa, text);
+        jb.appendSlice(self.gpa, "\"}\n") catch return false;
+        const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch return false;
+        defer f.close(self.io);
+        f.writePositionalAll(self.io, jb.items, st.size) catch return false;
+        return true;
     }
 
     /// Replace message `idx` IN PLACE (role + text) and re-persist — the in-place revision primitive. The
