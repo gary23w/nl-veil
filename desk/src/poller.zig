@@ -340,8 +340,8 @@ pub const Poller = struct {
     }
 
     /// Keep the API token in sync with <data>/.desktop_key each poll — the server may (re)write it AFTER
-    /// the desktop started or rotate it, and a stale token was silently rejecting deploy + delete (fixed by
-    /// a restart before). Skips if the user manually saved their own token.
+    /// the desktop started or rotate it, and a stale token silently rejects deploy + delete. Skips if the
+    /// user manually saved their own token.
     fn syncDesktopKey(self: *Poller, dd: []const u8) void {
         log.trace("poller.syncDesktopKey dd={s}", .{dd});
         {
@@ -427,10 +427,10 @@ pub const Poller = struct {
         var ver_len: u8 = 0;
         if (now_s - self.last_fleet_s >= FLEET_EVERY_S) {
             self.last_fleet_s = now_s;
-            // Liveness comes from the fleet GET itself — do NOT do a separate raw TCP probe. serverOnline()
-            // opened a connection and closed it WITHOUT sending a request, which left the server half-open
-            // (CLOSE_WAIT) with a worker thread spinning on the dead socket — a handful of those pinned ~7
-            // CPU cores. The fleet curl sends a real request with `Connection: close`, so the server closes cleanly.
+            // Liveness comes from the fleet GET itself — do NOT do a separate raw TCP probe. A
+            // connect-and-close with no request left the server half-open (CLOSE_WAIT) with a worker thread
+            // spinning on the dead socket, pinning CPU cores. The fleet curl sends a real request with
+            // `Connection: close`, so the server closes cleanly.
             var raw_ok = false;
             if (netcli.fleet(self.io, self.gpa, self.port())) |resp| {
                 raw_ok = true;
@@ -636,7 +636,7 @@ pub const Poller = struct {
             self.prev_live_n += 1;
         }
 
-        // zero-gradient sentinel firing on the OPEN swarm → surface it (it's the RSI signal we shipped)
+        // zero-gradient sentinel firing on the OPEN swarm → surface it
         if (sel.len > 0 and sel_metrics.gradient_warn and !self.grad_warned) {
             self.store.pushNotif("Zero-gradient warning", "edits aren't reaching the failing check", 2);
             self.grad_warned = true;

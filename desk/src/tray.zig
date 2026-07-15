@@ -1,8 +1,8 @@
 //! tray.zig — the OS system-tray presence + native notifications. On Windows it owns a real
-//! Shell_NotifyIcon icon anchored to a HIDDEN message window we create (v1 anchored to GetConsoleWindow,
-//! which is null under the Windows GUI subsystem — so no icon ever appeared). A per-frame `pump()` drains
-//! that window's message queue so tray clicks reach us (double-click → restore the app). Linux/macOS
-//! degrade to no-op stubs; the always-present in-app toast (drawn by the UI) is the cross-platform floor.
+//! Shell_NotifyIcon icon anchored to a HIDDEN message window we create (GetConsoleWindow is null under
+//! the Windows GUI subsystem, so it can't host the icon). A per-frame `pump()` drains that window's
+//! message queue so tray clicks reach us (double-click → restore the app). Linux/macOS degrade to no-op
+//! stubs; the always-present in-app toast (drawn by the UI) is the cross-platform floor.
 
 const std = @import("std");
 const builtin = @import("builtin");

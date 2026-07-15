@@ -26,10 +26,9 @@ pub const Line = struct {
     }
 };
 
-// Bumped from 512: whole-app function-entry tracing (see `trace`) is FAR heavier volume than the old
-// info/warn/err-only log ever was, and a small ring would evict real signal (errors, tool calls, cast
-// lifecycle) behind a firehose of trace lines within seconds. 8192 lines * 220B = ~1.8MB, fine for a
-// desktop app's static data.
+// Sized for whole-app function-entry tracing (see `trace`), which is FAR heavier volume than an
+// info/warn/err-only log: a small ring would evict real signal (errors, tool calls, cast lifecycle) behind a
+// firehose of trace lines within seconds. 8192 lines * 220B = ~1.8MB, fine for a desktop app's static data.
 const CAP = 8192;
 
 var g_lines: [CAP]Line = undefined;
@@ -91,10 +90,8 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
 
 /// Function-entry tracing: one call at the top of (almost) every non-hot-path function in the desktop app,
 /// so a live run's veil-desk.log reads as a call trace (which function ran, in what order, with what key
-/// arguments) — the exact thing that was MISSING when root-causing the DSML lock-up / crash bug. Deliberately
-/// excluded from main.zig's per-frame draw/render functions (60fps would flood the ring and defeat the
-/// purpose); everything else gets one. Gated by `g_trace_on` (default on) so it can be silenced without a
-/// rebuild if the volume ever gets in the way.
+/// arguments). Deliberately excluded from main.zig's per-frame draw/render functions (60fps would flood the
+/// ring and defeat the purpose). Gated by `g_trace_on` (default on) so it can be silenced without a rebuild.
 pub fn trace(comptime fmt: []const u8, args: anytype) void {
     if (!g_trace_on.load(.monotonic)) return;
     emit(.dbg, fmt, args);

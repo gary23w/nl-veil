@@ -74,8 +74,7 @@ pub const Db = struct {
     /// whose text CONTAINS `match` (substring), so an outcome-confirmed fact out-ranks its neighbours in later
     /// recall. Unlike reinforce()/note_stance it NEVER mints a new fact and never rewrites text — outcome
     /// feedback keyed on arbitrary text (a recalled lesson, a user prompt) can only re-rank what was actually
-    /// learned, never invent a memory from its own key. This is the fix for the recalled-lesson pollution:
-    /// reinforce() on a raw prompt minted "<prompt>: worked" straight into the lesson scope. No-op on any failure.
+    /// learned, never invent a memory from its own key. No-op on any failure.
     pub fn strengthen(self: Db, scope: []const u8, match: []const u8) void {
         log.trace("neuron.Db.strengthen scope={s} match_len={d}", .{ scope, match.len });
         const m = std.mem.trim(u8, match, " \r\n\t");

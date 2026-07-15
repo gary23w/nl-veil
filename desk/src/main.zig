@@ -1,8 +1,7 @@
-//! veil-desk — the native desktop dashboard for nl-veil. A borderless (own-chrome) window with five tabs
-//! (Dashboard / Deploy / Swarm / Hub / Settings) styled in the web UI's Tokyo Night palette. Same-machine
-//! companion: a background poller thread owns io and reads the run directories directly, while this (main)
-//! thread runs raylib and draws the Store. Deploy with the full swarm config, chat/monitor/stop a swarm,
-//! watch the live event console + metrics, connect hives from the Hub tab.
+//! veil-desk — the native desktop dashboard for nl-veil: a borderless (own-chrome) raylib window styled in
+//! the web UI's Tokyo Night palette. Same-machine companion — a background poller thread owns io and reads
+//! the run directories directly, while this (main) thread runs raylib and draws the Store. Deploy swarms,
+//! chat/monitor/stop them, and watch the live event console + metrics.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,10 +25,10 @@ const Tab = store_mod.Tab;
 pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 
 // The server spawns us with `.stderr = .ignore`, so a ReleaseSafe panic (bounds violation, unreachable,
-// unwrapped null) dies SILENTLY — the log just stops mid-turn and the exact fault is lost. That made a
-// real streaming-turn crash undiagnosable. Install a panic handler that appends the panic message +
-// return address to a durable file BEFORE the normal panic path runs, so any recurrence is pinpointable
-// regardless of how the desk was launched. Best-effort and allocation-free — we may be in a corrupt state.
+// unwrapped null) dies SILENTLY — the log just stops mid-turn and the fault is lost. Install a panic handler
+// that appends the panic message + return address to a durable file BEFORE the normal panic path runs, so a
+// recurrence is pinpointable regardless of how the desk was launched. Best-effort and allocation-free — we
+// may be in a corrupt state.
 pub const panic = std.debug.FullPanic(deskPanic);
 
 fn deskPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -56,8 +55,7 @@ const TITLE_H = 34;
 const TAB_H = 38;
 
 // Titlebar interactive zones — ONE definition shared by drawTitlebar (pixels) and handleWindowChrome
-// (drag hit-test). They used to be two hand-kept sets of magic numbers that had already drifted apart:
-// the right half of the File button both dragged the window AND opened the menu.
+// (drag hit-test) so the drag zone and the rendered rects can't drift apart.
 fn tbFileRect() t.Rect {
     return .{ .x = 70, .y = 5, .width = 46, .height = TITLE_H - 10 };
 }
@@ -79,18 +77,17 @@ const Ui = struct {
     focus: Focus = .none,
     input_active: bool = false, // handleKeys/editField set this when they consume a keystroke — drives FPS
     hot_frames: u32 = 0, // frames of snappy 60fps remaining after the last activity (activity-gated redraw)
-    // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) was the
-    // client CPU chug on long chats. Cache heights; recompute only when the message set or wrap width changes.
-    // INCREMENTAL: per-row fingerprints (mh_mfp) so a change re-measures only the changed/new rows — a server
-    // turn commits a frame every few hundred ms, and re-wrapping the WHOLE transcript per commit was the
-    // "incredibly slow since the REST migration" desk chug (the cost scaled with history length × commit rate).
+    // Chat message render-height cache: word-wrapping every message twice per frame (measure + draw) pins a
+    // CPU core on long chats. Cache heights; recompute only when the message set or wrap width changes.
+    // INCREMENTAL: per-row fingerprints (mh_mfp) so a change re-measures only the changed/new rows (re-wrapping
+    // the WHOLE transcript on every few-hundred-ms server commit scaled cost with history length × commit rate).
     mh: [store_mod.MAX_CHAT_MSGS]f32 = undefined,
     mh_mfp: [store_mod.MAX_CHAT_MSGS]u64 = undefined,
     mh_count: usize = 0,
     mh_cols: usize = 0,
     mh_fp: u64 = 0,
-    // live-stream measure cache: the growing preview only re-wraps when its length actually changed (it was
-    // re-measured EVERY frame at 30-60fps while busy, on top of the transcript rebuilds).
+    // live-stream measure cache: the growing preview only re-wraps when its length actually changed (not
+    // every frame at 30-60fps while busy).
     stream_h: f32 = 0,
     stream_h_len: usize = std.math.maxInt(usize),
     stream_h_cols: usize = 0,
@@ -336,25 +333,22 @@ pub fn main() !void {
     }
 
     // Borderless: we draw our own title bar (drag / File / minimize / close). Resizable stays on so the
-    // grip in the corner can drive setWindowSize. 60fps focused so scrolling/typing/hover feel instant (a
-    // 2D UI is trivial GPU load — the "machine got hot" was the swarm+poll load, not the UI); we drop to a
-    // low idle FPS when the window is in the background (heat control) below.
+    // grip in the corner can drive setWindowSize. 60fps focused so scrolling/typing/hover feel instant; we
+    // drop to a low idle FPS when the window is in the background (heat control) below.
     rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true });
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
     defer rl.closeWindow();
     defer t.deinit();
-    // Escape is raylib's default EXIT key — but here it's the documented "unfocus the input" key
-    // (handleKeys), so left at default it QUIT THE APP the first time someone escaped a text field.
+    // Escape is raylib's default EXIT key, but here it's the "unfocus the input" key (handleKeys) — leaving
+    // it as the exit key would quit the app whenever someone escapes a text field.
     rl.setExitKey(.null);
     rl.setTargetFPS(60);
 
-    // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load
-    // at a HIGH base size (48) so the atlas is high-res and downscaling to 11-22px stays crisp (loading
-    // near the render size left small text blurry — the "broken" look); bilinear smooths the scale.
-    // Crisp at every render size (11..22px) from the one 48px atlas: generate mipmaps and use TRILINEAR so
-    // downscaling picks the right mip level instead of bilinear-minifying a 48px glyph to 12px (that soft,
-    // "unresponsive"-looking blur). Mipmaps + trilinear is the standard raylib recipe for multi-size fonts.
+    // Real TTFs replace raylib's blocky default: a proportional UI font + a monospace console font. Load at
+    // a HIGH base size (48) and generate mipmaps + TRILINEAR filtering so downscaling to 11..22px picks the
+    // right mip level and stays crisp (loading near the render size, or bilinear-minifying a 48px glyph to
+    // 12px, leaves small text blurry). Mipmaps + trilinear is the standard raylib recipe for multi-size fonts.
     var ui_loaded = false;
     var mono_loaded = false;
     if (loadFontAt(uiCandidates(), 48)) |f| {
@@ -392,10 +386,9 @@ pub fn main() !void {
     syncThemeFromStore(&store);
 
     // AUTOMATION HOOK — poll <data>/.veil-desk/SIM.txt: whenever it exists AND the chat is idle + connected,
-    // send its contents as a chat message and delete it. This drives MULTI-TURN STEERING sims — drop the next
-    // SIM.txt after each answer lands and the veil is steered again — with zero synthetic UI input (a borderless
-    // window delivers that unreliably). No trigger file = normal run (no-op). `sim_mode` (set once any trigger
-    // fires) holds 30fps so a headless, unfocused run's turn/cast poll stays responsive.
+    // send its contents as a chat message and delete it. Drives multi-turn steering sims with zero synthetic
+    // UI input (a borderless window delivers that unreliably); no trigger file = normal run (no-op). `sim_mode`
+    // (set once any trigger fires) holds 30fps so a headless, unfocused run's turn/cast poll stays responsive.
     var sim_ticks: u32 = 0;
     var sim_mode = false;
 
@@ -414,10 +407,9 @@ pub fn main() !void {
         const busy0 = store.chat_busy;
         store.unlock();
         // Activity-gated frame rate. This is an immediate-mode UI: EVERY frame re-lays-out + redraws every chat
-        // message's markdown, so holding 60fps while the user is just READING pins a CPU core (worse with more
-        // messages/tabs — the "client chugs" report, even on a hosted model that does ZERO client compute).
-        // Stay at 60 only when something is actually changing — mouse activity, a keystroke, or a live token
-        // stream — and idle down otherwise. Input is still polled every frame; only the redraw rate drops.
+        // message's markdown, so holding 60fps while the user is just READING pins a CPU core. Stay at 60 only
+        // when something is actually changing — mouse activity, a keystroke, or a live token stream — and idle
+        // down otherwise. Input is still polled every frame; only the redraw rate drops.
         {
             const mdelta = rl.getMouseDelta();
             const mouse_active = mdelta.x != 0 or mdelta.y != 0 or rl.isMouseButtonDown(.left) or rl.isMouseButtonDown(.right) or rl.getMouseWheelMove() != 0;
@@ -645,7 +637,7 @@ fn handleWindowChrome() void {
         } else ui.resizing = false;
     }
     // title-bar drag (empty zone only: not over window controls, File, or the theme selector — the SAME
-    // rects drawTitlebar renders, so the drag zone can never drift out of sync with the pixels again)
+    // rects drawTitlebar renders, so the drag zone stays in sync with the pixels)
     const over_file = rl.checkCollisionPointRec(mp, tbFileRect());
     const over_theme = rl.checkCollisionPointRec(mp, tbThemeRect());
     const in_title = mp.y >= 0 and mp.y < TITLE_H and mp.x < sw - 142 and !(over_file or over_theme);
@@ -659,8 +651,8 @@ fn handleWindowChrome() void {
     if (ui.dragging) {
         if (rl.isMouseButtonDown(.left)) {
             // Absolute tracking: keep the grabbed point under the cursor. getMouseDelta() is window-relative,
-            // and moving the window shifts the mouse's window coords, corrupting the delta into a jitter loop —
-            // which is why dragging didn't work. screen_mouse = windowPos + mousePos; new = screen_mouse - grab.
+            // and moving the window shifts the mouse's window coords, corrupting the delta into a jitter loop.
+            // screen_mouse = windowPos + mousePos; new = screen_mouse - grab.
             const p = rl.getWindowPosition();
             const m = rl.getMousePosition();
             rl.setWindowPosition(@intFromFloat(p.x + m.x - ui.drag_grab_x), @intFromFloat(p.y + m.y - ui.drag_grab_y));
@@ -786,9 +778,8 @@ fn drawResizeGrip() void {
 // -------------------------------------------------------------------------------- setup
 
 // ASCII 32..126, PLUS the full Latin-1 supplement (0xA0..0xFF) and the General-Punctuation dashes/quotes.
-// The run data (LLM-authored goals) is littered with these and they were rendering as '?': "World?Bank"
-// was a non-breaking space (0xA0), "per?capita" a non-breaking hyphen (0x2011). Requesting the real
-// codepoints from the TTF makes them render as the proper space/dash instead of tofu.
+// LLM-authored goal text is littered with these (non-breaking space 0xA0, non-breaking hyphen 0x2011, …);
+// requesting the real codepoints from the TTF renders them as the proper space/dash instead of tofu ('?').
 const glyph_set = blk: {
     const extra = [_]i32{ 0x2010, 0x2011, 0x2012, 0x2013, 0x2014, 0x2015, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2026, 0x2192, 0x25CF, 0x25CB };
     // Math glyphs so LaTeX-ish formulas render legibly (see mdutil.mathToUnicode): fraction slash, arrows,
@@ -831,9 +822,9 @@ const glyph_set = blk: {
     break :blk arr;
 };
 
-// Two fonts, matching the ask: a clean proportional SANS for the UI (Calibri on Windows — modern +
-// rounded, deliberately NOT Segoe UI) and a MONOSPACE for the log console so its columns align. Per-OS
-// fallbacks pick the nearest clean sans / mono.
+// Two fonts: a clean proportional SANS for the UI (Calibri on Windows — modern + rounded, deliberately NOT
+// Segoe UI) and a MONOSPACE for the log console so its columns align. Per-OS fallbacks pick the nearest
+// clean sans / mono.
 fn uiCandidates() []const [:0]const u8 {
     return switch (builtin.os.tag) {
         .windows => &.{ "C:/Windows/Fonts/calibri.ttf", "C:/Windows/Fonts/corbel.ttf", "C:/Windows/Fonts/candara.ttf", "C:/Windows/Fonts/segoeui.ttf" },
@@ -1014,13 +1005,12 @@ fn pumpTray(store: *Store, tray: *tray_mod.Tray, gpa: std.mem.Allocator) void {
 
 // -------------------------------------------------------------------------------- input
 
-/// Switch tabs from ANY input path (digit shortcut or tab click). Resetting open_dd here is what keeps a
-/// dropdown opened on one tab from bleeding onto — or silently blocking every text field of — the next tab:
-/// the keyboard path skipped this reset before, so a stray open dropdown could wedge focus (and thus Ctrl+V
-/// paste / Ctrl+C copy, which only run on the focused field). Landing focus in the chat input on the way into
-/// Chat means you can just start typing — and lets the whole app be driven from the keyboard. When the switch
-/// is triggered by a digit key, that same keypress also queued a character; swallow it so "2" doesn't type a
-/// literal '2' into the input it just focused.
+/// Switch tabs from ANY input path (digit shortcut or tab click). Resetting open_dd here keeps a dropdown
+/// opened on one tab from bleeding onto — or silently blocking every text field of — the next tab (a stray
+/// open dropdown wedges focus, and thus Ctrl+V/Ctrl+C, which only run on the focused field). Landing focus
+/// in the chat input on the way into Chat lets the app be driven from the keyboard. When a digit key triggers
+/// the switch, that keypress also queued a character; swallow it so "2" doesn't type a literal '2' into the
+/// input it just focused.
 fn setTab(tabv: Tab) void {
     ui.tab = tabv;
     ui.open_dd = .none;
@@ -1043,9 +1033,8 @@ fn handleKeys(store: *Store) void {
         if (rl.isKeyPressed(.six)) setTab(.settings);
         if (rl.isKeyPressed(.seven)) setTab(.scheduled);
     }
-    // Keyboard copy — ONE priority chain, NOT gated on focus. The Chat tab force-focuses the prompt
-    // input (setTab) and clicks never clear focus, so the old focus==.none gate made "select text,
-    // Ctrl+C" unreachable there: editField copied the (usually empty) input instead of the selection.
+    // Keyboard copy — ONE priority chain, NOT gated on focus (the Chat tab force-focuses the prompt input and
+    // clicks never clear focus, so a focus gate would make "select text, Ctrl+C" copy the empty input instead):
     //   1. an active drag-selection   2. Ctrl+Shift+C → the WHOLE conversation
     //   3. the focused field's text (when non-empty)   4. the LAST veil answer
     {
@@ -1121,9 +1110,9 @@ fn editField(f: *Ui.Field) void {
         for (clip) |raw_ch| {
             // multi-line pastes flatten to spaces instead of being silently dropped
             const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
-            // Accept UTF-8 (any byte >= 128) as well as printable ASCII — the old `< 127` cap silently dropped
-            // every non-ASCII byte, so pasting text with smart quotes, em-dashes, or accents lost characters.
-            // The renderer folds these to ASCII for display, but the field keeps the real bytes to send/copy.
+            // Accept UTF-8 (any byte >= 128) as well as printable ASCII, so smart quotes, em-dashes, and accents
+            // survive a paste. The renderer folds these to ASCII for display, but the field keeps the real bytes
+            // to send/copy.
             if (ch >= 32 and ch != 127) {
                 if (ch == ' ' and f.cur > 0 and f.buf[f.cur - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
                 f.insert(ch);
@@ -1281,9 +1270,8 @@ fn drawRoster(store: *Store, r: t.Rect) void {
         if (is_sel) t.panel(rr, t.bg_sel) else if (hot) t.panel(rr, t.bg_hl);
         t.statusDot(@intFromFloat(rr.x + 14), @intFromFloat(rr.y + rr.height / 2), if (deleting) t.red else if (sw.live) t.green else if (sw.stopped) t.comment else t.yellow);
         const name_c = if (deleting) t.comment else t.fg;
-        // Reserve only ~130px on the right for the round/status columns. The old 236 reserve left the
-        // name ~22px in the narrow (270px) swarm-tab panel → "sw.." — unreadable. This keeps the name
-        // wide in both the wide dashboard row and the narrow side panel while clearing the right block.
+        // Reserve only ~130px on the right for the round/status columns, so the name stays wide in both the
+        // wide dashboard row and the narrow (270px) swarm-tab side panel while clearing the right block.
         const name_w: f32 = @max(48, rr.width - 130);
         t.textClip(sw.nameStr(), @intFromFloat(rr.x + 30), @intFromFloat(rr.y + 7), 14, name_c, @intFromFloat(name_w));
         if (sw.goal_len > 0) t.textClip(sw.goalStr(), @intFromFloat(rr.x + 30), @intFromFloat(rr.y + 26), 12, t.comment, @intFromFloat(name_w));
@@ -1341,8 +1329,8 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var msgs: [store_mod.MAX_CHAT_MSGS]store_mod.ChatMsg = undefined;
     const msg_n = store.msg_count;
     @memcpy(msgs[0..msg_n], store.msgs[0..msg_n]);
-    // sized by the store's own constant + clamped: THE crash of the first build simulation was this snapshot
-    // hardcoded at [8192] while stream_text is 16K — the first streaming reply past 8KB was an instant OOB.
+    // sized by the store's own constant (STREAM_CAP) + clamped — never hardcode a smaller size than
+    // stream_text, or a streaming reply past that size is an instant OOB.
     var stream_buf: [store_mod.STREAM_CAP]u8 = undefined;
     const stream_n = @min(store.stream_len, stream_buf.len);
     @memcpy(stream_buf[0..stream_n], store.stream_text[0..stream_n]);
@@ -1395,9 +1383,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var inflight_buf: [18432]u8 = undefined;
     const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
 
-    // Only the NEWEST row can be the live cast (updateCastRow only ever writes casts[n-1]) — scanning ALL rows let
-    // one historical row orphaned mid-"running" (a conv-switch/stop seam that dropped the watch) pin the green
-    // "the hive is working" bar forever, even in a brand-new conversation.
+    // Only the NEWEST row can be the live cast (updateCastRow only ever writes casts[n-1]). Scanning ALL rows
+    // would let a historical row orphaned mid-"running" (a conv-switch/stop seam) pin the green "hive is
+    // working" bar forever, even in a brand-new conversation.
     var cast_live = false;
     if (cast_n > 0) {
         const c = &casts[cast_n - 1];
@@ -1437,9 +1425,8 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(body_y), @intFromFloat(r.width - 2), @intFromFloat(body_h));
     const line_h: f32 = 15;
     const cols: usize = @intFromFloat(@max(8, (r.width - 16) / 7)); // ~7px per mono glyph at size 12
-    // Wrap the scrollback into display lines as a RING keeping the NEWEST slice.len lines — the old
-    // fill-from-the-start + hard-break pinned the view to STALE content once a full 16KB store ring
-    // wrapped past the array (the console looked frozen while new output landed invisibly below).
+    // Wrap the scrollback into display lines as a RING keeping the NEWEST slice.len lines, so a full 16KB
+    // store ring that wraps past the line array still shows the live tail rather than stale content.
     var lines: [512][]const u8 = undefined;
     var ln: usize = 0; // total wrapped lines produced; the ring keeps the newest @min(ln, lines.len)
     var it = std.mem.splitScalar(u8, scroll, '\n');
@@ -1546,11 +1533,11 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
     }
 }
 
-/// Compose the streaming display: reasoning as a `> ` blockquote, a blank line, then the answer. Matches
-/// how a finished veil message is stored (Chat.appendVeil), so the live view and the settled view agree.
-/// While a turn STREAMS a tool call, the raw `TOOL: write_file {"content":"<!DOCTYPE…"}` — a whole escaped file —
-/// otherwise dumps into the chat as a wall of JSON until the turn settles and collapses to a chip. Detect the
-/// tool-call prefix live and return a compact one-line placeholder ("writing snake.html…"); null if not a tool call.
+/// Compose the streaming display: reasoning as a `> ` blockquote, a blank line, then the answer. Matches how
+/// a finished veil message is stored (Chat.appendVeil), so the live view and the settled view agree. When a
+/// turn streams a tool call, detect the prefix live and return a compact one-line placeholder ("writing
+/// snake.html…") — otherwise the raw escaped `TOOL: write_file {…}` dumps a wall of JSON until the turn
+/// settles. Returns null if not a tool call.
 fn streamToolLabel(content: []const u8, buf: []u8) ?[]const u8 {
     const c = std.mem.trimStart(u8, content, " \r\n\t");
     var name: []const u8 = "";
@@ -1660,7 +1647,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
 
     const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
     const row_h: f32 = 42;
-    // wheel-scroll the list (it had no offset at all — rows past the pane bottom were unreachable)
+    // wheel-scroll the conversation list
     const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h;
     const max_scroll = if (total > list.height) total - list.height else 0;
     const wheel = rl.getMouseWheelMove();
@@ -1825,12 +1812,11 @@ fn isConsoleMsg(text_: []const u8) bool {
 const CONSOLE_CAP: usize = 24; // output rows a console card shows before a "+K more lines" footer (bounds a dump)
 
 /// Draw (or, with draw=false, just measure) a folded shell result "[console]\n$ cmd\n<output>" as a styled
-/// terminal CARD — the counterpart to the fenced-code panel, but for the AI's RUN: door (it replaces the ugly
-/// plain-prose "[console]" line). Reuses the code-panel shell (rounded, bordered, bg_hl@170 fill, mono rows) so
-/// it belongs to the same family, and adds traffic-light dots + a "console" header, a status-colored left accent
-/// bar, a green "$" prompt + bright command, then dim mono output (capped, with a "+K more lines" footer), and a
-/// quiet green dot on success / a labeled colored pill on failure. `card_top` is the y after renderMsg's reserved
-/// MSG_HEAD_H row. Height derives PURELY from the text (scan.parseConsole), so measure and draw never disagree.
+/// terminal CARD — the counterpart to the fenced-code panel, for the AI's RUN: door. Reuses the code-panel
+/// shell (rounded, bordered, bg_hl@170 fill, mono rows), adding traffic-light dots + a "console" header, a
+/// status-colored left accent bar, a "$" prompt + command, dim mono output (capped, with a "+K more lines"
+/// footer), and a status dot/pill. `card_top` is the y after renderMsg's reserved MSG_HEAD_H row. Height
+/// derives PURELY from the text (scan.parseConsole), so measure and draw never disagree.
 fn renderConsole(view: t.Rect, card_top: f32, text_: []const u8, fsz: i32, draw: bool) f32 {
     var out: [MSG_MAX_LINES][]const u8 = undefined;
     const p = scan.parseConsole(text_, &out);
@@ -2030,7 +2016,7 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
                 }
                 src = tl[ord_len..];
             } else {
-                lb[w] = 0xE2; // "•" (U+2022 — foldAscii now passes it through as a real bullet)
+                lb[w] = 0xE2; // "•" (U+2022 — foldAscii passes it through as a real bullet)
                 lb[w + 1] = 0x80;
                 lb[w + 2] = 0xA2;
                 w += 3;
@@ -2113,7 +2099,7 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
 const LineStyle = enum { prose, code, quote };
 
 /// One logical line, wrapped to fit `view`. CODE stays MONOSPACE + character-wrapped (column alignment is
-/// load-bearing for code). PROSE/QUOTE now render in the PROPORTIONAL ui font with real WORD wrap, so chat
+/// load-bearing for code). PROSE/QUOTE render in the PROPORTIONAL ui font with real WORD wrap, so chat
 /// answers read like text instead of terminal output. The measure pass (draw=false) and the draw pass run the
 /// identical wrap loop — only the actual pixel calls are gated on `draw` — so scroll height and pixels agree.
 fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, draw: bool, style: LineStyle, dim: bool) f32 {
@@ -2153,10 +2139,8 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
             cl = ll;
             // Reserve the trailing sentinel slot. `cl + 1 < cand.len` (not `cl < cand.len`): once the running
             // line reaches ll==1023, letting the separator fill the last byte pushes cl to cand.len (1024), and
-            // the `cand[cl] = 0` below then writes one past [1024]. A >=1023-byte spaceless run — minified JS/CSS,
-            // base64, a data URI, a long path/hex — as the first token of a wrapped segment hit exactly this,
-            // crashing the render thread mid-stream while folding a large read_file result (write content is
-            // shown as a short "writing <path>…" label, never wrapped — hence the write=ok / read=crash split).
+            // the `cand[cl] = 0` below then writes one past [1024]. A >=1023-byte spaceless run (minified JS/CSS,
+            // base64, a data URI, a long path/hex) as the first token of a wrapped segment hits exactly this.
             if (cl + 1 < cand.len) {
                 cand[cl] = ' ';
                 cl += 1;
@@ -2214,10 +2198,9 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
     };
 }
 
-/// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Now shows
-/// an inline PREVIEW of the first line of the thinking (dim italic-feel) so the user sees WHAT is being reasoned
-/// without expanding every trace ("the user should see what is being reasoned"). Click to expand the full text.
-/// Returns true on click (expand/collapse).
+/// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Shows
+/// an inline preview of the first line of the thinking so the user sees WHAT is being reasoned without expanding
+/// every trace. Click to expand the full text. Returns true on click (expand/collapse).
 fn thoughtChip(view: t.Rect, y0: f32, expanded: bool, preview: []const u8) bool {
     const r = t.Rect{ .x = view.x + 12, .y = y0 + 4, .width = view.width - 24, .height = 20 };
     const hot = t.hovering(r) and t.hovering(view);
@@ -2248,8 +2231,8 @@ fn firstLine(s: []const u8) []const u8 {
 }
 
 /// A single clean 'the hive is working' status line in the chat flow while a cast runs, so the chat isn't dead
-/// air — but the DETAILED grounding/thinking/tool log stays in the Swarm activity pane (streaming the raw event
-/// dump into the chat was too noisy). One line only; the % + phase come from `status`.
+/// air; the detailed grounding/thinking/tool log stays in the Swarm activity pane (the raw event dump is too
+/// noisy for the chat). One line only; the % + phase come from `status`.
 fn renderCastLive(view: t.Rect, y0: f32, status: []const u8, draw: bool) f32 {
     if (draw and inView(view, y0, MSG_LINE_H + 2)) {
         t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(y0 - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H + 2), t.withAlpha(t.green, 34));
@@ -2280,7 +2263,7 @@ fn toolName(text: []const u8) ?[]const u8 {
     return null;
 }
 
-/// An engaging, human one-liner for a tool name (the collapsed chip label).
+/// A human one-liner for a tool name (the collapsed chip label).
 fn toolFriendly(name: []const u8) [:0]const u8 {
     if (std.mem.eql(u8, name, "web_search")) return t.z("searched the web", .{});
     if (std.mem.eql(u8, name, "web_fetch")) return t.z("fetched a page", .{});
@@ -2490,8 +2473,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const fsz: i32 = 14;
     const cols = monoCols(view.width - 28, fsz);
 
-    // total content height — from the per-message height CACHE (renderMsg word-wrap is the client CPU chug on
-    // long chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
+    // total content height — from the per-message height CACHE (renderMsg word-wrap is expensive on long
+    // chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
     var fp: u64 = 0;
     for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
     fp +%= @as(u64, ui.tool_open orelse 0xffff) << 40; // expand/collapse changes a tool message's height
@@ -2499,8 +2482,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
     if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
     if (ui.mh_count != msgs.len or ui.mh_cols != cols or ui.mh_fp != fp) {
-        // INCREMENTAL rebuild: only rows whose own fingerprint changed re-measure (an appended tool row used to
-        // re-wrap the whole transcript). A width change misses every row fp comparison path via wipe below.
+        // INCREMENTAL rebuild: only rows whose own fingerprint changed re-measure. A width change isn't caught
+        // by the per-row fp, so `wipe` (below) forces every cached height stale.
         const wipe = ui.mh_cols != cols; // wrap width changed → every cached height is stale
         for (msgs, 0..) |*m, i| {
             const mfp: u64 = @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (ui.tool_open == i) @as(u64, 1) << 48 else 0);
@@ -2561,8 +2544,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
             if (ui.tool_open == i) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
-                // copy chip: flush RIGHT and only while the row is hovered (was pinned mid-row at width-126, which
-                // read as floating "in the middle" on a reasoning block that has no token-cost label to its right).
+                // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
+                // label to its right, so a mid-row chip would read as floating).
                 if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
                     if (copyChip(view.x + view.width - 60, y0 + 3)) {
                         copyToClipboard(m.textStr());
@@ -2581,7 +2564,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // text is untouched in the message, so the model still receives it and copy still grabs it.
             if (ui.tool_open == i) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
-                // the token cost now lives in the expanded dropdown (top-right), not the collapsed line
+                // the token cost lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
                 if (copyChip(view.x + view.width - 126, y0 + 3)) {
@@ -2640,7 +2623,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
 
     // floating "scroll to bottom": small, minimal, semi-transparent — only while scrolled away from the bottom.
     // Drawn OUTSIDE the scissor so it floats above the messages; click snaps to the bottom + re-arms sticky
-    // follow (line ~2441 keeps it pinned as new frames stream in).
+    // follow.
     if (show_jump) {
         const jhot = t.hovering(jump_r);
         rl.drawRectangleRounded(jump_r, 1.0, 12, t.withAlpha(if (jhot) t.bg_sel else t.bg_hl, if (jhot) 235 else 170));
@@ -2658,8 +2641,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
 
     // status line — CLIPPED to leave room for the auto-loop label at the right (a long "subtask 5/6 (inline): ..."
-    // status used to run under/over the toggle). The auto-loop label geometry is computed FIRST so the clip width
-    // subtracts it; both sit on the same status row.
+    // status would otherwise run under the toggle). The auto-loop label geometry is computed FIRST so the clip
+    // width subtracts it; both sit on the same status row.
     var sy = view.y + view.height + 4;
     const loop_state = blk: {
         store.lock();
@@ -2747,9 +2730,8 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
     // While a turn is generating (or auto-loop is driving), the send column offers control. For a SERVER turn
     // (steerable) it SPLITS into two stacked buttons — POST (blue: send the typed text as a live steer the running
-    // turn folds in) over STOP (red: abort + halt auto-loop). This makes steering an explicit, discoverable action
-    // (the old invisible Enter-to-steer read as "steering does not work"). A local-engine turn has no steer sink,
-    // so it shows Stop alone.
+    // turn folds in) over STOP (red: abort + halt auto-loop), making steering an explicit, discoverable action.
+    // A local-engine turn has no steer sink, so it shows Stop alone.
     if (busy or loop_on) {
         const server_steerable = store.chat_server_turn;
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
@@ -2981,8 +2963,8 @@ fn drawChatMemory(store: *Store, r: t.Rect) void {
     }
     const max_scroll = if (total > view.height) total - view.height else 0;
     const wheel = rl.getMouseWheelMove();
-    // hover the whole pane below the tab strip, not just the card viewport — wheeling over the header
-    // strip was a dead zone that read as "can't scroll"
+    // hover the whole pane below the tab strip, not just the card viewport, so wheeling over the header
+    // strip still scrolls
     if (wheel != 0 and t.hovering(.{ .x = r.x, .y = r.y + 32, .width = r.width, .height = r.height - 32 })) ui.mem_scroll -= wheel * 3 * 18;
     if (ui.mem_scroll < 0) ui.mem_scroll = 0;
     if (ui.mem_scroll > max_scroll) ui.mem_scroll = max_scroll;
@@ -3220,7 +3202,7 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     }
     const line_h: f32 = 17;
     const avail: usize = if (r.y + r.height - 8 > yy) @intFromFloat((r.y + r.height - 8 - yy) / line_h) else 0;
-    // wheel: scroll back through the event tail (it was hard tail-anchored with no offset); 0 = follow
+    // wheel: scroll back through the event tail; 0 = follow
     const con = t.Rect{ .x = r.x + 1, .y = yy, .width = r.width - 2, .height = r.y + r.height - yy - 4 };
     const maxback: usize = if (tail.len > avail) tail.len - avail else 0;
     const wheel = rl.getMouseWheelMove();
@@ -3309,8 +3291,8 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     textField(.{ .x = x, .y = gy + 14, .width = colw, .height = t.FIELD_H }, &ui.d_gateway, ui.focus == .d_gateway, "blank = same as the minds", .d_gateway);
     gy += fh + gap;
 
-    // RSI DIALS — the same knobs the deploy wizard writes into swarm.json. Omitting these is what made a
-    // desktop-deployed swarm behave differently from a wizard one (breakout / psyche / living-hive OFF).
+    // RSI DIALS — the same knobs the deploy wizard writes into swarm.json (omitting them makes a
+    // desktop-deployed swarm behave differently from a wizard one).
     flabel(x, gy, "RSI DIALS");
     gy += 20;
     const tcw = (colw - 3 * t.GAP) / 4;
@@ -3800,7 +3782,7 @@ fn drawConsole(r: t.Rect, evs: []const scan.Ev, live: bool) void {
     var yy: f32 = r.y + 8;
     var i: usize = start;
     // Monospace + fixed pixel columns so round / mind / text line up like a real log. 14px + brighter
-    // body color (fg vs fg_dim) — the console read as "very hard to read" at 13px dim.
+    // body color (fg vs fg_dim) for legibility.
     while (i < evs.len and yy < r.y + r.height - 4) : (i += 1) {
         const e = &evs[i];
         const kc = kindColor(e.kindStr());
@@ -4452,7 +4434,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.pushNotif("Token saved", "Deploy is authorized", 1);
         ui.focus = .none;
     }
-    y += 42; // clear the 34px field + gap (was 30 → the subtitle overlapped the input)
+    y += 42; // clear the 34px field + gap
     if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
     y += 34;
     // fixed slot wide enough for both labels so the button doesn't resize when toggled
@@ -4741,7 +4723,7 @@ fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
     var ls: usize = 0; // current line start
     var i: usize = 0;
     // Measure whole candidate LINES (word by word), not single chars — t.measure includes inter-char spacing,
-    // so summing single-char widths underestimates and lines overflow the box (the reported "falls out" bug).
+    // so summing single-char widths underestimates and lines overflow the box.
     while (i < s.len and n < out.len) {
         var we = i; // extend through the next word + its trailing spaces
         while (we < s.len and s[we] != ' ') we += 1;
@@ -4890,8 +4872,8 @@ fn textField(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, 
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const inner_y: i32 = @intFromFloat(r.y + (r.height - 13) / 2);
     // Don't grab focus while a dropdown is open: its option list is drawn OVER the fields below it, so a click
-    // meant for a dropdown item would otherwise fall through and focus the input underneath (the reported bug).
-    // The open dropdown owns the click; drawList closes it on an outside-click.
+    // meant for a dropdown item would otherwise fall through and focus the input underneath. The open dropdown
+    // owns the click; drawList closes it on an outside-click.
     if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) {
         ui.focus = which;
         // place the caret at the clicked character (and anchor a drag-selection there)

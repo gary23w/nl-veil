@@ -1,7 +1,6 @@
-//! theme.zig — the nl-veil visual language for the desktop shell.
-//! Palette is the exact Tokyo Night set from web/public/styles.css so veil-desk and the web UI read as
-//! one product. Everything here is immediate-mode: no retained widget tree, just draw + hit-test helpers
-//! called each frame against the raylib backend, so the whole UI is a pure function of AppState.
+//! theme.zig — the visual language for the desktop shell: palette + immediate-mode widget helpers.
+//! Palette mirrors the Tokyo Night set in web/public/styles.css so desk and the web UI stay in sync.
+//! Immediate-mode: no retained widget tree — draw + hit-test helpers run each frame against raylib.
 
 const std = @import("std");
 const rl = @import("raylib");
@@ -50,8 +49,7 @@ const Palette = struct {
 };
 
 // Default dark palette (Tokyo Night, mirrors web/public/styles.css).
-// fg is a soft off-white rather than pure #fff — full-blast white on a dark ground reads harsh; the
-// slightly blued white keeps the same contrast band as the web UI without the glare.
+// fg is a soft off-white, not pure #fff — full white on a dark ground reads harsh.
 const dark_palette = Palette{
     .bg = hex("1a1b26"),
     .bg_dark = hex("16161e"),
@@ -71,9 +69,8 @@ const dark_palette = Palette{
     .teal = hex("2ac3de"),
 };
 
-// Light palette tuned for readable contrast in the same visual language. fg is near-black (not #000 —
-// pure black on a pale ground is the same glare problem in reverse) and the border sits closer to the
-// panel fills so the chrome reads as soft edges, not wireframe.
+// Light palette in the same visual language. fg is near-black, not #000 (pure black on a pale ground
+// glares in reverse); the border sits close to the panel fills so chrome reads as soft edges.
 const light_palette = Palette{
     .bg = hex("f5f7fb"),
     .bg_dark = hex("e9edf5"),
@@ -154,8 +151,8 @@ pub fn withAlpha(c: Color, a: u8) Color {
     return .{ .r = c.r, .g = c.g, .b = c.b, .a = a };
 }
 
-/// Linear mix of two colors (k=0 → a, k=1 → b). Buttons use it for hover/press shades so every accent
-/// gets consistent state feedback without hand-picking per-color variants.
+/// Linear mix of two colors (k=0 → a, k=1 → b). Buttons derive hover/press shades from it so every
+/// accent gets consistent state feedback without per-color variants.
 fn blend(a: Color, b: Color, k: f32) Color {
     const ik = 1.0 - k;
     return .{
@@ -171,8 +168,7 @@ fn luma(c: Color) f32 {
 }
 
 // ---- design tokens: ONE spacing/sizing scale for the whole shell ----
-// Every tab draws against these instead of sprinkling magic paddings, so the rhythm is uniform:
-// PAD around a page, PAD_IN inside a panel, GAP between siblings, and three button heights.
+// Tabs draw against these instead of magic paddings, so spacing stays uniform.
 pub const PAD: f32 = 16; // outer page padding
 pub const PAD_IN: f32 = 12; // padding inside a panel
 pub const GAP: f32 = 12; // gap between sibling widgets/cards
@@ -197,9 +193,9 @@ pub fn applyCursor() void {
     cursor_want = .default;
 }
 
-/// raylib's rounded-rect "roundness" is RELATIVE to the rect's short side, so the same 0.14 gave a big
-/// button soft corners and a small chip nearly-square ones. Convert a PIXEL radius to the ratio so every
-/// widget shares one corner language.
+/// raylib's rounded-rect "roundness" is RELATIVE to the rect's short side, so a fixed ratio makes big
+/// buttons and small chips disagree. Convert a PIXEL radius to the ratio so every widget shares one
+/// corner language.
 fn roundnessFor(r: Rect, radius_px: f32) f32 {
     const m = @min(r.width, r.height);
     if (m <= 1) return 0;
@@ -207,12 +203,9 @@ fn roundnessFor(r: Rect, radius_px: f32) f32 {
 }
 
 // ---- text: a RING of scratch buffers + a loaded TTF ----
-//
-// The UI is single-threaded, but a SINGLE static buffer is a trap: Zig evaluates call arguments left to
-// right, so `text(z("desk"), x + measure(z("veil")), ...)` computes the position AFTER z() has already
-// overwritten the buffer the first arg points at — the logo rendered "veil veil", and an array of four
-// z()'d tab labels all pointed at the last one ("Settings"). A ring of buffers lets many z() results stay
-// live at once, which is exactly what nested/argument-order use needs.
+// A SINGLE static buffer is a trap: Zig evaluates call arguments left to right, so
+// `text(z("a"), measure(z("b")), ...)` reads the first buffer AFTER a later z() has overwritten it. A
+// ring lets many z() results stay live at once, which nested/argument-order use needs.
 const ZBUFS = 24;
 var zbufs: [ZBUFS][2048]u8 = undefined;
 var zi: usize = 0;
@@ -234,8 +227,7 @@ pub fn zs(s: []const u8) [:0]const u8 {
     return b[0..n :0];
 }
 
-/// Copy `src` into `dst`, folding it to renderable single-line ASCII. TWO jobs, both fixing real bugs seen
-/// in LLM-authored text (swarm goals/briefs, console events, chat):
+/// Copy `src` into `dst`, folding it to renderable single-line ASCII. Two jobs:
 ///   1) newlines/tabs/other control bytes -> a single space, so a multi-line string never renders as
 ///      several OVERLAPPING lines (drawTextEx honours '\n'); one-line row labels stay one line.
 ///   2) common Unicode punctuation the UI/mono fonts don't carry (em/en dashes, smart quotes, bullets,
@@ -275,10 +267,10 @@ pub fn foldAscii(dst: []u8, src: []const u8) usize {
             0x21D0 => "<-", // <= not in the atlas
             0x2713, 0x2714 => "v",
             0x00A1...0x00AC, 0x00AE...0x00FF => orig, // printable Latin-1 — atlas has it, keep verbatim
-            // Greek + super/subscript blocks — now in the font atlas, so pass through for real math rendering.
+            // Greek + super/subscript blocks — in the font atlas, so pass through for real math rendering.
             0x0391...0x03C9, 0x2070...0x209C => orig,
-            // Math operators/relations, real bullets/circles/arrows, and the scattered subscript letters (i j r u v)
-            // — all added to the atlas (see main.glyph_set), so keep them verbatim instead of dropping/ASCII-folding.
+            // Math operators/relations, real bullets/circles/arrows, and scattered subscript letters (i j r u v)
+            // — all in the atlas (see main.glyph_set), so keep them verbatim instead of dropping/ASCII-folding.
             0x2022, 0x25CB, 0x25CF, 0x25E6, 0x2044, 0x2190...0x2193, 0x21D2, 0x2202, 0x2207, 0x2208, 0x2209, 0x220F, 0x2211, 0x221A, 0x221D, 0x221E, 0x2229, 0x222A, 0x222B, 0x2248, 0x2260, 0x2261, 0x2264, 0x2265, 0x22C5, 0x1D62...0x1D65, 0x2C7C => orig,
             else => "", // emoji / CJK / rare symbol — drop, never tofu
         };
@@ -361,8 +353,8 @@ fn theFont() rl.Font {
 fn theMono() rl.Font {
     return mono_font orelse theFont();
 }
-// A real TTF carries its own advances; extra tracking made the UI text look spaced-out/"broken". Keep it
-// near zero for the proportional font (the mono path uses its own fixed 0.5 in textMono).
+// A real TTF carries its own advances, so extra tracking makes text look spaced-out. Keep it near zero
+// for the proportional font (the mono path uses its own fixed 0.5 in textMono).
 fn spacingFor(size: i32) f32 {
     return @max(0.0, @as(f32, @floatFromInt(size)) / 64.0);
 }
@@ -394,7 +386,7 @@ pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i
     textMono(b[0..n :0], x, y, size, c);
 }
 
-/// Left-aligned label, clipped to max_w px with an ellipsis — the workhorse for rows that must not overflow.
+/// Left-aligned label, clipped to max_w px with an ellipsis, for rows that must not overflow.
 pub fn textClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {
     const b = nextBuf();
     var n = foldAscii(b[0 .. b.len - 1], s);
@@ -461,8 +453,8 @@ pub fn setBlockClicks(v: bool) void {
 // solid = the page's primary action (filled accent, auto-contrast label)
 // tonal = everything else (soft accent wash, accent label) — the default `button`
 // ghost = quiet inline affordances (invisible until hovered)
-// All three: height-scaled label size (no more 14px text jammed in a 20px chip), pixel-radius corners,
-// press feedback (darker fill + 1px label nudge), and a pointing-hand cursor while hot.
+// All three: height-scaled label size, pixel-radius corners, press feedback (darker fill + 1px label
+// nudge), and a pointing-hand cursor while hot.
 pub const BtnStyle = enum { solid, tonal, ghost };
 
 /// Label size that fits the button's height with sane breathing room.
@@ -537,8 +529,8 @@ pub fn tabW(label: [:0]const u8) f32 {
     return @as(f32, @floatFromInt(measure(label, 13))) + 26;
 }
 
-/// A tab in a tab strip: active = a soft accent pill (works on ANY backdrop — the old bg-fill pill
-/// vanished on same-color panels); hover = a quiet highlight. Minimal: no underline.
+/// A tab in a tab strip: active = a soft accent pill (works on ANY backdrop, unlike a bg-fill pill which
+/// vanishes on same-color panels); hover = a quiet highlight. Minimal: no underline.
 pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
     const hot = mouse.over(r);
     const rn = roundnessFor(r, @min(8.0, r.height * 0.32));

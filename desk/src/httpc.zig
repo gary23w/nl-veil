@@ -1,25 +1,21 @@
 //! httpc.zig — a bounded raw-socket HTTP/1.1 client for PLAIN-HTTP loopback endpoints: the local veil
-//! server on :8787 and a local Ollama on :11434. Replaces the `curl` subprocess for that traffic.
+//! server on :8787 and a local Ollama on :11434. Replaces a `curl` subprocess for that traffic.
 //!
-//! TWIN FILE: src/worker/httpc.zig is a byte-for-byte twin below this header (the desk and the server
-//! are separate Zig packages by design, so they can't share a module without cross-package build
-//! wiring). Fix a bug in one → apply it to the other.
+//! TWIN FILE: src/worker/httpc.zig is a byte-for-byte twin of everything below this header (desk and server
+//! are separate Zig packages, so they can't share a module without cross-package build wiring). Fix a bug in
+//! one → apply it to the other.
 //!
-//! WHY not curl: every request used to spawn curl.exe with the bearer token and the full JSON body on
-//! the command line. Process command lines are readable by any same-user process on Windows, and the
-//! spawn pattern itself (self-built binary forking curl to POST bearer JSON at localhost, on the
-//! poller's few-second cadence) is exactly what Defender's behavior/ML models flag — it killed the app
-//! outright on unexcluded machines. In-process sockets have no argv, no child process, and no per-call
-//! process cost.
+//! WHY not curl: a curl subprocess puts the bearer token and JSON body on a child command line (readable by
+//! any same-user process on Windows), and the spawn pattern — a self-built binary forking curl to POST bearer
+//! JSON at localhost on the poller's cadence — is exactly what Defender's behavior/ML models flag. In-process
+//! sockets have no argv and no child process.
 //!
-//! WHY this doesn't reintroduce the "casting hangs" bug that motivated curl: the previous raw-socket
-//! client trusted `Connection: close` and read to EOF with NO time bound, so a server that kept the
-//! socket alive blocked the chat thread forever. This client (a) parses real HTTP framing — status
-//! line, headers, Content-Length or chunked — so a well-behaved reply completes without waiting for
-//! close, and (b) races the whole round trip against an Io sleeper (`Io.Select`), cancelling the loser:
-//! `timeout_s` is a hard ceiling exactly like curl --max-time. Cancellation reaches a blocked read on
-//! every backend (on Windows the Threaded Io cancels the pending AFD receive), so a wedged server
-//! surfaces as `.timed_out` instead of a frozen thread.
+//! Timeout is a HARD ceiling. This client parses real HTTP framing — status line, headers, Content-Length or
+//! chunked — so a well-behaved reply completes without waiting for close, and races the whole round trip
+//! against an Io sleeper (`Io.Select`): `timeout_s` bounds connect+send+recv like curl --max-time.
+//! Cancellation reaches a blocked read on every backend (on Windows the Threaded Io cancels the pending AFD
+//! receive), so a wedged server surfaces as `.timed_out`, not a frozen thread. (A predecessor raw-socket
+//! client read to EOF with no time bound, so a keep-alive server blocked the chat thread forever.)
 
 const std = @import("std");
 const Io = std.Io;
@@ -29,9 +25,9 @@ pub const Resp = struct {
     body: []u8 = &.{}, // gpa-owned; caller frees when len>0
 };
 
-/// The caller-facing outcome, shaped so netcli can keep its curl-era triage: `refused` was curl exit 7
-/// (nothing listening — fail fast), `timed_out` was exit 28 (server wedged — fail fast, retrying only
-/// multiplies the stall), `failed` was the transient "no status" reply worth retrying when idempotent.
+/// The caller-facing outcome netcli triages on: `refused` (nothing listening) and `timed_out` (server
+/// wedged) both mean fail fast — retrying only multiplies the stall; `failed` (a transient "no status" reply)
+/// is worth retrying when the request is idempotent.
 pub const Result = union(enum) {
     ok: Resp,
     refused,
