@@ -90,6 +90,13 @@
       "kind": "openai-compatible",
       "base_url": "https://router.huggingface.co/v1",
       "needs_key": true
+    },
+    {
+      "key": "zai",
+      "label": "Z.AI (GLM)",
+      "kind": "openai-compatible",
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "needs_key": true
     }
   ],
   "models": [
@@ -682,6 +689,56 @@
       "tools": "reliable",
       "cost": "low",
       "note": "Strong coder/tool-caller via HF Inference Providers (one hf_ token). Best HF pick for code-heavy or structured-output minds. Append ':provider'/':cheapest' to pin routing."
+    },
+    {
+      "id": "glm-5.2",
+      "label": "GLM-5.2",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Z.AI (Zhipu) flagship GLM-5.2. OpenAI-compatible chat/completions at https://api.z.ai/api/paas/v4 with Bearer auth; model field = bare id 'glm-5.2'. Strong agentic tool use + coding. Newest 5.x flagship — the top Z.AI pick for demanding minds."
+    },
+    {
+      "id": "glm-4.6",
+      "label": "GLM-4.6",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "GLM-4.6, ~200K context, ~30% more token-efficient than 4.5. Reliable native function calling; excellent agentic/coding value on Z.AI. Solid default before reaching for 5.2."
+    },
+    {
+      "id": "glm-4.5",
+      "label": "GLM-4.5",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 128000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "GLM-4.5 (355B MoE / 32B active), agent-oriented with strong tool use + reasoning. ~128K context. Dependable mid-tier agentic model; prefer 4.6/5.2 for new minds."
+    },
+    {
+      "id": "glm-4.5-air",
+      "label": "GLM-4.5 Air",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 128000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "GLM-4.5 Air (106B MoE / 12B active) — lighter, faster, cheaper sibling of 4.5 tuned for agentic tool use. Good high-volume/low-latency pick."
+    },
+    {
+      "id": "glm-4.5-flash",
+      "label": "GLM-4.5 Flash (free)",
+      "provider": "zai",
+      "hosting": "hosted",
+      "context": 128000,
+      "tools": "partial",
+      "cost": "free",
+      "note": "GLM-4.5 Flash — Z.AI's free tier. Fast and no-cost; supports tools but the small/free tier is less reliable in complex multi-tool swarms — validate per-mind. Great for testing the Z.AI provider without spend."
     }
   ],
   "defaults": {
