@@ -64,6 +64,7 @@ pub const Poller = struct {
     fc_cache_len: usize = 0,
     fc_cache_trunc: bool = false,
     last_key_s: i64 = 0, // .desktop_key re-read gate once a token is held
+    narr_until_s: i64 = 0, // estimated end of the current utterance — the next waits (no overlapping voices)
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
 
@@ -467,6 +468,42 @@ pub const Poller = struct {
         }
     }
 
+    /// NARRATOR: speak the next queued utterance through the OS's OWN text-to-speech — Windows SAPI via a
+    /// spawned PowerShell one-liner, macOS `say`, Linux `espeak` (best-effort). The utterance rides a FILE,
+    /// never argv, so model/notification text has zero quoting or injection surface. Overlap is prevented
+    /// by a duration estimate (~14 chars/sec): the next utterance waits until the current one should have
+    /// finished. This is the whole audio stack — the client bundles NO speech code; the OS carries it.
+    fn pumpNarration(self: *Poller, dd: []const u8, now_s: i64) void {
+        if (now_s < self.narr_until_s) return;
+        var ub: [store_mod.NARR_TEXT]u8 = undefined;
+        const n = self.store.popNarr(&ub);
+        if (n == 0) return;
+        const path = std.fmt.allocPrint(self.gpa, "{s}/.veil-desk/narr.txt", .{dd}) catch return;
+        defer self.gpa.free(path);
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = ub[0..n] }) catch return;
+        switch (builtin.os.tag) {
+            .windows => {
+                // the file path is embedded in a single-quoted PS string; ' doubled per PS quoting rules
+                var cmd: [900]u8 = undefined;
+                var w = std.Io.Writer.fixed(&cmd);
+                w.writeAll("Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak([IO.File]::ReadAllText('") catch return;
+                for (path) |c| {
+                    if (c == '\'') w.writeAll("''") catch return else w.writeByte(c) catch return;
+                }
+                w.writeAll("'))") catch return;
+                const argv: []const []const u8 = &.{ "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", w.buffered() };
+                _ = std.process.spawn(self.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+            },
+            .macos => {
+                _ = std.process.spawn(self.io, .{ .argv = &.{ "say", "-f", path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+            },
+            else => {
+                _ = std.process.spawn(self.io, .{ .argv = &.{ "espeak", "-f", path }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+            },
+        }
+        self.narr_until_s = now_s + 1 + @as(i64, @intCast(n / 14)); // ~14 spoken chars/sec + spawn slack
+    }
+
     /// Open the data dir in the OS file browser (best-effort). Set the child's cwd to the data dir and
     /// open "." — sidesteps resolving `dd` to an absolute path (getCwd is gone in this Zig).
     fn doOpenFolder(self: *Poller, dd: []const u8) void {
@@ -530,6 +567,7 @@ pub const Poller = struct {
 
         self.syncDesktopKey(dd);
         self.flushLog(dd);
+        self.pumpNarration(dd, now_s);
 
         // 1) server liveness + fleet counters — THROTTLED to every ~5s (see last_fleet_s). Between polls we
         // carry the previous values so the dashboard counters stay put instead of flickering to 0/offline.

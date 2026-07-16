@@ -156,6 +156,10 @@ const Ui = struct {
     // the wall time it last GREW. Updated at the one live renderMsg call site each frame.
     live_len_prev: usize = 0,
     live_change_t: f64 = -10,
+    // chat input drag-resize (the grab strip above the input row) + transcript select-all state
+    input_extra: f32 = 0,
+    input_dragging: bool = false,
+    conv_selected: bool = false, // Ctrl+A on the transcript: the WHOLE conversation is the copy target
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
@@ -1161,22 +1165,38 @@ fn handleKeys(store: *Store) void {
     }
     // Keyboard copy — ONE priority chain, NOT gated on focus (the Chat tab force-focuses the prompt input and
     // clicks never clear focus, so a focus gate would make "select text, Ctrl+C" copy the empty input instead):
-    //   1. an active drag-selection   2. Ctrl+Shift+C → the WHOLE conversation
-    //   3. the focused field's text (when non-empty)   4. the LAST veil answer
+    //   1. the focused field's OWN selection (Ctrl+A in a field must beat a stale transcript drag)
+    //   2. a transcript select-all (Ctrl+A outside a field selection)   3. an active drag-selection
+    //   4. Ctrl+Shift+C → the WHOLE conversation   5. the focused field's text   6. the LAST veil answer
     {
         const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+        // Ctrl+A on the chat TRANSCRIPT (no field content to select) = select the whole conversation —
+        // the standard chat-app read of select-all. In a field with text, editField's Ctrl+A wins.
+        if (ctrl and rl.isKeyPressed(.a) and ui.tab == .chat and ui.chat_inner == .chat) {
+            const field_has_text = if (focusedField()) |f| f.len > 0 else false;
+            if (!field_has_text) {
+                ui.conv_selected = true;
+                store.pushNotif("Conversation selected", "Ctrl+C copies the whole conversation", 0);
+            }
+        }
+        if (rl.isMouseButtonPressed(.left)) ui.conv_selected = false; // any click drops the select-all
         if (ctrl and rl.isKeyPressed(.c)) {
-            if (ui.tab == .chat and ui.chat_inner == .chat and sel_text_len > 0) {
+            const field_sel: ?[2]usize = if (focusedField()) |f| f.selRange() else null;
+            if (field_sel) |rg| {
+                const f = focusedField().?;
+                copyToClipboard(f.buf[rg[0]..rg[1]]);
+                markCopied();
+            } else if (ui.conv_selected) {
+                copyConversation(store);
+                ui.conv_selected = false;
+            } else if (ui.tab == .chat and ui.chat_inner == .chat and sel_text_len > 0) {
                 copyToClipboard(sel_text[0..sel_text_len]);
                 markCopied();
             } else if (shift) {
                 copyConversation(store);
             } else if (focusedField()) |f| {
-                if (f.selRange()) |rg| {
-                    copyToClipboard(f.buf[rg[0]..rg[1]]);
-                    markCopied();
-                } else if (f.len > 0) copyToClipboard(f.str());
+                if (f.len > 0) copyToClipboard(f.str());
             } else {
                 var last: ?store_mod.ChatMsg = null;
                 store.lock();
@@ -2401,12 +2421,18 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     return yy + MSG_GAP_H;
 }
 
-/// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns.
+/// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns,
+/// FITTED to the viewport: when the natural column widths overflow the message area, columns shrink
+/// (widest first, floor of 5 chars) and long cells clip with ".." — every column stays visible and
+/// aligned at any window size, instead of the old whole-line right-edge amputation that left broken
+/// fragments of the last columns. Re-fits every frame, so resizing the window re-flows the table live.
 fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: bool) f32 {
     var yy = y0;
     const MAXC = 10;
+    const COL_MIN: usize = 5;
     var colw: [MAXC]usize = [_]usize{0} ** MAXC;
-    // pass 1: column widths (in bytes ~ mono chars)
+    var ncols: usize = 0;
+    // pass 1: natural column widths (in bytes ~ mono chars)
     for (rows) |row| {
         const tl = std.mem.trim(u8, row, " \r\t");
         if (md.isTableSep(tl)) continue;
@@ -2419,8 +2445,24 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
             if (cl > colw[ci_]) colw[ci_] = cl;
             ci_ += 1;
         }
+        if (ci_ > ncols) ncols = ci_;
     }
-    // pass 2: draw each non-separator row as padded, joined cells
+    if (ncols == 0) return yy;
+    // fit: shrink the widest column one char at a time until the row fits the viewport's mono columns
+    const char_w = @max(1, t.measureMono("M", fsz));
+    const avail_chars: usize = @intCast(@max(16, @divTrunc(@as(i32, @intFromFloat(view.width - 40)), char_w)));
+    var total: usize = 3 * (ncols - 1);
+    for (colw[0..ncols]) |cw| total += cw;
+    while (total > avail_chars) {
+        var widest: usize = 0;
+        for (colw[0..ncols], 0..) |cw, i| {
+            if (cw > colw[widest]) widest = i;
+        }
+        if (colw[widest] <= COL_MIN) break; // every column at the floor — physically can't fit; clip the tail
+        colw[widest] -= 1;
+        total -= 1;
+    }
+    // pass 2: draw each non-separator row as padded, joined cells, each CELL clipped to its fitted width
     var header = true;
     for (rows) |row| {
         const tl = std.mem.trim(u8, row, " \r\t");
@@ -2430,19 +2472,27 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
         var it = std.mem.splitScalar(u8, md.tableInner(tl), '|');
         var ci_: usize = 0;
         while (it.next()) |cell| {
-            if (ci_ >= MAXC or w >= lb.len - 4) break;
+            if (ci_ >= ncols or w >= lb.len - 4) break;
             if (ci_ > 0) {
                 const sep = " | ";
                 @memcpy(lb[w .. w + sep.len], sep);
                 w += sep.len;
             }
             var cb: [256]u8 = undefined;
-            const cl = md.cleanInline(&cb, cell);
+            var cl = md.cleanInline(&cb, cell);
+            if (cl > colw[ci_]) {
+                // clip to the fitted column with a ".." tail so a shrunk cell reads as clipped, not broken
+                cl = colw[ci_];
+                if (cl >= 2) {
+                    cb[cl - 1] = '.';
+                    cb[cl - 2] = '.';
+                }
+            }
             const take = @min(cl, lb.len - w);
             @memcpy(lb[w .. w + take], cb[0..take]);
             w += take;
             // pad to the column width (skip padding the final column)
-            if (ci_ + 1 < MAXC and colw[ci_] > cl) {
+            if (ci_ + 1 < ncols and colw[ci_] > cl) {
                 const pad = @min(colw[ci_] - cl, lb.len - w);
                 @memset(lb[w .. w + pad], ' ');
                 w += pad;
@@ -2814,7 +2864,11 @@ fn drawSelection() void {
 }
 
 fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8) void {
-    const input_h: f32 = 66; // ~3 rows so a long prompt grows + scrolls instead of overflowing off-screen
+    // The input row is USER-RESIZABLE (drag the grab strip above it): crafting a long prompt deserves
+    // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
+    // make room because everything below derives from input_h. Clamped so the transcript keeps space.
+    ui.input_extra = std.math.clamp(ui.input_extra, 0, @max(0, r.height * 0.5 - 66));
+    const input_h: f32 = 66 + ui.input_extra;
     const status_h: f32 = 22;
     const tab_h: f32 = 26;
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
@@ -3120,10 +3174,25 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     sy += status_h;
 
-    // input row — a 3-row growing/scrolling text area (a long prompt wraps + scrolls instead of running off-screen)
+    // input row — a growing/scrolling text area; the GRAB STRIP above it drag-resizes the row (crafting
+    // a long prompt deserves room). Rows follow the dragged height so the extra space is real lines.
     const send_w: f32 = 92;
+    const grab = t.Rect{ .x = r.x, .y = sy - 5, .width = r.width, .height = 8 };
+    const grab_hot = t.hovering(grab) or ui.input_dragging;
+    if (grab_hot) {
+        t.fillRect(@intFromFloat(r.x + r.width / 2 - 24), @intFromFloat(sy - 3), 48, 3, t.withAlpha(t.blue, 170));
+        t.wantCursor(.resize_ns);
+        ui.input_active = true; // keep the frame rate up while adjusting
+    }
+    if (grab_hot and rl.isMouseButtonPressed(.left)) ui.input_dragging = true;
+    if (ui.input_dragging) {
+        if (rl.isMouseButtonDown(.left)) {
+            ui.input_extra = std.math.clamp(ui.input_extra - rl.getMouseDelta().y, 0, @max(0, r.height * 0.5 - 66));
+        } else ui.input_dragging = false;
+    }
+    const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - 16, 18))); // textArea's 18px line pitch
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
-    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, 3);
+    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows);
     // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
     // deriving y/height from input_h keeps the two aligned even if the row height changes later.
     const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
@@ -3154,9 +3223,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else {
         const can_send = ui.c_input.len > 0;
         const clicked = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, can_send);
-        // Enter sends; Shift+Enter is reserved for a future literal newline. Only when the input owns the keyboard.
+        // Enter sends; Shift+Enter inserts a literal newline (drafting multi-paragraph prompts).
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
-        const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift;
+        const enter_key = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
+        if (enter_key and shift and ui.focus == .c_input) ui.c_input.insert('\n');
+        const enter = enter_key and !shift;
         if (can_send and (clicked or (ui.focus == .c_input and enter))) {
             store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
             ui.c_input.clear();
@@ -5195,6 +5266,24 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
     t.text(t.z("renders the whole app in the typeface's bold cut.", .{}), @intFromFloat(x + wt_w + 14), @intFromFloat(y + 9), 12, t.comment);
+    y += 46;
+
+    // NARRATOR — the app speaks: replies + alerts read aloud through the OS's own text-to-speech (no
+    // audio code bundled). Voice INPUT rides the OS dictation layer (Win+H) into the normal input box.
+    const narr_on = store.settings.narrator;
+    const nr_w = @max(t.btnW(t.z("narrator: ON", .{}), 32), t.btnW(t.z("narrator: OFF", .{}), 32));
+    const nrr = t.Rect{ .x = x, .y = y, .width = nr_w, .height = 32 };
+    if (t.button(nrr, if (narr_on) t.z("narrator: ON", .{}) else t.z("narrator: OFF", .{}), if (narr_on) t.green else t.comment, true)) {
+        store.lock();
+        store.settings.narrator = !store.settings.narrator;
+        const now_on = store.settings.narrator;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        if (now_on) {
+            store.pushNotif("Narrator on", "replies and alerts will be read aloud. press Windows plus H to dictate into the message box", 1);
+        }
+    }
+    t.text(t.z("accessibility: reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}), @intFromFloat(x + nr_w + 14), @intFromFloat(y + 9), 12, t.comment);
     y += 46;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
