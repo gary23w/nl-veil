@@ -96,6 +96,10 @@ pub const Settings = struct {
     // heavy-bottomed letterforms many dyslexic readers find easier to track. The render loop hot-swaps
     // the font atlas whenever this differs from what's applied, so the toggle needs no restart.
     dyslexia: bool = false,
+    // TEXT SIZE (percent, 90|100|112|125) and WEIGHT — the rest of the typography customization. Size is
+    // draw-time scaling (no atlas rebuild); weight swaps to the face's Bold file like dyslexia swaps face.
+    font_scale: u8 = 100,
+    font_bold: bool = false,
     // CHAT ENGINE: default LOCAL. Interactive chat runs IN THE DESK (in-process, no poll round-trip), so the
     // AI's tools execute in the client's environment on this machine — not the server's buried sandbox. When ON,
     // a send instead routes to the SERVER-side chat turn (POST /api/v1/chat/convs/:id/messages, rendered by

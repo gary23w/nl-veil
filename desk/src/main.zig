@@ -432,6 +432,8 @@ pub fn main() !void {
         const online0 = store.server_online;
         const busy0 = store.chat_busy;
         const dys0 = store.settings.dyslexia;
+        const bold0 = store.settings.font_bold;
+        const scale0 = store.settings.font_scale;
         // POLLER hand-off: a run-now (or any background action) minted a conversation to show — consume it
         // once, open it in Chat, and switch tabs, so "run now" visibly runs instead of just toasting.
         var goto_buf: [64]u8 = undefined;
@@ -446,14 +448,19 @@ pub fn main() !void {
             store.pushChatCmd(store_mod.mkChatCmd(.select_conv, goto_buf[0..goto_len], ""));
             setTab(.chat);
         }
-        // ACCESSIBILITY: hot-swap the UI font when the dyslexia setting differs from what's applied —
-        // covers the Settings toggle AND the persisted setting landing after startup (settings load on
-        // the chat thread; fonts must load HERE, on the GL thread). Applied-state updates even on a
-        // failed load so a missing font file can't become a per-frame retry.
-        if (dys0 != font_dyslexia_applied) {
-            applyUiFont(dys0);
+        // TEXT SETTINGS: hot-swap the UI font when face/weight differ from what's applied — covers the
+        // Settings toggles AND the persisted values landing after startup (settings load on the chat
+        // thread; fonts must load HERE, on the GL thread). Applied-state updates even on a failed load
+        // so a missing font file can't become a per-frame retry. The size setting is draw-time math —
+        // no atlas rebuild — and the chat's line heights follow the combined factor.
+        if (dys0 != font_dyslexia_applied or bold0 != font_bold_applied) {
+            applyUiFont(dys0, bold0);
             font_dyslexia_applied = dys0;
+            font_bold_applied = bold0;
         }
+        t.setUiScale(@as(f32, @floatFromInt(scale0)) / 100.0);
+        MSG_LINE_H = @round(19.0 * t.uiScale());
+        MSG_HEAD_H = @round(18.0 * t.uiScale());
         // Activity-gated frame rate. This is an immediate-mode UI: EVERY frame re-lays-out + redraws every chat
         // message's markdown, so holding 60fps while the user is just READING pins a CPU core. Stay at 60 only
         // when something is actually changing — mouse activity, a keystroke, or a live token stream — and idle
@@ -899,10 +906,28 @@ fn monoCandidates() []const [:0]const u8 {
     };
 }
 
+/// Bold system faces mirroring uiCandidates — the text-weight setting for the standard face.
+fn uiBoldCandidates() []const [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => &.{ "C:/Windows/Fonts/calibrib.ttf", "C:/Windows/Fonts/corbelb.ttf", "C:/Windows/Fonts/candarab.ttf", "C:/Windows/Fonts/segoeuib.ttf" },
+        .macos => &.{ "/Library/Fonts/Arial Bold.ttf", "/System/Library/Fonts/HelveticaNeue.ttc" },
+        else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", "/usr/share/fonts/liberation/LiberationSans-Bold.ttf" },
+    };
+}
+
 /// Dyslexia mode's UI face: the BUNDLED OpenDyslexic (SIL OFL; desk/assets/fonts, same relative roots the
 /// icon loader probes) first, then system faces on the British Dyslexia Association's recommended list so
 /// the mode still helps when the asset is missing (source checkout without assets, other OSes).
-fn dyslexiaCandidates() []const [:0]const u8 {
+fn dyslexiaCandidates(bold: bool) []const [:0]const u8 {
+    if (bold) return &.{
+        "assets/fonts/OpenDyslexic3-Bold.ttf",
+        "desk/assets/fonts/OpenDyslexic3-Bold.ttf",
+        "../assets/fonts/OpenDyslexic3-Bold.ttf",
+        "../desk/assets/fonts/OpenDyslexic3-Bold.ttf",
+        "C:/Windows/Fonts/comicbd.ttf",
+        "C:/Windows/Fonts/verdanab.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    };
     return &.{
         "assets/fonts/OpenDyslexic3-Regular.ttf",
         "desk/assets/fonts/OpenDyslexic3-Regular.ttf",
@@ -915,20 +940,23 @@ fn dyslexiaCandidates() []const [:0]const u8 {
 }
 
 var font_dyslexia_applied: bool = false; // what the loaded UI atlas currently is (frame loop reconciles)
+var font_bold_applied: bool = false;
 
-/// (Re)load the proportional UI font per the accessibility setting and hand it to the theme. GL texture
-/// work — RENDER THREAD ONLY. On load failure the current font stays (and the caller records the attempt
-/// so a missing font can't turn into a per-frame retry storm).
-fn applyUiFont(dyslexia: bool) void {
-    const cands = if (dyslexia) dyslexiaCandidates() else uiCandidates();
+/// (Re)load the proportional UI font per the accessibility settings and hand it to the theme, which also
+/// derives the face's optical-size compensation (OpenDyslexic's glyphs are ~2/3 of Calibri's at the same
+/// px — uncompensated, dyslexia mode rendered unreadably small). GL texture work — RENDER THREAD ONLY.
+/// On load failure the current font stays (the caller records the attempt so a missing bold file can't
+/// turn into a per-frame retry storm).
+fn applyUiFont(dyslexia: bool, bold: bool) void {
+    const cands = if (dyslexia) dyslexiaCandidates(bold) else if (bold) uiBoldCandidates() else uiCandidates();
     if (loadFontAt(cands, 48)) |f| {
         var fm = f;
         rl.genTextureMipmaps(&fm.texture);
         rl.setTextureFilter(fm.texture, .trilinear);
-        t.swapFont(fm);
-        log.info("ui font applied (dyslexia={}) glyphs={d}", .{ dyslexia, fm.glyphCount });
+        const comp = t.swapFont(fm);
+        log.info("ui font applied (dyslexia={} bold={}) glyphs={d} comp={d:.2}", .{ dyslexia, bold, fm.glyphCount, comp });
     } else {
-        log.warn("ui font load FAILED (dyslexia={}) - keeping the current font", .{dyslexia});
+        log.warn("ui font load FAILED (dyslexia={} bold={}) - keeping the current font", .{ dyslexia, bold });
     }
 }
 fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
@@ -2119,8 +2147,10 @@ fn codeBlockSlice(text_: []const u8, from: usize) []const u8 {
     return text_[from..];
 }
 
-const MSG_LINE_H: f32 = 19;
-const MSG_HEAD_H: f32 = 18;
+// Chat line metrics — VARS, refreshed each frame from the text-scale settings so the reading surface's
+// line advance grows with its glyphs (fixed-height chrome elsewhere keeps its constants; it has slack).
+var MSG_LINE_H: f32 = 19;
+var MSG_HEAD_H: f32 = 18;
 const MSG_GAP_H: f32 = 12;
 const MSG_HEADING_H: f32 = 24;
 const MSG_FENCE_H: f32 = 6;
@@ -5015,6 +5045,8 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const notify_on = store.settings.notify;
     const speed_on = store.settings.speed_mode;
     const dys_on = store.settings.dyslexia;
+    const scale_now = store.settings.font_scale;
+    const bold_now = store.settings.font_bold;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -5125,6 +5157,44 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
     t.text(t.z("accessibility: renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}), @intFromFloat(x + dys_w + 14), @intFromFloat(y + 9), 12, t.comment);
+    y += 46;
+
+    // TEXT SIZE — a global text scale (90/100/112/125%), applied at draw time everywhere; the chat's
+    // line heights follow it. Cycles on click, persists with the settings, applies the same frame.
+    const size_name: [:0]const u8 = switch (scale_now) {
+        90 => t.z("text size: Small", .{}),
+        112 => t.z("text size: Large", .{}),
+        125 => t.z("text size: XL", .{}),
+        else => t.z("text size: Normal", .{}),
+    };
+    const size_w = @max(t.btnW(t.z("text size: Normal", .{}), 32), t.btnW(size_name, 32));
+    const szr = t.Rect{ .x = x, .y = y, .width = size_w, .height = 32 };
+    if (t.button(szr, size_name, if (scale_now != 100) t.green else t.comment, true)) {
+        const next: u8 = switch (scale_now) {
+            90 => 100,
+            100 => 112,
+            112 => 125,
+            else => 90,
+        };
+        store.lock();
+        store.settings.font_scale = next;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    t.text(t.z("scales every label and message - click to cycle Small / Normal / Large / XL.", .{}), @intFromFloat(x + size_w + 14), @intFromFloat(y + 9), 12, t.comment);
+    y += 46;
+
+    // TEXT WEIGHT — swaps to the face's Bold file (bundled OpenDyslexic Bold in dyslexia mode; the
+    // system face's bold otherwise). Thicker strokes read easier on some displays and for some eyes.
+    const wt_w = @max(t.btnW(t.z("text weight: Normal", .{}), 32), t.btnW(t.z("text weight: Bold", .{}), 32));
+    const wtr = t.Rect{ .x = x, .y = y, .width = wt_w, .height = 32 };
+    if (t.button(wtr, if (bold_now) t.z("text weight: Bold", .{}) else t.z("text weight: Normal", .{}), if (bold_now) t.green else t.comment, true)) {
+        store.lock();
+        store.settings.font_bold = !store.settings.font_bold;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    t.text(t.z("renders the whole app in the typeface's bold cut.", .{}), @intFromFloat(x + wt_w + 14), @intFromFloat(y + 9), 12, t.comment);
     y += 46;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----

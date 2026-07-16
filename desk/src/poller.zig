@@ -503,6 +503,7 @@ pub const Poller = struct {
         const p = std.fmt.allocPrint(self.gpa, "{s}/veil-desk.log", .{dd}) catch return;
         defer self.gpa.free(p);
         const dir = Io.Dir.cwd();
+        _ = dir.createDirPathStatus(self.io, dd, .default_dir) catch {}; // a fresh data dir must not eat the log
         // end-of-file from statFile, NEVER a fresh handle's length (returns 0 on Windows/Io and would
         // clobber the head); only FileNotFound legitimately means offset 0. Same rules as http.appendFile.
         const end: u64 = if (dir.statFile(self.io, p, .{})) |st| st.size else |e| switch (e) {
