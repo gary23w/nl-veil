@@ -13,6 +13,13 @@ pub fn sleepMs(ms: u64) void {
     if (builtin.os.tag == .windows) {
         Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
     } else {
-        std.Thread.sleep(ms * std.time.ns_per_ms);
+        // std.Thread.sleep does not exist in this Zig (0.16) — the tree's raw-thread POSIX sleep is a
+        // timespec + std.os.linux.nanosleep (see tools.zig watch / run.zig / mcp/client.zig). Split ms
+        // into whole seconds + remainder so nsec stays under 1e9.
+        const ts = std.posix.timespec{
+            .sec = @intCast(ms / 1000),
+            .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+        };
+        _ = std.os.linux.nanosleep(&ts, null);
     }
 }
