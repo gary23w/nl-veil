@@ -64,10 +64,10 @@ const SAFE_TOOLS = [_][]const u8{
 // has none and serves "any external client", so gate them to ADMINS. The desktop is admin on localhost, so it
 // gets the FULL hive-mind surface; a hosted non-admin tenant gets the safe subset.
 const ADMIN_TOOLS = [_][]const u8{
-    "run_python",       "run_tests",       "patch_system",   "make_tool",     "propose_change",
-    "simulate_change",  "stage_delivery",  "osint_scan",     "host_status",   "host_command",
-    "host_explore",     "browser_navigate", "browser_read",  "browser_click", "browser_type",
-    "browser_eval",     "browser_close",    "pixel_ingest",  "pixel_search",  "mcp_discover",
+    "run_python",      "run_tests",        "patch_system", "make_tool",     "propose_change",
+    "simulate_change", "stage_delivery",   "osint_scan",   "host_status",   "host_command",
+    "host_explore",    "browser_navigate", "browser_read", "browser_click", "browser_type",
+    "browser_eval",    "browser_close",    "pixel_ingest", "pixel_search",  "mcp_discover",
     "mcp_call",
 };
 

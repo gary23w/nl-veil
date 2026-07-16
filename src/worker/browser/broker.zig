@@ -145,13 +145,13 @@ fn mcpDispatch(gpa: std.mem.Allocator, rb: ReqBody) []u8 {
         return mcp_discovery.serverTools(gpa, g_io, g_env, server);
     }
     // mcp_call
-    if (server.len == 0) return gpa.dupe(u8, "{\"ok\":false,\"error\":\"need server\"}") catch @constCast("{\"ok\":false}");
-    const tool = pStr(rb.params, "tool") orelse return gpa.dupe(u8, "{\"ok\":false,\"error\":\"need tool\"}") catch @constCast("{\"ok\":false}");
+    if (server.len == 0) return gpa.dupe(u8, "{\"ok\":false,\"error\":\"need server\"}") catch @constCast("");
+    const tool = pStr(rb.params, "tool") orelse return gpa.dupe(u8, "{\"ok\":false,\"error\":\"need tool\"}") catch @constCast("");
     const args_v = switch (rb.params) {
         .object => |o| o.get("args") orelse std.json.Value{ .null = {} },
         else => std.json.Value{ .null = {} },
     };
-    const args_json = std.json.Stringify.valueAlloc(gpa, args_v, .{}) catch return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("{\"ok\":false}");
+    const args_json = std.json.Stringify.valueAlloc(gpa, args_v, .{}) catch return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("");
     defer gpa.free(args_json);
     return mcp_discovery.callServer(gpa, g_io, g_env, server, tool, args_json);
 }

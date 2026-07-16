@@ -146,15 +146,15 @@ pub fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Enviro
 /// Returns the daemon's JSON response (gpa-owned), or a JSON error.
 pub fn forward(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, action: []const u8, params_json: []const u8) []u8 {
     const info = ensure(gpa, io, env) orelse
-        return gpa.dupe(u8, "{\"ok\":false,\"error\":\"could not start the local browser host on this machine\"}") catch @constCast("{\"ok\":false}");
-    const key_lit = std.json.Stringify.valueAlloc(gpa, key, .{}) catch return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("{\"ok\":false}");
+        return gpa.dupe(u8, "{\"ok\":false,\"error\":\"could not start the local browser host on this machine\"}") catch @constCast("");
+    const key_lit = std.json.Stringify.valueAlloc(gpa, key, .{}) catch return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("");
     defer gpa.free(key_lit);
     const params = if (std.mem.trim(u8, params_json, " \r\n\t").len == 0) "{}" else params_json;
     const body = std.fmt.allocPrint(gpa, "{{\"token\":\"{s}\",\"key\":{s},\"action\":\"{s}\",\"params\":{s}}}", .{ info.token, key_lit, action, params }) catch
-        return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("{\"ok\":false}");
+        return gpa.dupe(u8, "{\"ok\":false,\"error\":\"oom\"}") catch @constCast("");
     defer gpa.free(body);
     switch (httpc.request(io, gpa, .{ .method = "POST", .port = info.port, .path = "/", .body = body, .timeout_s = 180, .cap = 48 << 20 })) {
-        .ok => |resp| return if (resp.body.len > 0) resp.body else (gpa.dupe(u8, "{\"ok\":true}") catch @constCast("{\"ok\":true}")),
-        else => return gpa.dupe(u8, "{\"ok\":false,\"error\":\"local browser host unreachable\"}") catch @constCast("{\"ok\":false}"),
+        .ok => |resp| return if (resp.body.len > 0) resp.body else (gpa.dupe(u8, "{\"ok\":true}") catch @constCast("")),
+        else => return gpa.dupe(u8, "{\"ok\":false,\"error\":\"local browser host unreachable\"}") catch @constCast(""),
     }
 }
