@@ -139,7 +139,7 @@ pub const Poller = struct {
                 .stop => self.doControl(dd, c.idStr(), "stop", "", ""),
                 .deploy => self.doDeploy(c.textStr()),
                 .delete => self.doDelete(dd, c.idStr()),
-                .open_folder => self.doOpenFolder(dd),
+                .open_folder => self.doOpenFolder(dd, c.idStr()),
                 .open_file => self.setSelFile(c.textStr()),
                 .sched_create => self.doSchedCreate(),
                 .sched_update => self.doSchedUpdate(c.idStr()),
@@ -504,16 +504,28 @@ pub const Poller = struct {
         self.narr_until_s = now_s + 1 + @as(i64, @intCast(n / 14)); // ~14 spoken chars/sec + spawn slack
     }
 
-    /// Open the data dir in the OS file browser (best-effort). Set the child's cwd to the data dir and
-    /// open "." — sidesteps resolving `dd` to an absolute path (getCwd is gone in this Zig).
-    fn doOpenFolder(self: *Poller, dd: []const u8) void {
-        log.trace("poller.doOpenFolder dd={s}", .{dd});
+    /// Open the data dir — or, with `rel` set, a specific run's folder (its work/ tree when one exists,
+    /// the run dir otherwise) — in the OS file browser (best-effort). Set the child's cwd to the target
+    /// and open "." — sidesteps resolving to an absolute path (getCwd is gone in this Zig). `rel` comes
+    /// from the roster's own ids; ".."-bearing strings are refused so the affordance can't wander.
+    fn doOpenFolder(self: *Poller, dd: []const u8, rel: []const u8) void {
+        log.trace("poller.doOpenFolder dd={s} rel={s}", .{ dd, rel });
+        var target: []const u8 = dd;
+        var tb: [640]u8 = undefined;
+        if (rel.len > 0 and std.mem.indexOf(u8, rel, "..") == null) {
+            const work = std.fmt.bufPrint(&tb, "{s}/{s}/work", .{ dd, rel }) catch dd;
+            if (Io.Dir.cwd().access(self.io, work, .{})) |_| {
+                target = work;
+            } else |_| {
+                target = std.fmt.bufPrint(&tb, "{s}/{s}", .{ dd, rel }) catch dd;
+            }
+        }
         const argv: []const []const u8 = switch (builtin.os.tag) {
             .windows => &.{ "explorer.exe", "." },
             .macos => &.{ "open", "." },
             else => &.{ "xdg-open", "." },
         };
-        _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = dd }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+        _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = target }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
     /// Append any new log lines to <data>/veil-desk.log — APPEND-ONLY (positioned write at end, the

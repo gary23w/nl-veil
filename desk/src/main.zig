@@ -161,6 +161,9 @@ const Ui = struct {
     input_extra: f32 = 0,
     input_dragging: bool = false,
     conv_selected: bool = false, // Ctrl+A on the transcript: the WHOLE conversation is the copy target
+    // Settings page scroll (content outgrows the window at larger text sizes)
+    settings_scroll: f32 = 0,
+    settings_h: f32 = 0, // content height measured last frame — the scroll clamp
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
@@ -4461,13 +4464,27 @@ fn drawFiles(store: *Store, r: t.Rect) void {
         t.text(t.z("select a file to view its contents", .{}), @intFromFloat(cx), @intFromFloat(r.y + 14), 13, t.comment);
         return;
     }
-    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(r.y + 10), 13, t.cyan, @intFromFloat(cw - 170));
-    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(r.y + 11), 11, t.orange);
-    // copy the whole (loaded) file content beside its name
-    if (cl > 0 and copyChip(cx + cw - 148, r.y + 9)) {
+    t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(r.y + 10), 13, t.cyan, @intFromFloat(cw - 260));
+    // header, right-to-left: [copy] [open folder] [(first 16 KB) when truncated] — the chip hugs the
+    // pane's right edge instead of floating mid-pane where the (usually absent) note reserved room
+    if (cl > 0 and copyChip(cx + cw - 44, r.y + 9)) {
         copyToClipboard(content[0..cl]);
         markCopied();
     }
+    const ofl = t.z("open folder", .{});
+    const ofw = t.btnW(ofl, 20);
+    if (t.buttonGhost(.{ .x = cx + cw - 52 - ofw, .y = r.y + 6, .width = ofw, .height = 20 }, ofl, t.blue, true)) {
+        var selb: [96]u8 = undefined;
+        var seln: usize = 0;
+        {
+            store.lock();
+            defer store.unlock();
+            seln = @min(store.selected_len, selb.len);
+            @memcpy(selb[0..seln], store.selected[0..seln]);
+        }
+        if (seln > 0) store.pushCmd(store_mod.mkCmd(.open_folder, selb[0..seln], ""));
+    }
+    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 60 - ofw - 100), @intFromFloat(r.y + 11), 11, t.orange);
     const view = t.Rect{ .x = cx, .y = r.y + 30, .width = cw, .height = r.height - 40 };
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
@@ -4567,9 +4584,9 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
         return;
     }
     t.textClip(selfile[0..sfl], @intFromFloat(cx), @intFromFloat(body.y + 10), 13, t.cyan, @intFromFloat(cw - 170));
-    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 96), @intFromFloat(body.y + 11), 11, t.orange);
-    // copy the whole (loaded) file content beside its name
-    if (cl > 0 and copyChip(cx + cw - 148, body.y + 9)) {
+    if (trunc) t.text(t.z("(first 16 KB)", .{}), @intFromFloat(cx + cw - 160), @intFromFloat(body.y + 11), 11, t.orange);
+    // copy the whole (loaded) file content — hugging the pane's right edge
+    if (cl > 0 and copyChip(cx + cw - 44, body.y + 9)) {
         copyToClipboard(content[0..cl]);
         markCopied();
     }
@@ -5190,8 +5207,20 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
     t.setBlockClicks(ui.open_dd != .none);
     defer t.setBlockClicks(false); // never let it leak to the titlebar/tabbar of the next frame
+    // SCROLL: the page outgrows the window (text size XL especially — the report was "we cannot scroll
+    // settings"). Wheel scrolls; the clamp comes from the content height measured LAST frame (immediate
+    // mode: this frame's total isn't known until it draws). An open dropdown keeps the wheel to itself.
+    {
+        const wheel = rl.getMouseWheelMove();
+        if (wheel != 0 and t.hovering(body) and ui.open_dd == .none) {
+            ui.settings_scroll -= wheel * 40;
+            ui.input_active = true;
+        }
+        ui.settings_scroll = std.math.clamp(ui.settings_scroll, 0, @max(0, ui.settings_h - body.height + 24));
+    }
+    rl.beginScissorMode(@intFromFloat(body.x), @intFromFloat(body.y), @intFromFloat(body.width), @intFromFloat(body.height));
     const pad: f32 = t.PAD;
-    var y: f32 = body.y + pad;
+    var y: f32 = body.y + pad - ui.settings_scroll;
     const x: f32 = pad;
     const colw = @min(body.width - pad * 2, 720);
     t.text(t.z("Settings", .{}), @intFromFloat(x), @intFromFloat(y), 20, t.fg);
@@ -5419,7 +5448,9 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             defer store.unlock();
             break :blk_ce store.settings.server_chat;
         };
-        const nv = t.checkbox(.{ .x = x, .y = y, .width = 22, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur);
+        // Full-row hit area: the label sits well past the 18px box, so a 22px-wide rect made only the tiny box
+        // clickable — clicking the label did nothing, which read as a "stuck" / policy-blocked switch.
+        const nv = t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur);
         if (nv != cur) {
             store.lock();
             store.settings.server_chat = nv;
@@ -5586,9 +5617,13 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     }
     y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    // content height for next frame's scroll clamp (add back the offset this frame subtracted)
+    ui.settings_h = (y + 24 + ui.settings_scroll) - body.y;
+    rl.endScissorMode();
 
-    // draw the open chat dropdown LAST so its option list sits on top of the fields below it. Unblock first
-    // so the option rows themselves are clickable (they were covered by the block during the form above).
+    // draw the open chat dropdown LAST so its option list sits on top of the fields below it (and outside
+    // the page scissor — a list flipped upward may poke above the body rect). Unblock first so the option
+    // rows themselves are clickable (they were covered by the block during the form above).
     t.setBlockClicks(false);
     flushChatDropdown(store);
 }

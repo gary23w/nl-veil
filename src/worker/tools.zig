@@ -1274,11 +1274,131 @@ test "htmlCloseInsert: body fragments splice before </body>; code files append a
     try std.testing.expectEqualStrings("</HTML>", x[htmlCloseInsert(x).?..]);
 }
 
+/// Repair the invalid-JSON shapes models actually emit in tool arguments — the reason "write_file often
+/// fails in swarm mode":
+///   1. RAW control characters inside string literals (a code file's newlines pasted unescaped into
+///      "content") — the dominant failure; std.json rightly rejects them. Escaped here.
+///   2. A TRUNCATED tail (the provider cut the arguments mid-string) — the string and any open
+///      containers are closed so the part that DID arrive still lands; `truncated` reports it so the
+///      caller can tell the model to append the rest.
+///   3. Prose before the first '{' and trailing garbage after the balanced object — both dropped.
+/// Returns a gpa-owned repaired document, or null when repair can't produce one (caller falls back to
+/// the original error message).
+fn repairToolJson(gpa: std.mem.Allocator, raw: []const u8, truncated: *bool) ?[]u8 {
+    truncated.* = false;
+    var i: usize = 0;
+    while (i < raw.len and raw[i] != '{') i += 1; // models sometimes preface arguments with prose
+    if (i == raw.len) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var stack: [16]u8 = undefined; // open-container stack so a truncated array closes with ']' not '}'
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+                out.append(gpa, c) catch return null;
+                continue;
+            }
+            switch (c) {
+                '\\' => {
+                    esc = true;
+                    out.append(gpa, c) catch return null;
+                },
+                '"' => {
+                    in_str = false;
+                    out.append(gpa, c) catch return null;
+                },
+                '\n' => out.appendSlice(gpa, "\\n") catch return null,
+                '\r' => out.appendSlice(gpa, "\\r") catch return null,
+                '\t' => out.appendSlice(gpa, "\\t") catch return null,
+                else => {
+                    if (c < 0x20) {
+                        var b: [8]u8 = undefined;
+                        out.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch return null) catch return null;
+                    } else out.append(gpa, c) catch return null;
+                },
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => {
+                in_str = true;
+                out.append(gpa, c) catch return null;
+            },
+            '{', '[' => {
+                if (depth >= stack.len) return null; // absurd nesting — not tool arguments
+                stack[depth] = if (c == '{') '}' else ']';
+                depth += 1;
+                out.append(gpa, c) catch return null;
+            },
+            '}', ']' => {
+                if (depth == 0) return null; // malformed beyond repair
+                depth -= 1;
+                out.append(gpa, c) catch return null;
+                if (depth == 0) break; // balanced object complete — drop any trailing garbage
+            },
+            else => out.append(gpa, c) catch return null,
+        }
+    }
+    if (in_str) { // cut off mid-string: close it (a dangling lone '\' would escape our closing quote)
+        if (esc) _ = out.pop();
+        out.append(gpa, '"') catch return null;
+        truncated.* = true;
+    }
+    while (depth > 0) { // close whatever containers the truncation left open, innermost first
+        depth -= 1;
+        out.append(gpa, stack[depth]) catch return null;
+        truncated.* = true;
+    }
+    return gpa.dupe(u8, out.items) catch null;
+}
+
+test "repairToolJson: raw newlines escape, truncation closes, prose/garbage drop, arrays close right" {
+    const gpa = std.testing.allocator;
+    var trunc = false;
+    // 1: raw control chars inside a string become escapes — the swarm write_file failure shape
+    const r1 = repairToolJson(gpa, "{\"path\":\"a.txt\",\"content\":\"line1\nline2\tend\"}", &trunc).?;
+    defer gpa.free(r1);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\",\"content\":\"line1\\nline2\\tend\"}", r1);
+    try std.testing.expect(!trunc);
+    // 2: truncated mid-string closes cleanly and reports it
+    const r2 = repairToolJson(gpa, "{\"path\":\"a.txt\",\"content\":\"partial fi", &trunc).?;
+    defer gpa.free(r2);
+    try std.testing.expectEqualStrings("{\"path\":\"a.txt\",\"content\":\"partial fi\"}", r2);
+    try std.testing.expect(trunc);
+    // 3: prose prefix + trailing garbage drop; nested array closes with ']'
+    const r3 = repairToolJson(gpa, "Here you go: {\"ops\":[{\"op\":\"replace\"", &trunc).?;
+    defer gpa.free(r3);
+    try std.testing.expectEqualStrings("{\"ops\":[{\"op\":\"replace\"}]}", r3);
+    try std.testing.expect(trunc);
+    const r4 = repairToolJson(gpa, "{\"path\":\"x\"} and then some", &trunc).?;
+    defer gpa.free(r4);
+    try std.testing.expectEqualStrings("{\"path\":\"x\"}", r4);
+}
+
 fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { path: []const u8 = "", content: []const u8 = "", mode: []const u8 = "overwrite" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
-        return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
+    var salvage_note: []const u8 = "";
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch blk_rep: {
+        // strict parse failed — repair the arguments (raw newlines in "content", a cut-off tail) and
+        // retry, so the file the model already composed lands instead of evaporating into an error.
+        var trunc = false;
+        const rep = repairToolJson(gpa, args_json, &trunc) orelse
+            return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
+        defer gpa.free(rep);
+        const p2 = std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true }) catch
+            return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
+        salvage_note = if (trunc)
+            " NOTE: your arguments were CUT OFF mid-content — I closed and wrote what arrived. read_file to see where it stops, then send the REST with mode:\"append\"."
+        else
+            " NOTE: your content carried raw (unescaped) newlines — repaired this time; emit \\n escapes in JSON strings.";
+        break :blk_rep p2;
+    };
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     const npath = blk_np: {
@@ -1400,7 +1520,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.", .{ wpath, final_bytes, p.value.path }) catch dupe(gpa, "wrote");
     if (restarted)
         return std.fmt.allocPrint(gpa, "rewrote {s} — your append RE-STARTED the file (its body opens with the same line the file already starts with), so it REPLACED the old attempt instead of gluing two half-programs together; file is now {d} bytes. To truly append, send only the NEW lines that continue the existing file.", .{ wpath, final_bytes }) catch dupe(gpa, "rewrote");
-    return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes }) catch dupe(gpa, "wrote");
+    return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes{s}", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes, salvage_note }) catch dupe(gpa, "wrote");
 }
 
 /// An "append" whose body RE-OPENS the file (the same first meaningful line as the existing head — the same
@@ -1516,8 +1636,15 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // Top-level `search`/`replace` too: a FLAT {path, search, replace} call (no ops array) is what an XML-shaped
     // tool call converts to, and some models emit it directly — treat it as a single replace op.
     const A = struct { path: []const u8 = "", ops: []const OpJson = &.{}, search: []const u8 = "", replace: []const u8 = "" };
-    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
-        return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch blk_rep: {
+        // same repair as write_file: escaped control chars / a closed-off truncated tail beat an error
+        var trunc = false;
+        const rep = repairToolJson(gpa, args_json, &trunc) orelse
+            return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
+        defer gpa.free(rep);
+        break :blk_rep std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true }) catch
+            return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
+    };
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
     if (p.value.ops.len == 0 and p.value.search.len == 0) return dupe(gpa, "edit_file needs either an ops array (each op replace/insert_before/insert_after/delete with an exact anchor) OR a top-level search+replace.");
