@@ -12,6 +12,7 @@ test {
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/plan.zig");
     _ = @import("worker/chat/sync.zig");
+    _ = @import("worker/chat/toolperf.zig");
     _ = @import("worker/control/supervisor.zig");
     _ = @import("worker/crawl.zig");
     _ = @import("worker/httpc.zig");
