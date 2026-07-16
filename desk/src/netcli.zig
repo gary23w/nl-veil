@@ -175,6 +175,13 @@ pub fn chatConv(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, co
     return httpReq(io, gpa, "GET", port, path, token, null, 8);
 }
 
+/// GET /api/v1/metrics/llm — the caller's per-model LLM usage aggregates + 14-day activity series
+/// (server worker/metrics.zig). Feeds the Dashboard's breakdown table and activity bars.
+pub fn metricsLlm(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.metricsLlm port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/metrics/llm", token, null, 6);
+}
+
 /// GET /api/v1/sched — the scheduled-task list (admin-gated: a non-admin token 403s and the caller
 /// surfaces it). Short ceiling: the poller refreshes this every few seconds beside the fleet poll.
 pub fn schedList(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
