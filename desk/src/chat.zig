@@ -10923,7 +10923,7 @@ test "castProviderId routes a cast to the chat's configured backend (local vs BY
 
 test "resolveBase substitutes the Cloudflare {account}, falls back to the sentinel, and passes others through" {
     var out: [256]u8 = undefined;
-    const cf = for (&catalog.providers) |*p| {
+    const cf = for (catalog.providers) |*p| { // providers is a slice now (from models.yaml) — iterate directly, no &
         if (std.mem.eql(u8, p.key, "workers-ai")) break p;
     } else unreachable;
     // account id spliced into the template
