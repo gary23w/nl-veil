@@ -2,7 +2,7 @@
 //! own std.Io, talks to the UI only through the Store). It runs the Chat tab's brain:
 //!   - model turns: streams /chat/completions through llm.zig, deltas land in Store.stream_text
 //!   - swarm casting: a reply whose first line is "CAST: <goal>" fires a cast (POST /api/v1/swarms via netcli,
-//!     the same door the Deploy tab uses), then WATCHES the run's events.jsonl (scan.tailEvents) for the
+//!     the same door the Swarm tab's Deploy form uses), then WATCHES the run's events.jsonl (scan.tailEvents) for the
 //!     activity pane; when the swarm stops it folds the findings back into the conversation for the model.
 //!   - persistence: conversations as JSONL under <data>/.veil-desk/chats/, settings JSON alongside, the API
 //!     key via secrets.zig. All chat-side io lives here.

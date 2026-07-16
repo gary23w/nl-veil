@@ -53,6 +53,7 @@ pub const Poller = struct {
     // the list reflects it on the very next tick instead of up to SCHED_EVERY_S later.
     last_sched_s: i64 = 0,
     sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
+    last_llm_s: i64 = 0, // LLM-usage metrics poll throttle (Dashboard aggregates move slowly)
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
 
@@ -564,6 +565,13 @@ pub const Poller = struct {
             self.refreshSched();
         }
 
+        // 1b') LLM usage metrics for the Dashboard — a slower cadence (the aggregates only move when a turn
+        // finishes, and the server re-reads its whole metrics file per GET).
+        if (online and now_s - self.last_llm_s >= 12) {
+            self.last_llm_s = now_s;
+            self.refreshLlm();
+        }
+
         // 1c) Cloudflare OAuth login status — one more cheap GET on the same cadence (faster while a login is
         // pending so "connected" appears promptly after the browser grant).
         {
@@ -703,6 +711,55 @@ pub const Poller = struct {
         self.store.sched_count = n;
         self.store.sched_seen = true;
         self.store.sched_denied = false;
+    }
+
+    /// GET /api/v1/metrics/llm → publish per-model aggregates + the 14-day series for the Dashboard. A
+    /// failed/unreachable fetch keeps the last-known numbers (metrics are slow-moving; stale beats blank).
+    fn refreshLlm(self: *Poller) void {
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        const resp = netcli.metricsLlm(self.io, self.gpa, self.port(), tok) orelse return;
+        defer if (resp.body.len > 0) self.gpa.free(resp.body);
+        if (resp.status != 200) return;
+
+        var models: [store_mod.MAX_LLM_MODELS]store_mod.LlmModelRow = undefined;
+        var mn: usize = 0;
+        if (std.mem.indexOf(u8, resp.body, "\"models\":[")) |arr| {
+            var cur = arr + "\"models\":[".len;
+            while (mn < models.len) {
+                const obj = scan.nextJsonObj(resp.body, &cur) orelse break;
+                models[mn] = .{};
+                parseLlmModel(obj, &models[mn]);
+                if (models[mn].model_len == 0 and models[mn].base_len == 0) continue;
+                mn += 1;
+            }
+        }
+        var days: [store_mod.LLM_DAYS]store_mod.LlmDay = [_]store_mod.LlmDay{.{}} ** store_mod.LLM_DAYS;
+        var dn: usize = 0;
+        if (std.mem.indexOf(u8, resp.body, "\"days\":[")) |arr| {
+            var cur = arr + "\"days\":[".len;
+            while (dn < days.len) {
+                const obj = scan.nextJsonObj(resp.body, &cur) orelse break;
+                parseLlmDay(obj, &days[dn]);
+                dn += 1;
+            }
+        }
+        var tot = store_mod.LlmModelRow{};
+        if (std.mem.indexOf(u8, resp.body, "\"totals\":")) |ti| {
+            var cur = ti + "\"totals\":".len;
+            if (scan.nextJsonObj(resp.body, &cur)) |obj| parseLlmModel(obj, &tot);
+        }
+
+        self.store.lock();
+        defer self.store.unlock();
+        @memcpy(self.store.llm_models[0..mn], models[0..mn]);
+        self.store.llm_model_count = mn;
+        self.store.llm_days = days;
+        self.store.llm_tot_calls = tot.calls;
+        self.store.llm_tot_in = tot.tin;
+        self.store.llm_tot_out = tot.tout;
+        self.store.llm_tot_secs = tot.secs;
+        self.store.llm_seen = true;
     }
 
     /// Open a URL in the OS browser (best-effort). The Cloudflare consent page — the ONE place the desk opens
@@ -907,6 +964,50 @@ fn valueForKey(json: []const u8, key: []const u8, buf: []u8) []const u8 {
 /// Fill one SchedRow from a task object, walking it pair-by-pair (scan.nextJsonPair) so free-text values
 /// (a prompt containing `"at":`) can never be misread as fields. Unknown keys (created, details, base_url,
 /// model) are simply skipped — the row only keeps what the tab renders.
+/// One flat {"model","base","calls","in","out","secs","last_ts"} object → an LlmModelRow. Also parses the
+/// "totals" object (which simply lacks model/base). Unknown keys skip — additive server fields stay safe.
+fn parseLlmModel(obj: []const u8, row: *store_mod.LlmModelRow) void {
+    var cur: usize = 0;
+    while (scan.nextJsonPair(obj, &cur)) |p| {
+        if (p.is_str) {
+            if (std.mem.eql(u8, p.key, "model")) {
+                row.model_len = @intCast(scan.unescapeInto(p.raw, &row.model).len);
+            } else if (std.mem.eql(u8, p.key, "base")) {
+                row.base_len = @intCast(scan.unescapeInto(p.raw, &row.base).len);
+            }
+        } else {
+            if (std.mem.eql(u8, p.key, "calls")) {
+                row.calls = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "in")) {
+                row.tin = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "out")) {
+                row.tout = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "secs")) {
+                row.secs = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+            } else if (std.mem.eql(u8, p.key, "last_ts")) {
+                row.last_ts = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+            }
+        }
+    }
+}
+
+/// One {"d","in","out","calls"} day bucket → an LlmDay.
+fn parseLlmDay(obj: []const u8, day: *store_mod.LlmDay) void {
+    var cur: usize = 0;
+    while (scan.nextJsonPair(obj, &cur)) |p| {
+        if (p.is_str) continue;
+        if (std.mem.eql(u8, p.key, "d")) {
+            day.day = std.fmt.parseInt(i64, p.raw, 10) catch 0;
+        } else if (std.mem.eql(u8, p.key, "in")) {
+            day.tin = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+        } else if (std.mem.eql(u8, p.key, "out")) {
+            day.tout = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+        } else if (std.mem.eql(u8, p.key, "calls")) {
+            day.calls = std.fmt.parseInt(u64, p.raw, 10) catch 0;
+        }
+    }
+}
+
 fn parseSchedTask(obj: []const u8, row: *store_mod.SchedRow) void {
     var cur: usize = 0;
     while (scan.nextJsonPair(obj, &cur)) |p| {

@@ -25,6 +25,7 @@ const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
 const deploy_service = @import("../deploy/service.zig");
 const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
+const metrics = @import("../metrics.zig"); // per-turn LLM usage lines behind the desk Dashboard
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
 // (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.
@@ -272,6 +273,7 @@ fn emitUsage(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
     if (din > 0 or dout > 0) {
         var b: [160]u8 = undefined;
         emitEvent(app, conv_dir, std.fmt.bufPrint(&b, "{{\"kind\":\"usage\",\"tokens_in\":{d},\"tokens_out\":{d},\"text\":\"{d} tokens in · {d} out\"}}", .{ din, dout, din, dout }) catch "{\"kind\":\"usage\"}");
+        metrics.record(app, din, dout, nowSecs(app.io)); // one Dashboard metrics line per finished turn
     }
 }
 
@@ -313,6 +315,12 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
 pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, loop: u8, tool_client: bool) void {
     const gpa = app.gpa;
+
+    // Arm this thread's LLM-usage recorder: emitUsage (the one usage choke-point, reached on every turn
+    // completion path) records one per-model metrics line for the Dashboard. Thread-local, so none of the
+    // eleven finish paths needs the model/uid threaded through.
+    metrics.beginTurn(uid, model, base_url, schedTaskOf(conv) != null, nowSecs(app.io));
+    defer metrics.endTurn();
 
     // ---- store + build paths (conv store under convs/, build tree under builds/ — same split as runMindTool) ----
     const base = std.fmt.allocPrint(gpa, "{s}/u{d}/_chat", .{ app.data, uid }) catch return;

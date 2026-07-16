@@ -20,7 +20,7 @@ const SpinLock = struct {
     }
 };
 
-pub const Tab = enum { dashboard, chat, deploy, swarm, hub, scheduled, settings };
+pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
 pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout };
 
@@ -381,6 +381,34 @@ test "SchedRowView.of clips the full prompt to a preview and carries every draw 
     try std.testing.expectEqual(@as(usize, 96), v.promptStr().len);
 }
 
+// --- LLM usage metrics (poller writes from GET /api/v1/metrics/llm; the Dashboard reads) ---
+
+pub const MAX_LLM_MODELS = 16;
+pub const LLM_DAYS = 14; // mirrors the server's aggregation window (worker/metrics.zig DAYS)
+
+/// One (model, provider-host) usage aggregate — everything the Dashboard's breakdown table shows.
+pub const LlmModelRow = struct {
+    model: [96]u8 = [_]u8{0} ** 96,
+    model_len: u8 = 0,
+    base: [96]u8 = [_]u8{0} ** 96, // provider HOST only (never a path, never a key)
+    base_len: u8 = 0,
+    calls: u64 = 0,
+    tin: u64 = 0,
+    tout: u64 = 0,
+    secs: u64 = 0, // summed wall seconds of the turns — tout/secs = observed generation speed
+    last_ts: i64 = 0,
+
+    pub fn modelStr(s: *const LlmModelRow) []const u8 {
+        return s.model[0..s.model_len];
+    }
+    pub fn baseStr(s: *const LlmModelRow) []const u8 {
+        return s.base[0..s.base_len];
+    }
+};
+
+/// One local day of activity (the 14-day bars). `day` = local epoch-day from the server.
+pub const LlmDay = struct { day: i64 = 0, tin: u64 = 0, tout: u64 = 0, calls: u64 = 0 };
+
 pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
@@ -542,6 +570,16 @@ pub const Store = struct {
     // per-turn chat performance ring (chat worker appends, Metrics tab reads)
     turn_metrics: [METRIC_RING]TurnMetric = undefined,
     turn_metric_count: usize = 0, // total turns recorded (may exceed the ring; @min with METRIC_RING to iterate)
+
+    // --- LLM usage metrics (poller writes from GET /api/v1/metrics/llm; Dashboard reads) ---
+    llm_models: [MAX_LLM_MODELS]LlmModelRow = undefined,
+    llm_model_count: usize = 0,
+    llm_days: [LLM_DAYS]LlmDay = [_]LlmDay{.{}} ** LLM_DAYS, // oldest first, [LLM_DAYS-1] = today
+    llm_tot_calls: u64 = 0,
+    llm_tot_in: u64 = 0,
+    llm_tot_out: u64 = 0,
+    llm_tot_secs: u64 = 0,
+    llm_seen: bool = false, // first successful metrics fetch landed ("no usage yet" vs "loading")
 
     // --- scheduled tasks (poller writes from GET /api/v1/sched; Scheduled tab reads) ---
     sched_rows: [MAX_SCHED]SchedRow = undefined,

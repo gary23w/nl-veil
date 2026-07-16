@@ -17,6 +17,7 @@ test {
     _ = @import("worker/hyperspace.zig");
     _ = @import("worker/llm.zig");
     _ = @import("worker/locs/atlas.zig");
+    _ = @import("worker/metrics.zig");
     _ = @import("worker/rerank.zig");
     _ = @import("worker/rsi.zig");
     _ = @import("worker/run.zig");

@@ -23,6 +23,7 @@ const control_writer = @import("worker/control/writer.zig");
 const chat_tools = @import("worker/chat/tools.zig");
 const chat_service = @import("worker/chat/service.zig");
 const sched = @import("worker/sched.zig");
+const metrics = @import("worker/metrics.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
@@ -312,6 +313,7 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/sched/:id", sched.updateTask, .{});
     router.delete("/api/v1/sched/:id", sched.deleteTask, .{});
     router.post("/api/v1/sched/:id/run", sched.runTaskNow, .{});
+    router.get("/api/v1/metrics/llm", metrics.getLlm, .{});
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});

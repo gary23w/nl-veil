@@ -75,7 +75,8 @@ const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_p
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
-const SchedInner = enum { tasks, build }; // the Scheduled tab's inner tabs (task list | builder form)
+const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
+const SwarmInner = enum { live, deploy }; // the Swarm tab's inner tabs (live view | deploy form)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
@@ -150,6 +151,7 @@ const Ui = struct {
     d_gap: bool = true,
     d_breakout: bool = false,
     d_psyche: bool = false,
+    swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
@@ -521,9 +523,13 @@ pub fn main() !void {
                                 store.chat_loop_afk = false;
                             } else if (std.mem.startsWith(u8, cmd, "tab ")) {
                                 const tn = std.mem.trim(u8, cmd[4..], " \r\n\t");
-                                const tv: ?Tab =
-                                    if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "deploy")) .deploy else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
-                                if (tv) |v| setTab(v);
+                                if (std.mem.eql(u8, tn, "deploy")) {
+                                    gotoDeploy(); // deploy is the Swarm tab's inner form now — "tab deploy" still lands there
+                                } else {
+                                    const tv: ?Tab =
+                                        if (std.mem.eql(u8, tn, "dashboard")) .dashboard else if (std.mem.eql(u8, tn, "chat")) .chat else if (std.mem.eql(u8, tn, "swarm")) .swarm else if (std.mem.eql(u8, tn, "hub")) .hub else if (std.mem.eql(u8, tn, "scheduled")) .scheduled else if (std.mem.eql(u8, tn, "tasks")) .scheduled else if (std.mem.eql(u8, tn, "settings")) .settings else null;
+                                    if (tv) |v| setTab(v);
+                                }
                             } else if (std.mem.startsWith(u8, cmd, "right ")) {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
@@ -604,7 +610,6 @@ pub fn main() !void {
         switch (ui.tab) {
             .dashboard => drawDashboard(&store, body),
             .chat => drawChat(&store, body),
-            .deploy => drawDeploy(&store, body),
             .swarm => drawSwarm(&store, body),
             .hub => drawHub(body),
             .scheduled => drawScheduled(&store, body),
@@ -787,7 +792,7 @@ fn drawFileMenu(store: *Store) void {
         if (hot and rl.isMouseButtonPressed(.left)) {
             ui.file_menu = false;
             switch (i) {
-                0 => ui.tab = .deploy,
+                0 => gotoDeploy(),
                 1 => store.pushCmd(store_mod.mkCmd(.refresh_now, "", "")),
                 2 => store.pushCmd(store_mod.mkCmd(.open_folder, "", "")),
                 3 => ui.close_req = true,
@@ -1051,6 +1056,12 @@ fn setTab(tabv: Tab) void {
     if (tabv == .chat) while (rl.getCharPressed() > 0) {}; // drain the trigger digit; don't type it into the field
 }
 
+/// Jump to the deploy form — an INNER tab of Swarm (there is no Deploy top tab anymore).
+fn gotoDeploy() void {
+    setTab(.swarm);
+    ui.swarm_inner = .deploy;
+}
+
 fn handleKeys(store: *Store) void {
     // any handled shortcut counts as activity so the redraw stays at 60fps for a beat (see the FPS gate)
     if (rl.isKeyPressed(.f12) or rl.isKeyPressed(.one) or rl.isKeyPressed(.two) or rl.isKeyPressed(.three) or
@@ -1060,11 +1071,11 @@ fn handleKeys(store: *Store) void {
     if (ui.focus == .none) {
         if (rl.isKeyPressed(.one)) setTab(.dashboard);
         if (rl.isKeyPressed(.two)) setTab(.chat);
-        if (rl.isKeyPressed(.three)) setTab(.deploy);
+        if (rl.isKeyPressed(.three)) setTab(.scheduled);
         if (rl.isKeyPressed(.four)) setTab(.swarm);
         if (rl.isKeyPressed(.five)) setTab(.hub);
         if (rl.isKeyPressed(.six)) setTab(.settings);
-        if (rl.isKeyPressed(.seven)) setTab(.scheduled);
+        if (rl.isKeyPressed(.seven)) gotoDeploy(); // deploy lives inside Swarm now
     }
     // Keyboard copy — ONE priority chain, NOT gated on focus (the Chat tab force-focuses the prompt input and
     // clicks never clear focus, so a focus gate would make "select text, Ctrl+C" copy the empty input instead):
@@ -1227,8 +1238,8 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Tasks", .{}), t.z("Settings", .{}) };
-    const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .scheduled, .settings };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Tasks", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Settings", .{}) };
+    const tabs = [_]Tab{ .dashboard, .chat, .scheduled, .swarm, .hub, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
         const w = t.tabW(lb);
@@ -1254,22 +1265,227 @@ fn drawDashboard(store: *Store, body: t.Rect) void {
     const fm = store.fleet_minds;
     const fh = store.fleet_headroom;
     const sc = store.swarm_count;
+    const tot_calls = store.llm_tot_calls;
+    const tot_in = store.llm_tot_in;
+    const tot_out = store.llm_tot_out;
+    const tot_secs = store.llm_tot_secs;
     store.unlock();
 
+    // row 1: the live fleet
     const card_w = (colw - 3 * t.GAP) / 4;
     statCard(x + 0 * (card_w + t.GAP), y, card_w, "SERVER", if (online) "online" else "offline", if (online) t.green else t.red);
     statCard(x + 1 * (card_w + t.GAP), y, card_w, "LIVE SWARMS", t.z("{d}", .{fl}), t.cyan);
     statCard(x + 2 * (card_w + t.GAP), y, card_w, "LIVE MINDS", t.z("{d}", .{fm}), t.magenta);
     statCard(x + 3 * (card_w + t.GAP), y, card_w, "HEADROOM", t.z("{d}", .{fh}), if (fh > 0) t.green else t.orange);
+    y += 92 + t.GAP;
+
+    // row 2: the LLM lifetime totals (every finished chat/task turn meters here)
+    var cb1: [24]u8 = undefined;
+    var cb2: [24]u8 = undefined;
+    var cb3: [24]u8 = undefined;
+    const spd: u64 = if (tot_secs > 0) tot_out / tot_secs else 0;
+    statCard(x + 0 * (card_w + t.GAP), y, card_w, "TURNS", t.zs(fmtCount(tot_calls, &cb1)), t.blue);
+    statCard(x + 1 * (card_w + t.GAP), y, card_w, "TOKENS IN", t.zs(fmtCount(tot_in, &cb2)), t.cyan);
+    statCard(x + 2 * (card_w + t.GAP), y, card_w, "TOKENS OUT", t.zs(fmtCount(tot_out, &cb3)), t.magenta);
+    statCard(x + 3 * (card_w + t.GAP), y, card_w, "AVG SPEED", t.z("{d} tok/s", .{spd}), t.green);
     y += 92 + t.PAD;
+
+    // two columns: swarms (left) | client + LLM breakdown + activity (right)
+    const right_w = @min(460, colw * 0.42);
+    const left_w = colw - right_w - t.PAD;
+    const bottom = body.y + body.height - pad;
 
     const nb_label = t.z("+ New swarm", .{});
     const nb = t.Rect{ .x = x, .y = y, .width = t.btnW(nb_label, t.BTN_MD), .height = t.BTN_MD };
-    if (t.buttonSolid(nb, nb_label, t.blue, true)) ui.tab = .deploy;
+    if (t.buttonSolid(nb, nb_label, t.blue, true)) gotoDeploy();
     t.text(t.z("Swarms ({d})", .{sc}), @intFromFloat(nb.x + nb.width + t.PAD), @intFromFloat(y + (t.BTN_MD - 14) / 2), 14, t.fg_dim);
-    y += t.BTN_MD + t.GAP;
-    const list_r = t.Rect{ .x = x, .y = y, .width = colw, .height = body.y + body.height - y - pad };
+    const list_r = t.Rect{ .x = x, .y = y + t.BTN_MD + t.GAP, .width = left_w, .height = bottom - y - t.BTN_MD - t.GAP };
     drawRoster(store, list_r);
+
+    // right column: CLIENT panel, then the per-model table, then the 14-day bars filling the rest
+    const rx = x + left_w + t.PAD;
+    const client_h: f32 = 150;
+    drawClientPanel(store, .{ .x = rx, .y = y, .width = right_w, .height = client_h });
+    const bars_h: f32 = 118;
+    const table_r = t.Rect{ .x = rx, .y = y + client_h + t.GAP, .width = right_w, .height = @max(90, bottom - y - client_h - bars_h - 2 * t.GAP) };
+    drawLlmTable(store, table_r);
+    drawLlmBars(store, .{ .x = rx, .y = table_r.y + table_r.height + t.GAP, .width = right_w, .height = bars_h });
+}
+
+/// "73.7k" / "1.2M" / "412" — token/call counts at dashboard scale.
+fn fmtCount(v: u64, buf: []u8) []const u8 {
+    if (v >= 1_000_000) return std.fmt.bufPrint(buf, "{d}.{d}M", .{ v / 1_000_000, (v % 1_000_000) / 100_000 }) catch "?";
+    if (v >= 1_000) return std.fmt.bufPrint(buf, "{d}.{d}k", .{ v / 1_000, (v % 1_000) / 100 }) catch "?";
+    return std.fmt.bufPrint(buf, "{d}", .{v}) catch "?";
+}
+
+// Win32 memory census for the CLIENT panel (the one OS fact raylib can't provide). Polled at ~1Hz via
+// mem_stat — GlobalMemoryStatusEx is cheap but not draw-loop cheap.
+const winmem = if (builtin.os.tag == .windows) struct {
+    const MEMORYSTATUSEX = extern struct {
+        dwLength: u32,
+        dwMemoryLoad: u32,
+        ullTotalPhys: u64,
+        ullAvailPhys: u64,
+        ullTotalPageFile: u64,
+        ullAvailPageFile: u64,
+        ullTotalVirtual: u64,
+        ullAvailVirtual: u64,
+        ullAvailExtendedVirtual: u64,
+    };
+    extern "kernel32" fn GlobalMemoryStatusEx(lpBuffer: *MEMORYSTATUSEX) callconv(.c) i32;
+} else struct {};
+
+var mem_stat: struct { total_mb: u64 = 0, avail_mb: u64 = 0, load: u32 = 0, at: f64 = -10 } = .{};
+
+fn refreshMemStat() void {
+    if (builtin.os.tag != .windows) return;
+    const now = rl.getTime();
+    if (now - mem_stat.at < 1.0) return;
+    mem_stat.at = now;
+    var m: winmem.MEMORYSTATUSEX = undefined;
+    m.dwLength = @sizeOf(winmem.MEMORYSTATUSEX);
+    if (winmem.GlobalMemoryStatusEx(&m) != 0) {
+        mem_stat.total_mb = m.ullTotalPhys >> 20;
+        mem_stat.avail_mb = m.ullAvailPhys >> 20;
+        mem_stat.load = m.dwMemoryLoad;
+    }
+}
+
+/// CLIENT — what this machine and session look like right now: OS/arch, cores, physical memory, the desk's
+/// uptime, and which server this client is pointed at. The "how is my client running" panel.
+fn drawClientPanel(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    t.text(t.z("CLIENT", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 12), 11, t.comment);
+    refreshMemStat();
+
+    var host: [64]u8 = undefined;
+    var host_n: usize = 0;
+    var port: u16 = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        const h = store.settings.hostStr();
+        host_n = @min(h.len, host.len);
+        @memcpy(host[0..host_n], h[0..host_n]);
+        port = store.settings.port;
+    }
+    const up: u64 = @intFromFloat(@max(0, rl.getTime()));
+    const cores = std.Thread.getCpuCount() catch 0;
+
+    var yy = r.y + 32;
+    const lh: f32 = 22;
+    clientRow(r, yy, "system", t.z("{s} / {s}", .{ @tagName(builtin.os.tag), @tagName(builtin.cpu.arch) }));
+    yy += lh;
+    clientRow(r, yy, "cpu", t.z("{d} logical cores", .{cores}));
+    yy += lh;
+    if (mem_stat.total_mb > 0) {
+        const used = mem_stat.total_mb - mem_stat.avail_mb;
+        clientRow(r, yy, "memory", t.z("{d}.{d} / {d}.{d} GB ({d}%)", .{ used / 1024, (used % 1024) / 103, mem_stat.total_mb / 1024, (mem_stat.total_mb % 1024) / 103, mem_stat.load }));
+    } else {
+        clientRow(r, yy, "memory", t.z("-", .{}));
+    }
+    yy += lh;
+    clientRow(r, yy, "desk uptime", t.z("{d}h {d}m", .{ up / 3600, (up % 3600) / 60 }));
+    yy += lh;
+    clientRow(r, yy, "server", t.z("{s}:{d}", .{ if (host_n > 0) host[0..host_n] else "127.0.0.1", port }));
+}
+
+fn clientRow(r: t.Rect, y: f32, label: []const u8, value: []const u8) void {
+    t.textClip(label, @intFromFloat(r.x + 14), @intFromFloat(y), 12, t.comment, 110);
+    t.textClip(value, @intFromFloat(r.x + 130), @intFromFloat(y), 12, t.fg, @intFromFloat(r.width - 144));
+}
+
+/// LLM BREAKDOWN — one row per (model, provider host): calls, tokens in/out, and the observed generation
+/// speed (out-tokens / summed turn seconds). Busiest first (server pre-sorts).
+fn drawLlmTable(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    t.text(t.z("LLM BREAKDOWN", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 12), 11, t.comment);
+    store.lock();
+    var rows: [store_mod.MAX_LLM_MODELS]store_mod.LlmModelRow = undefined;
+    const n = store.llm_model_count;
+    @memcpy(rows[0..n], store.llm_models[0..n]);
+    const seen = store.llm_seen;
+    store.unlock();
+
+    if (n == 0) {
+        const msg = if (seen) t.z("no LLM usage yet - run a chat or a task", .{}) else t.z("fetching usage...", .{});
+        t.text(msg, @intFromFloat(r.x + 14), @intFromFloat(r.y + 34), 12, t.comment);
+        return;
+    }
+    // column layout: model+host flexes; the numbers hold fixed right-aligned-ish slots
+    const cx_calls = r.x + r.width - 210;
+    const cx_in = r.x + r.width - 162;
+    const cx_out = r.x + r.width - 108;
+    const cx_spd = r.x + r.width - 56;
+    var yy = r.y + 32;
+    t.text(t.z("calls", .{}), @intFromFloat(cx_calls), @intFromFloat(yy), 11, t.comment);
+    t.text(t.z("in", .{}), @intFromFloat(cx_in), @intFromFloat(yy), 11, t.comment);
+    t.text(t.z("out", .{}), @intFromFloat(cx_out), @intFromFloat(yy), 11, t.comment);
+    t.text(t.z("tok/s", .{}), @intFromFloat(cx_spd), @intFromFloat(yy), 11, t.comment);
+    yy += 18;
+    rl.beginScissorMode(@intFromFloat(r.x), @intFromFloat(yy - 2), @intFromFloat(r.width), @intFromFloat(r.y + r.height - yy));
+    defer rl.endScissorMode();
+    for (rows[0..n]) |*m| {
+        if (yy > r.y + r.height - 14) break;
+        t.textClip(m.modelStr(), @intFromFloat(r.x + 14), @intFromFloat(yy), 12, t.fg, @intFromFloat(@max(40, cx_calls - r.x - 22)));
+        var b1: [24]u8 = undefined;
+        var b2: [24]u8 = undefined;
+        var b3: [24]u8 = undefined;
+        t.textClip(fmtCount(m.calls, &b1), @intFromFloat(cx_calls), @intFromFloat(yy), 12, t.fg_dim, 44);
+        t.textClip(fmtCount(m.tin, &b2), @intFromFloat(cx_in), @intFromFloat(yy), 12, t.cyan, 50);
+        t.textClip(fmtCount(m.tout, &b3), @intFromFloat(cx_out), @intFromFloat(yy), 12, t.magenta, 48);
+        const spd: u64 = if (m.secs > 0) m.tout / m.secs else 0;
+        t.text(t.z("{d}", .{spd}), @intFromFloat(cx_spd), @intFromFloat(yy), 12, t.green);
+        yy += 16;
+        // the provider host under the model, quieter — the same model id can live on two providers
+        if (m.base_len > 0 and yy <= r.y + r.height - 12) {
+            t.textClip(m.baseStr(), @intFromFloat(r.x + 14), @intFromFloat(yy), 10, t.withAlpha(t.comment, 180), @intFromFloat(@max(40, cx_calls - r.x - 22)));
+            yy += 14;
+        }
+        yy += 4;
+    }
+}
+
+/// 14-DAY ACTIVITY — one bar per local day of total tokens moved (in+out), today rightmost. The quick
+/// "how hard has this thing been working lately" read.
+fn drawLlmBars(store: *Store, r: t.Rect) void {
+    t.panelBordered(r, t.bg_dark, t.border);
+    t.text(t.z("14-DAY ACTIVITY (tokens)", .{}), @intFromFloat(r.x + 14), @intFromFloat(r.y + 12), 11, t.comment);
+    store.lock();
+    const days = store.llm_days;
+    store.unlock();
+
+    var maxv: u64 = 1;
+    for (days) |d| {
+        const v = d.tin + d.tout;
+        if (v > maxv) maxv = v;
+    }
+    const plot_x = r.x + 14;
+    const plot_w = r.width - 28;
+    const plot_bot = r.y + r.height - 26;
+    const plot_h = plot_bot - (r.y + 32);
+    const n: f32 = @floatFromInt(days.len);
+    const bw = @max(4, plot_w / n - 4);
+    for (days, 0..) |d, i| {
+        const v = d.tin + d.tout;
+        const h: f32 = if (v == 0) 2 else @max(3, plot_h * @as(f32, @floatFromInt(v)) / @as(f32, @floatFromInt(maxv)));
+        const bx = plot_x + @as(f32, @floatFromInt(i)) * (plot_w / n) + 2;
+        const col = if (i == days.len - 1) t.green else t.withAlpha(t.cyan, 170); // today pops
+        t.fillRect(@intFromFloat(bx), @intFromFloat(plot_bot - h), @intFromFloat(bw), @intFromFloat(h), col);
+    }
+    // edge labels: the window's first day and "today" (labels stay sparse — the bars carry the story)
+    var db: [16]u8 = undefined;
+    t.textClip(fmtDayLabel(days[0].day, &db), @intFromFloat(plot_x), @intFromFloat(plot_bot + 6), 10, t.comment, 60);
+    t.text(t.z("today", .{}), @intFromFloat(r.x + r.width - 46), @intFromFloat(plot_bot + 6), 10, t.comment);
+}
+
+/// Local epoch-day → "M/D" for the bars' left edge label. day 0 (no data yet) → "".
+fn fmtDayLabel(day: i64, buf: []u8) []const u8 {
+    if (day <= 0) return "";
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(day * 86400) };
+    const monday = es.getEpochDay().calculateYearDay().calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d}/{d}", .{ monday.month.numeric(), monday.day_index + 1 }) catch "";
 }
 
 fn statCard(x: f32, y: f32, w: f32, label: [:0]const u8, value: [:0]const u8, accent: t.Color) void {
@@ -1946,7 +2162,14 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     // is suppressed for it — but the MSG_HEAD_H row is still reserved so the on-hover whole-message copy chip
     // (drawn by the caller at y0) sits clear of the card's status pill.
     const is_console = role == .cast_note and isConsoleMsg(text_);
-    if (draw and !is_console and inView(view, yy, MSG_HEAD_H)) t.text(roleLabel(role), @intFromFloat(view.x + 14), @intFromFloat(yy), 11, roleColor(role));
+    if (draw and !is_console and inView(view, yy, MSG_HEAD_H)) {
+        var lx = view.x + 14;
+        // the LIVE reply (cursor=true only on the streaming message) gets the shadowy-figure avatar +
+        // pulsing thought dots — the "someone is in there thinking" marker the plain label lacked
+        if (cursor and role == .veil) lx += drawThinkingFigure(lx, yy);
+        t.text(roleLabel(role), @intFromFloat(lx), @intFromFloat(yy), 11, roleColor(role));
+        if (cursor and role == .veil) drawThinkingDots(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 10, yy);
+    }
     yy += MSG_HEAD_H;
     if (is_console) return renderConsole(view, yy, text_, fsz, draw);
     const dim = role == .cast_note or role == .thought;
@@ -2231,6 +2454,29 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
     }
     if (rows == 0) yy += MSG_LINE_H; // an empty/all-space segment still occupies one line
     return yy;
+}
+
+/// The shadowy-figure thinking avatar on the live reply's header row: a dim silhouette (head over
+/// shoulders) in the veil's own color, ghosted. Returns the width consumed so the role label shifts right.
+/// Sized to stay inside the MSG_HEAD_H (18px) label row.
+fn drawThinkingFigure(x: f32, y: f32) f32 {
+    const shadow = t.withAlpha(t.magenta, 96);
+    const cx: i32 = @intFromFloat(x + 6);
+    rl.drawCircle(cx, @intFromFloat(y + 5), 3.2, shadow); // head
+    rl.drawEllipse(cx, @intFromFloat(y + 14), 5.6, 4.4, shadow); // shoulders (lower half clipped by the text row below)
+    return 18;
+}
+
+/// Three thought dots pulsing in a staggered wave after the label — the motion says "thinking", the
+/// stagger keeps it calm. Pure time-driven (rl.getTime()), no state.
+fn drawThinkingDots(x: f32, y: f32) void {
+    const tm = rl.getTime();
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const ph = @sin(tm * 2.6 + @as(f64, @floatFromInt(i)) * 0.9);
+        const a: u8 = @intFromFloat(70.0 + 130.0 * @abs(ph));
+        rl.drawCircle(@intFromFloat(x + @as(f32, @floatFromInt(i)) * 8.0), @intFromFloat(y + 7), 1.8, t.withAlpha(t.magenta, a));
+    }
 }
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
@@ -3594,7 +3840,26 @@ fn jesc(w: *std.Io.Writer, s: []const u8) void {
 
 // -------------------------------------------------------------------------------- swarm view
 
+/// The Swarm tab: inner tabs LIVE (roster + selected swarm's activity/details/files) | DEPLOY (the full
+/// deploy form — folded in from its old top tab; every entry point that used to jump to Deploy lands on
+/// this inner tab via gotoDeploy).
 fn drawSwarm(store: *Store, body: t.Rect) void {
+    const pad: f32 = t.PAD;
+    const tab_h: f32 = 26;
+    const tl_live = t.z("Live", .{});
+    const tl_deploy = t.z("Deploy", .{});
+    var tx: f32 = pad;
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_live), .height = tab_h }, tl_live, ui.swarm_inner == .live)) ui.swarm_inner = .live;
+    tx += t.tabW(tl_live) + 6;
+    if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_deploy), .height = tab_h }, tl_deploy, ui.swarm_inner == .deploy)) ui.swarm_inner = .deploy;
+    const r = t.Rect{ .x = body.x, .y = body.y + pad + tab_h + 2, .width = body.width, .height = body.height - pad - tab_h - 2 };
+    switch (ui.swarm_inner) {
+        .live => drawSwarmLive(store, r),
+        .deploy => drawDeploy(store, r),
+    }
+}
+
+fn drawSwarmLive(store: *Store, body: t.Rect) void {
     const pad: f32 = 12;
     const left_w: f32 = 270;
     const left = t.Rect{ .x = pad, .y = body.y + pad, .width = left_w, .height = body.height - pad * 2 };
@@ -4741,7 +5006,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const sv_label = t.z("Save token", .{});
     const svw = t.btnW(sv_label, t.BTN_MD);
     const tf = t.Rect{ .x = x, .y = y, .width = colw - svw - t.GAP, .height = t.FIELD_H };
-    textField(tf, &ui.d_key, ui.focus == .d_key, "nlk_... (also used by the Deploy tab)", .d_key);
+    textField(tf, &ui.d_key, ui.focus == .d_key, "nlk_... (also used by the Swarm tab's Deploy form)", .d_key);
     const savb = t.Rect{ .x = x + colw - svw, .y = y, .width = svw, .height = t.BTN_MD };
     if (t.button(savb, sv_label, t.blue, ui.d_key.len > 0)) {
         store.lock();
