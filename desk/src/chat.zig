@@ -2882,6 +2882,14 @@ pub const Chat = struct {
         self.sc_serving = true; // the SERVER drives this conv — the local loop stands down
         self.setServerActive(true);
         self.setBusy(true);
+        // Reflect the truth in the UI: a scheduled run IS auto-loop-driven server-side (launchRun arms
+        // loop=1). Leaving the indicator "off" read as "auto-loop is not initializing" and invited a manual
+        // toggle that fired a REDUNDANT local turn. {done} clears it, as with any served loop.
+        {
+            self.store.lock();
+            self.store.chat_loop = true;
+            self.store.unlock();
+        }
         self.setStatus("scheduled run in progress — attached to the live turn");
         log.info("server chat: attached to live turn conv={s} from={d}", .{ conv, from0 });
     }

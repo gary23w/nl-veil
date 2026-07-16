@@ -806,6 +806,20 @@ pub fn runTaskNow(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         defer sched_mtx.unlock(app.io);
         t = loadTask(app, res.arena, u.id, seg) orelse return notFound(res);
     }
+    // ONE run per task at a time: an impatient second click (a long research run shows nothing for a while)
+    // used to mint a NEW same-task conv the next minute and run the whole thing again in parallel — double
+    // the tokens for the same deliverable. Refuse with the RUNNING conv id so the client opens that instead.
+    {
+        var pb: [64]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&pb, "scheduled_{s}_", .{t.id[0..@min(t.id.len, 45)]}) catch "";
+        var cb: [64]u8 = undefined;
+        if (prefix.len > 0) {
+            if (chat_engine.liveTurnWithPrefix(app.io, prefix, &cb)) |running| {
+                res.status = 409;
+                return res.json(.{ .ok = false, .err = "this task already has a run going — opening it", .conv = running }, .{});
+            }
+        }
+    }
     const conv = launchRun(app, res.arena, u.id, &t, nowSecs(app.io)) orelse {
         res.status = 409;
         return res.json(.{ .ok = false, .err = "a turn is already running for this task's conversation (or all turn slots are busy) — try again shortly" }, .{});
