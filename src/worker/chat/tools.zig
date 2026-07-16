@@ -121,12 +121,16 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const safe = toolSafe(tool);
     const admin_only = toolAdminOnly(tool);
     if (!safe and !admin_only) return badReq(res, "unknown or disallowed tool");
-    if (admin_only and !app.auth.isAdmin(u)) {
+    const is_admin = app.auth.isAdmin(u);
+    if (admin_only and !is_admin) {
         res.status = 403;
         try res.json(.{ .ok = false, .err = "this tool is admin-only on the chat surface (code-exec / host / engine / egress)" }, .{});
         return;
     }
-    return runMindTool(app, u.id, tool, body.args, safeSeg(body.dir), res);
+    // The desktop is admin on localhost — this endpoint runs the tool on the USER'S OWN machine, so an admin
+    // caller gets the roam privilege (the same one `veil exec-tool` grants): absolute-path reads and, crucially,
+    // the browser/pixel/mcp tools authorize on roam instead of a server env flag. This is the local-chat path.
+    return runMindTool(app, u.id, tool, body.args, safeSeg(body.dir), is_admin, res);
 }
 
 // ----- orchestration -------------------------------------------------------------------------
@@ -280,7 +284,7 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 // ----- mind tools ----------------------------------------------------------------------------
 
-fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []const u8, res: *httpz.Response) !void {
+fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []const u8, roam: bool, res: *httpz.Response) !void {
     const environ = app.sup.parent_env orelse return serverErr(res, "server env unavailable");
     // Per-user scratch + memory DB so observe/share/recall_hive on the chat surface never cross accounts
     // (the endpoint is multi-tenant on the productized server). Isolation is by the per-uid DB FILE — NOT by
@@ -326,6 +330,7 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .internet = true,
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0, // route edit_file through the swarm's micro-VCS on a real per-conversation build
+        .roam = roam, // admin-on-localhost: this runs on the user's own machine (browser/pixel/mcp authorize on roam)
     };
     const result = tools.execute(&ctx, tool, args);
     // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid
