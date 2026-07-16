@@ -152,6 +152,10 @@ const Ui = struct {
     d_breakout: bool = false,
     d_psyche: bool = false,
     swarm_inner: SwarmInner = .live, // Swarm tab: live view | the deploy form (Deploy folded in as an inner tab)
+    // live-reply activity tracking (drives the thinking mark's energy): the stream's last seen length +
+    // the wall time it last GREW. Updated at the one live renderMsg call site each frame.
+    live_len_prev: usize = 0,
+    live_change_t: f64 = -10,
     // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
@@ -2175,11 +2179,11 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     const is_console = role == .cast_note and isConsoleMsg(text_);
     if (draw and !is_console and inView(view, yy, MSG_HEAD_H)) {
         var lx = view.x + 14;
-        // the LIVE reply (cursor=true only on the streaming message) gets the shadowy-figure avatar +
-        // pulsing thought dots — the "someone is in there thinking" marker the plain label lacked
-        if (cursor and role == .veil) lx += drawThinkingFigure(lx, yy);
+        // the LIVE reply (cursor=true only on the streaming message) carries the animated BRAND MARK +
+        // thought dots — both paced by real stream activity (see thinkEnergy)
+        if (cursor and role == .veil) lx += drawThinkingMark(lx, yy);
         t.text(roleLabel(role), @intFromFloat(lx), @intFromFloat(yy), 11, roleColor(role));
-        if (cursor and role == .veil) drawThinkingDots(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 10, yy);
+        if (cursor and role == .veil) drawThinkingDots(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 14, yy);
     }
     yy += MSG_HEAD_H;
     if (is_console) return renderConsole(view, yy, text_, fsz, draw);
@@ -2467,25 +2471,32 @@ fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, 
     return yy;
 }
 
-/// The shadowy-figure thinking avatar on the live reply's header row: a dim silhouette (head over
-/// shoulders) in the veil's own color, ghosted. Returns the width consumed so the role label shifts right.
-/// Sized to stay inside the MSG_HEAD_H (18px) label row.
-fn drawThinkingFigure(x: f32, y: f32) f32 {
-    const shadow = t.withAlpha(t.magenta, 96);
-    const cx: i32 = @intFromFloat(x + 6);
-    rl.drawCircle(cx, @intFromFloat(y + 5), 3.2, shadow); // head
-    rl.drawEllipse(cx, @intFromFloat(y + 14), 5.6, 4.4, shadow); // shoulders (lower half clipped by the text row below)
-    return 18;
+/// How alive the live reply is RIGHT NOW, 0..1: 1.0 while stream bytes are actually landing, easing down
+/// to a calm 0.25 floor when the model goes quiet (deep think, tool wait). Drives the thinking mark and
+/// dots, so the indicator's tempo mirrors real activity instead of ticking blindly.
+fn thinkEnergy() f32 {
+    const dt = rl.getTime() - ui.live_change_t;
+    if (dt < 0.6) return 1.0;
+    return @floatCast(@max(0.25, 1.0 - (dt - 0.6) / 2.4 * 0.75));
 }
 
-/// Three thought dots pulsing in a staggered wave after the label — the motion says "thinking", the
-/// stagger keeps it calm. Pure time-driven (rl.getTime()), no state.
+/// The live reply's header indicator: the BRAND MARK (the real app icon when its texture is loaded)
+/// breathing beside the label. Sized + centered to sit inside the MSG_HEAD_H label row with clear margin
+/// — only the translucent halo may kiss the edges. Returns the width consumed by icon + breathing room.
+fn drawThinkingMark(x: f32, y: f32) f32 {
+    t.drawMarkPulse(x + 8, y + 7.5, 6.5, @floatCast(rl.getTime()), thinkEnergy());
+    return 26;
+}
+
+/// Three thought dots in a staggered wave after the label — their tempo and brightness follow the same
+/// live energy as the mark (quick while tokens land, a slow ember while the model thinks).
 fn drawThinkingDots(x: f32, y: f32) void {
     const tm = rl.getTime();
+    const e: f64 = thinkEnergy();
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        const ph = @sin(tm * 2.6 + @as(f64, @floatFromInt(i)) * 0.9);
-        const a: u8 = @intFromFloat(70.0 + 130.0 * @abs(ph));
+        const ph = @sin(tm * (1.8 + 3.2 * e) + @as(f64, @floatFromInt(i)) * 0.9);
+        const a: u8 = @intFromFloat(55.0 + (95.0 + 75.0 * e) * @abs(ph));
         rl.drawCircle(@intFromFloat(x + @as(f32, @floatFromInt(i)) * 8.0), @intFromFloat(y + 7), 1.8, t.withAlpha(t.magenta, a));
     }
 }
@@ -2903,6 +2914,11 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     }
     cur_sel_msg = std.math.maxInt(usize); // the streaming/cast-live rows change every frame — not selectable
     if (busy or stream.len > 0) {
+        // feed the thinking mark's energy: note whenever the stream actually GREW this frame
+        if (stream.len != ui.live_len_prev) {
+            ui.live_len_prev = stream.len;
+            ui.live_change_t = rl.getTime();
+        }
         yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
     }
     if (cast_live) yy = renderCastLive(view, yy, status, true);

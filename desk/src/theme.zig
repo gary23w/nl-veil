@@ -577,6 +577,34 @@ pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
     rl.drawCircle(@intFromFloat(cx), @intFromFloat(cy - s * 0.44), s * 0.38, fig);
 }
 
+/// The brand mark, ALIVE — the chat's thinking indicator. Breathes (scale), bobs, and glows by `energy`
+/// (0 = calm idle breath … 1 = tokens landing right now); `phase` is the caller's clock in seconds.
+/// Same two rendering paths as drawMark — the real app-icon texture when it loaded, the vector figure
+/// otherwise — so the indicator IS the brand, not a lookalike.
+pub fn drawMarkPulse(cx: f32, cy: f32, s: f32, phase: f32, energy: f32) void {
+    const e = std.math.clamp(energy, 0.0, 1.0);
+    const speed = 2.0 + 4.0 * e; // calm ~2rad/s breath → quick flutter while streaming
+    const wob = @sin(phase * speed);
+    const scale = 1.0 + (0.04 + 0.08 * e) * wob;
+    const bob = (0.4 + 0.9 * e) * @sin(phase * speed * 0.5);
+    const ss = s * scale;
+    const cyb = cy + bob;
+    // soft halo behind the mark — translucent, so a little bleed past the label row reads as glow,
+    // never as a shape colliding with the text (the old silhouette's failure)
+    const aura_a: u8 = @intFromFloat(14.0 + (22.0 + 42.0 * e) * (0.5 + 0.5 * wob));
+    rl.drawCircle(@intFromFloat(cx), @intFromFloat(cyb), ss * 1.4, withAlpha(magenta, aura_a));
+    ensureMarkTexture();
+    if (mark_tex) |tex| {
+        const src = Rect{ .x = 0, .y = 0, .width = @floatFromInt(tex.width), .height = @floatFromInt(tex.height) };
+        const dst = Rect{ .x = cx - ss, .y = cyb - ss, .width = ss * 2, .height = ss * 2 };
+        rl.drawTexturePro(tex, src, dst, .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        return;
+    }
+    const fig = magenta;
+    rl.drawRectangleRounded(.{ .x = cx - ss * 0.92, .y = cyb + ss * 0.06, .width = ss * 1.84, .height = ss * 0.98 }, 0.75, 10, fig);
+    rl.drawCircle(@intFromFloat(cx), @intFromFloat(cyb - ss * 0.44), ss * 0.38, fig);
+}
+
 /// Click-to-cycle selector (immediate-mode, no popup z-order): shows the current value; left-click →
 /// next, right-click → previous. Returns the delta (-1/0/+1) for the caller to apply. Good for small
 /// option sets (provider, style, minutes, mode) without a floating list.
