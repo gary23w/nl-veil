@@ -23,6 +23,7 @@ const llm = @import("../llm.zig");
 const cctx = @import("context.zig");
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
+const toolperf = @import("toolperf.zig"); // per-machine tool latency/reliability learning (dynamic, emergent)
 const deploy_service = @import("../deploy/service.zig");
 const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
 const metrics = @import("../metrics.zig"); // per-turn LLM usage lines behind the desk Dashboard
@@ -190,6 +191,12 @@ const TURN_TOOLS = tools.CHAT_SCHEMA ++ "," ++ ORCH_TOOLS;
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.
 fn nowSecs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toSeconds();
+}
+
+/// Millisecond wall clock — for per-tool latency in the tool-performance learner (seconds are too coarse; a
+/// fast local tool would read as 0). Same io time source as nowSecs.
+fn nowMillis(io: std.Io) i64 {
+    return @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
 /// Replace each byte not part of a valid UTF-8 sequence with '?' in place (length-preserving), so arbitrary
@@ -440,6 +447,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
     injectDurableMemory(app, &conv_buf);
+    // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
+    // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
+    // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
+    // until enough samples accrue — a fresh machine sees nothing.
+    if (toolperf.digest(gpa, app.io, app.data)) |dg| {
+        defer gpa.free(dg);
+        if (dg.len > 0) {
+            conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+            http.jstr(gpa, &conv_buf, dg) catch return;
+            conv_buf.append(gpa, '}') catch return;
+        }
+    }
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + the recall fragment + a recency window of the newest turns.
@@ -465,6 +484,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         for (tool_obs.items) |note| gpa.free(note);
         tool_obs.deinit(gpa);
     }
+
+    // TOOL-PERFORMANCE LEARNING: the drive loop times each executed tool into this accumulator; at turn exit it
+    // merges into {data}/.tool_perf.json (per-machine latency + fail-rate aggregate). A digest of the notable
+    // tools is injected below so the agent adapts to how tools actually behave here. Machine-wide (not per-conv)
+    // and off every hot path — the merge is one file read+write at turn exit.
+    var tool_perf: toolperf.Acc = .{};
+    defer toolperf.merge(app.io, gpa, app.data, &tool_perf);
 
     // The assembled, bounded PREFIX (system + recall + summary + goal + recency window). Everything appended past
     // this by the drive loop (settled answers, synthetic drive steps, per-pass tool notes) is compacted against it
@@ -612,7 +638,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, tool_client, &tools_spent, tool_budget);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -2221,6 +2247,7 @@ fn runInnerAgentic(
     ctx: *tools.ToolCtx,
     steer_cursor: *usize,
     tool_obs: *std.ArrayListUnmanaged([]u8),
+    tool_perf: *toolperf.Acc, // per-machine tool latency/reliability learner (records each executed tool)
     tool_client: bool,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
     tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
@@ -2423,6 +2450,8 @@ fn runInnerAgentic(
                 }
                 if (!repeated) call_ledger.append(gpa, call_h) catch {};
             }
+            var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
+            const t_call = nowMillis(app.io);
             const result = if (repeated)
                 (gpa.dupe(u8, "(you already ran this EXACT call earlier this turn — its full result is above in this conversation. Do NOT re-run it: extract what you need from the earlier result and MOVE ON to the next step, e.g. writing the deliverable file.)") catch @constCast(""))
             else if (dedupableTool(c.name) and tools_spent.* >= tool_budget) blk_ob: {
@@ -2438,6 +2467,7 @@ fn runInnerAgentic(
                 }
                 break :blk_ob gpa.dupe(u8, "(this scheduled run's RESEARCH budget is exhausted — no further web/search calls will execute. write_file/edit_file/read_file still work: write or finalize the deliverable NOW from what you already gathered, state any remaining gaps inside it, then reply DONE.)") catch @constCast("");
             } else blk: {
+                executed = true; // this branch actually runs the tool — its latency/outcome is real learning
                 if (dedupableTool(c.name)) tools_spent.* += 1; // only network research spends the budget
                 // CLIENT MODE: if this conversation's cast just finished, push its files down FIRST — the frames
                 // land before this tool's tool_request, and the client processes frames in order, so a delegated
@@ -2451,6 +2481,14 @@ fn runInnerAgentic(
                     (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
+            // TOOL-PERFORMANCE LEARNING: record only genuinely-executed calls (dedup/budget guards never ran the
+            // tool, so counting them would smear its stats). `ok` mirrors the observe gate — a real result, not
+            // an engine error string or an `"ok":false` payload.
+            if (executed) {
+                const dt = nowMillis(app.io) - t_call;
+                const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
+                tool_perf.record(c.name, ok, if (dt > 0) @intCast(dt) else 0);
+            }
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
