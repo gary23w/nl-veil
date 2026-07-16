@@ -248,9 +248,18 @@ pub const Poller = struct {
         } else if (resp.status == 401 or resp.status == 403) {
             self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
         } else if (resp.status == 409) {
-            // the run is ALREADY going (same-minute re-click while a long run streams) — say so instead of a
-            // bare "rejected" that reads as "the scheduler is broken" and invites more clicking
-            self.store.pushNotif("Already running", "this task's run is still going - open its conversation to watch it", 1);
+            // the run is ALREADY going — open THAT conversation (the 409 body carries its id) so the click
+            // lands the user inside the live run instead of reading as "the scheduler is broken"
+            self.store.pushNotif("Already running", "opening the run that's in progress", 1);
+            if (jstr(resp.body, "conv")) |running| {
+                if (running.len > 0) {
+                    self.store.lock();
+                    const cn = @min(running.len, self.store.goto_conv.len);
+                    @memcpy(self.store.goto_conv[0..cn], running[0..cn]);
+                    self.store.goto_conv_len = @intCast(cn);
+                    self.store.unlock();
+                }
+            }
         } else {
             const err = jstr(resp.body, "err") orelse "";
             self.store.pushNotif("Run rejected", if (err.len > 0) err else id, 2);

@@ -524,6 +524,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     const afk_stuck_msg = std.fmt.bufPrint(&stuck_buf, AFK_STUCK_TMPL, .{goal_clip}) catch "You repeated the last step — try a DIFFERENT approach; recall_hive / web_search the actual blocker first.";
     if (armed) emitKV(app, conv_dir, "status", "text", if (afk) "auto-loop (afk): driving toward the goal" else "auto-loop: driving toward the goal");
     var steer_cursor = ctrl_cursor; // moving cursor over control.jsonl for stop + mid-turn steer messages
+    // SCHEDULED-RUN TOOL BUDGET: an unattended auto-loop turn with a thorough model has an unbounded research
+    // appetite — a live run burned 107 web calls (the repeat guard blocks exact duplicates, but the model just
+    // VARIES the query) and was still "verifying" at the 10-minute mark, long after its deliverable was
+    // written. Interactive chats have a human with a Stop button; a scheduled run needs a hard ceiling: past
+    // the budget, every further tool call is answered with "finalize NOW", which drives the model to settle.
+    // The successful reference run used 14 calls; 60 is generous headroom for real research.
+    var tools_spent: usize = 0;
+    const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
         // CONTROL (between drive steps): a `stop` op ends the turn; a `steer`/`say` op injects the user's text as a
@@ -596,7 +604,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, tool_client);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, tool_client, &tools_spent, tool_budget);
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -918,6 +926,30 @@ pub fn tryBeginTurn(io: std.Io, conv: []const u8) bool {
     @memcpy(active_convs[slot][0..conv.len], conv);
     active_lens[slot] = conv.len;
     return true;
+}
+
+/// Idempotent network reads whose exact repeat within one turn returns the same bytes — the search-spiral
+/// tool set the repeat-call ledger covers. Stateful tools stay exempt (a re-read after a write is legitimate).
+fn dedupableTool(name: []const u8) bool {
+    const list = [_][]const u8{ "web_search", "web_fetch", "fetch_json", "read_url", "osint_scan", "deep_crawl" };
+    for (list) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// The conv id of a LIVE turn whose id starts with `prefix`, copied into `out` — or null. Lets run-now refuse
+/// a duplicate launch for a task that already has a run going (its conv ids share "scheduled_{taskid}_").
+pub fn liveTurnWithPrefix(io: std.Io, prefix: []const u8, out: *[64]u8) ?[]const u8 {
+    if (prefix.len == 0 or prefix.len > 64) return null;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] >= prefix.len and std.mem.startsWith(u8, active_convs[i][0..active_lens[i]], prefix)) {
+            const n = active_lens[i];
+            @memcpy(out[0..n], active_convs[i][0..n]);
+            return out[0..n];
+        }
+    }
+    return null;
 }
 
 /// Is a turn executing for `conv` RIGHT NOW? Read-only scan of the per-conv turn table — the liveness bit the
@@ -2112,6 +2144,8 @@ fn runInnerAgentic(
     steer_cursor: *usize,
     tool_obs: *std.ArrayListUnmanaged([]u8),
     tool_client: bool,
+    tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
+    tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -2119,6 +2153,14 @@ fn runInnerAgentic(
     var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
     var any_tool = false; // did any tool run this pass? gates the drive loop's LOOP_QUESTION for pure-prose answers
+    // REPEAT-CALL GUARD: a model in a research spiral re-issues the SAME network call (identical name+args)
+    // over and over — observed live: a scheduled run burned 40+ near-duplicate web_search/web_fetch calls
+    // without ever settling to write its deliverable. The result is already in context; re-running buys
+    // nothing and costs minutes + tokens. Ledger every executed idempotent-network call's (name,args) hash;
+    // a repeat is answered with a pointed refusal that steers the model to USE what it has. Stateful tools
+    // (read_file, run_python, swarm_status, recall...) are exempt — their results legitimately change.
+    var call_ledger: std.ArrayListUnmanaged(u64) = .empty;
+    defer call_ledger.deinit(gpa);
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -2264,17 +2306,47 @@ fn runInnerAgentic(
                 emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "steer received — skipped {d} queued tool call(s)", .{skipped}) catch "steer received");
                 break;
             }
-            // CLIENT MODE: if this conversation's cast just finished, push its files down FIRST — the frames land
-            // before this tool's tool_request, and the client processes frames in order, so a delegated
-            // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
-            if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, steer_cursor.*);
             emitToolState(app, conv_dir, c.name, "start", "");
-            // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled in-process
-            // via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes as a mind tool:
-            // in CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code tools
-            // act on the USER's machine, not the server's sandbox; otherwise it runs here (a hive/server turn).
-            const result = orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
-                (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
+            // REPEAT-CALL GUARD (see call_ledger above): an exact repeat of an idempotent network call is
+            // answered from the ledger — the model is told to use the result it already has and move on.
+            const call_h = std.hash.Fnv1a_64.hash(c.name) ^ std.hash.Fnv1a_64.hash(c.args);
+            var repeated = false;
+            if (dedupableTool(c.name)) {
+                for (call_ledger.items) |h| {
+                    if (h == call_h) {
+                        repeated = true;
+                        break;
+                    }
+                }
+                if (!repeated) call_ledger.append(gpa, call_h) catch {};
+            }
+            const result = if (repeated)
+                (gpa.dupe(u8, "(you already ran this EXACT call earlier this turn — its full result is above in this conversation. Do NOT re-run it: extract what you need from the earlier result and MOVE ON to the next step, e.g. writing the deliverable file.)") catch @constCast(""))
+            else if (dedupableTool(c.name) and tools_spent.* >= tool_budget) blk_ob: {
+                // BUDGET CEILING (scheduled runs): the research appetite is unbounded but the wallet is not.
+                // Past the budget, NETWORK research calls are answered with "finalize now" — but LOCAL tools
+                // (write_file/edit_file/read_file/run_tests) always execute, because finalizing IS writing:
+                // the first cut refused the very write_file the refusal demanded, and the run spun. One
+                // status frame the first time it trips.
+                if (tools_spent.* == tool_budget) {
+                    tools_spent.* += 1;
+                    var bb: [96]u8 = undefined;
+                    emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&bb, "research budget ({d}) exhausted — steering the run to finalize", .{tool_budget}) catch "research budget exhausted — finalizing");
+                }
+                break :blk_ob gpa.dupe(u8, "(this scheduled run's RESEARCH budget is exhausted — no further web/search calls will execute. write_file/edit_file/read_file still work: write or finalize the deliverable NOW from what you already gathered, state any remaining gaps inside it, then reply DONE.)") catch @constCast("");
+            } else blk: {
+                if (dedupableTool(c.name)) tools_spent.* += 1; // only network research spends the budget
+                // CLIENT MODE: if this conversation's cast just finished, push its files down FIRST — the frames
+                // land before this tool's tool_request, and the client processes frames in order, so a delegated
+                // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
+                if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, steer_cursor.*);
+                // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled
+                // in-process via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes
+                // as a mind tool: in CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so
+                // file/shell/code tools act on the USER's machine; otherwise it runs here (a hive/server turn).
+                break :blk orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
+                    (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
+            };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
