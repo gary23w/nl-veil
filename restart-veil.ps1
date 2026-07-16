@@ -9,13 +9,17 @@ Write-Host "stopping veil-desk + veil..."
 Get-Process veil-desk, veil -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
+# Dedicated cache (C:\zig went stale against the OneDrive tree once — builds "succeeded" but installed
+# yesterday's exe). If a build ever looks ignored again: delete this dir and rebuild.
+$cache = "C:\zig-nlveil"
+
 Write-Host "building server (ReleaseFast)..."
-& $zig build --release=fast --cache-dir C:\zig
+& $zig build --release=fast --cache-dir $cache
 if ($LASTEXITCODE -ne 0) { Write-Host "SERVER BUILD FAILED" -ForegroundColor Red; exit 1 }
 
 Write-Host "building desk (ReleaseFast)..."
 Push-Location "$repo\desk"
-& $zig build --release=fast --cache-dir C:\zig
+& $zig build --release=fast --cache-dir $cache
 if ($LASTEXITCODE -ne 0) { Write-Host "DESK BUILD FAILED" -ForegroundColor Red; Pop-Location; exit 1 }
 Pop-Location
 
@@ -33,4 +37,4 @@ try {
     Write-Host ("server up: v{0}, {1} swarms" -f $fleet.version, $fleet.swarms) -ForegroundColor Green
 } catch { Write-Host "server did not answer /fleet yet — check data/server-stderr.log" -ForegroundColor Yellow }
 Get-Process veil, veil-desk -ErrorAction SilentlyContinue | Format-Table Name, Id -AutoSize
-Write-Host "done. The Scheduled tab is the 6th top tab; steer fixes are live server-side."
+Write-Host "done. Tasks is the 6th top tab (edit + per-task model + recent runs live there)."

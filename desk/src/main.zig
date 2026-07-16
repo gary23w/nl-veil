@@ -150,7 +150,7 @@ const Ui = struct {
     d_gap: bool = true,
     d_breakout: bool = false,
     d_psyche: bool = false,
-    // Scheduled tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
+    // Tasks tab: task list + builder form ("once" fires at now+N; "every" repeats; "daily" at HH:MM)
     sched_inner: SchedInner = .tasks,
     sched_scroll: f32 = 0,
     sc_name: Field = .{},
@@ -162,6 +162,13 @@ const Ui = struct {
     sc_hour: i32 = 9, // daily: HH
     sc_minute: i32 = 0, // daily: MM
     sc_enabled: bool = true,
+    // per-task provider override (all three blank at create = snapshot the chat provider from Settings)
+    sc_base: Field = .{},
+    sc_model: Field = .{},
+    sc_key: Field = .{},
+    // edit mode: non-empty = the builder form is EDITING this existing task (save → POST /sched/:id)
+    sc_edit_id: [64]u8 = [_]u8{0} ** 64,
+    sc_edit_id_len: u8 = 0,
     // micro-console (below the swarm activity): dual-tab shell
     con_tab: u8 = 0, // 0 = You, 1 = Veil (the AI's tab)
     con_input: Field = .{},
@@ -191,7 +198,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_host, s_port, con_input, sc_name, sc_prompt, sc_details };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -1123,6 +1130,9 @@ fn focusedField() ?*Ui.Field {
         .sc_name => &ui.sc_name,
         .sc_prompt => &ui.sc_prompt,
         .sc_details => &ui.sc_details,
+        .sc_base => &ui.sc_base,
+        .sc_model => &ui.sc_model,
+        .sc_key => &ui.sc_key,
     };
 }
 
@@ -1217,7 +1227,7 @@ fn drawTabbar(store: *Store) void {
     const sw: f32 = @floatFromInt(rl.getScreenWidth());
     t.fillRect(0, TITLE_H, @intFromFloat(sw), TAB_H, t.bg_dark);
     t.hline(0, TITLE_H + TAB_H - 1, @intFromFloat(sw), t.border);
-    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Scheduled", .{}), t.z("Settings", .{}) };
+    const labels = [_][:0]const u8{ t.z("Dashboard", .{}), t.z("Chat", .{}), t.z("Deploy", .{}), t.z("Swarm", .{}), t.z("Hub", .{}), t.z("Tasks", .{}), t.z("Settings", .{}) };
     const tabs = [_]Tab{ .dashboard, .chat, .deploy, .swarm, .hub, .scheduled, .settings };
     var x: f32 = t.PAD;
     for (labels, tabs) |lb, tabv| {
@@ -1668,10 +1678,10 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, true);
         return;
     }
-    // INNER TABS: Chats | Scheduled — the schedule lives beside the conversations it mints, so a task's runs
-    // are one click away from the chats they produced (the Scheduled TOP tab remains the full manager).
+    // INNER TABS: Chats | Tasks — the tasks live beside the conversations they mint, so a task's runs
+    // are one click away from the chats they produced (the Tasks TOP tab remains the full manager).
     const tl_chats = t.z("Chats", .{});
-    const tl_sched = t.z("Scheduled", .{});
+    const tl_sched = t.z("Tasks", .{});
     var tx: f32 = r.x + t.PAD_IN;
     if (t.tab(.{ .x = tx, .y = r.y + 6, .width = t.tabW(tl_chats), .height = 26 }, tl_chats, ui.chats_inner == .chats)) ui.chats_inner = .chats;
     tx += t.tabW(tl_chats) + 6;
@@ -2477,12 +2487,13 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_metrics), .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
     tx += t.tabW(tl_metrics) + 6;
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_files), .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
-    // right-aligned in the same tab row: seed a scheduled task from THIS conversation (its first user ask
-    // becomes the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
+    // right-aligned in the same tab row: seed a task from THIS conversation (its first user ask becomes
+    // the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
     if (msgs.len > 0) {
-        const tl_sched = t.z("schedule", .{});
+        const tl_sched = t.z("make a task", .{});
         const sb = t.Rect{ .x = r.x + r.width - t.btnW(tl_sched, 22) - 2, .y = r.y + 2, .width = t.btnW(tl_sched, 22), .height = 22 };
         if (t.buttonGhost(sb, tl_sched, t.blue, true)) {
+            schedResetForm(); // a CREATE seed must never inherit a half-open edit's id/provider fields
             setField(&ui.sc_name, if (conv_title.len > 0) conv_title else "chat task");
             for (msgs) |*m| {
                 if (m.role == .user) {
@@ -4100,15 +4111,17 @@ fn drawHub(body: t.Rect) void {
 
 // -------------------------------------------------------------------------------- scheduled tasks
 
-/// The Scheduled tab: standing instructions the SERVER runs on its own clock — each run lands as a
+/// The Tasks tab: standing instructions the SERVER runs on its own clock — each run lands as a
 /// scheduled_* server conversation that the Chat sidebar merges in. Two inner tabs like the Chat pane:
-/// the task list and a builder form. Every mutation rides the poller's command ring to the admin-gated
-/// /api/v1/sched routes; the poller re-lists every few seconds so the rows track the server.
+/// the task list and a builder form (which doubles as the EDIT form when a row's "edit" is clicked).
+/// Every mutation rides the poller's command ring to the admin-gated /api/v1/sched routes; the poller
+/// re-lists every few seconds so the rows track the server.
 fn drawScheduled(store: *Store, body: t.Rect) void {
     const pad: f32 = t.PAD;
     const tab_h: f32 = 26;
-    const tl_tasks = t.z("Tasks", .{});
-    const tl_build = t.z("Build a task", .{});
+    const editing = ui.sc_edit_id_len > 0;
+    const tl_tasks = t.z("All tasks", .{});
+    const tl_build = if (editing) t.z("Edit task", .{}) else t.z("Build a task", .{});
     var tx: f32 = pad;
     if (t.tab(.{ .x = tx, .y = body.y + pad, .width = t.tabW(tl_tasks), .height = tab_h }, tl_tasks, ui.sched_inner == .tasks)) ui.sched_inner = .tasks;
     tx += t.tabW(tl_tasks) + 6;
@@ -4120,9 +4133,73 @@ fn drawScheduled(store: *Store, body: t.Rect) void {
     }
 }
 
+/// Reset the builder form to a blank CREATE (clears any half-open edit): fields, provider override, and
+/// the edit id all drop so the next submit mints a new task instead of overwriting the one last edited.
+fn schedResetForm() void {
+    ui.sc_name.clear();
+    ui.sc_prompt.clear();
+    ui.sc_details.clear();
+    ui.sc_base.clear();
+    ui.sc_model.clear();
+    ui.sc_key.clear();
+    ui.sc_kind = 0;
+    ui.sc_once_min = 30;
+    ui.sc_every_min = 30;
+    ui.sc_hour = 9;
+    ui.sc_minute = 0;
+    ui.sc_enabled = true;
+    ui.sc_edit_id_len = 0;
+}
+
+/// Enter EDIT mode for the task with this id: prefill every builder field from the store's full-fidelity
+/// row (prompt/details round-trip verbatim — that is why SchedRow carries them uncut) and flip to the
+/// builder tab. The key field stays BLANK: the server never echoes a stored api_key, and a blank key on
+/// save means "keep what's stored".
+fn schedBeginEdit(store: *Store, id: []const u8) void {
+    store.lock();
+    defer store.unlock();
+    for (store.sched_rows[0..store.sched_count]) |*row| {
+        if (!std.mem.eql(u8, row.idStr(), id)) continue;
+        setField(&ui.sc_name, row.nameStr());
+        setField(&ui.sc_prompt, row.promptStr());
+        setField(&ui.sc_details, row.detailsStr());
+        setField(&ui.sc_base, row.baseUrlStr());
+        setField(&ui.sc_model, row.modelStr());
+        ui.sc_key.clear(); // never echoed; blank = keep stored
+        ui.sc_kind = @min(row.kind, 2);
+        ui.sc_enabled = row.enabled;
+        if (row.every_min > 0) ui.sc_every_min = @intCast(@min(row.every_min, 1440));
+        if (parseHmUi(row.hmStr())) |hm| {
+            ui.sc_hour = hm[0];
+            ui.sc_minute = hm[1];
+        }
+        // a "once" task edits as "run in N minutes from now" — recomputed against the poller's clock
+        if (row.kind == 0 and row.at > store.last_refresh_s and store.last_refresh_s > 0) {
+            ui.sc_once_min = @intCast(std.math.clamp(@divTrunc(row.at - store.last_refresh_s, 60), 5, 1440));
+        } else if (row.kind == 0) {
+            ui.sc_once_min = 30;
+        }
+        const n = @min(id.len, ui.sc_edit_id.len);
+        @memcpy(ui.sc_edit_id[0..n], id[0..n]);
+        ui.sc_edit_id_len = @intCast(n);
+        ui.sched_inner = .build;
+        return;
+    }
+}
+
+/// Lenient "HH:MM" → {hour, minute} for prefilling the daily steppers (UI twin of the server's parseHm).
+fn parseHmUi(hm: []const u8) ?[2]i32 {
+    const colon = std.mem.indexOfScalar(u8, hm, ':') orelse return null;
+    const h = std.fmt.parseInt(i32, hm[0..colon], 10) catch return null;
+    const m = std.fmt.parseInt(i32, hm[colon + 1 ..], 10) catch return null;
+    if (h < 0 or h > 23 or m < 0 or m > 59) return null;
+    return .{ h, m };
+}
+
 /// "every 30m" / "daily 09:00" / "once Jul 15 13:40" — one row's human schedule summary, composed at
-/// draw time from the raw fields so it can never go stale against the clock.
-fn schedSummary(row: *const store_mod.SchedRow, buf: []u8) []const u8 {
+/// draw time from the raw fields so it can never go stale against the clock. anytype: the list rows
+/// draw from the slim SchedRowView, but any struct with the raw schedule fields works.
+fn schedSummary(row: anytype, buf: []u8) []const u8 {
     switch (row.kind) {
         1 => {
             if (row.every_min >= 60 and row.every_min % 60 == 0) return std.fmt.bufPrint(buf, "every {d}h", .{row.every_min / 60}) catch "every ?";
@@ -4152,21 +4229,20 @@ fn schedDue(next_due: i64, now: i64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "due in {d}m", .{mins}) catch "";
 }
 
-/// The task list: one row per scheduled task with its enabled toggle, schedule summary + countdown, run
-/// The chat sidebar's Scheduled inner tab: a COMPACT task list (name over due + runs). Row click opens the
+/// The chat sidebar's Tasks inner tab: a COMPACT task list (name over due + runs). Row click opens the
 /// task's newest run conversation right here in Chat; the small "run" fires it now (the poller then auto-opens
-/// the minted conv). The Scheduled TOP tab remains the full manager (builder form, toggle, delete).
+/// the minted conv). The Tasks TOP tab remains the full manager (builder form, edit, toggle, delete).
 fn drawChatsSchedList(store: *Store, r: t.Rect) void {
     store.lock();
-    var rows: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined;
+    var rows: [store_mod.MAX_SCHED]store_mod.SchedRowView = undefined;
     const n = store.sched_count;
-    @memcpy(rows[0..n], store.sched_rows[0..n]);
+    for (store.sched_rows[0..n], 0..) |*full, i| rows[i] = store_mod.SchedRowView.of(full);
     const online = store.server_online;
     const now = store.last_refresh_s;
     store.unlock();
     const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
     if (n == 0) {
-        t.text(t.z("no scheduled tasks yet -", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(list.y + 6), 12, t.comment);
+        t.text(t.z("no tasks yet -", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(list.y + 6), 12, t.comment);
         t.text(t.z("ask the veil to schedule one", .{}), @intFromFloat(r.x + t.PAD_IN), @intFromFloat(list.y + 22), 12, t.comment);
         return;
     }
@@ -4210,14 +4286,15 @@ fn drawChatsSchedList(store: *Store, r: t.Rect) void {
     }
 }
 
-/// count, the newest run's conversation (click → open it in Chat), a "run now", and a hover ✕ delete
-/// (the conv-row pattern: fire the command, the next list refresh drops the row).
+/// The full task manager list: one row per task with its enabled toggle, schedule summary + countdown,
+/// run count, the newest run's conversation (click → open it in Chat), "edit", "run now", and a hover ✕
+/// delete (the conv-row pattern: fire the command, the next list refresh drops the row).
 fn drawSchedTasks(store: *Store, r: t.Rect) void {
     t.panelBordered(r, t.bg_dark, t.border);
     store.lock();
-    var rows: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined;
+    var rows: [store_mod.MAX_SCHED]store_mod.SchedRowView = undefined;
     const n = store.sched_count;
-    @memcpy(rows[0..n], store.sched_rows[0..n]);
+    for (store.sched_rows[0..n], 0..) |*full, i| rows[i] = store_mod.SchedRowView.of(full);
     const seen = store.sched_seen;
     const denied = store.sched_denied;
     const online = store.server_online;
@@ -4228,11 +4305,11 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
         const msg = if (denied)
             t.z("admin token required - connect the admin key in Settings", .{})
         else if (!online)
-            t.z("server offline - start it to see scheduled tasks", .{})
+            t.z("server offline - start it to see tasks", .{})
         else if (!seen)
-            t.z("fetching scheduled tasks...", .{})
+            t.z("fetching tasks...", .{})
         else
-            t.z("no scheduled tasks yet - use Build a task", .{});
+            t.z("no tasks yet - use Build a task", .{});
         t.text(msg, @intFromFloat(r.x + t.PAD_IN + 2), @intFromFloat(r.y + t.PAD_IN + 2), 13, t.comment);
         return;
     }
@@ -4291,12 +4368,19 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
         if (t.buttonGhost(runb, run_label, t.blue, online)) {
             store.pushCmd(store_mod.mkCmd(.sched_run, row.idStr(), ""));
         }
+        // edit — opens the builder prefilled with this task (prompt, schedule, provider, recent runs)
+        const edit_label = t.z("edit", .{});
+        const edit_w = t.btnW(edit_label, 24);
+        const editb = t.Rect{ .x = runb.x - 8 - edit_w, .y = rr.y + (rr.height - 24) / 2, .width = edit_w, .height = 24 };
+        if (t.buttonGhost(editb, edit_label, t.cyan, true)) {
+            schedBeginEdit(store, row.idStr());
+        }
         // the newest run's conversation — click to open it in Chat (a server-side conv mirrors on select)
         var conv_label_hot = false;
         if (row.last_conv_len > 0) {
-            const cw: f32 = @min(170, @max(0, runb.x - (rr.x + 44 + name_w) - 12));
+            const cw: f32 = @min(170, @max(0, editb.x - (rr.x + 44 + name_w) - 12));
             if (cw > 40) {
-                const cr = t.Rect{ .x = runb.x - cw - 8, .y = rr.y + (rr.height - 14) / 2, .width = cw, .height = 16 };
+                const cr = t.Rect{ .x = editb.x - cw - 8, .y = rr.y + (rr.height - 14) / 2, .width = cw, .height = 16 };
                 conv_label_hot = t.hovering(cr);
                 t.textClip(row.lastConvStr(), @intFromFloat(cr.x), @intFromFloat(cr.y), 12, if (conv_label_hot) t.fg else t.cyan, @intFromFloat(cw));
                 if (conv_label_hot) t.wantCursor(.pointing_hand);
@@ -4307,9 +4391,9 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
             }
         }
         // ROW CLICK → the same jump: the whole row is the natural target (the tiny label alone was missed).
-        // Excludes the row's own controls (checkbox / run now / delete / conv label) so their clicks stay theirs.
+        // Excludes the row's own controls (checkbox / edit / run now / delete / conv label) so their clicks stay theirs.
         const cb_r = t.Rect{ .x = rr.x + 10, .y = rr.y, .width = 18, .height = rr.height };
-        const row_hot = hot and !t.hovering(cb_r) and !t.hovering(runb) and !t.hovering(xb) and !conv_label_hot;
+        const row_hot = hot and !t.hovering(cb_r) and !t.hovering(runb) and !t.hovering(editb) and !t.hovering(xb) and !conv_label_hot;
         if (row_hot and row.last_conv_len > 0) t.wantCursor(.pointing_hand);
         if (row_hot and rl.isMouseButtonPressed(.left)) {
             if (row.last_conv_len > 0) {
@@ -4324,15 +4408,27 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
 }
 
 /// The builder form: name + prompt + key details, a click-to-cycle schedule kind with its kind-specific
-/// steppers, and the create action. Mirrors the Deploy form's conventions (flabel + field rows + a solid
-/// call-to-action with an inline hint).
+/// steppers, a per-task PROVIDER OVERRIDE (base URL / model / key), and the create-or-save action. The
+/// same form serves CREATE and EDIT (sc_edit_id set → editing); in edit mode a RECENT RUNS panel sits
+/// beside the form so a task's last few conversations are one click from the thing that minted them.
 fn drawSchedBuild(store: *Store, r: t.Rect) void {
     const x = r.x;
     var y = r.y;
-    const colw = @min(r.width, 760);
+    const editing = ui.sc_edit_id_len > 0;
+    // in edit mode reserve a right-hand column for the recent-runs panel when the window allows it
+    const runs_w: f32 = 280;
+    const want_runs = editing and r.width >= 560 + runs_w;
+    const colw = @min(if (want_runs) r.width - runs_w - 24 else r.width, 760);
     const fh: f32 = 48; // one field row: 14px label + 34px input
     const area_h: f32 = 88; // a 4-row textArea (8px pad + 4×18px lines + 8px pad)
     const gap: f32 = t.GAP;
+
+    if (editing) {
+        var eb: [96]u8 = undefined;
+        const el = std.fmt.bufPrint(&eb, "editing: {s}", .{ui.sc_edit_id[0..ui.sc_edit_id_len]}) catch "editing";
+        t.text(t.zs(el), @intFromFloat(x), @intFromFloat(y), 12, t.cyan);
+        y += 20;
+    }
 
     flabel(x, y, "NAME");
     textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_name, ui.focus == .sc_name, "what to call this task", .sc_name);
@@ -4363,70 +4459,148 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     }
     y += fh + gap;
 
+    // per-task provider: THIS task's runs can use a different brain than your chat. Create: all three
+    // blank = snapshot the chat provider from Settings, per-field otherwise. Edit: what's shown is what's
+    // stored; a blank key keeps the stored one (the server never echoes keys back).
+    flabel(x, y, "MODEL OVERRIDE (this task can run on its own provider)");
+    textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.sc_base, ui.focus == .sc_base, "base URL - blank = your chat provider's", .sc_base);
+    textField(.{ .x = x + half + gap, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.sc_model, ui.focus == .sc_model, "model - blank = your chat model", .sc_model);
+    y += fh + 4;
+    textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_key, ui.focus == .sc_key, if (editing) "API key - blank = keep the stored key" else "API key - blank = your chat provider's", .sc_key);
+    y += fh + gap;
+
     if (t.checkbox(.{ .x = x, .y = y, .width = 200, .height = 30 }, t.z("enabled", .{}), ui.sc_enabled)) ui.sc_enabled = !ui.sc_enabled;
     y += 36;
-    t.text(t.z("runs use the chat provider from Settings - base URL, model and key are snapshotted at create", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
-    y += 24;
 
     const online = blk: {
         store.lock();
         defer store.unlock();
         break :blk store.server_online;
     };
-    const cb_label = t.z("Create scheduled task", .{});
+    const cb_label = if (editing) t.z("Save changes", .{}) else t.z("Create task", .{});
     const cb = t.Rect{ .x = x, .y = y, .width = @max(160, t.btnW(cb_label, t.BTN_LG)), .height = t.BTN_LG };
     if (t.buttonSolid(cb, cb_label, t.blue, online)) submitSched(store);
-    const hint = if (!online) t.z("server offline - start it to schedule", .{}) else t.z("posts to /api/v1/sched (admin)", .{});
-    t.text(hint, @intFromFloat(cb.x + cb.width + 14), @intFromFloat(y + (t.BTN_LG - 12) / 2), 12, if (online) t.comment else t.orange);
+    var hx = cb.x + cb.width + 10;
+    if (editing) {
+        const cancel_label = t.z("Cancel", .{});
+        const cancelb = t.Rect{ .x = hx, .y = y, .width = t.btnW(cancel_label, t.BTN_LG), .height = t.BTN_LG };
+        if (t.buttonGhost(cancelb, cancel_label, t.comment, true)) {
+            schedResetForm();
+            ui.sched_inner = .tasks;
+        }
+        hx = cancelb.x + cancelb.width + 14;
+    }
+    const hint = if (!online) t.z("server offline - start it first", .{}) else if (editing) t.z("updates the task in place (admin)", .{}) else t.z("posts to /api/v1/sched (admin)", .{});
+    t.text(hint, @intFromFloat(hx + 4), @intFromFloat(y + (t.BTN_LG - 12) / 2), 12, if (online) t.comment else t.orange);
+
+    if (want_runs) drawSchedRecentRuns(store, .{ .x = x + colw + 24, .y = r.y, .width = runs_w, .height = r.height });
 }
 
-/// Validate + package the builder form into the create JSON and hand it to the poller. The payload rides
-/// the store's dedicated slot, NOT Command.text — three 1200-byte fields at worst-case 2x escaping outgrow
-/// it. The provider snapshot resolves base/model/key exactly the way the chat thread does
-/// (chat.resolveProvider), so a scheduled run uses the same brain a desk chat turn would use right now.
+/// EDIT-mode side panel: the task's recent run conversations (the server keeps the newest five), newest
+/// first, each clickable → opens that conversation in Chat. This is the investigation path for "what did
+/// this task actually do last night?" — the runs are real chats, so the full transcript is right there.
+fn drawSchedRecentRuns(store: *Store, r: t.Rect) void {
+    flabel(r.x, r.y, "RECENT RUNS (newest first)");
+    // frame-time lookup by the edit id: the poller may refresh recent_convs while the form is open (a
+    // run finishing mid-edit), and this stays live where an edit-begin snapshot would go stale.
+    var recent: [340]u8 = undefined;
+    var recent_len: usize = 0;
+    var last: [64]u8 = undefined;
+    var last_len: usize = 0;
+    {
+        store.lock();
+        defer store.unlock();
+        for (store.sched_rows[0..store.sched_count]) |*row| {
+            if (!std.mem.eql(u8, row.idStr(), ui.sc_edit_id[0..ui.sc_edit_id_len])) continue;
+            recent_len = @min(row.recent_len, recent.len);
+            @memcpy(recent[0..recent_len], row.recent[0..recent_len]);
+            last_len = @min(row.last_conv_len, last.len);
+            @memcpy(last[0..last_len], row.last_conv[0..last_len]);
+            break;
+        }
+    }
+    // tasks from before run history existed have last_conv but an empty recent list — show what we have
+    const list = if (recent_len > 0) recent[0..recent_len] else last[0..last_len];
+    var y = r.y + 18;
+    if (list.len == 0) {
+        t.text(t.z("no runs yet - press run now", .{}), @intFromFloat(r.x), @intFromFloat(y), 12, t.comment);
+        return;
+    }
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |conv| {
+        if (conv.len == 0) continue;
+        if (y > r.y + r.height - 16) break;
+        const cr = t.Rect{ .x = r.x, .y = y, .width = r.width - 4, .height = 16 };
+        const hot = t.hovering(cr);
+        t.textClip(conv, @intFromFloat(cr.x), @intFromFloat(cr.y), 12, if (hot) t.fg else t.cyan, @intFromFloat(cr.width));
+        if (hot) t.wantCursor(.pointing_hand);
+        if (hot and rl.isMouseButtonPressed(.left)) {
+            store.pushChatCmd(store_mod.mkChatCmd(.select_conv, conv, ""));
+            setTab(.chat);
+        }
+        y += 20;
+    }
+}
+
+/// Validate + package the builder form and hand it to the poller. The payload rides the store's dedicated
+/// slot, NOT Command.text — three 1200-byte fields at worst-case 2x escaping outgrow it. CREATE resolves
+/// blank provider fields from the Settings chat provider per-field (all blank = exactly the old snapshot
+/// behavior); EDIT sends the form verbatim as a partial update, omitting api_key when blank so the stored
+/// key survives an unrelated edit.
 fn submitSched(store: *Store) void {
     if (ui.sc_name.len == 0 or ui.sc_prompt.len == 0) {
         store.pushNotif("Task incomplete", "give the task a name and a prompt", 2);
         return;
     }
+    const editing = ui.sc_edit_id_len > 0;
     var basebuf: [256]u8 = undefined;
     var keybuf: [192]u8 = undefined;
     var modelbuf: [96]u8 = undefined;
-    var base: []const u8 = "";
-    var key: []const u8 = "";
-    var model: []const u8 = "";
+    var base: []const u8 = ui.sc_base.str();
+    var key: []const u8 = ui.sc_key.str();
+    var model: []const u8 = ui.sc_model.str();
     var now: i64 = 0;
     {
         store.lock();
         defer store.unlock();
         const s = &store.settings;
         now = store.last_refresh_s; // the poller's epoch clock — the UI thread's only wall clock
-        var acct_scratch: [256]u8 = undefined;
-        var b: []const u8 = undefined;
-        var k: []const u8 = "";
-        switch (s.chat_kind) {
-            1 => {
-                // resolveBase substitutes the Cloudflare {account} placeholder (no-op for every other provider)
-                b = catalog.resolveBase(&catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)], s.cfAccount(), &acct_scratch);
-                k = s.chatKey();
-            },
-            2 => {
-                b = s.chatBase();
-                k = s.chatKey();
-            },
-            else => b = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1",
+        if (!editing) {
+            // CREATE: any blank provider field falls back to the chat provider from Settings, resolved
+            // exactly the way the chat thread does — all three blank reproduces the old full snapshot.
+            var acct_scratch: [256]u8 = undefined;
+            var b: []const u8 = undefined;
+            var k: []const u8 = "";
+            switch (s.chat_kind) {
+                1 => {
+                    // resolveBase substitutes the Cloudflare {account} placeholder (no-op for every other provider)
+                    b = catalog.resolveBase(&catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)], s.cfAccount(), &acct_scratch);
+                    k = s.chatKey();
+                },
+                2 => {
+                    b = s.chatBase();
+                    k = s.chatKey();
+                },
+                else => b = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1",
+            }
+            if (base.len == 0) {
+                const bn = @min(b.len, basebuf.len);
+                @memcpy(basebuf[0..bn], b[0..bn]);
+                base = basebuf[0..bn];
+            }
+            if (key.len == 0) {
+                const kn = @min(k.len, keybuf.len);
+                @memcpy(keybuf[0..kn], k[0..kn]);
+                key = keybuf[0..kn];
+            }
+            if (model.len == 0) {
+                var m: []const u8 = s.chatModel();
+                if (m.len == 0) m = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+                const mn = @min(m.len, modelbuf.len);
+                @memcpy(modelbuf[0..mn], m[0..mn]);
+                model = modelbuf[0..mn];
+            }
         }
-        const bn = @min(b.len, basebuf.len);
-        @memcpy(basebuf[0..bn], b[0..bn]);
-        base = basebuf[0..bn];
-        const kn = @min(k.len, keybuf.len);
-        @memcpy(keybuf[0..kn], k[0..kn]);
-        key = keybuf[0..kn];
-        var m: []const u8 = s.chatModel();
-        if (m.len == 0) m = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
-        const mn = @min(m.len, modelbuf.len);
-        @memcpy(modelbuf[0..mn], m[0..mn]);
-        model = modelbuf[0..mn];
     }
     if (ui.sc_kind == 0 and now == 0) {
         store.pushNotif("Not ready", "still reading the clock - try again in a second", 2);
@@ -4448,10 +4622,18 @@ fn submitSched(store: *Store) void {
     jesc(&w, ui.sc_prompt.str());
     w.writeAll("\",\"details\":\"") catch return;
     jesc(&w, ui.sc_details.str());
-    w.print("\",\"kind\":\"{s}\",\"at\":{d},\"every_min\":{d},\"hm\":\"{d:0>2}:{d:0>2}\",\"enabled\":{s},\"base_url\":\"{s}\",\"model\":\"{s}\",\"api_key\":\"", .{
-        kind, at, ui.sc_every_min, ui.sc_hour, ui.sc_minute, boolStr(ui.sc_enabled), base, model,
+    w.print("\",\"kind\":\"{s}\",\"at\":{d},\"every_min\":{d},\"hm\":\"{d:0>2}:{d:0>2}\",\"enabled\":{s},\"base_url\":\"", .{
+        kind, at, ui.sc_every_min, ui.sc_hour, ui.sc_minute, boolStr(ui.sc_enabled),
     }) catch return;
-    jesc(&w, key);
+    jesc(&w, base);
+    w.writeAll("\",\"model\":\"") catch return;
+    jesc(&w, model);
+    // EDIT + blank key → OMIT the field entirely: the update route treats "absent" as keep, but an empty
+    // STRING as "clear the stored key" — sending "" here would silently strip the task's credentials.
+    if (!editing or key.len > 0) {
+        w.writeAll("\",\"api_key\":\"") catch return;
+        jesc(&w, key);
+    }
     w.writeAll("\"}") catch return;
     const body = w.buffered();
 
@@ -4463,11 +4645,14 @@ fn submitSched(store: *Store) void {
         @memcpy(store.sched_create_json[0..bn], body[0..bn]);
         store.sched_create_len = bn;
     }
-    store.pushCmd(store_mod.mkCmd(.sched_create, "", ""));
-    store.pushNotif("Scheduling...", ui.sc_name.str(), 0);
-    ui.sc_name.clear();
-    ui.sc_prompt.clear();
-    ui.sc_details.clear();
+    if (editing) {
+        store.pushCmd(store_mod.mkCmd(.sched_update, ui.sc_edit_id[0..ui.sc_edit_id_len], ""));
+        store.pushNotif("Saving task...", ui.sc_name.str(), 0);
+    } else {
+        store.pushCmd(store_mod.mkCmd(.sched_create, "", ""));
+        store.pushNotif("Scheduling...", ui.sc_name.str(), 0);
+    }
+    schedResetForm();
     ui.sched_inner = .tasks;
 }
 
