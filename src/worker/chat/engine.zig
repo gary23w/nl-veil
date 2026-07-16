@@ -2188,11 +2188,13 @@ fn runInnerAgentic(
                 return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
             }
         }.f;
-        const browser_on = tool_client or envon(app.sup.parent_env, "NL_BROWSER_DRIVER");
-        const mcp_on = tool_client or envon(app.sup.parent_env, "NL_MCP");
-        if (!browser_on and !mcp_on) break :blk TURN_TOOLS;
-        const b = if (browser_on) ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA else "";
-        const m = if (mcp_on) ",\n" ++ tools.MCP_SCHEMA else "";
+        // Accessibility directive ("always include every tool"): a chat turn ALWAYS gets the browser/pixel/mcp
+        // schema so a tool can never silently drop out. The old signals are retained (discarded here) only so the
+        // reasoning stays legible; the swarm-mind schema in run.zig keeps its own env/tier gate.
+        const had_signal = tool_client or envon(app.sup.parent_env, "NL_BROWSER_DRIVER") or envon(app.sup.parent_env, "NL_MCP");
+        _ = had_signal;
+        const b = ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA;
+        const m = ",\n" ++ tools.MCP_SCHEMA;
         break :blk std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ TURN_TOOLS, b, m }) catch TURN_TOOLS;
     };
     defer if (turn_tools.ptr != TURN_TOOLS.ptr) gpa.free(@constCast(turn_tools));

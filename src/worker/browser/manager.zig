@@ -121,12 +121,202 @@ pub fn navigate(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
     return std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .url = final, .title = title }, .{}) catch error.OutOfMemory;
 }
 
-/// Snapshot the interactive elements (refs) plus a clipped page-text excerpt.
+/// Snapshot the interactive elements (refs) plus a clipped page-text excerpt — and, deterministically (so a
+/// disabled user's success never depends on the model *noticing*), weave in Pixel RAG and CAPTCHA handling:
+///   - STRONG challenge (a real CAPTCHA/interstitial in the DOM) → return a handoff payload, NOT an actionable
+///     read; the agent must relay it to the human. We never auto-solve or bypass verification.
+///   - thin/canvas/SPA page (little DOM text) → also render screenshot tiles and splice a `visual` block with
+///     tile paths + recovered leaf text, so the agent can still act when the DOM read is empty.
+///   - SUSPECTED challenge (text-only signal) → non-blocking `challenge` marker, normal read otherwise.
+/// `key` is the run_dir (tiles land under it, same convention as pixelrag). Everything is one coherent JSON.
 pub fn read(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8) Error![]u8 {
     g_mu.lockUncancelable(io);
     defer g_mu.unlock(io);
     const s = try ensure(gpa, io, env, key);
-    return s.snapshot();
+    const snap = try s.snapshot();
+
+    // Decision signals emitted by SNAPSHOT_JS (kind/url copied out before the parse arena is freed).
+    const Ch = struct { detected: bool = false, confidence: []const u8 = "none", kind: []const u8 = "unknown" };
+    const Sig = struct { textLen: u32 = 0, visualScore: f64 = 0, url: []const u8 = "", challenge: Ch = .{} };
+    var text_len: u32 = 0;
+    var vscore: f64 = 0;
+    var strong = false;
+    var suspected = false;
+    var kind_buf: [32]u8 = undefined;
+    var kind: []const u8 = "unknown";
+    var url_buf: [2048]u8 = undefined;
+    var cur_url: []const u8 = "";
+    if (std.json.parseFromSlice(Sig, gpa, snap, .{ .ignore_unknown_fields = true })) |sp| {
+        defer sp.deinit();
+        text_len = sp.value.textLen;
+        vscore = sp.value.visualScore;
+        strong = sp.value.challenge.detected and std.mem.eql(u8, sp.value.challenge.confidence, "strong");
+        suspected = sp.value.challenge.detected and std.mem.eql(u8, sp.value.challenge.confidence, "suspected");
+        const kl = @min(sp.value.challenge.kind.len, kind_buf.len);
+        @memcpy(kind_buf[0..kl], sp.value.challenge.kind[0..kl]);
+        kind = kind_buf[0..kl];
+        const ul = @min(sp.value.url.len, url_buf.len);
+        @memcpy(url_buf[0..ul], sp.value.url[0..ul]);
+        cur_url = url_buf[0..ul];
+    } else |_| {}
+
+    // 1. STRONG challenge → hand off to the human (never solve). Replaces the normal read.
+    if (strong) {
+        gpa.free(snap);
+        return challengePayload(gpa, io, env, s, key, cur_url, kind);
+    }
+
+    // 2. Visual fallback trigger (default ON — it's assistive tech; NL_BROWSER_PIXEL_FALLBACK=0 disables).
+    if (!envFalse(env, "NL_BROWSER_PIXEL_FALLBACK")) {
+        const text_min = envU32(env, "NL_READ_TEXT_MIN", 80); // genuinely-blank/unhydrated shells run well under this; a real small page (example.com ~127) does not
+        const text_rich = envU32(env, "NL_READ_TEXT_RICH", 600);
+        var reason: []const u8 = "";
+        if (text_len < text_min) {
+            reason = "sparse_text"; // blank / unhydrated SPA / challenge shell — little to no readable text
+        } else if (vscore >= 0.60 and text_len < text_rich) {
+            reason = "canvas_heavy"; // a canvas/map/whiteboard dominates the viewport with little DOM text
+        }
+        if (reason.len > 0) {
+            if (tileCurrentVisual(gpa, io, s, key, cur_url, reason, 3)) |visual| {
+                defer gpa.free(visual);
+                return spliceField(gpa, snap, "visual", visual); // frees snap on success
+            } else |_| {}
+        }
+    }
+
+    // 3. SUSPECTED challenge → non-blocking marker; the normal read still returns.
+    if (suspected) {
+        const marker = std.fmt.allocPrint(gpa, "{{\"detected\":true,\"confidence\":\"suspected\",\"kind\":\"{s}\",\"note\":\"possible human-verification prompt on this page — mention it to the user; do not attempt to bypass it\"}}", .{kind}) catch return snap;
+        defer gpa.free(marker);
+        return spliceField(gpa, snap, "challenge", marker);
+    }
+    return snap;
+}
+
+fn envU32(env: *const std.process.Environ.Map, name: []const u8, dflt: u32) u32 {
+    const v = env.get(name) orelse return dflt;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch dflt;
+}
+
+fn envFalse(env: *const std.process.Environ.Map, name: []const u8) bool {
+    const v = env.get(name) orelse return false;
+    return std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false");
+}
+
+/// Splice `"field": value_json` into the snapshot object `snap` (a JSON object string) — strip the trailing
+/// '}', append `,"field":<value>}`. Frees `snap`, returns the new gpa-owned string. If `snap` isn't a '}'-
+/// terminated object it's returned unchanged (caller still owns/frees `value_json`).
+fn spliceField(gpa: std.mem.Allocator, snap: []u8, field: []const u8, value_json: []const u8) []u8 {
+    const trimmed = std.mem.trim(u8, snap, " \r\n\t");
+    if (trimmed.len == 0 or trimmed[trimmed.len - 1] != '}') return snap;
+    const out = std.fmt.allocPrint(gpa, "{s},\"{s}\":{s}}}", .{ trimmed[0 .. trimmed.len - 1], field, value_json }) catch return snap;
+    gpa.free(snap);
+    return out;
+}
+
+/// Tile the CURRENTLY loaded page (no navigate — unlike renderTiles) into up to `max` screenshot tiles written
+/// under `{run_dir}/.pixelrag/_read/{hash}/`, returning a `visual` block: tile image PATHS (never inline base64
+/// — that would blow the model's context) + per-tile leaf-text excerpts + a recovered_text roll-up. Errors if
+/// nothing could be captured (caller then returns the plain snapshot).
+fn tileCurrentVisual(gpa: std.mem.Allocator, io: std.Io, s: *Session, run_dir: []const u8, url: []const u8, reason: []const u8, max: u32) Error![]u8 {
+    const h = std.hash.Wyhash.hash(0, url);
+    const dir = std.fmt.allocPrint(gpa, "{s}/.pixelrag/_read/{x}", .{ run_dir, h }) catch return error.OutOfMemory;
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+
+    const tile_h: i64 = 1600;
+    var doc_w: f64 = 1280;
+    var doc_h: i64 = tile_h;
+    const metrics = s.pageMetrics() catch (gpa.dupe(u8, "{}") catch return error.OutOfMemory);
+    defer gpa.free(metrics);
+    if (std.json.parseFromSlice(struct { w: f64 = 1280, h: f64 = 0 }, gpa, metrics, .{ .ignore_unknown_fields = true })) |mp| {
+        defer mp.deinit();
+        if (mp.value.w > 0) doc_w = mp.value.w;
+        if (mp.value.h > 0) doc_h = @intFromFloat(mp.value.h);
+    } else |_| {}
+
+    const n: u32 = @min(max, @as(u32, @intCast(@max(1, @divTrunc(doc_h + tile_h - 1, tile_h)))));
+    var tiles_json: std.ArrayListUnmanaged(u8) = .empty;
+    defer tiles_json.deinit(gpa);
+    var recovered: std.ArrayListUnmanaged(u8) = .empty;
+    defer recovered.deinit(gpa);
+    var i: u32 = 0;
+    var written: u32 = 0;
+    while (i < n) : (i += 1) {
+        const y0: i64 = @as(i64, i) * tile_h;
+        const h_px = @min(tile_h, doc_h - y0);
+        if (h_px <= 0) break;
+        const b64 = s.screenshotClipBase64(0, @floatFromInt(y0), doc_w, @floatFromInt(h_px)) catch continue;
+        defer gpa.free(b64);
+        const png = decodeB64(gpa, b64) catch continue;
+        defer gpa.free(png);
+        const full = std.fmt.allocPrint(gpa, "{s}/tile_{d}.png", .{ dir, i }) catch continue;
+        defer gpa.free(full);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = png }) catch continue;
+        const band = s.bandText(y0, y0 + tile_h) catch (gpa.dupe(u8, "") catch continue);
+        defer gpa.free(band);
+        const excerpt = if (band.len > 400) band[0..400] else band;
+        const ej = std.json.Stringify.valueAlloc(gpa, excerpt, .{}) catch continue;
+        defer gpa.free(ej);
+        const item = std.fmt.allocPrint(gpa, "{s}{{\"index\":{d},\"image\":\".pixelrag/_read/{x}/tile_{d}.png\",\"excerpt\":{s}}}", .{ if (written > 0) "," else "", i, h, i, ej }) catch continue;
+        defer gpa.free(item);
+        tiles_json.appendSlice(gpa, item) catch {};
+        if (recovered.items.len < 3000 and band.len > 0) {
+            if (recovered.items.len > 0) recovered.append(gpa, ' ') catch {};
+            recovered.appendSlice(gpa, band) catch {};
+        }
+        written += 1;
+    }
+    if (written == 0) return error.Protocol;
+    const rec_slice = recovered.items[0..@min(recovered.items.len, 3000)];
+    const rec = std.json.Stringify.valueAlloc(gpa, rec_slice, .{}) catch (gpa.dupe(u8, "\"\"") catch return error.OutOfMemory);
+    defer gpa.free(rec);
+    return std.fmt.allocPrint(gpa, "{{\"fallback\":true,\"reason\":\"{s}\",\"tiles\":[{s}],\"recovered_text\":{s},\"note\":\"Plain read returned little text, so the page was rendered to screenshot tiles. Excerpts are leaf-level text; the images are on disk for a vision pass. If you still can't act, describe the screenshot to the user or call pixel_ingest for a fuller searchable index.\"}}", .{ reason, tiles_json.items, rec }) catch error.OutOfMemory;
+}
+
+/// One full-page screenshot to disk for a challenge handoff. Returns the relative image path or null.
+fn snapOneShot(gpa: std.mem.Allocator, io: std.Io, s: *Session, run_dir: []const u8, url: []const u8) ?[]u8 {
+    const h = std.hash.Wyhash.hash(0, url);
+    const dir = std.fmt.allocPrint(gpa, "{s}/.pixelrag/_read/{x}", .{ run_dir, h }) catch return null;
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    const b64 = s.screenshotBase64() catch return null;
+    defer gpa.free(b64);
+    const png = decodeB64(gpa, b64) catch return null;
+    defer gpa.free(png);
+    const full = std.fmt.allocPrint(gpa, "{s}/challenge.png", .{dir}) catch return null;
+    defer gpa.free(full);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = png }) catch return null;
+    return std.fmt.allocPrint(gpa, ".pixelrag/_read/{x}/challenge.png", .{h}) catch null;
+}
+
+/// Build the CAPTCHA/human-verification handoff payload: a screenshot for the human, the URL, and mode-correct
+/// instructions. This is the accessibility-correct response — pause and ask the human — NOT an auto-solve.
+fn challengePayload(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, s: *Session, run_dir: []const u8, url: []const u8, kind: []const u8) []u8 {
+    const headful = wantHeadful(gpa, io, env);
+    const title = s.evaluate("document.title") catch (gpa.dupe(u8, "") catch return dupe(gpa, "{\"challenge\":{\"detected\":true,\"confidence\":\"strong\"}}"));
+    defer gpa.free(title);
+    const shot = snapOneShot(gpa, io, s, run_dir, url);
+    defer if (shot) |sp| gpa.free(sp);
+    const url_j = std.json.Stringify.valueAlloc(gpa, url, .{}) catch (gpa.dupe(u8, "\"\"") catch return dupe(gpa, "{\"ok\":false}"));
+    defer gpa.free(url_j);
+    const title_j = std.json.Stringify.valueAlloc(gpa, title, .{}) catch (gpa.dupe(u8, "\"\"") catch return dupe(gpa, "{\"ok\":false}"));
+    defer gpa.free(title_j);
+    // Own-vs-static tracking so the defer never frees a non-heap literal (the else/OOM path leaves it "null").
+    var shot_field: []const u8 = "null";
+    var shot_owned = false;
+    if (shot) |sp| {
+        if (std.fmt.allocPrint(gpa, "\"{s}\"", .{sp})) |f| {
+            shot_field = f;
+            shot_owned = true;
+        } else |_| {}
+    }
+    defer if (shot_owned) gpa.free(shot_field);
+    const instr = if (headful)
+        "This page is asking to verify you're human. The browser window is open on your screen — please complete the check yourself (checkbox or puzzle), then tell me to continue. I can't and won't solve it for you."
+    else
+        "This page needs a human-verification step and the browser is running hidden. Turn the browser window ON in Settings so you can solve it in place, or open this URL in your own browser, complete the check, and tell me to retry.";
+    return std.fmt.allocPrint(gpa, "{{\"url\":{s},\"title\":{s},\"challenge\":{{\"detected\":true,\"kind\":\"{s}\",\"confidence\":\"strong\",\"action_required\":\"human\",\"headful\":{},\"screenshot\":{s},\"instructions\":\"{s}\",\"note\":\"Automation paused at a human-verification challenge. I will not bypass or auto-solve it — waiting for you.\"}}}}", .{ url_j, title_j, kind, headful, shot_field, instr }) catch dupe(gpa, "{\"challenge\":{\"detected\":true,\"confidence\":\"strong\"}}");
 }
 
 /// Visible page text (document.body.innerText), clipped browser-side to `max` chars.
