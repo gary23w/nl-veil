@@ -142,6 +142,20 @@ pub fn main(init: std.process.Init) !void {
                 const model = try gpa.dupe(u8, it.next() orelse "mock");
                 return worker.run(gpa, io, init.environ_map, run_dir, nbin, model);
             }
+            // Manual, no-server exercise of the shared headless-browser layer (launch → CDP → navigate →
+            // snapshot → screenshot). Short-circuits like `worker` because it needs the real threaded io +
+            // environ, not the thin CLI client.
+            if (std.mem.eql(u8, sub, "browser-smoke")) {
+                const url = try gpa.dupe(u8, it.next() orelse "https://example.com");
+                @import("worker/browser/session.zig").smoke(gpa, io, init.environ_map, url);
+                return;
+            }
+            // Per-machine local-host daemon (round 2): owns the client's browser (+ later MCP) sessions behind
+            // the loopback broker so the desk's subprocess-per-tool delegation shares ONE session. Idle-exits.
+            if (std.mem.eql(u8, sub, "local-host")) {
+                @import("worker/browser/host.zig").runDaemon(gpa, io, init.environ_map);
+                return;
+            }
             cli_sub = try gpa.dupe(u8, sub);
             if (std.mem.eql(u8, sub, "--desk")) desktop_mode = true;
             while (it.next()) |arg| {
@@ -162,6 +176,33 @@ pub fn main(init: std.process.Init) !void {
         (std.fmt.parseInt(u16, std.mem.trim(u8, v, " \r\n\t"), 10) catch 8787)
     else
         8787;
+
+    // Single-process exercise of the Feature 2 browser tools (dispatch + gate + persistent session manager);
+    // needs the real io + environ, so it short-circuits here like `worker`/`browser-smoke`.
+    if (std.mem.eql(u8, cli_sub, "browser-flow-smoke")) {
+        const url = if (cli_args.items.len > 0) cli_args.items[0] else "https://example.com";
+        @import("cli/exec_tool.zig").browserFlowSmoke(gpa, io, init.environ_map, paths.home, paths.data, url);
+        return;
+    }
+    if (std.mem.eql(u8, cli_sub, "browser-invent-smoke")) {
+        const url = if (cli_args.items.len > 0) cli_args.items[0] else "https://example.com";
+        @import("cli/exec_tool.zig").browserInventSmoke(gpa, io, init.environ_map, paths.home, paths.data, url);
+        return;
+    }
+    if (std.mem.eql(u8, cli_sub, "pixel-smoke")) {
+        const url = if (cli_args.items.len > 0) cli_args.items[0] else "https://example.com";
+        const query = if (cli_args.items.len > 1) cli_args.items[1] else "documentation examples";
+        @import("cli/exec_tool.zig").pixelSmoke(gpa, io, init.environ_map, paths.home, paths.data, url, query);
+        return;
+    }
+    if (std.mem.eql(u8, cli_sub, "mcp-smoke")) {
+        @import("cli/exec_tool.zig").mcpSmoke(gpa, io, init.environ_map, paths.home, paths.data);
+        return;
+    }
+    if (std.mem.eql(u8, cli_sub, "mcp-invent-smoke")) {
+        @import("cli/exec_tool.zig").mcpInventSmoke(gpa, io, init.environ_map, paths.home, paths.data);
+        return;
+    }
 
     // CLI CLIENT: a recognized verb dispatches to the command-line client (a thin /api/v1/* caller) and exits.
     // This is the surface that retires the Python launcher — the server is the daemon, the CLI is its client.
