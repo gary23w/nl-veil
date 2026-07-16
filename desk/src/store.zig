@@ -110,6 +110,10 @@ pub const Settings = struct {
     // a send instead routes to the SERVER-side chat turn (POST /api/v1/chat/convs/:id/messages, rendered by
     // polling /events). Scheduled tasks always run server-side regardless of this — the desk may be closed.
     server_chat: bool = true, // default ON: the brain runs server-side and delegates tools to this client's harness
+    // BROWSER WINDOW (default off = headless): when the AI drives a web browser on this machine, show the
+    // browser window instead of running it hidden. Persisted, and mirrored to a small prefs file the local
+    // browser daemon reads so the next browser session opens in the chosen mode without a restart.
+    browser_headful: bool = false,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];

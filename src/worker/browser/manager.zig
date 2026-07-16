@@ -24,21 +24,61 @@ const Entry = struct {
     key: []u8, // gpa-owned run_dir
     sess: Session,
     last_used: i64,
+    headful: bool = false, // whether this session's browser is visible (vs headless)
 };
 
 var g_mu: std.Io.Mutex = .init;
 var g_slots: [MAX_SESSIONS]?Entry = .{null} ** MAX_SESSIONS;
 
-/// Find the live session for `key`, or open one. Caller holds g_mu. Returns a pointer into the fixed slot
-/// array (stable while the slot is occupied).
+/// Whether the browser should be VISIBLE (headful) vs headless. This is a CLIENT selection: the desk writes
+/// `{TEMP}/nl-veil-browser.json` = {"headful":bool} from its Settings toggle, and the daemon reads it per
+/// session-open so a toggle takes effect on the next session without an env change. NL_BROWSER_HEADFUL overrides.
+fn wantHeadful(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) bool {
+    if (env.get("NL_BROWSER_HEADFUL")) |v| {
+        if (v.len > 0) return !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+    }
+    const base = env.get("TEMP") orelse env.get("TMP") orelse env.get("TMPDIR") orelse return false;
+    const path = std.fmt.allocPrint(gpa, "{s}/nl-veil-browser.json", .{base}) catch return false;
+    defer gpa.free(path);
+    const txt = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1024)) catch return false;
+    defer gpa.free(txt);
+    const P = struct { headful: bool = false };
+    const p = std.json.parseFromSlice(P, gpa, txt, .{ .ignore_unknown_fields = true }) catch return false;
+    defer p.deinit();
+    return p.value.headful;
+}
+
+/// Open a fresh session for `key` in the requested headful/headless mode. The profile (+ its live
+/// DevToolsActivePort file) MUST live on local disk, never OneDrive (sync locks/delays it → PortTimeout),
+/// keyed by a hash of run_dir for per-run isolation.
+fn openSession(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, headful: bool) Error!Session {
+    const tmp_base = env.get("TEMP") orelse env.get("TMP") orelse env.get("TMPDIR");
+    const profile = if (tmp_base) |tb|
+        std.fmt.allocPrint(gpa, "{s}/nl-veil-cdp/{x}", .{ tb, std.hash.Wyhash.hash(0, key) }) catch return error.OutOfMemory
+    else
+        std.fmt.allocPrint(gpa, "{s}/.browser-profile", .{key}) catch return error.OutOfMemory;
+    defer gpa.free(profile);
+    return Session.open(gpa, io, env, .{ .user_data_dir = profile, .headless = !headful });
+}
+
+/// Find the live session for `key`, or open one. Caller holds g_mu. If a live session's visibility mode no
+/// longer matches the current client selection, it is closed and reopened so the toggle takes effect. Returns
+/// a pointer into the fixed slot array (stable while the slot is occupied).
 fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8) Error!*Session {
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    const headful = wantHeadful(gpa, io, env);
     var free_i: ?usize = null;
     var lru_i: usize = 0;
     var lru_ts: i64 = std.math.maxInt(i64);
     for (&g_slots, 0..) |*slot, i| {
         if (slot.*) |*e| {
             if (std.mem.eql(u8, e.key, key)) {
+                if (e.headful != headful) { // client toggled visibility → reopen in the new mode
+                    log.info("browser: reopening session for {s} (headful={})", .{ key, headful });
+                    e.sess.close();
+                    e.sess = try openSession(gpa, io, env, key, headful);
+                    e.headful = headful;
+                }
                 e.last_used = now;
                 return &e.sess;
             }
@@ -60,21 +100,11 @@ fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
         }
         break :blk lru_i;
     };
-
-    // The browser profile (and its live DevToolsActivePort handshake file) MUST live on local disk, never under
-    // OneDrive: OneDrive sync locks/delays files in the tree, which makes readEndpoint intermittently time out.
-    // Key it by a hash of run_dir so it stays per-run isolated. Falls back to run_dir only if no temp dir exists.
-    const tmp_base = env.get("TEMP") orelse env.get("TMP") orelse env.get("TMPDIR");
-    const profile = if (tmp_base) |tb|
-        std.fmt.allocPrint(gpa, "{s}/nl-veil-cdp/{x}", .{ tb, std.hash.Wyhash.hash(0, key) }) catch return error.OutOfMemory
-    else
-        std.fmt.allocPrint(gpa, "{s}/.browser-profile", .{key}) catch return error.OutOfMemory;
-    defer gpa.free(profile);
     const key_dup = gpa.dupe(u8, key) catch return error.OutOfMemory;
     errdefer gpa.free(key_dup);
-    const sess = try Session.open(gpa, io, env, .{ .user_data_dir = profile });
-    g_slots[idx] = .{ .key = key_dup, .sess = sess, .last_used = now };
-    log.info("browser: opened session for {s}", .{key});
+    const sess = try openSession(gpa, io, env, key, headful);
+    g_slots[idx] = .{ .key = key_dup, .sess = sess, .last_used = now, .headful = headful };
+    log.info("browser: opened session for {s} (headful={})", .{ key, headful });
     return &g_slots[idx].?.sess;
 }
 
