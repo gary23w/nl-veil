@@ -431,6 +431,7 @@ pub fn main() !void {
         store.lock();
         const online0 = store.server_online;
         const busy0 = store.chat_busy;
+        const dys0 = store.settings.dyslexia;
         // POLLER hand-off: a run-now (or any background action) minted a conversation to show — consume it
         // once, open it in Chat, and switch tabs, so "run now" visibly runs instead of just toasting.
         var goto_buf: [64]u8 = undefined;
@@ -444,6 +445,14 @@ pub fn main() !void {
         if (goto_len > 0) {
             store.pushChatCmd(store_mod.mkChatCmd(.select_conv, goto_buf[0..goto_len], ""));
             setTab(.chat);
+        }
+        // ACCESSIBILITY: hot-swap the UI font when the dyslexia setting differs from what's applied —
+        // covers the Settings toggle AND the persisted setting landing after startup (settings load on
+        // the chat thread; fonts must load HERE, on the GL thread). Applied-state updates even on a
+        // failed load so a missing font file can't become a per-frame retry.
+        if (dys0 != font_dyslexia_applied) {
+            applyUiFont(dys0);
+            font_dyslexia_applied = dys0;
         }
         // Activity-gated frame rate. This is an immediate-mode UI: EVERY frame re-lays-out + redraws every chat
         // message's markdown, so holding 60fps while the user is just READING pins a CPU core. Stay at 60 only
@@ -888,6 +897,39 @@ fn monoCandidates() []const [:0]const u8 {
         .macos => &.{ "/System/Library/Fonts/Menlo.ttc", "/System/Library/Fonts/SFNSMono.ttf", "/System/Library/Fonts/Courier.ttc" },
         else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/TTF/DejaVuSansMono.ttf", "/usr/share/fonts/liberation/LiberationMono-Regular.ttf" },
     };
+}
+
+/// Dyslexia mode's UI face: the BUNDLED OpenDyslexic (SIL OFL; desk/assets/fonts, same relative roots the
+/// icon loader probes) first, then system faces on the British Dyslexia Association's recommended list so
+/// the mode still helps when the asset is missing (source checkout without assets, other OSes).
+fn dyslexiaCandidates() []const [:0]const u8 {
+    return &.{
+        "assets/fonts/OpenDyslexic3-Regular.ttf",
+        "desk/assets/fonts/OpenDyslexic3-Regular.ttf",
+        "../assets/fonts/OpenDyslexic3-Regular.ttf",
+        "../desk/assets/fonts/OpenDyslexic3-Regular.ttf",
+        "C:/Windows/Fonts/comic.ttf",
+        "C:/Windows/Fonts/verdana.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    };
+}
+
+var font_dyslexia_applied: bool = false; // what the loaded UI atlas currently is (frame loop reconciles)
+
+/// (Re)load the proportional UI font per the accessibility setting and hand it to the theme. GL texture
+/// work — RENDER THREAD ONLY. On load failure the current font stays (and the caller records the attempt
+/// so a missing font can't turn into a per-frame retry storm).
+fn applyUiFont(dyslexia: bool) void {
+    const cands = if (dyslexia) dyslexiaCandidates() else uiCandidates();
+    if (loadFontAt(cands, 48)) |f| {
+        var fm = f;
+        rl.genTextureMipmaps(&fm.texture);
+        rl.setTextureFilter(fm.texture, .trilinear);
+        t.swapFont(fm);
+        log.info("ui font applied (dyslexia={}) glyphs={d}", .{ dyslexia, fm.glyphCount });
+    } else {
+        log.warn("ui font load FAILED (dyslexia={}) - keeping the current font", .{dyslexia});
+    }
 }
 fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
     for (candidates) |path| {
@@ -4972,6 +5014,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const tok_n = store.settings.token_len;
     const notify_on = store.settings.notify;
     const speed_on = store.settings.speed_mode;
+    const dys_on = store.settings.dyslexia;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -5068,6 +5111,20 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
     t.text(t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}), @intFromFloat(x + spd_w + 14), @intFromFloat(y + 9), 12, t.comment);
+    y += 46;
+
+    // ACCESSIBILITY — dyslexia mode: swaps the UI type for OpenDyslexic (bundled, SIL OFL), whose
+    // heavy-bottomed letterforms many dyslexic readers find easier to track. Applies INSTANTLY (the
+    // render loop hot-swaps the font atlas on the next frame) and persists with the settings.
+    const dys_w = @max(t.btnW(t.z("dyslexia mode: ON", .{}), 32), t.btnW(t.z("dyslexia mode: OFF", .{}), 32));
+    const dyr = t.Rect{ .x = x, .y = y, .width = dys_w, .height = 32 };
+    if (t.button(dyr, if (dys_on) t.z("dyslexia mode: ON", .{}) else t.z("dyslexia mode: OFF", .{}), if (dys_on) t.green else t.comment, true)) {
+        store.lock();
+        store.settings.dyslexia = !store.settings.dyslexia;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    t.text(t.z("accessibility: renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}), @intFromFloat(x + dys_w + 14), @intFromFloat(y + 9), 12, t.comment);
     y += 46;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
