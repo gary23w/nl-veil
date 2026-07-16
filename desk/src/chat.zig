@@ -3419,14 +3419,14 @@ pub const Chat = struct {
         escJson(&jb, self.gpa, model[0..model_n]);
         jb.appendSlice(self.gpa, "\",\"cf_account\":\"") catch return;
         escJson(&jb, self.gpa, cfa[0..cfa_n]);
-        // Server chat persists as an OPT-OUT flag under `local_brain` (true = user chose the local fallback).
-        // Written this way so the DEFAULT (server) needs no key: older files, whatever they carry, read as
-        // server-on. TWO dead predecessors, both ignored on read: `chat_server` (the old default-local build
-        // wrote `"chat_server":false` for everyone — reading it pinned upgraded installs local) and
-        // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
-        // your environment" as the local option's advantage after delegation made that the SERVER path's
-        // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful }) catch return;
+        // Server chat persists under `srv_brain` (true = server brain, the recommended default; only an
+        // explicit false = the retired local fallback). Written positively so the DEFAULT needs no key.
+        // THREE dead predecessors, all ignored on read: `chat_server` (the old default-local build wrote
+        // false for everyone), `chat_local` (opt-outs from a MISLEADING label), and now `local_brain` — a
+        // BROKEN toggle wrote `local_brain:true` on every idle frame (it read the checkbox's click flag as
+        // the new value), so every install with that build got silently pinned local and could never turn
+        // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3516,12 +3516,12 @@ pub const Chat = struct {
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
         // stays a thin client. The local engine survives only as a break-glass fallback when the server is
-        // unreachable. Persisted as the OPT-OUT key `local_brain` (absent = server on). Two dead predecessors are
-        // deliberately ignored: `chat_server` (the default-local build wrote `false` for everyone — reading it
-        // pinned upgraded installs to the retired brain) and `chat_local` (its opt-outs came from a misleading
-        // Settings label, not user intent — see saveSettings). A user who truly wants the fallback re-unchecks
-        // the now-honest toggle once.
-        s.server_chat = std.mem.indexOf(u8, data, "\"local_brain\":true") == null;
+        // unreachable. Persisted under `srv_brain` (absent OR true = server on; only explicit false = local).
+        // THREE dead predecessors deliberately ignored: `chat_server`, `chat_local`, and `local_brain` (a
+        // broken toggle wrote `local_brain:true` on every idle frame, pinning installs local with no way out —
+        // see saveSettings). Abandoning that key restores server-default; the fixed toggle persists any real
+        // opt-out under the new key.
+        s.server_chat = std.mem.indexOf(u8, data, "\"srv_brain\":false") == null;
     }
 
     fn loadKey(self: *Chat, dd: []const u8) void {

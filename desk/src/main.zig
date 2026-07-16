@@ -5450,8 +5450,13 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         };
         // Full-row hit area: the label sits well past the 18px box, so a 22px-wide rect made only the tiny box
         // clickable — clicking the label did nothing, which read as a "stuck" / policy-blocked switch.
-        const nv = t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur);
-        if (nv != cur) {
+        // CONTRACT: t.checkbox returns TRUE ON CLICK (the caller flips), NOT the new value. The previous
+        // shape here (`nv = t.checkbox(...); if (nv != cur)`) treated the click flag as the value — so every
+        // UN-clicked frame with the box CHECKED saw nv(false) != cur(true) and FORCED server_chat off:
+        // opening Settings silently killed server mode, and turning it on lasted exactly one frame. That
+        // was the whole "cannot click the input on or off / stuck in client mode" bug.
+        if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("server chat brain (recommended) - tools still run on THIS machine; off = old local engine (fallback only)", .{}), cur)) {
+            const nv = !cur;
             store.lock();
             store.settings.server_chat = nv;
             store.unlock();
