@@ -9,7 +9,7 @@ Write-Host "stopping veil-desk + veil..."
 Get-Process veil-desk, veil -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Seconds 2
 
-# Dedicated cache (C:\zig went stale against the OneDrive tree once — builds "succeeded" but installed
+# Dedicated cache (C:\zig went stale against the OneDrive tree once - builds "succeeded" but installed
 # yesterday's exe). If a build ever looks ignored again: delete this dir and rebuild.
 $cache = "C:\zig-nlveil"
 
@@ -35,6 +35,6 @@ Start-Sleep -Seconds 3
 try {
     $fleet = Invoke-RestMethod -Uri "http://127.0.0.1:8787/api/v1/fleet" -TimeoutSec 6
     Write-Host ("server up: v{0}, {1} swarms" -f $fleet.version, $fleet.swarms) -ForegroundColor Green
-} catch { Write-Host "server did not answer /fleet yet — check data/server-stderr.log" -ForegroundColor Yellow }
+} catch { Write-Host "server did not answer /fleet yet - check data/server-stderr.log" -ForegroundColor Yellow }
 Get-Process veil, veil-desk -ErrorAction SilentlyContinue | Format-Table Name, Id -AutoSize
 Write-Host "done. Tasks is the 6th top tab (edit + per-task model + recent runs live there)."
