@@ -336,6 +336,42 @@ pub const Mem = struct {
         return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \r\n\t"), 10) catch 0;
     }
 
+    /// Store MANY facts in ONE neuron subprocess (via `import` of a temp pack) instead of one spawn per fact.
+    /// The turn-exit hippocampus flush used to spawn neuron.exe per note — a 40-tool storm paid ~40 process
+    /// launches serialized onto the turn's tail (each ~300ms). This writes all facts to a uniquely-named temp
+    /// pack beside the db (random suffix so convs sharing a db never collide) and imports them at once. A note's
+    /// internal newlines are flattened to spaces (the pack is line-oriented). Returns facts stored (0 on failure).
+    pub fn observeBatch(self: Mem, scope: []const u8, notes: []const []const u8) u32 {
+        if (notes.len == 0) return 0;
+        if (notes.len == 1) return self.observe(scope, notes[0]); // one fact: skip the temp-file dance
+        self.lockW();
+        defer self.unlockW();
+        var rnd: [8]u8 = undefined;
+        self.io.random(&rnd);
+        var pb: [820]u8 = undefined;
+        const pack = std.fmt.bufPrint(&pb, "{s}.{s}.obatch.facts", .{ self.db, std.fmt.bytesToHex(rnd, .lower) }) catch return 0;
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.gpa);
+        for (notes) |note| {
+            const start = body.items.len;
+            body.appendSlice(self.gpa, note) catch return 0;
+            for (body.items[start..]) |*c| if (c.* == '\n' or c.* == '\r') {
+                c.* = ' ';
+            };
+            body.append(self.gpa, '\n') catch return 0;
+        }
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = body.items }) catch return 0;
+        defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
+        const out = self.run(&.{ "import", pack, "--scope", scope }) orelse return 0;
+        defer self.gpa.free(out);
+        const key = "imported ";
+        const i = std.mem.indexOf(u8, out, key) orelse return 0;
+        const rest = out[i + key.len ..];
+        var j: usize = 0;
+        while (j < rest.len and rest[j] >= '0' and rest[j] <= '9') j += 1;
+        return std.fmt.parseInt(u32, rest[0..j], 10) catch 0;
+    }
+
     pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
         self.lockW();
         if (self.run(&.{ "forget", scope })) |o| self.gpa.free(o);
