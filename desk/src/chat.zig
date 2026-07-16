@@ -124,6 +124,9 @@ const SYSTEM_REST =
     "- swarm_findings {}  — what the current cast has collected so far (its synthesis / recent events); or {\"id\":\"<id>\"}.\n" ++
     "- web_search {\"query\":\"...\"}  — a quick keyless web search (top results + excerpts).\n" ++
     "- web_fetch {\"url\":\"...\"}  — fetch one page as clean text.\n" ++
+    "- browser_navigate {\"url\":\"...\"}  — open a REAL web browser ON THIS MACHINE and go to a URL (returns the page title + final URL). REACH FOR THIS instead of giving up when a plain web_fetch/web_search can't get the data: a login-walled dashboard, a JS-heavy app, an interactive page, data behind a form. Then browser_read to see the page.\n" ++
+    "- browser_read {}  — read the current browser page: its visible text plus every clickable/typeable element, each tagged with a ref number.\n" ++
+    "- browser_click {\"ref\":N}  /  browser_type {\"ref\":N,\"text\":\"...\",\"submit\":true}  /  browser_close {}  — click or type into a ref from browser_read (submit presses Enter), or close the browser when done. NEVER type passwords or click pay/submit/delete without asking the user first.\n" ++
     "- fetch_json {\"url\":\"...\"}  — GET a JSON API and return the body.\n" ++
     "- recall_hive {\"query\":\"...\"}  — what the shared hive's COLLECTIVE knowledge already knows (general facts).\n" ++
     "- observe {\"fact\":\"...\"}  — add a GENERAL fact to the shared hive knowledge (NOT the user's private memory — " ++
