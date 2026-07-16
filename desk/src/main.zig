@@ -5380,6 +5380,21 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     t.text(t.z("accessibility: reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}), @intFromFloat(x + nr_w + 14), @intFromFloat(y + 9), 12, t.comment);
     y += 46;
 
+    // BROWSER WINDOW — when the AI drives a web browser ON THIS MACHINE, show the window (headful) instead of
+    // running it hidden (headless). Persisted, and mirrored to the local browser daemon's prefs file so the
+    // next browser session opens in the chosen mode without a restart.
+    const bh_on = store.settings.browser_headful;
+    const bw_w = @max(t.btnW(t.z("browser window: SHOWN", .{}), 32), t.btnW(t.z("browser window: HIDDEN", .{}), 32));
+    const bwr = t.Rect{ .x = x, .y = y, .width = bw_w, .height = 32 };
+    if (t.button(bwr, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), if (bh_on) t.green else t.comment, true)) {
+        store.lock();
+        store.settings.browser_headful = !store.settings.browser_headful;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    t.text(t.z("when the AI drives a web browser on this machine, show it on screen instead of running it hidden.", .{}), @intFromFloat(x + bw_w + 14), @intFromFloat(y + 9), 12, t.comment);
+    y += 46;
+
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
     // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
     if (!ui.s_seeded and (cmn > 0 or cbn > 0 or cfan > 0)) {

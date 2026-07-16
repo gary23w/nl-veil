@@ -30,6 +30,18 @@ MCP / AI-app discovery for RSI.
 - MCP client protocol (mock server: tools/list + tools/call); config scan finds a configured server, connects,
   lists tools, and `mcp_call` invokes it; `make_tool` → invoke → `mcp()` → broker → MCP server round-trips.
 
+## Round-2 fixes (2026-07-16, after first client test)
+- **Client-gate bug (delegated browser calls failed):** `browserDispatch`/`pixelDispatch`/`mcpDispatch`
+  re-checked `NL_BROWSER_DRIVER`/`NL_MCP` client-side, but the desk spawns `veil exec-tool` WITHOUT passing its
+  env (`desk/src/chat.zig`), so the exec-tool child (and the daemon) lack that var even when the server has it —
+  the delegated call returned "browser driver disabled". Fixed: gate only when `!ctx.roam`. A client (roam)
+  call is already authorized (the server put the tool in the schema, or the user invoked it directly).
+- **Headless/headful as a CLIENT selection:** desk Settings toggle **"browser window: SHOWN / HIDDEN"**
+  (`store.Settings.browser_headful`, persisted to `.veil-desk/settings.json`). On save/load the desk mirrors it
+  to `{TEMP}/nl-veil-browser.json` (`{"headful":bool}`) via libc `getenv`. The daemon's `manager.wantHeadful`
+  reads that file (or `NL_BROWSER_HEADFUL` env) at each session open and **close+reopens** a live session when
+  the mode changes — so toggling takes effect on the next browser session with no restart. Default headless.
+
 ## Deferred (follow-ups, not in this build)
 - HTTP/SSE MCP transport (stdio covers OS-installed servers; `mcp_call` reports http servers as unsupported).
 - Persistent daemon-hosted MCP connections (currently one-shot spawn per `mcp_call`).

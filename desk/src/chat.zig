@@ -3367,6 +3367,7 @@ pub const Chat = struct {
         var font_scale: u8 = 100;
         var font_bold = false;
         var narrator = false;
+        var browser_headful = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -3391,6 +3392,7 @@ pub const Chat = struct {
             font_scale = s.font_scale;
             font_bold = s.font_bold;
             narrator = s.narrator;
+            browser_headful = s.browser_headful;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -3421,12 +3423,31 @@ pub const Chat = struct {
         // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
         // your environment" as the local option's advantage after delegation made that the SERVER path's
         // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold, narrator }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
             log.warn("chat: could not persist settings", .{});
         };
+        self.syncBrowserPref(browser_headful);
+    }
+
+    /// Mirror the "show browser window" choice to a small prefs file the local browser daemon reads at each
+    /// session open (`{TEMP}/nl-veil-browser.json`), so toggling it takes effect on the next browser session
+    /// with no restart. Uses libc getenv (the desk links libc via raylib) — the daemon reads the same TEMP.
+    fn syncBrowserPref(self: *Chat, headful: bool) void {
+        var tmp: []const u8 = "";
+        for ([_][:0]const u8{ "TEMP", "TMP", "TMPDIR" }) |n| {
+            if (std.c.getenv(n)) |p| {
+                tmp = std.mem.span(p);
+                break;
+            }
+        }
+        if (tmp.len == 0) return;
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/nl-veil-browser.json", .{tmp}) catch return;
+        const body: []const u8 = if (headful) "{\"headful\":true}" else "{\"headful\":false}";
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = body }) catch {};
     }
 
     fn loadSettings(self: *Chat, dd: []const u8) void {
@@ -3484,6 +3505,8 @@ pub const Chat = struct {
         s.dyslexia = std.mem.indexOf(u8, data, "\"dyslexia\":true") != null; // opt-in: absent = standard font
         s.font_bold = std.mem.indexOf(u8, data, "\"font_bold\":true") != null;
         s.narrator = std.mem.indexOf(u8, data, "\"narrator\":true") != null;
+        s.browser_headful = std.mem.indexOf(u8, data, "\"browser_headful\":true") != null;
+        self.syncBrowserPref(s.browser_headful); // reflect the persisted choice to the daemon prefs file at startup
         if (jInt(data, "font_scale")) |v| {
             if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
         }

@@ -940,7 +940,10 @@ fn browserErr(gpa: std.mem.Allocator, e: anyerror) []u8 {
 /// NL_BROWSER_DRIVER (operator opt-in) and the offline flag; browser_navigate is additionally allowlist-gated.
 fn browserDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    if (!browserEnabled(ctx)) return dupe(gpa, "browser driver disabled — the operator must set NL_BROWSER_DRIVER=1 to enable web-browser control");
+    // A client-side (roam) call is already authorized: the server only offers browser_* in the schema when the
+    // OPERATOR set NL_BROWSER_DRIVER, and a direct CLI invocation is the user's own request — so don't re-gate
+    // on the client's env (the desk process may not carry NL_BROWSER_DRIVER even when the server does).
+    if (!ctx.roam and !browserEnabled(ctx)) return dupe(gpa, "browser driver disabled — set NL_BROWSER_DRIVER=1 on the server to offer web-browser control");
     if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run; the browser driver is unavailable");
     if (name.len <= "browser_".len) return dupe(gpa, "unknown browser tool");
     const action = name["browser_".len..]; // navigate | read | click | type | eval | close
@@ -981,7 +984,7 @@ fn browserOp(ctx: *ToolCtx, action: []const u8, params_json: []const u8) []u8 {
 /// offline flag; pixel_ingest is allowlist-gated like browser_navigate.
 fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    if (!browserEnabled(ctx)) return dupe(gpa, "pixel rag disabled — the operator must set NL_BROWSER_DRIVER=1 (it renders pages in the browser)");
+    if (!ctx.roam and !browserEnabled(ctx)) return dupe(gpa, "pixel rag disabled — set NL_BROWSER_DRIVER=1 on the server (it renders pages in the browser)");
     if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run; pixel rag is unavailable");
 
     if (std.mem.eql(u8, name, "pixel_ingest")) {
@@ -1018,7 +1021,7 @@ fn mcpEnabled(ctx: *ToolCtx) bool {
 /// (one-shot per call), so it runs correctly on the client (delegated) or server without a daemon.
 fn mcpDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    if (!mcpEnabled(ctx)) return dupe(gpa, "MCP disabled — the operator must set NL_MCP=1 to let the assistant find and use local MCP servers");
+    if (!ctx.roam and !mcpEnabled(ctx)) return dupe(gpa, "MCP disabled — set NL_MCP=1 on the server to let the assistant find and use local MCP servers");
 
     if (std.mem.eql(u8, name, "mcp_discover")) {
         const A = struct { server: []const u8 = "" };
