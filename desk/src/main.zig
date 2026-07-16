@@ -31,27 +31,48 @@ pub const std_options: std.Options = .{ .unexpected_error_tracing = false };
 // may be in a corrupt state.
 pub const panic = std.debug.FullPanic(deskPanic);
 
+extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+
+// Re-entry guard: writeCrashReport walks the stack + reads the PDB, which itself can fault on a truly corrupt
+// heap — that would re-enter deskPanic and recurse forever. The first entrant writes the report; a re-entrant
+// panic (the reporter faulted) skips straight to abort. The bare header is flushed BEFORE the risky trace, so
+// even a reporter fault leaves the panic message + address on disk.
+var panicking = std.atomic.Value(bool).init(false);
+
 fn deskPanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
-    writeCrashLine(msg, first_trace_addr);
+    if (!panicking.swap(true, .seq_cst)) writeCrashReport(msg, first_trace_addr);
     std.debug.defaultPanic(msg, first_trace_addr); // preserve the normal stderr trace + abort
 }
 
-fn writeCrashLine(msg: []const u8, ra: ?usize) void {
-    var buf: [700]u8 = undefined;
-    const line = (if (ra) |a|
-        std.fmt.bufPrint(&buf, "=== desk PANIC === {s} (ret_addr=0x{x})\n", .{ msg, a })
-    else
-        std.fmt.bufPrint(&buf, "=== desk PANIC === {s} (ret_addr=?)\n", .{msg})) catch return;
+/// Write the panic message, addresses, AND a SYMBOLICATED stack trace to a durable file. The desk is spawned
+/// with stderr ignored, so defaultPanic's trace vanishes; this puts file:line frames on disk regardless of how
+/// the desk was launched. Module base + RVA are logged too, so even a stripped-PDB build's bare address can be
+/// mapped later. Best-effort: the header is flushed first, then the trace is attempted (guarded against a
+/// reporter fault by `panicking` above).
+fn writeCrashReport(msg: []const u8, ra: ?usize) void {
     // The app's gpa may be corrupt mid-panic, so stand up a throwaway blocking Io on the page allocator
-    // (lock-free VirtualAlloc, no shared state). A single writeFile runs inline — no pool thread is spawned.
-    // Skip deinit: we abort in defaultPanic immediately after, so there's nothing to clean up.
+    // (lock-free VirtualAlloc, no shared state). Skip deinit: we abort in defaultPanic right after.
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     const io = threaded.io();
-    // The desk's cwd varies (repo root, zig-out/bin, Explorer double-click) and writeFile creates no parent
-    // dirs — a single hardcoded "data/..." path made every panic INVISIBLE from the wrong cwd (a live crash
-    // went undiagnosed for exactly this reason). Try each known data location, then the cwd itself.
+    const base = @intFromPtr(GetModuleHandleW(null)); // this module's load base → RVA = ret_addr - base
+    // The desk's cwd varies (repo root, zig-out/bin, Explorer double-click) and createFile makes no parent
+    // dirs — a single hardcoded "data/..." path once made a live crash INVISIBLE from the wrong cwd. Try each
+    // known data location, then the cwd itself; the first that opens gets the report.
     for ([_][]const u8{ "data/desk-panic.log", "../data/desk-panic.log", "../../data/desk-panic.log", "desk-panic.log" }) |p| {
-        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = line }) catch continue;
+        const f = std.Io.Dir.cwd().createFile(io, p, .{}) catch continue;
+        defer f.close(io);
+        var buf: [8 << 10]u8 = undefined;
+        var fw = f.writer(io, &buf);
+        const w = &fw.interface;
+        if (ra) |a|
+            w.print("=== desk PANIC === {s} (ret_addr=0x{x} base=0x{x} rva=0x{x})\n", .{ msg, a, base, a -% base }) catch {}
+        else
+            w.print("=== desk PANIC === {s} (ret_addr=? base=0x{x})\n", .{ msg, base }) catch {};
+        w.flush() catch {}; // header is durable now, before the risky symbolication
+        // Best-effort symbolicated backtrace (reads the co-located PDB). A fault here re-enters deskPanic →
+        // the `panicking` guard sends it to abort, so the flushed header survives.
+        std.debug.writeCurrentStackTrace(.{ .first_address = ra }, .{ .writer = w, .mode = .no_color }) catch {};
+        w.flush() catch {};
         return;
     }
 }
