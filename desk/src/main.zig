@@ -808,11 +808,13 @@ fn drawTitlebar(store: *Store) void {
     const online = store.server_online;
     const minds = store.fleet_minds;
     store.unlock();
-    const label = if (online) t.z("online   {d} minds", .{minds}) else t.z("offline", .{});
+    // Down is an ALARM state, not a shade of grey: the muted "offline" read as a stale-but-fine chip while
+    // every request was actually failing — say "server down" in red so a dead control plane is unmissable.
+    const label = if (online) t.z("online   {d} minds", .{minds}) else t.z("server down", .{});
     const lw = t.measure(label, 12);
     const lx = sw - @as(f32, @floatFromInt(lw)) - 154;
-    t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, if (online) t.green else t.comment);
-    t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, if (online) t.green else t.comment);
+    t.statusDot(@intFromFloat(lx - 11), TITLE_H / 2, if (online) t.green else t.red);
+    t.text(label, @intFromFloat(lx), (TITLE_H - 12) / 2, 12, if (online) t.green else t.red);
 
     const minb = t.Rect{ .x = sw - 138, .y = 0, .width = 46, .height = TITLE_H };
     const maxb = t.Rect{ .x = sw - 92, .y = 0, .width = 46, .height = TITLE_H };

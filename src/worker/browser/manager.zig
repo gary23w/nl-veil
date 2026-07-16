@@ -483,6 +483,32 @@ pub fn liveCount(io: std.Io) usize {
     return n;
 }
 
+/// How long an untouched session (and its resident headless browser) may live before it is closed. Sessions
+/// used to survive until the whole process exited — in the long-lived local-host daemon that meant every
+/// abandoned session pinned an Edge forever AND held liveCount above 0, so the daemon's own idle-exit could
+/// never fire. Generous: a mid-conversation pause must not lose the page, and a reopen only costs ~1 s.
+pub const SESSION_IDLE_S: i64 = 600;
+
+/// Close every session idle longer than `max_idle_s` and return the live count that remains. Called from the
+/// daemon's watch loop (and at dispatch time), so abandoned sessions age out instead of piling up browsers.
+pub fn sweepIdle(gpa: std.mem.Allocator, io: std.Io, max_idle_s: i64) usize {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    var live: usize = 0;
+    for (&g_slots) |*slot| {
+        if (slot.*) |*e| {
+            if (now - e.last_used > max_idle_s) {
+                log.info("browser: closing idle session for {s} ({d}s unused)", .{ e.key, now - e.last_used });
+                e.sess.close();
+                gpa.free(e.key);
+                slot.* = null;
+            } else live += 1;
+        }
+    }
+    return live;
+}
+
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("{\"ok\":false}");
 }
@@ -498,6 +524,7 @@ fn errJson(gpa: std.mem.Allocator, msg: []const u8) []u8 {
 pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, action: []const u8, params_json: []const u8) []u8 {
     touch(io);
     if (std.mem.eql(u8, action, "ping")) return dupe(gpa, "{\"ok\":true,\"pong\":true}");
+    _ = sweepIdle(gpa, io, SESSION_IDLE_S); // age out abandoned sessions before (possibly) opening a new one
 
     const pv = std.json.parseFromSlice(std.json.Value, gpa, if (params_json.len == 0) "{}" else params_json, .{}) catch
         return errJson(gpa, "bad params json");
