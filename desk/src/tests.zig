@@ -11,5 +11,6 @@ test {
     _ = @import("netcli.zig");
     _ = @import("scan.zig");
     _ = @import("secrets.zig");
+    _ = @import("store.zig");
     _ = @import("theme.zig");
 }

@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, deploy, swarm, hub, scheduled, settings };
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -232,9 +232,11 @@ pub const MAX_PLAN = 32; // == the server plan-board's MAX_TASKS cap
 pub const MAX_SCHED = 32;
 pub const MAX_CF_MODELS = 64; // live Workers AI models fetched from the connected Cloudflare account
 
-/// One scheduled task (poller writes from GET /api/v1/sched; the Scheduled tab reads). Raw schedule
-/// fields are kept — the UI composes the human summary ("every 30m" / "daily 09:00") at draw time, so
-/// the row never goes stale against a clock the poller doesn't re-publish.
+/// One task (poller writes from GET /api/v1/sched; the Tasks tab reads). Raw schedule fields are kept —
+/// the UI composes the human summary ("every 30m" / "daily 09:00") at draw time, so the row never goes
+/// stale against a clock the poller doesn't re-publish. prompt/details are FULL-fidelity (the Field cap,
+/// 1200 bytes) because the edit form must round-trip them verbatim — a clipped preview would silently
+/// truncate the task on the first save. Draw code snapshots the slim SchedRowView, never whole rows.
 pub const SchedRow = struct {
     id: [64]u8 = [_]u8{0} ** 64,
     id_len: u8 = 0,
@@ -251,8 +253,16 @@ pub const SchedRow = struct {
     runs: u32 = 0,
     last_conv: [64]u8 = [_]u8{0} ** 64, // the newest scheduled_* conversation this task produced
     last_conv_len: u8 = 0,
-    prompt: [96]u8 = [_]u8{0} ** 96, // preview of the task's prompt, for the row subtitle
-    prompt_len: u8 = 0,
+    prompt: [1200]u8 = [_]u8{0} ** 1200, // the FULL prompt (edit round-trip; rows draw a clipped preview)
+    prompt_len: u16 = 0,
+    details: [1200]u8 = [_]u8{0} ** 1200, // full key-details block, same reason
+    details_len: u16 = 0,
+    base_url: [192]u8 = [_]u8{0} ** 192, // per-task provider override ("" = server resolves its default)
+    base_url_len: u8 = 0,
+    model: [96]u8 = [_]u8{0} ** 96,
+    model_len: u8 = 0,
+    recent: [340]u8 = [_]u8{0} ** 340, // run HISTORY: comma-joined conv ids, newest first (server caps at 5)
+    recent_len: u16 = 0,
 
     pub fn idStr(s: *const SchedRow) []const u8 {
         return s.id[0..s.id_len];
@@ -269,7 +279,107 @@ pub const SchedRow = struct {
     pub fn promptStr(s: *const SchedRow) []const u8 {
         return s.prompt[0..s.prompt_len];
     }
+    pub fn detailsStr(s: *const SchedRow) []const u8 {
+        return s.details[0..s.details_len];
+    }
+    pub fn baseUrlStr(s: *const SchedRow) []const u8 {
+        return s.base_url[0..s.base_url_len];
+    }
+    pub fn modelStr(s: *const SchedRow) []const u8 {
+        return s.model[0..s.model_len];
+    }
+    pub fn recentStr(s: *const SchedRow) []const u8 {
+        return s.recent[0..s.recent_len];
+    }
 };
+
+/// What the task LIST rows actually draw — a slim per-row snapshot (~0.5KB vs the ~3KB full SchedRow), so
+/// the draw functions' copy-out-under-lock pattern stays cheap on the render thread's stack now that
+/// SchedRow carries full-fidelity prompt/details for the edit form.
+pub const SchedRowView = struct {
+    id: [64]u8 = [_]u8{0} ** 64,
+    id_len: u8 = 0,
+    name: [64]u8 = [_]u8{0} ** 64,
+    name_len: u8 = 0,
+    kind: u8 = 0,
+    at: i64 = 0,
+    every_min: u32 = 0,
+    hm: [8]u8 = [_]u8{0} ** 8,
+    hm_len: u8 = 0,
+    enabled: bool = true,
+    next_due: i64 = 0,
+    runs: u32 = 0,
+    last_conv: [64]u8 = [_]u8{0} ** 64,
+    last_conv_len: u8 = 0,
+    prompt: [96]u8 = [_]u8{0} ** 96, // clipped preview for the row subtitle
+    prompt_len: u8 = 0,
+
+    pub fn of(r: *const SchedRow) SchedRowView {
+        var v = SchedRowView{
+            .id = r.id,
+            .id_len = r.id_len,
+            .name = r.name,
+            .name_len = r.name_len,
+            .kind = r.kind,
+            .at = r.at,
+            .every_min = r.every_min,
+            .hm = r.hm,
+            .hm_len = r.hm_len,
+            .enabled = r.enabled,
+            .next_due = r.next_due,
+            .runs = r.runs,
+            .last_conv = r.last_conv,
+            .last_conv_len = r.last_conv_len,
+        };
+        const pn: usize = @min(r.prompt_len, v.prompt.len);
+        @memcpy(v.prompt[0..pn], r.prompt[0..pn]);
+        v.prompt_len = @intCast(pn);
+        return v;
+    }
+    pub fn idStr(s: *const SchedRowView) []const u8 {
+        return s.id[0..s.id_len];
+    }
+    pub fn nameStr(s: *const SchedRowView) []const u8 {
+        return s.name[0..s.name_len];
+    }
+    pub fn hmStr(s: *const SchedRowView) []const u8 {
+        return s.hm[0..s.hm_len];
+    }
+    pub fn lastConvStr(s: *const SchedRowView) []const u8 {
+        return s.last_conv[0..s.last_conv_len];
+    }
+    pub fn promptStr(s: *const SchedRowView) []const u8 {
+        return s.prompt[0..s.prompt_len];
+    }
+};
+
+test "SchedRowView.of clips the full prompt to a preview and carries every draw field" {
+    var full = SchedRow{};
+    @memcpy(full.id[0..7], "task-01");
+    full.id_len = 7;
+    @memcpy(full.name[0..5], "probe");
+    full.name_len = 5;
+    full.kind = 1;
+    full.every_min = 30;
+    full.enabled = false;
+    full.next_due = 12345;
+    full.runs = 7;
+    @memcpy(full.last_conv[0..10], "scheduled_");
+    full.last_conv_len = 10;
+    // a prompt longer than the 96-byte preview window must CLIP, never overflow or drop the row
+    for (0..300) |i| full.prompt[i] = 'p';
+    full.prompt_len = 300;
+    const v = SchedRowView.of(&full);
+    try std.testing.expectEqualStrings("task-01", v.idStr());
+    try std.testing.expectEqualStrings("probe", v.nameStr());
+    try std.testing.expectEqual(@as(u8, 1), v.kind);
+    try std.testing.expectEqual(@as(u32, 30), v.every_min);
+    try std.testing.expectEqual(false, v.enabled);
+    try std.testing.expectEqual(@as(i64, 12345), v.next_due);
+    try std.testing.expectEqual(@as(u32, 7), v.runs);
+    try std.testing.expectEqualStrings("scheduled_", v.lastConvStr());
+    try std.testing.expectEqual(@as(usize, 96), v.promptStr().len);
+}
 
 pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
 
@@ -438,10 +548,11 @@ pub const Store = struct {
     sched_count: usize = 0,
     sched_seen: bool = false, // the first successful list fetch landed ("loading…" vs "no tasks yet")
     sched_denied: bool = false, // the list GET came back 401/403 — the tab shows "admin token required"
-    // Create-payload hand-off: the full create JSON (three 1200-byte form fields, worst-case 2x escaped)
-    // outgrows Command.text, so the UI writes it HERE under lock and pushes a bare .sched_create; the
-    // poller copies + clears it when it drains that command. One slot — a second create before the poller
-    // wakes (sub-second) overwrites the first, same drop-tolerant discipline as the command ring itself.
+    // Task-payload hand-off: the full create/update JSON (three 1200-byte form fields, worst-case 2x
+    // escaped) outgrows Command.text, so the UI writes it HERE under lock and pushes a bare .sched_create
+    // or .sched_update (id in Command.id); the poller copies + clears it when it drains that command. One
+    // slot — a second submit before the poller wakes (sub-second) overwrites the first, same drop-tolerant
+    // discipline as the command ring itself.
     sched_create_json: [8192]u8 = undefined,
     sched_create_len: usize = 0,
 

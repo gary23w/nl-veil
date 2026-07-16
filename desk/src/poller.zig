@@ -130,6 +130,7 @@ pub const Poller = struct {
                 .open_folder => self.doOpenFolder(dd),
                 .open_file => self.setSelFile(c.textStr()),
                 .sched_create => self.doSchedCreate(),
+                .sched_update => self.doSchedUpdate(c.idStr()),
                 .sched_toggle => self.doSchedToggle(c.idStr(), c.textStr()),
                 .sched_delete => self.doSchedDelete(c.idStr()),
                 .sched_run => self.doSchedRun(c.idStr()),
@@ -153,15 +154,15 @@ pub const Poller = struct {
     /// Returns true when the response says the mutation landed (2xx).
     fn schedRespOk(self: *Poller, resp: ?netcli.Resp, what: []const u8) bool {
         const r = resp orelse {
-            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            self.store.pushNotif("Task failed", "server unreachable - is it running?", 2);
             return false;
         };
         defer if (r.body.len > 0) self.gpa.free(r.body);
         if (r.status >= 200 and r.status < 300) return true;
         if (r.status == 401 or r.status == 403) {
-            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+            self.store.pushNotif("Task unauthorized", "admin only - set the admin token in Settings", 2);
         } else {
-            self.store.pushNotif("Schedule rejected", what, 2);
+            self.store.pushNotif("Task rejected", what, 2);
         }
         return false;
     }
@@ -187,6 +188,28 @@ pub const Poller = struct {
         }
     }
 
+    /// POST the edit JSON the UI parked in the same hand-off slot to /api/v1/sched/:id — a partial update;
+    /// absent fields keep their stored value (which is how a blank key field means "keep the stored key").
+    fn doSchedUpdate(self: *Poller, id: []const u8) void {
+        var body: [8192]u8 = undefined;
+        var blen: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            blen = @min(self.store.sched_create_len, body.len);
+            @memcpy(body[0..blen], self.store.sched_create_json[0..blen]);
+            self.store.sched_create_len = 0; // consumed — a stale slot must never re-post
+        }
+        log.trace("poller.doSchedUpdate id={s} body_len={d}", .{ id, blen });
+        if (id.len == 0 or blen == 0) return; // ring replayed an already-consumed update — nothing to send
+        var tbuf: [128]u8 = undefined;
+        const tok = self.tokenSnap(&tbuf);
+        if (self.schedRespOk(netcli.schedUpdate(self.io, self.gpa, self.port(), tok, id, body[0..blen]), id)) {
+            self.store.pushNotif("Task updated", id, 1);
+            self.last_sched_s = 0; // show the edited row on the very next refresh tick
+        }
+    }
+
     /// Toggle a task's enabled flag. `state` is the DESIRED state ("1"/"0") the checkbox click computed.
     fn doSchedToggle(self: *Poller, id: []const u8, state: []const u8) void {
         log.trace("poller.doSchedToggle id={s} state={s}", .{ id, state });
@@ -207,14 +230,14 @@ pub const Poller = struct {
         // that landed) — that is success, not "rejected". The old handling notified failure AND skipped the
         // list refresh, so the ghost row sat there looking undeletable.
         const resp = netcli.schedDelete(self.io, self.gpa, self.port(), tok, id) orelse {
-            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            self.store.pushNotif("Task failed", "server unreachable - is it running?", 2);
             return;
         };
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
         if ((resp.status >= 200 and resp.status < 300) or resp.status == 404) {
             self.store.pushNotif("Task deleted", id, 1);
         } else if (resp.status == 401 or resp.status == 403) {
-            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+            self.store.pushNotif("Task unauthorized", "admin only - set the admin token in Settings", 2);
         } else {
             self.store.pushNotif("Delete rejected", id, 2);
         }
@@ -228,7 +251,7 @@ pub const Poller = struct {
         var tbuf: [128]u8 = undefined;
         const tok = self.tokenSnap(&tbuf);
         const resp = netcli.schedRun(self.io, self.gpa, self.port(), tok, id) orelse {
-            self.store.pushNotif("Schedule failed", "server unreachable - is it running?", 2);
+            self.store.pushNotif("Task failed", "server unreachable - is it running?", 2);
             return;
         };
         defer if (resp.body.len > 0) self.gpa.free(resp.body);
@@ -246,7 +269,7 @@ pub const Poller = struct {
             }
             self.last_sched_s = 0; // pick up runs/last_conv promptly
         } else if (resp.status == 401 or resp.status == 403) {
-            self.store.pushNotif("Schedule unauthorized", "admin only - set the admin token in Settings", 2);
+            self.store.pushNotif("Task unauthorized", "admin only - set the admin token in Settings", 2);
         } else if (resp.status == 409) {
             // the run is ALREADY going — open THAT conversation (the 409 body carries its id) so the click
             // lands the user inside the live run instead of reading as "the scheduler is broken"
@@ -894,6 +917,14 @@ fn parseSchedTask(obj: []const u8, row: *store_mod.SchedRow) void {
                 row.name_len = @intCast(scan.unescapeInto(p.raw, &row.name).len);
             } else if (std.mem.eql(u8, p.key, "prompt")) {
                 row.prompt_len = @intCast(scan.unescapeInto(p.raw, &row.prompt).len);
+            } else if (std.mem.eql(u8, p.key, "details")) {
+                row.details_len = @intCast(scan.unescapeInto(p.raw, &row.details).len);
+            } else if (std.mem.eql(u8, p.key, "base_url")) {
+                row.base_url_len = @intCast(scan.unescapeInto(p.raw, &row.base_url).len);
+            } else if (std.mem.eql(u8, p.key, "model")) {
+                row.model_len = @intCast(scan.unescapeInto(p.raw, &row.model).len);
+            } else if (std.mem.eql(u8, p.key, "recent_convs")) {
+                row.recent_len = @intCast(scan.unescapeInto(p.raw, &row.recent).len);
             } else if (std.mem.eql(u8, p.key, "hm")) {
                 row.hm_len = @intCast(scan.unescapeInto(p.raw, &row.hm).len);
             } else if (std.mem.eql(u8, p.key, "last_conv")) {

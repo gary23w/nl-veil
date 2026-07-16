@@ -47,11 +47,35 @@ pub const Task = struct {
     last_run: i64 = 0,
     next_due: i64 = 0,
     last_conv: []const u8 = "",
+    recent_convs: []const u8 = "", // run HISTORY: up to RECENT_MAX conv ids, comma-joined, newest first (includes last_conv)
     runs: i64 = 0,
     base_url: []const u8 = "",
     model: []const u8 = "",
     api_key: []const u8 = "", // STORED on disk; NEVER echoed back out — encodeTask redacts it for HTTP
 };
+
+/// How many run conversations a task remembers (the desk's "recent runs" investigation list). Five keeps the
+/// comma-joined field bounded (5 × 64-byte conv ids + commas < 340 bytes) while comfortably clearing the
+/// product floor of three previous chats per task.
+pub const RECENT_MAX: usize = 5;
+
+/// Prepend `newest` to the comma-joined `old` history, dropping any duplicate of `newest` (a same-minute
+/// re-run mints the same conv id) and clipping to RECENT_MAX entries. Allocated into `alloc` (arena).
+pub fn joinRecent(alloc: std.mem.Allocator, newest: []const u8, old: []const u8) []const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(alloc, newest) catch return newest;
+    var kept: usize = 1;
+    var it = std.mem.splitScalar(u8, old, ',');
+    while (it.next()) |e| {
+        const id = std.mem.trim(u8, e, " \r\n\t");
+        if (id.len == 0 or std.mem.eql(u8, id, newest)) continue;
+        if (kept >= RECENT_MAX) break;
+        out.append(alloc, ',') catch break;
+        out.appendSlice(alloc, id) catch break;
+        kept += 1;
+    }
+    return out.items;
+}
 
 fn validKind(k: []const u8) bool {
     return std.mem.eql(u8, k, "once") or std.mem.eql(u8, k, "every") or std.mem.eql(u8, k, "daily");
@@ -271,6 +295,8 @@ pub fn encodeTask(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), t: T
     try out.appendSlice(gpa, std.fmt.bufPrint(&nb, ",\"created\":{d},\"last_run\":{d},\"next_due\":{d}", .{ t.created, t.last_run, t.next_due }) catch return error.NoSpaceLeft);
     try out.appendSlice(gpa, ",\"last_conv\":");
     try http.jstr(gpa, out, t.last_conv);
+    try out.appendSlice(gpa, ",\"recent_convs\":");
+    try http.jstr(gpa, out, t.recent_convs);
     try out.appendSlice(gpa, std.fmt.bufPrint(&nb, ",\"runs\":{d}", .{t.runs}) catch return error.NoSpaceLeft);
     try out.appendSlice(gpa, ",\"base_url\":");
     try http.jstr(gpa, out, t.base_url);
@@ -517,6 +543,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
         fresh.last_run = now;
         fresh.runs += 1;
         fresh.last_conv = alloc.dupe(u8, conv) catch fresh.last_conv;
+        fresh.recent_convs = joinRecent(alloc, fresh.last_conv, fresh.recent_convs); // history: newest first, capped
         fresh.next_due = computeNextDue(fresh.kind, fresh.at, fresh.every_min, fresh.hm, fresh.created, fresh.last_run, now, localOffsetSecs());
         if (std.mem.eql(u8, fresh.kind, "once")) fresh.enabled = false; // a one-shot consumed itself
         _ = saveTask(app, alloc, uid, fresh); // a failed save can double-fire later — visible + recoverable, unlike a lost run
@@ -879,6 +906,23 @@ test "mintTaskId + convIdFor: slugged, stamped, safeSeg-clean, bounded at 64" {
     try std.testing.expect(id3.len <= 64 - 5); // room reserved for a "-hhhh" collision suffix
 }
 
+test "joinRecent: prepends newest, dedupes a same-minute re-run, caps at RECENT_MAX" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // empty history → just the newest
+    try std.testing.expectEqualStrings("c1", joinRecent(a, "c1", ""));
+    // normal growth, newest first
+    try std.testing.expectEqualStrings("c2,c1", joinRecent(a, "c2", "c1"));
+    try std.testing.expectEqualStrings("c3,c2,c1", joinRecent(a, "c3", "c2,c1"));
+    // a same-minute re-run mints the same conv id — never a duplicate entry
+    try std.testing.expectEqualStrings("c3,c2,c1", joinRecent(a, "c3", "c3,c2,c1"));
+    // the cap: a 6th run drops the oldest
+    try std.testing.expectEqualStrings("c6,c5,c4,c3,c2", joinRecent(a, "c6", "c5,c4,c3,c2,c1"));
+    // stray whitespace/empties in a hand-edited file are dropped, not preserved
+    try std.testing.expectEqualStrings("c2,c1", joinRecent(a, "c2", " c1 ,,"));
+}
+
 test "task JSON round-trips through encodeTask/parse; the HTTP encoding always redacts api_key" {
     const gpa = std.testing.allocator;
     const t = Task{
@@ -895,6 +939,7 @@ test "task JSON round-trips through encodeTask/parse; the HTTP encoding always r
         .last_run = 456,
         .next_due = 789,
         .last_conv = "scheduled_daily-report_03010705",
+        .recent_convs = "scheduled_daily-report_03010705,scheduled_daily-report_02280705",
         .runs = 7,
         .base_url = "http://127.0.0.1:11434/v1",
         .model = "gpt-oss:20b",
@@ -914,6 +959,7 @@ test "task JSON round-trips through encodeTask/parse; the HTTP encoding always r
         try std.testing.expectEqualStrings(t.kind, back.value.kind);
         try std.testing.expectEqualStrings(t.hm, back.value.hm);
         try std.testing.expectEqualStrings(t.last_conv, back.value.last_conv);
+        try std.testing.expectEqualStrings(t.recent_convs, back.value.recent_convs);
         try std.testing.expectEqualStrings(t.base_url, back.value.base_url);
         try std.testing.expectEqualStrings(t.model, back.value.model);
         try std.testing.expectEqualStrings("sk-secret", back.value.api_key);
