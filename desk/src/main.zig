@@ -451,7 +451,10 @@ pub fn main() !void {
             if (mouse_active or ui.input_active or busy0) ui.hot_frames = 40; // ~0.66s of 60fps after any activity
             ui.input_active = false; // handleKeys/editField below re-arm it for the next frame
             const focused = rl.isWindowFocused();
-            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 20 else 8;
+            // idle floors: 12 focused / 6 unfocused. Input is still polled EVERY frame, so the first wake
+            // costs at most one idle frame (~83ms) before hot_frames restores 60fps — imperceptible, and the
+            // focused-idle redraw was the last steady CPU line item after the poller/log churn fixes.
+            const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 12 else 6;
             if (ui.hot_frames > 0) ui.hot_frames -= 1;
             rl.setTargetFPS(fps);
         }
@@ -534,6 +537,11 @@ pub fn main() !void {
                                 // switch the right pane's inner tab (Swarm activity | Memory) for headless verification
                                 const rn = std.mem.trim(u8, cmd[6..], " \r\n\t");
                                 if (std.mem.eql(u8, rn, "memory")) ui.right_tab = .memory else if (std.mem.eql(u8, rn, "activity")) ui.right_tab = .activity;
+                            } else if (std.mem.startsWith(u8, cmd, "trace ")) {
+                                // function-entry tracing toggle for a diagnosis session (default OFF — the
+                                // per-second trace volume kept the log flusher writing to disk forever)
+                                const v = std.mem.trim(u8, cmd[6..], " \r\n\t");
+                                log.setTraceEnabled(std.mem.eql(u8, v, "on"));
                             } else if (std.mem.startsWith(u8, cmd, "speed ")) {
                                 // headless speed-mode toggle for automated verification
                                 const v = std.mem.trim(u8, cmd[6..], " \r\n\t");
@@ -1337,6 +1345,7 @@ const winmem = if (builtin.os.tag == .windows) struct {
 } else struct {};
 
 var mem_stat: struct { total_mb: u64 = 0, avail_mb: u64 = 0, load: u32 = 0, at: f64 = -10 } = .{};
+var cached_cores: usize = 0; // queried once on first Dashboard draw
 
 fn refreshMemStat() void {
     if (builtin.os.tag != .windows) return;
@@ -1371,7 +1380,9 @@ fn drawClientPanel(store: *Store, r: t.Rect) void {
         port = store.settings.port;
     }
     const up: u64 = @intFromFloat(@max(0, rl.getTime()));
-    const cores = std.Thread.getCpuCount() catch 0;
+    // core count can't change mid-session — one syscall ever, not one per frame
+    if (cached_cores == 0) cached_cores = std.Thread.getCpuCount() catch 0;
+    const cores = cached_cores;
 
     var yy = r.y + 32;
     const lh: f32 = 22;

@@ -37,10 +37,12 @@ var g_drain: usize = 0; // next index the file-flusher hasn't consumed
 var g_clock: i64 = 0;
 var g_held = std.atomic.Value(bool).init(false);
 
-/// Function-entry tracing toggle (see `trace`). Defaults ON so every function call across the app logs
-/// straight to veil-desk.log without extra setup; flip off (`log.setTraceEnabled(false)`) if the volume
-/// gets in the way. Atomic: the poller thread and UI thread both call `trace`.
-var g_trace_on = std.atomic.Value(bool).init(true);
+/// Function-entry tracing toggle (see `trace`). Defaults OFF: default-on tracing put ≥1 line in the ring
+/// EVERY second forever (poller tick + netcli lines), which kept the log flusher writing to the
+/// (OneDrive-synced) data dir every second — measurable idle CPU in the desk, OneDrive, AND Defender.
+/// Flip on for a diagnosis session via the SIM hook ("trace on") or log.setTraceEnabled(true). Atomic:
+/// the poller thread and UI thread both call `trace`.
+var g_trace_on = std.atomic.Value(bool).init(false);
 
 pub fn setTraceEnabled(on: bool) void {
     g_trace_on.store(on, .monotonic);

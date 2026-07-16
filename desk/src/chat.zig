@@ -750,7 +750,11 @@ pub const Chat = struct {
             if (tick % 10 == 4) self.watchPlan(dd); // ~1Hz: the ACTIVE conv's plan-board → right-pane checklist
             if (tick % 10 == 7) self.maybeVeilWork(dd); // concurrent veil: drive the parallel attempt (offset slot)
             if (tick % 10 == 3) self.maybeFinishAfterVeil(dd); // concurrent veil: compose the answer once cast + veil are both done
-            if (tick % 20 == 11) self.refreshChatFiles(dd); // ~2s: publish this chat's build files for the Files tab
+            // Files-tab refresh: ~2s while a turn/cast is actually producing files; ~20s once idle — an idle
+            // desk was re-walking the active conv's whole build tree every 2 seconds forever (churn the
+            // poller-side sub-scans had already been cured of).
+            if ((self.turn != .idle or self.sc_active) and tick % 20 == 11) self.refreshChatFiles(dd);
+            if (self.turn == .idle and !self.sc_active and tick % 200 == 11) self.refreshChatFiles(dd);
             if (tick % 50 == 0) self.refreshConvs(dd, false); // ~5s: pick up external changes
             if (tick % 300 == 299) self.fetchOllamaModels();
             if (tick % 10 == 9) self.pumpJudge(dd); // ~1Hz: the decoupled learning pass (own stream, never blocks)
