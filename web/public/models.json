@@ -528,6 +528,56 @@
       "note": "DeepSeek V3.1 chat via OpenRouter, supports structured tool calling (V3.1 Terminus variant: deepseek/deepseek-v3.1-terminus). Capable + cheap; DeepSeek tool reliability in complex swarms is good-not-perfect \u2014 test per-mind."
     },
     {
+      "id": "openrouter/free",
+      "label": "Free (rotating free tier) on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 200000,
+      "tools": "partial",
+      "cost": "free",
+      "note": "OpenRouter's own ROTATING free-tier router: 'openrouter/free' selects a currently-free model at random on every request (their free pool is grant/web3-subsidized and churns, so this never goes stale). $0 tokens \u2014 still needs an OpenRouter key, and free models may require enabling free-model/training consent in OpenRouter privacy settings. Which underlying model you get varies per call, so tool-calling reliability varies \u2014 validate for anything demanding; ideal for cheap/experimental minds."
+    },
+    {
+      "id": "meta-llama/llama-3.3-70b-instruct:free",
+      "label": "Llama 3.3 70B (free) on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "Meta Llama 3.3 70B via OpenRouter's free tier ($0). Reliable tool caller for a free model. The ':free' suffix is OpenRouter's free-variant convention; this specific free listing can rotate out over time \u2014 use openrouter/free for a self-maintaining rotator."
+    },
+    {
+      "id": "qwen/qwen3-coder:free",
+      "label": "Qwen3 Coder (free) on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 262144,
+      "tools": "reliable",
+      "cost": "free",
+      "note": "Qwen3 Coder via OpenRouter free tier ($0), strong for code + tool use. ':free' free-variant listing; may rotate out over time \u2014 openrouter/free is the durable rotating option."
+    },
+    {
+      "id": "openai/gpt-oss-20b:free",
+      "label": "GPT-OSS 20B (free) on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 131072,
+      "tools": "partial",
+      "cost": "free",
+      "note": "OpenAI open-weight GPT-OSS 20B via OpenRouter free tier ($0). Good cheap agentic option; small tier so validate tool reliability in complex swarms. ':free' listing may rotate out \u2014 prefer openrouter/free for a self-maintaining rotator."
+    },
+    {
+      "id": "openrouter/auto",
+      "label": "Auto Router (best model) on OpenRouter",
+      "provider": "openrouter",
+      "hosting": "hosted",
+      "context": 2000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "OpenRouter's meta Auto Router: routes your prompt to whichever of dozens of models gives the best output (variable pricing, billed at the chosen model's rate \u2014 NOT free). The response's returned model id tells you which was used. Good 'just pick something good' default when you don't want to choose."
+    },
+    {
       "id": "accounts/fireworks/models/kimi-k2-instruct-0905",
       "label": "Kimi K2 (0905) on Fireworks",
       "provider": "fireworks",

@@ -205,3 +205,33 @@ providers:
         label: DeepSeek V3.2
       - id: deepseek/deepseek-v3.1
         label: DeepSeek V3.1
+
+  # OpenRouter — one key, hundreds of models across every vendor, OpenAI-compatible (Bearer auth). The headline
+  # is openrouter/free: OpenRouter's OWN rotating free-tier router — it selects a currently-free model at random
+  # on every request (their free list is grant/web3-subsidized and churns, so a server-side rotator never goes
+  # stale). A few specific :free pins + openrouter/auto (meta-routes to the best model) round it out. Free models
+  # still need an OpenRouter key and may require enabling free-model/training consent in OpenRouter privacy
+  # settings. Docs: https://openrouter.ai/docs
+  - key: openrouter
+    label: OpenRouter
+    base: https://openrouter.ai/api/v1
+    needs_key: true
+    models:
+      - id: openrouter/free
+        label: Free (rotating free tier)
+      - id: meta-llama/llama-3.3-70b-instruct:free
+        label: Llama 3.3 70B (free)
+      - id: qwen/qwen3-coder:free
+        label: Qwen3 Coder (free)
+      - id: openai/gpt-oss-20b:free
+        label: GPT-OSS 20B (free)
+      - id: openrouter/auto
+        label: Auto Router (best model)
+      - id: deepseek/deepseek-chat-v3.1
+        label: DeepSeek V3.1
+      - id: qwen/qwen3-235b-a22b
+        label: Qwen3 235B A22B
+      - id: moonshotai/kimi-k2
+        label: Kimi K2
+      - id: anthropic/claude-sonnet-4.5
+        label: Claude Sonnet 4.5
