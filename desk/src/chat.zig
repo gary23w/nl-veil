@@ -4017,7 +4017,7 @@ pub const Chat = struct {
         const kn = @min(key.len, key_buf.len);
         @memcpy(key_buf[0..kn], key[0..kn]);
         var model: []const u8 = s.chatModel();
-        if (model.len == 0) model = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+        if (model.len == 0) model = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else catalog.defaults.local_model;
         const mn = @min(model.len, model_buf.len);
         @memcpy(model_buf[0..mn], model[0..mn]);
         return .{ .base_url = base_buf[0..bn], .key = key_buf[0..kn], .model = model_buf[0..mn] };
