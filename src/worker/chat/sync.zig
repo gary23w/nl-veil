@@ -108,6 +108,15 @@ pub fn manifestResponse(gpa: std.mem.Allocator, io: std.Io, workdir: []const u8)
         }
     } else |_| {}
     llm.jstr(gpa, &out, probe) catch return dupe(gpa, "{\"probe\":\"\",\"files\":[]}");
+    // SAME-DISK SHORT-CIRCUIT: a present probe means the client reads the SERVER's own workdir (both see the
+    // same physical directory), so the server detects shared==true and NEVER consults this file list — no
+    // transfer can ever be needed. Skip the whole walk (reading + hashing every file, on every sync) and
+    // return an empty list. The rare stale-probe case (a leftover from a crashed exchange) degrades to the
+    // server re-pushing files that already match on disk — a harmless rewrite of identical bytes, no data loss.
+    if (probe.len > 0) {
+        out.appendSlice(gpa, ",\"files\":[]}") catch return dupe(gpa, "{\"probe\":\"\",\"files\":[]}");
+        return gpa.dupe(u8, out.items) catch dupe(gpa, "{\"probe\":\"\",\"files\":[]}");
+    }
     out.appendSlice(gpa, ",\"files\":[") catch return dupe(gpa, "{\"probe\":\"\",\"files\":[]}");
     var count: usize = 0;
     var budget: usize = TOTAL_CAP;
