@@ -459,10 +459,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // read them anyway: recall runs once, at turn start.
     var tool_obs: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
-        for (tool_obs.items) |note| {
-            _ = ctx.mem.observe(mem_scope, note);
-            gpa.free(note);
-        }
+        // ONE subprocess for the whole batch (observeBatch imports a temp pack) instead of a neuron.exe spawn
+        // per note — a tool-heavy turn used to pay dozens of serialized ~300ms launches on its tail.
+        _ = ctx.mem.observeBatch(mem_scope, tool_obs.items);
+        for (tool_obs.items) |note| gpa.free(note);
         tool_obs.deinit(gpa);
     }
 
