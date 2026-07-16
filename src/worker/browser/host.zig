@@ -46,7 +46,9 @@ pub fn runDaemon(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Env
     while (true) {
         util.sleepMs(3000);
         const now = std.Io.Timestamp.now(io, .real).toSeconds();
-        const live = manager.liveCount(io);
+        // sweep, don't just count: an abandoned session used to hold liveCount above 0 forever, so the
+        // daemon (and its headless browsers) never idle-exited once anything had opened a session.
+        const live = manager.sweepIdle(gpa, io, manager.SESSION_IDLE_S);
         const last = manager.lastActivity();
         const idle_since = if (last != 0) last else started;
         if (live == 0 and now - idle_since > IDLE_EXIT_S) break;
@@ -95,7 +97,25 @@ fn reachable(gpa: std.mem.Allocator, io: std.Io, info: Info) bool {
 fn spawnDaemon(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) void {
     var exebuf: [4096]u8 = undefined;
     const n = std.process.executablePath(io, &exebuf) catch return;
-    const argv = [_][]const u8{ exebuf[0..n], "local-host" };
+    const self_exe = exebuf[0..n];
+    // WINDOWS: run the daemon from a TEMP COPY of the exe, not the install path — a daemon that holds the
+    // install exe open forces every rebuild/restart script to kill it, which is exactly how the shared
+    // browser died on every restart (a cold Edge for the next call, every time). The daemon needs no paths
+    // of its own (the `local-host` entry short-circuits before resolvePaths), so running from TEMP is safe.
+    // Any copy trouble (or the copy locked by a live-but-unreachable daemon) falls back to the install exe —
+    // worse (pins the file again) but functional. POSIX doesn't lock running binaries, so no copy there.
+    var daemon_exe: []const u8 = self_exe;
+    var cpb: [1024]u8 = undefined;
+    if (builtin.os.tag == .windows) {
+        if (env.get("TEMP") orelse env.get("TMP")) |tmp| blk: {
+            const copy_path = std.fmt.bufPrint(&cpb, "{s}/nl-veil-localhost.exe", .{tmp}) catch break :blk;
+            const bytes = std.Io.Dir.cwd().readFileAlloc(io, self_exe, gpa, .limited(256 << 20)) catch break :blk;
+            defer gpa.free(bytes);
+            std.Io.Dir.cwd().writeFile(io, .{ .sub_path = copy_path, .data = bytes }) catch break :blk;
+            daemon_exe = copy_path;
+        }
+    }
+    const argv = [_][]const u8{ daemon_exe, "local-host" };
     var mcopy = env.clone(gpa) catch {
         _ = std.process.spawn(io, .{ .argv = &argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch {};
         return;

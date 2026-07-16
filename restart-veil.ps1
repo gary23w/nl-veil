@@ -5,8 +5,15 @@ $repo = Split-Path -Parent $MyInvocation.MyCommand.Path
 $zig = "$env:USERPROFILE\zig-0.16.0\zig-x86_64-windows-0.16.0\zig.exe"
 Set-Location $repo
 
-Write-Host "stopping veil-desk + veil..."
-Get-Process veil-desk, veil -ErrorAction SilentlyContinue | Stop-Process -Force
+# Stop the desk + server, but SPARE the `veil local-host` browser daemon when it runs from its TEMP copy —
+# killing it on every restart is what forced a cold browser launch on the first tool call of every session.
+# A daemon still running from the repo's zig-out exe (a pre-TEMP-copy build) must die anyway: it holds the
+# exe open and the rebuild below could not replace it.
+Write-Host "stopping veil-desk + veil (sparing the TEMP-hosted local-host browser daemon)..."
+Get-Process veil-desk -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-CimInstance Win32_Process -Filter "Name='veil.exe'" -ErrorAction SilentlyContinue | Where-Object {
+    -not ($_.CommandLine -match 'local-host' -and $_.ExecutablePath -notlike "$repo*")
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 2
 
 # Dedicated cache (C:\zig went stale against the OneDrive tree once - builds "succeeded" but installed

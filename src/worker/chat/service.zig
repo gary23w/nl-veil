@@ -278,13 +278,15 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 /// POST /api/v1/chat/convs/:id/tool_result — a CLIENT-MODE turn delegated a tool to the client; the client runs
 /// it with its harness and posts the result here. Appended to tool_results.jsonl, which the blocked turn reads
-/// by call id and feeds back into the model. Body: {"id":"<call id>","result":"<tool output>"}.
+/// by call id and feeds back into the model. Body: {"id":"<call id>","result":"<tool output>"} — or
+/// {"id":"<call id>","ack":true}, the pickup/heartbeat signal a client posts while its tool is still running so
+/// the awaiting turn keeps its patience (see engine.awaitClientResult) instead of timing out a slow-but-alive tool.
 pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
-    const Body = struct { id: []const u8 = "", result: []const u8 = "" };
+    const Body = struct { id: []const u8 = "", result: []const u8 = "", ack: bool = false };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     if (b.id.len == 0) return badReq(res, "tool call id required");
     const dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg });
@@ -293,9 +295,14 @@ pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     defer line.deinit(app.gpa);
     try line.appendSlice(app.gpa, "{\"id\":");
     try http.jstr(app.gpa, &line, b.id);
-    try line.appendSlice(app.gpa, ",\"result\":");
-    try http.jstr(app.gpa, &line, b.result);
-    try line.appendSlice(app.gpa, "}\n");
+    if (b.ack) {
+        // an ack line deliberately carries NO "result" key — the waiter counts it, never consumes it
+        try line.appendSlice(app.gpa, ",\"ack\":true}\n");
+    } else {
+        try line.appendSlice(app.gpa, ",\"result\":");
+        try http.jstr(app.gpa, &line, b.result);
+        try line.appendSlice(app.gpa, "}\n");
+    }
     http.appendFile(app.io, app.gpa, path, line.items) catch return http.serverErr(res, "could not record tool result");
     try res.json(.{ .ok = true }, .{});
 }

@@ -644,6 +644,8 @@ fn runDelegatedTools(ctx: *Ctx, conv: []const u8, bytes: []const u8) void {
         const args = jsonStr(ctx.gpa, ln, "args") orelse ctx.gpa.dupe(u8, "{}") catch continue;
         defer ctx.gpa.free(args);
         std.debug.print("\n  [running {s} on this machine...]\n", .{tool});
+        postToolAck(ctx, conv, id); // pickup signal: the server's short no-ack window ends here, and the
+        //                             full tool patience starts (the CLI runs the tool synchronously below)
         const result = exec_tool.runTool(ctx, ".", tool, args); // workdir = the CLI's current directory
         defer ctx.gpa.free(result);
         postToolResult(ctx, conv, id, result);
@@ -660,6 +662,20 @@ fn applyFileSync(ctx: *Ctx, line: []const u8) void {
     if (std.fs.path.dirname(path)) |parent| _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, parent, .default_dir) catch {};
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = content }) catch return;
     std.debug.print("  [synced {s} from the hive — {d}b]\n", .{ path, content.len });
+}
+
+/// POST {"id":..,"ack":true} — tell the blocked server turn its tool was picked up and is running here, so
+/// its fast "no client attached" window doesn't fire while a slow tool works. Best-effort.
+fn postToolAck(ctx: *Ctx, conv: []const u8, id: []const u8) void {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(ctx.gpa);
+    body.appendSlice(ctx.gpa, "{\"id\":") catch return;
+    jstr(ctx.gpa, &body, id);
+    body.appendSlice(ctx.gpa, ",\"ack\":true}") catch return;
+    var pb: [220]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "/api/v1/chat/convs/{s}/tool_result", .{conv}) catch return;
+    const resp = call(ctx, "POST", path, body.items, 8, false) catch return;
+    if (resp.body.len > 0) ctx.gpa.free(resp.body);
 }
 
 /// POST the delegated tool's result back to the blocked server turn.

@@ -344,7 +344,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
     const ctrl_cursor = controlLen(app, conv_dir);
 
-    // CLIENT-MODE: truncate the delegated-tool-results channel so this turn's readToolResult scan starts clean
+    // CLIENT-MODE: truncate the delegated-tool-results channel so this turn's scanToolChannel scan starts clean
     // (results are keyed by call id, but resetting keeps the file from growing across a long conversation).
     if (tool_client) {
         if (std.fmt.allocPrint(gpa, "{s}/tool_results.jsonl", .{conv_dir})) |trp| {
@@ -1835,19 +1835,44 @@ fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u
     };
     if (built) emitEvent(app, conv_dir, ev.items);
 
-    const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // a client run_python / long shell can take a while
-    return awaitClientResult(app, conv_dir, id, ctrl_cursor, CLIENT_TOOL_TIMEOUT_S) orelse
-        gpa.dupe(u8, "(the client did not return a result in time — is the desk/CLI still connected?)") catch emptyRes();
+    // Heartbeat-aware wait: the client ACKs the request as soon as it picks it up (and the desk keeps
+    // heartbeating while its subprocess runs), so a missing client fails FAST instead of blocking the turn
+    // for the full tool budget, while a slow-but-alive tool gets its patience refreshed by every heartbeat.
+    const CLIENT_ACK_TIMEOUT_S: i64 = 20; // no ack at all → nothing is attached in client mode; fail fast
+    const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // patience from t0 AND from each fresh ack/heartbeat
+    var acked = false;
+    return awaitClientResult(app, conv_dir, id, ctrl_cursor, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked) orelse
+        gpa.dupe(u8, if (acked)
+            "(the client started this tool but stopped answering before returning a result — it may have crashed mid-run; verify the state before retrying)"
+        else
+            "(no desk/CLI client picked up this tool call — the client that started this conversation looks disconnected)") catch emptyRes();
 }
 
-/// Block until the client posts a result for `id` to /tool_result (or a stop lands / the timeout passes).
+/// Absolute ceiling on any client round-trip, heartbeats or not — the backstop against a client that
+/// heartbeats forever without ever posting a result (its own tool timeout is far shorter than this).
+const CLIENT_HARD_CAP_S: i64 = 1200;
+
+/// Block until the client posts a result for `id` to /tool_result (or a stop lands / the deadline passes).
 /// The one wait primitive under every client round-trip: delegated tools AND the sync protocol's manifest /
-/// file-pull exchanges. gpa-owned result; null = stopped or timed out (callers degrade, never wedge).
-fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, timeout_s: i64) ?[]u8 {
+/// file-pull exchanges. The deadline starts at `no_ack_timeout_s`; every NEW ack line the client posts for
+/// this id (the desk heartbeats while its tool subprocess runs) extends it to now + `ack_patience_s`, capped
+/// at CLIENT_HARD_CAP_S total. `saw_ack` (optional) reports whether the client ever acked, so the caller can
+/// tell "client gone" from "client died mid-run". gpa-owned result; null = stopped or timed out.
+fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, no_ack_timeout_s: i64, ack_patience_s: i64, saw_ack: ?*bool) ?[]u8 {
     const t0 = nowSecs(app.io);
-    while (nowSecs(app.io) - t0 < timeout_s) {
+    var deadline = t0 + no_ack_timeout_s;
+    const hard_cap = t0 + CLIENT_HARD_CAP_S;
+    var acks_seen: u32 = 0;
+    while (nowSecs(app.io) < @min(deadline, hard_cap)) {
         if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return null;
-        if (readToolResult(app, conv_dir, id)) |r| return r;
+        const chan = scanToolChannel(app, conv_dir, id);
+        if (chan.result) |r| return r;
+        if (chan.acks > acks_seen) {
+            acks_seen = chan.acks;
+            if (saw_ack) |sa| sa.* = true;
+            const fresh = nowSecs(app.io) + ack_patience_s;
+            if (fresh > deadline) deadline = fresh;
+        }
         sleepMsRaw(app.io, 150);
     }
     return null;
@@ -1906,7 +1931,7 @@ fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_curso
     };
     if (!built) return null;
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return null;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S, SYNC_WAIT_S, null) orelse return null;
     defer gpa.free(resp);
     const parsed = std.json.parseFromSlice(cync.ManifestResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return null;
     const shared = std.mem.eql(u8, std.mem.trim(u8, parsed.value.probe, " \r\n\t"), token);
@@ -1988,7 +2013,7 @@ fn pullClientFilesRooted(app: *App, conv_dir: []const u8, workdir: []const u8, c
     };
     if (!built) return 0;
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S) orelse return 0;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, SYNC_WAIT_S, SYNC_WAIT_S, null) orelse return 0;
     defer gpa.free(resp);
     const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return 0;
     defer parsed.deinit();
@@ -2119,23 +2144,36 @@ fn emitRunDirFiles(app: *App, conv_dir: []const u8, abs_dir: []const u8, rel: []
     }
 }
 
-/// Scan tool_results.jsonl for the line whose "id" matches; return its "result" (gpa-owned) or null (not yet).
-fn readToolResult(app: *App, conv_dir: []const u8, id: []const u8) ?[]u8 {
+const ChanScan = struct { result: ?[]u8 = null, acks: u32 = 0 };
+
+/// Scan tool_results.jsonl for lines whose "id" matches: a line carrying "result" settles the call (gpa-owned
+/// copy returned); {"ack":true} lines are the client's pickup/heartbeat signals and are only COUNTED — the
+/// waiter extends its deadline when the count grows. An ack line must never read as an (empty) result.
+fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8) ChanScan {
     const gpa = app.gpa;
-    const path = std.fmt.allocPrint(gpa, "{s}/tool_results.jsonl", .{conv_dir}) catch return null;
+    var out: ChanScan = .{};
+    const path = std.fmt.allocPrint(gpa, "{s}/tool_results.jsonl", .{conv_dir}) catch return out;
     defer gpa.free(path);
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(8 << 20)) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(8 << 20)) catch return out;
     defer gpa.free(data);
     var it = std.mem.splitScalar(u8, data, '\n');
     while (it.next()) |raw| {
         const ln = std.mem.trim(u8, raw, " \r\t");
         if (ln.len == 0) continue;
-        const R = struct { id: []const u8 = "", result: []const u8 = "" };
+        const R = struct { id: []const u8 = "", result: ?[]const u8 = null, ack: bool = false };
         const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
-        if (std.mem.eql(u8, p.value.id, id)) return gpa.dupe(u8, p.value.result) catch null;
+        if (!std.mem.eql(u8, p.value.id, id)) continue;
+        if (p.value.ack) {
+            out.acks += 1;
+            continue;
+        }
+        if (p.value.result) |r| {
+            out.result = gpa.dupe(u8, r) catch null;
+            return out;
+        }
     }
-    return null;
+    return out;
 }
 
 fn runInnerAgentic(

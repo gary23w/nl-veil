@@ -433,6 +433,12 @@ const CONSOLE_TIMEOUT_AI_S: i64 = 60; // AI RUN: door — a turn must not hang o
 const CONSOLE_TIMEOUT_YOU_S: i64 = 300; // You tab — the user may deliberately run something longer
 const CONSOLE_MAX_OUTPUT: u64 = 4 << 20; // force-stop a command that floods more than ~4MB into its sink
 
+// SERVER-DELEGATED tools (the exec-tool subprocess pumpDelegated polls — see DelegProc):
+const DELEG_TIMEOUT_S: i64 = 600; // hard ceiling for one delegated tool on this machine (a cold browser flow is slow but finite)
+const DELEG_HEARTBEAT_S: i64 = 10; // cadence of the {"ack":true} heartbeats that keep the server's awaiting turn patient
+const DELEG_MAX_OUTPUT: u64 = 8 << 20; // kill a tool flooding its sink; the posted result is clipped far below this
+const DELEG_RESULT_CAP: usize = 512 << 10; // max bytes of tool output posted back (matches the old stdout_limit)
+
 // Native, no-subprocess exit poll (std.process has no non-blocking wait). Mirrors supervisor.zig's winproc
 // pattern: on Windows read the exit code straight off the child HANDLE. Termination itself uses Child.kill
 // (native TerminateProcess via the Io vtable — no taskkill child, same spirit as terminateVeilPid).
@@ -484,6 +490,35 @@ const ConsoleProc = struct {
     }
     fn cmdStr(p: *const ConsoleProc) []const u8 {
         return p.cmd[0..p.cmd_len];
+    }
+};
+
+/// One in-flight SERVER-DELEGATED tool: the `veil exec-tool` subprocess, run off the worker's blocking path
+/// exactly like ConsoleProc and polled by pumpDelegated. Running it inline used to freeze the whole chat pump
+/// for the tool's duration (no streaming, no Stop, a static status line) — a slow browser launch read as a
+/// dead app. While this runs, the status line counts elapsed seconds and a heartbeat ack posts every
+/// DELEG_HEARTBEAT_S so the server's awaiting turn can tell "client working" from "client gone".
+const DelegProc = struct {
+    child: std.process.Child,
+    started_s: i64,
+    last_hb_s: i64,
+    id: [160]u8 = undefined, // the server's tool call id (the /tool_result key)
+    id_len: usize = 0,
+    tool: [64]u8 = undefined, // tool name, for the status line
+    tool_len: usize = 0,
+    base: [340]u8 = undefined, // sink path stem; "<base>.out"/".err" capture the subprocess's streams
+    base_len: usize = 0,
+    args_file: [900]u8 = undefined, // staged args JSON (deleted once the child is dead)
+    af_len: usize = 0,
+
+    fn idStr(p: *const DelegProc) []const u8 {
+        return p.id[0..p.id_len];
+    }
+    fn toolStr(p: *const DelegProc) []const u8 {
+        return p.tool[0..p.tool_len];
+    }
+    fn baseStr(p: *const DelegProc) []const u8 {
+        return p.base[0..p.base_len];
     }
 };
 
@@ -602,6 +637,11 @@ pub const Chat = struct {
     // micro-console: the one in-flight shell command (null = idle), polled from run() so it never blocks
     console: ?ConsoleProc = null,
     console_cancel: bool = false, // Stop button pressed → pumpConsole kills the running command next tick
+    // server-delegated tool: the one in-flight exec-tool subprocess (null = idle), polled from run() like the
+    // console — plus a small FIFO for tool_requests that land while one is still running (a server retry after
+    // its own timeout). Queued frames are heap-owned copies; each is acked so the server keeps waiting.
+    deleg: ?DelegProc = null,
+    deleg_q: [4]?[]u8 = .{null} ** 4,
     // COMMAND APPROVAL: a veil RUN: shell command parked awaiting the user's Approve/Bypass/Deny. While set,
     // the turn is held busy (awaitingShellApproval) and no new turn/loop/switch starts. Copied off the stream.
     pending_cmd: [1024]u8 = undefined,
@@ -746,6 +786,7 @@ pub const Chat = struct {
             self.pumpServerChat(dd); // EVERY tick (10Hz), matching pumpStream, so a SERVER turn's streamed frames
             //                          type out smoothly. No-op unless sc_active.
             self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
+            self.pumpDelegated(dd); // poll any in-flight server-delegated tool (same non-blocking pattern)
             // ~1Hz auto-loop backstop: a .loop_kick that lands the instant a turn is finishing hits maybeLoop's
             // `turn != .idle` guard and is lost — the settle-point call can't recover it if the turn had already
             // settled. Re-checking every idle tick self-heals that gap (maybeLoop no-ops unless loop is on AND the
@@ -786,6 +827,7 @@ pub const Chat = struct {
         self.judge_stream.deinit(self.gpa);
         if (self.console) |*p| p.child.kill(self.io); // don't leave a shell child running past shutdown
         self.console = null;
+        self.delegCancel(); // nor a delegated exec-tool child (and free any queued frames)
     }
 
     // ------------------------------------------------------------------------------ plumbing
@@ -1563,14 +1605,15 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "tool_request")) {
-            // CLIENT MODE: the server delegated this tool call and is now BLOCKED awaiting our result. Run it on
-            // THIS machine via the shared executor and post the result so the turn resumes. The matching "tool"
+            // CLIENT MODE: the server delegated this tool call and is now BLOCKED awaiting our result. Launch it
+            // on THIS machine via the shared executor — ASYNCHRONOUSLY (pumpDelegated posts the result when the
+            // subprocess exits), so streaming/Stop/status stay live while a slow tool works. The matching "tool"
             // start/done frames still draw the transcript chip — this frame is purely the delegation signal.
             self.scCommitReason(dd); // seal any pre-tool narration before we go run the tool
             self.scCommitText(dd);
             const id = scRawField(line, "id") orelse return;
             const tool = scRawField(line, "tool") orelse return;
-            self.runDelegatedTool(dd, id, tool, line); // extracts args off `line`, runs, posts to /tool_result
+            self.startDelegatedTool(dd, id, tool, line);
             return;
         }
         if (std.mem.eql(u8, kind, "file_sync")) {
@@ -1627,7 +1670,7 @@ pub const Chat = struct {
         if (self.build_dir_len == 0) self.syncBuildDir(dd);
     }
 
-    /// Resolve this conv's delegated workdir (the same path runDelegatedTool roots tools at), creating it.
+    /// Resolve this conv's delegated workdir (the same path launchDelegated roots tools at), creating it.
     fn delegatedWorkdir(self: *Chat, dd: []const u8, buf: []u8) []const u8 {
         var relb: [180]u8 = undefined;
         const rel = self.chatBuildRel(&relb);
@@ -1718,10 +1761,29 @@ pub const Chat = struct {
         return std.fmt.bufPrint(buf, "{s}", .{exe}) catch exe; // PATH fallback
     }
 
-    /// Run a server-delegated tool on THIS machine and post its result back. `line` is the full tool_request frame
-    /// (we pull "args" off it here so the caller needn't heap-unescape). Rooted at this conv's build workdir — the
-    /// SAME path the server would use — so files the tool writes land where the Files tab reads them.
-    fn runDelegatedTool(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
+    /// Accept a server-delegated tool call. If the executor slot is free, launch it asynchronously; if a tool
+    /// is already running (a server retry after its own timeout is the only real path here), ack the new id so
+    /// the server keeps waiting and queue the frame — pumpDelegated starts it once the current one finishes.
+    fn startDelegatedTool(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
+        if (self.deleg != null) {
+            self.postToolAck(id); // "client alive, will get to it" — stops the server's no-ack fast-fail
+            for (&self.deleg_q) |*slot| {
+                if (slot.* == null) {
+                    slot.* = self.gpa.dupe(u8, line) catch break;
+                    return;
+                }
+            }
+            self.postToolResult(id, "(desk: the delegated-tool queue is full — a previous tool is still running; re-request this call)");
+            return;
+        }
+        self.launchDelegated(dd, id, tool, line);
+    }
+
+    /// Launch a server-delegated tool on THIS machine as an INDEPENDENT OS process (pumpDelegated posts its
+    /// result back once it exits). `line` is the full tool_request frame (we pull "args" off it here so the
+    /// caller needn't heap-unescape). Rooted at this conv's build workdir — the SAME path the server would
+    /// use — so files the tool writes land where the Files tab reads them.
+    fn launchDelegated(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
         // 1) workdir = {dd}/{uid}/_chat/builds/{conv}/work (created on demand). Falls back to dd if unresolvable.
         var relb: [180]u8 = undefined;
         const rel = self.chatBuildRel(&relb);
@@ -1750,35 +1812,223 @@ pub const Chat = struct {
             self.postToolResult(id, "(desk: could not stage tool args)");
             return;
         };
-        defer Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
 
-        // 3) spawn `veil exec-tool <tool> --workdir <wd> --args-file <af>` and capture its stdout (the tool result).
+        // 3) sink files beside the console's (separate stems — a RUN: command and a delegated tool can overlap).
+        var bb: [340]u8 = undefined;
+        const base = std.fmt.bufPrint(&bb, "{s}/.veil-desk/deleg", .{dd}) catch {
+            self.postToolResult(id, "(desk: could not prepare the tool sinks)");
+            return;
+        };
+        var ob: [352]u8 = undefined;
+        var eb2: [352]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{base}) catch return;
+        const errp = std.fmt.bufPrint(&eb2, "{s}.err", .{base}) catch return;
+        const of = Io.Dir.cwd().createFile(self.io, outp, .{}) catch {
+            self.postToolResult(id, "(desk: could not open the tool output file)");
+            return;
+        };
+        const ef = Io.Dir.cwd().createFile(self.io, errp, .{}) catch {
+            of.close(self.io);
+            self.postToolResult(id, "(desk: could not open the tool output file)");
+            return;
+        };
+
+        // 4) spawn `veil exec-tool <tool> --workdir <wd> --args-file <af>` DETACHED — the old inline run froze
+        //    the whole chat pump (streaming, Stop, status) for the tool's duration.
         var binb: [1100]u8 = undefined;
         const bin = self.veilBinPath(&binb);
         const argv = [_][]const u8{ bin, "exec-tool", tool, "--workdir", workdir, "--args-file", args_file };
-        var stbuf: [96]u8 = undefined;
-        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
-        const r = std.process.run(self.gpa, self.io, .{
+        const child = std.process.spawn(self.io, .{
             .argv = &argv,
-            .stdout_limit = .limited(512 << 10),
-            .stderr_limit = .limited(32 << 10),
+            .stdin = .ignore,
+            .stdout = .{ .file = of },
+            .stderr = .{ .file = ef },
+            .create_no_window = true,
         }) catch |e| {
+            of.close(self.io);
+            ef.close(self.io);
+            Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
             var eb: [256]u8 = undefined;
             self.postToolResult(id, std.fmt.bufPrint(&eb, "(desk: could not run '{s} exec-tool' ({s}) — is the veil binary reachable?)", .{ bin[0..@min(bin.len, 120)], @errorName(e) }) catch "(desk: exec-tool failed to run)");
             return;
         };
-        defer self.gpa.free(r.stdout);
-        defer self.gpa.free(r.stderr);
-        const out = r.stdout;
-        const stderr = std.mem.trim(u8, r.stderr, " \r\n\t");
-        // 4) post the result. Prefer stdout; if the subprocess produced nothing but wrote to stderr, surface that.
-        if (out.len > 0) {
-            self.postToolResult(id, out);
+        of.close(self.io); // the child holds its own copies
+        ef.close(self.io);
+
+        const now = self.nowS();
+        var p: DelegProc = .{ .child = child, .started_s = now, .last_hb_s = now };
+        p.id_len = @min(id.len, p.id.len);
+        @memcpy(p.id[0..p.id_len], id[0..p.id_len]);
+        p.tool_len = @min(tool.len, p.tool.len);
+        @memcpy(p.tool[0..p.tool_len], tool[0..p.tool_len]);
+        p.base_len = @min(base.len, p.base.len);
+        @memcpy(p.base[0..p.base_len], base[0..p.base_len]);
+        p.af_len = @min(args_file.len, p.args_file.len);
+        @memcpy(p.args_file[0..p.af_len], args_file[0..p.af_len]);
+        self.deleg = p;
+
+        // pickup ack: ends the server's short "is any client attached?" window; heartbeats take over from here
+        self.postToolAck(id);
+        var stbuf: [96]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
+        log.info("delegated: launched {s} (id={s})", .{ tool[0..@min(tool.len, 48)], id[0..@min(id.len, 60)] });
+    }
+
+    /// Poll the in-flight delegated tool each tick WITHOUT blocking. While it runs: tick the elapsed-seconds
+    /// status and post a heartbeat ack every DELEG_HEARTBEAT_S (for the running id AND any queued ones, so a
+    /// queued retry isn't timed out by the server while it waits its turn). On exit/timeout/flood: read the
+    /// sinks, post the result, clean up, and start the next queued request. No-op when nothing is running.
+    fn pumpDelegated(self: *Chat, dd: []const u8) void {
+        const p = if (self.deleg) |*pp| pp else {
+            self.delegDequeue(dd);
+            return;
+        };
+        const now = self.nowS();
+        var exit_code: ?u32 = null;
+        if (!procExited(&p.child, &exit_code)) {
+            if (now - p.started_s >= DELEG_TIMEOUT_S) {
+                p.child.kill(self.io);
+                self.finishDelegated(dd, "(desk: the delegated tool ran too long on this machine and was stopped — try a narrower call)");
+                return;
+            }
+            if (self.delegSinkBytes(p) > DELEG_MAX_OUTPUT) {
+                p.child.kill(self.io);
+                self.finishDelegated(dd, "(desk: the delegated tool flooded its output and was stopped)");
+                return;
+            }
+            var stbuf: [96]u8 = undefined;
+            self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine... {d}s", .{ p.toolStr()[0..@min(p.tool_len, 48)], now - p.started_s }) catch "running tool locally...");
+            if (now - p.last_hb_s >= DELEG_HEARTBEAT_S) {
+                p.last_hb_s = now;
+                self.postToolAck(p.idStr());
+                for (self.deleg_q) |slot| {
+                    const qline = slot orelse continue;
+                    if (scRawField(qline, "id")) |qid| self.postToolAck(qid);
+                }
+            }
+            return;
+        }
+        if (p.child.id != null) {
+            if (p.child.wait(self.io)) |_| {} else |_| {} // reap only — the exit came from the peek
+        }
+        self.finishDelegated(dd, null);
+    }
+
+    /// Read the finished (or killed) delegated tool's sinks, post the result (or `forced` — a timeout/flood
+    /// note that overrides whatever partial output exists), clean up, and start the next queued request.
+    fn finishDelegated(self: *Chat, dd: []const u8, forced: ?[]const u8) void {
+        const p = if (self.deleg) |*pp| pp else return;
+        var ob: [352]u8 = undefined;
+        var eb: [352]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch "";
+        const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch "";
+        const scratch: ?[]u8 = self.gpa.alloc(u8, DELEG_RESULT_CAP + (32 << 10)) catch null;
+        defer if (scratch) |s| self.gpa.free(s);
+        const out = if (scratch) |s| self.readSinkHead(outp, s[0..DELEG_RESULT_CAP]) else "";
+        const stderr_raw = if (scratch) |s| self.readSinkHead(errp, s[DELEG_RESULT_CAP..]) else "";
+        const stderr = std.mem.trim(u8, stderr_raw, " \r\n\t");
+        Io.Dir.cwd().deleteFile(self.io, outp) catch {};
+        Io.Dir.cwd().deleteFile(self.io, errp) catch {};
+        Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
+
+        var idb: [160]u8 = undefined;
+        const idn = p.id_len;
+        @memcpy(idb[0..idn], p.id[0..idn]);
+        const elapsed = self.nowS() - p.started_s;
+        var tn: [64]u8 = undefined;
+        const tnn = p.tool_len;
+        @memcpy(tn[0..tnn], p.tool[0..tnn]);
+        self.deleg = null; // clear BEFORE posting — postToolResult can take a beat and state must be settled
+
+        if (forced) |msg| {
+            self.postToolResult(idb[0..idn], msg);
+        } else if (out.len > 0) {
+            self.postToolResult(idb[0..idn], out);
         } else if (stderr.len > 0) {
             var sb: [640]u8 = undefined;
-            self.postToolResult(id, std.fmt.bufPrint(&sb, "(tool produced no output; stderr: {s})", .{stderr[0..@min(stderr.len, 600)]}) catch "(tool produced no output)");
+            self.postToolResult(idb[0..idn], std.fmt.bufPrint(&sb, "(tool produced no output; stderr: {s})", .{stderr[0..@min(stderr.len, 600)]}) catch "(tool produced no output)");
         } else {
-            self.postToolResult(id, ""); // empty is a valid result (e.g. a silent write); the turn must still resume
+            self.postToolResult(idb[0..idn], ""); // empty is a valid result (e.g. a silent write); the turn must still resume
+        }
+        self.setStatus("");
+        log.info("delegated: {s} finished in {d}s ({d}b out, {d}b err)", .{ tn[0..tnn], elapsed, out.len, stderr.len });
+        self.delegDequeue(dd); // a queued retry (already acked) runs now
+    }
+
+    /// Start the oldest queued tool_request frame, if any (the slot must be free). Frames are heap-owned dupes.
+    fn delegDequeue(self: *Chat, dd: []const u8) void {
+        if (self.deleg != null) return;
+        const line = self.deleg_q[0] orelse return;
+        var i: usize = 0;
+        while (i + 1 < self.deleg_q.len) : (i += 1) self.deleg_q[i] = self.deleg_q[i + 1];
+        self.deleg_q[self.deleg_q.len - 1] = null;
+        defer self.gpa.free(line);
+        const id = scRawField(line, "id") orelse return;
+        const tool = scRawField(line, "tool") orelse return;
+        self.launchDelegated(dd, id, tool, line);
+    }
+
+    /// Kill any in-flight delegated tool and drop the queue WITHOUT posting results — for shutdown and for
+    /// abortServerChat (the awaiting server turn is gone; orphaned local work must not keep running).
+    fn delegCancel(self: *Chat) void {
+        if (self.deleg) |*p| {
+            p.child.kill(self.io);
+            var ob: [352]u8 = undefined;
+            var eb: [352]u8 = undefined;
+            if (std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()})) |outp| Io.Dir.cwd().deleteFile(self.io, outp) catch {} else |_| {}
+            if (std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()})) |errp| Io.Dir.cwd().deleteFile(self.io, errp) catch {} else |_| {}
+            Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
+            self.deleg = null;
+        }
+        for (&self.deleg_q) |*slot| {
+            if (slot.*) |l| self.gpa.free(l);
+            slot.* = null;
+        }
+    }
+
+    /// Combined byte size of the delegated tool's two sink files (the output-flood guard). 0 on stat errors.
+    fn delegSinkBytes(self: *Chat, p: *const DelegProc) u64 {
+        var ob: [352]u8 = undefined;
+        var eb: [352]u8 = undefined;
+        const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch return 0;
+        const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch return 0;
+        var total: u64 = 0;
+        if (Io.Dir.cwd().statFile(self.io, outp, .{})) |st| {
+            total += st.size;
+        } else |_| {}
+        if (Io.Dir.cwd().statFile(self.io, errp, .{})) |st| {
+            total += st.size;
+        } else |_| {}
+        return total;
+    }
+
+    /// Read up to buf.len bytes from the HEAD of a sink file — a tool result's meaning lives at the start
+    /// (readSink's tail-read is for killed console commands, where the newest output matters most).
+    fn readSinkHead(self: *Chat, path: []const u8, buf: []u8) []const u8 {
+        if (path.len == 0) return buf[0..0];
+        const f = Io.Dir.cwd().openFile(self.io, path, .{}) catch return buf[0..0];
+        defer f.close(self.io);
+        const n = f.readPositionalAll(self.io, buf, 0) catch return buf[0..0];
+        return buf[0..n];
+    }
+
+    /// POST {"id":..,"ack":true} — the cheap pickup/heartbeat signal the server's awaitClientResult counts to
+    /// tell "client working" from "client gone". Fire-and-forget: a dropped ack only shortens its patience.
+    fn postToolAck(self: *Chat, id: []const u8) void {
+        var convb: [96]u8 = undefined;
+        const conv = self.convScope(&convb);
+        if (conv.len == 0) return;
+        var bb: [400]u8 = undefined;
+        var w = Io.Writer.fixed(&bb);
+        const ok = blk: {
+            w.writeAll("{\"id\":\"") catch break :blk false;
+            wesc(&w, id);
+            w.writeAll("\",\"ack\":true}") catch break :blk false;
+            break :blk true;
+        };
+        if (!ok) return;
+        if (self.runner().chatToolResult(self.io, self.gpa, conv, w.buffered())) |resp| {
+            if (resp.body.len > 0) self.gpa.free(resp.body);
         }
     }
 
@@ -1824,6 +2074,7 @@ pub const Chat = struct {
             }
         }
         self.sc_serving = false; // no longer server-served → the local auto-loop may take over
+        self.delegCancel(); // the awaiting turn is gone — a still-running delegated tool must not keep working blind
         self.releaseServerCastDisplay("detached"); // finalize the row + clear status (the server turn that owned it is gone)
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
