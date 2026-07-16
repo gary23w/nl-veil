@@ -83,7 +83,11 @@ pub fn info(comptime fmt: []const u8, args: anytype) void {
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
     emit(.warn, fmt, args);
 }
+/// Diagnostic chatter (per-request http lines etc.) — gated with `trace`: ungated, these landed a line in
+/// the ring every few seconds forever, which kept the log flusher writing to the (OneDrive-synced) data
+/// dir around the clock — the surviving half of the idle-churn problem after trace itself went quiet.
 pub fn dbg(comptime fmt: []const u8, args: anytype) void {
+    if (!g_trace_on.load(.monotonic)) return;
     emit(.dbg, fmt, args);
 }
 pub fn err(comptime fmt: []const u8, args: anytype) void {

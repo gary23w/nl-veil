@@ -3364,6 +3364,8 @@ pub const Chat = struct {
         var speed = true;
         var server_chat = false;
         var dyslexia = false;
+        var font_scale: u8 = 100;
+        var font_bold = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -3385,6 +3387,8 @@ pub const Chat = struct {
             speed = s.speed_mode;
             server_chat = s.server_chat;
             dyslexia = s.dyslexia;
+            font_scale = s.font_scale;
+            font_bold = s.font_bold;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -3415,7 +3419,7 @@ pub const Chat = struct {
         // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
         // your environment" as the local option's advantage after delegation made that the SERVER path's
         // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3476,6 +3480,10 @@ pub const Chat = struct {
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
         s.dyslexia = std.mem.indexOf(u8, data, "\"dyslexia\":true") != null; // opt-in: absent = standard font
+        s.font_bold = std.mem.indexOf(u8, data, "\"font_bold\":true") != null;
+        if (jInt(data, "font_scale")) |v| {
+            if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
+        }
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
         // stays a thin client. The local engine survives only as a break-glass fallback when the server is

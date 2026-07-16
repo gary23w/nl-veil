@@ -309,15 +309,19 @@ fn scrubTransparentRgb(img: *rl.Image) void {
     }
 }
 
-/// Replace the proportional UI font at RUNTIME (the dyslexia-mode toggle), unloading the previous atlas
-/// so repeated toggles never leak GPU textures. Render thread only, like every font/texture call here.
-pub fn swapFont(f: rl.Font) void {
+/// Replace the proportional UI font at RUNTIME (dyslexia/weight toggles), unloading the previous atlas
+/// so repeated toggles never leak GPU textures. Recomputes the face's optical compensation. Render
+/// thread only, like every font/texture call here. Returns the compensation for logging.
+pub fn swapFont(f: rl.Font) f32 {
     if (ui_font) |old| rl.unloadFont(old);
     ui_font = f;
+    face_comp = computeFaceComp(f);
+    return face_comp;
 }
 
 pub fn setFont(f: rl.Font) void {
     log.trace("theme.setFont", .{});
+    face_comp = computeFaceComp(f);
     ui_font = f;
 }
 pub fn setMono(f: rl.Font) void {
@@ -360,26 +364,75 @@ fn theFont() rl.Font {
 fn theMono() rl.Font {
     return mono_font orelse theFont();
 }
+
+// ---- text scaling ---------------------------------------------------------------------------------------
+// Two multiplicative factors sit between every requested size and the pixels raylib draws:
+//   ui_scale  — the USER's text-size setting (Settings → text size; 0.9 … 1.25).
+//   face_comp — per-FACE optical-size compensation, computed from the loaded font's own cap height.
+//               Faces put wildly different glyph heights in the same em square (OpenDyslexic's 'H' is
+//               ~2/3 the height of Calibri's at the same px size — that is why dyslexia mode looked
+//               "too small and practically unreadable"). Normalizing every face to a common cap ratio
+//               makes a size setting MEAN the same thing regardless of the face in use.
+// The combined factor is capped so fixed-height chrome (fields, rows, buttons) can always contain its
+// text; reading surfaces that scale their own line heights (the chat) use uiScale() to follow along.
+
+var ui_scale: f32 = 1.0;
+var face_comp: f32 = 1.0;
+const CAP_TARGET: f32 = 0.64; // Calibri-ish cap-height/em — the app was designed against it
+const SCALE_MAX: f32 = 1.65;
+
+pub fn setUiScale(s: f32) void {
+    ui_scale = std.math.clamp(s, 0.8, 1.3);
+}
+
+/// The combined text factor (user setting × face compensation) — what scaled sizes actually multiply by.
+pub fn uiScale() f32 {
+    return @min(SCALE_MAX, ui_scale * face_comp);
+}
+
+/// Cap-height-based optical compensation for a freshly loaded UI face: measure the 'H' glyph's bitmap
+/// height against the load size and scale toward CAP_TARGET. Clamped — a degenerate atlas can't blow the
+/// layout up or shrink it away.
+fn computeFaceComp(f: rl.Font) f32 {
+    if (f.glyphCount <= 0 or f.baseSize <= 0) return 1.0;
+    const idx: usize = @intCast(std.math.clamp(rl.getGlyphIndex(f, 'H'), 0, f.glyphCount - 1));
+    const h = f.recs[idx].height;
+    if (h > 1) {
+        const ratio = h / @as(f32, @floatFromInt(f.baseSize));
+        return std.math.clamp(CAP_TARGET / ratio, 0.9, 1.45);
+    }
+    return 1.0;
+}
+
+fn scaledUi(size: i32) f32 {
+    return @round(@as(f32, @floatFromInt(size)) * uiScale());
+}
+fn scaledMono(size: i32) f32 {
+    return @round(@as(f32, @floatFromInt(size)) * @min(SCALE_MAX, ui_scale)); // user size only — the mono face is unchanged
+}
+
 // A real TTF carries its own advances, so extra tracking makes text look spaced-out. Keep it near zero
 // for the proportional font (the mono path uses its own fixed 0.5 in textMono).
-fn spacingFor(size: i32) f32 {
-    return @max(0.0, @as(f32, @floatFromInt(size)) / 64.0);
+fn spacingFor(size_px: f32) f32 {
+    return @max(0.0, size_px / 64.0);
 }
 
 pub fn text(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
-    rl.drawTextEx(theFont(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, @floatFromInt(size), spacingFor(size), c);
+    const px = scaledUi(size);
+    rl.drawTextEx(theFont(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, px, spacingFor(px), c);
 }
 
 pub fn measure(s: [:0]const u8, size: i32) i32 {
-    return @intFromFloat(rl.measureTextEx(theFont(), s, @floatFromInt(size), spacingFor(size)).x);
+    const px = scaledUi(size);
+    return @intFromFloat(rl.measureTextEx(theFont(), s, px, spacingFor(px)).x);
 }
 
 /// Monospace draw (log console) — fixed advances so aligned columns actually align.
 pub fn textMono(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
-    rl.drawTextEx(theMono(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, @floatFromInt(size), 0.5, c);
+    rl.drawTextEx(theMono(), s, .{ .x = @floatFromInt(x), .y = @floatFromInt(y) }, scaledMono(size), 0.5, c);
 }
 pub fn measureMono(s: [:0]const u8, size: i32) i32 {
-    return @intFromFloat(rl.measureTextEx(theMono(), s, @floatFromInt(size), 0.5).x);
+    return @intFromFloat(rl.measureTextEx(theMono(), s, scaledMono(size), 0.5).x);
 }
 /// Monospace clip helper for the console.
 pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {

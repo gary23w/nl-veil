@@ -1,4 +1,4 @@
-OpenDyslexic 3 (OpenDyslexic3-Regular.ttf)
+OpenDyslexic 3 (OpenDyslexic3-Regular.ttf, OpenDyslexic3-Bold.ttf)
 Copyright (c) 2012, Abelardo Gonzalez (http://abbiecod.es), with Reserved Font Name OpenDyslexic.
 Source: https://github.com/antijingoist/open-dyslexic (official author repository; project home: https://opendyslexic.org)
 
