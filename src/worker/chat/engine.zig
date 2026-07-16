@@ -348,6 +348,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         (std.fmt.allocPrint(gpa, "chat:{s}", .{conv}) catch return);
     defer gpa.free(mem_scope);
 
+    // FILE LEDGER (the fine-needle memory weave, ground-truth half): every landed file mutation — server-
+    // executed OR delegated to the client — is captured from the tool's own success result at the dispatch
+    // point, persisted to {conv_dir}/files.jsonl, and loaded back here at every turn start. The drive loop
+    // weaves it into each step, so "which files exist?" is answered by the ENGINE, not by the model burning
+    // steps on re-verification (or concluding "the write succeeded" from a failed read — observed live).
+    var file_ledger: FileLedger = .{};
+    defer file_ledger.deinit(gpa);
+    ledgerLoad(app, conv_dir, &file_ledger);
+
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
     const ctrl_cursor = controlLen(app, conv_dir);
 
@@ -380,6 +389,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_root}) catch return;
     defer gpa.free(workdir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+    // RESTART RESUME: an empty ledger over a non-empty workdir (client restart, pre-ledger conversation)
+    // seeds from a bounded disk survey — a "continue" turn then continues FROM the existing build instead
+    // of re-scaffolding it from zero (the observed restart bug in c6a594cb1).
+    ledgerBootstrap(app, workdir, &file_ledger);
     const db = std.fmt.allocPrint(gpa, "{s}/hive.sqlite", .{base}) catch return;
     defer gpa.free(db);
 
@@ -390,16 +403,25 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         .environ = environ,
         .run_dir = run_root,
         .workdir = workdir,
-        // a scheduled run's recall()/observe() tools work the TASK's own memory (the observe tool already
-        // dual-writes the hive, giving "task memory AND hive memory" for free); ordinary chat keeps the
-        // shared "chat" scope. DIRECTORY ISOLATION (strict): a scheduled run executes tools SERVER-side with
-        // roam=false (the ToolCtx default — only the client executor ever sets it), so every file tool is
-        // jailed to this run's builds/{conv}/work by safeRel, exactly like a chat. An unattended run can
-        // never write outside its own workdir.
-        .scope = if (sched_task != null) mem_scope else "chat",
+        // recall()/observe() tools work THIS conversation's own memory partition — the same scope the
+        // engine's turn-start recall reads and its tool-finding observes write. (They used to point at the
+        // shared "chat" scope for ordinary chats, which meant the model could NEVER recall what the engine
+        // had observed for this conversation, and vice versa — the two memory loops never met. recall_hive
+        // still covers the shared KNOWLEDGE/INTEL/SKILL scopes, and the observe tool still dual-writes the
+        // hive.) DIRECTORY ISOLATION (strict): a scheduled run executes tools SERVER-side with roam=false
+        // (the ToolCtx default — only the client executor ever sets it), so every file tool is jailed to
+        // this run's builds/{conv}/work by safeRel, exactly like a chat.
+        .scope = mem_scope,
         .mind = "chat",
         .round = 0,
-        .mem = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db),
+        .mem = blk_mem: {
+            var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
+            // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
+            // unweighted and a strengthen-reinforced fact from an unrelated project can outrank this
+            // conversation's own records on one shared generic stem.
+            m.trust = true;
+            break :blk_mem m;
+        },
         .files_written = &counters[0],
         .observed = &counters[1],
         .skills_saved = &counters[2],
@@ -428,7 +450,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     var recall_frag: std.ArrayListUnmanaged(u8) = .empty;
     defer recall_frag.deinit(gpa);
     {
-        const recalled = ctx.mem.recall(mem_scope, user_text);
+        // RESUME CUE: a continuation-shaped turn ("continue", the desk's auto-loop arm) carries no recall
+        // cue of its own — keyed on the literal word, recall surfaces nothing and the resumed turn starts
+        // unanchored (observed: a restart's "continue" re-scaffolded the whole build). Key it on the
+        // conversation's pinned GOAL instead: the memories of the actual work come back.
+        var goal_owned: ?[]u8 = null;
+        defer if (goal_owned) |g| gpa.free(g);
+        var recall_query: []const u8 = user_text;
+        if (continuationShaped(user_text)) {
+            goal_owned = firstUserGoal(app, conv_dir);
+            if (goal_owned) |g| recall_query = g;
+        }
+        const recalled = ctx.mem.recall(mem_scope, recall_query);
         defer gpa.free(recalled);
         if (recalled.len > 0) {
             scrubUtf8(recalled); // observed facts are already scrubbed, but a fetched-byte tail could slip in
@@ -463,6 +496,28 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + the recall fragment + a recency window of the newest turns.
     assembleHistory(app, conv_dir, user_text, &conv_buf, recall_frag.items);
+
+    // GROUND-TRUTH PREFIX (fine-needle weave, step 0): if previous turns already wrote files, say so up
+    // front as engine fact — loaded once per turn (turn-stable, so it lives cache-safe at the prefix tail).
+    // Without this, a "continue" turn re-discovers its own build with list_dir/read_file probes.
+    if (file_ledger.files.items.len > 0) {
+        var gt: std.ArrayListUnmanaged(u8) = .empty;
+        defer gt.deinit(gpa);
+        ledgerBlock(gpa, &file_ledger, &gt);
+        if (gt.items.len > 0) {
+            // Scratch-build then append in ONE shot: an OOM mid-append must skip the block cleanly, never
+            // strand a partial JSON object in conv_buf or abort the turn without its {done} frame.
+            var frag: std.ArrayListUnmanaged(u8) = .empty;
+            defer frag.deinit(gpa);
+            _ = blk_gt: {
+                frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :blk_gt false;
+                http.jstr(gpa, &frag, std.mem.trim(u8, gt.items, " \n")) catch break :blk_gt false;
+                frag.append(gpa, '}') catch break :blk_gt false;
+                conv_buf.appendSlice(gpa, frag.items) catch break :blk_gt false;
+                break :blk_gt true;
+            };
+        }
+    }
 
     // HIPPOCAMPUS (observe): the user's own turn is durable knowledge — store it so a later turn can recall it.
     // We NEVER observe the veil's assistant replies (only user turns + tool results); self-observing generated
@@ -566,6 +621,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // The successful reference run used 14 calls; 60 is generous headroom for real research.
     var tools_spent: usize = 0;
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
+    // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
+    // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
+    // stuck turn re-listed the same directory step after step while the context ballooned (observed live:
+    // 340k tokens in / 12k out on one chat turn that never progressed past exploration).
+    var echo_guard: [24]EchoRec = @splat(.{});
+    var call_ledger: std.ArrayListUnmanaged(u64) = .empty;
+    defer call_ledger.deinit(gpa);
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
         // CONTROL (between drive steps): a `stop` op ends the turn; a `steer`/`say` op injects the user's text as a
@@ -581,7 +643,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
         // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
-        compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len);
+        compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len, &ctx, &tool_obs);
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -596,8 +658,16 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&sb, "subtask {d}/{d} ({s}): {s}", .{ ti + 1, plan.len, plan[ti].route, clipBytes(plan[ti].text, 80) }) catch "subtask");
                 if (subtaskInstruction(gpa, plan[ti], ti, plan.len)) |instr| {
                     defer gpa.free(instr);
+                    // FINE-NEEDLE WEAVE: the subtask enters with the engine's ground truth + the facts this
+                    // conversation already observed about it — not a cold restatement of the task text.
+                    const weave = stepWeave(gpa, &ctx, &file_ledger, instr);
+                    defer if (weave.len > 0) gpa.free(weave);
+                    var stept: std.ArrayListUnmanaged(u8) = .empty;
+                    defer stept.deinit(gpa);
+                    stept.appendSlice(gpa, instr) catch break :outer;
+                    if (weave.len > 0) stept.appendSlice(gpa, weave) catch {};
                     conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-                    http.jstr(gpa, &conv_buf, instr) catch break :outer;
+                    http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
                     conv_buf.append(gpa, '}') catch break :outer;
                 }
             } else if (!afk) {
@@ -638,7 +708,34 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         }
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget);
+        const mut_before = file_ledger.mutations;
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger);
+        // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
+        // progress fact pairing the step's language with the engine-observed effect — the lexical thread
+        // that lets a later step's recall hop from "what am I doing" to "what already happened here".
+        // Mechanical composition (step text + ledger delta), batched via tool_obs like every other note.
+        if (file_ledger.mutations > mut_before and tool_obs.items.len < 200) {
+            const step_label: []const u8 = if (task_idx) |ti| plan[ti].text else if (prev_drive.len > 0) prev_drive else user_text;
+            var tail_buf: [220]u8 = undefined;
+            var tl: usize = 0;
+            const from = file_ledger.files.items.len -| 4;
+            for (file_ledger.files.items[from..]) |f| {
+                const add = std.fmt.bufPrint(tail_buf[tl..], "{s} ", .{f.path}) catch break;
+                tl += add.len;
+            }
+            if (std.fmt.allocPrint(gpa, "progress: step \"{s}\" landed {d} file change(s) — {s}", .{ clipBytes(step_label, 140), file_ledger.mutations - mut_before, tail_buf[0..tl] })) |note| {
+                tool_obs.append(gpa, note) catch gpa.free(note);
+            } else |_| {}
+            // MID-TURN FLUSH (thread the loom NOW): populate the conversation's neuron-db partition after a
+            // step that landed work (one batched spawn) so the NEXT step's weave recall can surface what
+            // this step just did and learned. Without it the partition stayed empty until turn exit and
+            // every step's conv recall abstained — the within-turn threads never existed.
+            if (tool_obs.items.len > 0) {
+                _ = ctx.mem.observeBatch(mem_scope, tool_obs.items);
+                for (tool_obs.items) |n2| gpa.free(n2);
+                tool_obs.clearRetainingCapacity();
+            }
+        }
         switch (inner.outcome) {
             .hard_error => {
                 // the inference failed — the helper emitted {kind:error}; ALSO emit {kind:done} so the desk
@@ -815,7 +912,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // stuck-recovery (afk re-grounds + researches on a repeat instead of churning).
         var next_step: []const u8 = trimmed;
         if (is_done) {
-            if (armed and ctx.files_written.* > 0 and !verified_done) {
+            // files_written counts only SERVER-executed writes; delegated client-mode writes register in the
+            // ledger (parsed from their result strings). Without the ledger arm, a desk-client build accepted
+            // a bare DONE with no verification nudge at all — the counter sat at 0 the whole turn.
+            if (armed and (ctx.files_written.* > 0 or file_ledger.mutations > 0) and !verified_done) {
                 verified_done = true; // TERMINAL BUILD-VERIFY (once): confirm the build before letting DONE stand
                 next_step = TERMINAL_VERIFY_PROMPT;
             } else if (armed) {
@@ -866,9 +966,21 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 break :outer; // off: a no-progress repeat ends the loop
             }
         }
-        conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-        http.jstr(gpa, &conv_buf, next_step) catch break :outer;
-        conv_buf.append(gpa, '}') catch break :outer;
+        // FINE-NEEDLE WEAVE: every synthetic drive step re-enters with the engine's file ledger + per-step
+        // recall from this conversation's neuron-db partition. This is what stops the observed churn class —
+        // the model re-listing directories and re-writing files it wrote two steps ago, because compaction
+        // folded the evidence and nothing re-surfaced it.
+        {
+            const weave = stepWeave(gpa, &ctx, &file_ledger, next_step);
+            defer if (weave.len > 0) gpa.free(weave);
+            var stept: std.ArrayListUnmanaged(u8) = .empty;
+            defer stept.deinit(gpa);
+            stept.appendSlice(gpa, next_step) catch break :outer;
+            if (weave.len > 0) stept.appendSlice(gpa, weave) catch {};
+            conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+            http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
+            conv_buf.append(gpa, '}') catch break :outer;
+        }
         var sbuf: [128]u8 = undefined;
         const status = std.fmt.bufPrint(&sbuf, "continuing: {s}", .{clipBytes(next_step, 80)}) catch "continuing";
         emitKV(app, conv_dir, "status", "text", status);
@@ -968,6 +1080,372 @@ fn dedupableTool(name: []const u8) bool {
     const list = [_][]const u8{ "web_search", "web_fetch", "fetch_json", "read_url", "osint_scan", "deep_crawl" };
     for (list) |n| if (std.mem.eql(u8, name, n)) return true;
     return false;
+}
+
+/// One tracked call signature for the turn-scoped tool-echo guard (the swarm loop's design, ported): sig =
+/// hash(name+args), res = hash of the last result, count = consecutive identical call+result repeats. Unlike
+/// the network ledger above this covers EVERY tool — a stateful tool whose result CHANGED resets its count,
+/// so legitimate re-reads after writes never trip it; only true echo loops (identical call, identical bytes,
+/// over and over) are warned and then refused.
+const EchoRec = struct { sig: u64 = 0, res: u64 = 0, count: u8 = 0 };
+
+// ------------------------------------------------------------------ file ledger (the fine-needle memory weave)
+
+/// One landed file mutation, engine-verified from the tool's own success result — the conversation's exact
+/// ground truth of what exists in the build workdir. Captured at the tool dispatch point (so DELEGATED
+/// client-mode writes register too), upserted by path, persisted per-conv as files.jsonl, observed into the
+/// conversation's neuron-db partition immediately, and woven into every drive step — so the model never has
+/// to "wonder" (or confabulate) what it already wrote.
+const LedgerFile = struct { path: []u8, bytes: u64 };
+const FileLedger = struct {
+    files: std.ArrayListUnmanaged(LedgerFile) = .empty,
+    mutations: u32 = 0, // landed mutations this TURN (incl. delegated) — the client-mode files_written stand-in
+    // The ledger KNOWS it may be missing entries (cap overflow, unreadable/oversized files.jsonl, an
+    // unparseable line). While set, the woven block must stop universally quantifying ("a file not in this
+    // list was never written") and say "may be incomplete" instead — a partial ledger that overclaims
+    // invites blind re-writes of good files, the exact damage it exists to prevent.
+    partial: bool = false,
+    // Entries came from a DISK SURVEY of the build workdir (restart resume — no files.jsonl existed yet),
+    // not from observed writes: the block words them as "already exist, continue FROM this state".
+    from_disk: bool = false,
+
+    fn deinit(self: *FileLedger, gpa: std.mem.Allocator) void {
+        for (self.files.items) |f| gpa.free(f.path);
+        self.files.deinit(gpa);
+    }
+    /// Upsert by path, separator-insensitively (Windows tools may report `src\\a.py` for the `src/a.py`
+    /// written earlier; both are one file). Stored paths are normalized to '/'. Bounded at 128 files —
+    /// overflow flips `partial` so the block downgrades its claim instead of lying by omission.
+    fn note(self: *FileLedger, gpa: std.mem.Allocator, path: []const u8, bytes: u64) void {
+        if (path.len == 0 or path.len > 300) return;
+        for (self.files.items) |*f| {
+            if (sameSep(f.path, path)) {
+                f.bytes = bytes;
+                return;
+            }
+        }
+        if (self.files.items.len >= 128) {
+            self.partial = true;
+            return;
+        }
+        const p = gpa.dupe(u8, path) catch return;
+        for (p) |*ch| {
+            if (ch.* == '\\') ch.* = '/';
+        }
+        self.files.append(gpa, .{ .path = p, .bytes = bytes }) catch gpa.free(p);
+    }
+    fn has(self: *const FileLedger, path: []const u8) ?u64 {
+        for (self.files.items) |f| {
+            if (sameSep(f.path, path)) return f.bytes;
+        }
+        return null;
+    }
+};
+
+/// Credential-shaped key anywhere in a small args clip — the observe cue is DROPPED rather than persisted
+/// into the memory store. Over-redaction ("count tokens" query) is the accepted cost; fail-safe direction.
+fn looksCredentialed(s: []const u8) bool {
+    var lb: [160]u8 = undefined;
+    if (s.len > lb.len) return true;
+    const lower = std.ascii.lowerString(lb[0..s.len], s);
+    const keys = [_][]const u8{ "authorization", "api_key", "api-key", "apikey", "token", "password", "passwd", "secret", "bearer", "credential" };
+    for (keys) |k| {
+        if (std.mem.indexOf(u8, lower, k) != null) return true;
+    }
+    return false;
+}
+
+/// Path equality where '\\' == '/' — the one normalization the ledger needs on Windows.
+fn sameSep(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        const xn: u8 = if (x == '\\') '/' else x;
+        const yn: u8 = if (y == '\\') '/' else y;
+        if (xn != yn) return false;
+    }
+    return true;
+}
+
+/// Parse a file-mutating tool's SUCCESS result into (path, bytes). These are the exact shapes tools.zig
+/// returns for write_file/edit_file — and DELEGATED client execution returns the identical strings (exec-tool
+/// runs the same code): "wrote {path} — file is now {N} bytes", "appended to {path} — …", "rewrote {path} — …",
+/// "edited {path} — {K} op(s) applied, file is now {N} bytes". Anything else (failures, guard notes, other
+/// tools) returns null. Pure — unit-tested.
+fn parseFileMutation(tool: []const u8, result: []const u8) ?struct { path: []const u8, bytes: u64 } {
+    if (!std.mem.eql(u8, tool, "write_file") and !std.mem.eql(u8, tool, "edit_file")) return null;
+    const prefixes = [_][]const u8{ "wrote ", "appended to ", "rewrote ", "edited " };
+    var rest: []const u8 = "";
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, result, p)) {
+            rest = result[p.len..];
+            break;
+        }
+    }
+    if (rest.len == 0) return null;
+    // The success shapes ALWAYS carry the "file is now {N} bytes" marker; failure strings never do —
+    // requiring it kills the failure-as-success mints (edit_file's "{path} does not exist … — use
+    // write_file…" starts with the raw model path, which can itself start with "edited "). Both scans run
+    // LAST-occurrence: a pathological path may contain " — " or even "file is now " — the true marker and
+    // separator are always the final ones (the tail after the real separator never repeats them).
+    const marker = std.mem.lastIndexOf(u8, rest, "file is now ") orelse return null;
+    const sep = std.mem.lastIndexOf(u8, rest[0..marker], " \xe2\x80\x94 ") orelse return null; // " — "
+    const path = rest[0..sep];
+    if (path.len == 0 or path.len > 300) return null;
+    var bytes: u64 = 0;
+    var i = marker + "file is now ".len;
+    while (i < rest.len and rest[i] >= '0' and rest[i] <= '9') : (i += 1)
+        bytes = bytes *| 10 +| (rest[i] - '0');
+    return .{ .path = path, .bytes = bytes };
+}
+
+/// The "path" argument of a tool call's args JSON (unescaped only for the plain case — an escaped path simply
+/// returns null and the caller stays quiet; fail-safe, never fail-wrong). Pure — unit-tested.
+fn argsPath(args: []const u8) ?[]const u8 {
+    const key = "\"path\":\"";
+    const s = std.mem.indexOf(u8, args, key) orelse return null;
+    const rest = args[s + key.len ..];
+    const e = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    const p = rest[0..e];
+    if (p.len == 0 or std.mem.indexOfScalar(u8, p, '\\') != null) return null;
+    return p;
+}
+
+/// Append one landed mutation to {conv_dir}/files.jsonl — the per-conv ledger file (same whole-line append
+/// idiom as messages.jsonl, so a concurrent reader never sees a partial object).
+fn ledgerPersist(app: *App, conv_dir: []const u8, tool: []const u8, path: []const u8, bytes: u64) void {
+    const gpa = app.gpa;
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(gpa);
+    line.appendSlice(gpa, "{\"path\":") catch return;
+    http.jstr(gpa, &line, path) catch return;
+    const mid = std.fmt.allocPrint(gpa, ",\"bytes\":{d},\"tool\":\"{s}\",\"ts\":{d}}}\n", .{ bytes, tool, nowSecs(app.io) }) catch return;
+    defer gpa.free(mid);
+    line.appendSlice(gpa, mid) catch return;
+    const fp = std.fmt.allocPrint(gpa, "{s}/files.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(fp);
+    http.appendFile(app.io, gpa, fp, line.items) catch {};
+}
+
+/// Load {conv_dir}/files.jsonl into the ledger (upsert per line — the newest entry for a path wins), giving
+/// the turn CROSS-TURN ground truth: a follow-up "continue" turn starts knowing every file already written.
+/// Only plain (backslash-free) paths are parsed — same fail-safe rule as argsPath.
+fn ledgerLoad(app: *App, conv_dir: []const u8, ledger: *FileLedger) void {
+    const gpa = app.gpa;
+    const fp = std.fmt.allocPrint(gpa, "{s}/files.jsonl", .{conv_dir}) catch return;
+    defer gpa.free(fp);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, fp, gpa, .limited(256 << 10)) catch |e| {
+        // .limited FAILS on an oversized file (it does not truncate) — an unreadable ledger is UNKNOWN
+        // state, not "no files": flag partial so the block never claims unlisted files were never written.
+        // A missing file is simply a fresh conversation.
+        if (e != error.FileNotFound) ledger.partial = true;
+        return;
+    };
+    defer gpa.free(data);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len == 0) continue;
+        const p = argsPath(t) orelse {
+            ledger.partial = true; // a line we could not parse (escaped path, corruption) — unknown entry
+            continue;
+        };
+        var bytes: u64 = 0;
+        if (std.mem.indexOf(u8, t, "\"bytes\":")) |bp| {
+            var i = bp + "\"bytes\":".len;
+            while (i < t.len and t[i] >= '0' and t[i] <= '9') : (i += 1)
+                bytes = bytes *| 10 +| (t[i] - '0');
+        }
+        ledger.note(gpa, p, bytes);
+    }
+    // COMPACTION: files.jsonl appends one line per landed write forever; past ~256KiB the .limited read
+    // above would start FAILING and the whole cross-turn ledger would silently vanish. Rewrite it as the
+    // upserted snapshot (bounded: <=128 entries) once it crosses half the cap — but only when the parse was
+    // COMPLETE (compacting a partial ledger would delete the very entries we failed to parse).
+    if (!ledger.partial and data.len > (128 << 10)) {
+        var snap: std.ArrayListUnmanaged(u8) = .empty;
+        defer snap.deinit(gpa);
+        var ok = true;
+        for (ledger.files.items) |f| {
+            snap.appendSlice(gpa, "{\"path\":") catch {
+                ok = false;
+                break;
+            };
+            http.jstr(gpa, &snap, f.path) catch {
+                ok = false;
+                break;
+            };
+            const tail = std.fmt.allocPrint(gpa, ",\"bytes\":{d},\"tool\":\"compact\",\"ts\":{d}}}\n", .{ f.bytes, nowSecs(app.io) }) catch {
+                ok = false;
+                break;
+            };
+            defer gpa.free(tail);
+            snap.appendSlice(gpa, tail) catch {
+                ok = false;
+                break;
+            };
+        }
+        if (ok) std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = fp, .data = snap.items }) catch {};
+    }
+}
+
+/// Render the ledger as ONE compact bracketed block (bounded ~1.4KB) — the GROUND TRUTH half of the per-step
+/// weave. Empty ledger renders nothing.
+fn ledgerBlock(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.ArrayListUnmanaged(u8)) void {
+    if (ledger.files.items.len == 0) return;
+    // A COMPLETE ledger may quantify universally; a partial one must not — overclaiming "never written"
+    // about a file that silently fell off the ledger invites a blind re-write over good work. Survey
+    // entries word the resume case: the work EXISTS, continue from it (the observed restart bug: a bare
+    // "continue" re-started the whole build from scratch).
+    out.appendSlice(gpa, if (ledger.partial and ledger.from_disk)
+        "\n\n[ENGINE GROUND TRUTH — the build workdir ALREADY CONTAINS these files (surveyed from disk; this conversation is RESUMING earlier work — do NOT start over or re-scaffold). The list may be INCOMPLETE — verify unlisted files with list_dir before assuming anything: "
+    else if (ledger.partial)
+        "\n\n[ENGINE GROUND TRUTH — these files were ALREADY WRITTEN in this conversation and exist in the build workdir. Do not re-write them blind and do not burn a step re-verifying them. This list may be INCOMPLETE — verify a file that is not listed with list_dir before assuming anything: "
+    else if (ledger.from_disk)
+        "\n\n[ENGINE GROUND TRUTH — the build workdir ALREADY CONTAINS these files (surveyed from disk; this conversation is RESUMING earlier work). Do NOT start over or re-scaffold: continue FROM this state — read what exists where needed and build the missing pieces: "
+    else
+        "\n\n[ENGINE GROUND TRUTH — these files were ALREADY WRITTEN in this conversation and exist in the build workdir. Do not re-write them blind and do not burn a step re-verifying them; a file NOT in this list was never successfully written: ") catch return;
+    var listed: usize = 0;
+    for (ledger.files.items) |f| {
+        if (out.items.len > 1400) break;
+        if (listed > 0) out.appendSlice(gpa, ", ") catch return;
+        out.appendSlice(gpa, f.path) catch return;
+        var bb: [32]u8 = undefined;
+        out.appendSlice(gpa, std.fmt.bufPrint(&bb, " ({d} B)", .{f.bytes}) catch "") catch return;
+        listed += 1;
+    }
+    if (listed < ledger.files.items.len) {
+        var mb: [40]u8 = undefined;
+        out.appendSlice(gpa, std.fmt.bufPrint(&mb, " … +{d} more", .{ledger.files.items.len - listed}) catch "") catch return;
+    }
+    out.append(gpa, ']') catch return;
+}
+
+/// The FINE-NEEDLE WEAVE for one drive step: engine ground truth (the file ledger) + per-step associative
+/// recall from the conversation's own neuron-db partition, appended to the synthetic step text — the model
+/// re-enters every step knowing what already exists on disk and what it already learned, instead of
+/// re-exploring, re-writing, or confabulating success. Returns gpa-owned text ("" = nothing to weave).
+fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLedger, step_text: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    ledgerBlock(gpa, ledger, &out);
+    // Per-step recall: the step text is the cue; the conversation's own observed facts (tool findings, file
+    // facts, user turns — including ones already compacted out of the context window) come back exactly when
+    // a step needs them. SATURATION spread — the activation wave follows every discriminative thread until
+    // it settles (neuron-db's frontier-drain convergence), not a fixed hop budget; k + decay + trust bound
+    // the output. One bounded subprocess per drive step; abstains quietly.
+    const rec = ctx.mem.assoc(ctx.scope, step_text, osc.Mem.SATURATE_HOPS, 6);
+    defer if (rec.len > 0) gpa.free(rec);
+    if (rec.len > 0) {
+        scrubUtf8(rec);
+        out.appendSlice(gpa, "\n[RELEVANT MEMORY (this conversation's own records): ") catch {};
+        out.appendSlice(gpa, clipBytes(rec, 700)) catch {};
+        out.append(gpa, ']') catch {};
+    } else {
+        // The conversation's own partition abstained — thread OUTWARD across the shared KNOWLEDGE hive
+        // (where the observe tool dual-writes and every swarm deposits findings), same saturation spread:
+        // a step with no conversation-local memory still inherits what the wider system already learned.
+        const hive = ctx.mem.assoc(tools.KNOWLEDGE_SCOPE, step_text, osc.Mem.SATURATE_HOPS, 4);
+        defer if (hive.len > 0) gpa.free(hive);
+        if (hive.len > 0) {
+            scrubUtf8(hive);
+            out.appendSlice(gpa, "\n[RELEVANT KNOWLEDGE (shared hive): ") catch {};
+            out.appendSlice(gpa, clipBytes(hive, 500)) catch {};
+            out.append(gpa, ']') catch {};
+        }
+    }
+    return out.toOwnedSlice(gpa) catch &[_]u8{};
+}
+
+/// A continuation-shaped user turn ("continue", "resume", the desk's auto-loop arm note) carries no recall
+/// cue of its own — the observed restart bug: recall keyed on the literal word "continue" surfaces nothing,
+/// the resumed turn starts unanchored, and the model re-scaffolds the build from zero.
+fn continuationShaped(text: []const u8) bool {
+    const t = std.mem.trim(u8, text, " \r\n\t");
+    if (t.len == 0) return true;
+    if (std.mem.startsWith(u8, t, "Auto-loop armed")) return true;
+    if (t.len > 80) return false;
+    var lb: [80]u8 = undefined;
+    const lower = std.ascii.lowerString(&lb, t);
+    const heads = [_][]const u8{ "continue", "go on", "keep going", "keep at it", "resume", "carry on", "proceed", "finish your task", "next" };
+    for (heads) |h| {
+        if (!std.mem.startsWith(u8, lower, h)) continue;
+        // word boundary: "nextjs setup" / "proceedings" must not read as continuations
+        if (lower.len > h.len and std.ascii.isAlphanumeric(lower[h.len])) continue;
+        return true;
+    }
+    return false;
+}
+
+/// The conversation's first user message (the pinned goal), parsed from messages.jsonl's head — the right
+/// recall cue for a continuation-shaped turn. Uses the same bounded head read as assembleHistory (a
+/// .limited readFileAlloc would FAIL outright on a long conversation's file). gpa-owned, or null.
+fn firstUserGoal(app: *App, conv_dir: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return null;
+    defer gpa.free(mpath);
+    const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return null;
+    defer gpa.free(head_buf);
+    const tail_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return null;
+    defer gpa.free(tail_buf);
+    const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return null;
+    var it = std.mem.splitScalar(u8, ht.head, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len == 0) continue;
+        const P = struct { role: []const u8 = "", content: []const u8 = "" };
+        const p = std.json.parseFromSlice(P, gpa, t, .{ .ignore_unknown_fields = true }) catch return null;
+        defer p.deinit();
+        if (std.mem.eql(u8, p.value.role, "user") and p.value.content.len > 0)
+            return gpa.dupe(u8, p.value.content) catch null;
+        return null; // first line is always the first user message by construction — anything else, abstain
+    }
+    return null;
+}
+
+/// RESTART RESUME (bootstrap): no files.jsonl entries, but the build workdir already holds files — a client
+/// restart or a conversation predating the ledger. Survey the tree (names + sizes only, bounded, dot/dep
+/// dirs skipped) so the resumed turn starts from "here is what exists" instead of re-scaffolding from zero.
+fn ledgerBootstrap(app: *App, workdir: []const u8, ledger: *FileLedger) void {
+    if (ledger.files.items.len > 0) return;
+    var n: usize = 0;
+    ledgerSurveyDir(app, workdir, "", 0, &n, ledger);
+    if (ledger.files.items.len > 0) ledger.from_disk = true;
+}
+
+fn ledgerSurveyDir(app: *App, abs_dir: []const u8, rel: []const u8, depth: usize, n: *usize, ledger: *FileLedger) void {
+    if (depth > 5) return;
+    var dir = std.Io.Dir.cwd().openDir(app.io, abs_dir, .{ .iterate = true }) catch return;
+    defer dir.close(app.io);
+    var it = dir.iterate();
+    while (it.next(app.io) catch null) |ent| {
+        if (n.* >= 128) {
+            ledger.partial = true; // the tree holds more than the survey — the block must not overclaim
+            return;
+        }
+        if (ent.name.len == 0 or ent.name[0] == '.') continue; // dot-entries incl. .git stay out
+        if (ent.kind == .directory and (std.mem.eql(u8, ent.name, "node_modules") or std.mem.eql(u8, ent.name, "__pycache__") or
+            std.mem.eql(u8, ent.name, "target") or std.mem.eql(u8, ent.name, "dist") or std.mem.eql(u8, ent.name, "zig-out"))) continue;
+        var ab: [1800]u8 = undefined;
+        const child_abs = std.fmt.bufPrint(&ab, "{s}/{s}", .{ abs_dir, ent.name }) catch continue;
+        var rb: [512]u8 = undefined;
+        const child_rel = (if (rel.len == 0)
+            std.fmt.bufPrint(&rb, "{s}", .{ent.name})
+        else
+            std.fmt.bufPrint(&rb, "{s}/{s}", .{ rel, ent.name })) catch continue;
+        switch (ent.kind) {
+            .directory => ledgerSurveyDir(app, child_abs, child_rel, depth + 1, n, ledger),
+            .file => {
+                const st = std.Io.Dir.cwd().statFile(app.io, child_abs, .{}) catch continue;
+                ledger.note(app.gpa, child_rel, st.size);
+                n.* += 1;
+            },
+            // OneDrive files-on-demand DEHYDRATED placeholders carry a reparse tag and classify as
+            // .sym_link — real workdir files the survey cannot see. Flag partial so the block never
+            // overclaims completeness over a cloud-dehydrated tree.
+            .sym_link => ledger.partial = true,
+            else => {},
+        }
+    }
 }
 
 /// The conv id of a LIVE turn whose id starts with `prefix`, copied into `out` — or null. Lets run-now refuse
@@ -1136,6 +1614,10 @@ fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
         // Composing a big tool call emits NO content/reasoning deltas — surface what's being written as a live
         // status line ("writing index.html — 12 KB...") so the user isn't staring at a silent turn. Not part of
         // the reply: don't set `streamed` (a call-only step must still fall back to emitting its reasoning once).
+        // FLUSH FIRST: a status frame must never interleave inside an unflushed delta run — the desk treats a
+        // delta that follows a non-delta frame as an inference boundary (its glue-seam heuristic) and would
+        // stitch a paragraph break into the middle of a healthy sentence.
+        streamFlush(sc);
         emitKV(sc.app, sc.conv_dir, "status", "text", text);
         return;
     }
@@ -1144,6 +1626,20 @@ fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
 }
 
 fn scAccum(sc: *StreamCtx, is_reason: bool, text: []const u8) void {
+    // CHANNEL-SWITCH FLUSH: emit the OTHER channel's buffered residue before accumulating this kind, so
+    // frames always land in true stream order. Without this, up to FLUSH_CHARS-1 bytes of thinking residue
+    // held since the reasoning→content switch were emitted AFTER the entire reply (a stale trailing
+    // "reasoning" frame) — which the desk's inference-seam heuristic read as a new inference and stitched a
+    // paragraph break into the middle of a healthy thought.
+    if (is_reason) {
+        if (sc.tok_len > 0) {
+            emitKV(sc.app, sc.conv_dir, "token", "delta", sc.tok[0..sc.tok_len]);
+            sc.tok_len = 0;
+        }
+    } else if (sc.rsn_len > 0) {
+        emitKV(sc.app, sc.conv_dir, "reasoning", "delta", sc.rsn[0..sc.rsn_len]);
+        sc.rsn_len = 0;
+    }
     const buf: []u8 = if (is_reason) &sc.rsn else &sc.tok;
     const len: *usize = if (is_reason) &sc.rsn_len else &sc.tok_len;
     const kind: []const u8 = if (is_reason) "reasoning" else "token";
@@ -2251,6 +2747,18 @@ fn runInnerAgentic(
     tool_client: bool,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
     tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
+    // REPEAT-CALL GUARDS, both TURN-scoped (owned by the drive loop — pass-local state forgot every repeat
+    // when the next drive step re-entered this function, so a stuck turn re-ran the same exploration step
+    // after step). `echo_guard` covers EVERY tool by (name,args)→result-hash: identical call + identical
+    // result repeatedly = a loop; a changed result resets the count, so re-reads after writes stay free.
+    // `call_ledger` is the stricter network set (see dedupableTool): a model in a research spiral re-issues
+    // the SAME network call over and over — observed live: 40+ duplicate web_search/web_fetch calls in one
+    // scheduled run. The result is already in context; a repeat is answered with a pointed refusal.
+    echo_guard: *[24]EchoRec,
+    call_ledger: *std.ArrayListUnmanaged(u64),
+    // FILE LEDGER (turn+conv-scoped, owned by runTurn): landed file mutations captured at this pass's
+    // dispatch point — the ground-truth half of the fine-needle memory weave.
+    file_ledger: *FileLedger,
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -2258,14 +2766,6 @@ fn runInnerAgentic(
     var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
     var any_tool = false; // did any tool run this pass? gates the drive loop's LOOP_QUESTION for pure-prose answers
-    // REPEAT-CALL GUARD: a model in a research spiral re-issues the SAME network call (identical name+args)
-    // over and over — observed live: a scheduled run burned 40+ near-duplicate web_search/web_fetch calls
-    // without ever settling to write its deliverable. The result is already in context; re-running buys
-    // nothing and costs minutes + tokens. Ledger every executed idempotent-network call's (name,args) hash;
-    // a repeat is answered with a pointed refusal that steers the model to USE what it has. Stateful tools
-    // (read_file, run_python, swarm_status, recall...) are exempt — their results legitimately change.
-    var call_ledger: std.ArrayListUnmanaged(u64) = .empty;
-    defer call_ledger.deinit(gpa);
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -2408,6 +2908,10 @@ fn runInnerAgentic(
         // and its tool results — providers 400 on that) and spliced in AFTER the batch, before the next inference.
         var pending_steer: std.ArrayListUnmanaged(u8) = .empty;
         defer pending_steer.deinit(gpa);
+        // GROUND-TRUTH CONFLICT note (anti-confabulation): built mid-batch, spliced AFTER the batch — a user
+        // turn may not sit between an assistant tool_calls turn and its results (same rule as pending_steer).
+        var post_note: std.ArrayListUnmanaged(u8) = .empty;
+        defer post_note.deinit(gpa);
         for (step.calls, 0..) |c, ci| {
             // COOPERATIVE CONTROL (between tool calls): a single inference can request many tools, each taking
             // seconds — checking only per-inference lets a Stop (or a steer) wait minutes. A stop aborts with the
@@ -2450,9 +2954,25 @@ fn runInnerAgentic(
                 }
                 if (!repeated) call_ledger.append(gpa, call_h) catch {};
             }
+            // TOOL-ECHO GUARD (see echo_guard above): identical call + identical RESULT repeatedly is a
+            // loop, not work. Read-class tools degrade later (6+) — a mind may legitimately need one more
+            // look — while everything else refuses at 4+, matching the swarm loop's thresholds.
+            var echo_slot: ?*EchoRec = null;
+            for (echo_guard) |*g| {
+                if (g.count > 0 and g.sig == call_h) {
+                    echo_slot = g;
+                    break;
+                }
+            }
+            const echo_read_class = std.mem.eql(u8, c.name, "read_file") or std.mem.eql(u8, c.name, "list_dir");
+            const echo_limit: u8 = if (echo_read_class) 6 else 3;
+            const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
+            if (echo_blocked) echo_slot.?.count +|= 1;
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
             const t_call = nowMillis(app.io);
-            const result = if (repeated)
+            var result = if (echo_blocked)
+                (gpa.dupe(u8, "(loop guard: you have made this EXACT call repeatedly and it returned the IDENTICAL result every time — it will not return anything different. Use the result you already have above, or take a DIFFERENT action: different arguments, a different tool, or write/settle your deliverable now.)") catch @constCast(""))
+            else if (repeated)
                 (gpa.dupe(u8, "(you already ran this EXACT call earlier this turn — its full result is above in this conversation. Do NOT re-run it: extract what you need from the earlier result and MOVE ON to the next step, e.g. writing the deliverable file.)") catch @constCast(""))
             else if (dedupableTool(c.name) and tools_spent.* >= tool_budget) blk_ob: {
                 // BUDGET CEILING (scheduled runs): the research appetite is unbounded but the wallet is not.
@@ -2489,6 +3009,38 @@ fn runInnerAgentic(
                 const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
                 tool_perf.record(c.name, ok, if (dt > 0) @intCast(dt) else 0);
             }
+            // TOOL-ECHO BOOKKEEPING: hash the result and track consecutive identical echoes; from the 2nd
+            // identical repeat the model gets an in-band warning appended to the result so it self-corrects
+            // with context (the refusal above only fires once the warnings were ignored).
+            if (executed) {
+                const rh = std.hash.Fnv1a_64.hash(result[0..@min(result.len, 4096)]);
+                if (echo_slot) |g| {
+                    if (g.res == rh) {
+                        g.count +|= 1;
+                        if (g.count >= 2 and result.len > 0) {
+                            const warned = std.fmt.allocPrint(gpa, "{s}\n(loop warning: this exact call has now returned the IDENTICAL result {d} times — do not repeat it; use what you already have, or change arguments/approach.)", .{ result, g.count }) catch result;
+                            if (warned.ptr != result.ptr) {
+                                gpa.free(result);
+                                result = warned;
+                            }
+                        }
+                    } else {
+                        g.res = rh; // same call, DIFFERENT result (state moved) — not a loop; restart the count
+                        g.count = 1;
+                    }
+                } else {
+                    // claim a slot for this new signature (evict the stalest = lowest count)
+                    var victim: *EchoRec = &echo_guard[0];
+                    for (echo_guard) |*g| {
+                        if (g.count == 0) {
+                            victim = g;
+                            break;
+                        }
+                        if (g.count < victim.count) victim = g;
+                    }
+                    victim.* = .{ .sig = call_h, .res = rh, .count = 1 };
+                }
+            }
             emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
@@ -2496,9 +3048,67 @@ fn runInnerAgentic(
             // QUEUED, not observed inline: each observe spawns a subprocess, which serialized big tool batches.
             // runTurn flushes the queue at turn exit (bounded — a runaway afk turn can't hoard notes forever).
             if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and tool_obs.items.len < 200) {
-                if (std.fmt.allocPrint(gpa, "tool {s}: {s}", .{ c.name, clipBytes(result, 200) })) |note| {
+                // CUE THREADING: the fact carries the call's ARGS head alongside the result — the query
+                // terms, the path, the URL. neuron-db is lexical-associative: a later step phrased like the
+                // ORIGINAL CUE can only hop to this finding if the cue's words live in the fact. Without
+                // them, "tool web_search: <results>" was unreachable from the question that asked for it.
+                // Exceptions: write/edit args are mostly file CONTENT (noise — the ledger threads paths) and
+                // host_command may carry credentials; a credential-shaped key anywhere in the clip drops the
+                // cue rather than persist it.
+                const args_cue: []const u8 = blk_ac: {
+                    if (std.mem.eql(u8, c.name, "write_file") or std.mem.eql(u8, c.name, "edit_file") or std.mem.eql(u8, c.name, "host_command")) break :blk_ac "";
+                    const head = clipBytes(c.args, 120);
+                    if (looksCredentialed(head)) break :blk_ac "(args redacted)";
+                    break :blk_ac head;
+                };
+                if (std.fmt.allocPrint(gpa, "tool {s} {s}: {s}", .{ c.name, args_cue, clipBytes(result, 200) })) |note| {
                     tool_obs.append(gpa, note) catch gpa.free(note);
                 } else |_| {}
+            }
+
+            // FILE LEDGER (fine-needle capture): a landed write/edit becomes engine ground truth NOW — in
+            // the ledger (woven into every subsequent drive step) and in files.jsonl (the next turn's
+            // load). Delegated client results carry the identical strings, so desk-client builds finally
+            // register their writes too. No inline neuron-db observe here: the generic tool-note queue
+            // above already carries "tool write_file: wrote {path} — …" (batched — an inline spawn per
+            // write would re-serialize big write batches), and WITHIN the turn the woven ledger block is
+            // the engine-exact source of file truth.
+            if (parseFileMutation(c.name, result)) |m| {
+                // Normalize separators BEFORE persisting: files.jsonl must hold '/'-paths so ledgerLoad's
+                // fail-safe (backslash ⇒ unparseable ⇒ partial) never triggers on our own lines.
+                var pbuf: [300]u8 = undefined;
+                @memcpy(pbuf[0..m.path.len], m.path);
+                for (pbuf[0..m.path.len]) |*ch| {
+                    if (ch.* == '\\') ch.* = '/';
+                }
+                const np = pbuf[0..m.path.len];
+                file_ledger.note(gpa, np, m.bytes);
+                file_ledger.mutations += 1;
+                ledgerPersist(app, conv_dir, c.name, np, m.bytes);
+            } else if (std.mem.eql(u8, c.name, "read_file") and std.mem.eql(u8, std.mem.trim(u8, result, " \r\n\t"), "not found")) {
+                // GROUND-TRUTH CONFLICT (anti-confabulation): the ledger says this file was WRITTEN, the
+                // read says NOT FOUND. Left unreconciled, the model has been observed concluding "the write
+                // succeeded" from exactly this evidence and settling. Contradict it mechanically, once per
+                // batch, with a concrete resolution path.
+                if (argsPath(c.args)) |rp| {
+                    if (file_ledger.has(rp)) |lb| {
+                        if (post_note.items.len == 0) {
+                            var nb2: [560]u8 = undefined;
+                            const cn = std.fmt.bufPrint(&nb2, "GROUND-TRUTH CONFLICT: the engine ledger recorded a successful write of {s} ({d} bytes) earlier in this conversation, but read_file just returned NOT FOUND. Resolve this mechanically: list the directory to locate the file; if it is truly missing, RE-WRITE it now. Do NOT conclude the work is done, and do NOT claim the file exists.", .{ clipBytes(rp, 260), lb }) catch "GROUND-TRUTH CONFLICT: a file the ledger recorded as written just read back NOT FOUND — locate or re-write it before settling.";
+                            var scratch: std.ArrayListUnmanaged(u8) = .empty;
+                            defer scratch.deinit(gpa);
+                            const note_ok = blk_pn: {
+                                scratch.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :blk_pn false;
+                                http.jstr(gpa, &scratch, cn) catch break :blk_pn false;
+                                scratch.append(gpa, '}') catch break :blk_pn false;
+                                post_note.appendSlice(gpa, scratch.items) catch break :blk_pn false;
+                                break :blk_pn true;
+                            };
+                            if (!note_ok) post_note.clearRetainingCapacity();
+                            emitKV(app, conv_dir, "status", "text", "ground-truth conflict: a ledgered file read back NOT FOUND — steering the model to reconcile");
+                        }
+                    }
+                }
             }
 
             // Build the whole tool-result object in a scratch list, then append it to conv_buf in ONE shot. A
@@ -2520,7 +3130,11 @@ fn runInnerAgentic(
         }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, base_url, key, model, conv_buf, base_len);
+        compactWorking(app, run_root, base_url, key, model, conv_buf, base_len, ctx, tool_obs);
+        // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
+        // (the user's live instruction stays last, i.e. most salient).
+        if (post_note.items.len > 0)
+            conv_buf.appendSlice(gpa, post_note.items) catch return .{ .outcome = .hard_error, .content = empty };
         // MID-BATCH STEER SPLICE — after compaction, so the literal user instruction can never be folded into a
         // summary note. The next completion sees: assistant tool_calls → results (real + skipped) → user steer.
         if (pending_steer.items.len > 0)
@@ -3173,11 +3787,120 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
 /// with a single compressed progress note so the loop can continue bounded. Called at a STEP BOUNDARY (after all of
 /// a step's tool results are appended), so the message sequence stays protocol-valid (no dangling tool_calls).
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
-fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize) void {
+fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8)) void {
     if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= cctx.WORKING_COMPACT_BYTES) return;
     const gpa = app.gpa;
+    // MEMORY-BEFORE-FORGETTING: the span about to be folded holds tool findings whose queued observes have
+    // not landed yet (the queue normally flushes at turn exit). Flush them NOW — one batched subprocess —
+    // so nothing leaves the context window without first landing in neuron-db, where the per-step weave's
+    // assoc recall can bring it back the moment a later step needs it. Without this, a compacted finding
+    // was unreachable for the REST OF THE TURN: gone from the window, not yet in memory.
+    if (tool_obs.items.len > 0) {
+        _ = ctx.mem.observeBatch(ctx.scope, tool_obs.items);
+        for (tool_obs.items) |note| gpa.free(note);
+        tool_obs.clearRetainingCapacity();
+    }
     const note = summarizeWorkingSpan(app, run_root, base_url, key, model, conv_buf.items[base_len..]) orelse return;
     defer gpa.free(note);
     conv_buf.shrinkRetainingCapacity(base_len);
     appendMsgObj(gpa, conv_buf, "assistant", note, cctx.SUMMARY_INJECT_CAP);
+}
+
+test "file ledger: mutation parsing, upsert, args-path extraction, and the woven ground-truth block" {
+    const gpa = std.testing.allocator;
+
+    // the exact success shapes tools.zig returns (identical when delegated to a client)
+    const w = parseFileMutation("write_file", "wrote lib/neurondb.ts \xe2\x80\x94 file is now 1117 bytes").?;
+    try std.testing.expectEqualStrings("lib/neurondb.ts", w.path);
+    try std.testing.expectEqual(@as(u64, 1117), w.bytes);
+    const e = parseFileMutation("edit_file", "edited app/layout.tsx \xe2\x80\x94 2 op(s) applied, file is now 528 bytes").?;
+    try std.testing.expectEqualStrings("app/layout.tsx", e.path);
+    try std.testing.expectEqual(@as(u64, 528), e.bytes);
+    const a = parseFileMutation("write_file", "appended to notes.md \xe2\x80\x94 file is now 90 bytes").?;
+    try std.testing.expectEqualStrings("notes.md", a.path);
+    // an em-dash IN the path: the separator is the LAST " — " before the marker (adversarial-audit find)
+    const d = parseFileMutation("write_file", "wrote a \xe2\x80\x94 b.txt \xe2\x80\x94 file is now 7 bytes").?;
+    try std.testing.expectEqualStrings("a \xe2\x80\x94 b.txt", d.path);
+    try std.testing.expectEqual(@as(u64, 7), d.bytes);
+    // failures and non-file tools never mint ledger entries — including edit_file's does-not-exist failure,
+    // whose result STARTS with a raw model path that can itself start with "edited " (audit find: the
+    // "file is now" marker requirement is what rejects it)
+    try std.testing.expect(parseFileMutation("write_file", "could not write file") == null);
+    try std.testing.expect(parseFileMutation("write_file", "bad path \xe2\x80\x94 stay inside the workdir") == null);
+    try std.testing.expect(parseFileMutation("edit_file", "edited notes.md does not exist (or is over 1MiB) \xe2\x80\x94 edit_file only changes an EXISTING file; use write_file to create a new one.") == null);
+    try std.testing.expect(parseFileMutation("web_fetch", "wrote nothing \xe2\x80\x94 file is now 5 bytes") == null);
+    try std.testing.expect(parseFileMutation("read_file", "not found") == null);
+
+    // args-path: plain path parses; escaped path abstains (fail-safe)
+    try std.testing.expectEqualStrings("lib/auth.ts", argsPath("{\"path\":\"lib/auth.ts\"}").?);
+    try std.testing.expect(argsPath("{\"path\":\"a\\b.ts\"}") == null);
+    try std.testing.expect(argsPath("{\"query\":\"no path here\"}") == null);
+
+    // ledger: upsert by path, exact lookup, bounded block rendering
+    var led: FileLedger = .{};
+    defer led.deinit(gpa);
+    led.note(gpa, "lib/neurondb.ts", 1117);
+    led.note(gpa, "app/layout.tsx", 419);
+    led.note(gpa, "app\\layout.tsx", 528); // Windows separators are the SAME file — upsert, not duplicate
+    try std.testing.expectEqual(@as(usize, 2), led.files.items.len);
+    try std.testing.expectEqual(@as(u64, 528), led.has("app/layout.tsx").?);
+    try std.testing.expectEqual(@as(u64, 528), led.has("app\\layout.tsx").?); // separator-insensitive lookup
+    try std.testing.expect(led.has("never-written.ts") == null);
+    try std.testing.expect(!led.partial);
+
+    var blk: std.ArrayListUnmanaged(u8) = .empty;
+    defer blk.deinit(gpa);
+    ledgerBlock(gpa, &led, &blk);
+    try std.testing.expect(std.mem.indexOf(u8, blk.items, "lib/neurondb.ts (1117 B)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blk.items, "app/layout.tsx (528 B)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blk.items, "ENGINE GROUND TRUTH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blk.items, "never successfully written") != null); // complete ⇒ may quantify
+
+    // a PARTIAL ledger must stop universally quantifying (audit find: overclaiming invites blind re-writes)
+    led.partial = true;
+    var blkp: std.ArrayListUnmanaged(u8) = .empty;
+    defer blkp.deinit(gpa);
+    ledgerBlock(gpa, &led, &blkp);
+    try std.testing.expect(std.mem.indexOf(u8, blkp.items, "never successfully written") == null);
+    try std.testing.expect(std.mem.indexOf(u8, blkp.items, "may be INCOMPLETE") != null);
+
+    // an empty ledger weaves nothing
+    var none: FileLedger = .{};
+    defer none.deinit(gpa);
+    var blk2: std.ArrayListUnmanaged(u8) = .empty;
+    defer blk2.deinit(gpa);
+    ledgerBlock(gpa, &none, &blk2);
+    try std.testing.expectEqual(@as(usize, 0), blk2.items.len);
+
+    // a disk-surveyed (restart-resume) ledger words the block as RESUME, not as observed writes
+    led.partial = false;
+    led.from_disk = true;
+    var blk3: std.ArrayListUnmanaged(u8) = .empty;
+    defer blk3.deinit(gpa);
+    ledgerBlock(gpa, &led, &blk3);
+    try std.testing.expect(std.mem.indexOf(u8, blk3.items, "RESUMING earlier work") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blk3.items, "Do NOT start over") != null);
+}
+
+test "continuation-shaped turns: resume phrasings match, real instructions do not" {
+    try std.testing.expect(continuationShaped("continue"));
+    try std.testing.expect(continuationShaped("  Continue.  "));
+    try std.testing.expect(continuationShaped("keep going"));
+    try std.testing.expect(continuationShaped("finish your task"));
+    try std.testing.expect(continuationShaped(""));
+    // the desk's auto-loop arm note is longer than the 80-byte gate — matched by its prefix
+    try std.testing.expect(continuationShaped("Auto-loop armed: continue driving toward the goal — pick up the plan (or the last goal) where it left off."));
+    try std.testing.expect(!continuationShaped("add a login page with NextAuth and bcrypt"));
+    try std.testing.expect(!continuationShaped("the feed pagination is broken — fix it, write tests for it, then redeploy the app to vercel"));
+    // word boundary: head words embedded in bigger words are NOT continuations
+    try std.testing.expect(!continuationShaped("nextjs app router setup"));
+    try std.testing.expect(!continuationShaped("proceedings review"));
+    try std.testing.expect(continuationShaped("next, wire the feed api"));
+}
+
+test "looksCredentialed: credential keys drop the cue; ordinary cues pass" {
+    try std.testing.expect(looksCredentialed("{\"url\":\"https://x.io\",\"headers\":{\"Authorization\":\"Bearer sk-\""));
+    try std.testing.expect(looksCredentialed("{\"cmd\":\"export API_KEY=abc\"}"));
+    try std.testing.expect(!looksCredentialed("{\"query\":\"neuron-db worker REST endpoints\"}"));
+    try std.testing.expect(!looksCredentialed("{\"path\":\"lib/feed.ts\"}"));
 }

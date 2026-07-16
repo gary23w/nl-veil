@@ -634,7 +634,9 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { query: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
-        const r = ctx.mem.assoc(ctx.scope, p.value.query, 3, 8);
+        // saturation spread: follow the associative threads until the activation wave settles (neuron-db
+        // breaks on frontier drain) — k + decay + trust bound the output, not a fixed hop budget
+        const r = ctx.mem.assoc(ctx.scope, p.value.query, Mem.SATURATE_HOPS, 8);
         if (r.len == 0) {
             gpa.free(r);
             return dupe(gpa, "(nothing recalled yet)");
@@ -1071,7 +1073,10 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const guard = "import os as _o\ntry:\n import webbrowser as _wb\n _wb.open=lambda *a,**k:False\nexcept Exception: pass\n_o.startfile=getattr(_o,'startfile',None) and (lambda *a,**k:None)\n";
     const src = std.fmt.allocPrint(gpa, "{s}{s}", .{ guard, p.value.code }) catch return dupe(gpa, "oom");
     defer gpa.free(src);
-    const script_name = std.fmt.allocPrint(gpa, ".tool-{s}.py", .{ctx.scope}) catch return dupe(gpa, "oom");
+    // slugified: per-conversation scopes carry ':' (chat:{conv} / sched:{tid}) — a raw ':' in the name
+    // makes NTFS write an invisible alternate data stream and non-NTFS workdirs fail the write outright
+    var scope_buf: [64]u8 = undefined;
+    const script_name = std.fmt.allocPrint(gpa, ".tool-{s}.py", .{slugify(&scope_buf, ctx.scope)}) catch return dupe(gpa, "oom");
     defer gpa.free(script_name);
     const script = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, script_name }) catch return dupe(gpa, "oom");
     defer gpa.free(script);
@@ -1161,7 +1166,9 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     const mcp_helper: []const u8 = if (broker_port != 0 and (ctx.roam or mcpEnabled(ctx))) MCP_HELPER_PY else "";
     const src = std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}", .{ guard, preamble, browser_helper, mcp_helper, body }) catch return dupe(gpa, "oom");
     defer gpa.free(src);
-    const script_name = std.fmt.allocPrint(gpa, ".authored-{s}-{s}.py", .{ ctx.scope, name }) catch return dupe(gpa, "oom");
+    // slugified scope: ':' in chat:{conv}/sched:{tid} scopes is an ADS/portability hazard in filenames
+    var scope_buf: [64]u8 = undefined;
+    const script_name = std.fmt.allocPrint(gpa, ".authored-{s}-{s}.py", .{ slugify(&scope_buf, ctx.scope), name }) catch return dupe(gpa, "oom");
     defer gpa.free(script_name);
     const script = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, script_name }) catch return dupe(gpa, "oom");
     defer gpa.free(script);

@@ -310,6 +310,16 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         try std.fmt.allocPrint(res.arena, "u{d}/_chat/work", .{uid});
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
 
+    // Per-CONVERSATION memory scope, matching the server drive loop's ToolCtx byte-for-byte: the engine's
+    // turn-start recall and tool-finding observes use "chat:{conv}", so the model-facing recall/observe
+    // tools must read/write the SAME partition — with the old shared "chat" scope the two memory loops
+    // never met (the model could not recall what the engine observed for this conversation, and vice
+    // versa). recall_hive still reads the fixed KNOWLEDGE/INTEL/SKILL scopes; a blank conv keeps "chat".
+    const mem_scope = if (conv.len > 0)
+        try std.fmt.allocPrint(res.arena, "chat:{s}", .{conv})
+    else
+        "chat";
+
     // The executor increments these; the chat surface ignores them (one shared sink is fine).
     var counters = [_]u32{0} ** 5;
     var ctx = tools.ToolCtx{
@@ -318,10 +328,14 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .environ = environ,
         .run_dir = run_root,
         .workdir = workdir,
-        .scope = "chat",
+        .scope = mem_scope,
         .mind = "chat",
         .round = 0,
-        .mem = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db),
+        .mem = blk_mem: {
+            var m = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
+            m.trust = true; // trust-weighted assoc ranking, matching the server drive loop's Mem
+            break :blk_mem m;
+        },
         .files_written = &counters[0],
         .observed = &counters[1],
         .skills_saved = &counters[2],

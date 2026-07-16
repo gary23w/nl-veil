@@ -299,6 +299,12 @@ pub const Mem = struct {
     environ: ?*const std.process.Environ.Map = null,
     trust: bool = false,
 
+    /// Spread-to-SATURATION hop count for assoc(): neuron-db's recall_spreading loops `0..hops` but breaks
+    /// the moment a hop lights no NEW episode (frontier drain), so a large count means "follow the threads
+    /// until the activation wave settles" — bounded by graph convergence, not by the counter. Result size
+    /// stays bounded by k; rank stays bounded by per-hop decay (0.5/df) and strength/trust weighting.
+    pub const SATURATE_HOPS: u32 = 1024;
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, bin: []const u8, db: []const u8) Mem {
         return .{ .gpa = gpa, .io = io, .bin = bin, .db = db };
     }

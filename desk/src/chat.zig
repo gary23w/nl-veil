@@ -662,6 +662,12 @@ pub const Chat = struct {
     arc_mutated: bool = false, // this arc performed a side-effecting action (shell launch / mutating tool) —
     //                            the trigger for the one bounded post-arc verification turn
     verify_done: bool = false, // the verification turn already ran for this arc (one per arc)
+    verify_pending: bool = false, // the verify turn is LIVE and its FIRST folded tool/console result is the
+    //                               verdict — checked MECHANICALLY in noteVerifyResult (a failed read-back
+    //                               re-arms verify_done and queues a corrective directive, so a "not found" /
+    //                               nonzero-exit check can never be accepted as done). Consumed at the first
+    //                               fold; cleared at any settle + with the arc flags so a stale verdict never
+    //                               grades an unrelated result.
     // WHOLE-ARC build debt (survives loop steps; arc_mutated/verify_done are per-step and reset in
     // loopContinue). The auto-loop can end via loop_infer emitting DONE right after a settle that ANNOUNCED
     // more work (or falsely claimed a write) — the per-step verify was skipped and the loop finished with
@@ -752,6 +758,12 @@ pub const Chat = struct {
     // right after any poll that consumed bytes, back off to SLOW after a few consecutive empties, snap back on data.
     sc_next_poll_ms: i64 = 0, //  earliest wall-clock ms for the next /events poll (0 = poll now)
     sc_empty_polls: u16 = 0, //   consecutive good polls that returned 0 new bytes (drives the back-off)
+    // SOFT SEAM between server inferences: only a tool/message/error/tool_request frame SEALS the live stream
+    // (scCommitText), but the server's mid-batch steer-skip emits just a {status} between two inferences — so
+    // inference N's content tail and inference N+1's head used to glue into one wall ("...fetch that.Let me
+    // inspect..."). Track the kind of the last rendered frame; a delta arriving right after a NON-delta frame
+    // starts a new streamed run, and scStreamAppend stitches "\n\n" first if the buffer would otherwise glue.
+    sc_prev_frame: enum { none, content, reason, other } = .none,
 
     pub fn run(self: *Chat) void {
         var dbuf: [512]u8 = undefined;
@@ -1428,17 +1440,29 @@ pub const Chat = struct {
     /// Append a streamed delta to the in-flight reply (is_reason=false) or reasoning (is_reason=true) buffer — the
     /// SAME buffers the local engine streams into, so main.zig renders them growing live (the reply "types out").
     /// Appends until full; a reply longer than the buffer caps the live preview, but the final {kind:message}
-    /// commits it whole. No-op after overflow.
-    fn scStreamAppend(self: *Chat, is_reason: bool, delta: []const u8) void {
+    /// commits it whole. No-op after overflow. `seam` = this delta starts a NEW streamed run (the previous frame
+    /// was not a delta of this kind): if the buffer already holds an unsealed tail that ends mid-word, stitch a
+    /// soft "\n\n" first so two inferences separated only by a {status} don't glue into one wall.
+    fn scStreamAppend(self: *Chat, is_reason: bool, delta: []const u8, seam: bool) void {
         self.store.lock();
         defer self.store.unlock();
         if (is_reason) {
-            const cur = self.store.stream_reason_len;
+            var cur = self.store.stream_reason_len;
+            if (seam and cur > 0 and !std.ascii.isWhitespace(self.store.stream_reason[cur - 1])) {
+                const sn = @min(2, self.store.stream_reason.len - cur);
+                @memcpy(self.store.stream_reason[cur..][0..sn], "\n\n"[0..sn]);
+                cur += sn;
+            }
             const n = @min(delta.len, self.store.stream_reason.len - cur);
             @memcpy(self.store.stream_reason[cur..][0..n], delta[0..n]);
             self.store.stream_reason_len = cur + n;
         } else {
-            const cur = self.store.stream_len;
+            var cur = self.store.stream_len;
+            if (seam and cur > 0 and !std.ascii.isWhitespace(self.store.stream_text[cur - 1])) {
+                const sn = @min(2, self.store.stream_text.len - cur);
+                @memcpy(self.store.stream_text[cur..][0..sn], "\n\n"[0..sn]);
+                cur += sn;
+            }
             const n = @min(delta.len, self.store.stream_text.len - cur);
             @memcpy(self.store.stream_text[cur..][0..n], delta[0..n]);
             self.store.stream_len = cur + n;
@@ -1490,6 +1514,11 @@ pub const Chat = struct {
         const line = std.mem.trim(u8, line_raw, " \r\n\t");
         if (line.len == 0) return;
         const kind = scRawField(line, "kind") orelse return; // no kind → not a frame we render
+        // Seam tracking: remember the kind of the PREVIOUS rendered frame before updating it for this one. A
+        // content/reasoning delta that follows anything else (a status-only steer-skip, a tool, ...) begins a
+        // NEW inference — scStreamAppend uses that to stitch a soft break into an unsealed live buffer.
+        const prev_frame = self.sc_prev_frame;
+        self.sc_prev_frame = if (std.mem.eql(u8, kind, "token")) .content else if (std.mem.eql(u8, kind, "reasoning")) .reason else .other;
         // STREAMED DELTAS: grow the live preview (types out). Robust to a non-streaming backend too, which sends
         // ONE reasoning delta (whole thinking) + then the message — the buffer just grows in one step.
         if (std.mem.eql(u8, kind, "token") or std.mem.eql(u8, kind, "reasoning")) {
@@ -1503,7 +1532,8 @@ pub const Chat = struct {
                 if (d.len > 0) {
                     const is_reason = std.mem.eql(u8, kind, "reasoning");
                     if (!is_reason) self.sc_chars += d.len; // content chars = out_chars proxy (reasoning excluded, as local does)
-                    self.scStreamAppend(is_reason, d);
+                    const seam = if (is_reason) prev_frame != .reason else prev_frame != .content;
+                    self.scStreamAppend(is_reason, d, seam);
                 }
             }
             return;
@@ -2333,10 +2363,45 @@ pub const Chat = struct {
         // a console command (e.g. a registration POST) is where the claim_url/verification_code first appears —
         // capture it durably before the ring evicts it
         self.captureOneTimeSecrets(dd, result);
+        self.noteVerifyResult(dd, result); // if this is the verify turn's check coming back, grade it mechanically
         var fb: [7168]u8 = undefined;
         const folded = std.fmt.bufPrint(&fb, "[console]\n$ {s}\n{s}", .{ cmd, result }) catch result;
         self.appendMsg(dd, .cast_note, folded);
         self.startTurn(dd, .tool_follow);
+    }
+
+    /// Mechanical failure shapes for a verification read-back: the check said the thing ISN'T there, or the
+    /// check command itself failed/never ran. Exit codes and whole-result shapes only — a bare substring
+    /// test graded HEALTHY verifies as failures (a read-back whose legitimate content merely contains the
+    /// phrase "not found", or a deletion arc whose correct proof IS an absence with a nonzero exit).
+    fn verifyReadbackFailed(result: []const u8) bool {
+        if (std.mem.indexOf(u8, result, "(exit code") != null) return true; // pumpConsole prints it ONLY for nonzero exits
+        if (std.mem.indexOf(u8, result, "(command timed out") != null) return true;
+        if (std.mem.indexOf(u8, result, "(failed to launch") != null) return true; // a check that never RAN is not a pass
+        // EXACT match: read_file's entire miss result is the literal "not found" — content that merely
+        // contains the phrase stays a pass.
+        const t = std.mem.trim(u8, result, " \r\n\t");
+        if (std.ascii.eqlIgnoreCase(t, "not found")) return true;
+        return false;
+    }
+
+    /// The verify turn's FIRST tool/console result just arrived (both fold doors call this before folding it
+    /// back). verify_done was optimistically set when the verify turn STARTED, but nothing ever checked what
+    /// the check returned — a "not found" read-back still let the next settle be accepted as done. If the
+    /// read-back mechanically failed, re-arm the verify gate (verify_done=false, so the arc must verify again
+    /// after the fix) and queue a corrective directive for the turn that reads this result. No-op unless a
+    /// verify verdict is actually pending; one verdict per verify turn.
+    fn noteVerifyResult(self: *Chat, dd: []const u8, result: []const u8) void {
+        if (!self.verify_pending) return;
+        self.verify_pending = false; // consumed — the FIRST result is the verdict
+        if (!verifyReadbackFailed(result)) return; // the check did not contradict the claim — verified stands
+        self.verify_done = false; // NOT verified — the gate fires again once the model settles on "done" after the fix
+        var db: [560]u8 = undefined;
+        const head = result[0..@min(result.len, 120)];
+        self.setDirective(std.fmt.bufPrint(&db, "VERIFICATION FAILED — the read-back did not confirm the claimed outcome (result: {s}). If that result contradicts the goal, the work is NOT done: fix the underlying issue (e.g. actually write the missing file), then verify again. If an ABSENCE was the expected outcome (e.g. verifying a deletion), state that explicitly and prove it differently (list the parent directory).", .{head}) catch
+            "VERIFICATION FAILED — the read-back did not confirm the claimed outcome. If that contradicts the goal, fix the underlying issue and verify again; if an absence was the expected outcome, prove it by listing the parent directory.");
+        self.appendMsgFull(dd, .cast_note, "(verification failed — the read-back contradicts the claimed outcome; continuing the fix)", false);
+        log.info("verify: the read-back FAILED mechanically — re-arming the verify gate", .{});
     }
 
     /// Poll the in-flight micro-console command each tick WITHOUT blocking. While it runs, do nothing; once it
@@ -5113,8 +5178,12 @@ pub const Chat = struct {
         // EXCEPT in afk: the user is away by definition, so the loop-infer driver answers on their behalf
         // rather than stranding the conversation on a question nobody is there to read.
         if (asks_user and !self.afkOn()) self.stopLoopQuiet();
+        // A verify turn that never dispatched its check (it settled straight to prose) leaves its verdict
+        // unconsumed — clear it here so a LATER unrelated tool result is never graded as the verification.
+        self.verify_pending = false;
         if (want_verify) {
             self.verify_done = true;
+            self.verify_pending = true; // the check's FIRST folded tool/console result is the verdict (noteVerifyResult)
             self.tool_iters += 1; // the verify turn spends from the arc's real budget
             // This settle WOULD have consolidated — the verify re-entry is machine-authored (internal_turn),
             // which suppresses shouldConsolidate for the rest of the arc, so carry the debt to the arc's
@@ -5571,6 +5640,7 @@ pub const Chat = struct {
         self.arc_built = false; // the whole-build debt belongs to ONE user goal — a new/switched/stopped arc clears it
         self.arc_final_verified = false;
         self.verify_done = false;
+        self.verify_pending = false; // an unconsumed verify verdict must not grade an unrelated arc's first result
         self.arc_fail_cmd_len = 0;
         self.arc_fail_note_len = 0;
         self.arc_fail_sig_len = 0; // a stale failure signature must not ride into an unrelated arc's lesson
@@ -6370,6 +6440,7 @@ pub const Chat = struct {
         }
         // Fold the result into the conversation as a labeled message the next turn reads (cast_note -> the
         // model sees it as user content; it's also the user-visible record that the tool ran).
+        self.noteVerifyResult(dd, result); // if this is the verify turn's check coming back, grade it mechanically
         var fb: [8320]u8 = undefined;
         const folded = std.fmt.bufPrint(&fb, "[tool:{s}]\n{s}", .{ name, result }) catch result;
         self.appendMsg(dd, .cast_note, folded);

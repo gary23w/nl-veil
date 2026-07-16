@@ -27,6 +27,7 @@ const agi = @import("agi.zig");
 const crawl = @import("crawl.zig");
 const writer = @import("writer.zig");
 const locs = @import("locs/atlas.zig");
+const cctx = @import("chat/context.zig");
 
 const log = std.log.scoped(.worker);
 
@@ -3914,6 +3915,47 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             const think = if (step.reasoning.len > 0) step.reasoning else reasoning;
             if (think.len > 0) w.act(mi.name, round, "thinking", "", clip(think, 1400));
         }
+        // MARKUP TOOL-CALL RECOVERY (the chat engine's rescue, wired into the swarm too): a local model
+        // sometimes emits its tool call as XML-ish markup in the CONTENT channel instead of a structured
+        // tool_calls entry. With no calls parsed, the reply falls through to the narrated-write salvage —
+        // and a page of narration + markup can be committed INTO a source file (the c6a5937fe corruption:
+        // a LEAD's read_file markup landed inside agents/page.tsx). Recover the call(s) so the tool
+        // actually executes and the markup never reaches the salvage path.
+        if (step.calls.len == 0 and cctx.looksLikeToolMarkup(step.content)) {
+            if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
+                var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
+                for (rec.calls) |rc| {
+                    const idc = gpa.dupe(u8, "") catch {
+                        gpa.free(rc.name);
+                        gpa.free(rc.args);
+                        continue;
+                    };
+                    built.append(gpa, .{ .id = idc, .name = rc.name, .args = rc.args }) catch {
+                        gpa.free(idc);
+                        gpa.free(rc.name);
+                        gpa.free(rc.args);
+                    };
+                }
+                gpa.free(rec.calls); // wrapper array only; name/args ownership moved into `built` (or freed above)
+                if (built.items.len == 0) {
+                    built.deinit(gpa);
+                    gpa.free(rec.stripped); // every append OOM-failed — leave the original content untouched
+                } else if (built.toOwnedSlice(gpa)) |owned| {
+                    gpa.free(step.content);
+                    step.content = rec.stripped; // narration with the markup block removed
+                    step.calls = owned; // adopted into the Step; freed by step.deinit
+                    w.act(mi.name, round, "tool_recover", "markup", "recovered tool call(s) the model emitted as content markup — executing them instead of salvaging the markup text");
+                } else |_| {
+                    for (built.items) |bc| {
+                        gpa.free(bc.id);
+                        gpa.free(bc.name);
+                        gpa.free(bc.args);
+                    }
+                    built.deinit(gpa);
+                    gpa.free(rec.stripped);
+                }
+            }
+        }
         if (step.calls.len == 0) {
             if (operate) {
                 if (recoverHostCall(gpa, step.content)) |rc| {
@@ -4021,11 +4063,18 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
             }
             var result: []u8 = undefined;
             var guard_blocked = false;
-            if (gslot != null and gslot.?.count >= 3) {
+            // Read-class tools are cheap, local, and idempotent — and a mind mid-edit legitimately re-reads
+            // its file to copy exact lines for a SEARCH/REPLACE block (an early hard refusal here stranded
+            // such an edit and the mind's apology prose got salvaged INTO the file — the c6a5937fe
+            // personas.ts corruption). They degrade at a higher threshold, and the refusal names the
+            // productive escape hatch instead of leaving the mind with nothing to emit.
+            const read_class = std.mem.eql(u8, c.name, "read_file") or std.mem.eql(u8, c.name, "list_dir");
+            const guard_limit: u8 = if (read_class) 6 else 3;
+            if (gslot != null and gslot.?.count >= guard_limit) {
                 gslot.?.count +|= 1;
                 guard_blocked = true;
-                w.act(mi.name, round, "loop_guard", c.name, "identical call repeated 4+ times with the identical result — refused without executing");
-                result = gpa.dupe(u8, "[loop guard] REFUSED: you have made this exact call at least 4 times and it returned the same thing every time. It will not return anything different. Use the result you already have, or take a DIFFERENT action — different arguments, a different tool, or write your deliverable now.") catch @constCast("");
+                w.act(mi.name, round, "loop_guard", c.name, "identical call repeated with the identical result — refused without executing");
+                result = gpa.dupe(u8, "[loop guard] REFUSED: you have made this exact call many times and it returned the same thing every time. It will not return anything different. Use the result you already have, or take a DIFFERENT action — different arguments, a different tool, or write your deliverable now. If you were re-reading a file to copy lines for a SEARCH/REPLACE edit, stop re-reading: reply with the file's relative path on its own line, then ONE fenced code block holding the COMPLETE corrected file.") catch @constCast("");
             } else {
                 result = tools.execute(&ctx, c.name, c.args);
                 if (retriableToolFail(c.name, result)) {
@@ -4312,7 +4361,11 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         if (salvage_slot.len > 0 and fileShapedToken(salvage_slot)) {
             var body = salvageFileBody(gpa, monologue);
             var salvage_cut = emissionLooksCut(monologue, emission_truncated);
-            var reject = salvageRejectReason(w, salvage_slot, body);
+            // fallback = the extractor found NO explicit signal (fence / write payload) and returned the
+            // whole trimmed reply — exact equality is the precise detector (every extraction is a strict
+            // subset of the trimmed monologue)
+            const from_fallback = std.mem.eql(u8, body, std.mem.trim(u8, monologue, " \r\n\t"));
+            var reject = salvageRejectReason(w, salvage_slot, body, from_fallback);
             if (reject) |why| {
                 had_reject = true;
                 noteReject(w, salvage_slot, why);
@@ -4373,7 +4426,8 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
                             w.act(mi.name, round, if (applied2) "salvage_retry" else "salvage_retry_reject", n2.path, clip(eres2, 220));
                         } else {
                             const body2 = salvageFileBody(gpa, rep.content);
-                            if (salvageRejectReason(w, salvage_slot, body2)) |why2| {
+                            const from_fallback2 = std.mem.eql(u8, body2, std.mem.trim(u8, rep.content, " \r\n\t"));
+                            if (salvageRejectReason(w, salvage_slot, body2, from_fallback2)) |why2| {
                                 if (body2.len > 0) gpa.free(@constCast(body2));
                                 noteReject(w, salvage_slot, why2);
                                 w.act(mi.name, round, "salvage_retry_reject", salvage_slot, why2);
@@ -4761,8 +4815,9 @@ fn slotFileMissing(w: *Worker, slot: []const u8) bool {
 /// Why a salvaged reply body must NOT be committed to the slot file (null = commit it). Factored out so the
 /// corrective retry judges the model's SECOND attempt with exactly the rules that rejected its first. The
 /// SEARCH/REPLACE check guards against parseNarratedSlot leftovers (malformed / zero-op blocks) — committing
-/// those markers as file contents would corrupt the file.
-fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?[]const u8 {
+/// those markers as file contents would corrupt the file. `from_fallback` = the body is the WHOLE trimmed
+/// reply (no fenced block / extracted payload existed) — a weak signal that may only CREATE, never replace.
+fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8, from_fallback: bool) ?[]const u8 {
     const gpa = w.gpa;
     if (bufedit.hasSearchReplace(body)) return "narrated edit markers, not a file body — put the file's path on its own line above the SEARCH block, or reply with the full file";
     if (body.len < 80) {
@@ -4781,11 +4836,6 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
     }
     if (salvageLeadConversational(body)) return "conversational lead-in (chatter, not a file body)";
     if (salvageHasToolFragment(body)) return "contains a raw tool-call fragment";
-    if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py")) switch (pySalvageCheck(w, body)) {
-        7 => return "fails py_compile (syntax error)",
-        8 => return "defines the same top-level name TWICE — the body glues two copies of the module together; emit ONE clean copy of the file",
-        else => {},
-    };
     const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch return null;
     defer gpa.free(full);
     const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch null;
@@ -4799,8 +4849,22 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8) ?
         } else |_| {}
     }
     const cur = std.mem.trim(u8, existing orelse "", " \r\n\t");
-    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !bufedit.editMarkerCorruption(cur) and !truncPending(w, salvage_slot))
-        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a marker-corrupted or KNOWN-TRUNCATED file is broken — any clean full body may replace it
+    // A marker-corrupted or KNOWN-TRUNCATED file is already broken — a clean replacement is convergence.
+    const file_broken = bufedit.editMarkerCorruption(cur) or truncPending(w, salvage_slot);
+    // WHOLE-REPLY FALLBACK MAY ONLY CREATE: a fenceless reply is never a deliberate rewrite — every
+    // deliberate emission carries a fence, an extracted write payload, or SEARCH/REPLACE blocks. Letting the
+    // fallback REPLACE an existing file is how an 18KB personas.ts became a 600-byte apology (c6a5937fe):
+    // the failure-implication escape below opened the no-clobber hatch and the prose walked through it.
+    // Applies in quick mode too — quick's rewrite-in-place convergence also always emits fenced bodies.
+    if (from_fallback and cur.len > 0 and !file_broken)
+        return "prose reply without a fenced block cannot REPLACE an existing file — emit SEARCH/REPLACE edits on its exact current lines, or ONE fenced code block holding the complete corrected file";
+    if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py")) switch (pySalvageCheck(w, body)) {
+        7 => return "fails py_compile (syntax error)",
+        8 => return "defines the same top-level name TWICE — the body glues two copies of the module together; emit ONE clean copy of the file",
+        else => {},
+    };
+    if (!w.quick and cur.len >= 40 and cur.len >= body.len and !slotImplicatedInFailure(w, salvage_slot) and !file_broken)
+        return "slot already holds a longer/equal file (no clobber)"; // edits may shrink/keep size; a broken file (markers/truncation) may be replaced by any clean full body
     return null;
 }
 
@@ -4979,22 +5043,29 @@ fn laneSlotOverride(w: *Worker, lane: []const u8, others_files: []const u8) []co
 }
 
 fn salvageLeadConversational(body: []const u8) bool {
+    // Judge the first THREE content lines, not just the first: models often lead with a bare path line
+    // (the narrated-write address) or a blank line before the chatter, and a single-line check let
+    // "src/x.ts\n\nI was unable to …" through as a "file body" (the c6a5937fe personas.ts corruption).
+    // A leading path-shaped token is skipped — it addresses the file; what FOLLOWS it is the content.
+    const bad = [_][]const u8{ "we'll", "we need", "we will", "we should", "i will", "i'll", "i was unable", "i cannot", "i can't", "unable to ", "let me", "sure", "here", "okay", "ok,", "title:", "list ", "include ", "ensure ", "at end", "first,", "next,", "step ", "now ", "this file", "this document", "below is", "below,", "as an ai", "as lead", "as the lead", "it looks like", "it seems ", "looking at ", "since i", "however," };
     var it = std.mem.splitScalar(u8, body, '\n');
-    var first: []const u8 = "";
+    var content_lines: u8 = 0;
+    var first = true;
     while (it.next()) |ln| {
         const t = std.mem.trim(u8, ln, " \r\t");
-        if (t.len > 0) {
-            first = t;
-            break;
+        if (t.len == 0) continue;
+        if (first) {
+            first = false;
+            if (fileShapedToken(t)) continue; // the narrated form's address line — judge what follows it
         }
+        const lead = clip(t, 48);
+        for (bad) |b| {
+            if (lead.len >= b.len and std.ascii.eqlIgnoreCase(lead[0..b.len], b)) return true;
+        }
+        content_lines += 1;
+        if (content_lines >= 3) return false;
     }
-    if (first.len == 0) return true;
-    const lead = clip(first, 48);
-    const bad = [_][]const u8{ "we'll", "we need", "we will", "i will", "i'll", "let me", "sure", "here", "okay", "ok,", "title:", "list ", "include ", "ensure ", "at end", "first,", "next,", "step ", "now ", "this file", "this document", "below is", "below,", "as an ai", "i cannot", "i can't" };
-    for (bad) |b| {
-        if (lead.len >= b.len and std.ascii.eqlIgnoreCase(lead[0..b.len], b)) return true;
-    }
-    return false;
+    return content_lines == 0; // nothing but blank/path lines — not a file body
 }
 
 fn salvageHasToolFragment(body: []const u8) bool {
@@ -5006,17 +5077,16 @@ fn salvageHasToolFragment(body: []const u8) bool {
         if (containsKeyValue(t, "name", "write_file")) return true;
         if (std.mem.indexOf(u8, t, "\"tool_call\":") != null) return true;
     }
-    // INVOCATION MARKUP of ANY dialect: a file body must never begin with tool-call syntax. JSON-only
-    // prefixes let a provider's native markup emitted as TEXT pass as a "valid file body" and get committed
-    // over real source files. General signals, no provider list:
-    const nl = std.mem.indexOfScalar(u8, t, '\n') orelse t.len;
-    const first_line = t[0..nl];
-    // an invoke/tool-call tag with a named parameter on the opening line (XML-ish, Hermes, or vendor forms)
-    if (std.mem.indexOf(u8, first_line, "invoke name=") != null) return true;
-    if (std.mem.indexOf(u8, first_line, "<tool_call") != null or std.mem.indexOf(u8, first_line, "tool_calls>") != null or std.mem.indexOf(u8, first_line, "<function_call") != null) return true;
-    // a special-token delimiter rune near the head (fullwidth bar U+FF5C, the "<|...|>" family rendered
-    // as text) — these appear only in provider control tokens, never in a real source/document body
-    if (std.mem.indexOf(u8, t[0..@min(t.len, 200)], "\xef\xbd\x9c") != null) return true;
+    // INVOCATION MARKUP of ANY dialect, ANYWHERE in the body: a file body must never carry tool-call
+    // invocation syntax. JSON-only prefixes let a provider's native markup emitted as TEXT pass as a
+    // "valid file body" and get committed over real source files — and a head-only scan missed markup
+    // that followed a page of narration (the c6a5937fe corruption: prose + path line + DSML markup
+    // committed into a .tsx). General signals, no provider list:
+    if (std.mem.indexOf(u8, t, "invoke name=") != null) return true;
+    if (std.mem.indexOf(u8, t, "<tool_call") != null or std.mem.indexOf(u8, t, "tool_calls>") != null or std.mem.indexOf(u8, t, "<function_call") != null) return true;
+    // a special-token delimiter rune (fullwidth bar U+FF5C, the "<|...|>" family rendered as text) —
+    // these appear only in provider control tokens, never in a real source/document body
+    if (std.mem.indexOf(u8, t, "\xef\xbd\x9c") != null) return true;
     return false;
 }
 
@@ -9350,6 +9420,25 @@ test "salvageHasToolFragment rejects a bare tool-call blob but keeps a real file
     try std.testing.expect(!salvageHasToolFragment(real_cfg));
 
     try std.testing.expect(!salvageHasToolFragment("   \n  "));
+}
+
+test "salvage gates catch the c6a5937fe corruption shapes: narration + path line + provider markup" {
+    // tool markup ANYWHERE in the body — not just on the first line — is invocation syntax, not a file
+    // (the real corrupted agents/page.tsx: ~600 bytes of LEAD narration, then a path line, then DSML markup)
+    const lead_reply = "All four frontend files already exist with complete implementations: `agents/page.tsx` (4637 bytes).\n" ++
+        "As LEAD, I'm assigning these refinements — let me improve it now.\n\n" ++
+        "ai-twitter/src/app/agents/page.tsx\n\n" ++
+        "<\xef\xbd\x9c\xef\xbd\x9cDSML\xef\xbd\x9c\xef\xbd\x9ctool_calls>\n<\xef\xbd\x9c\xef\xbd\x9cDSML\xef\xbd\x9c\xef\xbd\x9cinvoke name=\"read_file\">\n</invoke>";
+    try std.testing.expect(salvageHasToolFragment(lead_reply));
+
+    // a leading path line must not shield the narration that follows it from the conversational gate
+    // (the real corrupted personas.ts: path line, then a loop-guard apology committed over 18KB of code)
+    const apology = "src/lib/agents/personas.ts\n\nI was unable to read the content of this file (the read tool refused due to loop guarding), so I cannot produce a verbatim SEARCH block.";
+    try std.testing.expect(salvageLeadConversational(apology));
+
+    // real file bodies stay committable: code, and a doc that merely starts with a heading
+    try std.testing.expect(!salvageLeadConversational("import x from 'y'\nconst a = 1\nexport default a"));
+    try std.testing.expect(!salvageLeadConversational("# Setup\n\nInstall the dependencies, then run the dev server."));
 }
 
 test "salvageFileBody picks the LARGEST fenced block, skipping a small Note block" {
