@@ -2174,9 +2174,12 @@ fn runInnerAgentic(
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
     const base_len = conv_buf.items.len;
 
-    // The chat surface gets the web-browser driver tools only when the operator enabled NL_BROWSER_DRIVER;
-    // otherwise TURN_TOOLS unchanged (no prefill cost). The chat is admin on localhost, matching the ADMIN_TOOLS
-    // gate the /api/v1/chat/tool endpoint applies to the same names.
+    // Offer the browser (+ pixel) and MCP tools whenever a CLIENT (desk/CLI, tool_client) is attached to run
+    // them — that is the "client-side by default" model: the client's own machine can drive a browser and reach
+    // its installed MCP servers, so the chat should always know it has the capability (the client controls
+    // visibility via its browser-window setting). A server-side turn with no client (API/hive) still requires
+    // the operator env flag. Adds ~10 tool defs to a client turn's prefill; that is the price of the capability
+    // being available on demand.
     const turn_tools: []const u8 = blk: {
         const envon = struct {
             fn f(e: ?*const std.process.Environ.Map, name: []const u8) bool {
@@ -2185,8 +2188,8 @@ fn runInnerAgentic(
                 return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
             }
         }.f;
-        const browser_on = envon(app.sup.parent_env, "NL_BROWSER_DRIVER");
-        const mcp_on = envon(app.sup.parent_env, "NL_MCP");
+        const browser_on = tool_client or envon(app.sup.parent_env, "NL_BROWSER_DRIVER");
+        const mcp_on = tool_client or envon(app.sup.parent_env, "NL_MCP");
         if (!browser_on and !mcp_on) break :blk TURN_TOOLS;
         const b = if (browser_on) ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA else "";
         const m = if (mcp_on) ",\n" ++ tools.MCP_SCHEMA else "";
