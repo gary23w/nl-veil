@@ -3366,6 +3366,7 @@ pub const Chat = struct {
         var dyslexia = false;
         var font_scale: u8 = 100;
         var font_bold = false;
+        var narrator = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -3389,6 +3390,7 @@ pub const Chat = struct {
             dyslexia = s.dyslexia;
             font_scale = s.font_scale;
             font_bold = s.font_bold;
+            narrator = s.narrator;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -3419,7 +3421,7 @@ pub const Chat = struct {
         // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
         // your environment" as the local option's advantage after delegation made that the SERVER path's
         // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia, font_scale, font_bold, narrator }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3481,6 +3483,7 @@ pub const Chat = struct {
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
         s.dyslexia = std.mem.indexOf(u8, data, "\"dyslexia\":true") != null; // opt-in: absent = standard font
         s.font_bold = std.mem.indexOf(u8, data, "\"font_bold\":true") != null;
+        s.narrator = std.mem.indexOf(u8, data, "\"narrator\":true") != null;
         if (jInt(data, "font_scale")) |v| {
             if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
         }
@@ -3725,6 +3728,71 @@ pub const Chat = struct {
 
     /// Append to the ACTIVE conversation: into the Store (render copy, oldest evicted at cap) and rewrite
     /// its file (title + the retained messages — the file mirrors what the app can re-show).
+    /// Clean a reply for SPEECH: fenced code collapses to "(code on screen)", markdown chrome (#*_`>|)
+    /// drops, whitespace collapses, and the result caps at a listenable length with a spoken tail marker.
+    /// A narrated wall of markdown is noise; a sentence or three is an interface.
+    fn narrClean(out: *[store_mod.NARR_TEXT]u8, s: []const u8) []const u8 {
+        var w: usize = 0;
+        var in_fence = false;
+        var said_code = false;
+        var last_space = true;
+        var it = std.mem.splitScalar(u8, s, '\n');
+        outer: while (it.next()) |line| {
+            const tl = std.mem.trim(u8, line, " \r\t");
+            if (std.mem.startsWith(u8, tl, "```")) {
+                in_fence = !in_fence;
+                if (in_fence and !said_code) {
+                    const note = " (code on screen) ";
+                    if (w + note.len < out.len - 24) {
+                        @memcpy(out[w .. w + note.len], note);
+                        w += note.len;
+                        said_code = true;
+                        last_space = true;
+                    }
+                }
+                continue;
+            }
+            if (in_fence) continue;
+            for (tl) |c| {
+                if (w >= out.len - 24) break :outer;
+                const drop = c == '#' or c == '*' or c == '_' or c == '`' or c == '|' or c == '>';
+                if (drop) continue;
+                const sp = c == ' ' or c == '\t';
+                if (sp and last_space) continue;
+                out[w] = if (sp) ' ' else c;
+                last_space = sp;
+                w += 1;
+            }
+            if (w > 0 and !last_space and w < out.len - 24) {
+                out[w] = ' ';
+                w += 1;
+                last_space = true;
+            }
+        }
+        if (w >= out.len - 24) {
+            const tail = ". more on screen.";
+            @memcpy(out[w .. w + tail.len], tail);
+            w += tail.len;
+        }
+        return out[0..w];
+    }
+
+    test "narrClean: markdown becomes speakable — code elided once, chrome dropped, capped with a spoken tail" {
+        var b: [store_mod.NARR_TEXT]u8 = undefined;
+        const in1 = "## Done\n\nI **built** the `parser`.\n```zig\nconst x = 1;\nconst y = 2;\n```\nAll *tests* pass.";
+        const out1 = narrClean(&b, in1);
+        try std.testing.expect(std.mem.indexOf(u8, out1, "Done") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out1, "built the parser") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out1, "(code on screen)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out1, "const x") == null); // code bodies never spoken
+        try std.testing.expect(std.mem.indexOf(u8, out1, "#") == null and std.mem.indexOf(u8, out1, "*") == null);
+        // a wall of text caps at a listenable length and says so
+        const wall = "word " ** 200;
+        const out2 = narrClean(&b, wall);
+        try std.testing.expect(out2.len <= store_mod.NARR_TEXT);
+        try std.testing.expect(std.mem.endsWith(u8, out2, ". more on screen."));
+    }
+
     pub fn appendMsg(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8) void {
         self.appendMsgFull(dd, role, text, true);
     }
@@ -3732,6 +3800,13 @@ pub const Chat = struct {
     /// appendMsg with the hippocampus observe optional — a reflect DRAFT commits without observing (only the
     /// FINAL text should become a neuron; a superseded draft in recall would poison future prompts).
     fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool) void {
+        // NARRATOR: every committed reply is also an utterance — the audible transcript. Cleaned for
+        // speech (markdown stripped, code elided, capped) and queued; the poller speaks it via OS TTS.
+        // pushNarr no-ops unless the narrator setting is on, so this line costs nothing otherwise.
+        if (role == .veil) {
+            var nb: [store_mod.NARR_TEXT]u8 = undefined;
+            self.store.pushNarr(narrClean(&nb, text));
+        }
         var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         var idn: usize = 0;
         var evicted = false; // ring eviction shifted rows → the file must be fully rewritten, not appended

@@ -100,6 +100,11 @@ pub const Settings = struct {
     // draw-time scaling (no atlas rebuild); weight swaps to the face's Bold file like dyslexia swaps face.
     font_scale: u8 = 100,
     font_bold: bool = false,
+    // NARRATOR (default off): the app SPEAKS — replies and alerts are read aloud through the OS's own
+    // text-to-speech (Windows SAPI / macOS say / espeak), so visually impaired users can operate the app
+    // through the chat + their ears with ZERO audio code bundled in this client. Voice input rides the
+    // OS dictation layer (Win+H types into the focused input) for the same reason.
+    narrator: bool = false,
     // CHAT ENGINE: default LOCAL. Interactive chat runs IN THE DESK (in-process, no poll round-trip), so the
     // AI's tools execute in the client's environment on this machine — not the server's buried sandbox. When ON,
     // a send instead routes to the SERVER-side chat turn (POST /api/v1/chat/convs/:id/messages, rendered by
@@ -630,6 +635,12 @@ pub const Store = struct {
     notif_head: usize = 0,
     notif_count: usize = 0,
 
+    // --- narrator utterance queue (any thread pushes; the poller speaks via the OS TTS) ---
+    narr_q: [NARR_RING][NARR_TEXT]u8 = undefined,
+    narr_lens: [NARR_RING]u16 = [_]u16{0} ** NARR_RING,
+    narr_head: usize = 0,
+    narr_count: usize = 0,
+
     pub fn lock(s: *Store) void {
         s.mu.lock();
     }
@@ -733,8 +744,48 @@ pub const Store = struct {
             s.notifs[s.notif_head] = n;
             s.notif_head = (s.notif_head + 1) % NOTIF_RING;
         }
+        // narrator: every toast is also an utterance ("Task updated. news.") — the audible app surface
+        var nb: [NARR_TEXT]u8 = undefined;
+        const spoken = std.fmt.bufPrint(&nb, "{s}. {s}", .{ title, body }) catch title;
+        s.narrPushLocked(spoken);
+    }
+
+    /// Queue one narrator utterance (spoken by the poller through the OS TTS). Thread-safe; drops the
+    /// OLDEST when full — narration must track the present, not replay a backlog.
+    pub fn pushNarr(s: *Store, text: []const u8) void {
+        s.lock();
+        defer s.unlock();
+        s.narrPushLocked(text);
+    }
+
+    fn narrPushLocked(s: *Store, text: []const u8) void {
+        if (!s.settings.narrator or text.len == 0) return;
+        if (s.narr_count >= NARR_RING) { // full → drop the oldest
+            s.narr_head = (s.narr_head + 1) % NARR_RING;
+            s.narr_count -= 1;
+        }
+        const idx = (s.narr_head + s.narr_count) % NARR_RING;
+        const n = @min(text.len, NARR_TEXT);
+        @memcpy(s.narr_q[idx][0..n], text[0..n]);
+        s.narr_lens[idx] = @intCast(n);
+        s.narr_count += 1;
+    }
+
+    /// Pop the next utterance into `out`; 0 = queue empty.
+    pub fn popNarr(s: *Store, out: *[NARR_TEXT]u8) usize {
+        s.lock();
+        defer s.unlock();
+        if (s.narr_count == 0) return 0;
+        const n = s.narr_lens[s.narr_head];
+        @memcpy(out[0..n], s.narr_q[s.narr_head][0..n]);
+        s.narr_head = (s.narr_head + 1) % NARR_RING;
+        s.narr_count -= 1;
+        return n;
     }
 };
+
+pub const NARR_RING = 4; // pending utterances — small on purpose (see drop-oldest above)
+pub const NARR_TEXT = 440; // one utterance's byte cap (~30s of speech)
 
 pub fn mkCmd(kind: CmdKind, id: []const u8, text: []const u8) Command {
     log.trace("store.mkCmd kind={t} id={s} text_len={d}", .{ kind, id, text.len });
