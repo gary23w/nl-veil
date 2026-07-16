@@ -1555,6 +1555,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     if (wd_thread) |t| t.join();
 
     _ = w.scratch.reset(.retain_capacity);
+    // Close any headless browser this cast opened (Feature 2/1) so a daemonized browser is never orphaned on
+    // worker exit — sessions otherwise only close on browser_close / LRU eviction. No-op if none were opened.
+    @import("browser/manager.zig").closeAll(gpa, io);
     w.emit("stopped", std.fmt.allocPrint(w.a(), ",\"reason\":\"{s}\",\"rounds\":{d}", .{ stop_reason, round }) catch ",\"rounds\":0");
     writeDone(&w, stop_reason);
 }
@@ -3801,7 +3804,20 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     defer if (base_owned) gpa.free(@constCast(base_schema));
     const authored_defs = if (mi.scout or w.cap.lean_schema) (gpa.dupe(u8, "") catch @constCast("")) else buildAuthoredSchema(gpa, w.mem);
     defer gpa.free(authored_defs);
-    const live_schema = if (authored_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}", .{ base_schema, authored_defs }) catch base_schema) else base_schema;
+    // Web-browser driver tools (Feature 2) are injected only when the operator enabled NL_BROWSER_DRIVER, and
+    // only for full/operate tiers online (not the lean/scout research schemas) — they act on the live web.
+    const browser_on = blk: {
+        const v = environ.get("NL_BROWSER_DRIVER") orelse break :blk false;
+        break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+    };
+    const browser_defs: []const u8 = if (browser_on and w.internet and (gate.schema == .full or gate.schema == .operate)) ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA else "";
+    // MCP find-and-use tools: injected when NL_MCP is set (separate opt-in from the browser driver).
+    const mcp_on = blk: {
+        const v = environ.get("NL_MCP") orelse break :blk false;
+        break :blk v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+    };
+    const mcp_defs: []const u8 = if (mcp_on and (gate.schema == .full or gate.schema == .operate)) ",\n" ++ tools.MCP_SCHEMA else "";
+    const live_schema = if (authored_defs.len > 0 or browser_defs.len > 0 or mcp_defs.len > 0) (std.fmt.allocPrint(gpa, "{s}{s}{s}{s}", .{ base_schema, authored_defs, browser_defs, mcp_defs }) catch base_schema) else base_schema;
     defer if (live_schema.ptr != base_schema.ptr) gpa.free(@constCast(live_schema));
     var web_calls: u32 = 0;
     var fetched_url: []const u8 = "";

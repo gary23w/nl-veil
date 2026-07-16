@@ -2174,6 +2174,26 @@ fn runInnerAgentic(
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
     const base_len = conv_buf.items.len;
 
+    // The chat surface gets the web-browser driver tools only when the operator enabled NL_BROWSER_DRIVER;
+    // otherwise TURN_TOOLS unchanged (no prefill cost). The chat is admin on localhost, matching the ADMIN_TOOLS
+    // gate the /api/v1/chat/tool endpoint applies to the same names.
+    const turn_tools: []const u8 = blk: {
+        const envon = struct {
+            fn f(e: ?*const std.process.Environ.Map, name: []const u8) bool {
+                const m = e orelse return false;
+                const v = m.get(name) orelse return false;
+                return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+            }
+        }.f;
+        const browser_on = envon(app.sup.parent_env, "NL_BROWSER_DRIVER");
+        const mcp_on = envon(app.sup.parent_env, "NL_MCP");
+        if (!browser_on and !mcp_on) break :blk TURN_TOOLS;
+        const b = if (browser_on) ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA else "";
+        const m = if (mcp_on) ",\n" ++ tools.MCP_SCHEMA else "";
+        break :blk std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ TURN_TOOLS, b, m }) catch TURN_TOOLS;
+    };
+    defer if (turn_tools.ptr != TURN_TOOLS.ptr) gpa.free(@constCast(turn_tools));
+
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
         // COOPERATIVE CONTROL (before each inference): a stop aborts with whatever narration we have; a steer is
@@ -2189,7 +2209,7 @@ fn runInnerAgentic(
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, TURN_TOOLS, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
 

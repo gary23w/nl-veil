@@ -11,6 +11,41 @@ const commons = @import("commons.zig");
 const llm = @import("llm.zig");
 const rerank = @import("rerank.zig");
 const crawl = @import("crawl.zig");
+const browser_mgr = @import("browser/manager.zig");
+const browser_broker = @import("browser/broker.zig");
+const browser_host = @import("browser/host.zig");
+const mcp_discovery = @import("mcp/discovery.zig");
+const pixelrag = @import("pixelrag.zig");
+
+/// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
+/// params)` helper that POSTs to the loopback broker so an INVENTED tool can compose the browser primitives
+/// (navigate/read/click/type/eval/close). It reads the broker url + token + run_dir key from the child env
+/// (which runAuthored injects). `_o` is os (bound by the sandbox guard preamble).
+const BROWSER_HELPER_PY =
+    \\def browser(action,params=None):
+    \\ import json as _bj,urllib.request as _bu
+    \\ _d=_bj.dumps({"token":_o.environ.get("NL_BROWSER_BROKER_TOKEN",""),"key":_o.environ.get("NL_BROWSER_KEY",""),"action":action,"params":params or {}}).encode()
+    \\ _rq=_bu.Request(_o.environ.get("NL_BROWSER_BROKER",""),data=_d,headers={"Content-Type":"application/json"})
+    \\ return _bj.loads(_bu.urlopen(_rq,timeout=90).read().decode())
+    \\
+;
+
+/// Injected into an authored tool's body when NL_MCP is set: an `mcp(server,tool,args)` helper (and mcp_find())
+/// so an INVENTED tool can call the AI-ready MCP servers installed on the machine, via the same local broker as
+/// browser().
+const MCP_HELPER_PY =
+    \\def mcp(server,tool,args=None):
+    \\ import json as _pj,urllib.request as _pu
+    \\ _d=_pj.dumps({"token":_o.environ.get("NL_BROWSER_BROKER_TOKEN",""),"key":_o.environ.get("NL_BROWSER_KEY",""),"action":"mcp_call","params":{"server":server,"tool":tool,"args":args or {}}}).encode()
+    \\ _rq=_pu.Request(_o.environ.get("NL_BROWSER_BROKER",""),data=_d,headers={"Content-Type":"application/json"})
+    \\ return _pj.loads(_pu.urlopen(_rq,timeout=90).read().decode())
+    \\def mcp_find(server=None):
+    \\ import json as _pj,urllib.request as _pu
+    \\ _d=_pj.dumps({"token":_o.environ.get("NL_BROWSER_BROKER_TOKEN",""),"key":_o.environ.get("NL_BROWSER_KEY",""),"action":"mcp_discover","params":({"server":server} if server else {})}).encode()
+    \\ _rq=_pu.Request(_o.environ.get("NL_BROWSER_BROKER",""),data=_d,headers={"Content-Type":"application/json"})
+    \\ return _pj.loads(_pu.urlopen(_rq,timeout=90).read().decode())
+    \\
+;
 
 extern "kernel32" fn TerminateProcess(hProcess: *anyopaque, uExitCode: u32) callconv(.winapi) i32;
 extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
@@ -423,6 +458,36 @@ pub const ASK_VEIL_TOOL =
 /// itself). Joined with ",\n" so ask_veil is its OWN line for the newline-split tool droppers (offlineSchema etc.).
 pub const FULL_SCHEMA = SCHEMA ++ ",\n" ++ ASK_VEIL_TOOL;
 
+/// The web-browser driver tools (Feature 2 — RSI-driven Chromium control). NOT part of the static SCHEMA: they
+/// are injected into a mind's / the chat's tools array at runtime ONLY when NL_BROWSER_DRIVER is set (see
+/// run.zig / chat engine), so they never inflate the prefill on a build with the feature off. execute()
+/// dispatches any `browser_*` call regardless, returning a "disabled" note when the gate is unset. These act on
+/// the LIVE web, so they are classified admin-only on the chat surface (chat/tools.zig ADMIN_TOOLS) and gated by
+/// NL_BROWSER_ALLOWLIST. Comma-joined, no outer brackets, like SCHEMA. Each line is its own entry for the
+/// newline-split tool droppers.
+pub const BROWSER_SCHEMA =
+    \\{"type":"function","function":{"name":"browser_navigate","description":"Open (or reuse) a real web browser ON THE USER'S OWN MACHINE (a local browser, started on demand) and navigate it to a URL, then return the page's title and final URL. When information is hard to get by plain crawling — a login-walled dashboard, a JS-heavy SPA, an interactive page, data behind a form — say so and REACH FOR THIS instead of giving up: web_search/web_fetch/read_url/deep_crawl fetch static text, this drives the user's live browser. After navigating, call browser_read to see the page, then browser_click/browser_type to interact. Never enter passwords, card numbers, or other credentials, and do not click irreversible actions (pay/submit/delete) without explicit human approval.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"browser_read","description":"Read the current browser page: returns its title, a clipped text excerpt, and the list of interactive elements each tagged with a numeric ref (for browser_click / browser_type). Call this after navigate or after any click/type to see the new state.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"browser_click","description":"Click the interactive element identified by the ref number from a prior browser_read. Then call browser_read to see the result. Do not click irreversible controls (pay, place order, delete, confirm) without explicit human approval.","parameters":{"type":"object","properties":{"ref":{"type":"integer","description":"the element ref from browser_read"}},"required":["ref"]}}},
+    \\{"type":"function","function":{"name":"browser_type","description":"Type text into the input/textarea identified by the ref from a prior browser_read. Set submit=true to press Enter / submit the enclosing form afterwards (e.g. a search box). Never type passwords or other credentials.","parameters":{"type":"object","properties":{"ref":{"type":"integer"},"text":{"type":"string"},"submit":{"type":"boolean","description":"press Enter / submit the form after typing (default false)"}},"required":["ref","text"]}}},
+    \\{"type":"function","function":{"name":"browser_eval","description":"Evaluate a small read-only JavaScript expression in the current page and return its value (JSON). Use for inspection the structured read doesn't cover (a computed value, a specific element's text). Do NOT use it to submit forms or perform privileged actions.","parameters":{"type":"object","properties":{"js":{"type":"string"}},"required":["js"]}}},
+    \\{"type":"function","function":{"name":"browser_close","description":"Close the browser session when you are done with it, freeing the browser process.","parameters":{"type":"object","properties":{},"required":[]}}}
+;
+
+/// Pixel RAG tools (Feature 1 — screenshot-to-data retrieval). Injected at runtime alongside BROWSER_SCHEMA
+/// when NL_BROWSER_DRIVER is set (they render pages in the same browser). Comma-joined, no outer brackets.
+pub const PIXEL_SCHEMA =
+    \\{"type":"function","function":{"name":"pixel_ingest","description":"Ingest a web page as RENDERED screenshot tiles (not parsed HTML): the page is loaded in a real browser, tiled into images, and each tile's text is indexed for retrieval. Use it to make a visually complex page (dashboards, tables, charts, docs) searchable when plain text extraction would lose the layout. Returns the doc_id and tile count.","parameters":{"type":"object","properties":{"url":{"type":"string"},"doc_id":{"type":"string","description":"optional id for this document (auto-derived from the url if omitted)"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"pixel_search","description":"Search pages you previously pixel_ingested and return the best-matching screenshot tiles — each result has the tile's image path, a text excerpt, and a score. Call pixel_ingest on a page first.","parameters":{"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer","description":"max results (default 4)"}},"required":["query"]}}}
+;
+
+/// MCP tools (round 2): let RSI find + use the AI-ready MCP servers / runtimes installed on the user's machine.
+/// Injected at runtime only when NL_MCP is set. Comma-joined, no outer brackets.
+pub const MCP_SCHEMA =
+    \\{"type":"function","function":{"name":"mcp_discover","description":"Discover AI-ready capabilities installed on THIS machine: MCP servers declared in the local app configs (Claude Desktop, Cursor, VS Code) and local AI runtimes (Ollama, LM Studio). Call with no arguments to list every server + runtime; pass a server name to connect to it and list the tools it offers. Use this to find a local tool/app that can get information or perform an action plain web tools can't.","parameters":{"type":"object","properties":{"server":{"type":"string","description":"optional: a server name from a prior mcp_discover, to list ITS tools"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"mcp_call","description":"Call a tool on a locally-installed MCP server (discovered via mcp_discover). Give the server name, the tool name, and the tool's arguments object; returns the tool's result. Only use servers/tools the user already has installed and configured.","parameters":{"type":"object","properties":{"server":{"type":"string"},"tool":{"type":"string"},"args":{"type":"object","description":"the tool's arguments"}},"required":["server","tool"]}}}
+;
+
 /// The CHAT veil's tool set — the subset of SCHEMA a solo, top-level chat turn can actually reach. The full
 /// SCHEMA carries swarm-mind / host-sim / RSI-only verbs (patch_system, host_command/status, make_tool, share,
 /// probe, …) that a chat veil has no teammate bus, host, spatial grid, or governance loop to use; carrying them
@@ -535,6 +600,9 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "read_url")) return readUrl(ctx, args_json);
     if (std.mem.eql(u8, name, "osint_scan")) return osintScan(ctx, args_json);
     if (std.mem.eql(u8, name, "deep_crawl")) return deepCrawl(ctx, args_json);
+    if (std.mem.startsWith(u8, name, "browser_")) return browserDispatch(ctx, name, args_json);
+    if (std.mem.startsWith(u8, name, "pixel_")) return pixelDispatch(ctx, name, args_json);
+    if (std.mem.startsWith(u8, name, "mcp_")) return mcpDispatch(ctx, name, args_json);
     if (std.mem.eql(u8, name, "propose_change")) return proposeChange(ctx, args_json);
     if (std.mem.eql(u8, name, "simulate_change")) return simulateChange(ctx, args_json);
     if (std.mem.eql(u8, name, "observe")) {
@@ -857,6 +925,124 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name}) catch dupe(gpa, "unknown tool");
 }
 
+/// True when the web-browser driver is enabled for this process (operator opt-in). Off by default: the driver
+/// launches a real browser and acts on the live web, so it stays dark unless NL_BROWSER_DRIVER is set truthy.
+fn browserEnabled(ctx: *ToolCtx) bool {
+    const v = ctx.environ.get("NL_BROWSER_DRIVER") orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+}
+
+fn browserErr(gpa: std.mem.Allocator, e: anyerror) []u8 {
+    return std.fmt.allocPrint(gpa, "browser error: {s}", .{@errorName(e)}) catch dupe(gpa, "browser error");
+}
+
+/// Dispatch a `browser_*` tool through the process-global browser session manager (keyed by run_dir). Gated by
+/// NL_BROWSER_DRIVER (operator opt-in) and the offline flag; browser_navigate is additionally allowlist-gated.
+fn browserDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    if (!browserEnabled(ctx)) return dupe(gpa, "browser driver disabled — the operator must set NL_BROWSER_DRIVER=1 to enable web-browser control");
+    if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run; the browser driver is unavailable");
+    if (name.len <= "browser_".len) return dupe(gpa, "unknown browser tool");
+    const action = name["browser_".len..]; // navigate | read | click | type | eval | close
+
+    // browser_navigate: normalize the scheme and apply the allowlist BEFORE routing; other verbs pass args
+    // through unchanged (their JSON args already match the dispatcher's expected params).
+    if (std.mem.eql(u8, action, "navigate")) {
+        const A = struct { url: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        const raw = std.mem.trim(u8, p.value.url, " \r\n\t");
+        if (raw.len == 0) return dupe(gpa, "browser_navigate needs a url");
+        const url = if (std.mem.indexOf(u8, raw, "://") != null) (gpa.dupe(u8, raw) catch return dupe(gpa, "oom")) else (std.fmt.allocPrint(gpa, "https://{s}", .{raw}) catch return dupe(gpa, "oom"));
+        defer gpa.free(url);
+        const allow = ctx.environ.get("NL_BROWSER_ALLOWLIST") orelse "";
+        if (!egressAllowed(allow, url)) return std.fmt.allocPrint(gpa, "blocked: host '{s}' is not on NL_BROWSER_ALLOWLIST", .{urlHost(url)}) catch dupe(gpa, "blocked by allowlist");
+        const params = std.json.Stringify.valueAlloc(gpa, .{ .url = url }, .{}) catch return dupe(gpa, "oom");
+        defer gpa.free(params);
+        return browserOp(ctx, action, params);
+    }
+    if (std.mem.eql(u8, action, "read") or std.mem.eql(u8, action, "click") or std.mem.eql(u8, action, "type") or std.mem.eql(u8, action, "eval") or std.mem.eql(u8, action, "close")) {
+        return browserOp(ctx, action, args_json);
+    }
+    return std.fmt.allocPrint(gpa, "unknown browser tool: {s}", .{name}) catch dupe(gpa, "unknown browser tool");
+}
+
+/// The client-vs-server routing seam. A tool executing on the CLIENT (roam=true — a desk/CLI delegated call)
+/// forwards to the per-machine local-host daemon so ONE browser session survives the desk's subprocess-per-call
+/// pattern and drives the USER's browser. A server/swarm/CLI-direct call (roam=false) uses the in-process
+/// manager. Both funnel through the identical manager.dispatch action set.
+fn browserOp(ctx: *ToolCtx, action: []const u8, params_json: []const u8) []u8 {
+    const key = ctx.run_dir;
+    if (ctx.roam) return browser_host.forward(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
+    return browser_mgr.dispatch(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
+}
+
+/// Dispatch a `pixel_*` tool (Pixel RAG). Gated by NL_BROWSER_DRIVER (ingest renders in the browser) and the
+/// offline flag; pixel_ingest is allowlist-gated like browser_navigate.
+fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    if (!browserEnabled(ctx)) return dupe(gpa, "pixel rag disabled — the operator must set NL_BROWSER_DRIVER=1 (it renders pages in the browser)");
+    if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run; pixel rag is unavailable");
+
+    if (std.mem.eql(u8, name, "pixel_ingest")) {
+        const A = struct { url: []const u8 = "", doc_id: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        const rawu = std.mem.trim(u8, p.value.url, " \r\n\t");
+        if (rawu.len == 0) return dupe(gpa, "pixel_ingest needs a url");
+        const url = if (std.mem.indexOf(u8, rawu, "://") != null) (gpa.dupe(u8, rawu) catch return dupe(gpa, "oom")) else (std.fmt.allocPrint(gpa, "https://{s}", .{rawu}) catch return dupe(gpa, "oom"));
+        defer gpa.free(url);
+        const allow = ctx.environ.get("NL_BROWSER_ALLOWLIST") orelse "";
+        if (!egressAllowed(allow, url)) return std.fmt.allocPrint(gpa, "blocked: host '{s}' is not on NL_BROWSER_ALLOWLIST", .{urlHost(url)}) catch dupe(gpa, "blocked by allowlist");
+        // roam ⇒ render on the client's local-host daemon (persistent browser); else render in-process.
+        return pixelrag.ingest(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, url, p.value.doc_id, ctx.roam);
+    }
+    if (std.mem.eql(u8, name, "pixel_search")) {
+        const A = struct { query: []const u8 = "", k: u32 = 4 };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "pixel_search needs a query");
+        return pixelrag.search(gpa, ctx.io, ctx.run_dir, p.value.query, p.value.k);
+    }
+    return std.fmt.allocPrint(gpa, "unknown pixel tool: {s}", .{name}) catch dupe(gpa, "unknown pixel tool");
+}
+
+/// True when MCP discovery/use is enabled (operator opt-in). Off by default: mcp_call spawns local MCP server
+/// processes from the user's app configs.
+fn mcpEnabled(ctx: *ToolCtx) bool {
+    const v = ctx.environ.get("NL_MCP") orelse return false;
+    return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
+}
+
+/// Dispatch an `mcp_*` tool: find + use the AI-ready MCP servers installed on the machine. Self-contained
+/// (one-shot per call), so it runs correctly on the client (delegated) or server without a daemon.
+fn mcpDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    if (!mcpEnabled(ctx)) return dupe(gpa, "MCP disabled — the operator must set NL_MCP=1 to let the assistant find and use local MCP servers");
+
+    if (std.mem.eql(u8, name, "mcp_discover")) {
+        const A = struct { server: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        const srv = std.mem.trim(u8, p.value.server, " \r\n\t");
+        if (srv.len == 0) return mcp_discovery.discoverAll(gpa, ctx.io, ctx.environ);
+        return mcp_discovery.serverTools(gpa, ctx.io, ctx.environ, srv);
+    }
+    if (std.mem.eql(u8, name, "mcp_call")) {
+        const A = struct { server: []const u8 = "", tool: []const u8 = "", args: std.json.Value = .null };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        if (std.mem.trim(u8, p.value.server, " \r\n\t").len == 0 or std.mem.trim(u8, p.value.tool, " \r\n\t").len == 0) return dupe(gpa, "mcp_call needs a server and a tool");
+        const args_str = switch (p.value.args) {
+            .object => std.json.Stringify.valueAlloc(gpa, p.value.args, .{}) catch return dupe(gpa, "oom"),
+            else => gpa.dupe(u8, "{}") catch return dupe(gpa, "oom"),
+        };
+        defer gpa.free(args_str);
+        return mcp_discovery.callServer(gpa, ctx.io, ctx.environ, p.value.server, p.value.tool, args_str);
+    }
+    return std.fmt.allocPrint(gpa, "unknown mcp tool: {s}", .{name}) catch dupe(gpa, "unknown mcp tool");
+}
+
 /// Force Python children to UTF-8 IO. Windows Python defaults stdout/stderr to the ANSI codepage (cp1252),
 /// so the first non-ASCII char a script prints ('→', '·', any emoji) kills it with UnicodeEncodeError:
 /// 'charmap' — observed live when a build's own test runner printed an arrow. Harmless on POSIX and for
@@ -899,7 +1085,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "browser_navigate", "browser_read", "browser_click", "browser_type", "browser_eval", "browser_close", "pixel_ingest", "pixel_search", "mcp_discover", "mcp_call" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
@@ -937,7 +1123,31 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     const gpa = ctx.gpa;
     const guard = "import os as _o\ntry:\n import webbrowser as _wb\n _wb.open=lambda *a,**k:False\nexcept Exception: pass\n_o.startfile=getattr(_o,'startfile',None) and (lambda *a,**k:None)\n";
     const preamble = "import sys,json as _j\ntry: ARGS=_j.loads(sys.argv[1])\nexcept Exception: ARGS={}\n";
-    const src = std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ guard, preamble, body }) catch return dupe(gpa, "oom");
+    // Browser bridge (Feature 2): when the driver is enabled, start the loopback broker and expose a
+    // browser() helper to the authored body so an INVENTED tool can drive the SAME session the mind uses
+    // (keyed by run_dir). Off by default → the body runs byte-identically to before.
+    // Local-capability bridge: when the browser driver and/or MCP is enabled, bring up the local broker (the
+    // per-machine daemon on the CLIENT so an invented tool shares the mind's session; the in-process broker on
+    // server/swarm) and inject the matching helper(s) so an invented tool can drive the browser and/or call
+    // installed MCP servers. Off ⇒ the body runs byte-identically to before.
+    var broker_port: u16 = 0;
+    var broker_tok: []const u8 = "";
+    var tok_buf: [32]u8 = undefined;
+    if (browserEnabled(ctx) or mcpEnabled(ctx)) {
+        if (ctx.roam) {
+            if (browser_host.ensure(gpa, ctx.io, ctx.environ)) |info| {
+                broker_port = info.port;
+                @memcpy(&tok_buf, &info.token);
+                broker_tok = &tok_buf;
+            }
+        } else if (browser_broker.ensure(gpa, ctx.io, ctx.environ)) |info| {
+            broker_port = info.port;
+            broker_tok = info.token;
+        }
+    }
+    const browser_helper: []const u8 = if (broker_port != 0 and browserEnabled(ctx)) BROWSER_HELPER_PY else "";
+    const mcp_helper: []const u8 = if (broker_port != 0 and mcpEnabled(ctx)) MCP_HELPER_PY else "";
+    const src = std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}", .{ guard, preamble, browser_helper, mcp_helper, body }) catch return dupe(gpa, "oom");
     defer gpa.free(src);
     const script_name = std.fmt.allocPrint(gpa, ".authored-{s}-{s}.py", .{ ctx.scope, name }) catch return dupe(gpa, "oom");
     defer gpa.free(script_name);
@@ -948,6 +1158,12 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     forcePyUtf8(&env);
     defer env.deinit();
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+    if (broker_port != 0) {
+        var ub: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/", .{broker_port})) |url| env.put("NL_BROWSER_BROKER", url) catch {} else |_| {}
+        env.put("NL_BROWSER_BROKER_TOKEN", broker_tok) catch {};
+        env.put("NL_BROWSER_KEY", ctx.run_dir) catch {};
+    }
     const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", PYRUN, script_name, aj };

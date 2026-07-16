@@ -10,6 +10,7 @@ const cli = @import("../cli.zig");
 const tools = @import("../worker/tools.zig");
 const osc = @import("../worker/oscillation.zig");
 const cync = @import("../worker/chat/sync.zig");
+const mcp_client = @import("../worker/mcp/client.zig");
 
 const NEURON_EXE = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
 
@@ -47,6 +48,312 @@ pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: 
         .roam = true,
     };
     return tools.execute(&tctx, name, args_json);
+}
+
+/// Single-process exercise of the Feature 2 browser tools through tools.execute (dispatch + NL_BROWSER_DRIVER
+/// gate + the process-global session manager): browser_navigate → browser_read → browser_close in sequence, so
+/// the persistent session is proven to carry across separate tool calls (an exec-tool one-shot can't). Requires
+/// NL_BROWSER_DRIVER=1 in the process env. Rooted at a temp run_dir under `data` (the manager keys sessions by
+/// run_dir; its .browser-profile lives there).
+pub fn browserFlowSmoke(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, home: []const u8, data: []const u8, url: []const u8) void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout.interface;
+
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ home, NEURON_EXE }) catch "";
+    const run_dir = std.fmt.allocPrint(gpa, "{s}/browser-flow-smoke", .{data}) catch return;
+    defer gpa.free(run_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const db = std.fmt.allocPrint(gpa, "{s}/.flow-mem.sqlite", .{run_dir}) catch return;
+    defer gpa.free(db);
+
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .run_dir = run_dir,
+        .workdir = run_dir,
+        .scope = "flowsmoke",
+        .mind = "flowsmoke",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, neuron_bin, db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+    };
+
+    const nav_args = std.json.Stringify.valueAlloc(gpa, .{ .url = url }, .{}) catch return;
+    defer gpa.free(nav_args);
+    inline for (.{ .{ "browser_navigate", nav_args }, .{ "browser_read", "{}" }, .{ "browser_close", "{}" } }) |step| {
+        const r = tools.execute(&ctx, step[0], step[1]);
+        defer if (r.len > 0) gpa.free(r);
+        w.print("--- {s} ---\n{s}\n", .{ step[0], clip(r, 1200) }) catch {};
+        w.flush() catch {};
+    }
+}
+
+fn clip(s: []const u8, n: usize) []const u8 {
+    return if (s.len > n) s[0..n] else s;
+}
+
+/// The FULL RSI-invents-a-browser-tool path (Feature 2, task 3): register a browser-driven tool with make_tool
+/// (persisted to the swarm tool registry), then call it — its Python body drives the browser via the injected
+/// browser() helper → the loopback broker → the shared session. Proves invention + registration + the bridge,
+/// end to end, keyed by run_dir. Requires NL_BROWSER_DRIVER=1 and neuron.exe under {home}/bin.
+pub fn browserInventSmoke(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, home: []const u8, data: []const u8, url: []const u8) void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout.interface;
+
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ home, NEURON_EXE }) catch "";
+    const run_dir = std.fmt.allocPrint(gpa, "{s}/browser-invent-smoke", .{data}) catch return;
+    defer gpa.free(run_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const db = std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir}) catch return;
+    defer gpa.free(db);
+
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .run_dir = run_dir,
+        .workdir = run_dir,
+        .scope = "invent",
+        .mind = "invent",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, neuron_bin, db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+    };
+
+    // The authored tool's body — composes the browser primitives through the injected browser() helper.
+    const body =
+        \\u=ARGS.get("url","https://example.com")
+        \\browser("navigate",{"url":u})
+        \\d=browser("read")
+        \\browser("close")
+        \\print(_j.dumps({"ok":True,"title":d.get("title"),"count":d.get("count"),"head":(d.get("text") or "")[:80]}))
+    ;
+    const mk = .{
+        .name = "check_page",
+        .description = "navigate to a url and report its title + interactive-element count",
+        .params = .{ .type = "object", .properties = .{ .url = .{ .type = "string" } }, .required = .{"url"} },
+        .body = body,
+    };
+    const mk_json = std.json.Stringify.valueAlloc(gpa, mk, .{}) catch return;
+    defer gpa.free(mk_json);
+    const r1 = tools.execute(&ctx, "make_tool", mk_json);
+    defer if (r1.len > 0) gpa.free(r1);
+    w.print("--- make_tool check_page ---\n{s}\n", .{clip(r1, 400)}) catch {};
+    w.flush() catch {};
+
+    const call_args = std.json.Stringify.valueAlloc(gpa, .{ .url = url }, .{}) catch return;
+    defer gpa.free(call_args);
+    const r2 = tools.execute(&ctx, "check_page", call_args);
+    defer if (r2.len > 0) gpa.free(r2);
+    w.print("--- invoke check_page (invented, drives browser via broker) ---\n{s}\n", .{clip(r2, 1200)}) catch {};
+    w.flush() catch {};
+}
+
+/// RSI-invents-an-MCP-tool smoke (round 2, step 4): make_tool registers a tool whose body calls mcp() → the
+/// local broker → a discovered MCP server, then invoke it. Proves an invented tool can drive installed MCP
+/// servers. Requires NL_MCP=1 and (for the test) APPDATA pointing at a config with a `mock` server.
+pub fn mcpInventSmoke(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, home: []const u8, data: []const u8) void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout.interface;
+
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ home, NEURON_EXE }) catch "";
+    const run_dir = std.fmt.allocPrint(gpa, "{s}/mcp-invent-smoke", .{data}) catch return;
+    defer gpa.free(run_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const db = std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir}) catch return;
+    defer gpa.free(db);
+
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .run_dir = run_dir,
+        .workdir = run_dir,
+        .scope = "mcpinv",
+        .mind = "mcpinv",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, neuron_bin, db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+    };
+    const body =
+        \\r=mcp("mock","echo",{"text":ARGS.get("text","hi from an invented tool")})
+        \\print(_j.dumps({"ok":True,"echo":r}))
+    ;
+    const mk = .{
+        .name = "call_mock",
+        .description = "call the local 'mock' MCP server's echo tool",
+        .params = .{ .type = "object", .properties = .{ .text = .{ .type = "string" } } },
+        .body = body,
+    };
+    const mk_json = std.json.Stringify.valueAlloc(gpa, mk, .{}) catch return;
+    defer gpa.free(mk_json);
+    const r1 = tools.execute(&ctx, "make_tool", mk_json);
+    defer if (r1.len > 0) gpa.free(r1);
+    w.print("--- make_tool call_mock ---\n{s}\n", .{clip(r1, 300)}) catch {};
+    w.flush() catch {};
+
+    const r2 = tools.execute(&ctx, "call_mock", "{\"text\":\"round-two works\"}");
+    defer if (r2.len > 0) gpa.free(r2);
+    w.print("--- invoke call_mock (invented → mcp() → local MCP server) ---\n{s}\n", .{clip(r2, 800)}) catch {};
+    w.flush() catch {};
+}
+
+/// Pixel RAG Phase A smoke: pixel_ingest a url (render → tile → index) then pixel_search a query, through
+/// tools.execute. Requires NL_BROWSER_DRIVER=1. Prints both results + confirms tile PNGs were written.
+pub fn pixelSmoke(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, home: []const u8, data: []const u8, url: []const u8, query: []const u8) void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout.interface;
+
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ home, NEURON_EXE }) catch "";
+    const run_dir = std.fmt.allocPrint(gpa, "{s}/pixel-smoke", .{data}) catch return;
+    defer gpa.free(run_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const db = std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir}) catch return;
+    defer gpa.free(db);
+
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .run_dir = run_dir,
+        .workdir = run_dir,
+        .scope = "pixel",
+        .mind = "pixel",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, neuron_bin, db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+    };
+
+    const ing_args = std.json.Stringify.valueAlloc(gpa, .{ .url = url }, .{}) catch return;
+    defer gpa.free(ing_args);
+    const r1 = tools.execute(&ctx, "pixel_ingest", ing_args);
+    defer if (r1.len > 0) gpa.free(r1);
+    w.print("--- pixel_ingest ---\n{s}\n", .{clip(r1, 600)}) catch {};
+    w.flush() catch {};
+
+    const q_args = std.json.Stringify.valueAlloc(gpa, .{ .query = query, .k = 3 }, .{}) catch return;
+    defer gpa.free(q_args);
+    const r2 = tools.execute(&ctx, "pixel_search", q_args);
+    defer if (r2.len > 0) gpa.free(r2);
+    w.print("--- pixel_search \"{s}\" ---\n{s}\n", .{ query, clip(r2, 1600) }) catch {};
+    w.flush() catch {};
+}
+
+const MOCK_MCP_PY =
+    \\import sys, json
+    \\def send(o): sys.stdout.write(json.dumps(o)+"\n"); sys.stdout.flush()
+    \\for line in sys.stdin:
+    \\    line=line.strip()
+    \\    if not line: continue
+    \\    try: msg=json.loads(line)
+    \\    except: continue
+    \\    mid=msg.get("id"); method=msg.get("method")
+    \\    if method=="initialize":
+    \\        send({"jsonrpc":"2.0","id":mid,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"1.0"}}})
+    \\    elif method=="tools/list":
+    \\        send({"jsonrpc":"2.0","id":mid,"result":{"tools":[{"name":"echo","description":"echo back text","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}})
+    \\    elif method=="tools/call":
+    \\        args=(msg.get("params") or {}).get("arguments") or {}
+    \\        send({"jsonrpc":"2.0","id":mid,"result":{"content":[{"type":"text","text":"echo: "+str(args.get("text",""))}]}})
+    \\    elif mid is not None:
+    \\        send({"jsonrpc":"2.0","id":mid,"result":{}})
+;
+
+/// MCP layer smoke: (a) mcp_discover through tools.execute (scans the machine's real MCP configs + probes local
+/// AI ports); (b) the MCP stdio client against a mock server (initialize → tools/list → tools/call). Requires
+/// NL_MCP=1 for part (a).
+pub fn mcpSmoke(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, home: []const u8, data: []const u8) void {
+    var out_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout.interface;
+
+    var nb: [700]u8 = undefined;
+    const neuron_bin = std.fmt.bufPrint(&nb, "{s}/bin/{s}", .{ home, NEURON_EXE }) catch "";
+    const run_dir = std.fmt.allocPrint(gpa, "{s}/mcp-smoke", .{data}) catch return;
+    defer gpa.free(run_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const db = std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir}) catch return;
+    defer gpa.free(db);
+
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = environ,
+        .run_dir = run_dir,
+        .workdir = run_dir,
+        .scope = "mcp",
+        .mind = "mcp",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, neuron_bin, db),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .internet = true,
+        .fmtx = &fmtx,
+    };
+    const disc = tools.execute(&ctx, "mcp_discover", "{}");
+    defer if (disc.len > 0) gpa.free(disc);
+    w.print("--- mcp_discover (scan configs + probe ports) ---\n{s}\n", .{clip(disc, 1400)}) catch {};
+    w.flush() catch {};
+
+    // Mock stdio MCP server for the client protocol test.
+    const mock = std.fmt.allocPrint(gpa, "{s}/mcp-mock.py", .{run_dir}) catch return;
+    defer gpa.free(mock);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mock, .data = MOCK_MCP_PY }) catch {};
+    const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const srv = mcp_client.Server{ .command = py, .args = &.{mock} };
+    const tl = mcp_client.listStdio(gpa, io, environ, srv, 30);
+    defer if (tl.len > 0) gpa.free(tl);
+    w.print("--- mcp client: tools/list (mock) ---\n{s}\n", .{clip(tl, 800)}) catch {};
+    const cr = mcp_client.callStdio(gpa, io, environ, srv, "echo", "{\"text\":\"hello mcp\"}");
+    defer if (cr.len > 0) gpa.free(cr);
+    w.print("--- mcp client: tools/call echo (mock) ---\n{s}\n", .{clip(cr, 800)}) catch {};
+    w.flush() catch {};
 }
 
 /// `veil exec-tool <name> [--workdir DIR] [--args-file PATH]` — args JSON from PATH (or stdin), result on
