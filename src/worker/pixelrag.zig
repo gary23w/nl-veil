@@ -104,10 +104,11 @@ fn indexOne(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, mem: Mem, d
 const RTile = struct { index: u32 = 0, y: i64 = 0, png: []const u8 = "", text: []const u8 = "" };
 const RTResp = struct { ok: bool = false, tiles: []const RTile = &.{} };
 
-/// Render `url` and index its tiles. On the CLIENT (`roam`), the render is done by the persistent local-host
-/// daemon (so pixel_ingest reuses ONE browser and doesn't leak Edge across the desk's per-call subprocesses)
-/// and the indexing is done here; on the server/swarm it renders in-process. Returns a JSON summary.
-pub fn ingest(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, run_dir: []const u8, mem: Mem, url: []const u8, doc_id_in: []const u8, roam: bool) []u8 {
+/// Render `url` and index its tiles. Under `use_daemon` (subprocess-per-call clients: `veil exec-tool`), the
+/// render is done by the persistent local-host daemon (so pixel_ingest reuses ONE browser and doesn't leak Edge
+/// across the desk's per-call subprocesses) and the indexing is done here; a long-lived server/swarm/CLI-direct
+/// caller renders in-process. Returns a JSON summary.
+pub fn ingest(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, run_dir: []const u8, mem: Mem, url: []const u8, doc_id_in: []const u8, use_daemon: bool) []u8 {
     const doc_id = resolveDocId(gpa, doc_id_in, url);
     defer gpa.free(doc_id);
     const dir = std.fmt.allocPrint(gpa, "{s}/.pixelrag/{s}", .{ run_dir, doc_id }) catch return dupe(gpa, "oom");
@@ -120,7 +121,7 @@ pub fn ingest(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Enviro
     var manifest_add: std.ArrayListUnmanaged(u8) = .empty;
     defer manifest_add.deinit(gpa);
 
-    if (roam) {
+    if (use_daemon) {
         // Render on the local-host daemon; it returns base64 tiles we decode + index here.
         const url_lit = std.json.Stringify.valueAlloc(gpa, url, .{}) catch return dupe(gpa, "oom");
         defer gpa.free(url_lit);
@@ -150,7 +151,7 @@ pub fn ingest(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Enviro
     }
 
     if (manifest_add.items.len > 0) appendManifest(gpa, io, run_dir, manifest_add.items);
-    log.info("pixel_ingest {s}: {d} tiles, {d} indexed, {d} chars (roam={})", .{ doc_id, tile_count, indexed, total_chars, roam });
+    log.info("pixel_ingest {s}: {d} tiles, {d} indexed, {d} chars (daemon={})", .{ doc_id, tile_count, indexed, total_chars, use_daemon });
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"doc_id\":\"{s}\",\"tiles\":{d},\"indexed\":{d},\"chars\":{d},\"note\":\"rendered + indexed; retrieve with pixel_search\"}}", .{ doc_id, tile_count, indexed, total_chars }) catch dupe(gpa, "ingested");
 }
 

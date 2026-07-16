@@ -11,6 +11,7 @@
 const std = @import("std");
 const launch = @import("launch.zig");
 const cdpm = @import("cdp.zig");
+const util = @import("util.zig");
 const Cdp = cdpm.Cdp;
 
 const log = std.log.scoped(.browser);
@@ -81,7 +82,9 @@ pub const Session = struct {
         _ = cdp.call("Page.enable", "{}", sid) catch {};
         _ = cdp.call("Runtime.enable", "{}", sid) catch {};
 
-        return .{ .gpa = gpa, .io = io, .child = child, .cdp = cdp, .session_id = sid, .user_data_dir = udd };
+        var s: Session = .{ .gpa = gpa, .io = io, .child = child, .cdp = cdp, .session_id = sid, .user_data_dir = udd };
+        s.harden(); // arm dialog/popup neutralization before the first navigate (see harden()'s note)
+        return s;
     }
 
     pub fn close(self: *Session) void {
@@ -103,19 +106,32 @@ pub const Session = struct {
         const res = self.cdp.callTimeout("Page.navigate", params, self.session_id, 30_000) catch return error.Protocol;
         self.gpa.free(res);
         self.waitReady(20_000);
+        self.harden(); // re-arm on the freshly loaded document (each navigation is a fresh JS context)
         return self.evalString("location.href") catch self.gpa.dupe(u8, url) catch error.OutOfMemory;
+    }
+
+    /// Neutralize the two things that silently break headless click-through: modal JS dialogs and popups. Our
+    /// CDP client is request/response and DISCARDS event frames (see cdp.zig), so it never answers
+    /// Page.javascriptDialogOpening — a native alert()/confirm()/beforeunload would block the renderer and hang
+    /// the next Runtime.evaluate. So we defang them at the JS layer instead: alert/confirm/prompt become
+    /// non-blocking, beforeunload can't veto a navigation, and popups (target=_blank / window.open) are coerced
+    /// into the SAME tab the session drives — otherwise a click would spawn a tab this single-page session never
+    /// sees. Best-effort and idempotent (guarded by __nlHardened); re-run after every navigation.
+    pub fn harden(self: *Session) void {
+        const r = self.evaluate(HARDEN_JS) catch return;
+        self.gpa.free(r);
     }
 
     fn waitReady(self: *Session, timeout_ms: u32) void {
         var waited: u32 = 0;
         while (waited < timeout_ms) : (waited += 250) {
             const st = self.evalString("document.readyState") catch {
-                self.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+                util.sleepMs(250);
                 continue;
             };
             defer self.gpa.free(st);
             if (std.mem.eql(u8, st, "complete")) return;
-            self.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+            util.sleepMs(250);
         }
     }
 
@@ -194,13 +210,49 @@ pub const Session = struct {
         return self.evaluate(js);
     }
 
-    /// Click the element previously tagged `ref` by snapshot(). Returns a small JSON status.
+    /// Click the element previously tagged `ref` by snapshot(), then SETTLE any navigation the click triggered
+    /// so a following browser_read sees the landing page, not the page mid-transition. Coerces a target=_blank
+    /// anchor to open in-tab (the session drives one tab). Returns {ok,tag,navigated,url}; a missing ref returns
+    /// {ok:false,error:'ref not found'} unchanged.
     pub fn clickRef(self: *Session, ref: u32) Error![]u8 {
+        const before = self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory);
+        defer self.gpa.free(before);
         const js = std.fmt.allocPrint(self.gpa,
-            \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});el.scrollIntoView({{block:'center'}});el.click();return JSON.stringify({{ok:true,tag:el.tagName.toLowerCase()}});}})()
+            \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});try{{if(el.tagName==='A'&&el.target&&el.target!=='_self')el.target='_self';}}catch(e){{}}el.scrollIntoView({{block:'center'}});el.click();return JSON.stringify({{ok:true,tag:el.tagName.toLowerCase()}});}})()
         , .{ref}) catch return error.OutOfMemory;
         defer self.gpa.free(js);
-        return self.evaluate(js);
+        const raw = try self.evaluate(js);
+        // A failed click (missing ref) carries its own error — hand it back verbatim.
+        const ClickRes = struct { ok: bool = false, tag: []const u8 = "" };
+        const p = std.json.parseFromSlice(ClickRes, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
+        defer p.deinit();
+        if (!p.value.ok) return raw;
+        const tag = self.gpa.dupe(u8, p.value.tag) catch return raw;
+        defer self.gpa.free(tag);
+        self.gpa.free(raw);
+
+        const navigated = self.settleAfterClick(before);
+        if (navigated) self.harden(); // the landing page is a fresh JS context — re-arm before the next click
+        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
+        defer self.gpa.free(url);
+        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+    }
+
+    /// After a click, wait briefly for the URL to change (a navigation) and, if it does, for the new document to
+    /// finish loading. A pure in-page click (button, JS handler) never changes the URL, so this returns false
+    /// after the short grace window without over-waiting. Returns true iff a navigation occurred.
+    fn settleAfterClick(self: *Session, before: []const u8) bool {
+        var waited: u32 = 0;
+        while (waited < 1500) : (waited += 100) {
+            util.sleepMs(100);
+            const cur = self.evalString("location.href") catch continue;
+            defer self.gpa.free(cur);
+            if (!std.mem.eql(u8, cur, before)) {
+                self.waitReady(8000);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Type `text` into the element tagged `ref` (input/textarea value + input/change events, or a
@@ -213,11 +265,28 @@ pub const Session = struct {
             \\try{el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));el.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));if(el.form&&el.form.requestSubmit)el.form.requestSubmit();}catch(e){}
         else
             "";
+        const before = if (submit) (self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory)) else "";
+        defer if (submit) self.gpa.free(before);
         const js = std.fmt.allocPrint(self.gpa,
             \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});var v={s};el.focus();if('value' in el){{el.value=v;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));}}else{{el.textContent=v;el.dispatchEvent(new Event('input',{{bubbles:true}}));}}{s}return JSON.stringify({{ok:true,tag:el.tagName.toLowerCase()}});}})()
         , .{ ref, tlit, submit_js }) catch return error.OutOfMemory;
         defer self.gpa.free(js);
-        return self.evaluate(js);
+        const raw = try self.evaluate(js);
+        // A submit typically navigates (search box → results). Settle it so the caller's next read lands on the
+        // results page, and report the destination — same contract as clickRef.
+        if (!submit) return raw;
+        const TypeRes = struct { ok: bool = false, tag: []const u8 = "" };
+        const p = std.json.parseFromSlice(TypeRes, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
+        defer p.deinit();
+        if (!p.value.ok) return raw;
+        const tag = self.gpa.dupe(u8, p.value.tag) catch return raw;
+        defer self.gpa.free(tag);
+        self.gpa.free(raw);
+        const navigated = self.settleAfterClick(before);
+        if (navigated) self.harden();
+        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
+        defer self.gpa.free(url);
+        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .url = url }) catch error.OutOfMemory;
     }
 };
 
@@ -240,6 +309,13 @@ fn getStr(gpa: std.mem.Allocator, json: []const u8, key: []const u8) ?[]u8 {
         else => null,
     };
 }
+
+// Injected after every navigation (and at open). Makes headless click-through robust: modal dialogs become
+// non-blocking (our CDP client can't answer them), beforeunload can't veto a navigation, and popups are kept
+// in the driven tab. Idempotent per document via __nlHardened.
+const HARDEN_JS =
+    \\(function(){if(window.__nlHardened)return 'already';window.__nlHardened=true;try{window.alert=function(){};}catch(e){}try{window.confirm=function(){return true;};}catch(e){}try{window.prompt=function(){return null;};}catch(e){}try{window.print=function(){};}catch(e){}try{window.open=function(u){try{if(u)location.href=u;}catch(e){}return null;};}catch(e){}try{document.addEventListener('click',function(e){try{var a=e.target&&e.target.closest?e.target.closest('a[target]'):null;if(a&&a.target&&a.target!=='_self')a.target='_self';}catch(_){}} ,true);}catch(e){}try{window.onbeforeunload=null;var _ael=window.addEventListener;window.addEventListener=function(t,f,o){try{if(String(t).toLowerCase()==='beforeunload')return;}catch(e){}return _ael.call(window,t,f,o);};}catch(e){}return 'ok';})()
+;
 
 const SNAPSHOT_JS =
     \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',text:label});}var txt=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim().slice(0,4000);return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:txt});})()
