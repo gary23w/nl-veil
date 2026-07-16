@@ -73,12 +73,34 @@ pub const Opts = struct {
     height: u32 = 2000,
 };
 
+/// Reinforce the promo-suppression launch flags by pre-seeding the fresh profile (belt-and-suspenders; the
+/// flags are the primary lever). `First Run` marks first-run as already done; Default/Preferences disables
+/// profile sign-in + sync so the sync-confirmation modal can't appear. Written ONCE (only if absent) so later
+/// launches never fight Edge's own rewrites. Best-effort — a failure just leaves the flags to do the work.
+fn seedProfile(gpa: std.mem.Allocator, io: std.Io, user_data_dir: []const u8) void {
+    const fr = std.fmt.allocPrint(gpa, "{s}/First Run", .{user_data_dir}) catch return;
+    defer gpa.free(fr);
+    if (!exists(io, fr)) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = fr, .data = "" }) catch {};
+
+    const default_dir = std.fmt.allocPrint(gpa, "{s}/Default", .{user_data_dir}) catch return;
+    defer gpa.free(default_dir);
+    const prefs = std.fmt.allocPrint(gpa, "{s}/Preferences", .{default_dir}) catch return;
+    defer gpa.free(prefs);
+    if (exists(io, prefs)) return;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, default_dir, .default_dir) catch {};
+    const body =
+        \\{"browser":{"has_seen_welcome_page":true,"check_default_browser":false},"signin":{"allowed":false,"allowed_on_next_startup":false},"sync":{"requested":false,"has_setup_completed":false}}
+    ;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = prefs, .data = body }) catch {};
+}
+
 /// Spawn `browser_path` headless with an OS-assigned DevTools port, isolated to `user_data_dir` (created if
 /// absent). The stale DevToolsActivePort file is removed first so readEndpoint() waits for the NEW process's
 /// port, never a previous run's. Returns the live Child — the caller owns it (kill + reap on teardown). Stdio
 /// is ignored and no console window pops (windowless parent), exactly like a worker spawn.
 pub fn spawn(gpa: std.mem.Allocator, io: std.Io, browser_path: []const u8, user_data_dir: []const u8, opts: Opts) !std.process.Child {
     _ = std.Io.Dir.cwd().createDirPathStatus(io, user_data_dir, .default_dir) catch {};
+    seedProfile(gpa, io, user_data_dir);
     var pbuf: [1280]u8 = undefined;
     if (std.fmt.bufPrint(&pbuf, "{s}/DevToolsActivePort", .{user_data_dir})) |dp| {
         std.Io.Dir.cwd().deleteFile(io, dp) catch {};
@@ -100,8 +122,28 @@ pub fn spawn(gpa: std.mem.Allocator, io: std.Io, browser_path: []const u8, user_
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
-        "about:blank",
     });
+    // Accessibility hardening — a HEADFUL Edge on a fresh profile that Windows-SSO implicitly signs in will pop
+    // the browser-chrome "We are now syncing your data / Got it" modal (a constrained-window WebUI, NOT page DOM
+    // — unreachable by our snapshot/click). We can't dismiss it, so we suppress the implicit-signin→sync→promo
+    // chain at launch. `--disable-features` MUST be a single CSV switch (repeated switches don't reliably merge).
+    // `AutomationControlled` off drops the navigator.webdriver automation fingerprint at the source, so the
+    // user's own assistive session isn't pre-emptively degraded (this is NOT captcha evasion). All harmless
+    // headless too. Sources: Microsoft Edge policy docs (ImplicitSignInEnabled/BrowserSignin/SyncDisabled),
+    // chromium-edge-launcher default flags.
+    try av.appendSlice(gpa, &.{
+        "--disable-sync", // sync never runs ⇒ the "syncing your data" confirmation never fires (primary lever)
+        "--disable-features=msImplicitSignin,msEdgeWelcomeExperience,EdgeSyncPromotion,AutomationControlled",
+        "--disable-blink-features=AutomationControlled", // clears navigator.webdriver at the Blink source
+        "--disable-search-engine-choice-screen", // the 2024+ choice screen blocks startup on some locales
+        "--propagate-iph-for-testing", // no-arg ⇒ suppresses in-product-help / feature-tour nudge bubbles
+        "--no-service-autorun",
+        "--disable-background-networking", // background promo/experiment/field-trial pulls that can spawn UI
+        "--disable-component-update",
+        "--disable-default-apps",
+        "--metrics-recording-only",
+    });
+    try av.append(gpa, "about:blank");
 
     return std.process.spawn(io, .{
         .argv = av.items,

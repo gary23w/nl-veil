@@ -472,8 +472,8 @@ pub const FULL_SCHEMA = SCHEMA ++ ",\n" ++ ASK_VEIL_TOOL;
 /// newline-split tool droppers.
 pub const BROWSER_SCHEMA =
     \\{"type":"function","function":{"name":"browser_navigate","description":"Open (or reuse) a real web browser ON THE USER'S OWN MACHINE (a local browser, started on demand) and navigate it to a URL, then return the page's title and final URL. When information is hard to get by plain crawling — a login-walled dashboard, a JS-heavy SPA, an interactive page, data behind a form — say so and REACH FOR THIS instead of giving up: web_search/web_fetch/read_url/deep_crawl fetch static text, this drives the user's live browser. After navigating, call browser_read to see the page, then browser_click/browser_type to interact. Never enter passwords, card numbers, or other credentials, and do not click irreversible actions (pay/submit/delete) without explicit human approval.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"browser_read","description":"Read the current browser page: returns its title, a clipped text excerpt, and the list of interactive elements each tagged with a numeric ref (for browser_click / browser_type). Call this after navigate or after any click/type to see the new state.","parameters":{"type":"object","properties":{},"required":[]}}},
-    \\{"type":"function","function":{"name":"browser_click","description":"Click the interactive element identified by the ref number from a prior browser_read. Then call browser_read to see the result. Do not click irreversible controls (pay, place order, delete, confirm) without explicit human approval.","parameters":{"type":"object","properties":{"ref":{"type":"integer","description":"the element ref from browser_read"}},"required":["ref"]}}},
+    \\{"type":"function","function":{"name":"browser_read","description":"Read the current browser page: returns its title, a clipped text excerpt, and the list of interactive elements each tagged with a numeric ref (for browser_click / browser_type). Call this after navigate or after any click/type to see the new state. If the page yields little readable text (blank, canvas/SPA, or walled), the result ALSO carries a `visual` block with screenshot-tile image paths and recovered text — use it; you don't need to call pixel_ingest yourself for a normal read. If the result carries a `challenge` block (a CAPTCHA / 'verify you are human' prompt), STOP and relay its `instructions` to the user verbatim — never try to solve or bypass verification.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"browser_click","description":"Click the interactive element identified by the ref number from a prior browser_read. Clicks are real, trusted browser input (not synthetic), so sites accept them. The result reports whether the click caused a navigation (`navigated`) and the resulting `url`; then call browser_read to see the new page. Do not click irreversible controls (pay, place order, delete, confirm) without explicit human approval.","parameters":{"type":"object","properties":{"ref":{"type":"integer","description":"the element ref from browser_read"}},"required":["ref"]}}},
     \\{"type":"function","function":{"name":"browser_type","description":"Type text into the input/textarea identified by the ref from a prior browser_read. Set submit=true to press Enter / submit the enclosing form afterwards (e.g. a search box). Never type passwords or other credentials.","parameters":{"type":"object","properties":{"ref":{"type":"integer"},"text":{"type":"string"},"submit":{"type":"boolean","description":"press Enter / submit the form after typing (default false)"}},"required":["ref","text"]}}},
     \\{"type":"function","function":{"name":"browser_eval","description":"Evaluate a small read-only JavaScript expression in the current page and return its value (JSON). Use for inspection the structured read doesn't cover (a computed value, a specific element's text). Do NOT use it to submit forms or perform privileged actions.","parameters":{"type":"object","properties":{"js":{"type":"string"}},"required":["js"]}}},
     \\{"type":"function","function":{"name":"browser_close","description":"Close the browser session when you are done with it, freeing the browser process.","parameters":{"type":"object","properties":{},"required":[]}}}
@@ -1142,7 +1142,10 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     var broker_port: u16 = 0;
     var broker_tok: []const u8 = "";
     var tok_buf: [32]u8 = undefined;
-    if (browserEnabled(ctx) or mcpEnabled(ctx)) {
+    // roam (a client machine) OR the server env flags enable the bridge, so an INVENTED tool on the user's own
+    // machine gets the browser()/mcp() helpers even when the desk process doesn't carry NL_BROWSER_DRIVER — the
+    // "AI writes a click-script" path the user asked for.
+    if (ctx.roam or browserEnabled(ctx) or mcpEnabled(ctx)) {
         if (ctx.browser_daemon) {
             if (browser_host.ensure(gpa, ctx.io, ctx.environ)) |info| {
                 broker_port = info.port;
@@ -1154,8 +1157,8 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
             broker_tok = info.token;
         }
     }
-    const browser_helper: []const u8 = if (broker_port != 0 and browserEnabled(ctx)) BROWSER_HELPER_PY else "";
-    const mcp_helper: []const u8 = if (broker_port != 0 and mcpEnabled(ctx)) MCP_HELPER_PY else "";
+    const browser_helper: []const u8 = if (broker_port != 0 and (ctx.roam or browserEnabled(ctx))) BROWSER_HELPER_PY else "";
+    const mcp_helper: []const u8 = if (broker_port != 0 and (ctx.roam or mcpEnabled(ctx))) MCP_HELPER_PY else "";
     const src = std.fmt.allocPrint(gpa, "{s}{s}{s}{s}{s}", .{ guard, preamble, browser_helper, mcp_helper, body }) catch return dupe(gpa, "oom");
     defer gpa.free(src);
     const script_name = std.fmt.allocPrint(gpa, ".authored-{s}-{s}.py", .{ ctx.scope, name }) catch return dupe(gpa, "oom");

@@ -81,6 +81,11 @@ pub const Session = struct {
 
         _ = cdp.call("Page.enable", "{}", sid) catch {};
         _ = cdp.call("Runtime.enable", "{}", sid) catch {};
+        // Clear the navigator.webdriver automation fingerprint at PARSE time (before any page script), so the
+        // user's own assistive session isn't pre-emptively refused/degraded by a naive webdriver sniff. Persists
+        // across navigations (unlike HARDEN_JS, which runs post-load and re-arms per document). Deliberately
+        // scoped to this ONE property — this is not, and must not become, CAPTCHA/anti-bot evasion.
+        _ = cdp.call("Page.addScriptToEvaluateOnNewDocument", "{\"source\":\"try{Object.defineProperty(navigator,'webdriver',{get:()=>false});}catch(e){}\"}", sid) catch {};
 
         var s: Session = .{ .gpa = gpa, .io = io, .child = child, .cdp = cdp, .session_id = sid, .user_data_dir = udd };
         s.harden(); // arm dialog/popup neutralization before the first navigate (see harden()'s note)
@@ -210,26 +215,63 @@ pub const Session = struct {
         return self.evaluate(js);
     }
 
-    /// Click the element previously tagged `ref` by snapshot(), then SETTLE any navigation the click triggered
-    /// so a following browser_read sees the landing page, not the page mid-transition. Coerces a target=_blank
-    /// anchor to open in-tab (the session drives one tab). Returns {ok,tag,navigated,url}; a missing ref returns
+    /// Dispatch one Input.dispatchMouseEvent to the page session. Unlike a JS el.click(), these carry
+    /// isTrusted:true — real browser-level input that bot-protection and strict event validators accept. Coords
+    /// are CSS pixels in the viewport frame (the space getBoundingClientRect reports) — NO devicePixelRatio.
+    fn dispatchMouse(self: *Session, kind: []const u8, x: i64, y: i64, button: []const u8, buttons: u8, clicks: u8) Error!void {
+        const p = std.fmt.allocPrint(self.gpa, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":{d},\"clickCount\":{d},\"pointerType\":\"mouse\"}}", .{ kind, x, y, button, buttons, clicks }) catch return error.OutOfMemory;
+        defer self.gpa.free(p);
+        const r = self.cdp.callTimeout("Input.dispatchMouseEvent", p, self.session_id, 5_000) catch return error.Protocol;
+        self.gpa.free(r);
+    }
+
+    /// Dispatch one Input.dispatchKeyEvent (raw params JSON) to the page session — a real, trusted keystroke.
+    fn dispatchKey(self: *Session, params_json: []const u8) Error!void {
+        const r = self.cdp.callTimeout("Input.dispatchKeyEvent", params_json, self.session_id, 5_000) catch return error.Protocol;
+        self.gpa.free(r);
+    }
+
+    /// Trusted left click on the element tagged `ref`: scroll it into view, resolve its viewport-center point,
+    /// then move → press → dwell → release via the Input domain (isTrusted:true), then SETTLE any navigation so a
+    /// following browser_read sees the landing page. Falls back to a synthetic el.click() only when the element
+    /// can't be localized in the viewport. Returns {ok,tag,navigated,url}; a missing ref returns
     /// {ok:false,error:'ref not found'} unchanged.
     pub fn clickRef(self: *Session, ref: u32) Error![]u8 {
         const before = self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory);
         defer self.gpa.free(before);
-        const js = std.fmt.allocPrint(self.gpa,
-            \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});try{{if(el.tagName==='A'&&el.target&&el.target!=='_self')el.target='_self';}}catch(e){{}}el.scrollIntoView({{block:'center'}});el.click();return JSON.stringify({{ok:true,tag:el.tagName.toLowerCase()}});}})()
-        , .{ref}) catch return error.OutOfMemory;
-        defer self.gpa.free(js);
-        const raw = try self.evaluate(js);
-        // A failed click (missing ref) carries its own error — hand it back verbatim.
-        const ClickRes = struct { ok: bool = false, tag: []const u8 = "" };
-        const p = std.json.parseFromSlice(ClickRes, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
-        defer p.deinit();
-        if (!p.value.ok) return raw;
-        const tag = self.gpa.dupe(u8, p.value.tag) catch return raw;
-        defer self.gpa.free(tag);
+        const rjs = std.fmt.allocPrint(self.gpa, RESOLVE_CLICK_JS, .{ref}) catch return error.OutOfMemory;
+        defer self.gpa.free(rjs);
+        const raw = try self.evaluate(rjs);
+        const R = struct { ok: bool = false, x: i64 = 0, y: i64 = 0, hit: bool = false, tag: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(R, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
+        if (!parsed.value.ok) {
+            parsed.deinit(); // missing ref → the resolve JSON already carries {ok:false,error:'ref not found'}
+            return raw;
+        }
+        const hit = parsed.value.hit;
+        const x = parsed.value.x;
+        const y = parsed.value.y;
+        const tag = self.gpa.dupe(u8, parsed.value.tag) catch {
+            parsed.deinit();
+            return raw;
+        };
+        parsed.deinit();
         self.gpa.free(raw);
+        defer self.gpa.free(tag);
+
+        if (hit) {
+            self.dispatchMouse("mouseMoved", x, y, "none", 0, 0) catch {};
+            self.dispatchMouse("mousePressed", x, y, "left", 1, 1) catch {};
+            util.sleepMs(40); // a real press→release gap; some UIs debounce a zero-duration press
+            self.dispatchMouse("mouseReleased", x, y, "left", 0, 1) catch {};
+        } else {
+            // Couldn't place an in-viewport click point (element off-screen in a scroll container we couldn't
+            // fully center) — fall back to a synthetic click so the action still fires.
+            const cjs = std.fmt.allocPrint(self.gpa, "(function(){{var el=document.querySelector('[data-nlref=\"{d}\"]');if(el)el.click();}})()", .{ref}) catch return error.OutOfMemory;
+            defer self.gpa.free(cjs);
+            const cr = self.evaluate(cjs) catch (self.gpa.dupe(u8, "") catch "");
+            if (cr.len > 0) self.gpa.free(cr);
+        }
 
         const navigated = self.settleAfterClick(before);
         if (navigated) self.harden(); // the landing page is a fresh JS context — re-arm before the next click
@@ -255,33 +297,56 @@ pub const Session = struct {
         return false;
     }
 
-    /// Type `text` into the element tagged `ref` (input/textarea value + input/change events, or a
-    /// contenteditable's text). The text is passed as a JSON string literal, so it is not JS-interpolated. When
-    /// `submit` is set, an Enter keydown is dispatched and the enclosing form (if any) is submitted afterwards.
+    /// Type `text` into the element tagged `ref` using TRUSTED input: focus + clear the field, place the caret
+    /// with a real click, then Input.insertText (isTrusted:true, unicode-safe, fast — the right choice for an
+    /// assistive agent). When `submit` is set, a real Enter key event is dispatched (native form submission) and
+    /// the resulting navigation is settled. Returns {ok,tag} or {ok,tag,navigated,url}; a missing ref returns
+    /// {ok:false,error:'ref not found'} unchanged.
     pub fn typeRef(self: *Session, ref: u32, text: []const u8, submit: bool) Error![]u8 {
-        const tlit = std.json.Stringify.valueAlloc(self.gpa, text, .{}) catch return error.OutOfMemory;
-        defer self.gpa.free(tlit);
-        const submit_js = if (submit)
-            \\try{el.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',keyCode:13,bubbles:true}));el.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',keyCode:13,bubbles:true}));if(el.form&&el.form.requestSubmit)el.form.requestSubmit();}catch(e){}
-        else
-            "";
         const before = if (submit) (self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory)) else "";
         defer if (submit) self.gpa.free(before);
-        const js = std.fmt.allocPrint(self.gpa,
-            \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});var v={s};el.focus();if('value' in el){{el.value=v;el.dispatchEvent(new Event('input',{{bubbles:true}}));el.dispatchEvent(new Event('change',{{bubbles:true}}));}}else{{el.textContent=v;el.dispatchEvent(new Event('input',{{bubbles:true}}));}}{s}return JSON.stringify({{ok:true,tag:el.tagName.toLowerCase()}});}})()
-        , .{ ref, tlit, submit_js }) catch return error.OutOfMemory;
-        defer self.gpa.free(js);
-        const raw = try self.evaluate(js);
-        // A submit typically navigates (search box → results). Settle it so the caller's next read lands on the
-        // results page, and report the destination — same contract as clickRef.
-        if (!submit) return raw;
-        const TypeRes = struct { ok: bool = false, tag: []const u8 = "" };
-        const p = std.json.parseFromSlice(TypeRes, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
-        defer p.deinit();
-        if (!p.value.ok) return raw;
-        const tag = self.gpa.dupe(u8, p.value.tag) catch return raw;
-        defer self.gpa.free(tag);
+
+        const rjs = std.fmt.allocPrint(self.gpa, RESOLVE_TYPE_JS, .{ref}) catch return error.OutOfMemory;
+        defer self.gpa.free(rjs);
+        const raw = try self.evaluate(rjs);
+        const R = struct { ok: bool = false, x: i64 = 0, y: i64 = 0, hit: bool = false, tag: []const u8 = "" };
+        const parsed = std.json.parseFromSlice(R, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch return raw;
+        if (!parsed.value.ok) {
+            parsed.deinit();
+            return raw;
+        }
+        const hit = parsed.value.hit;
+        const x = parsed.value.x;
+        const y = parsed.value.y;
+        const tag = self.gpa.dupe(u8, parsed.value.tag) catch {
+            parsed.deinit();
+            return raw;
+        };
+        parsed.deinit();
         self.gpa.free(raw);
+        defer self.gpa.free(tag);
+
+        // A genuine click places the caret — contenteditable / rich editors (search boxes, chat inputs) accept
+        // insertText only after a real pointer focus. RESOLVE_TYPE_JS already focused + cleared the field.
+        if (hit) {
+            self.dispatchMouse("mouseMoved", x, y, "none", 0, 0) catch {};
+            self.dispatchMouse("mousePressed", x, y, "left", 1, 1) catch {};
+            util.sleepMs(30);
+            self.dispatchMouse("mouseReleased", x, y, "left", 0, 1) catch {};
+        }
+        if (text.len > 0) {
+            const tp = jsonObj(self.gpa, .{ .text = text }) catch return error.OutOfMemory; // {"text":"..."} escaped
+            defer self.gpa.free(tp);
+            const ir = self.cdp.callTimeout("Input.insertText", tp, self.session_id, 10_000) catch return error.Protocol;
+            self.gpa.free(ir);
+        }
+        if (submit) {
+            self.dispatchKey("{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13,\"text\":\"\\r\"}") catch {};
+            util.sleepMs(20);
+            self.dispatchKey("{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13}") catch {};
+        }
+
+        if (!submit) return jsonObj(self.gpa, .{ .ok = true, .tag = tag }) catch error.OutOfMemory;
         const navigated = self.settleAfterClick(before);
         if (navigated) self.harden();
         const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
@@ -310,6 +375,21 @@ fn getStr(gpa: std.mem.Allocator, json: []const u8, key: []const u8) ?[]u8 {
     };
 }
 
+// Resolve a data-nlref element to a viewport-center click point for trusted Input.dispatchMouseEvent. Scrolls
+// it into view FIRST (scrollIntoView updates layout synchronously, so the getBoundingClientRect on the next
+// line already reflects the scroll), clamps the point into the viewport, and reports whether the box actually
+// intersects it (`hit`) so the caller can fall back to a synthetic click when it can't be localized. Used via
+// allocPrint with the ref, so `{{`/`}}` are literal braces and `{d}` is the ref.
+const RESOLVE_CLICK_JS =
+    \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});try{{if(el.tagName==='A'&&el.target&&el.target!=='_self')el.target='_self';}}catch(e){{}}el.scrollIntoView({{block:'center',inline:'center'}});var r=el.getBoundingClientRect();var vw=window.innerWidth||1,vh=window.innerHeight||1;var x=Math.min(Math.max(r.left+r.width/2,1),vw-1);var y=Math.min(Math.max(r.top+r.height/2,1),vh-1);var _tp=document.elementFromPoint(x,y);var hit=(r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw&&!!_tp&&(_tp===el||el.contains(_tp)));return JSON.stringify({{ok:true,x:Math.round(x),y:Math.round(y),hit:hit,tag:el.tagName.toLowerCase()}});}})()
+;
+
+// Like RESOLVE_CLICK_JS but for typing: also focuses the element and clears any existing value (so insertText
+// replaces rather than appends). Returns the same {ok,x,y,hit,tag} shape.
+const RESOLVE_TYPE_JS =
+    \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});el.scrollIntoView({{block:'center',inline:'center'}});try{{el.focus();}}catch(e){{}}try{{if('value' in el)el.value='';}}catch(e){{}}var r=el.getBoundingClientRect();var vw=window.innerWidth||1,vh=window.innerHeight||1;var x=Math.min(Math.max(r.left+r.width/2,1),vw-1);var y=Math.min(Math.max(r.top+r.height/2,1),vh-1);var _tp=document.elementFromPoint(x,y);var hit=(r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw&&!!_tp&&(_tp===el||el.contains(_tp)));return JSON.stringify({{ok:true,x:Math.round(x),y:Math.round(y),hit:hit,tag:el.tagName.toLowerCase()}});}})()
+;
+
 // Injected after every navigation (and at open). Makes headless click-through robust: modal dialogs become
 // non-blocking (our CDP client can't answer them), beforeunload can't veto a navigation, and popups are kept
 // in the driven tab. Idempotent per document via __nlHardened.
@@ -317,8 +397,17 @@ const HARDEN_JS =
     \\(function(){if(window.__nlHardened)return 'already';window.__nlHardened=true;try{window.alert=function(){};}catch(e){}try{window.confirm=function(){return true;};}catch(e){}try{window.prompt=function(){return null;};}catch(e){}try{window.print=function(){};}catch(e){}try{window.open=function(u){try{if(u)location.href=u;}catch(e){}return null;};}catch(e){}try{document.addEventListener('click',function(e){try{var a=e.target&&e.target.closest?e.target.closest('a[target]'):null;if(a&&a.target&&a.target!=='_self')a.target='_self';}catch(_){}} ,true);}catch(e){}try{window.onbeforeunload=null;var _ael=window.addEventListener;window.addEventListener=function(t,f,o){try{if(String(t).toLowerCase()==='beforeunload')return;}catch(e){}return _ael.call(window,t,f,o);};}catch(e){}return 'ok';})()
 ;
 
+// Snapshot the interactive elements (tagged data-nlref) + page text, PLUS the decision signals manager.read
+// uses in one round-trip: textLen (full pre-clip innerText length — the clipped `text` can't signal "thin"),
+// visualScore (largest canvas/svg/video as a fraction of the viewport → canvas/SPA pages), and challenge
+// (CAPTCHA / human-verification). STRONG (suppresses the read → human handoff) is anchored to a Cloudflare
+// interstitial NODE, or a challenge WIDGET (turnstile/recaptcha-frame/hcaptcha) on an otherwise-empty page — a
+// full-page WALL, NOT a captcha embedded in a content-rich form (which stays readable). This avoids false
+// positives from page titles or HTML text merely mentioning a challenge. SUSPECTED is a narrow block-page
+// phrase (non-blocking marker). Scope: Cloudflare/Turnstile/reCAPTCHA/hCaptcha; other vendors (AWS WAF,
+// DataDome, Akamai, …) aren't fingerprinted — a miss just reads the wall as content, never a false handoff.
 const SNAPSHOT_JS =
-    \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',text:label});}var txt=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim().slice(0,4000);return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:txt});})()
+    \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',text:label});}var _ft=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var vw=window.innerWidth||1,vh=window.innerHeight||1;var vis=0;var vels=document.querySelectorAll('canvas,svg,video');for(var vi=0;vi<vels.length;vi++){var vr=vels[vi].getBoundingClientRect();var iw=Math.max(0,Math.min(vr.right,vw)-Math.max(vr.left,0));var ih=Math.max(0,Math.min(vr.bottom,vh)-Math.max(vr.top,0));var f=(iw*ih)/(vw*vh);if(f>vis)vis=f;}var chSig=[];var chKind='unknown';var strong=false;var suspected=false;try{var _wq=null;if(document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile'))_wq='turnstile';else if(document.querySelector('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/api2/bframe"],iframe[src*="recaptcha/enterprise/anchor"],iframe[src*="recaptcha/enterprise/bframe"]'))_wq='recaptcha';else if(document.querySelector('iframe[src*="hcaptcha.com"],.h-captcha'))_wq='hcaptcha';if(document.querySelector('#challenge-running,#cf-please-wait,#cf-challenge-running,#challenge-stage,#challenge-form,.cf-browser-verification')){strong=true;chKind='cloudflare';chSig.push('cf-interstitial');}if(_wq){chSig.push('widget:'+_wq);if(_ft.length<200){strong=true;if(chKind==='unknown')chKind=_wq;}}}catch(e){}try{if(!strong){var _bt=_ft.slice(0,4000);if(/verify (you are|you'?re) (a )?human/i.test(_bt)||/detected unusual traffic/i.test(_bt)||/enable javascript and cookies to continue/i.test(_bt)){suspected=true;chSig.push('text');}}}catch(e){}var challenge={detected:(strong||suspected),kind:chKind,confidence:(strong?'strong':(suspected?'suspected':'none')),signals:chSig};return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:_ft.slice(0,4000),textLen:_ft.length,visualScore:Math.round(vis*100)/100,challenge:challenge});})()
 ;
 
 // ---------------------------------------------------------------------------------------------------- smoke
