@@ -533,6 +533,90 @@ pub fn btnW(label: [:0]const u8, h: f32) f32 {
     return @as(f32, @floatFromInt(measure(label, btnFont(h)))) + hpad * 2;
 }
 
+// ---- keyboard navigation (accessibility) -----------------------------------------------------------------
+// Immediate-mode focus: every interactive control REGISTERS itself as it draws, and registration order IS
+// the tab order (draw order runs top-to-bottom, left-to-right — the logical order the guidelines ask for).
+// Tab/Shift+Tab move a HIGH-CONTRAST double focus ring (never color-only: it is a shape); Enter or Space
+// activates the ringed control; a mouse click or Escape drops keyboard mode. When the focus moves, the
+// focused control's label is queued for the narrator — Tab around, HEAR where you are, Enter to act.
+// This is the screen-reader interaction pattern rebuilt for a GPU immediate-mode UI in ~90 lines.
+
+var kb_count: usize = 0; // controls registered this frame
+var kb_prev_count: usize = 0; // last frame's total (Tab wraps against this)
+var kb_focus: i32 = -1; // focused registration index; -1 = keyboard nav inactive
+var kb_activate: bool = false; // Enter/Space fired this frame → the focused control returns "clicked"
+var kb_announce: [160]u8 = undefined; // focused label, queued for the narrator
+var kb_announce_len: usize = 0;
+var kb_announced: i32 = -2; // last index announced (speak once per focus move, not per frame)
+
+/// Once per frame, BEFORE any control draws. `advance`/`back` = Tab / Shift+Tab, `activate` = Enter/Space
+/// (the caller gates these on "no text field focused" so typing is never hijacked).
+pub fn kbFrame(advance: bool, back: bool, activate: bool) void {
+    kb_prev_count = kb_count;
+    kb_count = 0;
+    kb_activate = false;
+    if (kb_prev_count == 0) {
+        kb_focus = -1;
+        return;
+    }
+    if (advance or back) {
+        if (kb_focus < 0) {
+            kb_focus = if (back) @intCast(kb_prev_count - 1) else 0;
+        } else {
+            kb_focus += if (back) -1 else 1;
+            if (kb_focus < 0) kb_focus = @intCast(kb_prev_count - 1);
+            if (kb_focus >= @as(i32, @intCast(kb_prev_count))) kb_focus = 0;
+        }
+    }
+    if (kb_focus >= @as(i32, @intCast(kb_prev_count))) kb_focus = -1; // the view shrank under the ring
+    kb_activate = activate and kb_focus >= 0;
+}
+
+/// Drop keyboard-nav mode (mouse click / Escape / tab switch).
+pub fn kbCancel() void {
+    kb_focus = -1;
+    kb_announced = -2;
+}
+
+/// Consume the pending focus announcement (main forwards it to the narrator queue).
+pub fn kbTakeAnnouncement(out: []u8) usize {
+    if (kb_announce_len == 0) return 0;
+    const n = @min(kb_announce_len, out.len);
+    @memcpy(out[0..n], kb_announce[0..n]);
+    kb_announce_len = 0;
+    return n;
+}
+
+/// Register one interactive control; returns true when THIS control is keyboard-activated this frame.
+/// Draws the focus ring + queues the spoken label when the ring sits here.
+fn kbRegister(r: Rect, label: []const u8, kind: []const u8) bool {
+    const idx: i32 = @intCast(kb_count);
+    kb_count += 1;
+    if (idx != kb_focus) return false;
+    // double ring: accent inner + fg outer — visible on any backdrop in any scheme
+    rl.drawRectangleLinesEx(.{ .x = r.x - 3, .y = r.y - 3, .width = r.width + 6, .height = r.height + 6 }, 2, blue);
+    rl.drawRectangleLinesEx(.{ .x = r.x - 5, .y = r.y - 5, .width = r.width + 10, .height = r.height + 10 }, 1, fg);
+    if (kb_announced != kb_focus) {
+        kb_announced = kb_focus;
+        var w: usize = 0;
+        for (label) |c| {
+            if (w >= kb_announce.len - 12) break;
+            kb_announce[w] = c;
+            w += 1;
+        }
+        const sep = ". ";
+        @memcpy(kb_announce[w .. w + sep.len], sep);
+        w += sep.len;
+        for (kind) |c| {
+            if (w >= kb_announce.len) break;
+            kb_announce[w] = c;
+            w += 1;
+        }
+        kb_announce_len = w;
+    }
+    return kb_activate;
+}
+
 pub fn buttonEx(r: Rect, label: [:0]const u8, accent: Color, enabled: bool, style: BtnStyle) bool {
     const hot = enabled and mouse.over(r);
     const down = hot and rl.isMouseButtonDown(.left) and !clicks_blocked;
@@ -569,7 +653,8 @@ pub fn buttonEx(r: Rect, label: [:0]const u8, accent: Color, enabled: bool, styl
     const tw = measure(label, fs);
     const nudge: f32 = if (down) 1 else 0;
     text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - @as(f32, @floatFromInt(fs))) / 2 + nudge), fs, label_c);
-    return hot and rl.isMouseButtonPressed(.left) and !clicks_blocked;
+    const kb = kbRegister(r, label, "button") and enabled;
+    return kb or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);
 }
 
 pub fn button(r: Rect, label: [:0]const u8, accent: Color, enabled: bool) bool {
@@ -603,7 +688,8 @@ pub fn tab(r: Rect, label: [:0]const u8, active: bool) bool {
     const tw = measure(label, 13);
     text(label, @intFromFloat(r.x + (r.width - @as(f32, @floatFromInt(tw))) / 2), @intFromFloat(r.y + (r.height - 13) / 2), 13, c);
     if (hot and !active and !clicks_blocked) wantCursor(.pointing_hand);
-    return hot and rl.isMouseButtonPressed(.left) and !clicks_blocked;
+    const kb = kbRegister(r, label, "tab");
+    return kb or (hot and rl.isMouseButtonPressed(.left) and !clicks_blocked);
 }
 
 /// A titlebar glyph button (minimize / close). `danger` tints the hover red. Returns true on click.
@@ -693,7 +779,8 @@ pub fn checkbox(r: Rect, label: [:0]const u8, on: bool) bool {
     if (on) text(z("x", .{}), @intFromFloat(box.x + 5), @intFromFloat(box.y + 2), 14, green);
     text(label, @intFromFloat(r.x + 26), @intFromFloat(r.y + (r.height - 13) / 2), 13, if (on) fg else if (hot) fg else fg_dim);
     if (hot) wantCursor(.pointing_hand);
-    return hot and rl.isMouseButtonPressed(.left);
+    const kb = kbRegister(r, if (label.len > 0) label else @as([]const u8, if (on) "checked" else "unchecked"), "checkbox");
+    return kb or (hot and rl.isMouseButtonPressed(.left));
 }
 
 /// A small +/- stepper for an integer in [lo,hi]. Returns the new value.

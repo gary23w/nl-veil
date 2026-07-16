@@ -138,6 +138,7 @@ const Ui = struct {
     d_gateway: Field = .{},
     d_provider: usize = 0,
     d_model: usize = 0,
+    d_use_default: bool = false, // deploy PROVIDER slot 0: inherit the client's configured chat LLM
     d_minds: i32 = 3,
     d_minutes: usize = 3, // index into catalog.minutes
     d_style: usize = 0,
@@ -481,6 +482,22 @@ pub fn main() !void {
             const fps: i32 = if (ui.hot_frames > 0) (if (focused) 60 else 30) else if (focused) 12 else 6;
             if (ui.hot_frames > 0) ui.hot_frames -= 1;
             rl.setTargetFPS(fps);
+        }
+        // KEYBOARD NAVIGATION (accessibility): Tab / Shift+Tab walk a high-contrast focus ring across
+        // every button/tab/checkbox in draw order; Enter or Space activates — but ONLY while no text
+        // field owns the keyboard, so typing is never hijacked. Escape or any click drops the ring.
+        // With the narrator on, each focus move SPEAKS the control ("dyslexia mode: OFF. button") —
+        // the app is operable and audible without sight or mouse.
+        {
+            const tab_k = rl.isKeyPressed(.tab);
+            const kshift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+            const no_field = ui.focus == .none;
+            t.kbFrame(tab_k and !kshift, tab_k and kshift, no_field and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter) or rl.isKeyPressed(.space)));
+            if (rl.isMouseButtonPressed(.left) or rl.isKeyPressed(.escape)) t.kbCancel();
+            if (tab_k) ui.input_active = true; // keep 60fps while walking the ring
+            var ab: [160]u8 = undefined;
+            const an = t.kbTakeAnnouncement(&ab);
+            if (an > 0) store.pushNarr(ab[0..an]);
         }
         tray.pump();
         pumpTray(&store, &tray, gpa);
@@ -3722,17 +3739,24 @@ fn drawDeploy(store: *Store, body: t.Rect) void {
     textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_name, ui.focus == .d_name, "swarm name", .d_name);
     ly += fh + gap;
 
-    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), prov.label, .provider);
+    // "default" = inherit the CLIENT's configured chat LLM (Settings → CHAT MODEL): the swarm runs on
+    // whatever brain the user already set up, no re-entering providers and keys per deploy.
+    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("PROVIDER", .{}), if (ui.d_use_default) "default (your chat model)" else prov.label, .provider);
     ly += fh + gap;
-    selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), prov.models[ui.d_model].label, .model);
-    ly += fh + gap;
+    if (ui.d_use_default) {
+        selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), "from Settings - chat model", .model);
+        ly += fh + gap;
+    } else {
+        selector(.{ .x = x, .y = ly, .width = cw, .height = fh }, t.z("MODEL", .{}), prov.models[ui.d_model].label, .model);
+        ly += fh + gap;
+    }
 
-    if (prov.needs_account) {
+    if (!ui.d_use_default and prov.needs_account) {
         flabel(x, ly, "CLOUDFLARE ACCOUNT ID (blank = use the server's own Workers AI creds)");
         textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_cfacct, ui.focus == .d_cfacct, "account id", .d_cfacct);
         ly += fh + gap;
     }
-    if (prov.needs_key) {
+    if (!ui.d_use_default and prov.needs_key) {
         const kh: [:0]const u8 = if (std.mem.eql(u8, prov.key, "huggingface")) t.z("HF TOKEN (hf_...)", .{}) else if (prov.needs_account) t.z("CLOUDFLARE API TOKEN (blank = server creds)", .{}) else t.z("API KEY (nlk_... or provider key)", .{});
         flabel(x, ly, kh);
         textField(.{ .x = x, .y = ly + 14, .width = cw, .height = t.FIELD_H }, &ui.d_key, ui.focus == .d_key, "sk-... / nlk_...", .d_key);
@@ -3834,18 +3858,27 @@ fn flushDropdown() void {
     const prov = &catalog.providers[ui.d_provider];
     switch (ui.open_dd) {
         .provider => {
+            // slot 0 = inherit the client's configured chat LLM; catalog providers shift up one
+            labels[0] = "default (your chat model)";
+            count = 1;
             for (catalog.providers, 0..) |p, i| {
-                labels[i] = p.label;
+                labels[i + 1] = p.label;
                 count += 1;
             }
-            current = ui.d_provider;
+            current = if (ui.d_use_default) 0 else ui.d_provider + 1;
         },
         .model => {
-            for (prov.models, 0..) |m, i| {
-                labels[i] = m.label;
-                count += 1;
+            if (ui.d_use_default) { // the model comes from Settings; the list is informational only
+                labels[0] = "from Settings - chat model";
+                count = 1;
+                current = 0;
+            } else {
+                for (prov.models, 0..) |m, i| {
+                    labels[i] = m.label;
+                    count += 1;
+                }
+                current = ui.d_model;
             }
-            current = ui.d_model;
         },
         .style => {
             for (catalog.styles, 0..) |s, i| {
@@ -3881,10 +3914,17 @@ fn flushDropdown() void {
     if (chosen) |ci| {
         switch (ui.open_dd) {
             .provider => {
-                ui.d_provider = ci;
-                ui.d_model = 0;
+                if (ci == 0) {
+                    ui.d_use_default = true;
+                } else {
+                    ui.d_use_default = false;
+                    ui.d_provider = ci - 1;
+                    ui.d_model = 0;
+                }
             },
-            .model => ui.d_model = ci,
+            .model => {
+                if (!ui.d_use_default) ui.d_model = ci;
+            },
             .style => ui.d_style = ci,
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
@@ -3895,21 +3935,32 @@ fn flushDropdown() void {
     }
 }
 
-/// Draw a dropdown option list under `anchor`; returns the clicked ABSOLUTE index, or null. Wheel-scrolls
-/// when there are more options than fit (so e.g. all installed Ollama models are reachable, not just 9).
+/// Draw a dropdown option list under `anchor` (or ABOVE it when the window edge is closer than the list);
+/// returns the clicked ABSOLUTE index, or null. The list CLAMPS to the window — visible rows shrink to
+/// what actually fits and the wheel scrolls through the rest, so an anchor near the bottom of a small
+/// window can never strand options outside the window where no scroll could reach them.
 fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
     const ih: f32 = 32;
-    const max_vis: usize = 9;
     const total = labels.len;
-    const vis = @min(total, max_vis);
-    const lr = t.Rect{ .x = anchor.x, .y = anchor.y + anchor.height + 4, .width = anchor.width, .height = ih * @as(f32, @floatFromInt(vis)) + 8 };
+    const win_h: f32 = @floatFromInt(rl.getScreenHeight());
+    const below = win_h - (anchor.y + anchor.height + 4) - 8; // space under the anchor
+    const above = anchor.y - 4 - 8; // space over it (used when below is cramped)
+    var fit_below: usize = if (below > ih) @intFromFloat(@divTrunc(below - 8, ih)) else 0;
+    var fit_above: usize = if (above > ih) @intFromFloat(@divTrunc(above - 8, ih)) else 0;
+    fit_below = @min(fit_below, 9);
+    fit_above = @min(fit_above, 9);
+    const flip = fit_below < @min(total, 4) and fit_above > fit_below; // cramped below + more room above
+    const vis = @max(1, @min(total, if (flip) fit_above else fit_below));
+    const list_h = ih * @as(f32, @floatFromInt(vis)) + 8;
+    const ly = if (flip) anchor.y - 4 - list_h else anchor.y + anchor.height + 4;
+    const lr = t.Rect{ .x = anchor.x, .y = ly, .width = anchor.width, .height = list_h };
     t.panelBordered(lr, t.bg_dark, t.blue);
 
     var start: usize = 0;
-    if (total > max_vis) {
+    if (total > vis) {
         const wheel = rl.getMouseWheelMove();
         if (wheel != 0 and t.hovering(lr)) ui.dd_scroll -= wheel;
-        const maxoff: f32 = @floatFromInt(total - max_vis);
+        const maxoff: f32 = @floatFromInt(total - vis);
         if (ui.dd_scroll < 0) ui.dd_scroll = 0;
         if (ui.dd_scroll > maxoff) ui.dd_scroll = maxoff;
         start = @intFromFloat(ui.dd_scroll);
@@ -3927,11 +3978,11 @@ fn drawList(anchor: t.Rect, labels: []const []const u8, current: usize) ?usize {
         if (hot and rl.isMouseButtonPressed(.left)) clicked = i;
         yy += ih;
     }
-    // a subtle scrollbar thumb + count when the list overflows
-    if (total > max_vis) {
+    // a subtle scrollbar thumb when the list overflows its clamped height
+    if (total > vis) {
         const track_h = lr.height - 8;
         const thumb_h = @max(12.0, track_h * @as(f32, @floatFromInt(vis)) / @as(f32, @floatFromInt(total)));
-        const thumb_y = lr.y + 4 + (track_h - thumb_h) * (ui.dd_scroll / @as(f32, @floatFromInt(total - max_vis)));
+        const thumb_y = lr.y + 4 + (track_h - thumb_h) * (ui.dd_scroll / @as(f32, @floatFromInt(total - vis)));
         t.fillRect(@intFromFloat(lr.x + lr.width - 5), @intFromFloat(thumb_y), 3, @intFromFloat(thumb_h), t.comment);
     }
     // click outside the list AND its anchor button closes it
@@ -3963,15 +4014,58 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
     var w = std.Io.Writer.fixed(&b);
     // Resolve the Cloudflare {account} placeholder (no-op for every other provider) before sending.
     var basebuf: [256]u8 = undefined;
-    const eff_base = catalog.resolveBase(prov, ui.d_cfacct.str(), &basebuf);
+    var eff_base = catalog.resolveBase(prov, ui.d_cfacct.str(), &basebuf);
+    var eff_provider: []const u8 = prov.key;
+    var eff_model: []const u8 = prov.models[ui.d_model].id;
+    var keybuf: [192]u8 = undefined;
+    var modelbuf: [96]u8 = undefined;
+    var eff_key: []const u8 = ui.d_key.str();
+    if (ui.d_use_default) {
+        // DEFAULT provider: the swarm inherits the client's configured chat LLM — the same per-field
+        // resolution the task builder snapshots (Settings → CHAT MODEL), so one setup drives everything.
+        store.lock();
+        const s = &store.settings;
+        var acct_scratch: [256]u8 = undefined;
+        var bsl: []const u8 = undefined;
+        var ksl: []const u8 = "";
+        switch (s.chat_kind) {
+            1 => {
+                const p = &catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)];
+                bsl = catalog.resolveBase(p, s.cfAccount(), &acct_scratch);
+                ksl = s.chatKey();
+                eff_provider = p.key;
+            },
+            2 => {
+                bsl = s.chatBase();
+                ksl = s.chatKey();
+                eff_provider = "ollama"; // custom endpoint: keyless-tolerant provider tag; base+key travel explicitly
+            },
+            else => {
+                bsl = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1";
+                eff_provider = "ollama";
+            },
+        }
+        const bn = @min(bsl.len, basebuf.len);
+        @memcpy(basebuf[0..bn], bsl[0..bn]);
+        eff_base = basebuf[0..bn];
+        const kn = @min(ksl.len, keybuf.len);
+        @memcpy(keybuf[0..kn], ksl[0..kn]);
+        eff_key = keybuf[0..kn];
+        var msl: []const u8 = s.chatModel();
+        if (msl.len == 0) msl = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+        const mn = @min(msl.len, modelbuf.len);
+        @memcpy(modelbuf[0..mn], msl[0..mn]);
+        eff_model = modelbuf[0..mn];
+        store.unlock();
+    }
     w.writeAll("{\"name\":\"") catch return;
     jesc(&w, ui.d_name.str());
     w.print("\",\"provider\":\"{s}\",\"model\":\"{s}\",\"style\":\"{s}\",\"stack\":\"{s}\",\"mode\":\"{s}\",\"base_url\":\"{s}\",\"minutes\":{d},\"encrypt\":{s},\"veil_population\":{s},\"autonomy\":\"{s}\",\"internet\":{s},\"gap_assess\":{s},\"breakout\":{s},\"observe_psyche\":{s},\"api_key\":\"", .{
-        prov.key,               prov.models[ui.d_model].id,    catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
+        eff_provider,           eff_model,                     catalog.styles[ui.d_style], catalog.stacks[ui.d_stack], catalog.modes[ui.d_mode],
         eff_base,               catalog.minutes[ui.d_minutes], boolStr(ui.d_encrypt),      boolStr(ui.d_population),   if (ui.d_autonomy_full) "full" else "bounded",
         boolStr(ui.d_internet), boolStr(ui.d_gap),             boolStr(ui.d_breakout),     boolStr(ui.d_psyche),
     }) catch return;
-    jesc(&w, ui.d_key.str());
+    jesc(&w, eff_key);
     w.writeAll("\",\"gateway_model\":\"") catch return;
     jesc(&w, ui.d_gateway.str());
     w.writeAll("\",\"goal\":\"") catch return;
