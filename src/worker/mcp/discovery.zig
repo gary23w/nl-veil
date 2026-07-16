@@ -12,7 +12,9 @@ const mcp = @import("client.zig");
 const log = std.log.scoped(.mcp);
 
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
-    return gpa.dupe(u8, s) catch @constCast("{\"ok\":false}");
+    // OOM fallback is ZERO-LENGTH on purpose: callers free this result unconditionally, and a static non-empty
+    // literal handed to gpa.free is an invalid free / UB. free() of an empty slice is a no-op (Allocator.free).
+    return gpa.dupe(u8, s) catch @constCast("");
 }
 fn errJson(gpa: std.mem.Allocator, msg: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch dupe(gpa, "{\"ok\":false}");
@@ -193,4 +195,33 @@ pub fn serverTools(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.E
 /// mcp_call: run `tool` on the named stdio server with `arguments_json`.
 pub fn callServer(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, name: []const u8, tool: []const u8, arguments_json: []const u8) []u8 {
     return withNamedServer(gpa, io, env, name, tool, arguments_json);
+}
+
+test "serversObj accepts both config shapes (mcpServers / servers) and rejects everything else" {
+    const gpa = std.testing.allocator;
+    // Claude/Cursor shape
+    const claude = try std.json.parseFromSlice(std.json.Value, gpa, "{\"mcpServers\":{\"fs\":{\"command\":\"node\"}}}", .{});
+    defer claude.deinit();
+    try std.testing.expect(serversObj(claude.value).?.contains("fs"));
+    // VS Code shape
+    const vscode = try std.json.parseFromSlice(std.json.Value, gpa, "{\"servers\":{\"db\":{\"command\":\"psql\"}}}", .{});
+    defer vscode.deinit();
+    try std.testing.expect(serversObj(vscode.value).?.contains("db"));
+    // no server map, or the key present but not an object → null (never a crash)
+    const empty = try std.json.parseFromSlice(std.json.Value, gpa, "{\"other\":1}", .{});
+    defer empty.deinit();
+    try std.testing.expect(serversObj(empty.value) == null);
+    const wrongtype = try std.json.parseFromSlice(std.json.Value, gpa, "{\"mcpServers\":\"nope\"}", .{});
+    defer wrongtype.deinit();
+    try std.testing.expect(serversObj(wrongtype.value) == null);
+}
+
+test "objStr returns the string value or an empty string for missing/mistyped keys" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"command\":\"node\",\"port\":8080}", .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try std.testing.expectEqualStrings("node", objStr(o, "command"));
+    try std.testing.expectEqualStrings("", objStr(o, "missing"));
+    try std.testing.expectEqualStrings("", objStr(o, "port")); // present but an int, not a string
 }

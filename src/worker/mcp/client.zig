@@ -45,7 +45,9 @@ pub const Server = struct {
 };
 
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
-    return gpa.dupe(u8, s) catch @constCast("{\"ok\":false}");
+    // OOM fallback is ZERO-LENGTH on purpose: callers free this result unconditionally, and a static non-empty
+    // literal handed to gpa.free is an invalid free / UB. free() of an empty slice is a no-op (Allocator.free).
+    return gpa.dupe(u8, s) catch @constCast("");
 }
 
 fn errJson(gpa: std.mem.Allocator, msg: []const u8) []u8 {

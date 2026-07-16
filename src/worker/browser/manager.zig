@@ -440,10 +440,10 @@ pub fn closeKey(gpa: std.mem.Allocator, io: std.Io, key: []const u8) []u8 {
             gpa.free(e.key);
             slot.* = null;
             log.info("browser: closed session for {s}", .{key});
-            return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"closed\":true}}", .{}) catch @constCast("{\"ok\":true,\"closed\":true}");
+            return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"closed\":true}}", .{}) catch @constCast("");
         };
     }
-    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"closed\":false}}", .{}) catch @constCast("{\"ok\":true,\"closed\":false}");
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"closed\":false}}", .{}) catch @constCast("");
 }
 
 /// Teardown hook: close every live session. A long-lived host calls this on shutdown so no headless browser
@@ -510,7 +510,9 @@ pub fn sweepIdle(gpa: std.mem.Allocator, io: std.Io, max_idle_s: i64) usize {
 }
 
 fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
-    return gpa.dupe(u8, s) catch @constCast("{\"ok\":false}");
+    // OOM fallback is ZERO-LENGTH on purpose: callers free this result unconditionally, and a static non-empty
+    // literal handed to gpa.free is an invalid free / UB. free() of an empty slice is a no-op (Allocator.free).
+    return gpa.dupe(u8, s) catch @constCast("");
 }
 
 fn errJson(gpa: std.mem.Allocator, msg: []const u8) []u8 {
@@ -612,4 +614,50 @@ fn pBool(v: std.json.Value, key: []const u8) bool {
         },
         else => false,
     };
+}
+
+test "pStr/pInt/pBool read only their own JSON type; missing/mistyped keys degrade to null/false" {
+    const gpa = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, "{\"url\":\"x\",\"ref\":7,\"submit\":true,\"n\":\"5\"}", .{});
+    defer parsed.deinit();
+    const v = parsed.value;
+    try std.testing.expectEqualStrings("x", pStr(v, "url").?);
+    try std.testing.expectEqual(@as(i64, 7), pInt(v, "ref").?);
+    try std.testing.expect(pBool(v, "submit"));
+    // absent key
+    try std.testing.expect(pStr(v, "missing") == null);
+    try std.testing.expect(pInt(v, "missing") == null);
+    try std.testing.expect(!pBool(v, "missing"));
+    // present but wrong type: "n" is a string, not an int — must not coerce
+    try std.testing.expect(pInt(v, "n") == null);
+    try std.testing.expect(pStr(v, "ref") == null);
+    // a non-object root never panics
+    const scalar = try std.json.parseFromSlice(std.json.Value, gpa, "42", .{});
+    defer scalar.deinit();
+    try std.testing.expect(pInt(scalar.value, "ref") == null);
+}
+
+test "spliceField appends a field, frees the input, and leaves a non-object untouched" {
+    const gpa = std.testing.allocator;
+    const snap = try gpa.dupe(u8, "{\"a\":1}");
+    const out = spliceField(gpa, snap, "b", "2"); // frees snap, returns a fresh alloc
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("{\"a\":1,\"b\":2}", out);
+    // a value that isn't a '}'-terminated object is returned as-is (same backing slice, caller still frees once)
+    const bad = try gpa.dupe(u8, "not json");
+    const out2 = spliceField(gpa, bad, "b", "2");
+    defer gpa.free(out2);
+    try std.testing.expectEqualStrings("not json", out2);
+}
+
+test "dupe OOM fallback is a zero-length slice that is safe to free (guards the browser result contract)" {
+    // A real allocation succeeds and round-trips; the OOM path is exercised by the failing_allocator below.
+    const ok = dupe(std.testing.allocator, "{\"ok\":true}");
+    defer std.testing.allocator.free(ok);
+    try std.testing.expectEqualStrings("{\"ok\":true}", ok);
+    // Under OOM, dupe returns "" — freeing it (as every dispatch caller does) must be a no-op, not an invalid free.
+    var fa = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const empty = dupe(fa.allocator(), "{\"ok\":false}");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    fa.allocator().free(empty); // would trip the allocator's invalid-free detection if it weren't zero-length
 }

@@ -6,6 +6,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
     _ = @import("worker/agi.zig");
+    _ = @import("worker/browser/manager.zig");
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
@@ -17,6 +18,7 @@ test {
     _ = @import("worker/hyperspace.zig");
     _ = @import("worker/llm.zig");
     _ = @import("worker/locs/atlas.zig");
+    _ = @import("worker/mcp/discovery.zig");
     _ = @import("worker/metrics.zig");
     _ = @import("worker/modelcfg.zig");
     _ = @import("worker/rerank.zig");
