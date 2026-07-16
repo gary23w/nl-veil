@@ -54,6 +54,16 @@ pub const Poller = struct {
     last_sched_s: i64 = 0,
     sched_scratch: [store_mod.MAX_SCHED]store_mod.SchedRow = undefined,
     last_llm_s: i64 = 0, // LLM-usage metrics poll throttle (Dashboard aggregates move slowly)
+    // idle-churn gates: the roster walk + the selected swarm's Details/Files sub-scans ran EVERY second
+    // forever; these cache the last result so an idle desk touches the filesystem every 5-10s instead.
+    last_roster_s: i64 = 0, // last full data-dir roster walk (0 = force next tick; deploy/delete reset it)
+    roster_cache_n: usize = 0, // rows currently valid in swarm_scratch
+    roster_any_live: bool = false, // last walk saw a live swarm → keep walking per-tick
+    last_subscan_s: i64 = 0, // last Details/Files sub-scan of the selected swarm
+    file_cache_n: usize = 0, // published counts for skipped sub-scan ticks (scratch buffers keep the data)
+    fc_cache_len: usize = 0,
+    fc_cache_trunc: bool = false,
+    last_key_s: i64 = 0, // .desktop_key re-read gate once a token is held
     last_cf_s: i64 = 0, // Cloudflare OAuth status poll throttle (reset to 0 to poll on the next tick)
     last_cfm_s: i64 = 0, // Cloudflare live-models fetch throttle (only while connected; 0 = fetch next tick)
 
@@ -342,6 +352,7 @@ pub const Poller = struct {
 
     fn doDeploy(self: *Poller, body: []const u8) void {
         log.trace("poller.doDeploy body_len={d}", .{body.len});
+        self.last_roster_s = 0; // the new swarm must appear on the very next roster walk
         // `body` is the complete DeployReq JSON built by the UI (Deploy form). Post it verbatim.
         if (body.len == 0) {
             log.err("deploy: EMPTY body (submitDeploy built nothing — buffer overflow or bad state)", .{});
@@ -381,6 +392,7 @@ pub const Poller = struct {
     fn doDelete(self: *Poller, dd: []const u8, rel: []const u8) void {
         log.trace("poller.doDelete rel={s}", .{rel});
         if (rel.len == 0) return;
+        self.last_roster_s = 0; // drop the row on the very next roster walk
         const base = if (std.mem.lastIndexOfScalar(u8, rel, '/')) |sl| rel[sl + 1 ..] else rel;
         if (std.mem.indexOfScalar(u8, rel, '/') != null) {
             // server swarm → API delete (stops + removes)
@@ -424,11 +436,20 @@ pub const Poller = struct {
     /// user manually saved their own token.
     fn syncDesktopKey(self: *Poller, dd: []const u8) void {
         log.trace("poller.syncDesktopKey dd={s}", .{dd});
+        var have_token = false;
         {
             self.store.lock();
             const manual = self.store.settings.token_manual;
+            have_token = self.store.settings.token_len > 0;
             self.store.unlock();
             if (manual) return;
+        }
+        // First boot polls every tick so pairing lands instantly; once a token is held, a rotated key
+        // still syncs within 10s — no need to re-read the file every second forever.
+        if (have_token) {
+            const now_s: i64 = @intCast(@divTrunc(Io.Timestamp.now(self.io, .real).nanoseconds, std.time.ns_per_s));
+            if (now_s - self.last_key_s < 10) return;
+            self.last_key_s = now_s;
         }
         const path = std.fmt.allocPrint(self.gpa, "{s}/.desktop_key", .{dd}) catch return;
         defer self.gpa.free(path);
@@ -458,13 +479,18 @@ pub const Poller = struct {
         _ = std.process.spawn(self.io, .{ .argv = argv, .cwd = .{ .path = dd }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
     }
 
-    /// Append any new log lines to <data>/veil-desk.log. Uses writeFile (whole-file rewrite of a bounded
-    /// in-memory copy) rather than an append API — simplest reliable path.
+    /// Append any new log lines to <data>/veil-desk.log — APPEND-ONLY (positioned write at end, the
+    /// http.appendFile idiom). The old shape rewrote the ENTIRE accumulated buffer (up to 512KB) on every
+    /// tick that produced a line; with trace defaulting on, that was a ~0.5MB disk write EVERY SECOND into
+    /// the OneDrive-synced data dir — the desk, OneDrive, and Defender all burned CPU on it around the
+    /// clock. Now a flush writes only the NEW lines (typically <1KB), and a 1MB ceiling rotates the file
+    /// by rewriting it with just those fresh lines (old diagnostics age out; the F12 overlay still has the
+    /// in-memory ring).
     fn flushLog(self: *Poller, dd: []const u8) void {
         var lb: [128]log.Line = undefined;
         const n = log.drain(&lb);
         if (n == 0) return;
-        log.trace("poller.flushLog draining {d} lines to {s}/veil-desk.log", .{ n, dd });
+        self.log_buf.clearRetainingCapacity(); // reused as the per-flush format scratch, NOT an accumulator
         for (lb[0..n]) |ln| {
             const hh: u64 = @intCast(@mod(@divTrunc(ln.t_s, 3600), 24));
             const mm: u64 = @intCast(@mod(@divTrunc(ln.t_s, 60), 60));
@@ -473,14 +499,24 @@ pub const Poller = struct {
             defer self.gpa.free(s);
             self.log_buf.appendSlice(self.gpa, s) catch {};
         }
-        if (self.log_buf.items.len > 512 * 1024) {
-            const keep = self.log_buf.items[self.log_buf.items.len / 2 ..];
-            std.mem.copyForwards(u8, self.log_buf.items, keep);
-            self.log_buf.items.len = keep.len;
-        }
+        if (self.log_buf.items.len == 0) return;
         const p = std.fmt.allocPrint(self.gpa, "{s}/veil-desk.log", .{dd}) catch return;
         defer self.gpa.free(p);
-        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = p, .data = self.log_buf.items }) catch {};
+        const dir = Io.Dir.cwd();
+        // end-of-file from statFile, NEVER a fresh handle's length (returns 0 on Windows/Io and would
+        // clobber the head); only FileNotFound legitimately means offset 0. Same rules as http.appendFile.
+        const end: u64 = if (dir.statFile(self.io, p, .{})) |st| st.size else |e| switch (e) {
+            error.FileNotFound => 0,
+            else => return, // transient stat trouble (AV window): drop this flush, never clobber
+        };
+        if (end > 1024 * 1024) {
+            // rotate: start the file over with just this flush's lines
+            dir.writeFile(self.io, .{ .sub_path = p, .data = self.log_buf.items }) catch {};
+            return;
+        }
+        const f = dir.createFile(self.io, p, .{ .truncate = false }) catch return;
+        defer f.close(self.io);
+        f.writePositionalAll(self.io, self.log_buf.items, end) catch {};
     }
 
     fn refresh(self: *Poller) void {
@@ -592,8 +628,22 @@ pub const Poller = struct {
             }
         }
 
-        // 2) roster
-        const nsw = scan.listSwarms(self.io, self.gpa, dd, &self.swarm_scratch, now_s, 45);
+        // 2) roster — a data-dir walk + per-swarm summary reads. Per-tick ONLY while something is live
+        // (a cast's progress/finish must show within a second); idle, the walk drops to every 5s. A deploy
+        // or delete resets last_roster_s so its effect shows on the very next tick.
+        var nsw = self.roster_cache_n;
+        if (self.roster_any_live or now_s - self.last_roster_s >= 5) {
+            self.last_roster_s = now_s;
+            nsw = scan.listSwarms(self.io, self.gpa, dd, &self.swarm_scratch, now_s, 45);
+            self.roster_cache_n = nsw;
+            self.roster_any_live = false;
+            for (self.swarm_scratch[0..nsw]) |*sw| {
+                if (sw.live) {
+                    self.roster_any_live = true;
+                    break;
+                }
+            }
+        }
 
         // 3) selected swarm tail
         var selbuf: [64]u8 = undefined;
@@ -610,6 +660,7 @@ pub const Poller = struct {
         var fc_len: usize = 0;
         var fc_trunc = false;
         if (sel_len > 0) {
+            var quiet = false; // selection unchanged AND events.jsonl hasn't grown since last tick
             const ep = std.fmt.allocPrint(self.gpa, "{s}/{s}/events.jsonl", .{ dd, selbuf[0..sel_len] }) catch "";
             if (ep.len > 0) {
                 defer self.gpa.free(ep);
@@ -619,6 +670,7 @@ pub const Poller = struct {
                     // unchanged since last tick — reuse the parsed ring (still in ev_scratch) + metrics
                     ev_n = self.ev_cache_n;
                     metrics = self.ev_cache_metrics;
+                    quiet = true;
                 } else {
                     ev_n = scan.tailEvents(self.io, self.gpa, ep, &self.ev_scratch, &metrics);
                     self.ev_cache_size = cur_size;
@@ -628,21 +680,32 @@ pub const Poller = struct {
                     self.ev_cache_metrics = metrics;
                 }
             }
-            // Details tab: the manifest + blueprint the run was given (cheap flat reads, refreshed each tick
-            // so a late-written .blueprint still appears).
-            scan.readSwarmConfig(self.io, self.gpa, dd, selbuf[0..sel_len], &self.cfg_scratch);
-            // Files tab: list built files, and (if one is open) re-read its content.
-            file_n = scan.listWorkFiles(self.io, self.gpa, dd, selbuf[0..sel_len], &self.file_scratch);
-            var selfile: [128]u8 = undefined;
-            var selfile_len: usize = 0;
-            {
-                self.store.lock();
-                selfile_len = self.store.sel_file_len;
-                @memcpy(selfile[0..selfile_len], self.store.sel_file[0..selfile_len]);
-                self.store.unlock();
+            // Details/Files sub-scans (manifest+blueprint reads, a work-tree walk, the open file's re-read):
+            // per-tick while the run is MOVING (events growing / selection fresh), every 10s once it's quiet —
+            // an idle desk was re-walking a whole built project tree every second, forever, for nothing.
+            if (!quiet or now_s - self.last_subscan_s >= 10) {
+                self.last_subscan_s = now_s;
+                scan.readSwarmConfig(self.io, self.gpa, dd, selbuf[0..sel_len], &self.cfg_scratch);
+                file_n = scan.listWorkFiles(self.io, self.gpa, dd, selbuf[0..sel_len], &self.file_scratch);
+                var selfile: [128]u8 = undefined;
+                var selfile_len: usize = 0;
+                {
+                    self.store.lock();
+                    selfile_len = self.store.sel_file_len;
+                    @memcpy(selfile[0..selfile_len], self.store.sel_file[0..selfile_len]);
+                    self.store.unlock();
+                }
+                if (selfile_len > 0)
+                    fc_len = scan.readWorkFile(self.io, self.gpa, dd, selbuf[0..sel_len], selfile[0..selfile_len], &self.fc_scratch, &fc_trunc);
+                self.file_cache_n = file_n;
+                self.fc_cache_len = fc_len;
+                self.fc_cache_trunc = fc_trunc;
+            } else {
+                // scratch buffers still hold the last sub-scan's data — republish the cached view
+                file_n = self.file_cache_n;
+                fc_len = self.fc_cache_len;
+                fc_trunc = self.fc_cache_trunc;
             }
-            if (selfile_len > 0)
-                fc_len = scan.readWorkFile(self.io, self.gpa, dd, selbuf[0..sel_len], selfile[0..selfile_len], &self.fc_scratch, &fc_trunc);
         }
 
         // 4) publish under lock
