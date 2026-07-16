@@ -9,6 +9,7 @@ const ent = @import("../../plan/entitlements.zig");
 const neurons = @import("../../plan/neurons.zig");
 const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
+const modelcfg = @import("../modelcfg.zig");
 const tail_fanout = @import("../control/fanout.zig");
 const App = http.App;
 const requireUser = http.requireUser;
@@ -178,7 +179,7 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
             eff_base = std.fmt.allocPrint(arena, "https://api.cloudflare.com/client/v4/accounts/{s}/ai/v1", .{app.cf_account_id}) catch return failSrv("out of memory");
             eff_key = app.workers_ai_token;
         }
-        if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+        if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = modelcfg.defaults.cf_model;
     } else if (eff_key.len == 0 and body.base_url.len == 0) {
         // Fall back to a stored BYOK key ONLY when the caller gave no explicit endpoint (the deploy-wizard
         // flow: pick a provider, no base, no key). A custom OpenAI-compatible endpoint always carries its own
@@ -544,8 +545,9 @@ pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const live = app.sup.liveMindsForUser(u.id);
     const active = app.sup.activeSwarmsForUser(u.id);
     const minds: usize = if (body.minds == 0) 1 else body.minds;
-    const keyless = std.mem.eql(u8, body.provider, "mock") or std.mem.eql(u8, body.provider, "ollama") or
-        std.mem.eql(u8, body.provider, "workers-ai") or std.mem.eql(u8, body.provider, "cloudflare");
+    // keyless providers come from the catalog (models.yaml keyless:true — mock/ollama/workers-ai); the
+    // "cloudflare" sentinel is a server-side alias for workers-ai-with-server-creds, kept explicit.
+    const keyless = modelcfg.isKeyless(body.provider) or std.mem.eql(u8, body.provider, "cloudflare");
     const has_key = app.vault.has(u.id, body.provider);
     const blocked: ?[]const u8 =
         if (minds > e.per_swarm_minds) "exceeds this plan's minds-per-swarm" else if (live + minds > e.max_minds) "would exceed your live-mind limit" else if (active >= e.max_swarms) "concurrent-swarm limit reached" else null;

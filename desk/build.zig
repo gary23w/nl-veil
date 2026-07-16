@@ -16,6 +16,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // The SHARED model catalog: the server's src/worker/modelcfg.zig, comptime-parsing the repo-root
+    // models.yaml (registered as its anonymous import). catalog.zig imports "modelcfg" so every desk model
+    // menu reads the SAME source of truth the server does. A fresh module per build target keeps its
+    // comptime-parsed data local to this package.
+    const modelcfg = b.createModule(.{
+        .root_source_file = b.path("../src/worker/modelcfg.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    modelcfg.addAnonymousImport("models.yaml", .{ .root_source_file = b.path("../models.yaml") });
+
     const exe = b.addExecutable(.{
         .name = "veil-desk",
         .root_module = b.createModule(.{
@@ -25,6 +36,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("raylib", raylib_dep.module("raylib"));
+    exe.root_module.addImport("modelcfg", modelcfg);
     exe.root_module.linkLibrary(raylib_dep.artifact("raylib"));
     // GUI subsystem on Windows release builds: no console window behind the dashboard.
     if (target.result.os.tag == .windows and optimize != .Debug) exe.subsystem = .Windows;
@@ -48,6 +60,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("raylib", raylib_dep.module("raylib"));
+    tests.root_module.addImport("modelcfg", modelcfg);
     tests.root_module.linkLibrary(raylib_dep.artifact("raylib"));
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run veil-desk unit tests");

@@ -1045,9 +1045,10 @@ fn seedChatDefaults(store: *Store) void {
     defer store.unlock();
     const s = &store.settings;
     s.chat_kind = 0;
-    const model = "gpt-oss:20b";
-    @memcpy(s.chat_model[0..model.len], model);
-    s.chat_model_len = model.len;
+    const model = catalog.defaults.local_model; // the catalog's local default (models.yaml)
+    const n = @min(model.len, s.chat_model.len);
+    @memcpy(s.chat_model[0..n], model[0..n]);
+    s.chat_model_len = @intCast(n);
 }
 
 /// Auto-load the admin API key the server dropped at <data>/.desktop_key so Deploy works with no manual
@@ -4055,7 +4056,7 @@ fn submitDeploy(store: *Store, prov: *const catalog.Provider) void {
         @memcpy(keybuf[0..kn], ksl[0..kn]);
         eff_key = keybuf[0..kn];
         var msl: []const u8 = s.chatModel();
-        if (msl.len == 0) msl = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+        if (msl.len == 0) msl = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else catalog.defaults.local_model;
         const mn = @min(msl.len, modelbuf.len);
         @memcpy(modelbuf[0..mn], msl[0..mn]);
         eff_model = modelbuf[0..mn];
@@ -5141,7 +5142,7 @@ fn submitSched(store: *Store) void {
             }
             if (model.len == 0) {
                 var m: []const u8 = s.chatModel();
-                if (m.len == 0) m = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else "gpt-oss:20b";
+                if (m.len == 0) m = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else catalog.defaults.local_model;
                 const mn = @min(m.len, modelbuf.len);
                 @memcpy(modelbuf[0..mn], m[0..mn]);
                 model = modelbuf[0..mn];
@@ -5751,7 +5752,7 @@ fn flushChatDropdown(store: *Store) void {
             store.lock();
             store.settings.chat_kind = newkind;
             if (newkind == 0) {
-                setChatModelLocked(store, if (ol_n > 0) models[0].nameStr() else "gpt-oss:20b");
+                setChatModelLocked(store, if (ol_n > 0) models[0].nameStr() else catalog.defaults.local_model);
             } else if (newkind == 1) {
                 const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
                 if (p.needs_account and cf_n > 0) setChatModelLocked(store, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);

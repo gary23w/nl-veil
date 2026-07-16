@@ -31,6 +31,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("app.js", .{ .root_source_file = b.path("web/public/app.js") });
     exe.root_module.addAnonymousImport("styles.css", .{ .root_source_file = b.path("web/public/styles.css") });
     exe.root_module.addAnonymousImport("models.json", .{ .root_source_file = b.path("web/public/models.json") });
+    // models.yaml — THE model catalog (src/worker/modelcfg.zig @embedFile's it). Registered on the root
+    // module so the embed resolves; the desk build and both test modules register their own copy too.
+    exe.root_module.addAnonymousImport("models.yaml", .{ .root_source_file = b.path("models.yaml") });
     b.installArtifact(exe);
 
     // ---- veil-desk (desktop dashboard) ----
@@ -72,6 +75,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("httpz", httpz.module("httpz"));
+    tests.root_module.addAnonymousImport("models.yaml", .{ .root_source_file = b.path("models.yaml") }); // modelcfg tests @embedFile it
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_tests.step);
