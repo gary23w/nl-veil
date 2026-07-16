@@ -218,9 +218,9 @@ fn parseModels(raw: []const u8, comptime want_key: []const u8) []const Model {
 // ---- tests: the EMBEDDED catalog itself is the fixture — CI fails on a bad edit -------------------------
 
 test "models.yaml parses: provider order pins the desk's persisted dropdown indices" {
-    try std.testing.expect(providers.len >= 9);
-    // the legacy indices the desk persisted — order is a compatibility contract (append-only)
-    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "workers-ai", "groq", "deepseek", "google", "mock", "huggingface" };
+    try std.testing.expect(providers.len >= 10);
+    // the persisted dropdown indices — order is a compatibility contract (append-only)
+    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "workers-ai", "groq", "deepseek", "google", "mock", "huggingface", "zai" };
     for (expect, 0..) |k, i| try std.testing.expectEqualStrings(k, providers[i].key);
 }
 
