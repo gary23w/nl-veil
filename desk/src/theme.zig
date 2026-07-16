@@ -309,6 +309,13 @@ fn scrubTransparentRgb(img: *rl.Image) void {
     }
 }
 
+/// Replace the proportional UI font at RUNTIME (the dyslexia-mode toggle), unloading the previous atlas
+/// so repeated toggles never leak GPU textures. Render thread only, like every font/texture call here.
+pub fn swapFont(f: rl.Font) void {
+    if (ui_font) |old| rl.unloadFont(old);
+    ui_font = f;
+}
+
 pub fn setFont(f: rl.Font) void {
     log.trace("theme.setFont", .{});
     ui_font = f;

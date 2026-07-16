@@ -3363,6 +3363,7 @@ pub const Chat = struct {
         var shell_allow = false;
         var speed = true;
         var server_chat = false;
+        var dyslexia = false;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -3383,6 +3384,7 @@ pub const Chat = struct {
             shell_allow = s.shell_always_allow;
             speed = s.speed_mode;
             server_chat = s.server_chat;
+            dyslexia = s.dyslexia;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -3413,7 +3415,7 @@ pub const Chat = struct {
         // `chat_local` (its opt-outs were manufactured by a MISLEADING Settings label that sold "tools in
         // your environment" as the local option's advantage after delegation made that the SERVER path's
         // behavior too). A fresh key on each semantic break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"local_brain\":{},\"dyslexia\":{}}}", .{ lopen, ropen, shell_allow, speed, !server_chat, dyslexia }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -3473,6 +3475,7 @@ pub const Chat = struct {
         s.chat_right_open = std.mem.indexOf(u8, data, "\"right\":false") == null;
         s.shell_always_allow = std.mem.indexOf(u8, data, "\"shell_allow\":true") != null;
         s.speed_mode = std.mem.indexOf(u8, data, "\"speed\":false") == null; // absent (old settings) = default ON
+        s.dyslexia = std.mem.indexOf(u8, data, "\"dyslexia\":true") != null; // opt-in: absent = standard font
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
         // stays a thin client. The local engine survives only as a break-glass fallback when the server is
