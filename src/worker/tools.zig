@@ -229,6 +229,11 @@ pub const ToolCtx = struct {
     // assistant to act on their own files — the workdir jail is a SWARM-mind boundary, not a client one.
     // Writes (write_file/edit_file/delete_file) stay workdir-locked everywhere. Never set for minds.
     roam: bool = false,
+    // Route browser/pixel tools through the per-machine local-host DAEMON instead of the in-process manager.
+    // Set ONLY by `veil exec-tool` (subprocess-per-call: a fresh process per delegated tool can't hold a browser
+    // session, so the daemon does). A LONG-LIVED process (the server's /chat/tool endpoint, a swarm worker) keeps
+    // the session IN-PROCESS — spawning a daemon from it just piles up unreachable daemons.
+    browser_daemon: bool = false,
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -970,13 +975,13 @@ fn browserDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 
     return std.fmt.allocPrint(gpa, "unknown browser tool: {s}", .{name}) catch dupe(gpa, "unknown browser tool");
 }
 
-/// The client-vs-server routing seam. A tool executing on the CLIENT (roam=true — a desk/CLI delegated call)
-/// forwards to the per-machine local-host daemon so ONE browser session survives the desk's subprocess-per-call
-/// pattern and drives the USER's browser. A server/swarm/CLI-direct call (roam=false) uses the in-process
-/// manager. Both funnel through the identical manager.dispatch action set.
+/// The routing seam. A SUBPROCESS-PER-CALL executor (`veil exec-tool`, browser_daemon=true) forwards to the
+/// per-machine local-host daemon so ONE browser session survives across its separate processes. A LONG-LIVED
+/// process (the server's /chat/tool endpoint, a swarm worker) keeps the session in-process — spawning a daemon
+/// from it just races unreachable daemons. Both funnel through the identical manager.dispatch action set.
 fn browserOp(ctx: *ToolCtx, action: []const u8, params_json: []const u8) []u8 {
     const key = ctx.run_dir;
-    if (ctx.roam) return browser_host.forward(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
+    if (ctx.browser_daemon) return browser_host.forward(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
     return browser_mgr.dispatch(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
 }
 
@@ -997,8 +1002,9 @@ fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer gpa.free(url);
         const allow = ctx.environ.get("NL_BROWSER_ALLOWLIST") orelse "";
         if (!egressAllowed(allow, url)) return std.fmt.allocPrint(gpa, "blocked: host '{s}' is not on NL_BROWSER_ALLOWLIST", .{urlHost(url)}) catch dupe(gpa, "blocked by allowlist");
-        // roam ⇒ render on the client's local-host daemon (persistent browser); else render in-process.
-        return pixelrag.ingest(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, url, p.value.doc_id, ctx.roam);
+        // browser_daemon ⇒ render on the machine's local-host daemon (subprocess-per-call needs the persistent
+        // browser); else render in-process (server/swarm/CLI-direct keep their own session).
+        return pixelrag.ingest(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, url, p.value.doc_id, ctx.browser_daemon);
     }
     if (std.mem.eql(u8, name, "pixel_search")) {
         const A = struct { query: []const u8 = "", k: u32 = 4 };
@@ -1137,7 +1143,7 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     var broker_tok: []const u8 = "";
     var tok_buf: [32]u8 = undefined;
     if (browserEnabled(ctx) or mcpEnabled(ctx)) {
-        if (ctx.roam) {
+        if (ctx.browser_daemon) {
             if (browser_host.ensure(gpa, ctx.io, ctx.environ)) |info| {
                 broker_port = info.port;
                 @memcpy(&tok_buf, &info.token);

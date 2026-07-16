@@ -14,6 +14,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const broker = @import("broker.zig");
 const manager = @import("manager.zig");
+const util = @import("util.zig");
 const httpc = @import("../httpc.zig");
 
 const log = std.log.scoped(.browser);
@@ -43,7 +44,7 @@ pub fn runDaemon(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Env
 
     const started = std.Io.Timestamp.now(io, .real).toSeconds();
     while (true) {
-        io.sleep(.{ .nanoseconds = 3 * std.time.ns_per_s }, .awake) catch {};
+        util.sleepMs(3000);
         const now = std.Io.Timestamp.now(io, .real).toSeconds();
         const live = manager.liveCount(io);
         const last = manager.lastActivity();
@@ -113,7 +114,7 @@ pub fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Enviro
     spawnDaemon(gpa, io, env);
     var waited: u32 = 0;
     while (waited < 12_000) : (waited += 200) {
-        io.sleep(.{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+        util.sleepMs(200); // raw-thread-safe: this runs on an httpz worker / exec-tool thread, where io.sleep throws
         if (readInfo(gpa, io, path)) |info| {
             if (reachable(gpa, io, info)) return info;
         }

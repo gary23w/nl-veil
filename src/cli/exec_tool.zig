@@ -46,6 +46,9 @@ pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: 
         // tools may take absolute/~ paths, and stage_file may copy outside files into the workdir. Swarm minds
         // never get this (their ToolCtx builders don't set it).
         .roam = true,
+        // Subprocess-per-call: a fresh exec-tool process per delegated tool can't hold a browser session, so
+        // browser/pixel tools route to the persistent per-machine daemon instead of an in-process manager.
+        .browser_daemon = true,
     };
     return tools.execute(&tctx, name, args_json);
 }

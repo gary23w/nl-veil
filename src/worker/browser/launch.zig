@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const util = @import("util.zig");
 
 const log = std.log.scoped(.browser);
 
@@ -125,7 +126,7 @@ pub fn readEndpoint(gpa: std.mem.Allocator, io: std.Io, user_data_dir: []const u
     var waited: u32 = 0;
     while (waited < timeout_ms) : (waited += 100) {
         const txt = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(4096)) catch {
-            io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+            util.sleepMs(100);
             continue;
         };
         defer gpa.free(txt);
@@ -133,7 +134,7 @@ pub fn readEndpoint(gpa: std.mem.Allocator, io: std.Io, user_data_dir: []const u
         const port_s = lines.next() orelse return error.BadPortFile;
         const ws = lines.next() orelse {
             // port line present but ws path not flushed yet — retry
-            io.sleep(.{ .nanoseconds = 100 * std.time.ns_per_ms }, .awake) catch {};
+            util.sleepMs(100);
             continue;
         };
         const port = std.fmt.parseInt(u16, std.mem.trim(u8, port_s, " \t"), 10) catch return error.BadPortFile;
