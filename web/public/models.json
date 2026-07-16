@@ -97,6 +97,13 @@
       "kind": "openai-compatible",
       "base_url": "https://api.z.ai/api/paas/v4",
       "needs_key": true
+    },
+    {
+      "key": "tokengo",
+      "label": "TokenGO",
+      "kind": "openai-compatible",
+      "base_url": "https://api.thorbase.com/v1",
+      "needs_key": true
     }
   ],
   "models": [
@@ -739,6 +746,106 @@
       "tools": "partial",
       "cost": "free",
       "note": "GLM-4.5 Flash — Z.AI's free tier. Fast and no-cost; supports tools but the small/free tier is less reliable in complex multi-tool swarms — validate per-mind. Great for testing the Z.AI provider without spend."
+    },
+    {
+      "id": "z-ai/glm-5.2",
+      "label": "GLM 5.2 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Z.AI GLM-5.2 flagship served via TokenGO (self-operated inference at a discount; official API as fallback). OpenAI-compatible at https://api.thorbase.com/v1, Bearer auth, model field = vendor slug 'z-ai/glm-5.2'. 1M context. ~$1.26/$3.96 per 1M in/out. Top TokenGO pick for demanding agentic minds."
+    },
+    {
+      "id": "moonshotai/kimi-k2.6",
+      "label": "Kimi K2.6 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 262000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Moonshot Kimi K2.6 (text+vision) via TokenGO. Purpose-built for agentic tool use; tops tool-use benchmarks. 262K context. ~$0.61/$3.07 per 1M in/out. Slug 'moonshotai/kimi-k2.6'. Excellent agentic default."
+    },
+    {
+      "id": "deepseek/deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "DeepSeek V4 Pro (large MoE) via TokenGO, 1M context, strong long-horizon agentic coding. ~$0.43/$0.87 per 1M in/out — very cheap for its tier. Slug 'deepseek/deepseek-v4-pro'."
+    },
+    {
+      "id": "deepseek/deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 1000000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "DeepSeek V4 Flash via TokenGO, 1M context, reliable tool caller. Cheapest strong option here: ~$0.10/$0.20 per 1M in/out. Slug 'deepseek/deepseek-v4-flash'. Great high-volume default."
+    },
+    {
+      "id": "qwen/qwen3.5-397b-a17b",
+      "label": "Qwen3.5 397B A17B (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 262000,
+      "tools": "reliable",
+      "cost": "med",
+      "note": "Qwen3.5 397B-A17B MoE (text+vision) via TokenGO, strong instruction-following + agent tool use. 262K context. ~$0.40/$2.65 per 1M in/out. Slug 'qwen/qwen3.5-397b-a17b'."
+    },
+    {
+      "id": "minimax/minimax-m2.5",
+      "label": "MiniMax M2.5 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 197000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "MiniMax M2.5 via TokenGO, 197K context. Cheap (~$0.14/$0.81 per 1M in/out); verify tool-calling reliability in complex swarms. Slug 'minimax/minimax-m2.5'."
+    },
+    {
+      "id": "z-ai/glm-5.1",
+      "label": "GLM 5.1 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 203000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Z.AI GLM-5.1 via TokenGO, 203K context, agent-tuned. ~$0.88/$2.80 per 1M in/out. Slug 'z-ai/glm-5.1'. Cheaper step below 5.2."
+    },
+    {
+      "id": "z-ai/glm-5",
+      "label": "GLM 5 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 203000,
+      "tools": "reliable",
+      "cost": "low",
+      "note": "Z.AI GLM-5 via TokenGO, 203K context. ~$0.48/$1.54 per 1M in/out — cheapest of the GLM-5 line here. Slug 'z-ai/glm-5'."
+    },
+    {
+      "id": "deepseek/deepseek-v3.2",
+      "label": "DeepSeek V3.2 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 131000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "DeepSeek V3.2 (sparse-attention MoE) via TokenGO, 131K context. Very cheap (~$0.22/$0.33). DeepSeek tool-calling is good but verify in dense swarms. Slug 'deepseek/deepseek-v3.2'."
+    },
+    {
+      "id": "deepseek/deepseek-v3.1",
+      "label": "DeepSeek V3.1 (TokenGO)",
+      "provider": "tokengo",
+      "hosting": "hosted",
+      "context": 164000,
+      "tools": "partial",
+      "cost": "low",
+      "note": "DeepSeek V3.1 via TokenGO, 164K context. ~$0.19/$0.71 per 1M in/out. Structured tool calling supported; verify per-mind. Slug 'deepseek/deepseek-v3.1'."
     }
   ],
   "defaults": {

@@ -176,3 +176,32 @@ providers:
         label: GLM-4.5 Air
       - id: glm-4.5-flash
         label: GLM-4.5 Flash (free)
+
+  # TokenGO (API host: api.thorbase.com) — OpenAI-compatible aggregator running discounted self-operated
+  # inference for Moonshot / Z.AI / DeepSeek / Qwen / MiniMax. Bearer auth; model ids are vendor/model slugs.
+  # $5 free test credits on signup. Docs: https://tokengo.com/docs
+  - key: tokengo
+    label: TokenGO
+    base: https://api.thorbase.com/v1
+    needs_key: true
+    models:
+      - id: z-ai/glm-5.2
+        label: GLM 5.2
+      - id: moonshotai/kimi-k2.6
+        label: Kimi K2.6
+      - id: deepseek/deepseek-v4-pro
+        label: DeepSeek V4 Pro
+      - id: deepseek/deepseek-v4-flash
+        label: DeepSeek V4 Flash
+      - id: qwen/qwen3.5-397b-a17b
+        label: Qwen3.5 397B A17B
+      - id: minimax/minimax-m2.5
+        label: MiniMax M2.5
+      - id: z-ai/glm-5.1
+        label: GLM 5.1
+      - id: z-ai/glm-5
+        label: GLM 5
+      - id: deepseek/deepseek-v3.2
+        label: DeepSeek V3.2
+      - id: deepseek/deepseek-v3.1
+        label: DeepSeek V3.1
