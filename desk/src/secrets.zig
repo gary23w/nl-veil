@@ -78,6 +78,47 @@ pub fn load(io: Io, gpa: std.mem.Allocator, dir: []const u8, out: []u8) usize {
     return loadAt(io, gpa, p, out);
 }
 
+// ---- PER-PROVIDER keys ---------------------------------------------------------------------------------
+// Each cloud/BYOK provider (and the custom URL) keeps its OWN at-rest key, so selecting DeepSeek and saving a
+// key never overwrites (or gets mismatched with) the OpenAI/Anthropic/… key. The `slug` is the provider's
+// stable catalog id (e.g. "deepseek", "workers-ai", "custom") — filesystem-safe by construction.
+
+/// `<dir>/chat_key_<slug>[.bin]` — the per-provider key file. null only on alloc failure.
+fn pathForSlug(gpa: std.mem.Allocator, dir: []const u8, slug: []const u8) ?[]u8 {
+    const ext = if (builtin.os.tag == .windows) ".bin" else "";
+    return std.fmt.allocPrint(gpa, "{s}/chat_key_{s}{s}", .{ dir, slug, ext }) catch null;
+}
+
+/// Persist `key` for provider `slug` as plaintext-local. Empty removes just that provider's key.
+pub fn saveFor(io: Io, gpa: std.mem.Allocator, dir: []const u8, slug: []const u8, key: []const u8) bool {
+    log.trace("secrets.saveFor slug={s} key_len={d}", .{ slug, key.len });
+    const p = pathForSlug(gpa, dir, slug) orelse return false;
+    defer gpa.free(p);
+    return saveAt(io, gpa, p, key);
+}
+
+/// Load provider `slug`'s key into `out`; returns its length (0 = none stored for this provider).
+pub fn loadFor(io: Io, gpa: std.mem.Allocator, dir: []const u8, slug: []const u8, out: []u8) usize {
+    const p = pathForSlug(gpa, dir, slug) orelse return 0;
+    defer gpa.free(p);
+    return loadAt(io, gpa, p, out);
+}
+
+/// ONE-TIME UPGRADE: an older build stored a SINGLE global key (`chat_key`) shared across every provider.
+/// Move it to `slug` — the provider it was actually being used for — and delete the legacy file, so the
+/// upgrading user keeps their key for the current provider while every OTHER provider correctly starts empty
+/// (the old shared-key mismatch is gone). Returns the migrated length in `out` (0 = nothing to migrate).
+pub fn migrateLegacy(io: Io, gpa: std.mem.Allocator, dir: []const u8, slug: []const u8, out: []u8) usize {
+    const legacy = path(gpa, dir) orelse return 0;
+    defer gpa.free(legacy);
+    const n = loadAt(io, gpa, legacy, out);
+    if (n == 0) return 0;
+    _ = saveFor(io, gpa, dir, slug, out[0..n]);
+    Io.Dir.cwd().deleteFile(io, legacy) catch {};
+    log.info("secrets: migrated the legacy shared chat key to provider '{s}'", .{slug});
+    return n;
+}
+
 /// Read the plaintext secret from `p`. AUTO-UNSEAL MIGRATION: a file written by an older build is a DPAPI blob;
 /// on Windows we try to unseal it ONCE and, on success, rewrite it as plaintext so at-rest is plaintext-local
 /// from here on. A plaintext file fails the unseal (DPAPI blobs are structured) and falls through unchanged.
@@ -120,4 +161,33 @@ test "secrets round-trip (native store)" {
     // empty key removes the secret
     try std.testing.expect(save(io, std.testing.allocator, dir, ""));
     try std.testing.expectEqual(@as(usize, 0), load(io, std.testing.allocator, dir, &buf));
+}
+
+test "per-provider keys stay separate; legacy migrates to the current provider only" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = std.testing.allocator;
+    const dir = "zig-secrets-pp-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var buf: [64]u8 = undefined;
+
+    // two providers, two distinct keys — neither clobbers the other
+    try std.testing.expect(saveFor(io, gpa, dir, "deepseek", "sk-deep"));
+    try std.testing.expect(saveFor(io, gpa, dir, "openai", "sk-open"));
+    try std.testing.expectEqualStrings("sk-deep", buf[0..loadFor(io, gpa, dir, "deepseek", &buf)]);
+    try std.testing.expectEqualStrings("sk-open", buf[0..loadFor(io, gpa, dir, "openai", &buf)]);
+    // a provider never given a key reads empty (no cross-provider leak)
+    try std.testing.expectEqual(@as(usize, 0), loadFor(io, gpa, dir, "anthropic", &buf));
+
+    // legacy: a single global key migrates to the CURRENT provider and is then gone; others stay empty
+    const dir2 = "zig-secrets-mig-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dir2, .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir2) catch {};
+    try std.testing.expect(save(io, gpa, dir2, "sk-legacy"));
+    try std.testing.expectEqual(@as(usize, 9), migrateLegacy(io, gpa, dir2, "deepseek", &buf));
+    try std.testing.expectEqualStrings("sk-legacy", buf[0..loadFor(io, gpa, dir2, "deepseek", &buf)]);
+    try std.testing.expectEqual(@as(usize, 0), load(io, gpa, dir2, &buf)); // legacy file consumed
+    try std.testing.expectEqual(@as(usize, 0), migrateLegacy(io, gpa, dir2, "openai", &buf)); // nothing left to migrate
 }
