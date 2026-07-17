@@ -4765,8 +4765,11 @@ pub const Chat = struct {
         if (idn == 0) return;
         // HIPPOCAMPUS: persist this turn as a neuron under the conversation's scope so it survives the 64-message
         // ring eviction and can be relevance-recalled into future prompts (esp. a cast's synthesis digest, which
-        // otherwise ages out as one [cast] message). No-op when neuron-db is disabled.
-        if (do_observe) self.mind().observe(idb[0..idn], text);
+        // otherwise ages out as one [cast] message). No-op when neuron-db is disabled. Engine CHROME — the
+        // "(server chat: … — stopping)" class of paren-notes — is narration, not knowledge: observed, it
+        // recirculated through recall as if it were a finding (seen live in the desk hive). Real content
+        // never opens with '('.
+        if (do_observe and text.len > 0 and text[0] != '(') self.mind().observe(idb[0..idn], text);
         // FAST PATH: a plain append writes ONE line (O(1)). The full whole-file rewrite — which during a server
         // turn ran per tool/status frame and scaled with history length, on sync-watched storage — is only needed
         // when the ring evicted (rows shifted) or the file doesn't exist yet (fresh conv needs its title header).
