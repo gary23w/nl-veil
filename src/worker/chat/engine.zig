@@ -80,7 +80,11 @@ const AFK_STUCK_TMPL = "You just repeated the previous step — that is not maki
 /// TERMINAL BUILD-VERIFY (desk fireTerminalVerify): an armed loop must not accept a bare DONE right after writing
 /// files — a model can ANNOUNCE a build it didn't finish. One completeness check (run the tests / write any missing
 /// file) is injected before the loop ends; it fires at most once per turn and only when files were actually written.
-const TERMINAL_VERIFY_PROMPT = "Before calling this done, VERIFY the deliverable actually works: run_tests (or run the code with run_python) to confirm it runs, and if any file the goal requires is missing or empty, write it NOW (write_file). If everything is present and works, give your FINAL summary to the user with no further tool calls — do not rewrite files that are already correct.";
+// "run the project's OWN build" + the import cross-check are load-bearing: an armed build turn accepted DONE
+// after a smoke test that exercised one API slice while pages imported component files that were never
+// written — the gap only surfaced as webpack errors at deploy time (observed live, c6a5a520a). A whole-project
+// build/compile catches missing-reference gaps that spot-checks structurally cannot.
+const TERMINAL_VERIFY_PROMPT = "Before calling this done, VERIFY the deliverable actually works AS A WHOLE: if the project has its own build/test entrypoint (a build script, a compiler, a test suite), RUN IT — a full build catches files that import or reference files never actually written, which spot-checking one flow misses. Otherwise run the code directly (run_tests / run_python). If any file the goal requires — or any file the written files import/include — is missing or empty, write it NOW (write_file). Verifying one slice does not verify the whole. If everything is present and works, give your FINAL summary to the user with no further tool calls — do not rewrite files that are already correct.";
 
 /// The single question the drive inference answers between settled steps: it either names the next concrete
 /// step (which becomes a synthetic user turn) or replies DONE. Carries the LOOP_SYSTEM intent inline rather than
