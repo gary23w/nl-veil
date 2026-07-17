@@ -92,7 +92,7 @@ fn tbThemeRect() t.Rect {
 }
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, sched_model };
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
@@ -1766,9 +1766,19 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const con_n = @min(con_src.len, con_buf.len);
     @memcpy(con_buf[0..con_n], con_src[0..con_n]);
     const con_busy = if (con_ai) store.console_busy_ai else store.console_busy_you;
-    const left_open = store.settings.chat_left_open;
-    const right_open = store.settings.chat_right_open;
+    var left_open = store.settings.chat_left_open;
+    var right_open = store.settings.chat_right_open;
     store.unlock();
+
+    // RESPONSIVE COLLAPSE: both side panes at full width can starve the center column on a narrow window —
+    // the old fixed math drove center.width negative, drawing a degenerate/"broken" empty bordered box AND
+    // underflowing monoCols(view.width-28) (a panic in the desk's ReleaseSafe build). Collapse the panes to
+    // their strip state (a first-class supported layout), right pane first then left, until the center keeps
+    // a usable minimum. Derived from the live window width each frame, so widening the window restores them.
+    const min_center: f32 = 260;
+    const lwf: f32 = if (left_open) CHAT_LEFT_W else CHAT_STRIP_W; // left width before any collapse
+    if (lwf + (if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W) + pad * 4 + min_center > body.width) right_open = false;
+    if (lwf + (if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W) + pad * 4 + min_center > body.width) left_open = false;
 
     const left_w: f32 = if (left_open) CHAT_LEFT_W else CHAT_STRIP_W;
     const right_w: f32 = if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W;
@@ -1780,7 +1790,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const con_gap: f32 = if (con_h > 0) pad else 0;
     const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph - con_h - con_gap };
     const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
-    const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = right.x - (left.x + left_w) - pad * 2, .height = ph };
+    // Final safety net: even with both panes collapsed to strips, an extreme window must never feed a
+    // negative width downstream (monoCols underflow / degenerate panel rect). 28 keeps view.width-28 >= 0.
+    const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = @max(28, right.x - (left.x + left_w) - pad * 2), .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
     // Sized for the draft-mode worst case: quoted reasoning (4096 + "> " per line) + separator + "— drafting —"
@@ -1918,7 +1930,10 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
             t.textMonoClip(t.z("veil is running a command...", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + (input_h - 12) / 2), 12, t.comment, @intFromFloat(r.width - runw - 20));
             if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "veil", ""));
         } else {
-            t.textMono(t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + (input_h - 12) / 2), 12, t.comment);
+            // clipped to the panel width — the only draw in this row that lacked a bound, so the placeholder
+            // ran off the right edge of the 320px console (and past its border, since this is drawn after the
+            // scissor is popped). Matches the busy/pending siblings above.
+            t.textMonoClip(t.z("(the veil types here during a workflow)", .{}), @intFromFloat(r.x + 8), @intFromFloat(iy + (input_h - 12) / 2), 12, t.comment, @intFromFloat(r.width - 16));
         }
         return;
     }
@@ -3876,6 +3891,7 @@ fn flushDropdown() void {
     if (ui.open_dd == .none) return;
     switch (ui.open_dd) {
         .chat_provider, .chat_byok, .chat_model => return, // owned by flushChatDropdown (Settings tab)
+        .sched_model => return, // owned by flushSchedDropdown (Tasks tab) — never rendered from the deploy form
         else => {},
     }
     // Build the option labels + current index for the open kind.
@@ -3935,7 +3951,7 @@ fn flushDropdown() void {
             }
             current = ui.d_mode;
         },
-        .none, .chat_provider, .chat_byok, .chat_model => return,
+        .none, .chat_provider, .chat_byok, .chat_model, .sched_model => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -3956,10 +3972,54 @@ fn flushDropdown() void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none, .chat_provider, .chat_byok, .chat_model => {},
+            .none, .chat_provider, .chat_byok, .chat_model, .sched_model => {},
         }
         ui.open_dd = .none;
     }
+}
+
+/// Tasks-form MODEL OVERRIDE dropdown: a flat "Provider - Model" pick list built from the shared catalog.
+/// Row 0 clears the override (blank = the task inherits your chat model at run time). Picking a model writes
+/// its wire id into ui.sc_model and — only when the base-URL field is still empty — auto-fills that provider's
+/// base_url (skipping the {account}-templated Cloudflare base, which the server fills from its own creds), so
+/// "pick a cloud model and go" works without hand-typing an endpoint. Never clobbers a base the user typed.
+fn flushSchedDropdown() void {
+    if (ui.open_dd != .sched_model) return;
+    // label backing storage lives for the whole call (drawList borrows these slices) — same stack-buffer
+    // idiom flushChatDropdown uses for its live Cloudflare list.
+    var namebuf: [128][96]u8 = undefined;
+    var labels: [128][]const u8 = undefined;
+    var pmap: [128]struct { p: usize, m: usize } = undefined;
+    labels[0] = "(your chat model - default)";
+    var count: usize = 1;
+    var current: usize = 0;
+    const cur = ui.sc_model.str();
+    outer: for (catalog.providers, 0..) |p, pi| {
+        for (p.models, 0..) |m, mi| {
+            if (count >= labels.len) break :outer;
+            labels[count] = std.fmt.bufPrint(namebuf[count][0..], "{s} - {s}", .{ p.label, m.label }) catch m.label;
+            pmap[count] = .{ .p = pi, .m = mi };
+            if (cur.len > 0 and std.mem.eql(u8, cur, m.id)) current = count;
+            count += 1;
+        }
+    }
+    const chosen = drawList(ui.dd_rect, labels[0..count], current) orelse return;
+    if (chosen == 0) {
+        ui.sc_model.clear(); // inherit the chat model at run time; leave the base field as the user has it
+    } else {
+        const prov = &catalog.providers[pmap[chosen].p];
+        setField(&ui.sc_model, prov.models[pmap[chosen].m].id);
+        // Picking "Provider - Model" is an explicit PROVIDER choice, so keep the base in lockstep with the
+        // model — otherwise a re-pick from a different provider leaves a stale base and the server (which
+        // infers the provider FROM base_url, no provider field is sent) silently mis-wires the task. A
+        // concrete base overwrites; an {account}-templated (Cloudflare) base clears to blank so the server
+        // falls back to its own Workers AI creds instead of a URL with an unresolved placeholder.
+        if (std.mem.indexOf(u8, prov.base_url, "{account}") == null)
+            setField(&ui.sc_base, prov.base_url)
+        else
+            ui.sc_base.clear();
+    }
+    ui.open_dd = .none;
 }
 
 /// Draw a dropdown option list under `anchor` (or ABOVE it when the window edge is closer than the list);
@@ -4982,6 +5042,11 @@ fn drawSchedTasks(store: *Store, r: t.Rect) void {
 /// same form serves CREATE and EDIT (sc_edit_id set → editing); in edit mode a RECENT RUNS panel sits
 /// beside the form so a task's last few conversations are one click from the thing that minted them.
 fn drawSchedBuild(store: *Store, r: t.Rect) void {
+    // While the MODEL dropdown is open, block the form's fields/buttons from eating a click meant for the
+    // option list drawn over them (flushSchedDropdown clears this before drawing the list). Mirrors the
+    // Settings/Deploy dropdown-overlay guard.
+    t.setBlockClicks(ui.open_dd != .none);
+    defer t.setBlockClicks(false);
     const x = r.x;
     var y = r.y;
     const editing = ui.sc_edit_id_len > 0;
@@ -5034,7 +5099,11 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     // stored; a blank key keeps the stored one (the server never echoes keys back).
     flabel(x, y, "MODEL OVERRIDE (this task can run on its own provider)");
     textField(.{ .x = x, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.sc_base, ui.focus == .sc_base, "base URL - blank = your chat provider's", .sc_base);
-    textField(.{ .x = x + half + gap, .y = y + 14, .width = half, .height = t.FIELD_H }, &ui.sc_model, ui.focus == .sc_model, "model - blank = your chat model", .sc_model);
+    // MODEL: a dropdown populated from the shared model catalog (was a free-text field). Shows the chosen
+    // model id, or the default hint when blank. The option list + selection are handled by flushSchedDropdown
+    // after the whole form draws (so the list sits on top of the fields below it).
+    const model_disp: []const u8 = if (ui.sc_model.len > 0) ui.sc_model.str() else "model - blank = your chat model";
+    selector(.{ .x = x + half + gap, .y = y + 14, .width = half, .height = t.FIELD_H }, t.z("MODEL", .{}), model_disp, .sched_model);
     y += fh + 4;
     textField(.{ .x = x, .y = y + 14, .width = colw, .height = t.FIELD_H }, &ui.sc_key, ui.focus == .sc_key, if (editing) "API key - blank = keep the stored key" else "API key - blank = your chat provider's", .sc_key);
     y += fh + gap;
@@ -5064,6 +5133,10 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     t.text(hint, @intFromFloat(hx + 4), @intFromFloat(y + (t.BTN_LG - 12) / 2), 12, if (online) t.comment else t.orange);
 
     if (want_runs) drawSchedRecentRuns(store, .{ .x = x + colw + 24, .y = r.y, .width = runs_w, .height = r.height });
+
+    // draw the open MODEL dropdown LAST so its list sits on top of the fields below it (unblock so options click)
+    t.setBlockClicks(false);
+    flushSchedDropdown();
 }
 
 /// EDIT-mode side panel: the task's recent run conversations (the server keeps the newest five), newest
