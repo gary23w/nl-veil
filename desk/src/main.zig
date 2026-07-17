@@ -207,6 +207,13 @@ const Ui = struct {
     // micro-console (below the swarm activity): dual-tab shell
     con_tab: u8 = 0, // 0 = You, 1 = Veil (the AI's tab)
     con_input: Field = .{},
+    // You-shell command HISTORY: a ring of past commands, browsed with Up/Down exactly like a real prompt.
+    con_hist: [32][512]u8 = undefined,
+    con_hist_len: [32]usize = [_]usize{0} ** 32,
+    con_hist_total: usize = 0, // monotonically increasing push count; slot = total % ring size
+    con_hist_back: usize = 0, // 0 = the live draft; N = N entries back into history
+    con_hist_draft: [512]u8 = undefined, // the in-progress text saved when browsing starts (Down restores it)
+    con_hist_draft_len: usize = 0,
     // Files tab view state
     file_scroll: f32 = 0,
     // deploy dropdowns
@@ -420,6 +427,7 @@ pub fn main() !void {
         t.setMono(fm);
         mono_loaded = true;
     }
+    applyChatVariantFonts(false, false); // bold + italic chat faces; the settings reconcile below re-applies
     // Window + taskbar icon from assets/icon.png (with a procedural fallback).
     const icon = makeIcon();
     rl.setWindowIcon(icon);
@@ -484,6 +492,7 @@ pub fn main() !void {
         // no atlas rebuild — and the chat's line heights follow the combined factor.
         if (dys0 != font_dyslexia_applied or bold0 != font_bold_applied) {
             applyUiFont(dys0, bold0);
+            applyChatVariantFonts(dys0, bold0); // keep the chat's bold/italic variants in the same family
             font_dyslexia_applied = dys0;
             font_bold_applied = bold0;
         }
@@ -962,6 +971,15 @@ fn uiBoldCandidates() []const [:0]const u8 {
     };
 }
 
+/// Italic system faces mirroring uiCandidates — the chat markdown's *em* spans.
+fn uiItalicCandidates() []const [:0]const u8 {
+    return switch (builtin.os.tag) {
+        .windows => &.{ "C:/Windows/Fonts/calibrii.ttf", "C:/Windows/Fonts/corbeli.ttf", "C:/Windows/Fonts/candarai.ttf", "C:/Windows/Fonts/segoeuii.ttf" },
+        .macos => &.{ "/Library/Fonts/Arial Italic.ttf", "/System/Library/Fonts/HelveticaNeue.ttc" },
+        else => &.{ "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf", "/usr/share/fonts/TTF/DejaVuSans-Oblique.ttf", "/usr/share/fonts/liberation/LiberationSans-Italic.ttf" },
+    };
+}
+
 /// Dyslexia mode's UI face: the BUNDLED OpenDyslexic (SIL OFL; desk/assets/fonts, same relative roots the
 /// icon loader probes) first, then system faces on the British Dyslexia Association's recommended list so
 /// the mode still helps when the asset is missing (source checkout without assets, other OSes).
@@ -1013,6 +1031,34 @@ fn loadFontAt(candidates: []const [:0]const u8, size: i32) ?rl.Font {
         } else |_| {}
     }
     return null;
+}
+
+/// Mipmaps + trilinear on a freshly loaded face — the same multi-size crispness recipe the base fonts use.
+fn prepFont(f: rl.Font) rl.Font {
+    var fm = f;
+    rl.genTextureMipmaps(&fm.texture);
+    rl.setTextureFilter(fm.texture, .trilinear);
+    return fm;
+}
+
+/// (Re)load the chat markdown's STRONG + EM variant faces to match the active UI face. Regular face: the
+/// system bold + italic variants. Weight setting ON: the base face IS already bold, so strong keeps the
+/// bold file but renders double-struck (setStrongDistinct(false)) to keep a visible emphasis step.
+/// Dyslexia mode: the bundled OpenDyslexic bold for strong and NO italic — slanted glyphs hurt exactly the
+/// readers that mode serves, so *em* stays upright there. GL texture work — RENDER THREAD ONLY.
+fn applyChatVariantFonts(dyslexia: bool, bold: bool) void {
+    var strong: ?rl.Font = null;
+    var em: ?rl.Font = null;
+    if (dyslexia) {
+        if (loadFontAt(dyslexiaCandidates(true), 48)) |f| strong = prepFont(f);
+    } else {
+        if (loadFontAt(uiBoldCandidates(), 48)) |f| strong = prepFont(f);
+        if (loadFontAt(uiItalicCandidates(), 48)) |f| em = prepFont(f);
+    }
+    t.swapStrong(strong);
+    t.swapEm(em);
+    t.setStrongDistinct(strong != null and !bold);
+    log.info("chat variant fonts (dyslexia={} bold={}): strong={} em={}", .{ dyslexia, bold, strong != null, em != null });
 }
 
 fn makeIcon() rl.Image {
@@ -1766,6 +1812,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     const con_n = @min(con_src.len, con_buf.len);
     @memcpy(con_buf[0..con_n], con_src[0..con_n]);
     const con_busy = if (con_ai) store.console_busy_ai else store.console_busy_you;
+    var con_cwd_buf: [400]u8 = undefined;
+    const con_cwd_n = @min(store.console_cwd_len, con_cwd_buf.len);
+    @memcpy(con_cwd_buf[0..con_cwd_n], store.console_cwd[0..con_cwd_n]);
     var left_open = store.settings.chat_left_open;
     var right_open = store.settings.chat_right_open;
     store.unlock();
@@ -1821,12 +1870,58 @@ fn drawChat(store: *Store, body: t.Rect) void {
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
-    if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy);
+    if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
 }
 
-/// A dual-tab micro-terminal under the swarm activity: tab "You" runs shell commands the user types; tab
-/// "Veil" shows (and lets the AI drive) its own shell. Output streams into the scrollback in store.console_*.
-fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy: bool) void {
+/// Push a just-run command into the You-shell history ring (skipping an immediate repeat — the arrow-up +
+/// Enter loop must not fill the ring with duplicates) and snap browsing back to the live prompt.
+fn conHistPush(cmd: []const u8) void {
+    if (cmd.len == 0) return;
+    ui.con_hist_back = 0;
+    if (ui.con_hist_total > 0) {
+        const last = (ui.con_hist_total - 1) % ui.con_hist.len;
+        if (std.mem.eql(u8, ui.con_hist[last][0..ui.con_hist_len[last]], cmd)) return;
+    }
+    const slot = ui.con_hist_total % ui.con_hist.len;
+    const n = @min(cmd.len, ui.con_hist[slot].len);
+    @memcpy(ui.con_hist[slot][0..n], cmd[0..n]);
+    ui.con_hist_len[slot] = n;
+    ui.con_hist_total += 1;
+}
+
+/// Up/Down history browsing for the focused console input — the missing half of "works like a real shell".
+/// Up walks back through past commands (saving the live draft first); Down walks forward and finally
+/// restores the draft. Repeat-keys work so holding Up scrubs quickly.
+fn conHistBrowse() void {
+    const avail = @min(ui.con_hist_total, ui.con_hist.len);
+    const up = rl.isKeyPressed(.up) or rl.isKeyPressedRepeat(.up);
+    const down = rl.isKeyPressed(.down) or rl.isKeyPressedRepeat(.down);
+    if (up and ui.con_hist_back < avail) {
+        if (ui.con_hist_back == 0) {
+            ui.con_hist_draft_len = @min(ui.con_input.len, ui.con_hist_draft.len);
+            @memcpy(ui.con_hist_draft[0..ui.con_hist_draft_len], ui.con_input.buf[0..ui.con_hist_draft_len]);
+        }
+        ui.con_hist_back += 1;
+        const slot = (ui.con_hist_total - ui.con_hist_back) % ui.con_hist.len;
+        setField(&ui.con_input, ui.con_hist[slot][0..ui.con_hist_len[slot]]);
+        ui.input_active = true;
+    } else if (down and ui.con_hist_back > 0) {
+        ui.con_hist_back -= 1;
+        if (ui.con_hist_back == 0) {
+            setField(&ui.con_input, ui.con_hist_draft[0..ui.con_hist_draft_len]);
+        } else {
+            const slot = (ui.con_hist_total - ui.con_hist_back) % ui.con_hist.len;
+            setField(&ui.con_input, ui.con_hist[slot][0..ui.con_hist_len[slot]]);
+        }
+        ui.input_active = true;
+    }
+}
+
+/// A dual-tab micro-terminal under the swarm activity: tab "You" is a real shell prompt (persistent cwd via
+/// the cd/pwd builtins, PowerShell on Windows, Up/Down history); tab "Veil" shows (and lets the AI drive)
+/// its own shell. Output streams into the scrollback in store.console_*; `cwd` is the You shell's current
+/// directory (chat thread publishes it) drawn as the prompt line over the input field.
+fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy: bool, cwd: []const u8) void {
     t.panelBordered(r, t.bg_dark, t.border);
     // ---- tab header (You = user shell, Veil = AI shell) ----
     const th: f32 = 26;
@@ -1837,8 +1932,9 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
 
     // ---- scrollback (mono, tail-anchored, viewport-culled, wheel-scrollable) ----
     const input_h: f32 = 30;
+    const prompt_h: f32 = if (ai) 0 else 16; // the You tab reserves one row for the cwd prompt line
     const body_y: f32 = r.y + 3 + th + 5;
-    const body_h: f32 = r.height - (body_y - r.y) - input_h - 10;
+    const body_h: f32 = r.height - (body_y - r.y) - input_h - prompt_h - 10;
     rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(body_y), @intFromFloat(r.width - 2), @intFromFloat(body_h));
     const line_h: f32 = 15;
     const cols: usize = @intFromFloat(@max(8, (r.width - 16) / 7)); // ~7px per mono glyph at size 12
@@ -1876,7 +1972,7 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
     const startj = if (endj - first_kept > rows) endj - rows else first_kept;
     var yy: f32 = body_y;
     if (ln == 0) {
-        const hint = if (ai) t.z("the veil runs shell commands here (RUN: ...)", .{}) else t.z("type a shell command, Enter to run", .{});
+        const hint = if (ai) t.z("the veil runs shell commands here (RUN: ...)", .{}) else t.z("a real shell: cd persists, Up recalls, cls clears", .{});
         t.textMonoClip(hint, @intFromFloat(r.x + 8), @intFromFloat(yy), 12, t.comment, @intFromFloat(r.width - 16));
     }
     var li = startj;
@@ -1937,8 +2033,32 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
         }
         return;
     }
+    // ---- the You shell's PROMPT LINE: the cwd the next command runs in (the cd builtin maintains it) ----
+    {
+        const py = iy - prompt_h + 1;
+        t.textMono(t.z(">", .{}), @intFromFloat(r.x + 8), @intFromFloat(py), 11, t.green);
+        const px: f32 = r.x + 18;
+        const pmax = r.width - 18 - 8;
+        if (cwd.len > 0 and pmax > 30) {
+            // tail-biased clip: the DEEPEST segment is the informative part, so an overflowing path drops
+            // its head ("...ects\Garrett\nl-veil") instead of its tail like textMonoClip would
+            const char_w = @max(1, t.measureMono(t.z("M", .{}), 11));
+            const cols_p: usize = @intCast(@max(8, @divTrunc(@as(i32, @intFromFloat(pmax)), char_w)));
+            if (cwd.len <= cols_p) {
+                t.textMonoClip(cwd, @intFromFloat(px), @intFromFloat(py), 11, t.comment, @intFromFloat(pmax));
+            } else {
+                var pb: [420]u8 = undefined;
+                const keep = cols_p - 3;
+                const tail_s = cwd[cwd.len - keep ..];
+                const shown = std.fmt.bufPrint(&pb, "...{s}", .{tail_s}) catch cwd;
+                t.textMonoClip(shown, @intFromFloat(px), @intFromFloat(py), 11, t.comment, @intFromFloat(pmax));
+            }
+        }
+    }
+    // Up/Down browse the command history while the prompt is focused — exactly like a real shell.
+    if (ui.focus == .con_input) conHistBrowse();
     const cf = t.Rect{ .x = r.x + 4, .y = iy, .width = r.width - runw - 12, .height = input_h };
-    textField(cf, &ui.con_input, ui.focus == .con_input, "> command", .con_input);
+    textField(cf, &ui.con_input, ui.focus == .con_input, "command", .con_input);
     if (busy) {
         // a command is running — swap Run for Stop so the user can interrupt it from here
         if (t.button(stopb, t.z("Stop", .{}), t.red, true)) store.pushChatCmd(store_mod.mkChatCmd(.console_cancel, "you", ""));
@@ -1947,6 +2067,7 @@ fn drawMicroConsole(store: *Store, r: t.Rect, ai: bool, scroll: []const u8, busy
         const clicked = t.buttonSolid(stopb, t.z("Run", .{}), t.blue, can);
         const enter = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
         if (can and (clicked or (ui.focus == .con_input and enter))) {
+            conHistPush(ui.con_input.str());
             store.pushChatCmd(store_mod.mkChatCmd(.console_run, "you", ui.con_input.str()));
             ui.con_input.clear();
         }
@@ -2320,7 +2441,7 @@ fn renderConsole(view: t.Rect, card_top: f32, text_: []const u8, fsz: i32, draw:
 /// (backdrop + copy chip), GFM tables (aligned columns), headings, horizontal rules, bullets, and inline
 /// **bold** / `code` / <br> handled. ONE function measures AND draws (draw flag) so scroll math and pixels
 /// can never disagree. Returns the y after the message.
-fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, cols: usize, fsz: i32, draw: bool, cursor: bool) f32 {
+fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, fsz: i32, draw: bool, cursor: bool) f32 {
     var yy = y0;
     // A folded shell result ("[console]\n$ cmd\n…") renders as a styled terminal CARD instead of plain prose.
     // renderConsole is reached HERE in BOTH the height-cache/measure pass and the draw pass (renderMsg is called
@@ -2371,6 +2492,12 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             if (draw and inView(view, yy, block_h)) {
                 const block = t.Rect{ .x = bx, .y = yy, .width = bw, .height = block_h };
                 t.panelBordered(block, t.withAlpha(t.bg_hl, 170), t.border);
+                // the fence's language tag ("```zig") becomes a quiet label in the top-right corner
+                const lang = std.mem.trim(u8, tl[3..], " \r\t`");
+                if (lang.len > 0 and lang.len <= 12 and !t.hovering(block)) {
+                    const lw = t.measure(t.zs(lang), 10);
+                    t.textClip(lang, @intFromFloat(bx + bw - 10 - @as(f32, @floatFromInt(lw))), @intFromFloat(yy + 6), 10, t.comment, lw + 4);
+                }
                 var k: usize = 0;
                 while (k < n_code) : (k += 1) {
                     const cl = std.mem.trimEnd(u8, lines[i + 1 + k], "\r");
@@ -2403,7 +2530,9 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
             i = j - 1; // for-loop adds 1
             continue;
         }
-        // heading — sized by level (# = h1 biggest ... ###### = smallest), with a little top lead for separation
+        // heading — a real hierarchy: bold face, sized by level, wrapped (never clipped), and an anchoring
+        // hairline under h1/h2. The whole heading parses through the span grammar, so inline `code` or
+        // emphasis inside a heading renders instead of leaking markers.
         if (std.mem.startsWith(u8, tl, "#")) {
             var lvl: u8 = 0;
             var h = tl;
@@ -2412,67 +2541,103 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
                 lvl += 1;
             }
             h = std.mem.trimStart(u8, h, " ");
-            var hb: [512]u8 = undefined;
-            const hn = md.cleanInline(&hb, h);
             const hsz: i32 = switch (lvl) {
-                1 => 21,
-                2 => 18,
-                3 => 16,
+                1 => 22,
+                2 => 19,
+                3 => 17,
                 else => 15,
             };
-            const hh: f32 = @as(f32, @floatFromInt(hsz)) + 12; // glyph + top/bottom lead
-            if (draw and inView(view, yy, hh)) t.textClip(hb[0..hn], @intFromFloat(view.x + 14), @intFromFloat(yy + 8), hsz, t.fg, @intFromFloat(view.width - 28));
-            yy += hh;
+            const hlh: f32 = @round((@as(f32, @floatFromInt(hsz)) + 6) * t.uiScale());
+            var il: md.Inline = .{};
+            md.parseInline(&il, h);
+            yy += 9; // top lead separates the section from the prose above
+            const hcolor = if (lvl >= 5) t.fg_dim else t.fg;
+            yy = renderInline(view, yy, &il, hsz, hlh, draw, hcolor, .strong, 0, 0);
+            if (lvl <= 2) {
+                if (draw and inView(view, yy, 8)) t.fillRect(@intFromFloat(view.x + 14), @intFromFloat(yy + 2), @intFromFloat(view.width - 28), 1, t.withAlpha(t.border, 200));
+                yy += 7;
+            } else {
+                yy += 2;
+            }
             continue;
         }
         // blockquote (used for the model's reasoning): dim text with a left accent bar
         if (std.mem.startsWith(u8, tl, ">")) {
-            var qb: [2048]u8 = undefined;
-            const qn = md.cleanInline(&qb, std.mem.trimStart(u8, tl[1..], " "));
+            var il: md.Inline = .{};
+            md.parseInline(&il, std.mem.trimStart(u8, tl[1..], " "));
             const y_before = yy;
-            yy = renderWrapped(view, yy, qb[0..qn], cols, fsz, draw, .quote, dim);
+            yy = renderInline(view, yy, &il, fsz, MSG_LINE_H, draw, t.comment, .ui, 6, 6);
             if (draw and inView(view, y_before, yy - y_before)) t.fillRect(@intFromFloat(view.x + 10), @intFromFloat(y_before - 1), 2, @intFromFloat(yy - y_before - MSG_LINE_H + 2), t.comment);
             continue;
         }
-        // bullet / ordered-list / prose with inline cleanup
-        var lb: [2048]u8 = undefined;
-        var w: usize = 0;
-        var src = raw;
+        if (tl.len == 0) {
+            yy += MSG_LINE_H; // blank line = paragraph spacing
+            continue;
+        }
+        // bullet / task / ordered-list / prose — all through the span grammar, with NESTED indent levels,
+        // accent-colored markers, and a hanging indent so wrapped lines align under their own text.
         const is_bullet = std.mem.startsWith(u8, tl, "- ") or std.mem.startsWith(u8, tl, "* ") or std.mem.startsWith(u8, tl, "+ ");
-        // ordered list: "N. " or "N) " (up to a couple of digits)
-        var ord_len: usize = 0;
+        var ord_len: usize = 0; // "N. " / "N) " (up to a couple of digits)
         if (!is_bullet) {
             var k: usize = 0;
             while (k < tl.len and k < 3 and tl[k] >= '0' and tl[k] <= '9') k += 1;
             if (k > 0 and k + 1 < tl.len and (tl[k] == '.' or tl[k] == ')') and tl[k + 1] == ' ') ord_len = k + 2;
         }
         if (is_bullet or ord_len > 0) {
-            const indent = raw.len - std.mem.trimStart(u8, raw, " \t").len;
-            const pad = @min(indent + 1, 6);
-            @memset(lb[0..pad], ' ');
-            w = pad;
-            if (ord_len > 0) {
-                for (tl[0..ord_len]) |mc| { // copy the "N. " marker verbatim
-                    lb[w] = mc;
-                    w += 1;
+            // nesting depth from leading whitespace (2 spaces or one tab per level, capped)
+            var depth: usize = 0;
+            {
+                var spaces: usize = 0;
+                for (raw) |rc| {
+                    if (rc == ' ') spaces += 1 else if (rc == '\t') spaces += 2 else break;
                 }
-                src = tl[ord_len..];
-            } else {
-                lb[w] = 0xE2; // "•" (U+2022 — foldAscii passes it through as a real bullet)
-                lb[w + 1] = 0x80;
-                lb[w + 2] = 0xA2;
-                w += 3;
-                lb[w] = ' ';
-                w += 1;
-                src = tl[2..];
+                depth = @min(spaces / 2, 3);
             }
-        }
-        w += md.cleanInline(lb[w..], src);
-        if (w == 0) {
-            yy += MSG_LINE_H; // blank line = paragraph spacing
+            const dpx: f32 = @floatFromInt(depth * 16);
+            var src = if (is_bullet) tl[2..] else tl[ord_len..];
+            // task-list checkbox: "- [ ] " / "- [x] "
+            var task: u8 = 0; // 0 = none, 1 = open, 2 = done
+            if (is_bullet and src.len >= 3 and src[0] == '[' and src[2] == ']' and (src.len == 3 or src[3] == ' ')) {
+                if (src[1] == ' ') task = 1;
+                if (src[1] == 'x' or src[1] == 'X') task = 2;
+                if (task != 0) src = std.mem.trimStart(u8, src[3..], " ");
+            }
+            var il: md.Inline = .{};
+            md.parseInline(&il, src);
+            var marker_w: f32 = 16;
+            if (ord_len > 0) {
+                const mz = t.zs(tl[0..ord_len]);
+                marker_w = @max(16, @as(f32, @floatFromInt(t.measureStyled(mz, fsz, .ui))) + 4);
+            }
+            const y_row = yy;
+            yy = renderInline(view, yy, &il, fsz, MSG_LINE_H, draw, if (dim) t.fg_dim else (if (task == 2) t.fg_dim else t.fg), .ui, dpx + marker_w, dpx + marker_w);
+            if (draw and inView(view, y_row, MSG_LINE_H)) {
+                const mx = view.x + 14 + dpx;
+                if (task != 0) {
+                    // a real checkbox: bordered square, filled + checked when done
+                    const bx2 = mx;
+                    const by2 = y_row + (MSG_LINE_H - 11) / 2;
+                    if (task == 2) {
+                        t.panel(.{ .x = bx2, .y = by2, .width = 11, .height = 11 }, t.blue);
+                        rl.drawLineEx(.{ .x = bx2 + 2.5, .y = by2 + 5.5 }, .{ .x = bx2 + 4.5, .y = by2 + 8 }, 1.6, t.bg);
+                        rl.drawLineEx(.{ .x = bx2 + 4.5, .y = by2 + 8 }, .{ .x = bx2 + 8.5, .y = by2 + 3 }, 1.6, t.bg);
+                    } else {
+                        t.panelBordered(.{ .x = bx2, .y = by2, .width = 11, .height = 11 }, t.withAlpha(t.bg_hl, 120), t.comment);
+                    }
+                } else if (ord_len > 0) {
+                    t.textStyled(t.zs(tl[0..ord_len]), mx, y_row, fsz, t.blue, .ui);
+                } else {
+                    // marker glyph alternates by depth: • ◦ • ◦ (both in the font atlas)
+                    const glyph = if (depth % 2 == 1) t.z("\u{25E6}", .{}) else t.z("\u{2022}", .{});
+                    t.textStyled(glyph, mx + 2, y_row, fsz, t.blue, .ui);
+                }
+            }
             continue;
         }
-        yy = renderWrapped(view, yy, lb[0..w], cols, fsz, draw, .prose, dim);
+        // plain prose paragraph
+        var il: md.Inline = .{};
+        md.parseInline(&il, tl);
+        yy = renderInline(view, yy, &il, fsz, MSG_LINE_H, draw, if (dim) t.fg_dim else t.fg, .ui, 0, 0);
     }
     if (cursor and draw and @mod(rl.getTime(), 1.0) < 0.6) {
         t.textMono(t.z("|", .{}), @intFromFloat(view.x + 14), @intFromFloat(yy - MSG_LINE_H + 2), fsz, t.magenta);
@@ -2523,6 +2688,7 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
     }
     // pass 2: draw each non-separator row as padded, joined cells, each CELL clipped to its fitted width
     var header = true;
+    var body_row: usize = 0; // zebra counter (data rows only)
     for (rows) |row| {
         const tl = std.mem.trim(u8, row, " \r\t");
         if (md.isTableSep(tl)) continue;
@@ -2559,96 +2725,202 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
             ci_ += 1;
         }
         if (draw and inView(view, yy, MSG_LINE_H)) {
-            if (header) t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 130));
+            if (header) {
+                t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 130));
+            } else if (body_row % 2 == 1) {
+                // zebra striping: alternate data rows get a whisper of fill so wide tables stay scannable
+                t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 55));
+            }
             t.textMonoClip(lb[0..w], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (header) t.fg else t.fg_dim, @intFromFloat(view.width - 26));
         }
         yy += MSG_LINE_H;
+        if (!header) body_row += 1;
         header = false;
     }
     return yy + 4;
 }
 
-const LineStyle = enum { prose, code, quote };
+// ---- the styled-span text engine ------------------------------------------------------------------------
+// mdutil.parseInline turns a source line into display bytes + style runs; this lays them out with REAL
+// typography: per-span faces (bold/italic/mono), inline-code chips, clickable underlined links, and proper
+// word wrap with hanging indents — across every font size and weight. ONE code path measures AND draws
+// (draw flag), so scroll math and pixels can never disagree; hostile input (2KB spaceless runs, marker
+// storms) char-splits and never crashes.
 
-/// One logical line, wrapped to fit `view`. CODE stays MONOSPACE + character-wrapped (column alignment is
-/// load-bearing for code). PROSE/QUOTE render in the PROPORTIONAL ui font with real WORD wrap, so chat
-/// answers read like text instead of terminal output. The measure pass (draw=false) and the draw pass run the
-/// identical wrap loop — only the actual pixel calls are gated on `draw` — so scroll height and pixels agree.
-fn renderWrapped(view: t.Rect, y0: f32, seg: []const u8, cols: usize, fsz: i32, draw: bool, style: LineStyle, dim: bool) f32 {
-    var yy = y0;
-    if (style == .code) {
-        var i: usize = 0;
-        while (true) {
-            const end = @min(seg.len, i + cols);
-            if (draw) {
-                const shown = inView(view, yy, MSG_LINE_H);
-                if (shown) {
-                    t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 160));
-                    t.textMonoClip(seg[i..end], @intFromFloat(view.x + 16), @intFromFloat(yy), fsz, t.cyan, @intFromFloat(view.width - 30));
+/// Which face a span renders in. Headings pass base=.strong so every child span stays bold.
+fn spanKind(st: md.Style, base: t.FontKind) t.FontKind {
+    if (st.code) return .mono;
+    if (base == .strong) return .strong;
+    if (st.bold) return .strong;
+    if (st.italic) return .em;
+    return .ui;
+}
+
+fn spanColor(st: md.Style, base: t.Color) t.Color {
+    if (st.link) return t.blue;
+    if (st.code) return t.teal;
+    return base;
+}
+
+/// Draw one measured piece of a row (a word fragment in a single style) + its decorations. Pure pixels —
+/// the caller already did the layout math. `w` is the piece's measured advance.
+fn drawPieceDecorated(il: *const md.Inline, sp: md.Span, z: [:0]const u8, x: f32, yy: f32, w: f32, size: i32, line_h: f32, color: t.Color, kind: t.FontKind) void {
+    const st = sp.style;
+    if (st.code) { // the code chip: a soft rounded backdrop so `inline code` reads at a glance
+        t.panel(.{ .x = x - 2, .y = yy - 1, .width = w + 4, .height = line_h - 1 }, t.withAlpha(t.bg_hl, 210));
+    }
+    t.textStyled(z, x, yy, size, color, kind);
+    if (st.strike) t.fillRect(@intFromFloat(x - 1), @intFromFloat(yy + line_h * 0.42), @intFromFloat(w + 2), 1, t.withAlpha(color, 210));
+    if (st.link) {
+        const r = t.Rect{ .x = x, .y = yy, .width = w, .height = line_h - 2 };
+        const hot = t.hovering(r);
+        t.fillRect(@intFromFloat(x), @intFromFloat(yy + line_h - 4), @intFromFloat(w), 1, t.withAlpha(t.blue, if (hot) 255 else 140));
+        if (hot) {
+            t.wantCursor(.pointing_hand);
+            if (rl.isMouseButtonPressed(.left)) {
+                if (il.urlOf(sp)) |url| {
+                    // only real web schemes leave the app — a model can emit anything into an href
+                    if (std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))
+                        rl.openURL(t.zs(url));
                 }
-                captureSelLine(shown, yy, view.x + 16, fsz, true, seg[i..end]);
             }
-            i = end;
-            if (i >= seg.len) break;
-            yy += MSG_LINE_H;
         }
-        return yy + MSG_LINE_H;
     }
-    // proportional word-wrap for prose + quote
-    const left: f32 = if (style == .quote) 18 else 14;
-    const x0: f32 = view.x + left;
-    const max_w: f32 = @max(40, view.width - left - 12);
-    const color = if (style == .quote) t.comment else (if (dim) t.fg_dim else t.fg);
-    var line_buf: [1024]u8 = undefined;
-    var ll: usize = 0;
+}
+
+/// Lay out one parsed line (`il`) wrapped into `view`, honoring per-span styles. `first_indent` offsets the
+/// first row (list markers live in that gap), `hang_indent` every wrapped row — the hanging indent that
+/// keeps bullet text aligned under itself. Returns the y after the last row. Measure/draw parity: the one
+/// loop runs in both passes; only pixel calls check `draw`.
+fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: f32, draw: bool, base_color: t.Color, base_kind: t.FontKind, first_indent: f32, hang_indent: f32) f32 {
+    var yy = y0;
+    const x_base = view.x + 14;
+    const max_x = view.x + view.width - 12;
+    const space_w: f32 = @floatFromInt(@max(2, t.measureStyled(t.z(" ", .{}), size, base_kind)));
+    var x = x_base + first_indent;
+    var row_x0 = x;
+    var row_text: [1024]u8 = undefined; // the row's plain bytes, for the selection/copy capture
+    var row_len: usize = 0;
     var rows: u32 = 0;
-    var wit = std.mem.tokenizeScalar(u8, seg, ' ');
-    while (wit.next()) |word| {
-        var cand: [1024]u8 = undefined; // current line + (space) + word, null-terminated for measure
-        var cl: usize = 0;
-        if (ll > 0) {
-            @memcpy(cand[0..ll], line_buf[0..ll]);
-            cl = ll;
-            // Reserve the trailing sentinel slot. `cl + 1 < cand.len` (not `cl < cand.len`): once the running
-            // line reaches ll==1023, letting the separator fill the last byte pushes cl to cand.len (1024), and
-            // the `cand[cl] = 0` below then writes one past [1024]. A >=1023-byte spaceless run (minified JS/CSS,
-            // base64, a data URI, a long path/hex) as the first token of a wrapped segment hits exactly this.
-            if (cl + 1 < cand.len) {
-                cand[cl] = ' ';
-                cl += 1;
-            }
-        }
-        const wl = @min(word.len, cand.len -| cl -| 1);
-        @memcpy(cand[cl..][0..wl], word[0..wl]);
-        cl += wl;
-        if (cl >= cand.len) cl = cand.len - 1; // belt-and-suspenders: the sentinel index is never OOB
-        cand[cl] = 0;
-        const cw: f32 = @floatFromInt(t.measure(cand[0..cl :0], fsz));
-        if (ll > 0 and cw > max_w) {
-            if (draw) {
-                const shown = inView(view, yy, MSG_LINE_H);
-                if (shown) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
-                captureSelLine(shown, yy, x0, fsz, false, line_buf[0..ll]);
-            }
-            yy += MSG_LINE_H;
+    var line_start = true;
+    var pending_space = false;
+    var sidx: usize = 0; // monotone span cursor (spans are ordered by offset)
+
+    const n = il.text_len;
+    var pos: usize = 0;
+    while (pos < n) {
+        const c = il.text[pos];
+        if (c == '\n') { // hard break (<br>)
+            if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
+            yy += line_h;
             rows += 1;
-            @memcpy(line_buf[0..wl], word[0..wl]);
-            ll = wl;
-        } else {
-            @memcpy(line_buf[0..cl], cand[0..cl]);
-            ll = cl;
+            x = x_base + hang_indent;
+            row_x0 = x;
+            row_len = 0;
+            line_start = true;
+            pending_space = false;
+            pos += 1;
+            continue;
         }
-    }
-    if (ll > 0) {
-        if (draw) {
-            const shown = inView(view, yy, MSG_LINE_H);
-            if (shown) t.textClip(line_buf[0..ll], @intFromFloat(x0), @intFromFloat(yy), fsz, color, @intFromFloat(max_w));
-            captureSelLine(shown, yy, x0, fsz, false, line_buf[0..ll]);
+        if (c == ' ') {
+            pending_space = !line_start;
+            pos += 1;
+            continue;
         }
-        yy += MSG_LINE_H;
-        rows += 1;
+        // the WORD [pos, wend) — may cross span boundaries
+        var wend = pos;
+        while (wend < n and il.text[wend] != ' ' and il.text[wend] != '\n') wend += 1;
+        // measure it piece-wise (advance the span cursor as offsets pass)
+        var ww: f32 = 0;
+        {
+            var p = pos;
+            var si = sidx;
+            while (p < wend) {
+                while (si + 1 < il.span_count and p >= il.spans[si].off + il.spans[si].len) si += 1;
+                const sp = il.spans[si];
+                const pe = @min(wend, @as(usize, sp.off) + sp.len);
+                if (pe <= p) break; // degenerate span table — never spin
+                ww += @floatFromInt(t.measureStyled(t.zs(il.text[p..pe]), size, spanKind(sp.style, base_kind)));
+                p = pe;
+            }
+        }
+        const sw: f32 = if (pending_space) space_w else 0;
+        if (!line_start and x + sw + ww > max_x) { // wrap BEFORE this word
+            if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
+            yy += line_h;
+            rows += 1;
+            x = x_base + hang_indent;
+            row_x0 = x;
+            row_len = 0;
+            line_start = true;
+            pending_space = false;
+        } else if (pending_space) {
+            x += sw;
+            if (row_len < row_text.len) {
+                row_text[row_len] = ' ';
+                row_len += 1;
+            }
+            pending_space = false;
+        }
+        // emit the word piece-wise; a piece that STILL overflows an empty row char-splits (long url/path)
+        var p = pos;
+        while (p < wend) {
+            while (sidx + 1 < il.span_count and p >= il.spans[sidx].off + il.spans[sidx].len) sidx += 1;
+            const sp = il.spans[sidx];
+            const pe = @min(wend, @as(usize, sp.off) + sp.len);
+            if (pe <= p) break;
+            var piece = il.text[p..pe];
+            const kind = spanKind(sp.style, base_kind);
+            const color = spanColor(sp.style, base_color);
+            while (piece.len > 0) {
+                var z = t.zs(piece);
+                var w: f32 = @floatFromInt(t.measureStyled(z, size, kind));
+                var taken = piece.len;
+                if (x + w > max_x and !line_start) { // no room mid-row: wrap, then retry on the fresh row
+                    if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
+                    yy += line_h;
+                    rows += 1;
+                    x = x_base + hang_indent;
+                    row_x0 = x;
+                    row_len = 0;
+                    line_start = true;
+                    continue;
+                }
+                if (x + w > max_x) { // fresh row and STILL too wide: take the longest fitting prefix
+                    taken = 1;
+                    while (taken < piece.len) : (taken += 1) {
+                        const zc = t.zs(piece[0 .. taken + 1]);
+                        if (x + @as(f32, @floatFromInt(t.measureStyled(zc, size, kind))) > max_x) break;
+                    }
+                    z = t.zs(piece[0..taken]);
+                    w = @floatFromInt(t.measureStyled(z, size, kind));
+                }
+                const shown = inView(view, yy, line_h);
+                if (draw and shown) drawPieceDecorated(il, sp, z, x, yy, w, size, line_h, color, kind);
+                x += w;
+                line_start = false;
+                const cn = @min(taken, row_text.len - row_len);
+                @memcpy(row_text[row_len..][0..cn], piece[0..cn]);
+                row_len += cn;
+                piece = piece[taken..];
+                if (piece.len > 0) { // the split continues on a new row
+                    if (draw) captureSelLine(shown, yy, row_x0, size, false, row_text[0..row_len]);
+                    yy += line_h;
+                    rows += 1;
+                    x = x_base + hang_indent;
+                    row_x0 = x;
+                    row_len = 0;
+                    line_start = true;
+                }
+            }
+            p = pe;
+        }
+        pos = wend;
     }
-    if (rows == 0) yy += MSG_LINE_H; // an empty/all-space segment still occupies one line
+    if (row_len > 0 or rows == 0) {
+        if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
+        yy += line_h;
+    }
     return yy;
 }
 
@@ -2998,7 +3270,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and ui.tool_open != i)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
-                renderMsg(view, 0, m.role, m.textStr(), cols, fsz, false, false);
+                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false);
             ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
@@ -3010,7 +3282,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (busy or stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
         if (stream.len != ui.stream_h_len or cols != ui.stream_h_cols) {
-            ui.stream_h = renderMsg(view, 0, .veil, stream, cols, fsz, false, false);
+            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false);
             ui.stream_h_len = stream.len;
             ui.stream_h_cols = cols;
         }
@@ -3050,7 +3322,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // The reasoning trace renders collapsed (a dim one-line chip); click to read the full thinking that
             // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
             if (ui.tool_open == i) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
                 if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
@@ -3070,7 +3342,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // Tool calls render as a compact chip (raw JSON/result hidden). Click to expand/collapse; the full
             // text is untouched in the message, so the model still receives it and copy still grabs it.
             if (ui.tool_open == i) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
@@ -3087,7 +3359,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
         cur_sel_msg = i; // capture THIS message's text-line geometry for selection
         cur_sel_char0 = 0;
-        _ = renderMsg(view, y0, m.role, m.textStr(), cols, fsz, true, false);
+        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
@@ -3104,7 +3376,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.live_len_prev = stream.len;
             ui.live_change_t = rl.getTime();
         }
-        yy = renderMsg(view, yy, .veil, stream, cols, fsz, true, true);
+        yy = renderMsg(view, yy, .veil, stream, fsz, true, true);
     }
     if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {

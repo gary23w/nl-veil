@@ -284,10 +284,15 @@ pub fn foldAscii(dst: []u8, src: []const u8) usize {
 }
 
 // The loaded fonts (real TTFs, loaded at startup). `ui_font` is proportional (labels, buttons, headers);
-// `mono_font` is fixed-width for the log console so its columns line up. Until set, fall back to raylib's
-// default. Drawing goes through drawTextEx for kerning + antialiasing.
+// `mono_font` is fixed-width for the log console so its columns line up. `strong_font`/`em_font` are the
+// BOLD and ITALIC variants of the UI face for the chat's styled markdown — optional: when a variant is
+// missing, strong falls back to a synthetic double-strike and em to the regular face, so the renderer
+// never cares. Until set, fall back to raylib's default. Drawing goes through drawTextEx for kerning +
+// antialiasing.
 var ui_font: ?rl.Font = null;
 var mono_font: ?rl.Font = null;
+var strong_font: ?rl.Font = null;
+var em_font: ?rl.Font = null;
 var mark_tex: ?rl.Texture = null;
 var mark_tex_attempted: bool = false;
 
@@ -327,6 +332,18 @@ pub fn setFont(f: rl.Font) void {
 pub fn setMono(f: rl.Font) void {
     log.trace("theme.setMono", .{});
     mono_font = f;
+}
+/// Install (or clear) the BOLD chat variant, unloading any previous atlas. null = no distinct bold face —
+/// strong text falls back to a synthetic double-strike of the regular face.
+pub fn swapStrong(f: ?rl.Font) void {
+    if (strong_font) |old| rl.unloadFont(old);
+    strong_font = f;
+}
+/// Install (or clear) the ITALIC chat variant. null = italic renders in the regular face (deliberate under
+/// the dyslexia face — italics hurt exactly the readers that mode serves).
+pub fn swapEm(f: ?rl.Font) void {
+    if (em_font) |old| rl.unloadFont(old);
+    em_font = f;
 }
 pub fn deinit() void {
     log.trace("theme.deinit", .{});
@@ -444,6 +461,47 @@ pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i
         b[n] = 0;
     }
     textMono(b[0..n :0], x, y, size, c);
+}
+
+// ---- styled text (the chat's markdown renderer): one draw/measure pair that picks the face per style ----
+
+pub const FontKind = enum { ui, strong, em, mono };
+
+fn fontForKind(k: FontKind) rl.Font {
+    return switch (k) {
+        .ui => theFont(),
+        .strong => strong_font orelse theFont(),
+        .em => em_font orelse theFont(),
+        .mono => theMono(),
+    };
+}
+
+/// Whether the loaded strong face actually DIFFERS from the base face. When the accessibility weight
+/// setting already made the whole UI bold, "bold" spans double-strike on top so emphasis stays visible.
+var strong_distinct = false;
+pub fn setStrongDistinct(v: bool) void {
+    strong_distinct = v;
+}
+
+/// Draw `s` in the face for `kind` at a float position (the span renderer accumulates sub-pixel x).
+/// strong without a distinct bold face degrades to a half-pixel double-strike — visible weight on any font.
+pub fn textStyled(s: [:0]const u8, x: f32, y: f32, size: i32, c: Color, kind: FontKind) void {
+    if (kind == .mono) {
+        rl.drawTextEx(theMono(), s, .{ .x = x, .y = y }, scaledMono(size), 0.5, c);
+        return;
+    }
+    const px = scaledUi(size);
+    const f = fontForKind(kind);
+    rl.drawTextEx(f, s, .{ .x = x, .y = y }, px, spacingFor(px), c);
+    if (kind == .strong and !strong_distinct) {
+        rl.drawTextEx(f, s, .{ .x = x + 0.6, .y = y }, px, spacingFor(px), c);
+    }
+}
+
+pub fn measureStyled(s: [:0]const u8, size: i32, kind: FontKind) i32 {
+    if (kind == .mono) return @intFromFloat(rl.measureTextEx(theMono(), s, scaledMono(size), 0.5).x);
+    const px = scaledUi(size);
+    return @intFromFloat(rl.measureTextEx(fontForKind(kind), s, px, spacingFor(px)).x);
 }
 
 /// Left-aligned label, clipped to max_w px with an ellipsis, for rows that must not overflow.

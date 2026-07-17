@@ -724,6 +724,10 @@ pub const Chat = struct {
     //                         busy-but-getting-nowhere spiral: the loop keeps acting, so loop_idle never fires)
     build_dir: [400]u8 = undefined, // absolute build workdir for THIS chat (set from the server's tool response);
     build_dir_len: usize = 0, // the AI writes files here + the console (You/Veil) is cd'd here so both share it
+    // The You shell's OWN current directory: set by the user's `cd` builtin, cleared when a new build workdir
+    // is announced (setBuildDir) so the console follows the build again. 0 = follow build_dir / the app cwd.
+    console_cwd: [400]u8 = undefined,
+    console_cwd_len: usize = 0,
     reflect_draft: [12288]u8 = undefined, // the current draft being iteratively self-critiqued
     reflect_draft_len: usize = 0,
     reflect_pass: u8 = 0, // how many self-check iterations have run for this answer (bounded by REFLECT_MAX_PASSES)
@@ -2528,6 +2532,134 @@ pub const Chat = struct {
         var nb: [480]u8 = undefined;
         const note = std.fmt.bufPrint(&nb, "[build] working directory: {s} — the console (You + Veil tabs) is cd'd here, so you can inspect and run the files.", .{rel}) catch "[build] working directory set";
         self.appendMsg(dd, .cast_note, note);
+        // a NEW build workdir re-anchors the You shell there (a manual `cd` from before it is superseded —
+        // the note above promises the console is cd'd to the build)
+        self.console_cwd_len = 0;
+        self.publishConsoleCwd();
+    }
+
+    // ---------------------------------------------------------------------------- the You tab's shell state
+    // What makes the micro-console iterate like a REAL shell: a persistent current directory (cd/pwd/cls
+    // builtins below + the PowerShell carrier in consoleStart), with the prompt published to the Store so
+    // the UI can show where the next command will run.
+
+    /// The You shell's EFFECTIVE current directory: the user's own `cd` target if set, else this chat's build
+    /// workdir, else the app's own cwd resolved absolute ("" only if even that fails).
+    fn consoleEffCwd(self: *Chat, buf: []u8) []const u8 {
+        if (self.console_cwd_len > 0) {
+            const n = @min(self.console_cwd_len, buf.len);
+            @memcpy(buf[0..n], self.console_cwd[0..n]);
+            return buf[0..n];
+        }
+        if (self.build_dir_len > 0) {
+            const n = @min(self.build_dir_len, buf.len);
+            @memcpy(buf[0..n], self.build_dir[0..n]);
+            return buf[0..n];
+        }
+        const n = Io.Dir.cwd().realPath(self.io, buf) catch return "";
+        return buf[0..n];
+    }
+
+    /// Publish the You shell's effective cwd to the Store — the console UI renders it as the prompt line.
+    fn publishConsoleCwd(self: *Chat) void {
+        var b: [400]u8 = undefined;
+        self.store.consoleSetCwd(self.consoleEffCwd(&b));
+    }
+
+    /// Append one output line to the You scrollback (builtin results / builtin errors).
+    fn consoleLine(self: *Chat, s: []const u8) void {
+        self.store.consoleAppend(false, s);
+        self.store.consoleAppend(false, "\n");
+    }
+
+    /// Echo "{dir}> {cmd}" into the scrollback the way a real terminal echoes its prompt + command. Only the
+    /// LAST path segment is shown (the pane is ~40 mono columns; the full path lives in the prompt line the
+    /// UI draws over the input field). The Veil tab shows its build dir's segment the same way.
+    fn echoPrompt(self: *Chat, ai: bool, cmd: []const u8) void {
+        var eb: [400]u8 = undefined;
+        const eff = if (ai)
+            (if (self.build_dir_len > 0) self.build_dir[0..self.build_dir_len] else "")
+        else
+            self.consoleEffCwd(&eb);
+        self.store.consoleAppend(ai, "\n");
+        const seg = lastPathSegment(eff);
+        if (seg.len > 0) self.store.consoleAppend(ai, seg);
+        self.store.consoleAppend(ai, "> ");
+        self.store.consoleAppend(ai, cmd);
+        self.store.consoleAppend(ai, "\n");
+    }
+
+    /// The You tab's shell BUILTINS — cd / pwd / cls / clear resolve in-process (no spawn, instant), exactly
+    /// the pieces a one-shot child process can never provide (its cwd dies with it). Returns true when the
+    /// command was handled here.
+    fn consoleBuiltin(self: *Chat, dd: []const u8, cmd: []const u8) bool {
+        // first token, lowercased (bounded — a builtin verb is short)
+        var vb: [8]u8 = undefined;
+        const sp = std.mem.indexOfAny(u8, cmd, " \t") orelse cmd.len;
+        if (sp == 0 or sp > vb.len) return false;
+        for (cmd[0..sp], 0..) |c, i| vb[i] = std.ascii.toLower(c);
+        const verb = vb[0..sp];
+        const rest = std.mem.trim(u8, cmd[sp..], " \t\r\n");
+
+        if (std.mem.eql(u8, verb, "cls") or std.mem.eql(u8, verb, "clear")) {
+            self.store.consoleClear(false);
+            return true;
+        }
+        if (std.mem.eql(u8, verb, "pwd") and rest.len == 0) {
+            if (self.build_dir_len == 0) self.syncBuildDir(dd); // same late-bind a spawned command gets
+            self.echoPrompt(false, cmd);
+            var eb: [400]u8 = undefined;
+            const eff = self.consoleEffCwd(&eb);
+            self.consoleLine(if (eff.len > 0) eff else "(unknown)");
+            self.publishConsoleCwd();
+            return true;
+        }
+        if (std.mem.eql(u8, verb, "cd")) {
+            if (self.build_dir_len == 0) self.syncBuildDir(dd);
+            self.echoPrompt(false, cmd);
+            self.consoleCd(rest);
+            return true;
+        }
+        return false;
+    }
+
+    /// The `cd` builtin: no arg prints the cwd (cmd behavior); otherwise resolve the target against the
+    /// effective cwd, verify it exists, canonicalize via the opened handle, and adopt it as the shell's own
+    /// directory. Quotes and the cmd-ism `/d` are tolerated so muscle memory from both shells works.
+    fn consoleCd(self: *Chat, arg0: []const u8) void {
+        var arg = arg0;
+        if (arg.len >= 2 and (arg[0] == '/' or arg[0] == '-') and (arg[1] == 'd' or arg[1] == 'D'))
+            arg = std.mem.trimStart(u8, arg[2..], " \t"); // `cd /d X` — the drive switch is implicit here
+        if (arg.len >= 2 and ((arg[0] == '"' and arg[arg.len - 1] == '"') or (arg[0] == '\'' and arg[arg.len - 1] == '\'')))
+            arg = arg[1 .. arg.len - 1];
+        var eb: [400]u8 = undefined;
+        const eff = self.consoleEffCwd(&eb);
+        if (arg.len == 0) {
+            self.consoleLine(if (eff.len > 0) eff else "(unknown)");
+            return;
+        }
+        var cand_buf: [800]u8 = undefined;
+        const cand = if (isAbsPath(arg))
+            arg
+        else
+            (std.fmt.bufPrint(&cand_buf, "{s}/{s}", .{ eff, arg }) catch {
+                self.consoleLine("cd: path too long");
+                return;
+            });
+        var d = Io.Dir.cwd().openDir(self.io, cand, .{}) catch {
+            var mb: [512]u8 = undefined;
+            self.consoleLine(std.fmt.bufPrint(&mb, "cd: no such directory: {s}", .{arg}) catch "cd: no such directory");
+            return;
+        };
+        defer d.close(self.io);
+        var rb: [400]u8 = undefined;
+        const rn = d.realPath(self.io, &rb) catch 0;
+        const canon = if (rn > 0) rb[0..rn] else cand;
+        const cn = @min(canon.len, self.console_cwd.len);
+        @memcpy(self.console_cwd[0..cn], canon[0..cn]);
+        self.console_cwd_len = cn;
+        self.publishConsoleCwd();
+        self.consoleLine(canon); // echo the landing dir, like cmd's `cd` does
     }
 
     /// Re-bind the console to the ACTIVE conversation's build workdir on chat selection. setBuildDir only fires
@@ -2541,6 +2673,9 @@ pub const Chat = struct {
         var rb: [160]u8 = undefined;
         const rel = self.chatBuildRel(&rb); // reads the OLD build_dir for the uid prefix — must run before the clear
         self.build_dir_len = 0;
+        // whatever this rebind lands on, the console prompt reflects it (a user `cd` still takes precedence
+        // inside consoleEffCwd, so publishing here never stomps a manual location)
+        defer self.publishConsoleCwd();
         if (rel.len == 0) return;
         var ab: [400]u8 = undefined;
         const abs = std.fmt.bufPrint(&ab, "{s}/{s}/work", .{ dd, rel }) catch return;
@@ -2563,18 +2698,20 @@ pub const Chat = struct {
             if (ai) self.foldConsoleAi(dd, "", "(empty command)");
             return;
         }
+        // SHELL BUILTINS (You tab only): cd / pwd / cls resolve instantly in-process — the cwd they maintain
+        // is what makes the console iterate like a real shell (each spawned command starts there). They work
+        // even while a command runs, exactly like typing into a busy terminal's next prompt would not — but
+        // these never spawn, so there's nothing to contend with.
+        if (!ai and self.consoleBuiltin(dd, trimmed)) return;
         if (self.console != null) {
             self.store.consoleAppend(ai, "\n(the console is busy with another command)\n");
             if (ai) self.foldConsoleAi(dd, trimmed, "(the console was busy; command not run)");
             return;
         }
-        self.store.consoleAppend(ai, "\n> ");
-        self.store.consoleAppend(ai, trimmed);
-        self.store.consoleAppend(ai, "\n");
-        // The AI door learns the batch %-rules from its system prompt; the HUMAN typing into the You tab
-        // gets a one-line hint when their command is about to hit the classic trap ("%i was unexpected").
-        if (builtin.os.tag == .windows and !ai and needsBatchPercentHint(trimmed))
-            self.store.consoleAppend(ai, "(note: this console runs commands via a batch script — write for-loop variables as %%i, not %i)\n");
+        // late-bind the build workdir BEFORE the echo so the very first prompt already shows the right dir
+        if (self.build_dir_len == 0) self.syncBuildDir(dd);
+        self.echoPrompt(ai, trimmed);
+        if (!ai) self.publishConsoleCwd();
 
         // Sink files: <dd>/.veil-desk/console_{ai|you}.{out,err}. createFile truncates, so a prior run's bytes
         // never bleed in. Two files (not one) because Windows reopens each inherited handle independently, so a
@@ -2603,43 +2740,52 @@ pub const Chat = struct {
             self.consoleLaunchFailed(dd, ai, "(failed to open the console output file)");
             return;
         };
-        // Run in the chat's build workdir if one has been set (so `dir`/`ls`/`python app.py` see the AI's files).
-        // LATE BIND if unbound: syncBuildDir only binds on chat SELECTION (dir must exist then) and setBuildDir
-        // only on a build-tool response — a workdir created by a CAST after selection left the console in the app
-        // cwd, so `type <hive file>` failed while the file sat right there and the veil concluded it was never
-        // written (then re-did the hive's work inline). One cheap openDir probe per unbound console command.
-        if (self.build_dir_len == 0) self.syncBuildDir(dd);
-        // Set the child's CWD via a DIR HANDLE rather than prepending `cd /d …`: a prepended `cd` runs in the
-        // spawned cmd's own initial directory (which differed from ours → "The system cannot find the path
-        // specified" even though the AI's files were right there). Opening the build dir with the same
-        // Io.Dir.cwd() the desktop's own (working) file ops use, then handing CreateProcessW the handle, makes
-        // Windows infer the correct absolute path — no relative/absolute or slash ambiguity.
-        var cwd_dir: ?Io.Dir = if (self.build_dir_len > 0)
-            (Io.Dir.cwd().openDir(self.io, self.build_dir[0..self.build_dir_len], .{}) catch null)
+        // Run in the shell's effective directory: the You tab honors the user's own `cd` first (console_cwd),
+        // then the chat's build workdir; the AI door keeps its build-workdir binding. (The late-bind openDir
+        // probe already ran before the prompt echo above — a workdir created by a CAST after selection would
+        // otherwise leave the console in the app cwd.) Set the child's CWD via a DIR HANDLE rather than
+        // prepending `cd /d …`: a prepended `cd` runs in the spawned shell's own initial directory (which
+        // differed from ours → "The system cannot find the path specified" even though the AI's files were
+        // right there). Opening the dir with the same Io.Dir.cwd() the desktop's own (working) file ops use,
+        // then handing CreateProcessW the handle, makes Windows infer the correct absolute path.
+        const want_cwd: []const u8 = if (!ai and self.console_cwd_len > 0)
+            self.console_cwd[0..self.console_cwd_len]
+        else if (self.build_dir_len > 0)
+            self.build_dir[0..self.build_dir_len]
+        else
+            "";
+        var cwd_dir: ?Io.Dir = if (want_cwd.len > 0)
+            (Io.Dir.cwd().openDir(self.io, want_cwd, .{}) catch null)
         else
             null;
         defer if (cwd_dir) |*d| d.close(self.io); // valid through the spawn call; closed after
-        // Windows: the command runs from a .cmd BATCH FILE, never as `cmd /c <argv element>`. spawn
+        // Windows: the command runs from a SCRIPT FILE, never as `cmd /c <argv element>`. spawn
         // serializes argv with C-runtime quoting (an embedded " becomes \") but cmd.exe parses its command
         // line under its OWN rules and never un-escapes \" — so any quoted command reached its child with
         // literal backslash-quote bytes (observed: powershell -Command "(Get-Date)..." degraded into a
-        // quoted string literal that PowerShell just echoed). With a script file, spawn hands cmd.exe only
-        // the (quoted) script path and the command INSIDE the file is parsed exactly as if typed in a
-        // terminal: quotes, &&, pipes and redirects all keep their meaning. The path must be absolute
-        // (a relative argv[0] resolves against .cwd — the BUILD dir — not where the script lives).
+        // quoted string literal that PowerShell just echoed). With a script file, the command INSIDE the
+        // file is parsed exactly as if typed in a terminal: quotes, &&, pipes and redirects all keep their
+        // meaning. The path must be absolute (a relative argv[0] resolves against .cwd — the BUILD dir —
+        // not where the script lives).
+        //
+        // WHICH shell: the You tab is a POWERSHELL prompt (a real shell for a human: pwd/ls/cat aliases,
+        // sane quoting, real $env: expansion — `pwd` in the old cmd-batch carrier just printed "'pwd' is
+        // not recognized"). The AI door KEEPS the cmd batch carrier: its system prompt + learned lessons
+        // teach the batch %-rules, and changing its dialect would invalidate them.
         var win_argv: [1][]const u8 = undefined;
+        var win_argv_ps: [7][]const u8 = undefined;
         var apb: [520]u8 = undefined;
         const posix_argv = [_][]const u8{ "sh", "-c", trimmed };
         const argv: []const []const u8 = if (builtin.os.tag == .windows) blk: {
             var cpb: [332]u8 = undefined;
-            const cmdp = std.fmt.bufPrint(&cpb, "{s}.cmd", .{base}) catch {
+            const cmdp = std.fmt.bufPrint(&cpb, "{s}{s}", .{ base, if (ai) @as([]const u8, ".cmd") else ".ps1" }) catch {
                 of.close(self.io);
                 ef.close(self.io);
                 self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
                 return;
             };
             var script: [8192]u8 = undefined;
-            const body = buildBatchScript(&script, trimmed) orelse {
+            const body = (if (ai) buildBatchScript(&script, trimmed) else buildPsScript(&script, trimmed)) orelse {
                 of.close(self.io);
                 ef.close(self.io);
                 self.consoleLaunchFailed(dd, ai, "(the command is too long or contains bytes the console cannot carry)");
@@ -2658,8 +2804,14 @@ pub const Chat = struct {
                 self.consoleLaunchFailed(dd, ai, "(failed to prepare the command)");
                 return;
             };
-            win_argv[0] = apb[0..an];
-            break :blk &win_argv;
+            if (ai) {
+                win_argv[0] = apb[0..an];
+                break :blk &win_argv;
+            }
+            // -NoProfile: fast + reproducible; -NonInteractive: a Read-Host/credential prompt errors instead
+            // of hanging a windowless child until the timeout; Bypass is per-process only (no system change).
+            win_argv_ps = .{ "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", apb[0..an] };
+            break :blk &win_argv_ps;
         } else &posix_argv;
         const child = std.process.spawn(self.io, .{
             .argv = argv,
@@ -2673,7 +2825,7 @@ pub const Chat = struct {
             ef.close(self.io);
             if (builtin.os.tag == .windows) {
                 var cpb2: [332]u8 = undefined;
-                if (std.fmt.bufPrint(&cpb2, "{s}.cmd", .{base})) |cmdp| {
+                if (std.fmt.bufPrint(&cpb2, "{s}{s}", .{ base, if (ai) @as([]const u8, ".cmd") else ".ps1" })) |cmdp| {
                     Io.Dir.cwd().deleteFile(self.io, cmdp) catch {};
                 } else |_| {}
             }
@@ -2815,9 +2967,9 @@ pub const Chat = struct {
         const err_slice = if (scratch) |s| self.readSink(errp, s[40 << 10 ..]) else "";
         Io.Dir.cwd().deleteFile(self.io, outp) catch {}; // data is in scratch now — clean up the sinks
         Io.Dir.cwd().deleteFile(self.io, errp) catch {};
-        if (builtin.os.tag == .windows) { // the batch carrier (only safe to delete once the child is dead)
+        if (builtin.os.tag == .windows) { // the script carrier (only safe to delete once the child is dead)
             var cpb: [332]u8 = undefined;
-            if (std.fmt.bufPrint(&cpb, "{s}.cmd", .{p.baseStr()})) |cmdp| {
+            if (std.fmt.bufPrint(&cpb, "{s}{s}", .{ p.baseStr(), if (ai) @as([]const u8, ".cmd") else ".ps1" })) |cmdp| {
                 Io.Dir.cwd().deleteFile(self.io, cmdp) catch {};
             } else |_| {}
         }
@@ -3665,9 +3817,10 @@ pub const Chat = struct {
 
     // ---------------------------------------------------------------------- chat Files tab (this chat's own dir)
 
-    /// The data-relative build dir for THIS conversation ("u{uid}/_chat/builds/{conv}"); "" if no active conv.
-    /// The uid is taken from the leading "uN" segment of build_dir (set when a build tool ran) — defaults to u1,
-    /// which is the desktop's admin user on localhost.
+    /// The data-relative build dir for THIS conversation ("u{uid}/_chat/builds/{conv}", or the task tree
+    /// "u{uid}/_sched/{task}/runs/{stamp}" for a scheduled run's conv); "" if no active conv. The uid is taken
+    /// from the leading "uN" segment of build_dir (set when a build tool ran) — defaults to u1, which is the
+    /// desktop's admin user on localhost.
     fn chatBuildRel(self: *Chat, buf: []u8) []const u8 {
         var cb: [64]u8 = undefined;
         const conv = self.convScope(&cb);
@@ -3679,7 +3832,26 @@ pub const Chat = struct {
                 if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
             }
         }
+        if (schedConvParts(conv)) |p| {
+            return std.fmt.bufPrint(buf, "{s}/_sched/{s}/runs/{s}", .{ uid, p.tid, p.stamp }) catch "";
+        }
         return std.fmt.bufPrint(buf, "{s}/_chat/builds/{s}", .{ uid, conv }) catch "";
+    }
+
+    /// LOCAL TWIN of the server's chat/paths.zig schedParts (kept verbatim so the two mappings can never
+    /// drift): "scheduled_{taskid}_{stamp}" with an all-digit stamp → parts; anything else → null.
+    fn schedConvParts(conv: []const u8) ?struct { tid: []const u8, stamp: []const u8 } {
+        const prefix = "scheduled_";
+        if (!std.mem.startsWith(u8, conv, prefix)) return null;
+        const rest = conv[prefix.len..];
+        const us = std.mem.lastIndexOfScalar(u8, rest, '_') orelse return null;
+        if (us == 0) return null;
+        const stamp = rest[us + 1 ..];
+        if (stamp.len < 4) return null;
+        for (stamp) |c| {
+            if (c < '0' or c > '9') return null;
+        }
+        return .{ .tid = rest[0..us], .stamp = stamp };
     }
 
     /// Scan this chat's own build dir ({conv}/work) and publish the file list into the Store for the Files tab.
@@ -8831,24 +9003,61 @@ fn buildBatchScript(buf: []u8, cmd: []const u8) ?[]const u8 {
     return buf[0..w];
 }
 
-/// Would this command trip the batch-vs-interactive FOR-variable trap (`for %i ...` errors in a batch
-/// script; it needs %%i)? True when a "for" token appears and a SINGLE-letter %x variable (not %%x, not a
-/// %NAME% env pair) follows. Drives the one-line You-tab hint in consoleStart. Pure — unit-tested.
-fn needsBatchPercentHint(cmd: []const u8) bool {
-    var lb: [1024]u8 = undefined;
-    const n = @min(cmd.len, lb.len);
-    for (cmd[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
-    const low = lb[0..n];
-    const at = std.mem.indexOf(u8, low, "for ") orelse return false;
-    var j = at + 4;
-    while (j + 1 < n) : (j += 1) {
-        if (low[j] != '%') continue;
-        if (j > 0 and low[j - 1] == '%') continue; // %%x — already batch-escaped
-        if (!std.ascii.isAlphabetic(low[j + 1])) continue; // %2/%* are handled by buildBatchScript itself
-        if (j + 2 < n and (std.ascii.isAlphanumeric(low[j + 2]) or low[j + 2] == '%')) continue; // %NAME(%) env ref
-        return true; // single-letter %x after a for — the trap
+/// Compose the PowerShell script that carries ONE You-tab command (the AI door keeps the batch carrier
+/// above — its prompt + learned lessons speak batch). Three pieces around the verbatim command:
+///   1) a UTF-8 BOM, so Windows PowerShell 5.1 reads the FILE as UTF-8 (BOM-less .ps1 parses as ANSI and
+///      garbles any non-ASCII path/arg);
+///   2) an output-encoding prelude (try/catch — the setter can throw with no console attached) + Python
+///      UTF-8 env, mirroring the batch carrier's chcp/PYTHONUTF8 fix;
+///   3) an exit-code trailer so the child's exit status matches what a real shell would report:
+///      $LASTEXITCODE when a native command ran, else $? for cmdlet success/failure.
+/// The command itself is embedded VERBATIM — PowerShell parses the file with its full grammar, so quotes,
+/// pipes, $vars and operators mean exactly what they mean at a real PS prompt (nothing to escape, unlike
+/// batch's %-rules). Returns null when the command can't be carried (NUL byte / overflow). Pure — unit-tested.
+fn buildPsScript(buf: []u8, cmd: []const u8) ?[]const u8 {
+    const H = struct {
+        fn put(b: []u8, at: usize, s: []const u8) ?usize {
+            if (at + s.len > b.len) return null;
+            @memcpy(b[at .. at + s.len], s);
+            return at + s.len;
+        }
+    };
+    var w = H.put(buf, 0, "\xEF\xBB\xBF" ++
+        "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}\r\n" ++
+        "$env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'\r\n") orelse return null;
+    var i: usize = 0;
+    while (i < cmd.len) : (i += 1) {
+        const c = cmd[i];
+        if (c == 0) return null;
+        if (c == '\r') continue; // dropped; the matching \n below re-emits the full CRLF
+        if (c == '\n') {
+            w = H.put(buf, w, "\r\n") orelse return null;
+        } else {
+            if (w >= buf.len) return null;
+            buf[w] = c;
+            w += 1;
+        }
     }
-    return false;
+    w = H.put(buf, w, "\r\n" ++
+        "if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\r\n" ++
+        "if ($?) { exit 0 } else { exit 1 }\r\n") orelse return null;
+    return buf[0..w];
+}
+
+/// The last path segment of a directory path ("C:\a\build" → "build"), tolerant of either slash form and
+/// trailing separators; a bare drive root ("C:\") yields "C:". Pure — used for the compact prompt echo.
+fn lastPathSegment(p: []const u8) []const u8 {
+    const trimmed = std.mem.trimEnd(u8, p, "/\\");
+    if (trimmed.len == 0) return "";
+    if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| return trimmed[i + 1 ..];
+    return trimmed;
+}
+
+/// Absolute path on either OS family: leading slash/backslash, or a Windows drive spec ("C:...").
+fn isAbsPath(p: []const u8) bool {
+    if (p.len == 0) return false;
+    if (p[0] == '/' or p[0] == '\\') return true;
+    return p.len >= 2 and p[1] == ':' and std.ascii.isAlphabetic(p[0]);
 }
 
 const RunLoose = struct { cmd: []const u8, at: usize };
@@ -12414,13 +12623,37 @@ test "scRawField matches the KEY, not a same-named VALUE (the [tool:] blank-name
     try std.testing.expect(scRawField(msg, "tool") == null); // absent field → null
 }
 
-test "needsBatchPercentHint fires only on single-% for-loop variables" {
-    try std.testing.expect(needsBatchPercentHint("for %i in (*.txt) do @echo %i"));
-    try std.testing.expect(needsBatchPercentHint("FOR /f %a in ('dir /b') do echo %a"));
-    try std.testing.expect(!needsBatchPercentHint("for %%i in (*.txt) do @echo %%i")); // already escaped
-    try std.testing.expect(!needsBatchPercentHint("echo %PATH% for the record")); // env pair, not a loop var
-    try std.testing.expect(!needsBatchPercentHint("curl https://x/a%20b")); // no for-loop at all
-    try std.testing.expect(!needsBatchPercentHint("dir"));
+test "buildPsScript: BOM + encoding prelude, verbatim command, exit trailer, CRLF, NUL/overflow rejected" {
+    var buf: [8192]u8 = undefined;
+    const PRE = "\xEF\xBB\xBF" ++
+        "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}\r\n" ++
+        "$env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'\r\n";
+    const POST = "\r\n" ++
+        "if ($LASTEXITCODE -is [int]) { exit $LASTEXITCODE }\r\n" ++
+        "if ($?) { exit 0 } else { exit 1 }\r\n";
+    // the command is carried VERBATIM — PS quoting/vars/pipes must not be touched (no batch %-mangling)
+    try std.testing.expectEqualStrings(PRE ++ "git log --format=\"%h %s\" | Select-Object -First 3" ++ POST, buildPsScript(&buf, "git log --format=\"%h %s\" | Select-Object -First 3").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo $env:PATH" ++ POST, buildPsScript(&buf, "echo $env:PATH").?);
+    // multi-line commands normalize to CRLF (either input form)
+    try std.testing.expectEqualStrings(PRE ++ "echo a\r\necho b" ++ POST, buildPsScript(&buf, "echo a\necho b").?);
+    try std.testing.expectEqualStrings(PRE ++ "echo a\r\necho b" ++ POST, buildPsScript(&buf, "echo a\r\necho b").?);
+    // a NUL can't ride a script file; a too-small buffer refuses instead of truncating the command
+    try std.testing.expect(buildPsScript(&buf, "echo a\x00b") == null);
+    var tiny: [64]u8 = undefined;
+    try std.testing.expect(buildPsScript(&tiny, "dir") == null);
+}
+
+test "lastPathSegment + isAbsPath: prompt/cd helpers handle both slash families" {
+    try std.testing.expectEqualStrings("build", lastPathSegment("C:\\a\\build"));
+    try std.testing.expectEqualStrings("work", lastPathSegment("data/u1/_chat/builds/c1/work/"));
+    try std.testing.expectEqualStrings("C:", lastPathSegment("C:\\"));
+    try std.testing.expectEqualStrings("", lastPathSegment(""));
+    try std.testing.expect(isAbsPath("C:\\Users"));
+    try std.testing.expect(isAbsPath("c:/Users"));
+    try std.testing.expect(isAbsPath("/usr/bin"));
+    try std.testing.expect(isAbsPath("\\\\server\\share"));
+    try std.testing.expect(!isAbsPath("sub/dir"));
+    try std.testing.expect(!isAbsPath("..") and !isAbsPath(""));
 }
 
 // A tiny harness for the async-console tests: a Chat wired to a throwaway data dir. Caller owns teardown.
@@ -12492,14 +12725,38 @@ test "micro-console: a You command runs async (non-blocking), streams its output
     try std.testing.expect(consoleScrollHas(ctx.store, false, "neuron-db-console-probe"));
 }
 
-test "micro-console: a nonzero exit surfaces '(exit code N)' and the batch carrier is cleaned up" {
-    if (builtin.os.tag != .windows) return; // the .cmd carrier + full-u32 exit peek are the Windows path
+test "micro-console: cd/pwd/cls builtins keep a persistent cwd in-process (no spawn)" {
+    const dd = "zig-console-cd-tmp";
+    var ctx = ConsoleTestCtx.init(dd, false);
+    defer ctx.deinit(dd);
+    _ = Io.Dir.cwd().createDirPathStatus(ctx.io(), dd ++ "/subdir", .default_dir) catch {};
+    ctx.chat.consoleStart(dd, false, "cd " ++ dd ++ "/subdir");
+    try std.testing.expect(ctx.chat.console == null); // a builtin never registers a proc
+    try std.testing.expect(ctx.chat.console_cwd_len > 0);
+    try std.testing.expect(std.mem.endsWith(u8, ctx.chat.console_cwd[0..ctx.chat.console_cwd_len], "subdir"));
+    try std.testing.expect(ctx.store.console_cwd_len > 0); // published for the UI prompt line
+    // pwd echoes the adopted cwd; a RELATIVE cd resolved against it, so the canonical path is absolute
+    ctx.chat.consoleStart(dd, false, "pwd");
+    try std.testing.expect(ctx.chat.console == null);
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "subdir"));
+    // a bad target is refused and the cwd stays put
+    const before = ctx.chat.console_cwd_len;
+    ctx.chat.consoleStart(dd, false, "cd definitely-not-a-real-dir-xyz");
+    try std.testing.expect(consoleScrollHas(ctx.store, false, "cd: no such directory"));
+    try std.testing.expectEqual(before, ctx.chat.console_cwd_len);
+    // cls wipes the You scrollback
+    ctx.chat.consoleStart(dd, false, "cls");
+    try std.testing.expectEqual(@as(usize, 0), ctx.store.console_you_len);
+}
+
+test "micro-console: a nonzero exit surfaces '(exit code N)' and the script carrier is cleaned up" {
+    if (builtin.os.tag != .windows) return; // the script carrier + full-u32 exit peek are the Windows path
     const dd = "zig-console-exit-tmp";
     var ctx = ConsoleTestCtx.init(dd, false);
     defer ctx.deinit(dd);
     ctx.chat.consoleStart(dd, false, "exit 3");
     try std.testing.expect(ctx.chat.console != null);
-    const carrier = dd ++ "/.veil-desk/console_you.cmd";
+    const carrier = dd ++ "/.veil-desk/console_you.ps1"; // the You door rides the PowerShell carrier
     // the carrier exists while the command is registered...
     if (Io.Dir.cwd().statFile(ctx.io(), carrier, .{})) |_| {} else |_| return error.CarrierMissingWhileRunning;
     ctx.drain(dd);
