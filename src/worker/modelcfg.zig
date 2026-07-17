@@ -218,10 +218,23 @@ fn parseModels(raw: []const u8, comptime want_key: []const u8) []const Model {
 // ---- tests: the EMBEDDED catalog itself is the fixture — CI fails on a bad edit -------------------------
 
 test "models.yaml parses: provider order pins the desk's persisted dropdown indices" {
-    try std.testing.expect(providers.len >= 12);
+    try std.testing.expect(providers.len >= 13);
     // the persisted dropdown indices — order is a compatibility contract (append-only)
-    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "workers-ai", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter" };
+    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "workers-ai", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot" };
     for (expect, 0..) |k, i| try std.testing.expectEqualStrings(k, providers[i].key);
+}
+
+test "moonshot (Kimi) provider: first-party API, kimi-k3 flagship first, OpenAI-compatible BYOK" {
+    const p = for (providers) |pr| {
+        if (std.mem.eql(u8, pr.key, "moonshot")) break pr;
+    } else unreachable;
+    try std.testing.expectEqualStrings("https://api.moonshot.ai/v1", p.base_url);
+    try std.testing.expect(p.needs_key and !p.keyless and !p.local and !p.needs_account);
+    try std.testing.expectEqualStrings("kimi-k3", p.models[0].id); // flagship = the provider's default model
+    try std.testing.expectEqualStrings("Kimi K3 (flagship, 1M ctx)", p.models[0].label);
+    try std.testing.expect(p.models.len >= 12);
+    // a dotted id survives the bare-scalar parse (no quoting needed)
+    try std.testing.expectEqualStrings("kimi-k2.7-code", p.models[1].id);
 }
 
 test "models.yaml parses: fields, flags, models, quoted scalars, defaults" {
