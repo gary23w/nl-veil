@@ -3557,9 +3557,18 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - 16, 18))); // textArea's 18px line pitch
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
     textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows);
-    // Send/Stop spans the full input row (same convention as the swarm-detail chat + console rows) —
-    // deriving y/height from input_h keeps the two aligned even if the row height changes later.
-    const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = input_h };
+    // Shift+Enter inserts a literal newline in EVERY turn state (drafting a multi-paragraph or blank-line
+    // message / steer) — every send/post key below gates on !shift, so this never doubles with a send.
+    if (ui.focus == .c_input and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and
+        (rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift)))
+    {
+        _ = ui.c_input.delSel();
+        ui.c_input.insert('\n');
+    }
+    // Send/Stop buttons DON'T stretch with a tall (dragged) input — fixed height, anchored to the TOP of the
+    // send column. send_bh caps the single Send/Stop; the split Post/Stop caps each half below.
+    const send_bh: f32 = @min(input_h, 46);
+    const sendb = t.Rect{ .x = r.x + r.width - send_w, .y = sy, .width = send_w, .height = send_bh };
     // While a turn is generating (or auto-loop is driving), the send column offers control. For a SERVER turn
     // (steerable) it SPLITS into two stacked buttons — POST (blue: send the typed text as a live steer the running
     // turn folds in) over STOP (red: abort + halt auto-loop), making steering an explicit, discoverable action.
@@ -3570,7 +3579,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         const enter = (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and !shift and ui.focus == .c_input;
         if (server_steerable) {
             const g: f32 = 6;
-            const bh = (input_h - g) / 2;
+            const bh: f32 = @min(44, (input_h - g) / 2); // fixed height, top-anchored — never stretch to a tall input
             const postb = t.Rect{ .x = sendb.x, .y = sy, .width = send_w, .height = bh };
             const stopb = t.Rect{ .x = sendb.x, .y = sy + bh + g, .width = send_w, .height = bh };
             const can_post = ui.c_input.len > 0;
@@ -3587,10 +3596,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     } else {
         const can_send = ui.c_input.len > 0;
         const clicked = t.buttonSolid(sendb, t.z("Send", .{}), t.blue, can_send);
-        // Enter sends; Shift+Enter inserts a literal newline (drafting multi-paragraph prompts).
+        // Enter sends; Shift+Enter (handled above, in every turn state) already inserted the newline.
         const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
         const enter_key = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
-        if (enter_key and shift and ui.focus == .c_input) ui.c_input.insert('\n');
         const enter = enter_key and !shift;
         if (can_send and (clicked or (ui.focus == .c_input and enter))) {
             store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
@@ -6198,15 +6206,39 @@ fn flushChatDropdown(store: *Store) void {
 /// Greedy word-wrap `s` into `out` display lines at pixel width `maxw` (font size 13). Accumulates single-glyph
 /// widths (O(n), no O(n^2) re-measure) and breaks at the last space that fits. Returns the line count.
 fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
+    // HARD newlines first: each '\n' (shift+enter) ends a visual line, and a run of them makes blank lines —
+    // the field stores '\n' literally, and splitting here keeps the per-line slices newline-free so the
+    // renderer (foldAscii) never folds a '\n' into a space. Each segment is then width-wrapped.
     var n: usize = 0;
-    var ls: usize = 0; // current line start
-    var i: usize = 0;
+    var a: usize = 0; // start of the current hard line
+    while (n < out.len) {
+        var e = a;
+        while (e < s.len and s[e] != '\n') e += 1;
+        n += wrapSegment(s, a, e, maxw, out[n..]);
+        if (e >= s.len) break; // last hard line consumed
+        a = e + 1; // step past the '\n'; a trailing "\n" leaves a == s.len → one more (empty) segment next pass
+    }
+    return n;
+}
+
+/// Width-wrap the hard-line segment s[a..e] into sub-slices of `s`, appending to `out`. Always emits at least
+/// one slice — an empty segment (a blank line) becomes a single empty slice pointing at its own offset in `s`
+/// (so lineOff's pointer math resolves the caret onto it). Returns the count appended.
+fn wrapSegment(s: []const u8, a: usize, e: usize, maxw: f32, out: [][]const u8) usize {
+    if (out.len == 0) return 0;
+    if (a >= e) {
+        out[0] = s[a..a]; // blank line — a real slice into the buffer, not "" (whose ptr is elsewhere)
+        return 1;
+    }
+    var n: usize = 0;
+    var ls: usize = a;
+    var i: usize = a;
     // Measure whole candidate LINES (word by word), not single chars — t.measure includes inter-char spacing,
     // so summing single-char widths underestimates and lines overflow the box.
-    while (i < s.len and n < out.len) {
+    while (i < e and n < out.len) {
         var we = i; // extend through the next word + its trailing spaces
-        while (we < s.len and s[we] != ' ') we += 1;
-        while (we < s.len and s[we] == ' ') we += 1;
+        while (we < e and s[we] != ' ') we += 1;
+        while (we < e and s[we] == ' ') we += 1;
         const w: f32 = @floatFromInt(t.measure(t.zs(s[ls..we]), 13));
         if (w <= maxw) {
             i = we;
@@ -6220,14 +6252,14 @@ fn wrapInto(s: []const u8, maxw: f32, out: [][]const u8) usize {
         }
         // a single word is wider than the whole line — hard-break it by character
         var j = ls + 1;
-        while (j < we and @as(f32, @floatFromInt(t.measure(t.zs(s[ls .. j + 1]), 13))) <= maxw) j += 1;
+        while (j < e and @as(f32, @floatFromInt(t.measure(t.zs(s[ls .. j + 1]), 13))) <= maxw) j += 1;
         out[n] = s[ls..j];
         n += 1;
         ls = j;
         i = j;
     }
-    if (ls < s.len and n < out.len) {
-        out[n] = s[ls..];
+    if (ls < e and n < out.len) {
+        out[n] = s[ls..e];
         n += 1;
     }
     return n;
@@ -6326,10 +6358,14 @@ fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, w
     }
 }
 
-/// Byte offset of a wrapped-line slice within its Field's buffer.
+/// Byte offset of a wrapped-line slice within its Field's buffer. Pointer math works for EMPTY lines too
+/// (a blank line's slice points at its own offset), so a caret can land on a blank line. The guard covers
+/// only a degenerate slice whose pointer isn't in the buffer (e.g. a literal "") — that maps to end-of-text.
 fn lineOff(f: *const Ui.Field, line: []const u8) usize {
-    if (line.len == 0) return f.len;
-    return @intFromPtr(line.ptr) - @intFromPtr(&f.buf);
+    const base = @intFromPtr(&f.buf);
+    const p = @intFromPtr(line.ptr);
+    if (p < base or p > base + f.buf.len) return f.len;
+    return p - base;
 }
 
 /// Map a mouse position to a byte index in the field: row from y (clamped), column via prefix-measure.
