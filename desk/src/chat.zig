@@ -1646,6 +1646,29 @@ pub const Chat = struct {
         return false;
     }
 
+    /// The user is leaving a conversation whose SERVER turn is still running. ADOPT it as a background turn —
+    /// the server keeps driving it, pumpBackground keeps servicing its delegated tools, and its transcript
+    /// re-mirrors when the user returns — instead of blocking the switch (old behavior) or stopping the turn.
+    /// Clears ONLY the foreground poller/UI state; never posts {op:stop} and never cancels the in-flight
+    /// delegated tool (it belongs to the departing conv and posts back by origin id — see Stage A). No-op unless
+    /// a server turn is actually live in the foreground (a local turn / cast still blocks the switch upstream).
+    fn detachToBackground(self: *Chat) void {
+        if (!self.sc_active) return;
+        self.bgAdd(self.sc_conv[0..self.sc_conv_len], self.sc_from);
+        self.scClearStream(); // drop the half-streamed foreground preview
+        self.setServerActive(false);
+        self.setBusy(false);
+        self.setStatus("");
+        self.sc_serving = false; // no longer the foreground-served turn (it runs server-side from here)
+        self.releaseServerCastDisplay("detached (backgrounded the conversation)");
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            self.store.chat_loop = false; // the foreground send column resets; any afk loop keeps running server-side
+            self.store.chat_loop_afk = false;
+        }
+    }
+
     /// Service ONE background conversation's frame: run its delegated tools / sync answers so the server turn
     /// keeps moving, and report whether this frame was the turn's {done}. Deliberately does NOT render (no
     /// tokens/messages/status) — a background turn is invisible until the user switches back and re-mirrors it.
@@ -2328,6 +2351,31 @@ pub const Chat = struct {
         }
     }
 
+    /// Cancel only the delegated work belonging to `conv` (kill its in-flight tool if that is what the shared
+    /// executor is running, and drop its queued frames). Used by abortServerChat so aborting the FOREGROUND
+    /// turn never kills a BACKGROUND conversation's tool that happens to be occupying the one executor slot.
+    fn delegCancelFor(self: *Chat, conv: []const u8) void {
+        if (self.deleg) |*p| {
+            if (std.mem.eql(u8, p.convStr(), conv)) {
+                p.child.kill(self.io);
+                var ob: [360]u8 = undefined;
+                var eb: [360]u8 = undefined;
+                if (std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()})) |outp| Io.Dir.cwd().deleteFile(self.io, outp) catch {} else |_| {}
+                if (std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()})) |errp| Io.Dir.cwd().deleteFile(self.io, errp) catch {} else |_| {}
+                Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
+                self.deleg = null;
+            }
+        }
+        for (&self.deleg_q) |*slot| {
+            if (slot.*) |q| {
+                if (std.mem.eql(u8, q.convStr(), conv)) {
+                    self.gpa.free(q.line);
+                    slot.* = null;
+                }
+            }
+        }
+    }
+
     /// Combined byte size of the delegated tool's two sink files (the output-flood guard). 0 on stat errors.
     fn delegSinkBytes(self: *Chat, p: *const DelegProc) u64 {
         var ob: [360]u8 = undefined; // base (per-conv, up to 352) + ".out"/".err" must fit
@@ -2414,7 +2462,8 @@ pub const Chat = struct {
             }
         }
         self.sc_serving = false; // no longer server-served → the local auto-loop may take over
-        self.delegCancel(); // the awaiting turn is gone — a still-running delegated tool must not keep working blind
+        self.delegCancelFor(conv); // cancel ONLY this (foreground) conv's delegated work — a background conv's tool
+        //                            may be occupying the shared executor and must keep running for its own turn
         self.releaseServerCastDisplay("detached"); // finalize the row + clear status (the server turn that owned it is gone)
         self.scClearStream(); // drop any half-streamed preview
         if (note.len > 0) self.appendMsg(dd, .veil, note);
@@ -2443,7 +2492,11 @@ pub const Chat = struct {
         // in those idle gaps would repoint conv_active and the settling veil/merge appends would overwrite the
         // newly-selected chat. Mirror maybeLoop's guard. sc_active: a SERVER-chat turn renders its frames into the
         // active conv from the poller (self.turn stays .idle for it), so a switch mid-turn would misroute them.
-        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil or self.sc_active;
+        // NOTE: sc_active is deliberately NOT in this gate. A plain SERVER-brain turn can be ADOPTED into a
+        // background slot on switch (detachToBackground) — it keeps running server-side and its tools keep being
+        // serviced — so it no longer needs to block the switch. A LOCAL turn, a cast, or an AI console command
+        // still can't be backgrounded (single-slot / display-bound), so those still block.
+        return self.turn != .idle or self.cast_active or self.consoleAiBusy() or self.veil_work_active or self.cast_awaiting_veil;
     }
 
     /// Is a cast in flight anywhere in its lifecycle (deploying/running, or the concurrent-veil parallel attempt /
@@ -3426,6 +3479,7 @@ pub const Chat = struct {
     }
 
     pub fn cmdNewConv(self: *Chat, dd: []const u8) void {
+        self.detachToBackground(); // a live server turn keeps running in the background; don't block the new chat
         var idb: [64]u8 = undefined; // = Store.conv_active capacity; [32] literals here were the missed-widening panic class
         const now = self.nowS();
         const id = std.fmt.bufPrint(&idb, "c{x}", .{@as(u64, @intCast(now))}) catch return;
@@ -3460,6 +3514,11 @@ pub const Chat = struct {
 
     fn cmdSelectConv(self: *Chat, dd: []const u8, id: []const u8) void {
         if (id.len == 0) return; // busy-guard is at the .select_conv dispatch (busyForSwitch), which also notifies
+        self.detachToBackground(); // if the CURRENT conv has a live server turn, adopt it to a background slot first
+        // Re-focusing a conversation that has been running in the BACKGROUND: reclaim its slot and force a fresh
+        // server re-mirror below, so the transcript the desk shows is the server's current truth (the desk never
+        // rendered it while backgrounded) and the live poller re-attaches if the turn is still going.
+        const was_bg = self.bgRemove(id);
         {
             self.store.lock();
             defer self.store.unlock();
@@ -3473,7 +3532,7 @@ pub const Chat = struct {
         self.releaseServerCastDisplay("detached (left the conversation)"); // a server-cast display cannot span a conversation switch
         self.resetArcFlags(); // a stale arc_mutated/fail pair must not leak a verify turn or lesson across chats
         self.mirror_live = false; // stale liveness from a previous select must never arm a watch on THIS conv
-        self.loadMsgs(dd, id);
+        self.loadMsgs(dd, id, was_bg);
         { // re-anchor the loop's durable goal to THIS conversation's first message
             self.store.lock();
             defer self.store.unlock();
@@ -4297,14 +4356,16 @@ pub const Chat = struct {
         return std.fmt.bufPrint(buf, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch null;
     }
 
-    fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8) void {
+    fn loadMsgs(self: *Chat, dd: []const u8, id: []const u8, remirror: bool) void {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return;
         // SCHEDULED runs live server-side and GROW there (a run may still be streaming, or finished after the
         // mirror was cut) — a once-mirrored snapshot showed the prompt with no reply and read as "the task
         // never executed". Re-mirror on EVERY select so the view is the server's current truth; the local copy
-        // is refreshed in place (best-effort — a down server just shows the last mirror).
-        if (std.mem.startsWith(u8, id, "scheduled_")) _ = self.mirrorServerConv(dd, id);
+        // is refreshed in place (best-effort — a down server just shows the last mirror). `remirror` forces the
+        // same refresh for a conversation returning from the BACKGROUND (the desk never rendered it while it ran
+        // there, so its local copy is stale) — and sets mirror_live, so the poller re-attaches if it's still going.
+        if (remirror or std.mem.startsWith(u8, id, "scheduled_")) _ = self.mirrorServerConv(dd, id);
         const data = Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(2 << 20)) catch blk: {
             // No local file: a SERVER-born conversation (a scheduled_* run merged into the sidebar by
             // refreshConvs). Mirror it down once, then load through the unchanged local path — every
