@@ -121,6 +121,10 @@ const Ui = struct {
     stream_h: f32 = 0,
     stream_h_len: usize = std.math.maxInt(usize),
     stream_h_cols: usize = 0,
+    // SMOOTH REVEAL: how many bytes of the in-flight reply are shown on screen. Server tokens arrive in
+    // poll-batched chunks (33-120ms), so dumping each batch at once makes a slow reply appear in visible
+    // jumps; this advances toward the received length at a steady catch-up rate so the text flows like typing.
+    stream_reveal: usize = 0,
     tool_open: ?usize = null, // which tool-call message is expanded (else all collapsed to a one-line chip)
     chat: Field = .{},
     // Chat tab
@@ -1849,7 +1853,23 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // Sized for the draft-mode worst case: quoted reasoning (4096 + "> " per line) + separator + "— drafting —"
     // header + the quoted 12288-cap reflect draft; quoteInto ellipsizes gracefully if this still overflows.
     var inflight_buf: [18432]u8 = undefined;
-    const inflight = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
+    const inflight_full = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
+
+    // SMOOTH REVEAL: show a growing prefix of the received buffer, advancing each frame, so chunky poll-batched
+    // token arrivals read as smooth typing instead of appearing in jumps. Catch-up is proportional (≈1/5 of the
+    // backlog per frame, min a few bytes) — a small chunk flows over ~5 frames (~80ms) yet a big burst drains
+    // fast so the display never lags far behind reality. The buffer resets to empty between turns; clamp down
+    // with it so a new reply starts revealing from the top.
+    if (ui.stream_reveal > inflight_full.len) ui.stream_reveal = inflight_full.len;
+    if (ui.stream_reveal < inflight_full.len) {
+        const gap = inflight_full.len - ui.stream_reveal;
+        ui.stream_reveal += @max(@as(usize, 3), gap / 5);
+        if (ui.stream_reveal > inflight_full.len) ui.stream_reveal = inflight_full.len;
+    }
+    // never cut a multibyte UTF-8 glyph mid-sequence — back up to the last char boundary at/under the reveal
+    var reveal = ui.stream_reveal;
+    while (reveal > 0 and reveal < inflight_full.len and (inflight_full[reveal] & 0xC0) == 0x80) reveal -= 1;
+    const inflight = inflight_full[0..reveal];
 
     // Only the NEWEST row can be the live cast (updateCastRow only ever writes casts[n-1]). Scanning ALL rows
     // would let a historical row orphaned mid-"running" (a conv-switch/stop seam) pin the green "hive is
