@@ -699,9 +699,10 @@ test "cleanFactInto: folds newlines, collapses runs, drops junk, clips at the bu
     );
     // semicolons soften so quoted CODE stays ONE fact (the core would split each "; " statement into its
     // own junk row); periods are untouched — sentence atomization is the fine weave by design
+    var wide: [160]u8 = undefined;
     try std.testing.expectEqualStrings(
         "build failed: const a = q(id), if (!a) { return 404, } exited code 1. See lib/db.ts",
-        cleanFactInto(&b, "build failed: const a = q(id);\nif (!a) { return 404; }\nexited code 1. See lib/db.ts").?,
+        cleanFactInto(&wide, "build failed: const a = q(id);\nif (!a) { return 404; }\nexited code 1. See lib/db.ts").?,
     );
     // overflow clips inside the buffer without tearing anything
     var big: [200]u8 = undefined;
