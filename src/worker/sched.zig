@@ -69,6 +69,17 @@ pub const Task = struct {
     base_url: []const u8 = "",
     model: []const u8 = "",
     api_key: []const u8 = "", // STORED on disk; NEVER echoed back out — encodeTask redacts it for HTTP
+    // MODEL TRIO (optional, appended to the wire contract): per-role provider overrides so an unattended run
+    // uses the same trio the creating turn did — `think_*` for planning + context housekeeping, `prompt_*`
+    // for the auto-loop drive. Empty ⇒ that role falls back to base_url/model/api_key at run time (resolveTrio).
+    // Both role keys are secrets: encodeTask redacts them for HTTP exactly like api_key. Old task files lack
+    // these keys entirely — parseFromSliceLeaky(ignore_unknown_fields) leaves them "" ⇒ single-model as before.
+    think_base_url: []const u8 = "",
+    think_model: []const u8 = "",
+    think_api_key: []const u8 = "",
+    prompt_base_url: []const u8 = "",
+    prompt_model: []const u8 = "",
+    prompt_api_key: []const u8 = "",
 };
 
 /// How many run conversations a task remembers (the desk's "recent runs" investigation list). Five keeps the
@@ -337,6 +348,18 @@ pub fn encodeTask(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), t: T
     try http.jstr(gpa, out, t.model);
     try out.appendSlice(gpa, ",\"api_key\":");
     try http.jstr(gpa, out, if (redact_key) "" else t.api_key);
+    try out.appendSlice(gpa, ",\"think_base_url\":");
+    try http.jstr(gpa, out, t.think_base_url);
+    try out.appendSlice(gpa, ",\"think_model\":");
+    try http.jstr(gpa, out, t.think_model);
+    try out.appendSlice(gpa, ",\"think_api_key\":");
+    try http.jstr(gpa, out, if (redact_key) "" else t.think_api_key);
+    try out.appendSlice(gpa, ",\"prompt_base_url\":");
+    try http.jstr(gpa, out, t.prompt_base_url);
+    try out.appendSlice(gpa, ",\"prompt_model\":");
+    try http.jstr(gpa, out, t.prompt_model);
+    try out.appendSlice(gpa, ",\"prompt_api_key\":");
+    try http.jstr(gpa, out, if (redact_key) "" else t.prompt_api_key);
     try out.append(gpa, '}');
 }
 
@@ -390,6 +413,13 @@ pub const CreateSpec = struct {
     base_url: []const u8 = "",
     model: []const u8 = "",
     api_key: []const u8 = "",
+    // MODEL TRIO (optional): per-role overrides carried from the creating turn; empty ⇒ fall back to base.
+    think_base_url: []const u8 = "",
+    think_model: []const u8 = "",
+    think_api_key: []const u8 = "",
+    prompt_base_url: []const u8 = "",
+    prompt_model: []const u8 = "",
+    prompt_api_key: []const u8 = "",
 };
 
 pub const CreateResult = union(enum) { id: []const u8, err: []const u8 };
@@ -445,6 +475,12 @@ pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSp
         .base_url = s.base_url,
         .model = s.model,
         .api_key = s.api_key,
+        .think_base_url = s.think_base_url,
+        .think_model = s.think_model,
+        .think_api_key = s.think_api_key,
+        .prompt_base_url = s.prompt_base_url,
+        .prompt_model = s.prompt_model,
+        .prompt_api_key = s.prompt_api_key,
     };
     if (!saveTask(app, alloc, uid, t)) return .{ .err = "could not write the task file" };
     // The task's PERMANENT working directory, created up front so it exists (and is browsable) before the
@@ -739,6 +775,14 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     defer app.gpa.free(text);
 
     const pr = resolveProvider(app, alloc, uid, t);
+    // The run's model trio: coding/base is the blank-filled provider above; thinking/prompting come straight
+    // from the task (empty ⇒ ModelTrio.pick falls back to coding, so an old single-model task is unchanged).
+    // This is how an unattended run's auto-loop drive + planning honor the trio the creating turn picked.
+    const trio: chat_engine.ModelTrio = .{
+        .coding = .{ .base_url = pr.base, .key = pr.key, .model = pr.model },
+        .thinking = .{ .base_url = t.think_base_url, .key = t.think_api_key, .model = t.think_model },
+        .prompting = .{ .base_url = t.prompt_base_url, .key = t.prompt_api_key, .model = t.prompt_model },
+    };
 
     // Claim-before-spawn, exactly like postMessage: a `false` here means a same-named run from this minute is
     // still going, or the engine is saturated — skip WITHOUT bookkeeping so the task fires on a later tick.
@@ -748,7 +792,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // DONE (bounded by LOOP_MAX_STEPS, so a stuck task ends instead of burning forever). Never afk: an
     // unattended run must terminate on its own. spawnTurn copies every arg into its own blob (conv lives in
     // a stack buffer here) and owns releasing the turn slot on every completion path.
-    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
+    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
 
     // Bookkeeping AFTER the spawn is committed, under the sched lock with a FRESH re-load: a concurrent
     // update (rename, toggle, prompt edit) between the caller's read and this save must not be clobbered by
@@ -906,6 +950,14 @@ pub fn createTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         base_url: []const u8 = "",
         model: []const u8 = "",
         api_key: []const u8 = "",
+        // MODEL TRIO (optional): the desk's Tasks form / a raw API client may send per-role overrides so the
+        // task's unattended runs use the same trio. Absent ⇒ empty ⇒ each role falls back to base at run time.
+        think_base_url: []const u8 = "",
+        think_model: []const u8 = "",
+        think_api_key: []const u8 = "",
+        prompt_base_url: []const u8 = "",
+        prompt_model: []const u8 = "",
+        prompt_api_key: []const u8 = "",
     };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     // ONE create path: the same createFromSpec the chat veil's schedule_task tool calls — identical
@@ -922,6 +974,12 @@ pub fn createTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .base_url = b.base_url,
         .model = b.model,
         .api_key = b.api_key,
+        .think_base_url = b.think_base_url,
+        .think_model = b.think_model,
+        .think_api_key = b.think_api_key,
+        .prompt_base_url = b.prompt_base_url,
+        .prompt_model = b.prompt_model,
+        .prompt_api_key = b.prompt_api_key,
     })) {
         .id => |id| {
             res.status = 201;

@@ -1366,7 +1366,7 @@ pub const Chat = struct {
                 .delete_conv => self.cmdDeleteConv(dd, c.idStr()),
                 .stop_cast => self.cmdStopCast(dd, c.idStr()),
                 .save_settings => self.saveSettings(dd),
-                .save_key => self.cmdSaveKey(dd, c.textStr()),
+                .save_key => self.cmdSaveKey(dd, c.idStr(), c.textStr()),
                 .console_run => self.cmdConsoleRun(dd, std.mem.eql(u8, c.idStr(), "veil"), c.textStr()),
                 .console_cancel => self.console_cancel = true, // Stop button → pumpConsole kills it next tick
                 .console_approve => self.cmdConsoleApprove(dd, std.mem.eql(u8, c.idStr(), "always")), // Approve / Bypass a parked veil command
@@ -1444,6 +1444,32 @@ pub const Chat = struct {
         var mb: [96]u8 = undefined;
         const prov = self.resolveProvider(&bb, &kb, &mb);
 
+        // MODEL TRIO: send a per-role override for "thinking" (planning + context housekeeping) and "prompting"
+        // (the auto-loop drive) when the user configured them. An inactive role (unified, or unset) is sent as
+        // empty strings so the server falls back to the coding/base triple above — the single-model default.
+        var tbb: [256]u8 = undefined;
+        var tkb: [192]u8 = undefined;
+        var tmb: [96]u8 = undefined;
+        var pbb: [256]u8 = undefined;
+        var pkb: [192]u8 = undefined;
+        var pmb: [96]u8 = undefined;
+        var think = llm.Provider{ .base_url = "", .key = "", .model = "" };
+        var prompt = llm.Provider{ .base_url = "", .key = "", .model = "" };
+        {
+            var unified = true;
+            var think_set = false;
+            var prompt_set = false;
+            {
+                self.store.lock();
+                unified = self.store.settings.chat_unified;
+                think_set = self.store.settings.chat_think.set;
+                prompt_set = self.store.settings.chat_prompt.set;
+                self.store.unlock();
+            }
+            if (!unified and think_set) think = self.resolveProviderFor(.thinking, &tbb, &tkb, &tmb);
+            if (!unified and prompt_set) prompt = self.resolveProviderFor(.prompting, &pbb, &pkb, &pmb);
+        }
+
         // AUTO-LOOP MODE: the server now owns the loop, so PASS the desk's live toggle (0=off, 1=on, 2=afk) in the
         // body instead of throwing it away. The server drive loop drives persistently when armed (afk = never accept
         // DONE, only Stop ends it); the desk's LOCAL maybeLoop still stands down for this conv via the sc_serving guard.
@@ -1455,7 +1481,9 @@ pub const Chat = struct {
 
         // Heap body: on default-on a long user message would overflow a fixed buffer (which would then wrongly
         // fall back). Size it to the escaped worst case; any alloc/build failure just falls back to local.
-        const cap = text.len * 2 + prov.base_url.len + prov.model.len + prov.key.len + 128;
+        const cap = text.len * 2 + prov.base_url.len + prov.model.len + prov.key.len +
+            think.base_url.len + think.model.len + think.key.len +
+            prompt.base_url.len + prompt.model.len + prompt.key.len + 256;
         const body = self.gpa.alloc(u8, cap) catch return false;
         defer self.gpa.free(body);
         var w = Io.Writer.fixed(body);
@@ -1468,6 +1496,19 @@ pub const Chat = struct {
             wesc(&w, prov.model);
             w.writeAll("\",\"api_key\":\"") catch break :blk false;
             wesc(&w, prov.key);
+            // MODEL TRIO: empty roles fall back to the coding/base triple server-side (ModelTrio.pick).
+            w.writeAll("\",\"think_base_url\":\"") catch break :blk false;
+            wesc(&w, think.base_url);
+            w.writeAll("\",\"think_model\":\"") catch break :blk false;
+            wesc(&w, think.model);
+            w.writeAll("\",\"think_api_key\":\"") catch break :blk false;
+            wesc(&w, think.key);
+            w.writeAll("\",\"prompt_base_url\":\"") catch break :blk false;
+            wesc(&w, prompt.base_url);
+            w.writeAll("\",\"prompt_model\":\"") catch break :blk false;
+            wesc(&w, prompt.model);
+            w.writeAll("\",\"prompt_api_key\":\"") catch break :blk false;
+            wesc(&w, prompt.key);
             // CLIENT MODE: the server delegates every tool call back as a tool_request frame; the desk runs it on
             // THIS machine (via `veil exec-tool`) so the veil acts in the user's environment, not the server's box.
             w.writeAll("\",\"tool_client\":true,\"loop\":") catch break :blk false;
@@ -1867,9 +1908,15 @@ pub const Chat = struct {
             const state = scRawField(line, "state") orelse "";
             if (std.mem.eql(u8, state, "start")) self.sc_tools += 1; // metrics: one count per tool call (start, not done)
             // A SERVER veil just cast a swarm — arm a DISPLAY-ONLY watch (once per cast, on its "start" frame) so the
-            // right-pane Swarm activity shows the run. The desk never runs the local cast lifecycle here (the server
-            // veil composes the answer via swarm_status). cast_active stays FALSE (see startServerCastWatch).
-            if (std.mem.eql(u8, tool, "cast") and std.mem.eql(u8, state, "start") and !self.cast_active) {
+            // right-pane Activity shows the run. The desk never runs the local cast lifecycle here (the server veil
+            // composes the answer via swarm_status). cast_active stays FALSE (see startServerCastWatch).
+            // Only a LOCAL cast for the CURRENT conversation position is a real reason to defer: a STALE cast_active
+            // must not permanently hide server casts. auto-loop bumps conv_epoch on every send (see cmdSend), so a
+            // local cast fired earlier leaves cast_active lingering while its cast_epoch goes stale — the old
+            // `!cast_active` guard then blocked every later server cast from EVER showing a card. startServerCastWatch
+            // clears the stale flag (cast_active=false) once it arms.
+            const local_cast_here = self.cast_active and self.cast_epoch == self.conv_epoch;
+            if (std.mem.eql(u8, tool, "cast") and std.mem.eql(u8, state, "start") and !local_cast_here) {
                 self.startServerCastWatch();
             }
             var pvb: [260]u8 = undefined;
@@ -4207,27 +4254,59 @@ pub const Chat = struct {
         self.resetVeilWork(); // stopping the cast also abandons the parallel veil attempt + pending finish
     }
 
-    fn cmdSaveKey(self: *Chat, dd: []const u8, key: []const u8) void {
+    /// Save an api key under the SELECTED role's provider slot. `role` is ""/"think"/"prompt" (the panel the
+    /// user clicked Save on). Keyed by the role's own (kind,byok) slug — so two roles on the same provider
+    /// share that provider's one key — and mirrored into the role's in-memory key buffer for resolveProviderFor.
+    fn cmdSaveKey(self: *Chat, dd: []const u8, role: []const u8, key: []const u8) void {
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
-        // Save under the CURRENTLY-SELECTED provider's own slot, not one shared file — otherwise a key saved
-        // while DeepSeek is selected is silently reused for (and mismatched with) every other provider.
+        const slot: KeySlot = if (std.mem.eql(u8, role, "think")) .think else if (std.mem.eql(u8, role, "prompt")) .prompt else .base;
+        // Save under the SELECTED provider's own slot, not one shared file — otherwise a key saved while
+        // DeepSeek is selected is silently reused for (and mismatched with) every other provider.
         var kind: u8 = 0;
         var byok: u8 = 0;
         {
             self.store.lock();
             defer self.store.unlock();
-            kind = self.store.settings.chat_kind;
-            byok = self.store.settings.chat_byok;
+            const s = &self.store.settings;
+            switch (slot) {
+                .base => {
+                    kind = s.chat_kind;
+                    byok = s.chat_byok;
+                },
+                .think => {
+                    kind = s.chat_think.kind;
+                    byok = s.chat_think.byok;
+                },
+                .prompt => {
+                    kind = s.chat_prompt.kind;
+                    byok = s.chat_prompt.byok;
+                },
+            }
         }
         const slug = keySlug(kind, byok);
         const ok = slug.len > 0 and secrets.saveFor(self.io, self.gpa, side, slug, key);
         if (ok) {
             self.store.lock();
             defer self.store.unlock();
-            const n = @min(key.len, self.store.settings.chat_key.len);
-            @memcpy(self.store.settings.chat_key[0..n], key[0..n]);
-            self.store.settings.chat_key_len = @intCast(n);
+            const s = &self.store.settings;
+            switch (slot) {
+                .base => {
+                    const n = @min(key.len, s.chat_key.len);
+                    @memcpy(s.chat_key[0..n], key[0..n]);
+                    s.chat_key_len = @intCast(n);
+                },
+                .think => {
+                    const n = @min(key.len, s.chat_think.key.len);
+                    @memcpy(s.chat_think.key[0..n], key[0..n]);
+                    s.chat_think.key_len = @intCast(n);
+                },
+                .prompt => {
+                    const n = @min(key.len, s.chat_prompt.key.len);
+                    @memcpy(s.chat_prompt.key[0..n], key[0..n]);
+                    s.chat_prompt.key_len = @intCast(n);
+                },
+            }
         }
         if (ok)
             self.store.pushNotif("Key saved", "stored for this provider in the local (user-private) store", 1)
@@ -4297,6 +4376,9 @@ pub const Chat = struct {
         var rightw: u16 = 320;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
+        var unified = true;
+        var think_cfg: store_mod.RoleCfg = .{};
+        var prompt_cfg: store_mod.RoleCfg = .{};
         {
             self.store.lock();
             defer self.store.unlock();
@@ -4322,6 +4404,9 @@ pub const Chat = struct {
             browser_headful = s.browser_headful;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
+            unified = s.chat_unified;
+            think_cfg = s.chat_think;
+            prompt_cfg = s.chat_prompt;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -4352,7 +4437,13 @@ pub const Chat = struct {
         // BROKEN toggle wrote `local_brain:true` on every idle frame (it read the checkbox's click flag as
         // the new value), so every install with that build got silently pinned local and could never turn
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"leftw\":{d},\"rightw\":{d}}}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, leftw, rightw }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"leftw\":{d},\"rightw\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, leftw, rightw }) catch return;
+        // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
+        // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
+        jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
+        emitRoleCfg(&jb, self.gpa, "think", think_cfg) catch return;
+        emitRoleCfg(&jb, self.gpa, "prompt", prompt_cfg) catch return;
+        jb.appendSlice(self.gpa, "}") catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -4459,6 +4550,12 @@ pub const Chat = struct {
         // see saveSettings). Abandoning that key restores server-default; the fixed toggle persists any real
         // opt-out under the new key.
         s.server_chat = std.mem.indexOf(u8, data, "\"srv_brain\":false") == null;
+        // MODEL TRIO: default unified TRUE (absent → true, the single-model default), then parse the thinking /
+        // prompting role overrides. Missing keys leave the RoleCfg defaults (set=false) ⇒ fall back to coding,
+        // so an old settings.json loads as today's single-model chat.
+        s.chat_unified = std.mem.indexOf(u8, data, "\"unified\":false") == null;
+        parseRoleCfg(self.gpa, data, "think", &s.chat_think);
+        parseRoleCfg(self.gpa, data, "prompt", &s.chat_prompt);
     }
 
     /// Load the CURRENTLY-SELECTED provider's key into settings.chat_key (what resolveProvider sends and the
@@ -4468,26 +4565,69 @@ pub const Chat = struct {
     fn loadKey(self: *Chat, dd: []const u8) void {
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
+        // Base (coding) key → settings.chat_key, plus the two trio role keys → their RoleCfg buffers. Each is
+        // resolved by its own provider slug; a provider with no saved key clears its buffer (len 0). Two roles
+        // on the SAME provider correctly share that provider's one key (keyed by slug, not by role).
+        self.loadKeyInto(side, .base);
+        self.loadKeyInto(side, .think);
+        self.loadKeyInto(side, .prompt);
+    }
+
+    const KeySlot = enum { base, think, prompt };
+
+    /// Load ONE provider key from the OS secret store into the matching in-memory buffer. Snapshots (kind,byok)
+    /// under the store lock, does the secrets file read WITHOUT the lock (io), then copies the key back under the
+    /// lock — so resolveProviderFor never has to touch io while holding the lock. Only the base slot honors the
+    /// one-time legacy-key migration (the two role slots are new — nothing legacy to upgrade).
+    fn loadKeyInto(self: *Chat, side: []const u8, slot: KeySlot) void {
         var kind: u8 = 0;
         var byok: u8 = 0;
         {
             self.store.lock();
             defer self.store.unlock();
-            kind = self.store.settings.chat_kind;
-            byok = self.store.settings.chat_byok;
+            const s = &self.store.settings;
+            switch (slot) {
+                .base => {
+                    kind = s.chat_kind;
+                    byok = s.chat_byok;
+                },
+                .think => {
+                    kind = s.chat_think.kind;
+                    byok = s.chat_think.byok;
+                },
+                .prompt => {
+                    kind = s.chat_prompt.kind;
+                    byok = s.chat_prompt.byok;
+                },
+            }
         }
         const slug = keySlug(kind, byok);
         var kb: [192]u8 = undefined;
         var n: usize = 0;
         if (slug.len > 0) {
             n = secrets.loadFor(self.io, self.gpa, side, slug, &kb);
-            if (n == 0) n = secrets.migrateLegacy(self.io, self.gpa, side, slug, &kb); // one-time upgrade from the old shared key
+            if (n == 0 and slot == .base) n = secrets.migrateLegacy(self.io, self.gpa, side, slug, &kb); // one-time upgrade from the old shared key
         }
         self.store.lock();
         defer self.store.unlock();
-        const m = @min(n, self.store.settings.chat_key.len);
-        @memcpy(self.store.settings.chat_key[0..m], kb[0..m]);
-        self.store.settings.chat_key_len = @intCast(m); // 0 clears — this provider has no saved key
+        const s = &self.store.settings;
+        switch (slot) {
+            .base => {
+                const m = @min(n, s.chat_key.len);
+                @memcpy(s.chat_key[0..m], kb[0..m]);
+                s.chat_key_len = @intCast(m); // 0 clears — this provider has no saved key
+            },
+            .think => {
+                const m = @min(n, s.chat_think.key.len);
+                @memcpy(s.chat_think.key[0..m], kb[0..m]);
+                s.chat_think.key_len = @intCast(m);
+            },
+            .prompt => {
+                const m = @min(n, s.chat_prompt.key.len);
+                @memcpy(s.chat_prompt.key[0..m], kb[0..m]);
+                s.chat_prompt.key_len = @intCast(m);
+            },
+        }
     }
 
     // ------------------------------------------------------------------------------ conversations on disk
@@ -4989,31 +5129,70 @@ pub const Chat = struct {
 
     // ------------------------------------------------------------------------------ the model turn
 
+    /// The three trio roles. coding = the main answer/build stream; thinking = planning + context housekeeping;
+    /// prompting = the auto-loop self-prompt-back. startTurn maps its Turn kind to one of these; routeToServerChat
+    /// sends one triple per role to the server.
+    pub const Role = enum { coding, thinking, prompting };
+
     fn resolveProvider(self: *Chat, base_buf: *[256]u8, key_buf: *[192]u8, model_buf: *[96]u8) llm.Provider {
+        return self.resolveProviderFor(.coding, base_buf, key_buf, model_buf);
+    }
+
+    /// Resolve ONE trio role into an llm.Provider{base_url,key,model}. The base chat_* fields ARE the coding role
+    /// (and every role when chat_unified). A thinking/prompting role that is explicitly configured (set + a model)
+    /// overrides; otherwise it FALLS BACK to the coding/base provider — so "use one model for all three" and an
+    /// unconfigured role both behave exactly as before the trio. The api key comes from the role's own in-memory
+    /// buffer (loadKey pre-loads all three from the OS secret store), so nothing here touches io under the lock.
+    fn resolveProviderFor(self: *Chat, role: Role, base_buf: *[256]u8, key_buf: *[192]u8, model_buf: *[96]u8) llm.Provider {
         self.store.lock();
         defer self.store.unlock();
         const s = &self.store.settings;
+        // Effective provider fields for this role: the base chat_* set, unless a non-unified thinking/prompting
+        // role is explicitly configured (then read that role's RoleCfg).
+        var kind = s.chat_kind;
+        var byok = s.chat_byok;
+        var base_field: []const u8 = s.chatBase();
+        var base_field_len = s.chat_base_len;
+        var cf_acct: []const u8 = s.cfAccount();
+        var sel_model: []const u8 = s.chatModel();
+        var sel_key: []const u8 = s.chatKey();
+        if (!s.chat_unified) {
+            const rc: ?*const store_mod.RoleCfg = switch (role) {
+                .coding => null,
+                .thinking => if (s.chat_think.set) &s.chat_think else null,
+                .prompting => if (s.chat_prompt.set) &s.chat_prompt else null,
+            };
+            if (rc) |r| {
+                kind = r.kind;
+                byok = r.byok;
+                base_field = r.baseStr();
+                base_field_len = r.base_len;
+                cf_acct = r.cfAccountStr();
+                sel_model = r.modelStr();
+                sel_key = r.keyStr();
+            }
+        }
         var base: []const u8 = undefined;
         var key: []const u8 = "";
         var acct_scratch: [256]u8 = undefined;
-        switch (s.chat_kind) {
+        switch (kind) {
             1 => {
                 // resolveBase substitutes the Cloudflare {account} placeholder (no-op for every other provider)
-                base = catalog.resolveBase(&catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)], s.cfAccount(), &acct_scratch);
-                key = s.chatKey();
+                base = catalog.resolveBase(&catalog.providers[@min(byok, catalog.providers.len - 1)], cf_acct, &acct_scratch);
+                key = sel_key;
             },
             2 => {
-                base = s.chatBase();
-                key = s.chatKey();
+                base = base_field;
+                key = sel_key;
             },
-            else => base = if (s.chat_base_len > 0) s.chatBase() else "http://127.0.0.1:11434/v1",
+            else => base = if (base_field_len > 0) base_field else "http://127.0.0.1:11434/v1",
         }
         const bn = @min(base.len, base_buf.len);
         @memcpy(base_buf[0..bn], base[0..bn]);
         const kn = @min(key.len, key_buf.len);
         @memcpy(key_buf[0..kn], key[0..kn]);
-        var model: []const u8 = s.chatModel();
-        if (model.len == 0) model = if (s.chat_kind == 1) catalog.providers[@min(s.chat_byok, catalog.providers.len - 1)].models[0].id else catalog.defaults.local_model;
+        var model: []const u8 = sel_model;
+        if (model.len == 0) model = if (kind == 1) catalog.providers[@min(byok, catalog.providers.len - 1)].models[0].id else catalog.defaults.local_model;
         const mn = @min(model.len, model_buf.len);
         @memcpy(model_buf[0..mn], model[0..mn]);
         return .{ .base_url = base_buf[0..bn], .key = key_buf[0..kn], .model = model_buf[0..mn] };
@@ -5048,7 +5227,15 @@ pub const Chat = struct {
         var bb: [256]u8 = undefined;
         var kb: [192]u8 = undefined;
         var mb: [96]u8 = undefined;
-        const prov = self.resolveProvider(&bb, &kb, &mb);
+        // MODEL TRIO: the LOCAL engine runs one inference per turn — map this turn's kind to a trio role so the
+        // local fallback honors the coding/thinking/prompting choice too (auto-loop drive = prompting; planning,
+        // consolidation, reflection = thinking; everything else = coding). An unset role falls back to coding.
+        const turn_role: Role = switch (kind) {
+            .loop_infer => .prompting,
+            .reflect, .consolidate => .thinking,
+            else => .coding,
+        };
+        const prov = self.resolveProviderFor(turn_role, &bb, &kb, &mb);
         const tier = senseTier(prov);
         const tb = budgetFor(tier);
         var msgs: std.ArrayListUnmanaged(u8) = .empty;
@@ -7540,7 +7727,7 @@ pub const Chat = struct {
                 // Clear the "hive running" status line we own — leaving it froze the green "the hive is working"
                 // bar forever after the hive finished. A LIVE server turn (sc_active) owns the status itself and
                 // its {done} frame clears it, so only touch it once the turn has settled.
-                if (!self.sc_active) self.setStatus("the hive finished — results in Swarm activity");
+                if (!self.sc_active) self.setStatus("the hive finished — results in Activity");
                 self.cast_server_owned = false;
                 self.cast_active = false; // belt-and-suspenders; was already false
                 return;
@@ -10229,6 +10416,45 @@ fn utf8Run(s: []const u8, i: usize) usize {
     if (i + n > s.len) return 0;
     if (!std.unicode.utf8ValidateSlice(s[i .. i + n])) return 0;
     return n;
+}
+
+/// Parse one trio RoleCfg from loadSettings' JSON given a comptime key prefix (`think` / `prompt`). Missing
+/// keys leave the passed struct untouched (defaults: set=false ⇒ fall back to the coding/base provider). byok
+/// clamps into the catalog exactly like the base `byok` field. The api key is NOT read here — loadKey fills it.
+fn parseRoleCfg(gpa: std.mem.Allocator, data: []const u8, comptime prefix: []const u8, out: *store_mod.RoleCfg) void {
+    out.set = std.mem.indexOf(u8, data, "\"" ++ prefix ++ "_set\":true") != null;
+    if (jInt(data, prefix ++ "_kind")) |v| out.kind = @intCast(@max(0, @min(v, 2)));
+    if (jInt(data, prefix ++ "_byok")) |v| out.byok = @intCast(@max(0, @min(v, @as(i64, @intCast(catalog.providers.len - 1)))));
+    if (llm.jsonUnescape(gpa, data, prefix ++ "_base")) |b| {
+        defer gpa.free(b);
+        const n = @min(b.len, out.base.len);
+        @memcpy(out.base[0..n], b[0..n]);
+        out.base_len = @intCast(n);
+    }
+    if (llm.jsonUnescape(gpa, data, prefix ++ "_model")) |m| {
+        defer gpa.free(m);
+        const n = @min(m.len, out.model.len);
+        @memcpy(out.model[0..n], m[0..n]);
+        out.model_len = @intCast(n);
+    }
+    if (llm.jsonUnescape(gpa, data, prefix ++ "_cf")) |a| {
+        defer gpa.free(a);
+        const n = @min(a.len, out.cf_account.len);
+        @memcpy(out.cf_account[0..n], a[0..n]);
+        out.cf_account_len = @intCast(n);
+    }
+}
+
+/// Serialize one trio RoleCfg into saveSettings' JSON, keyed `<prefix>_set/_kind/_byok/_base/_model/_cf`. The
+/// api key is NOT emitted — role keys live in the OS secret store (secrets.zig), keyed by the provider slug.
+fn emitRoleCfg(jb: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, comptime prefix: []const u8, cfg: store_mod.RoleCfg) !void {
+    try jb.print(gpa, ",\"" ++ prefix ++ "_set\":{},\"" ++ prefix ++ "_kind\":{d},\"" ++ prefix ++ "_byok\":{d},\"" ++ prefix ++ "_base\":\"", .{ cfg.set, cfg.kind, cfg.byok });
+    escJson(jb, gpa, cfg.baseStr());
+    try jb.appendSlice(gpa, "\",\"" ++ prefix ++ "_model\":\"");
+    escJson(jb, gpa, cfg.modelStr());
+    try jb.appendSlice(gpa, "\",\"" ++ prefix ++ "_cf\":\"");
+    escJson(jb, gpa, cfg.cfAccountStr());
+    try jb.appendSlice(gpa, "\"");
 }
 
 fn escJson(list: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) void {

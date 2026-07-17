@@ -53,7 +53,18 @@ pub fn run(
     const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse "http://127.0.0.1:11434/v1";
     const model = ctx.environ.get("NL_LLM_MODEL") orelse "gpt-oss:20b";
     const api_key = ctx.environ.get("NL_LLM_KEY") orelse "";
+    // MODEL TRIO (optional): point the "thinking" (planning + context housekeeping) and "prompting" (the
+    // auto-loop self-prompt-back drive) calls at other models via NL_LLM_THINK_* / NL_LLM_PROMPT_*. Any left
+    // unset stays "" and the server falls back to the base model above — a plain NL_LLM_* setup is unchanged.
+    const think_base = ctx.environ.get("NL_LLM_THINK_BASE_URL") orelse "";
+    const think_model = ctx.environ.get("NL_LLM_THINK_MODEL") orelse "";
+    const think_key = ctx.environ.get("NL_LLM_THINK_KEY") orelse "";
+    const prompt_base = ctx.environ.get("NL_LLM_PROMPT_BASE_URL") orelse "";
+    const prompt_model = ctx.environ.get("NL_LLM_PROMPT_MODEL") orelse "";
+    const prompt_key = ctx.environ.get("NL_LLM_PROMPT_KEY") orelse "";
     cli.out("  backend: {s}  ({s})\n", .{ model, base_url });
+    if (think_model.len > 0) cli.out("  thinking: {s}\n", .{think_model});
+    if (prompt_model.len > 0) cli.out("  prompting: {s}\n", .{prompt_model});
 
     var stdin_buf: [4096]u8 = undefined;
     while (true) {
@@ -86,6 +97,19 @@ pub fn run(
         appendJsonStr(ctx.gpa, &jb, model);
         jb.appendSlice(ctx.gpa, ",\"api_key\":") catch continue;
         appendJsonStr(ctx.gpa, &jb, api_key);
+        // model trio: empty roles are sent as "" and the server falls back to the base model above.
+        jb.appendSlice(ctx.gpa, ",\"think_base_url\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, think_base);
+        jb.appendSlice(ctx.gpa, ",\"think_model\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, think_model);
+        jb.appendSlice(ctx.gpa, ",\"think_api_key\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, think_key);
+        jb.appendSlice(ctx.gpa, ",\"prompt_base_url\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, prompt_base);
+        jb.appendSlice(ctx.gpa, ",\"prompt_model\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, prompt_model);
+        jb.appendSlice(ctx.gpa, ",\"prompt_api_key\":") catch continue;
+        appendJsonStr(ctx.gpa, &jb, prompt_key);
         // client mode: the server delegates tool calls back to us and we run them locally.
         jb.appendSlice(ctx.gpa, ",\"tool_client\":true,\"loop\":0}") catch continue;
 

@@ -426,13 +426,21 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, loop: u8, tool_client: bool) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client: bool) void {
     const gpa = app.gpa;
+
+    // The trio splits this turn's LLM calls across three models. `coding` is the base/default (the main answer
+    // stream, metrics attribution, cast/schedule inheritance); `think` drives planning + context housekeeping;
+    // `prompt` drives the auto-loop self-prompt-back. An unset thinking/prompting role resolves back to coding
+    // (see ModelTrio.pick), so a single-model client behaves exactly as before.
+    const coding = trio.coding;
+    const think = trio.pick(.thinking);
+    const prompt = trio.pick(.prompting);
 
     // Arm this thread's LLM-usage recorder: emitUsage (the one usage choke-point, reached on every turn
     // completion path) records one per-model metrics line for the Dashboard. Thread-local, so none of the
-    // eleven finish paths needs the model/uid threaded through.
-    metrics.beginTurn(uid, model, base_url, schedTaskOf(conv) != null, nowSecs(app.io));
+    // eleven finish paths needs the model/uid threaded through. Attributed to the coding/base model.
+    metrics.beginTurn(uid, coding.model, coding.base_url, schedTaskOf(conv) != null, nowSecs(app.io));
     defer metrics.endTurn();
 
     // ---- store + build paths (conv store under convs/, build tree under builds/ — same split as runMindTool) ----
@@ -697,7 +705,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
         // so no in-progress work is lost.
         if (shouldPlan(user_text)) {
-            const fresh = planTask(app, run_root, base_url, key, model, user_text);
+            const fresh = planTask(app, run_root, think.base_url, think.key, think.model, user_text);
             if (fresh.len > 0) {
                 persistPlan(app, conv_dir, fresh);
                 emitPlanMessage(app, conv_dir, fresh);
@@ -773,7 +781,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
         // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
-        compactWorking(app, run_root, base_url, key, model, &conv_buf, assembled_len, &ctx, &tool_obs);
+        compactWorking(app, run_root, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs);
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -849,7 +857,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -972,7 +980,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // the chat ~8s and then swapped the text the user just watched type out. Reflect only runs when nothing
         // streamed (a non-streaming backend), where there's no live answer to preserve.
         if (!has_plan and !inner.streamed and drive == 0 and answer.len >= REFLECT_MIN) {
-            if (reflectAnswer(app, run_root, base_url, key, model, user_text, answer)) |improved| {
+            if (reflectAnswer(app, run_root, think.base_url, think.key, think.model, user_text, answer)) |improved| {
                 gpa.free(answer);
                 answer = improved;
                 emitKV(app, conv_dir, "status", "text", "reflected");
@@ -1053,7 +1061,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         lq.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
         http.jstr(gpa, &lq, LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
-        var next = llm.complete(gpa, app.io, run_root, "loop", base_url, key, model, lq.items, "", 512, 0.5);
+        var next = llm.complete(gpa, app.io, run_root, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);
         defer next.deinit(gpa);
 
         const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
@@ -1166,13 +1174,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
     // SCHEDULED-RUN LEARNING: at normal completion, fold this run's outcome + one distilled lesson into the
     // TASK's memory so the next run starts smarter — the recursive-improvement loop for recurring tasks.
-    if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, run_root, base_url, key, model, &conv_buf);
+    if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, run_root, think.base_url, think.key, think.model, &conv_buf);
     // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
     // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
     // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
     emitUsage(app, conv_dir, usage_t0);
-    refreshSummary(app, conv_dir, run_root, base_url, key, model);
+    refreshSummary(app, conv_dir, run_root, think.base_url, think.key, think.model);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
@@ -1943,16 +1951,81 @@ test "deriveLocalBudget: conservative floor, scales with RAM+cores" {
     try std.testing.expectEqual(@as(u32, 1), deriveLocalBudget(64, 8)); // big RAM but few cores → still 1
 }
 
+/// One provider endpoint: an OpenAI-compatible base_url, its api key, and the model id.
+pub const Provider = struct {
+    base_url: []const u8 = "",
+    key: []const u8 = "",
+    model: []const u8 = "",
+    /// "Set" only when it names a real endpoint AND model; a blank field means "inherit the coding/base
+    /// provider" — the trio's fallback, and how a single-model client (which sends only the base triple)
+    /// keeps every role on one model.
+    pub fn isSet(p: Provider) bool {
+        return p.base_url.len > 0 and p.model.len > 0;
+    }
+};
+
+/// Which model a given LLM call runs on. The engine's labeled call sites map onto these: coding = the main
+/// agentic build/answer stream ("chat"); thinking = planning + every context-housekeeping call
+/// ("plan"/"reflect"/"summary"/"ctxsum"/"compact"/"lesson"); prompting = the auto-loop self-prompt-back
+/// drive ("loop"). A user can point each at a different model — a strong coder, a mid planner, a cheap driver.
+pub const Role = enum { coding, thinking, prompting };
+
+/// The three models one turn may run on. `coding` is the base/default triple every caller always sends;
+/// `thinking`/`prompting` are optional overrides. An unset override falls back to `coding` (see pick), so a
+/// single-model client — one that leaves the extra triples blank — behaves exactly as it did before the trio.
+pub const ModelTrio = struct {
+    coding: Provider = .{},
+    thinking: Provider = .{},
+    prompting: Provider = .{},
+
+    /// The provider a role should use, resolving an unset thinking/prompting back to the coding base.
+    pub fn pick(self: ModelTrio, role: Role) Provider {
+        return switch (role) {
+            .coding => self.coding,
+            .thinking => if (self.thinking.isSet()) self.thinking else self.coding,
+            .prompting => if (self.prompting.isSet()) self.prompting else self.coding,
+        };
+    }
+};
+
+test "ModelTrio.pick: unset thinking/prompting fall back to coding; configured roles win" {
+    const coding: Provider = .{ .base_url = "https://c/v1", .key = "kc", .model = "coder" };
+    // both extras unset → every role resolves to coding (the single-model default / backward-compat)
+    const solo: ModelTrio = .{ .coding = coding };
+    try std.testing.expectEqualStrings("coder", solo.pick(.coding).model);
+    try std.testing.expectEqualStrings("coder", solo.pick(.thinking).model);
+    try std.testing.expectEqualStrings("coder", solo.pick(.prompting).model);
+    // a role with base_url+model is used as-is; a role missing the model is NOT "set" → falls back to coding
+    const trio: ModelTrio = .{
+        .coding = coding,
+        .thinking = .{ .base_url = "https://t/v1", .key = "kt", .model = "planner" },
+        .prompting = .{ .base_url = "https://p/v1", .key = "kp", .model = "" }, // blank model ⇒ unset
+    };
+    try std.testing.expectEqualStrings("planner", trio.pick(.thinking).model);
+    try std.testing.expectEqualStrings("https://t/v1", trio.pick(.thinking).base_url);
+    try std.testing.expectEqualStrings("coder", trio.pick(.prompting).model); // blank model → fell back
+    try std.testing.expect(!(Provider{ .base_url = "https://x/v1", .model = "" }).isSet());
+    try std.testing.expect((Provider{ .base_url = "https://x/v1", .model = "m" }).isSet());
+}
+
+/// Copy `s` into `dst` at `off.*`, advance the offset, and return the copied sub-slice. The blob-packing
+/// primitive spawnTurn uses to own every string arg in one allocation (the caller's arena dies at once).
+fn dupInto(dst: []u8, off: *usize, s: []const u8) []const u8 {
+    const r = dst[off.*..][0..s.len];
+    @memcpy(r, s);
+    off.* += s.len;
+    return r;
+}
+
 /// Owned arguments for a background turn: one backing `blob` holds every string arg (the request arena that
 /// spawnTurn was called from dies immediately), plus slices into it. turnThread frees the blob + the struct.
+/// `trio` carries the three role models (coding/thinking/prompting), each Provider slicing into `blob`.
 pub const TurnArgs = struct {
     app: *App,
     uid: u64,
     blob: []u8,
     conv: []const u8,
-    base_url: []const u8,
-    key: []const u8,
-    model: []const u8,
+    trio: ModelTrio,
     text: []const u8,
     loop: u8,
     tool_client: bool,
@@ -1961,9 +2034,9 @@ pub const TurnArgs = struct {
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text, args.loop, args.tool_client);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
-    if (llm.isLocal(args.base_url)) releaseLocal(args.app.io); // release the machine-sized local-model slot
+    if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
     const gpa = args.app.gpa;
     gpa.free(args.blob);
     gpa.destroy(args);
@@ -1974,43 +2047,45 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key: []const u8, model: []const u8, text: []const u8, loop: u8, tool_client: bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool) void {
     const gpa = app.gpa;
-    const total = conv.len + base_url.len + key.len + model.len + text.len;
+    const c = trio.coding;
+    const t = trio.thinking;
+    const p = trio.prompting;
+    // Own every string in ONE allocation: conv + text + all three role triples (9 strings). `total` is the
+    // exact sum of what dupInto copies below — the two MUST stay in lockstep (a short total → OOB blob slices).
+    const total = conv.len + text.len +
+        c.base_url.len + c.key.len + c.model.len +
+        t.base_url.len + t.key.len + t.model.len +
+        p.base_url.len + p.key.len + p.model.len;
     // The caller (postMessage) already claimed the per-conv turn slot via tryBeginTurn; EVERY completion path here
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
-    // paths run the turn directly, so they release explicitly.
+    // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
+        runTurn(app, uid, conv, trio, text, loop, tool_client);
         endTurn(app.io, conv);
-        if (llm.isLocal(base_url)) releaseLocal(app.io);
+        if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
+        runTurn(app, uid, conv, trio, text, loop, tool_client);
         endTurn(app.io, conv);
-        if (llm.isLocal(base_url)) releaseLocal(app.io);
+        if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
     var o: usize = 0;
-    const cv = blob[o..][0..conv.len];
-    @memcpy(cv, conv);
-    o += conv.len;
-    const bu = blob[o..][0..base_url.len];
-    @memcpy(bu, base_url);
-    o += base_url.len;
-    const ky = blob[o..][0..key.len];
-    @memcpy(ky, key);
-    o += key.len;
-    const md = blob[o..][0..model.len];
-    @memcpy(md, model);
-    o += model.len;
-    const tx = blob[o..][0..text.len];
-    @memcpy(tx, text);
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .base_url = bu, .key = ky, .model = md, .text = tx, .loop = loop, .tool_client = tool_client };
-    if (std.Thread.spawn(.{}, turnThread, .{args})) |t| {
-        t.detach();
+    const cv = dupInto(blob, &o, conv);
+    const tx = dupInto(blob, &o, text);
+    // Re-slice every provider string into the owned blob (the passed-in slices die with the request arena).
+    const owned: ModelTrio = .{
+        .coding = .{ .base_url = dupInto(blob, &o, c.base_url), .key = dupInto(blob, &o, c.key), .model = dupInto(blob, &o, c.model) },
+        .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
+        .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
+    };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client };
+    if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
+        th.detach();
     } else |_| {
         turnThread(args); // spawn failed → run inline (blocks) + free, rather than drop the turn
     }
@@ -2418,14 +2493,18 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
     }
 }
 
-fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
+fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, trio: ModelTrio, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
+    // cast inherits the CODING/base model (a hive builds like the main turn); schedule_task persists the full trio.
+    const base_url = trio.coding.base_url;
+    const key = trio.coding.key;
+    const model = trio.coding.model;
     if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, args, tool_client);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
-    if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, base_url, key, model, args);
+    if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, trio, args);
     if (std.mem.eql(u8, name, "schedule_update")) return scheduleUpdateTool(app, uid, ctx, args);
     if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
@@ -2464,7 +2543,7 @@ fn syncDirTool(app: *App, conv: []const u8, conv_dir: []const u8, ctrl_cursor: u
 /// The task inherits THIS turn's provider creds, so its unattended runs use the same backend that created it.
 /// Time conveniences the model can actually express: in_min (relative) and at_hm (next local occurrence) for
 /// "once" — it never has to guess epoch seconds.
-fn scheduleTool(app: *App, uid: u64, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8) []u8 {
+fn scheduleTool(app: *App, uid: u64, trio: ModelTrio, args: []const u8) []u8 {
     const gpa = app.gpa;
     const A = struct {
         name: []const u8 = "",
@@ -2503,9 +2582,17 @@ fn scheduleTool(app: *App, uid: u64, base_url: []const u8, key: []const u8, mode
         .every_min = a.every_min,
         .hm = a.hm,
         .enabled = true,
-        .base_url = base_url,
-        .model = model,
-        .api_key = key,
+        // The task inherits this turn's trio; unset thinking/prompting are stored empty and fall back to the
+        // coding/base provider at run time (launchRun rebuilds a ModelTrio whose pick() resolves the blanks).
+        .base_url = trio.coding.base_url,
+        .model = trio.coding.model,
+        .api_key = trio.coding.key,
+        .think_base_url = trio.thinking.base_url,
+        .think_model = trio.thinking.model,
+        .think_api_key = trio.thinking.key,
+        .prompt_base_url = trio.prompting.base_url,
+        .prompt_model = trio.prompting.model,
+        .prompt_api_key = trio.prompting.key,
     })) {
         .id => |id| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"schedule_task\",\"id\":\"{s}\",\"note\":\"created — it fires on schedule as an unattended run with its own cross-run memory; schedule_list shows it\"}}", .{id}) catch emptyRes(),
         .err => |e| return orchErr(gpa, e),
@@ -3308,9 +3395,7 @@ fn runInnerAgentic(
     conv: []const u8,
     conv_dir: []const u8,
     run_root: []const u8,
-    base_url: []const u8,
-    key: []const u8,
-    model: []const u8,
+    trio: ModelTrio,
     conv_buf: *std.ArrayListUnmanaged(u8),
     ctx: *tools.ToolCtx,
     steer_cursor: *usize,
@@ -3337,6 +3422,13 @@ fn runInnerAgentic(
     foreign_warned: *bool,
 ) InnerResult {
     const gpa = app.gpa;
+    // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING
+    // call), and pick `think` for the context-housekeeping calls (compact/summary). orchTool receives the full
+    // trio (it forwards to schedule_task, which persists all three). See ModelTrio for the fallback rule.
+    const base_url = trio.coding.base_url;
+    const key = trio.coding.key;
+    const model = trio.coding.model;
+    const think = trio.pick(.thinking);
     const empty: []u8 = &[_]u8{};
     // the last narrated content across tool iterations — the salvage if we exhaust MAX_ITERS or a stop lands mid-loop.
     var last_content: []u8 = empty;
@@ -3576,7 +3668,7 @@ fn runInnerAgentic(
                 // its Discourse key and built around the failure). Everything else executes as a mind tool: in
                 // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
                 // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
-                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
+                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, c.name, c.args, tool_client) orelse
                     (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
@@ -3746,7 +3838,7 @@ fn runInnerAgentic(
         }
         // WITHIN-TURN COMPACTION (step boundary): if this pass's working growth has crossed the budget, compress it
         // into a progress note so a long/afk turn can keep going without overflowing the model window.
-        compactWorking(app, run_root, base_url, key, model, conv_buf, base_len, ctx, tool_obs);
+        compactWorking(app, run_root, think.base_url, think.key, think.model, conv_buf, base_len, ctx, tool_obs);
         // GROUND-TRUTH CONFLICT SPLICE — after compaction (never folded into a summary), before any steer
         // (the user's live instruction stays last, i.e. most salient).
         if (post_note.items.len > 0)
@@ -3763,7 +3855,7 @@ fn runInnerAgentic(
     // friendly note, only if the summary itself fails.
     // These salvage returns follow a full tool loop, so tools_ran reflects the real work (any_tool) — the drive
     // loop must keep its multi-step continuation, not be short-circuited by the no-tools fast path.
-    if (summarizeTurn(app, run_root, base_url, key, model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum, .tools_ran = any_tool };
+    if (summarizeTurn(app, run_root, think.base_url, think.key, think.model, conv_buf.items)) |sum| return .{ .outcome = .settled, .content = sum, .tools_ran = any_tool };
     const fallback: []const u8 = if (last_content.len > 0) last_content else "I did as much as I could this turn — say \"continue\" if there's more you want.";
     return .{ .outcome = .settled, .content = gpa.dupe(u8, fallback) catch empty, .tools_ran = any_tool };
 }

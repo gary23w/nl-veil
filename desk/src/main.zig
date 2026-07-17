@@ -92,7 +92,7 @@ fn tbThemeRect() t.Rect {
 }
 
 const InnerTab = enum { console, details, files };
-const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, sched_model };
+const DdKind = enum { none, provider, model, style, minutes, stack, mode, chat_provider, chat_byok, chat_model, think_provider, think_byok, think_model, prompt_provider, prompt_byok, prompt_model, sched_model };
 
 const ChatInner = enum { chat, metrics, files }; // the Chat center-pane inner tabs
 const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swarm activity | Memory)
@@ -157,6 +157,8 @@ const Ui = struct {
     s_url: Field = .{},
     s_ckey: Field = .{},
     s_cfacct: Field = .{}, // Cloudflare account id (chat BYOK, when the provider needs one)
+    s_tkey: Field = .{}, // MODEL TRIO: thinking-role api key entry (non-unified panel)
+    s_pkey: Field = .{}, // MODEL TRIO: prompting-role api key entry (non-unified panel)
     s_seeded: bool = false, // provider fields copied from the store once (after the chat thread loads)
     // Settings: server target (host empty = this machine)
     s_host: Field = .{},
@@ -252,7 +254,7 @@ const Ui = struct {
     log_follow: bool = true,
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
-    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
+    const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
     const Field = struct {
         buf: [1200]u8 = [_]u8{0} ** 1200,
         len: usize = 0,
@@ -1339,6 +1341,8 @@ fn focusedField() ?*Ui.Field {
         .s_url => &ui.s_url,
         .s_ckey => &ui.s_ckey,
         .s_cfacct => &ui.s_cfacct,
+        .s_tkey => &ui.s_tkey,
+        .s_pkey => &ui.s_pkey,
         .s_host => &ui.s_host,
         .s_port => &ui.s_port,
         .con_input => &ui.con_input,
@@ -3198,7 +3202,7 @@ fn renderCastLive(view: t.Rect, y0: f32, status: []const u8, draw: bool) f32 {
             t.fillRect(@intFromFloat(x1), @intFromFloat(by), @intFromFloat(x2 - x1), @intFromFloat(bh), t.withAlpha(t.green, a));
         }
         drawSpinner(view.x + 17, y0 + 6, tm, t.green);
-        t.text(t.z("the hive is working — {s}  (live detail in Swarm activity)", .{if (status.len > 0) status else "casting"}), @intFromFloat(view.x + 32), @intFromFloat(y0), 12, t.green);
+        t.text(t.z("the hive is working — {s}  (live detail in Activity)", .{if (status.len > 0) status else "casting"}), @intFromFloat(view.x + 32), @intFromFloat(y0), 12, t.green);
     }
     return y0 + MSG_LINE_H + 6 + MSG_GAP_H;
 }
@@ -4037,7 +4041,7 @@ fn drawChatRight(store: *Store, r: t.Rect, open: bool, casts: []const store_mod.
     }
     // collapse chevron + the "Swarm activity | Memory" tab strip (Memory = durable keys/logins/prefs the AI keeps)
     if (t.buttonGhost(.{ .x = r.x + r.width - 32, .y = r.y + 7, .width = 26, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, false);
-    const tl_act = t.z("Swarm activity", .{});
+    const tl_act = t.z("Activity", .{});
     const tl_mem = t.z("Memory", .{});
     if (t.tab(.{ .x = r.x + 8, .y = r.y + 7, .width = t.tabW(tl_act), .height = 24 }, tl_act, ui.right_tab == .activity)) ui.right_tab = .activity;
     if (t.tab(.{ .x = r.x + 8 + t.tabW(tl_act) + 6, .y = r.y + 7, .width = t.tabW(tl_mem), .height = 24 }, tl_mem, ui.right_tab == .memory)) ui.right_tab = .memory;
@@ -4356,7 +4360,7 @@ fn selector(r: t.Rect, label: [:0]const u8, value: []const u8, kind: DdKind) voi
 fn flushDropdown() void {
     if (ui.open_dd == .none) return;
     switch (ui.open_dd) {
-        .chat_provider, .chat_byok, .chat_model => return, // owned by flushChatDropdown (Settings tab)
+        .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model => return, // owned by flushChatDropdown (Settings tab)
         .sched_model => return, // owned by flushSchedDropdown (Tasks tab) — never rendered from the deploy form
         else => {},
     }
@@ -4417,7 +4421,7 @@ fn flushDropdown() void {
             }
             current = ui.d_mode;
         },
-        .none, .chat_provider, .chat_byok, .chat_model, .sched_model => return,
+        .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model => return,
     }
     const chosen = drawList(ui.dd_rect, labels[0..count], current);
     if (chosen) |ci| {
@@ -4438,7 +4442,7 @@ fn flushDropdown() void {
             .minutes => ui.d_minutes = ci,
             .stack => ui.d_stack = ci,
             .mode => ui.d_mode = ci,
-            .none, .chat_provider, .chat_byok, .chat_model, .sched_model => {},
+            .none, .chat_provider, .chat_byok, .chat_model, .think_provider, .think_byok, .think_model, .prompt_provider, .prompt_byok, .prompt_model, .sched_model => {},
         }
         ui.open_dd = .none;
     }
@@ -6404,6 +6408,29 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     }
     const half = (colw - 10) / 2;
 
+    // MODEL TRIO master toggle: one model for all three roles (default) vs a per-role coding/thinking/prompting
+    // trio. Turning the trio ON seeds the thinking + prompting roles from the current (coding) model so each
+    // panel starts identical, then the user tunes them; saveSettings' loadKey then loads each role's key.
+    const unified = blk_u: {
+        store.lock();
+        defer store.unlock();
+        break :blk_u store.settings.chat_unified;
+    };
+    if (t.checkbox(.{ .x = x, .y = y, .width = colw, .height = 22 }, t.z("use one model for all three (coding / thinking / prompting)", .{}), unified)) {
+        const nv = !unified;
+        store.lock();
+        store.settings.chat_unified = nv;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+        store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
+    }
+    y += 30;
+    if (!unified) {
+        t.text(t.z("CODING MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+        t.text(t.z("writes the code — the main build/answer stream", .{}), @intFromFloat(x + 110), @intFromFloat(y), 11, t.comment);
+        y += 20;
+    }
+
     // PROVIDER dropdown: Local / BYOK / Custom URL
     const kind_lbl = switch (chat_kind) {
         1 => t.z("BYOK (cloud key)", .{}),
@@ -6557,6 +6584,11 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         if (chat_key_n > 0) t.text(t.z("key set ({d} chars)", .{chat_key_n}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
         y += 48;
     }
+    // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
+    if (!unified) {
+        y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "plans + summarizes (housekeeping)", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
+        y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "drives the auto-loop (prompts back)", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+    }
     y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
     // content height for next frame's scroll clamp (add back the offset this frame subtracted)
@@ -6584,37 +6616,121 @@ fn byokProviderList(out: *[16]usize) usize {
     return n;
 }
 
-fn setChatModel(store: *Store, model: []const u8) void {
+/// Render one MODEL-TRIO override role's provider/model/key controls (thinking or prompting) below the base
+/// (coding) block, reusing the same selector/textField widgets via the role's own DdKinds + key Field. Returns
+/// the new y. Supports Local + BYOK (a custom endpoint stays a coding-only option). role is 1 (thinking) or 2.
+fn chatRolePanel(store: *Store, x: f32, y_in: f32, colw: f32, half: f32, ol_n: usize, role: u8, title: [:0]const u8, sub: [:0]const u8, dd_prov: DdKind, dd_byok: DdKind, dd_model: DdKind, key_field: *Ui.Field, key_focus: Ui.Focus, save_role: [:0]const u8) f32 {
+    var y = y_in;
+    var kind: u8 = 0;
+    var byok: u8 = 0;
+    var modelbuf: [96]u8 = undefined;
+    var model_n: usize = 0;
+    var keyn: usize = 0;
+    var role_set = false;
+    {
+        store.lock();
+        defer store.unlock();
+        const s = &store.settings;
+        role_set = s.roleSet(role);
+        kind = s.kindFor(role);
+        byok = s.byokFor(role);
+        const m = s.modelStrFor(role);
+        model_n = @min(m.len, modelbuf.len);
+        @memcpy(modelbuf[0..model_n], m[0..model_n]);
+        keyn = s.keyLenFor(role);
+    }
+    t.hline(@intFromFloat(x), @intFromFloat(y), @intFromFloat(colw), t.border);
+    y += 10;
+    t.text(title, @intFromFloat(x), @intFromFloat(y), 12, t.comment);
+    t.text(sub, @intFromFloat(x + 130), @intFromFloat(y), 11, t.comment);
+    y += 20;
+    // PROVIDER selector. An UNSET role INHERITS the coding model (whatever it is — including a custom endpoint):
+    // shown as "— same as coding". Picking Local or BYOK from the dropdown gives the role its OWN provider
+    // (setKindFor marks it configured). kind==2 (Custom URL) is only reachable for a role via a hand-edit; the
+    // dropdown offers Local/BYOK only, so a role can never be freshly pointed at an unrepresentable endpoint.
+    const kind_lbl: [:0]const u8 = if (!role_set) t.z("— same as coding", .{}) else switch (kind) {
+        1 => t.z("BYOK (cloud key)", .{}),
+        2 => t.z("Custom URL (from coding)", .{}),
+        else => t.z("Local (Ollama)", .{}),
+    };
+    selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("PROVIDER", .{}), kind_lbl, dd_prov);
+    if (!role_set) {
+        t.text(t.z("inherits the coding model above — pick a provider to give this role its own", .{}), @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+        return y + 58;
+    }
+    if (kind == 1) {
+        const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
+        selector(.{ .x = x + half + 10, .y = y, .width = half, .height = 48 }, t.z("CLOUD PROVIDER", .{}), t.zs(p.label), dd_byok);
+    }
+    y += 58;
+    // MODEL dropdown + an availability hint on the right
+    const model_disp: []const u8 = if (model_n > 0) modelbuf[0..model_n] else "(pick a model)";
+    selector(.{ .x = x, .y = y, .width = half, .height = 48 }, t.z("MODEL", .{}), model_disp, dd_model);
+    if (kind == 1) {
+        const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
+        t.text(t.z("models available on {s}", .{p.label}), @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+    } else if (kind == 0) {
+        const hint = if (ol_n > 0) t.z("{d} models installed on this machine", .{ol_n}) else t.z("Ollama not reachable - showing common models", .{});
+        t.text(hint, @intFromFloat(x + half + 10), @intFromFloat(y + 18), 11, t.comment);
+    }
+    y += 58;
+    // API KEY (BYOK only) — saved under THIS role's provider slug (shared with any role on the same provider)
+    if (kind == 1) {
+        flabel(x, y, t.z("API KEY (stored in the OS-protected local store, never plaintext)", .{}));
+        y += 14;
+        const sk_label = t.z("Save key", .{});
+        const skw = t.btnW(sk_label, t.BTN_MD);
+        textField(.{ .x = x, .y = y, .width = colw - 240, .height = t.FIELD_H }, key_field, ui.focus == key_focus, "sk-...", key_focus);
+        if (t.button(.{ .x = x + colw - 240 + t.GAP, .y = y, .width = skw, .height = t.BTN_MD }, sk_label, t.blue, key_field.len > 0)) {
+            store.pushChatCmd(store_mod.mkChatCmd(.save_key, save_role, key_field.str()));
+            key_field.clear();
+            ui.focus = .none;
+        }
+        if (keyn > 0) t.text(t.z("key set ({d} chars)", .{keyn}), @intFromFloat(x + colw - 240 + t.GAP + skw + 12), @intFromFloat(y + 10), 12, t.green);
+        y += 48;
+    }
+    return y;
+}
+
+fn setChatModel(store: *Store, role: u8, model: []const u8) void {
     store.lock();
-    setChatModelLocked(store, model);
+    setChatModelLocked(store, role, model);
     store.unlock();
 }
 
-/// Caller MUST hold store.lock(). Copies `model` into settings.chat_model.
-fn setChatModelLocked(store: *Store, model: []const u8) void {
-    const n = @min(model.len, store.settings.chat_model.len);
-    @memcpy(store.settings.chat_model[0..n], model[0..n]);
-    store.settings.chat_model_len = @intCast(n);
+/// Caller MUST hold store.lock(). Copies `model` into the given trio role's model field (0 base/coding).
+fn setChatModelLocked(store: *Store, role: u8, model: []const u8) void {
+    store.settings.setModelFor(role, model);
 }
 
-/// Render + apply the open chat dropdown (PROVIDER / CLOUD PROVIDER / MODEL) on top of the Settings form.
-/// Selections apply live AND persist, and switching provider re-selects a valid model — so the chat can
-/// never be left pointing a cloud provider at a local model (the "BYOK breaks" trap).
+/// Render + apply the open chat dropdown (PROVIDER / CLOUD PROVIDER / MODEL) on top of the Settings form, for
+/// whichever MODEL-TRIO role owns it (open_dd encodes the role: chat_* = coding/base, think_* = thinking,
+/// prompt_* = prompting). Selections apply live AND persist, and switching provider re-selects a valid model —
+/// so no role can be left pointing a cloud provider at a local model (the "BYOK breaks" trap).
 fn flushChatDropdown(store: *Store) void {
-    switch (ui.open_dd) {
-        .chat_provider, .chat_byok, .chat_model => {},
+    const role: u8 = switch (ui.open_dd) {
+        .chat_provider, .chat_byok, .chat_model => 0,
+        .think_provider, .think_byok, .think_model => 1,
+        .prompt_provider, .prompt_byok, .prompt_model => 2,
         else => return,
-    }
-    // snapshot the state the list needs
+    };
+    const Which = enum { provider, byok, model };
+    const which: Which = switch (ui.open_dd) {
+        .chat_provider, .think_provider, .prompt_provider => .provider,
+        .chat_byok, .think_byok, .prompt_byok => .byok,
+        else => .model, // one of the three *_model kinds (the switch above already filtered non-chat)
+    };
+    // snapshot the state the list needs (for the ROLE that owns the open dropdown)
     store.lock();
-    const kind = store.settings.chat_kind;
-    const byok = store.settings.chat_byok;
+    const kind = store.settings.kindFor(role);
+    const byok = store.settings.byokFor(role);
     var models: [store_mod.MAX_OLLAMA_MODELS]store_mod.OllamaModel = undefined;
     const ol_n = store.ollama_model_count;
     @memcpy(models[0..ol_n], store.ollama_models[0..ol_n]);
     var cur_model: [96]u8 = undefined;
-    const cur_model_n = store.settings.chat_model_len;
-    @memcpy(cur_model[0..cur_model_n], store.settings.chat_model[0..cur_model_n]);
+    const cm = store.settings.modelStrFor(role);
+    const cur_model_n = cm.len;
+    @memcpy(cur_model[0..cur_model_n], cm[0..cur_model_n]);
     // live Cloudflare model list (stack-local copy, so its slices are valid through drawList below)
     var cf_models: [store_mod.MAX_CF_MODELS][96]u8 = undefined;
     var cf_lens: [store_mod.MAX_CF_MODELS]u8 = undefined;
@@ -6629,15 +6745,15 @@ fn flushChatDropdown(store: *Store) void {
     var byok_idx: [16]usize = undefined;
     var byok_n: usize = 0;
 
-    switch (ui.open_dd) {
-        .chat_provider => {
+    switch (which) {
+        .provider => {
             labels[0] = "Local (Ollama)";
             labels[1] = "BYOK (cloud key)";
             labels[2] = "Custom URL";
-            count = 3;
-            current = @min(kind, 2);
+            count = if (role == 0) 3 else 2; // override roles: Local/BYOK only (a custom endpoint uses the coding model)
+            current = @min(kind, if (role == 0) @as(u8, 2) else @as(u8, 1));
         },
-        .chat_byok => {
+        .byok => {
             byok_n = byokProviderList(&byok_idx);
             for (0..byok_n) |i| {
                 labels[i] = catalog.providers[byok_idx[i]].label;
@@ -6645,7 +6761,7 @@ fn flushChatDropdown(store: *Store) void {
             }
             count = byok_n;
         },
-        .chat_model => {
+        .model => {
             if (kind == 0 and ol_n > 0) {
                 for (0..ol_n) |i| {
                     labels[i] = models[i].nameStr();
@@ -6672,39 +6788,35 @@ fn flushChatDropdown(store: *Store) void {
                 }
             }
         },
-        else => return,
     }
 
     const chosen = drawList(ui.dd_rect, labels[0..count], current) orelse return;
-    // Switching provider re-selects a valid default model so the chat can never point a cloud provider at
-    // a local model (the "BYOK breaks" trap). All model strings below are either catalog-static or slices
-    // into the STACK-local `models` snapshot — never a slice into the shared Store held past an unlock.
-    // Provider+model must change ATOMICALLY (one lock): otherwise the chat thread could drain a queued
-    // send/cast between the two writes and read the new provider with the old (mismatched) model — the
-    // exact "cloud provider pointed at a local model" trap this feature exists to prevent.
-    switch (ui.open_dd) {
-        .chat_provider => {
+    // Switching provider re-selects a valid default model so no role can point a cloud provider at a local
+    // model (the "BYOK breaks" trap). All model strings below are either catalog-static or slices into the
+    // STACK-local `models` snapshot — never a slice into the shared Store held past an unlock. Provider+model
+    // must change ATOMICALLY (one lock). Writing an override role's fields marks it configured (set=true).
+    switch (which) {
+        .provider => {
             const newkind: u8 = @intCast(chosen);
             store.lock();
-            store.settings.chat_kind = newkind;
+            store.settings.setKindFor(role, newkind);
             if (newkind == 0) {
-                setChatModelLocked(store, if (ol_n > 0) models[0].nameStr() else catalog.defaults.local_model);
+                setChatModelLocked(store, role, if (ol_n > 0) models[0].nameStr() else catalog.defaults.local_model);
             } else if (newkind == 1) {
                 const p = &catalog.providers[@min(byok, catalog.providers.len - 1)];
-                if (p.needs_account and cf_n > 0) setChatModelLocked(store, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+                if (p.needs_account and cf_n > 0) setChatModelLocked(store, role, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, role, p.models[0].id);
             } // custom (2) keeps its typed model
             store.unlock();
         },
-        .chat_byok => {
+        .byok => {
             const newbyok: u8 = @intCast(byok_idx[chosen]);
             store.lock();
-            store.settings.chat_byok = newbyok;
+            store.settings.setByokFor(role, newbyok);
             const p = &catalog.providers[newbyok];
-            if (p.needs_account and cf_n > 0) setChatModelLocked(store, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, p.models[0].id);
+            if (p.needs_account and cf_n > 0) setChatModelLocked(store, role, cf_models[0][0..cf_lens[0]]) else if (p.models.len > 0) setChatModelLocked(store, role, p.models[0].id);
             store.unlock();
         },
-        .chat_model => setChatModel(store, labels[chosen]),
-        else => {},
+        .model => setChatModel(store, role, labels[chosen]),
     }
     store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // apply live + persist
     ui.open_dd = .none;

@@ -28,6 +28,19 @@ const requireUser = http.requireUser;
 const badReq = http.badReq;
 const notFound = http.notFound;
 
+/// Resolve ONE role's (base_url, api_key) against Cloudflare OAuth: when the key is blank and the endpoint or
+/// model names Workers AI, swap in the user's auto-refreshed CF token + authoritative account base from the
+/// vault (so the turn runs with no pasted key). Any other provider — or a role left entirely blank — passes
+/// through untouched. Mirrors the single-triple logic postMessage used before the model trio; called per role.
+fn resolveCf(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8) struct { base: []const u8, key: []const u8 } {
+    if (api_key.len != 0) return .{ .base = base_url, .key = api_key };
+    const looks_cf = std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;
+    if (looks_cf or std.mem.startsWith(u8, model, "@cf/")) {
+        if (cf_oauth.resolveToken(app, uid, arena)) |cf| return .{ .base = cf.base_url, .key = cf.key };
+    }
+    return .{ .base = base_url, .key = api_key };
+}
+
 /// Sanitize a conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
 /// bounded). Empty / unsafe → "". Mirrors chat_tools.safeSeg verbatim so a conv addressed here resolves to
 /// the SAME `{data}/u{uid}/_chat/...{seg}` tree the chat build tools + a cast for that conversation use.
@@ -246,6 +259,16 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         base_url: []const u8 = "",
         model: []const u8 = "",
         api_key: []const u8 = "",
+        // MODEL TRIO (optional): per-role overrides for the "thinking" (planning + context housekeeping —
+        // plan/reflect/summary/ctxsum/compact/lesson) and "prompting" (the auto-loop self-prompt-back drive)
+        // calls. Absent/empty ⇒ that role falls back to the base (coding) triple above, so a single-model
+        // client sends none of these and behaves exactly as before the trio.
+        think_base_url: []const u8 = "",
+        think_model: []const u8 = "",
+        think_api_key: []const u8 = "",
+        prompt_base_url: []const u8 = "",
+        prompt_model: []const u8 = "",
+        prompt_api_key: []const u8 = "",
         // AUTO-LOOP mode the desk armed for this conversation: 0=off (a normal bounded turn), 1=on (drive toward the
         // goal until DONE / no-progress / cap), 2=afk (persistent — never accept DONE, only Stop ends it). Absent =
         // 0. The server drive loop owns the loop now, so the desk stops running its own local loop for served convs.
@@ -272,20 +295,23 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
     }
 
-    // CLOUDFLARE LOGIN: when the desk sends an empty key against a Workers AI endpoint (or an @cf/ model), the
-    // user is relying on their Cloudflare OAuth login — resolve the (auto-refreshed) token + account base from
-    // the vault so the turn runs with no pasted key. Any other provider is untouched.
-    var eff_base = b.base_url;
-    var eff_key = b.api_key;
-    if (eff_key.len == 0) {
-        const looks_cf = std.mem.indexOf(u8, b.base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, b.base_url, "/ai/") != null;
-        if (looks_cf or std.mem.startsWith(u8, b.model, "@cf/")) {
-            if (cf_oauth.resolveToken(app, u.id, res.arena)) |cf| {
-                eff_key = cf.key;
-                eff_base = cf.base_url; // authoritative account base (the desk may have sent the "cloudflare" sentinel)
-            }
-        }
-    }
+    // CLOUDFLARE LOGIN: when a role is sent with an empty key against a Workers AI endpoint (or an @cf/ model),
+    // the user is relying on their Cloudflare OAuth login — resolveCf swaps in the (auto-refreshed) token +
+    // account base from the vault so the turn runs with no pasted key. Any other provider passes through. Each
+    // of the three roles is resolved independently (a user can point, say, prompting at CF and coding at BYOK).
+    const cc = resolveCf(app, u.id, res.arena, b.base_url, b.model, b.api_key);
+    const eff_base = cc.base;
+    const eff_key = cc.key;
+    const tc = resolveCf(app, u.id, res.arena, b.think_base_url, b.think_model, b.think_api_key);
+    const pc = resolveCf(app, u.id, res.arena, b.prompt_base_url, b.prompt_model, b.prompt_api_key);
+    // The base (coding) triple is always populated; thinking/prompting stay empty when the client didn't send
+    // them and fall back to coding inside the engine (ModelTrio.pick). The local-admission gate keys on the
+    // coding/base backend only (below) — a mixed setup with a local secondary role is a documented limitation.
+    const trio: chat_engine.ModelTrio = .{
+        .coding = .{ .base_url = eff_base, .key = eff_key, .model = b.model },
+        .thinking = .{ .base_url = tc.base, .key = tc.key, .model = b.think_model },
+        .prompting = .{ .base_url = pc.base, .key = pc.key, .model = b.prompt_model },
+    };
 
     // LOCAL-MODEL ADMISSION: a hosted backend fans out up to MAX_ACTIVE_TURNS, but a local model is one process
     // that can't parallelize — admit at most this machine's local budget at a time. Checked AFTER the per-conv
@@ -302,7 +328,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, eff_base, eff_key, b.model, text, loop_mode, b.tool_client);
+    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});
