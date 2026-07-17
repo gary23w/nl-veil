@@ -450,9 +450,14 @@ test "moonshot (Kimi) provider: first-party API, kimi-k3 flagship first, OpenAI-
     try std.testing.expect(p.needs_key and !p.keyless and !p.local and !p.needs_account);
     try std.testing.expectEqualStrings("kimi-k3", p.models[0].id); // flagship = the provider's default model
     try std.testing.expectEqualStrings("Kimi K3 (flagship, 1M ctx)", p.models[0].label);
-    try std.testing.expect(p.models.len >= 12);
+    // exactly the four ids the live API serves (GET /v1/models, 2026-07-17) — the catalog once listed the
+    // legacy moonshot-v1-* line and kimi-k2.5, which the API rejects with "Not found the model or Permission
+    // denied"; a catalog entry that can't complete a request is worse than none.
+    try std.testing.expectEqual(@as(usize, 4), p.models.len);
     // a dotted id survives the bare-scalar parse (no quoting needed)
     try std.testing.expectEqualStrings("kimi-k2.7-code", p.models[1].id);
+    try std.testing.expectEqualStrings("kimi-k2.7-code-highspeed", p.models[2].id);
+    try std.testing.expectEqualStrings("kimi-k2.6", p.models[3].id);
 }
 
 test "senseModel: param count sensed from the id — 8b/20b small, 70b/120b mid, frontier large" {
