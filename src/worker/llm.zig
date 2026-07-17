@@ -27,24 +27,26 @@ pub var calls_made: std.atomic.Value(u64) = .init(0);
 /// prompt prefix uncached every call.
 pub var tokens_cached: std.atomic.Value(u64) = .init(0);
 
-pub const TokUsage = struct { in: u64, out: u64 };
+pub const TokUsage = struct { in: u64, out: u64, cached: u64 = 0 };
 
 /// Per-THREAD token totals (paid + free summed). Each chat turn runs on its OWN detached thread (spawnTurn), so a
 /// thread-local total read as a delta across the turn is exactly THAT turn's usage — correct even when several
 /// conversations' turns run concurrently (the process-global atomics above would cross-count them).
 threadlocal var tl_tokens_in: u64 = 0;
 threadlocal var tl_tokens_out: u64 = 0;
+threadlocal var tl_tokens_cached: u64 = 0;
 
 /// Add one call's tokens to the calling thread's running total (called at each usage-fold site, beside the atomics).
-fn meterTL(in: u64, out: u64) void {
+fn meterTL(in: u64, out: u64, cached: u64) void {
     tl_tokens_in += in;
     tl_tokens_out += out;
+    tl_tokens_cached += cached;
 }
 
 /// Snapshot the CALLING THREAD's token totals. A chat turn reads it before + after its work and reports the
 /// delta as that turn's usage.
 pub fn tokensSnapshot() TokUsage {
-    return .{ .in = tl_tokens_in, .out = tl_tokens_out };
+    return .{ .in = tl_tokens_in, .out = tl_tokens_out, .cached = tl_tokens_cached };
 }
 
 pub const Caps = struct {
@@ -315,7 +317,7 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
             _ = tokens_in.fetchAdd(parsed.value.prompt_eval_count orelse 0, .monotonic);
             _ = tokens_out.fetchAdd(ec, .monotonic);
         }
-        meterTL(parsed.value.prompt_eval_count orelse 0, ec);
+        meterTL(parsed.value.prompt_eval_count orelse 0, ec, 0);
         _ = calls_made.fetchAdd(1, .monotonic);
     }
     if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
@@ -856,7 +858,9 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 }
 
 fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, heal_ok: bool) Step {
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
     const r = post(gpa, io, run_dir, tag, base_url, key, body);
+    const call_ms = @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - t0, std.time.ns_per_ms);
     if (!r.ok) {
         // HTTP-level error (some providers return the constraint here, not in a JSON error field) — try to heal.
         if (heal_ok) {
@@ -882,23 +886,40 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
             },
             finish_reason: ?[]const u8 = null,
         } = &.{},
-        usage: ?struct { prompt_tokens: u64 = 0, completion_tokens: u64 = 0, prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null } = null,
+        // Cache-hit reporting is provider-dialect: OpenAI nests usage.prompt_tokens_details.cached_tokens;
+        // DeepSeek reports top-level usage.prompt_cache_hit_tokens; Moonshot/Kimi top-level usage.cached_tokens.
+        // Parse all three so "is provider prompt caching actually working?" is answerable from our own meters.
+        usage: ?struct {
+            prompt_tokens: u64 = 0,
+            completion_tokens: u64 = 0,
+            prompt_cache_hit_tokens: u64 = 0,
+            cached_tokens: u64 = 0,
+            prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
+        } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
     };
     const parsed = std.json.parseFromSlice(Resp, gpa, r.content, .{ .ignore_unknown_fields = true }) catch
         return stepErr(gpa, std.fmt.allocPrint(gpa, "bad LLM response: {s}", .{r.content[0..@min(r.content.len, 300)]}) catch "unparseable response");
     defer parsed.deinit();
     if (parsed.value.usage) |u| {
+        const nested: u64 = if (u.prompt_tokens_details) |d| d.cached_tokens else 0;
+        const cached = @max(nested, @max(u.prompt_cache_hit_tokens, u.cached_tokens));
         if (isLocal(base_url)) {
             _ = tokens_in_free.fetchAdd(u.prompt_tokens, .monotonic);
             _ = tokens_out_free.fetchAdd(u.completion_tokens, .monotonic);
         } else {
             _ = tokens_in.fetchAdd(u.prompt_tokens, .monotonic);
             _ = tokens_out.fetchAdd(u.completion_tokens, .monotonic);
-            if (u.prompt_tokens_details) |d| _ = tokens_cached.fetchAdd(d.cached_tokens, .monotonic);
+            _ = tokens_cached.fetchAdd(cached, .monotonic);
         }
-        meterTL(u.prompt_tokens, u.completion_tokens);
+        meterTL(u.prompt_tokens, u.completion_tokens, cached);
         _ = calls_made.fetchAdd(1, .monotonic);
+        // WHERE THE SECONDS GO — one line per completed call: purpose tag, provider latency, and the token
+        // split (cached = the provider-cache share of `in`). This is the flight recorder for "some models
+        // run incredibly slow": provider wall-time per call vs. our own engine gaps between the lines.
+        std.log.info("llm[{s}] {d}ms in={d} (cached {d}) out={d}", .{ tag, call_ms, u.prompt_tokens, cached, u.completion_tokens });
+    } else {
+        std.log.info("llm[{s}] {d}ms (no usage in response)", .{ tag, call_ms });
     }
     if (parsed.value.@"error") |e| {
         // a JSON error field (HTTP 200 with an {"error":…} body, as Kimi returns) — try to heal the constraint.
@@ -1277,6 +1298,8 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
         usage: ?struct {
             prompt_tokens: u64 = 0,
             completion_tokens: u64 = 0,
+            prompt_cache_hit_tokens: u64 = 0, // DeepSeek's dialect
+            cached_tokens: u64 = 0, // Moonshot/Kimi's dialect
             prompt_tokens_details: ?struct { cached_tokens: u64 = 0 } = null,
         } = null,
         @"error": ?struct { message: []const u8 = "" } = null,
@@ -1309,7 +1332,8 @@ fn handleSseStreamLine(st: *StreamState, gpa: std.mem.Allocator, line: []const u
     if (parsed.value.usage) |u| {
         st.p_in = u.prompt_tokens;
         st.p_out = u.completion_tokens;
-        if (u.prompt_tokens_details) |dd| st.p_cached = dd.cached_tokens;
+        const nested: u64 = if (u.prompt_tokens_details) |dd| dd.cached_tokens else 0;
+        st.p_cached = @max(nested, @max(u.prompt_cache_hit_tokens, u.cached_tokens));
         st.metered = true;
     }
 }
@@ -1402,8 +1426,10 @@ fn meterStream(st: *const StreamState, local: bool) void {
         _ = tokens_out.fetchAdd(st.p_out, .monotonic);
         _ = tokens_cached.fetchAdd(st.p_cached, .monotonic);
     }
-    meterTL(st.p_in, st.p_out);
+    meterTL(st.p_in, st.p_out, st.p_cached);
     _ = calls_made.fetchAdd(1, .monotonic);
+    // the streamed twin of completeBodyH's flight-recorder line (latency reads off the log timestamps here)
+    std.log.info("llm[stream] in={d} (cached {d}) out={d}", .{ st.p_in, st.p_cached, st.p_out });
 }
 
 /// STREAMING agentic step (chat only). Same request as complete() but "stream":true; curl streams the

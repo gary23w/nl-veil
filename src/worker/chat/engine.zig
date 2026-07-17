@@ -218,6 +218,44 @@ fn schedTaskOf(conv: []const u8) ?[]const u8 {
     return rest[0..us];
 }
 
+test "msgTail: full when it fits; suffix anchors on a non-tool boundary; tool anchors are skipped" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":\"sys\"}");
+    try buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"");
+    try buf.appendNTimes(gpa, 'x', 3000); // a fat message pushes everything else past the window
+    try buf.appendSlice(gpa, "\"}");
+    try buf.appendSlice(gpa, ",{\"role\":\"assistant\",\"tool_calls\":[{\"id\":\"1\"}]}");
+    try buf.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":\"1\",\"content\":\"r\"}");
+    try buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"latest\"}");
+    // fits → verbatim
+    try std.testing.expectEqualStrings(buf.items, msgTail(buf.items, buf.items.len + 1));
+    // window covers assistant+tool+user → anchors at the assistant (its tool result stays paired)
+    try std.testing.expect(std.mem.startsWith(u8, msgTail(buf.items, 150), "{\"role\":\"assistant\""));
+    // window covers only tool+user → the ORPHAN tool anchor is skipped; lands on the final user
+    try std.testing.expect(std.mem.startsWith(u8, msgTail(buf.items, 90), "{\"role\":\"user\",\"content\":\"latest\"}"));
+    // window inside the last object (no boundary) → degrades to the FULL list, never a torn slice
+    try std.testing.expectEqualStrings(buf.items, msgTail(buf.items, 20));
+}
+
+test "clipToolResult: small stays verbatim (same ptr); big keeps head+tail around an elision note" {
+    const gpa = std.testing.allocator;
+    const small = "tiny result";
+    try std.testing.expect(clipToolResult(gpa, small).ptr == small.ptr);
+    const big = try gpa.alloc(u8, 12 * 1024);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    @memcpy(big[0..4], "HEAD");
+    @memcpy(big[big.len - 4 ..], "TAIL");
+    const c = clipToolResult(gpa, big);
+    defer gpa.free(c);
+    try std.testing.expect(c.len < big.len);
+    try std.testing.expect(std.mem.startsWith(u8, c, "HEAD"));
+    try std.testing.expect(std.mem.endsWith(u8, c, "TAIL"));
+    try std.testing.expect(std.mem.indexOf(u8, c, "bytes elided") != null);
+}
+
 test "schedTaskOf: extracts the task id from a run conv, null for ordinary convs" {
     try std.testing.expectEqualStrings("news-0715174857", schedTaskOf("scheduled_news-0715174857_07151753").?);
     try std.testing.expectEqualStrings("daily-report-0301070500", schedTaskOf("scheduled_daily-report-0301070500_03010705").?);
@@ -255,6 +293,47 @@ fn clipBytes(s: []const u8, max: usize) []const u8 {
     return s[0..n];
 }
 
+/// Bounded-context sizes for the cheap auxiliary inferences (drive-loop step picker / round-cap summary).
+const LOOP_CTX_BYTES: usize = 14 * 1024;
+const SUMMARY_CTX_BYTES: usize = 18 * 1024;
+
+/// The LARGEST suffix of a serialized message list (comma-joined {"role":…} objects) that fits `want` bytes
+/// AND starts on a clean, VALID boundary — the "recent context" slice for cheap auxiliary inferences, which
+/// must never re-prefill the whole transcript. A boundary is valid when the message is NOT role:"tool": an
+/// orphaned tool result (its assistant tool_calls message cut off) 400s on strict providers. Returns the
+/// full input when it already fits or no valid boundary lands inside the window (never a blind byte slice —
+/// that would tear a JSON object).
+fn msgTail(items: []const u8, want: usize) []const u8 {
+    if (items.len <= want) return items;
+    const marker = ",{\"role\":\"";
+    var from = items.len - want;
+    while (std.mem.indexOfPos(u8, items, from, marker)) |at| {
+        const role_at = at + marker.len;
+        if (role_at < items.len and items[role_at] != 't') // user/assistant/system anchor — not an orphan tool result
+            return items[at + 1 ..]; // skip the joining comma — the slice starts at {"role":…
+        from = role_at;
+    }
+    return items;
+}
+
+/// How much of a tool result rides back into the conversation context. Results append VERBATIM below this;
+/// above it, the middle is elided (head + tail kept) — every later inference re-uploads every appended byte,
+/// so one 100KB npm/test dump otherwise taxes EVERY subsequent call of the turn.
+const TOOL_RESULT_KEEP: usize = 10 * 1024;
+const TOOL_RESULT_HEAD: usize = 7 * 1024;
+const TOOL_RESULT_TAIL: usize = 2 * 1024;
+
+/// Clip an oversized tool result to head + elision note + tail (UTF-8-boundary safe). Returns `result`
+/// unchanged (same pointer) when it already fits; otherwise a NEW gpa string (caller frees whichever it holds).
+fn clipToolResult(gpa: std.mem.Allocator, result: []const u8) []u8 {
+    if (result.len <= TOOL_RESULT_KEEP) return @constCast(result);
+    const head = clipBytes(result, TOOL_RESULT_HEAD);
+    var tstart = result.len - TOOL_RESULT_TAIL;
+    while (tstart < result.len and (result[tstart] & 0xC0) == 0x80) tstart += 1; // never start mid-codepoint
+    const tail = result[tstart..];
+    return std.fmt.allocPrint(gpa, "{s}\n...[{d} bytes elided from the middle of this tool result — it was too large to keep in full. The head and tail above/below are verbatim; re-run the tool with a narrower target if you need the elided part.]...\n{s}", .{ head, result.len - head.len - tail.len, tail }) catch @constCast(result);
+}
+
 /// Append one message object to messages.jsonl as a COMPLETE single line: {"role":..,"content":..,"kind":..,"ts":N}.
 /// The whole escaped line is built first, then appended, so a reader never sees a partial/multiline object.
 fn appendMsg(app: *App, conv_dir: []const u8, role: []const u8, content: []const u8, kind: []const u8, ts: i64) void {
@@ -282,10 +361,11 @@ fn emitUsage(app: *App, conv_dir: []const u8, t0: llm.TokUsage) void {
     const t1 = llm.tokensSnapshot();
     const din = if (t1.in >= t0.in) t1.in - t0.in else 0;
     const dout = if (t1.out >= t0.out) t1.out - t0.out else 0;
+    const dcached = if (t1.cached >= t0.cached) t1.cached - t0.cached else 0;
     if (din > 0 or dout > 0) {
         var b: [160]u8 = undefined;
         emitEvent(app, conv_dir, std.fmt.bufPrint(&b, "{{\"kind\":\"usage\",\"tokens_in\":{d},\"tokens_out\":{d},\"text\":\"{d} tokens in · {d} out\"}}", .{ din, dout, din, dout }) catch "{\"kind\":\"usage\"}");
-        metrics.record(app, din, dout, nowSecs(app.io)); // one Dashboard metrics line per finished turn
+        metrics.record(app, din, dout, dcached, nowSecs(app.io)); // one Dashboard metrics line per finished turn
     }
 }
 
@@ -927,16 +1007,26 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             }
         } else idle_steps = 0;
 
-        // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE). The loop question is a
-        // SYNTHETIC turn — appended only long enough to ask, then truncated back off conv_buf so it never rides
-        // into the next real pass and never touches messages.jsonl.
-        const saved_len = conv_buf.items.len;
-        conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
-        http.jstr(gpa, &conv_buf, LOOP_QUESTION) catch break :outer;
-        conv_buf.append(gpa, '}') catch break :outer;
-        var next = llm.complete(gpa, app.io, run_root, "loop", base_url, key, model, conv_buf.items, "", 512, 0.5);
+        // DRIVE INFERENCE: one no-tools completion that names the next step (or DONE) — on a BOUNDED context:
+        // a goal-anchor system message + the freshest boundary-aligned slice of the conversation + the loop
+        // question, built in its OWN buffer (conv_buf is untouched). It used to ride the ENTIRE conv_buf,
+        // re-prefilling a 50-150K-token transcript once per drive step just to pick the next step — pure
+        // overhead on slow hosted models, and (being a toolless request) it couldn't even reuse the provider's
+        // prompt cache, which keys on the tools-bearing prefix. The chat inference above still sees the full
+        // context; the picker needs the goal + the tail, and the verify/repeat/cast guards below still gate it.
+        var lq: std.ArrayListUnmanaged(u8) = .empty;
+        defer lq.deinit(gpa);
+        lq.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch break :outer;
+        var gb: [1700]u8 = undefined;
+        const goal_line = std.fmt.bufPrint(&gb, "You drive an agentic work loop. THE GOAL of this conversation: {s}\n(Only the most recent part of the conversation follows.)", .{clipBytes(user_text, 1400)}) catch "You drive an agentic work loop; only the most recent part of the conversation follows.";
+        http.jstr(gpa, &lq, goal_line) catch break :outer;
+        lq.appendSlice(gpa, "},") catch break :outer;
+        lq.appendSlice(gpa, msgTail(conv_buf.items, LOOP_CTX_BYTES)) catch break :outer;
+        lq.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
+        http.jstr(gpa, &lq, LOOP_QUESTION) catch break :outer;
+        lq.append(gpa, '}') catch break :outer;
+        var next = llm.complete(gpa, app.io, run_root, "loop", base_url, key, model, lq.items, "", 512, 0.5);
         defer next.deinit(gpa);
-        conv_buf.shrinkRetainingCapacity(saved_len); // drop the synthetic loop question
 
         const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
         // A failed/empty drive inference always ends the turn (even afk — we can't determine a next step, and a
@@ -3553,17 +3643,22 @@ fn runInnerAgentic(
             // Build the whole tool-result object in a scratch list, then append it to conv_buf in ONE shot. A
             // mid-object OOM must never leave conv_buf as a partial/unterminated object — that malformed JSON would
             // ride into the next completion (a 400) instead of a clean hard_error. On any failure: free + hard_error.
+            // OVERSIZED results are clipped (head + tail) before they enter the context: every appended byte is
+            // re-uploaded on EVERY later inference of the turn, so one giant build/test dump otherwise taxes the
+            // whole rest of the conversation (a first-order slowness source on hosted models).
+            const kept = clipToolResult(gpa, result);
             var toolobj: std.ArrayListUnmanaged(u8) = .empty;
             defer toolobj.deinit(gpa);
             const obj_ok = blk: {
                 toolobj.appendSlice(gpa, ",{\"role\":\"tool\",\"tool_call_id\":") catch break :blk false;
                 http.jstr(gpa, &toolobj, c.id) catch break :blk false;
                 toolobj.appendSlice(gpa, ",\"content\":") catch break :blk false;
-                http.jstr(gpa, &toolobj, result) catch break :blk false;
+                http.jstr(gpa, &toolobj, kept) catch break :blk false;
                 toolobj.append(gpa, '}') catch break :blk false;
                 conv_buf.appendSlice(gpa, toolobj.items) catch break :blk false;
                 break :blk true;
             };
+            if (kept.ptr != result.ptr) gpa.free(kept);
             if (result.len > 0) gpa.free(result); // OOM fallback in execute() can hand back a static "" — don't free that
             if (!obj_ok) return .{ .outcome = .hard_error, .content = empty };
         }
@@ -3598,7 +3693,9 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
-    msgs.appendSlice(gpa, conv_items) catch return null;
+    // BOUNDED: the round-cap salvage fires exactly when the transcript is at its biggest — summarize from the
+    // freshest boundary-aligned slice (which holds this turn's work) instead of re-prefilling all of it.
+    msgs.appendSlice(gpa, msgTail(conv_items, SUMMARY_CTX_BYTES)) catch return null;
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, "In 1-3 sentences, tell the user what you accomplished this turn and what (if anything) remains. Do not call any tools.") catch return null;
     msgs.append(gpa, '}') catch return null;
