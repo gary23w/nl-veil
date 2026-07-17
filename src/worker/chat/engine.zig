@@ -179,7 +179,8 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"swarm_asks","description":"List the OPEN questions a running swarm's minds have raised for you (via their ask_veil tool) and not yet been answered. Check this while a swarm runs — a mind may be blocked waiting on a decision only you can make. Each ask has an ask_id, the mind that asked, and the question.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"answer_swarm","description":"Answer a mind's open question (from swarm_asks). Your answer lands in that mind's inbox as a priority directive on its next round, unblocking it.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"},"ask_id":{"type":"string","description":"the ask_id from swarm_asks"},"mind":{"type":"string","description":"the mind that asked (from swarm_asks)"},"text":{"type":"string","description":"your answer/decision for the mind"}},"required":["id","ask_id","mind","text"]}}},
     \\{"type":"function","function":{"name":"schedule_task","description":"Create a SCHEDULED TASK when the user asks for something to happen later or repeatedly ('every morning at 9', 'in 20 minutes', 'daily news digest'). Each firing runs a fresh UNATTENDED chat turn with this same provider, and the task keeps its own memory across runs. The prompt must be SELF-CONTAINED (a run cannot see this conversation) — put concrete specifics (locations, formats, file names) in details. kind 'once' needs in_min OR at_hm; 'every' needs every_min; 'daily' needs hm.","parameters":{"type":"object","properties":{"name":{"type":"string","description":"short task name"},"prompt":{"type":"string","description":"the self-contained instruction each run executes"},"details":{"type":"string","description":"pinned specifics every run should use (optional)"},"kind":{"type":"string","enum":["once","every","daily"]},"in_min":{"type":"integer","description":"once: fire this many minutes from now"},"at_hm":{"type":"string","description":"once: fire at the next local occurrence of HH:MM"},"every_min":{"type":"integer","description":"every: interval in minutes"},"hm":{"type":"string","description":"daily: local wall-clock HH:MM"}},"required":["name","prompt","kind"]}}},
-    \\{"type":"function","function":{"name":"schedule_list","description":"List the user's scheduled tasks (id, name, kind, next due, run count, enabled) — check before creating a duplicate, and to find ids for schedule_delete.","parameters":{"type":"object","properties":{},"required":[]}}},
+    \\{"type":"function","function":{"name":"schedule_update","description":"Revise an EXISTING scheduled task in place (partial update — ONLY the fields you pass change; everything else keeps its stored value). This is how a task self-heals and self-improves over time: during a scheduled run, call it on YOUR OWN task id (given in the run context) to fold what this run learned into the prompt/details, tune the cadence, or repair a broken definition; in normal chat, use it when the user asks to change an existing schedule. Always pass reason — it is recorded into the task's cross-run memory so future runs know why the definition changed. Provider credentials cannot be changed here. Revisions must preserve the task's goal.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id (a scheduled run's own id is in its RUN CONTEXT; schedule_list shows all ids)"},"name":{"type":"string","description":"new short task name"},"prompt":{"type":"string","description":"the new SELF-CONTAINED instruction future runs execute (replaces the old prompt verbatim)"},"details":{"type":"string","description":"new pinned specifics future runs should use (replaces the old details verbatim — restate what should survive)"},"kind":{"type":"string","enum":["once","every","daily"]},"every_min":{"type":"integer","description":"every: new interval in minutes"},"hm":{"type":"string","description":"daily: new local wall-clock HH:MM"},"in_min":{"type":"integer","description":"once: re-arm to fire this many minutes from now"},"enabled":{"type":"boolean","description":"false pauses the task (it keeps its memory and can be re-armed later); true re-enables it"},"reason":{"type":"string","description":"one sentence: WHY this revision (recorded in task memory for future runs)"}},"required":["id","reason"]}}},
+    \\{"type":"function","function":{"name":"schedule_list","description":"List the user's scheduled tasks (id, name, kind, next due, run count, enabled, plus FAILING/self-tuned health markers) — check before creating a duplicate, and to find ids for schedule_update/schedule_delete.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"schedule_delete","description":"Delete a scheduled task by its id (from schedule_list). Use when the user asks to cancel/remove a schedule.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"sync_dir","description":"PROJECT a folder from the user's machine into this conversation's workdir (read-only copy, hash-diffed: only changed files transfer, the source is NEVER written back to). Use when the user points you at a project that lives OUTSIDE the workdir — an app inside a game-engine folder, a repo elsewhere on disk, an immutable system — so you AND any hive you cast can work with its files. Re-run it to refresh (cheap: unchanged files skip). Text files only, capped 64 files / 4MB — project the SPECIFIC subfolder that matters, not a whole engine install.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"ABSOLUTE folder on the user's machine (e.g. C:/dev/mygame/src or /home/u/app — no ~, expand it first)"},"as":{"type":"string","description":"optional folder name inside the workdir (default: the source folder's name)"}},"required":["path"]}}}
 ;
@@ -771,10 +772,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 salvageSteers(app, conv_dir, &steer_cursor); // an errored turn must not eat a pending steer
                 // SCHEDULED runs learn from failure mechanically: record the failed run into the TASK's memory
                 // (a plain engine fact, not model output — the confab rule stays intact) so the next run's
-                // recall sees "the previous run failed" and can route around whatever broke.
-                if (sched_task != null) {
+                // recall sees "the previous run failed" and can route around whatever broke. The outcome ALSO
+                // lands on the task file (recordRunOutcome): the next run opens in SELF-HEAL posture
+                // deterministically (not recall-dependent), and consecutive failures back the schedule off.
+                if (sched_task) |tid| {
                     var fb: [200]u8 = undefined;
                     _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "previous scheduled run ({s}) FAILED: the model call errored mid-turn — check the provider/key, or simplify the task prompt", .{conv[0..@min(conv.len, 64)]}) catch "a previous scheduled run failed with a model-call error");
+                    _ = sched.recordRunOutcome(app, uid, tid, false, "FAILED: the model call errored mid-turn (provider/key/prompt trouble)");
                 }
                 finishTurn(app, conv_dir, usage_t0);
                 return;
@@ -814,10 +818,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
             const note = "(no reply — the model returned an empty or malformed response this turn)";
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
-            // SCHEDULED runs learn from an empty run too — a mechanical fact the next run's recall sees.
-            if (sched_task != null) {
+            // SCHEDULED runs learn from an empty run too — a mechanical fact the next run's recall sees, plus
+            // the task-file outcome that flips the next run into self-heal posture and arms the backoff.
+            if (sched_task) |tid| {
                 var fb: [180]u8 = undefined;
                 _ = ctx.mem.observe(mem_scope, std.fmt.bufPrint(&fb, "run {s} produced NO ANSWER (empty/malformed model response) — retry with a simpler first step", .{conv[0..@min(conv.len, 64)]}) catch "a previous run produced no answer");
+                _ = sched.recordRunOutcome(app, uid, tid, false, "FAILED: empty/malformed model response (no answer produced)");
             }
             salvageSteers(app, conv_dir, &steer_cursor); // an empty-reply end must not eat a pending steer
             finishTurn(app, conv_dir, usage_t0);
@@ -1037,7 +1043,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
     // SCHEDULED-RUN LEARNING: at normal completion, fold this run's outcome + one distilled lesson into the
     // TASK's memory so the next run starts smarter — the recursive-improvement loop for recurring tasks.
-    if (sched_task != null) schedLearn(app, &ctx, mem_scope, conv, conv_dir, run_root, base_url, key, model, &conv_buf);
+    if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, run_root, base_url, key, model, &conv_buf);
     // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
     // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
@@ -1056,11 +1062,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 ///      recall injection presents it as task history, not as ground truth about the world.
 /// Difficult recurring tasks improve because every run leaves behind what happened, what to change, and every
 /// tool finding already observed during the run. Bounded: one small extra inference, best-effort.
-fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, conv: []const u8, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, tid: []const u8, conv: []const u8, conv_dir: []const u8, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8)) void {
     const gpa = app.gpa;
     var ob: [220]u8 = undefined;
     const note = std.fmt.bufPrint(&ob, "run {s} COMPLETED: {d} file(s) written, {d} observation(s) stored", .{ conv[0..@min(conv.len, 64)], ctx.files_written.*, ctx.observed.* }) catch "scheduled run completed";
     _ = ctx.mem.observe(mem_scope, note);
+    // Task-file outcome ledger: a completed run resets fail_streak and stamps last_status — the next run's RUN
+    // CONTEXT opens on "the previous run worked" instead of a stale failure, and any backoff unwinds.
+    var sb2: [180]u8 = undefined;
+    _ = sched.recordRunOutcome(app, uid, tid, true, std.fmt.bufPrint(&sb2, "ok: {d} file(s) written, {d} observation(s) stored", .{ ctx.files_written.*, ctx.observed.* }) catch "ok");
 
     const saved = conv_buf.items.len;
     defer conv_buf.shrinkRetainingCapacity(saved); // the lesson question never rides into durable context
@@ -2155,7 +2165,7 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
     }
 }
 
-fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
+fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
     if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, args, tool_client);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
@@ -2163,6 +2173,7 @@ fn orchTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
     if (std.mem.eql(u8, name, "swarm_asks")) return asksTool(app, uid, args);
     if (std.mem.eql(u8, name, "answer_swarm")) return answerTool(app, uid, args);
     if (std.mem.eql(u8, name, "schedule_task")) return scheduleTool(app, uid, base_url, key, model, args);
+    if (std.mem.eql(u8, name, "schedule_update")) return scheduleUpdateTool(app, uid, ctx, args);
     if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
     if (std.mem.eql(u8, name, "sync_dir")) return syncDirTool(app, conv, conv_dir, ctrl_cursor, args, tool_client);
@@ -2243,6 +2254,104 @@ fn scheduleTool(app: *App, uid: u64, base_url: []const u8, key: []const u8, mode
         .id => |id| return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"schedule_task\",\"id\":\"{s}\",\"note\":\"created — it fires on schedule as an unattended run with its own cross-run memory; schedule_list shows it\"}}", .{id}) catch emptyRes(),
         .err => |e| return orchErr(gpa, e),
     }
+}
+
+/// schedule_update — revise an existing task in place: THE self-improvement verb. A scheduled run calls it on
+/// its OWN id (handed to it in the run context) to fold lessons into its prompt/details, tune its cadence, or
+/// repair a broken definition; an interactive chat calls it when the user asks to change a schedule. One shared
+/// validated path (sched.updateById — the same one the HTTP route uses), absent-vs-present parsed via
+/// std.json.Value exactly like the route (a typed struct's defaults can't tell "" from not-sent). The revision
+/// is recorded into the TASK's own memory scope ("sched:{id}") with the model's stated reason, so future runs
+/// recall WHY the definition changed. The provider triple (base_url/model/api_key) is not on the surface: a
+/// self-revising task must never be able to redirect its own credentials.
+fn scheduleUpdateTool(app: *App, uid: u64, ctx: *tools.ToolCtx, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, args, .{}) catch return orchErr(gpa, "schedule_update: could not parse args JSON");
+    const obj = switch (parsed) {
+        .object => |o| o,
+        else => return orchErr(gpa, "schedule_update: args must be a JSON object"),
+    };
+    const idv = obj.get("id") orelse return orchErr(gpa, "schedule_update: 'id' is required — your own task id is in the SCHEDULED RUN CONTEXT; schedule_list shows all ids");
+    if (idv != .string or idv.string.len == 0) return orchErr(gpa, "schedule_update: 'id' must be a task-id string");
+    const id = idv.string;
+
+    var s: sched.UpdateSpec = .{};
+    var changed: std.ArrayListUnmanaged(u8) = .empty; // arena-backed summary of which fields were passed
+    const mark = struct {
+        fn add(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), field: []const u8) void {
+            if (list.items.len > 0) list.appendSlice(a, ", ") catch return;
+            list.appendSlice(a, field) catch {};
+        }
+    }.add;
+    if (obj.get("name")) |v| {
+        if (v != .string) return orchErr(gpa, "schedule_update: name must be a string");
+        s.name = v.string;
+        mark(arena, &changed, "name");
+    }
+    if (obj.get("prompt")) |v| {
+        if (v != .string) return orchErr(gpa, "schedule_update: prompt must be a string");
+        s.prompt = v.string;
+        mark(arena, &changed, "prompt");
+    }
+    if (obj.get("details")) |v| {
+        if (v != .string) return orchErr(gpa, "schedule_update: details must be a string");
+        s.details = v.string;
+        mark(arena, &changed, "details");
+    }
+    if (obj.get("kind")) |v| {
+        if (v != .string) return orchErr(gpa, "schedule_update: kind must be \"once\", \"every\", or \"daily\"");
+        s.kind = v.string;
+        mark(arena, &changed, "kind");
+    }
+    if (obj.get("every_min")) |v| {
+        if (v != .integer) return orchErr(gpa, "schedule_update: every_min must be an integer");
+        s.every_min = v.integer;
+        mark(arena, &changed, "every_min");
+    }
+    if (obj.get("hm")) |v| {
+        if (v != .string) return orchErr(gpa, "schedule_update: hm must be \"HH:MM\"");
+        s.hm = v.string;
+        mark(arena, &changed, "hm");
+    }
+    if (obj.get("in_min")) |v| {
+        // "once" re-arm convenience, mirroring schedule_task: the model states minutes-from-now, never epoch math
+        if (v != .integer or v.integer < 1) return orchErr(gpa, "schedule_update: in_min must be a positive integer (minutes from now)");
+        if (v.integer > sched.EVERY_MIN_MAX) return orchErr(gpa, "schedule_update: in_min is capped at 527040 (one year)");
+        s.at = nowSecs(app.io) + v.integer * 60;
+        mark(arena, &changed, "at");
+    }
+    if (obj.get("enabled")) |v| {
+        if (v != .bool) return orchErr(gpa, "schedule_update: enabled must be a boolean");
+        s.enabled = v.bool;
+        mark(arena, &changed, if (v.bool) "enabled(on)" else "enabled(paused)");
+    }
+    if (changed.items.len == 0) return orchErr(gpa, "schedule_update: pass at least one field to change (name/prompt/details/kind/every_min/hm/in_min/enabled)");
+
+    switch (sched.updateById(app, arena, uid, id, s)) {
+        .ok => {},
+        .not_found => return orchErr(gpa, "schedule_update: no such task id — call schedule_list for the exact ids"),
+        .err => |e| return orchErr(gpa, e),
+    }
+
+    // PROVENANCE into the task's own cross-run memory: future runs' TASK MEMORY recall surfaces what changed
+    // and why — the revision trail is how "improved over time" stays legible instead of silent prompt drift.
+    var reason: []const u8 = "";
+    if (obj.get("reason")) |v| {
+        if (v == .string) reason = v.string;
+    }
+    var scope_buf: [80]u8 = undefined;
+    if (std.fmt.bufPrint(&scope_buf, "sched:{s}", .{id})) |scope| {
+        var note: std.ArrayListUnmanaged(u8) = .empty;
+        note.print(arena, "task definition REVISED (fields: {s})", .{changed.items}) catch {};
+        if (reason.len > 0) note.print(arena, " — reason: {s}", .{reason[0..@min(reason.len, 300)]}) catch {};
+        note.appendSlice(arena, " — future runs execute the NEW definition") catch {};
+        if (note.items.len > 0) _ = ctx.mem.observe(scope, note.items);
+    } else |_| {}
+
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"schedule_update\",\"id\":\"{s}\",\"updated\":\"{s}\",\"note\":\"revision recorded in the task's memory; every future run executes the new definition\"}}", .{ id, changed.items }) catch emptyRes();
 }
 
 /// schedule_list — the user's tasks, one compact line each (id | name | kind | next due | runs | state).
@@ -3197,7 +3306,7 @@ fn runInnerAgentic(
                 // its Discourse key and built around the failure). Everything else executes as a mind tool: in
                 // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
                 // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
-                break :blk orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
+                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
                     (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON

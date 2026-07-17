@@ -17,6 +17,14 @@
 //! full tool surface, so until per-role tool gating lands, only the admin may aim it — scheduled or not.
 //! Catch-up policy for overdue tasks (server was down, machine slept): run ONCE and schedule the next occurrence
 //! from NOW — never backfill a run per missed interval (a laptop closed for a week must not fire 2016 turns).
+//!
+//! SELF-HEALING / SELF-IMPROVING: a task is not a frozen prompt. Every run's first message carries an
+//! engine-authored RUN CONTEXT (its own task id, run number, cadence, and the previous run's recorded outcome),
+//! runs may revise their OWN definition through the chat veil's schedule_update tool (updateById — the same
+//! single validated path the HTTP update route uses), and the engine keeps a mechanical outcome ledger on the
+//! task file (last_status + fail_streak). A failed run makes the next run open in repair posture ("fix the
+//! cause first"), and consecutive failures back the schedule off exponentially (failBackoffSecs) so a broken
+//! task retries at declining cost instead of burning a full run every interval forever.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -49,6 +57,14 @@ pub const Task = struct {
     last_conv: []const u8 = "",
     recent_convs: []const u8 = "", // run HISTORY: up to RECENT_MAX conv ids, comma-joined, newest first (includes last_conv)
     runs: i64 = 0,
+    // Mechanical outcome ledger (engine-written, never model text): the previous run's one-line outcome and how
+    // many runs in a row have FAILED (0 = healthy). fail_streak > 0 puts the next run in repair posture
+    // (buildRunMessage's SELF-HEAL block) and, from the second consecutive failure, backs the schedule off
+    // (recordRunOutcome + failBackoffSecs). revisions counts definition updates (route or schedule_update) —
+    // the visible trace of a task improving itself over time.
+    last_status: []const u8 = "",
+    fail_streak: i64 = 0,
+    revisions: i64 = 0,
     base_url: []const u8 = "",
     model: []const u8 = "",
     api_key: []const u8 = "", // STORED on disk; NEVER echoed back out — encodeTask redacts it for HTTP
@@ -219,6 +235,19 @@ pub fn computeNextDue(kind: []const u8, at: i64, every_min: i64, hm: []const u8,
     return at; // "once" (and, via loadTask's normalization, anything unknown — which then disables itself after one run)
 }
 
+/// How much LONGER than its normal cadence a failing "every" task waits before the next attempt, given how many
+/// runs in a row have failed. Pure — recordRunOutcome pushes next_due by this after a failed run.
+///   streak 1  → 0 (the first failure retries on the normal schedule, in repair posture — cheap to heal fast)
+///   streak 2+ → interval × 2,4,8,16 (shift capped at ×16), absolute cap 2 days
+/// "daily" already retries at most once a day and "once" consumed itself, so only "every" backs off — the kind
+/// where an always-failing task would otherwise burn a full unattended run every N minutes forever.
+pub fn failBackoffSecs(kind: []const u8, every_min: i64, fail_streak: i64) i64 {
+    if (!std.mem.eql(u8, kind, "every") or fail_streak < 2) return 0;
+    const step = std.math.clamp(every_min, 1, EVERY_MIN_MAX) * 60;
+    const shift: u6 = @intCast(@min(fail_streak - 1, 4));
+    return @min(step << shift, 172800);
+}
+
 /// Room the id slug leaves for uniqueness suffixes: 48 + "-MMDDHHMMSS"(11) + a possible "-hhhh" collision
 /// suffix (5) = 64, the safeSeg ceiling.
 const SLUG_MAX: usize = 48;
@@ -298,6 +327,9 @@ pub fn encodeTask(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), t: T
     try out.appendSlice(gpa, ",\"recent_convs\":");
     try http.jstr(gpa, out, t.recent_convs);
     try out.appendSlice(gpa, std.fmt.bufPrint(&nb, ",\"runs\":{d}", .{t.runs}) catch return error.NoSpaceLeft);
+    try out.appendSlice(gpa, ",\"last_status\":");
+    try http.jstr(gpa, out, t.last_status);
+    try out.appendSlice(gpa, std.fmt.bufPrint(&nb, ",\"fail_streak\":{d},\"revisions\":{d}", .{ t.fail_streak, t.revisions }) catch return error.NoSpaceLeft);
     try out.appendSlice(gpa, ",\"base_url\":");
     try http.jstr(gpa, out, t.base_url);
     try out.appendSlice(gpa, ",\"model\":");
@@ -417,6 +449,94 @@ pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSp
     return .{ .id = alloc.dupe(u8, id) catch return .{ .err = "out of memory" } };
 }
 
+/// A partial update: null = keep the stored value, non-null = replace it. The single update shape BOTH revisers
+/// share — the HTTP route (human/desk edits) and the chat veil's schedule_update tool (the task revising
+/// ITSELF mid-run, or the veil revising it from conversation). The tool never passes the provider triple
+/// (base_url/model/api_key): a self-improving task must not be able to redirect its own credentials.
+pub const UpdateSpec = struct {
+    name: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+    details: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    at: ?i64 = null,
+    every_min: ?i64 = null,
+    hm: ?[]const u8 = null,
+    enabled: ?bool = null,
+    base_url: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+};
+
+/// Apply the present fields of `s` onto `t` and validate the FINAL shape (not just the touched fields —
+/// switching kind to "daily" must fail unless a parseable hm is stored, from this update or an earlier one).
+/// Returns a static error string, or null on success. `sched_changed` = a schedule field (kind/at/every_min/hm)
+/// was present (next_due must be recomputed); `content_changed` = the task's substance (name/prompt/details)
+/// changed (counts as a revision). Pure — string fields alias `s`, so the caller's allocation outlives the save.
+pub fn applySpecToTask(t: *Task, s: UpdateSpec, sched_changed: *bool, content_changed: *bool) ?[]const u8 {
+    if (s.name) |v| {
+        const tv = std.mem.trim(u8, v, " \r\n\t");
+        if (tv.len == 0) return "name must be a non-empty string";
+        t.name = tv;
+        content_changed.* = true;
+    }
+    if (s.prompt) |v| {
+        const tv = std.mem.trim(u8, v, " \r\n\t");
+        if (tv.len == 0) return "prompt must be a non-empty string";
+        t.prompt = tv;
+        content_changed.* = true;
+    }
+    if (s.details) |v| {
+        t.details = v;
+        content_changed.* = true;
+    }
+    if (s.kind) |v| {
+        if (!validKind(v)) return "kind must be \"once\", \"every\", or \"daily\"";
+        t.kind = v;
+        sched_changed.* = true;
+    }
+    if (s.at) |v| {
+        t.at = v;
+        sched_changed.* = true;
+    }
+    if (s.every_min) |v| {
+        t.every_min = v;
+        sched_changed.* = true;
+    }
+    if (s.hm) |v| {
+        t.hm = v;
+        sched_changed.* = true;
+    }
+    if (s.enabled) |v| t.enabled = v;
+    if (s.base_url) |v| t.base_url = v;
+    if (s.model) |v| t.model = v;
+    if (s.api_key) |v| t.api_key = v;
+    if (std.mem.eql(u8, t.kind, "every") and (t.every_min < 1 or t.every_min > EVERY_MIN_MAX)) return "every_min must be between 1 and 527040 (one year) for kind \"every\"";
+    if (std.mem.eql(u8, t.kind, "daily") and parseHm(t.hm) == null) return "hm must be \"HH:MM\" for kind \"daily\"";
+    return null;
+}
+
+pub const UpdateResult = union(enum) { ok: void, not_found: void, err: []const u8 };
+
+/// Validate + apply + persist one partial update — THE single update path (HTTP route and schedule_update tool
+/// both land here, mirroring createFromSpec's one-create-path rule). Holds sched_mtx across load-apply-save so
+/// a tick's bookkeeping can never interleave. next_due is recomputed only when a schedule field was present (an
+/// unrelated rename must not re-anchor a running interval); a content or schedule change counts one revision.
+pub fn updateById(app: *App, alloc: std.mem.Allocator, uid: u64, id: []const u8, s: UpdateSpec) UpdateResult {
+    const seg = safeSeg(id);
+    if (seg.len == 0) return .not_found;
+    sched_mtx.lockUncancelable(app.io);
+    defer sched_mtx.unlock(app.io);
+    var t = loadTask(app, alloc, uid, seg) orelse return .not_found;
+    var sched_changed = false;
+    var content_changed = false;
+    if (applySpecToTask(&t, s, &sched_changed, &content_changed)) |e| return .{ .err = e };
+    if (sched_changed)
+        t.next_due = computeNextDue(t.kind, t.at, t.every_min, t.hm, t.created, t.last_run, nowSecs(app.io), localOffsetSecs());
+    if (content_changed or sched_changed) t.revisions += 1;
+    if (!saveTask(app, alloc, uid, t)) return .{ .err = "could not write the task file" };
+    return .ok;
+}
+
 /// One compact human line per task ("id | name | kind ... | next due in Nm | runs N | enabled") — the chat
 /// veil's schedule_list result. gpa-owned; empty string when none exist.
 pub fn listBrief(app: *App, gpa: std.mem.Allocator, uid: u64) []u8 {
@@ -441,7 +561,12 @@ pub fn listBrief(app: *App, gpa: std.mem.Allocator, uid: u64) []u8 {
             out.print(gpa, "{s} | {s} | {s}", .{ t.id, t.name, t.kind }) catch break;
             if (std.mem.eql(u8, t.kind, "every")) out.print(gpa, " {d}min", .{t.every_min}) catch {};
             if (std.mem.eql(u8, t.kind, "daily")) out.print(gpa, " at {s}", .{t.hm}) catch {};
-            out.print(gpa, " | next due in {d}m | runs {d} | {s}\n", .{ due_min, t.runs, if (t.enabled) "enabled" else "disabled" }) catch break;
+            out.print(gpa, " | next due in {d}m | runs {d} | {s}", .{ due_min, t.runs, if (t.enabled) "enabled" else "disabled" }) catch break;
+            // Health surfaces where the veil actually looks: a sick task is visible (and fixable via
+            // schedule_update) from any chat, not only from inside its own runs.
+            if (t.fail_streak > 0) out.print(gpa, " | FAILING x{d}", .{t.fail_streak}) catch {};
+            if (t.revisions > 0) out.print(gpa, " | self-tuned x{d}", .{t.revisions}) catch {};
+            out.append(gpa, '\n') catch break;
         }
     } else |_| {}
     return gpa.dupe(u8, out.items) catch @constCast("");
@@ -457,6 +582,73 @@ pub fn deleteById(app: *App, alloc: std.mem.Allocator, uid: u64, id: []const u8)
     defer sched_mtx.unlock(app.io);
     std.Io.Dir.cwd().deleteFile(app.io, path) catch return false;
     return true;
+}
+
+// ---- run outcome ledger + composing one run's first message -------------------------------------------------
+
+/// Record how a run ENDED onto the task file — the engine's ground-truth outcome ledger, written from the chat
+/// engine's completion paths (never from model text). ok resets fail_streak; a failure increments it, and from
+/// the second consecutive failure pushes next_due out by failBackoffSecs (never pulled earlier — @max) so an
+/// unattended task that keeps dying retries at declining cost. The note lands verbatim (clipped) in last_status,
+/// where the NEXT run's RUN CONTEXT block and the desk's task list can see it. Returns the new streak.
+/// Self-contained (own arena, takes the sched lock) — callable from any engine thread at turn end.
+pub fn recordRunOutcome(app: *App, uid: u64, id: []const u8, ok: bool, note: []const u8) i64 {
+    const seg = safeSeg(id);
+    if (seg.len == 0) return 0;
+    var arena_state = std.heap.ArenaAllocator.init(app.gpa);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const now = nowSecs(app.io);
+    sched_mtx.lockUncancelable(app.io);
+    defer sched_mtx.unlock(app.io);
+    var t = loadTask(app, alloc, uid, seg) orelse return 0;
+    t.last_status = note[0..@min(note.len, 160)]; // engine-authored ASCII one-liners; the clip keeps the file tiny
+    t.fail_streak = if (ok) 0 else t.fail_streak + 1;
+    if (!ok) {
+        const backoff = failBackoffSecs(t.kind, t.every_min, t.fail_streak);
+        if (backoff > 0) t.next_due = @max(t.next_due, now + backoff);
+    }
+    _ = saveTask(app, alloc, uid, t);
+    return t.fail_streak;
+}
+
+/// Compose one run's FIRST MESSAGE: the prompt, the pinned details, then an engine-authored RUN CONTEXT block —
+/// the task's own id, run number, cadence, the previous run's recorded outcome, a SELF-HEAL directive when the
+/// task is failing, and the standing self-improvement contract (revise yourself via schedule_update). The id is
+/// what makes self-revision DETERMINISTIC: without it the run would have to fish its own identity out of
+/// schedule_list by name. gpa-owned; null only on OOM. Pure of I/O — unit-tested below.
+pub fn buildRunMessage(gpa: std.mem.Allocator, t: *const Task) ?[]u8 {
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    defer text.deinit(gpa);
+    const fail = build: {
+        text.appendSlice(gpa, t.prompt) catch break :build true;
+        const det = std.mem.trim(u8, t.details, " \r\n\t");
+        if (det.len > 0) {
+            text.appendSlice(gpa, "\n\nKey details / data to use:\n") catch break :build true;
+            text.appendSlice(gpa, det) catch break :build true;
+        }
+        text.appendSlice(gpa, "\n\n--- SCHEDULED RUN CONTEXT (engine-authored) ---\n") catch break :build true;
+        text.print(gpa, "This is run #{d} of scheduled task \"{s}\" — its id is \"{s}\" (", .{ t.runs + 1, t.name, t.id }) catch break :build true;
+        if (std.mem.eql(u8, t.kind, "every"))
+            text.print(gpa, "runs every {d} min", .{t.every_min}) catch break :build true
+        else if (std.mem.eql(u8, t.kind, "daily"))
+            text.print(gpa, "runs daily at {s}", .{t.hm}) catch break :build true
+        else
+            text.appendSlice(gpa, "one-shot") catch break :build true;
+        text.appendSlice(gpa, ").\n") catch break :build true;
+        const st = std.mem.trim(u8, t.last_status, " \r\n\t");
+        if (st.len > 0) text.print(gpa, "Previous run outcome: {s}\n", .{st}) catch break :build true;
+        if (t.fail_streak > 0)
+            text.print(gpa, "SELF-HEAL FIRST: the last {d} run(s) of this task FAILED in a row. Before working the task, diagnose and FIX the cause — verify inputs, tools, and approach; simplify whatever keeps breaking — and record what you fixed with observe so the repair sticks.\n", .{t.fail_streak}) catch break :build true;
+        text.appendSlice(gpa, "STANDING DIRECTIVE — this task must be SELF-HEALING and SELF-IMPROVING across runs: " ++
+            "fix any error or warning this run surfaces instead of merely reporting it; reuse what TASK MEMORY says worked and skip its recorded pitfalls; " ++
+            "and when the task DEFINITION itself should change — a clearer prompt, sharper details, a saner cadence, pausing when obsolete — apply that yourself by calling schedule_update with id \"") catch break :build true;
+        text.appendSlice(gpa, t.id) catch break :build true;
+        text.appendSlice(gpa, "\" and a short reason. Improvements must preserve this task's goal.") catch break :build true;
+        break :build false;
+    };
+    if (fail) return null;
+    return text.toOwnedSlice(gpa) catch null;
 }
 
 // ---- provider resolution + launching one run ----------------------------------------------------------------
@@ -506,19 +698,15 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     var cb: [64]u8 = undefined;
     const conv = convIdFor(&cb, t.id, now + localOffsetSecs());
 
-    // First message = the prompt, plus the task's pinned data block when present — the same text every run,
-    // so each minted conversation is self-contained (the turn cannot see the task file). No preamble: the run
-    // fires with the AUTO-LOOP ARMED (loop=1 below), so the drive loop carries it through ambiguity to a
-    // completed deliverable, and the engine injects the task's memory (recall) + records outcomes/lessons
-    // (see runTurn's sched branches) — autonomy and learning are ENGINE mechanics, not prompt pleading.
-    var text: std.ArrayListUnmanaged(u8) = .empty;
-    defer text.deinit(app.gpa);
-    text.appendSlice(app.gpa, t.prompt) catch return null;
-    const det = std.mem.trim(u8, t.details, " \r\n\t");
-    if (det.len > 0) {
-        text.appendSlice(app.gpa, "\n\nKey details / data to use:\n") catch return null;
-        text.appendSlice(app.gpa, det) catch return null;
-    }
+    // First message = the prompt + pinned details + the engine-authored RUN CONTEXT (buildRunMessage): the run
+    // knows its OWN task id, run number, cadence, and the previous run's recorded outcome — the mechanical
+    // ground the self-heal/self-improve loop stands on (schedule_update needs the id; repair posture needs the
+    // outcome). Each minted conversation stays self-contained: everything the run may know about its task is IN
+    // the message. The run fires with the AUTO-LOOP ARMED (loop=1 below), so the drive loop carries it through
+    // ambiguity to a completed deliverable, and the engine injects the task's memory (recall) + records
+    // outcomes/lessons (see runTurn's sched branches) — autonomy and learning are ENGINE mechanics.
+    const text = buildRunMessage(app.gpa, t) orelse return null;
+    defer app.gpa.free(text);
 
     const pr = resolveProvider(app, alloc, uid, t);
 
@@ -530,7 +718,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // DONE (bounded by LOOP_MAX_STEPS, so a stuck task ends instead of burning forever). Never afk: an
     // unattended run must terminate on its own. spawnTurn copies every arg into its own blob (conv lives in
     // a stack buffer here) and owns releasing the turn slot on every completion path.
-    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text.items, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
+    chat_engine.spawnTurn(app, uid, conv, pr.base, pr.key, pr.model, text, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
 
     // Bookkeeping AFTER the spawn is committed, under the sched lock with a FRESH re-load: a concurrent
     // update (rename, toggle, prompt edit) between the caller's read and this save must not be clobbered by
@@ -714,9 +902,10 @@ pub fn createTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 /// POST /api/v1/sched/:id — partial update: any subset of the create fields (+ enabled). Parsed as a generic
-/// JSON object so ABSENT means "keep" (a typed struct's defaults can't tell "" apart from not-sent). next_due
-/// is recomputed only when a schedule field (kind/at/every_min/hm) actually changed — an unrelated rename must
-/// not re-anchor a running interval.
+/// JSON object so ABSENT means "keep" (a typed struct's defaults can't tell "" apart from not-sent); the route
+/// type-checks each present field into an UpdateSpec and updateById — the ONE update path this route shares
+/// with the chat veil's schedule_update tool — validates the final shape, recomputes next_due only when a
+/// schedule field was sent (an unrelated rename must not re-anchor a running interval), and persists.
 pub fn updateTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = gate(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
@@ -729,70 +918,57 @@ pub fn updateTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         else => return badReq(res, "bad body"),
     };
 
-    sched_mtx.lockUncancelable(app.io);
-    defer sched_mtx.unlock(app.io);
-    var t = loadTask(app, res.arena, u.id, seg) orelse return notFound(res);
-    var sched_changed = false;
-
+    var s = UpdateSpec{};
     if (obj.get("name")) |v| {
-        if (v != .string or std.mem.trim(u8, v.string, " \r\n\t").len == 0) return badReq(res, "name must be a non-empty string");
-        t.name = std.mem.trim(u8, v.string, " \r\n\t");
+        if (v != .string) return badReq(res, "name must be a non-empty string");
+        s.name = v.string;
     }
     if (obj.get("prompt")) |v| {
-        if (v != .string or std.mem.trim(u8, v.string, " \r\n\t").len == 0) return badReq(res, "prompt must be a non-empty string");
-        t.prompt = std.mem.trim(u8, v.string, " \r\n\t");
+        if (v != .string) return badReq(res, "prompt must be a non-empty string");
+        s.prompt = v.string;
     }
     if (obj.get("details")) |v| {
         if (v != .string) return badReq(res, "details must be a string");
-        t.details = v.string;
+        s.details = v.string;
     }
     if (obj.get("kind")) |v| {
-        if (v != .string or !validKind(v.string)) return badReq(res, "kind must be \"once\", \"every\", or \"daily\"");
-        t.kind = v.string;
-        sched_changed = true;
+        if (v != .string) return badReq(res, "kind must be \"once\", \"every\", or \"daily\"");
+        s.kind = v.string;
     }
     if (obj.get("at")) |v| {
         if (v != .integer) return badReq(res, "at must be an epoch-seconds integer");
-        t.at = v.integer;
-        sched_changed = true;
+        s.at = v.integer;
     }
     if (obj.get("every_min")) |v| {
         if (v != .integer) return badReq(res, "every_min must be an integer");
-        t.every_min = v.integer;
-        sched_changed = true;
+        s.every_min = v.integer;
     }
     if (obj.get("hm")) |v| {
         if (v != .string) return badReq(res, "hm must be \"HH:MM\"");
-        t.hm = v.string;
-        sched_changed = true;
+        s.hm = v.string;
     }
     if (obj.get("enabled")) |v| {
         if (v != .bool) return badReq(res, "enabled must be a boolean");
-        t.enabled = v.bool;
+        s.enabled = v.bool;
     }
     if (obj.get("base_url")) |v| {
         if (v != .string) return badReq(res, "base_url must be a string");
-        t.base_url = v.string;
+        s.base_url = v.string;
     }
     if (obj.get("model")) |v| {
         if (v != .string) return badReq(res, "model must be a string");
-        t.model = v.string;
+        s.model = v.string;
     }
     if (obj.get("api_key")) |v| {
         if (v != .string) return badReq(res, "api_key must be a string");
-        t.api_key = v.string;
+        s.api_key = v.string;
     }
 
-    // Validate the FINAL shape, not just the touched fields — switching kind to "daily" must fail here unless
-    // a parseable hm is stored (from this update or an earlier one), or the tick loop would inherit a task it
-    // can only guess at.
-    if (std.mem.eql(u8, t.kind, "every") and (t.every_min < 1 or t.every_min > EVERY_MIN_MAX)) return badReq(res, "every_min must be between 1 and 527040 (one year) for kind \"every\"");
-    if (std.mem.eql(u8, t.kind, "daily") and parseHm(t.hm) == null) return badReq(res, "hm must be \"HH:MM\" for kind \"daily\"");
-
-    if (sched_changed)
-        t.next_due = computeNextDue(t.kind, t.at, t.every_min, t.hm, t.created, t.last_run, nowSecs(app.io), localOffsetSecs());
-    if (!saveTask(app, res.arena, u.id, t)) return serverErr(res, "could not write the task file");
-    try res.json(.{ .ok = true }, .{});
+    switch (updateById(app, res.arena, u.id, seg, s)) {
+        .ok => try res.json(.{ .ok = true }, .{}),
+        .not_found => return notFound(res),
+        .err => |e| return if (std.mem.eql(u8, e, "could not write the task file")) serverErr(res, e) else badReq(res, e),
+    }
 }
 
 /// DELETE /api/v1/sched/:id — remove the task file. Structural ownership like every chat route: the path is
@@ -941,6 +1117,9 @@ test "task JSON round-trips through encodeTask/parse; the HTTP encoding always r
         .last_conv = "scheduled_daily-report_03010705",
         .recent_convs = "scheduled_daily-report_03010705,scheduled_daily-report_02280705",
         .runs = 7,
+        .last_status = "ok: 2 file(s), 3 note(s)",
+        .fail_streak = 2,
+        .revisions = 3,
         .base_url = "http://127.0.0.1:11434/v1",
         .model = "gpt-oss:20b",
         .api_key = "sk-secret",
@@ -960,6 +1139,9 @@ test "task JSON round-trips through encodeTask/parse; the HTTP encoding always r
         try std.testing.expectEqualStrings(t.hm, back.value.hm);
         try std.testing.expectEqualStrings(t.last_conv, back.value.last_conv);
         try std.testing.expectEqualStrings(t.recent_convs, back.value.recent_convs);
+        try std.testing.expectEqualStrings(t.last_status, back.value.last_status);
+        try std.testing.expectEqual(t.fail_streak, back.value.fail_streak);
+        try std.testing.expectEqual(t.revisions, back.value.revisions);
         try std.testing.expectEqualStrings(t.base_url, back.value.base_url);
         try std.testing.expectEqualStrings(t.model, back.value.model);
         try std.testing.expectEqualStrings("sk-secret", back.value.api_key);
@@ -978,5 +1160,94 @@ test "task JSON round-trips through encodeTask/parse; the HTTP encoding always r
         defer back.deinit();
         try std.testing.expectEqualStrings("", back.value.api_key);
         try std.testing.expectEqualStrings(t.name, back.value.name);
+    }
+    // a PRE-LEDGER task file (no last_status/fail_streak/revisions) still parses, healthy by default
+    {
+        const old = "{\"id\":\"x\",\"name\":\"n\",\"prompt\":\"p\",\"kind\":\"every\",\"every_min\":30}";
+        const back = try std.json.parseFromSlice(Task, gpa, old, .{ .ignore_unknown_fields = true });
+        defer back.deinit();
+        try std.testing.expectEqual(@as(i64, 0), back.value.fail_streak);
+        try std.testing.expectEqual(@as(i64, 0), back.value.revisions);
+        try std.testing.expectEqualStrings("", back.value.last_status);
+    }
+}
+
+test "failBackoffSecs: only 'every' backs off, from the SECOND consecutive failure, doubling to caps" {
+    // first failure retries on the normal cadence (repair posture is enough); non-"every" kinds never back off
+    try std.testing.expectEqual(@as(i64, 0), failBackoffSecs("every", 60, 0));
+    try std.testing.expectEqual(@as(i64, 0), failBackoffSecs("every", 60, 1));
+    try std.testing.expectEqual(@as(i64, 0), failBackoffSecs("daily", 60, 5));
+    try std.testing.expectEqual(@as(i64, 0), failBackoffSecs("once", 60, 5));
+    // hourly task: 2h, 4h, 8h, 16h, then the multiplier caps at x16
+    try std.testing.expectEqual(@as(i64, 2 * 3600), failBackoffSecs("every", 60, 2));
+    try std.testing.expectEqual(@as(i64, 4 * 3600), failBackoffSecs("every", 60, 3));
+    try std.testing.expectEqual(@as(i64, 8 * 3600), failBackoffSecs("every", 60, 4));
+    try std.testing.expectEqual(@as(i64, 16 * 3600), failBackoffSecs("every", 60, 5));
+    try std.testing.expectEqual(@as(i64, 16 * 3600), failBackoffSecs("every", 60, 50));
+    // a long cadence hits the 2-day absolute cap instead
+    try std.testing.expectEqual(@as(i64, 172800), failBackoffSecs("every", 1440, 3));
+    // a garbled interval is clamped like computeNextDue clamps it — never zero, never overflow
+    try std.testing.expectEqual(@as(i64, 120), failBackoffSecs("every", 0, 2));
+}
+
+test "applySpecToTask: absent keeps, present replaces + validates the FINAL shape, change flags drive revisions" {
+    var t = Task{ .id = "x", .name = "n", .prompt = "p", .kind = "every", .every_min = 30 };
+    var sc = false;
+    var cc = false;
+    // empty spec: nothing changes, still valid
+    try std.testing.expect(applySpecToTask(&t, .{}, &sc, &cc) == null);
+    try std.testing.expect(!sc and !cc);
+    // content change flips cc only
+    try std.testing.expect(applySpecToTask(&t, .{ .prompt = "  better prompt  " }, &sc, &cc) == null);
+    try std.testing.expectEqualStrings("better prompt", t.prompt);
+    try std.testing.expect(cc and !sc);
+    // schedule change flips sc; final shape validated
+    cc = false;
+    try std.testing.expect(applySpecToTask(&t, .{ .every_min = 120 }, &sc, &cc) == null);
+    try std.testing.expect(sc and !cc);
+    try std.testing.expectEqual(@as(i64, 120), t.every_min);
+    // bad final shapes are rejected with the route's exact messages
+    sc = false;
+    try std.testing.expectEqualStrings("prompt must be a non-empty string", applySpecToTask(&t, .{ .prompt = "  " }, &sc, &cc).?);
+    try std.testing.expectEqualStrings("kind must be \"once\", \"every\", or \"daily\"", applySpecToTask(&t, .{ .kind = "hourly" }, &sc, &cc).?);
+    try std.testing.expectEqualStrings("every_min must be between 1 and 527040 (one year) for kind \"every\"", applySpecToTask(&t, .{ .every_min = 0 }, &sc, &cc).?);
+    // switching to daily without a stored hm fails on the FINAL shape, not just the touched field
+    try std.testing.expectEqualStrings("hm must be \"HH:MM\" for kind \"daily\"", applySpecToTask(&t, .{ .kind = "daily" }, &sc, &cc).?);
+    try std.testing.expect(applySpecToTask(&t, .{ .kind = "daily", .hm = "07:30" }, &sc, &cc) == null);
+    // enabled/provider fields apply without counting as content or schedule changes
+    sc = false;
+    cc = false;
+    try std.testing.expect(applySpecToTask(&t, .{ .enabled = false, .model = "m2" }, &sc, &cc) == null);
+    try std.testing.expect(!sc and !cc);
+    try std.testing.expect(!t.enabled);
+    try std.testing.expectEqualStrings("m2", t.model);
+}
+
+test "buildRunMessage: prompt + details + run context (id, run number, cadence, outcome, heal posture)" {
+    const gpa = std.testing.allocator;
+    // healthy task: context names the id + cadence + standing directive, but NO self-heal block
+    {
+        const t = Task{ .id = "digest-0301070500", .name = "Digest", .prompt = "Do the digest.", .details = "use source X", .kind = "every", .every_min = 60, .runs = 4 };
+        const msg = buildRunMessage(gpa, &t).?;
+        defer gpa.free(msg);
+        try std.testing.expect(std.mem.startsWith(u8, msg, "Do the digest."));
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Key details / data to use:\nuse source X") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "run #5 of scheduled task \"Digest\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "its id is \"digest-0301070500\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "runs every 60 min") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "schedule_update with id \"digest-0301070500\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEALING and SELF-IMPROVING") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEAL FIRST") == null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Previous run outcome") == null);
+    }
+    // failing task: previous outcome + repair posture lead the run; empty details adds no details block
+    {
+        const t = Task{ .id = "digest-0301070500", .name = "Digest", .prompt = "Do the digest.", .kind = "daily", .hm = "09:30", .runs = 9, .last_status = "FAILED: the model call errored mid-turn", .fail_streak = 3 };
+        const msg = buildRunMessage(gpa, &t).?;
+        defer gpa.free(msg);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Key details") == null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "runs daily at 09:30") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "Previous run outcome: FAILED: the model call errored mid-turn") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEAL FIRST: the last 3 run(s) of this task FAILED in a row") != null);
     }
 }
