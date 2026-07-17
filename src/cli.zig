@@ -53,10 +53,10 @@ pub const Ctx = struct {
 /// anything else, keeping bare `veil` = run the daemon). Kept in sync with `dispatch` below.
 pub fn isCommand(sub: []const u8) bool {
     const verbs = [_][]const u8{
-        "cast",      "deploy",        "list",      "ls",      "ps",        "stop",
-        "rm",        "delete",        "events",    "logs",    "watch",     "chat",
-        "sched",     "hub",           "doctor",    "health",  "desktop",   "desk",
-        "help",      "--help",        "-h",        "version", "--version", "exec-tool",
+        "cast",      "deploy",        "list",   "ls",      "ps",        "stop",
+        "rm",        "delete",        "events", "logs",    "watch",     "chat",
+        "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
+        "help",      "--help",        "-h",     "version", "--version", "exec-tool",
         "sync-read", "sync-manifest",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
