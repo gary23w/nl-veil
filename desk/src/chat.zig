@@ -3719,9 +3719,24 @@ pub const Chat = struct {
     /// delegations timed out server-side. null = unreachable: the caller must not arm a server watch at all.
     /// A 404 (no conv dir / no events file yet) is a genuinely empty tail: 0.
     fn eventsTailCursor(self: *Chat, conv: []const u8, start: usize) ?usize {
+        // SIZE PROBE first (from = max u64 — the server answers {"ok":true,"len":N} instead of a body): the
+        // tail WITHOUT transferring the backlog. Transfer can't even work on a long conversation — httpc caps
+        // one response at 1MB, so a from=0 fetch of a bigger events file never completes (the failure that
+        // originally zeroed the cursor and replayed history). An older server treats the sentinel as
+        // past-the-end and returns an empty 200 — the parse fails and the drain below covers it.
+        if (self.runner().chatEvents(self.io, self.gpa, conv, std.math.maxInt(u64))) |er| {
+            defer if (er.body.len > 0) self.gpa.free(er.body);
+            if (er.status == 200 and er.body.len > 0) {
+                const P = struct { ok: bool = false, len: usize = 0 };
+                if (std.json.parseFromSlice(P, self.gpa, er.body, .{ .ignore_unknown_fields = true })) |pp| {
+                    defer pp.deinit();
+                    if (pp.value.ok) return pp.value.len;
+                } else |_| {}
+            }
+        }
         var cur = start;
         var probes: usize = 0;
-        while (probes < 40) : (probes += 1) { // 40 × the server's 8MB response cap ≫ any real events file
+        while (probes < 40) : (probes += 1) { // the server pages ≤512KB per response; 40 pages ≫ a real file
             const er = self.runner().chatEvents(self.io, self.gpa, conv, cur) orelse return null;
             defer if (er.body.len > 0) self.gpa.free(er.body);
             if (er.status == 404) return 0;
