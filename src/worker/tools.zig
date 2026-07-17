@@ -470,7 +470,7 @@ fn hiveStore(ctx: *ToolCtx, fact: []const u8) bool {
 /// in the turn that actually uses it — instead of riding to the provider on every call of every chat.
 fn getCredential(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    if (ctx.durable_path.len == 0) return dupe(gpa, "no durable credential store on this surface (swarm minds never hold user credentials)");
+    if (ctx.durable_path.len == 0) return dupe(gpa, "no durable credential store on this executor — get_credential runs on the veil server (and swarm minds never hold user credentials)");
     const A = struct { query: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
@@ -478,6 +478,16 @@ fn getCredential(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (q.len < 3) return dupe(gpa, "name the credential: pass a few identifying words (the service, domain, or masked label from YOUR MEMORY)");
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ctx.durable_path, gpa, .limited(256 << 10)) catch return dupe(gpa, "no durable memory store found");
     defer gpa.free(data);
+    if (credentialLookup(gpa, data, q)) |b| {
+        defer gpa.free(b);
+        return std.fmt.allocPrint(gpa, "{s}\n(handle with care: use it directly in the call that needs it; NEVER echo it into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use)", .{b}) catch dupe(gpa, "(credential found but could not be rendered)");
+    }
+    return dupe(gpa, "no stored credential matches that description — check YOUR MEMORY's withheld entries or ask the user");
+}
+
+/// Best-matching secretive entry from raw memories.jsonl bytes for a word query (gpa-owned; null = no match).
+/// Score = number of 3+ char query words found in the entry text (case-insensitive); newest wins ties.
+pub fn credentialLookup(gpa: std.mem.Allocator, data: []const u8, q: []const u8) ?[]u8 {
     const M = struct { cat: []const u8 = "", text: []const u8 = "" };
     var best: ?[]u8 = null;
     var best_score: usize = 0;
@@ -502,11 +512,25 @@ fn getCredential(ctx: *ToolCtx, args_json: []const u8) []u8 {
             best_score = score;
         }
     }
-    if (best) |b| {
-        defer gpa.free(b);
-        return std.fmt.allocPrint(gpa, "{s}\n(handle with care: use it directly in the call that needs it; NEVER echo it into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use)", .{b}) catch dupe(gpa, "(credential found but could not be rendered)");
-    }
-    return dupe(gpa, "no stored credential matches that description — check YOUR MEMORY's withheld entries or ask the user");
+    return best;
+}
+
+test "credentialLookup finds the right secretive entry by words" {
+    const gpa = std.testing.allocator;
+    const data =
+        \\{"cat":"key","text":"Discourse API key for home.renovation.reviews: aaaa1111bbbb2222cccc3333"}
+        \\{"cat":"fact","text":"Discourse API requires Api-Key/Api-Username headers"}
+        \\{"cat":"key","text":"GitHub personal access token: ghp_abc123abc123abc123abc123abc123"}
+        \\
+    ;
+    const hit = credentialLookup(gpa, data, "Discourse API key for home.renovation.reviews") orelse return error.TestExpectedResult;
+    defer gpa.free(hit);
+    try std.testing.expect(std.mem.indexOf(u8, hit, "aaaa1111bbbb2222cccc3333") != null);
+    // the workflow [fact] is not secretive, so a query matching it best still returns a KEY entry or nothing
+    const gh = credentialLookup(gpa, data, "github token") orelse return error.TestExpectedResult;
+    defer gpa.free(gh);
+    try std.testing.expect(std.mem.indexOf(u8, gh, "ghp_") != null);
+    try std.testing.expect(credentialLookup(gpa, data, "stripe billing") == null);
 }
 
 /// The swarm-shared skill library lives in its own neuron-db scope (in the per-swarm mind.sqlite), so every
