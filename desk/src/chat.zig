@@ -4463,15 +4463,40 @@ pub const Chat = struct {
             if (Io.Dir.cwd().statFile(self.io, fp, .{})) |st| {
                 row.mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
             } else |_| {}
-            // title = first line's {"title":"..."}
+            // Display title: the first line's {"title":"..."} when it is a real name, else the first message's
+            // text, else left empty for the render's "New chat" fallback. NEVER the raw conv id — a chat must
+            // always show a human name (the id is a storage key). Some mirrors wrote the id straight into the
+            // title line (mirrorServerConv's old id fallback), so a title that EQUALS the id counts as "no title".
             if (Io.Dir.cwd().readFileAlloc(self.io, fp, self.gpa, .limited(4 << 10)) catch null) |head| {
                 defer self.gpa.free(head);
                 const nl = std.mem.indexOfScalar(u8, head, '\n') orelse head.len;
+                var titled = false;
                 if (llm.jsonUnescape(self.gpa, head[0..nl], "title")) |t| {
                     defer self.gpa.free(t);
-                    const tn = @min(t.len, row.title.len);
-                    @memcpy(row.title[0..tn], t[0..tn]);
-                    row.title_len = @intCast(tn);
+                    const tt = std.mem.trim(u8, t, " \r\n\t");
+                    if (tt.len > 0 and !std.mem.eql(u8, tt, stem)) {
+                        const tn = @min(tt.len, row.title.len);
+                        @memcpy(row.title[0..tn], tt[0..tn]);
+                        row.title_len = @intCast(tn);
+                        titled = true;
+                    }
+                }
+                // no usable title → name the chat after its first message so the sidebar shows what it is ABOUT
+                if (!titled and nl + 1 < head.len) {
+                    var lit = std.mem.splitScalar(u8, head[nl + 1 ..], '\n');
+                    while (lit.next()) |line| {
+                        if (line.len < 4) continue;
+                        if (llm.jsonUnescape(self.gpa, line, "t")) |mt| {
+                            defer self.gpa.free(mt);
+                            const mm = std.mem.trim(u8, mt, " \r\n\t");
+                            if (mm.len > 0) {
+                                const tn = @min(mm.len, row.title.len);
+                                @memcpy(row.title[0..tn], mm[0..tn]);
+                                row.title_len = @intCast(tn);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             rows[n] = row;
