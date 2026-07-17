@@ -218,6 +218,23 @@ fn schedTaskOf(conv: []const u8) ?[]const u8 {
     return rest[0..us];
 }
 
+test "memory-weave gates: echo tools, credential-shaped results, note atomization" {
+    // recall/observe echoes never become new facts; real finding tools still do
+    try std.testing.expect(memoryEchoTool("recall"));
+    try std.testing.expect(memoryEchoTool("recall_hive"));
+    try std.testing.expect(memoryEchoTool("observe"));
+    try std.testing.expect(!memoryEchoTool("web_search"));
+    try std.testing.expect(!memoryEchoTool("read_file"));
+    // result-side credential scan (the args were clean; the VALUE came back in the body)
+    try std.testing.expect(containsCredentialKey("status=200, body={\"csrf\":\"cku...\"}"));
+    try std.testing.expect(containsCredentialKey("set-cookie: session=abc"));
+    try std.testing.expect(!containsCredentialKey("dir listing: index.html 3771 b"));
+    // atomization: one fact per note — newlines fold, sentence enders soften, so the store cannot shred it
+    var n = "wrote a.ts — file is now 31 bytes.\nNext: build the feed. Then ship!".*;
+    atomizeNoteInPlace(&n);
+    try std.testing.expectEqualStrings("wrote a.ts — file is now 31 bytes, Next: build the feed, Then ship!", &n);
+}
+
 test "msgTail: full when it fits; suffix anchors on a non-tool boundary; tool anchors are skipped" {
     const gpa = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -622,7 +639,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // DEFERRED to turn exit (a `defer` covers every completion path): the observe is a subprocess spawn that sat
     // between prefix assembly and the first inference — pure write-side durability nothing in THIS turn reads
     // (recall already ran above), so it must not tax the first token.
-    defer _ = ctx.mem.observe(mem_scope, user_text);
+    // A SCHEDULED run's message ends in engine-authored boilerplate (RUN CONTEXT / WORKDIR / SELF-HEAL) — that
+    // is chrome, not knowledge; stored, it resurfaced in later runs' recall as junk facts ("--- SCHEDULED RUN
+    // CONTEXT ---", the workdir paragraph — observed live in sched:* scopes). Store the task's own words only.
+    defer {
+        const cut = std.mem.indexOf(u8, user_text, "--- SCHEDULED RUN CONTEXT") orelse user_text.len;
+        _ = ctx.mem.observe(mem_scope, user_text[0..cut]);
+    }
 
     // TOOL-FINDING OBSERVES, BATCHED: each observe is a subprocess spawn, and doing one between every tool call
     // serialized big tool batches (a 40-tool storm paid ~40 spawns inline). The tool loop appends preformatted
@@ -837,6 +860,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                 tl += add.len;
             }
             if (std.fmt.allocPrint(gpa, "progress: step \"{s}\" landed {d} file change(s) — {s}", .{ clipBytes(step_label, 140), file_ledger.mutations - mut_before, tail_buf[0..tl] })) |note| {
+                atomizeNoteInPlace(note);
                 tool_obs.append(gpa, note) catch gpa.free(note);
             } else |_| {}
             // MID-TURN FLUSH (thread the loom NOW): populate the conversation's neuron-db partition after a
@@ -1289,11 +1313,45 @@ fn looksCredentialed(s: []const u8) bool {
     var lb: [160]u8 = undefined;
     if (s.len > lb.len) return true;
     const lower = std.ascii.lowerString(lb[0..s.len], s);
-    const keys = [_][]const u8{ "authorization", "api_key", "api-key", "apikey", "token", "password", "passwd", "secret", "bearer", "credential" };
+    return containsCredentialKey(lower);
+}
+
+/// Case-INSENSITIVE-ready scan for credential-shaped key names (caller lowercases, or use on known-lower
+/// text). Split from looksCredentialed so RESULT clips (longer than its 160-byte args window) can be
+/// scanned too: a probe that returned a csrf/session token must not persist as a memory fact.
+fn containsCredentialKey(lower: []const u8) bool {
+    const keys = [_][]const u8{ "authorization", "api_key", "api-key", "apikey", "token", "password", "passwd", "secret", "bearer", "credential", "csrf", "set-cookie" };
     for (keys) |k| {
         if (std.mem.indexOf(u8, lower, k) != null) return true;
     }
     return false;
+}
+
+/// Would storing this tool's RESULT just re-mint memory output as new facts? recall/recall_hive RETURN
+/// memory — observing their echoes copies other scopes' facts into this one (observed live: a Discourse
+/// task's memory carrying an unrelated FPS-game description via one recall echo — the bleed class that
+/// relevance gates can't stop once the fact is laundered into the local scope). observe/skill acks are
+/// bookkeeping, not findings.
+fn memoryEchoTool(name: []const u8) bool {
+    const t = [_][]const u8{ "recall", "recall_hive", "observe", "skill" };
+    for (t) |n| {
+        if (std.mem.eql(u8, name, n)) return true;
+    }
+    return false;
+}
+
+/// In-place atomization guard for a composed tool note: fold hard whitespace and SOFTEN sentence enders
+/// (". " → ", ") so the store's sentence atomizer keeps the note as ONE fact — a tool finding is one
+/// thread, not a paragraph to shred (the desk's atomizeForObserve discipline, applied server-side).
+fn atomizeNoteInPlace(s: []u8) void {
+    for (s) |*c| {
+        if (c.* == '\n' or c.* == '\r' or c.* == '\t') c.* = ' ';
+    }
+    var i: usize = 0;
+    while (i + 1 < s.len) : (i += 1) {
+        const c = s[i];
+        if ((c == '.' or c == ';' or c == '!' or c == '?') and s[i + 1] == ' ') s[i] = ',';
+    }
 }
 
 /// Path equality where '\\' == '/' — the one normalization the ledger needs on Windows.
@@ -3557,7 +3615,16 @@ fn runInnerAgentic(
             // through recall into later prompts, exactly what on-demand fetch exists to prevent.
             // QUEUED, not observed inline: each observe spawns a subprocess, which serialized big tool batches.
             // runTurn flushes the queue at turn exit (bounded — a runaway afk turn can't hoard notes forever).
-            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and !std.mem.eql(u8, c.name, "get_credential") and tool_obs.items.len < 200) {
+            // memoryEchoTool: recall/observe echoes are memory OUTPUT — re-observing them launders other
+            // scopes' facts into this one. resultCredentialed: a probe that RETURNED a token/csrf/secret
+            // (args were clean — the value came back in the body) must not persist either.
+            const result_credentialed = blk_rc: {
+                var rl2: [200]u8 = undefined;
+                const head = clipBytes(result, rl2.len);
+                const lower = std.ascii.lowerString(rl2[0..head.len], head);
+                break :blk_rc containsCredentialKey(lower);
+            };
+            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and !std.mem.eql(u8, c.name, "get_credential") and !memoryEchoTool(c.name) and !result_credentialed and tool_obs.items.len < 200) {
                 // CUE THREADING: the fact carries the call's ARGS head alongside the result — the query
                 // terms, the path, the URL. neuron-db is lexical-associative: a later step phrased like the
                 // ORIGINAL CUE can only hop to this finding if the cue's words live in the fact. Without
@@ -3572,6 +3639,7 @@ fn runInnerAgentic(
                     break :blk_ac head;
                 };
                 if (std.fmt.allocPrint(gpa, "tool {s} {s}: {s}", .{ c.name, args_cue, clipBytes(result, 200) })) |note| {
+                    atomizeNoteInPlace(note); // ONE fact per finding — the store's sentence atomizer must not shred it
                     tool_obs.append(gpa, note) catch gpa.free(note);
                 } else |_| {}
             }

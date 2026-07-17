@@ -333,11 +333,16 @@ pub const Mem = struct {
         return r.stdout;
     }
 
-    /// Store one fact. Returns the running fact count (0 on failure).
+    /// Store one fact. Returns the running fact count (0 on failure). The fact is whitespace-normalized
+    /// first (cleanFactInto): the store is line-oriented, so a raw newline SHREDS one note into a meaningless
+    /// row per line — live hives grew rows like "· GitHub  Skip t" and lone code lines ("avatarColor: string;")
+    /// from exactly this. A note with no real signal after normalization is dropped, not stored.
     pub fn observe(self: Mem, scope: []const u8, fact: []const u8) u32 {
+        var nb: [1600]u8 = undefined;
+        const clean = cleanFactInto(&nb, fact) orelse return 0;
         self.lockW();
         defer self.unlockW();
-        const out = self.run(&.{ "observe", scope, fact }) orelse return 0;
+        const out = self.run(&.{ "observe", scope, clean }) orelse return 0;
         defer self.gpa.free(out);
         return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \r\n\t"), 10) catch 0;
     }
@@ -345,8 +350,9 @@ pub const Mem = struct {
     /// Store MANY facts in ONE neuron subprocess (via `import` of a temp pack) instead of one spawn per fact.
     /// The turn-exit hippocampus flush used to spawn neuron.exe per note — a 40-tool storm paid ~40 process
     /// launches serialized onto the turn's tail (each ~300ms). This writes all facts to a uniquely-named temp
-    /// pack beside the db (random suffix so convs sharing a db never collide) and imports them at once. A note's
-    /// internal newlines are flattened to spaces (the pack is line-oriented). Returns facts stored (0 on failure).
+    /// pack beside the db (random suffix so convs sharing a db never collide) and imports them at once. Each
+    /// note rides through the SAME cleanFactInto normalization observe() applies (one line, junk-gated).
+    /// Returns facts stored (0 on failure).
     pub fn observeBatch(self: Mem, scope: []const u8, notes: []const []const u8) u32 {
         if (notes.len == 0) return 0;
         if (notes.len == 1) return self.observe(scope, notes[0]); // one fact: skip the temp-file dance
@@ -358,14 +364,15 @@ pub const Mem = struct {
         const pack = std.fmt.bufPrint(&pb, "{s}.{s}.obatch.facts", .{ self.db, std.fmt.bytesToHex(rnd, .lower) }) catch return 0;
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(self.gpa);
+        var kept: bool = false;
         for (notes) |note| {
-            const start = body.items.len;
-            body.appendSlice(self.gpa, note) catch return 0;
-            for (body.items[start..]) |*c| if (c.* == '\n' or c.* == '\r') {
-                c.* = ' ';
-            };
+            var nb: [1600]u8 = undefined;
+            const clean = cleanFactInto(&nb, note) orelse continue;
+            body.appendSlice(self.gpa, clean) catch return 0;
             body.append(self.gpa, '\n') catch return 0;
+            kept = true;
         }
+        if (!kept) return 0;
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = body.items }) catch return 0;
         defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
         const out = self.run(&.{ "import", pack, "--scope", scope }) orelse return 0;
@@ -634,3 +641,57 @@ pub const Mem = struct {
         return std.fmt.parseInt(u32, rest[0..j], 10) catch 0;
     }
 };
+
+/// Normalize one fact for the LINE-ORIENTED store: CR/LF/TAB fold to spaces, runs collapse, ends trim,
+/// clipped to `buf` at a codepoint boundary. Sentence atomization inside the core is DESIGN (prose weaves
+/// into fine sentence-facts); raw newlines are NOT — they shred one note into a junk row per line. Returns
+/// null when nothing worth storing survives: under 12 alphanumeric characters is line noise (navigation
+/// crumbs, lone braces), not knowledge.
+pub fn cleanFactInto(buf: []u8, fact: []const u8) ?[]const u8 {
+    var w: usize = 0;
+    var alnum: usize = 0;
+    var pending_space = false;
+    for (fact) |c0| {
+        const c = if (c0 == '\n' or c0 == '\r' or c0 == '\t') ' ' else c0;
+        if (c == ' ') {
+            if (w > 0) pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            if (w >= buf.len) break;
+            buf[w] = ' ';
+            w += 1;
+            pending_space = false;
+        }
+        if (w >= buf.len) break;
+        buf[w] = c;
+        w += 1;
+        const l = c | 0x20;
+        if ((l >= 'a' and l <= 'z') or (c >= '0' and c <= '9')) alnum += 1;
+    }
+    while (w > 0 and (buf[w - 1] & 0xC0) == 0x80) w -= 1; // a clip that fell inside a codepoint backs out of it
+    if (alnum < 12) return null;
+    return buf[0..w];
+}
+
+test "cleanFactInto: folds newlines, collapses runs, drops junk, clips at the buffer" {
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "line one line two done",
+        cleanFactInto(&b, "line one\r\n\tline two\n\n   done  ").?,
+    );
+    // junk: too little signal to be knowledge
+    try std.testing.expect(cleanFactInto(&b, "\u{00B7} GitHub  Skip t") == null);
+    try std.testing.expect(cleanFactInto(&b, "}\n);\n") == null);
+    try std.testing.expect(cleanFactInto(&b, "") == null);
+    // a real one-liner passes verbatim
+    try std.testing.expectEqualStrings(
+        "npm MUST be run via shell=True on this Windows machine",
+        cleanFactInto(&b, "npm MUST be run via shell=True on this Windows machine").?,
+    );
+    // overflow clips inside the buffer without tearing anything
+    var big: [200]u8 = undefined;
+    @memset(&big, 'x');
+    const clipped = cleanFactInto(&b, &big).?;
+    try std.testing.expectEqual(@as(usize, 64), clipped.len);
+}
