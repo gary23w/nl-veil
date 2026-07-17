@@ -1860,8 +1860,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
         cast_live = c.status == .deploying or c.status == .running or c.status == .collecting;
     }
 
-    // the active conversation's display title (the schedule button seeds the task name from it)
-    var conv_title: []const u8 = active[0..active_n];
+    // the active conversation's display title (the schedule button seeds the task name from it). Default to a
+    // human label, never the raw conv id.
+    var conv_title: []const u8 = "New chat";
     for (convs[0..conv_n]) |*cv| {
         if (cv.title_len > 0 and std.mem.eql(u8, cv.idStr(), active[0..active_n])) {
             conv_title = cv.titleStr();
@@ -2232,7 +2233,9 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
                 ui.focus = .none;
             }
         } else {
-            const title = if (cv.title_len > 0) cv.titleStr() else cv.idStr();
+            // Never show the raw conv id — it's a storage key, not a name. refreshConvs resolves a real title
+            // (or the first message); a still-nameless conv reads as "New chat", not "c6a5a…".
+            const title = if (cv.title_len > 0) cv.titleStr() else "New chat";
             t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + (rr.height - 13) / 2), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
             const xb = t.Rect{ .x = rr.x + rr.width - 28, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
             if (hot and !t.hovering(xb)) t.wantCursor(.pointing_hand);
