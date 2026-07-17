@@ -121,10 +121,12 @@ const Ui = struct {
     stream_h: f32 = 0,
     stream_h_len: usize = std.math.maxInt(usize),
     stream_h_cols: usize = 0,
-    // SMOOTH REVEAL: how many bytes of the in-flight reply are shown on screen. Server tokens arrive in
-    // poll-batched chunks (33-120ms), so dumping each batch at once makes a slow reply appear in visible
-    // jumps; this advances toward the received length at a steady catch-up rate so the text flows like typing.
-    stream_reveal: usize = 0,
+    // SMOOTH REVEAL: how many bytes of the in-flight reply are shown on screen (fractional so a sub-byte/frame
+    // rate accumulates cleanly). Server tokens arrive in poll-batched chunks (33-120ms); dumping each batch at
+    // once made a slow reply appear in visible jumps, and draining each batch FASTER than the next arrives made
+    // it chunk-pause-chunk. This spreads each batch over a window slightly longer than the poll cadence, so the
+    // reveal is still flowing when the next batch lands — continuous, at the model's real pace.
+    stream_reveal: f64 = 0,
     tool_open: ?usize = null, // which tool-call message is expanded (else all collapsed to a one-line chip)
     chat: Field = .{},
     // Chat tab
@@ -1855,19 +1857,25 @@ fn drawChat(store: *Store, body: t.Rect) void {
     var inflight_buf: [18432]u8 = undefined;
     const inflight_full = buildInflight(&inflight_buf, sreason_buf[0..sreason_n], stream_buf[0..stream_n], stream_draft);
 
-    // SMOOTH REVEAL: show a growing prefix of the received buffer, advancing each frame, so chunky poll-batched
-    // token arrivals read as smooth typing instead of appearing in jumps. Catch-up is proportional (≈1/5 of the
-    // backlog per frame, min a few bytes) — a small chunk flows over ~5 frames (~80ms) yet a big burst drains
-    // fast so the display never lags far behind reality. The buffer resets to empty between turns; clamp down
-    // with it so a new reply starts revealing from the top.
-    if (ui.stream_reveal > inflight_full.len) ui.stream_reveal = inflight_full.len;
-    if (ui.stream_reveal < inflight_full.len) {
-        const gap = inflight_full.len - ui.stream_reveal;
-        ui.stream_reveal += @max(@as(usize, 3), gap / 5);
-        if (ui.stream_reveal > inflight_full.len) ui.stream_reveal = inflight_full.len;
+    // SMOOTH REVEAL: show a growing prefix of the received buffer so chunky poll-batched arrivals read as smooth
+    // typing. Advance is PROPORTIONAL to the backlog and TIME-BASED: reveal the backlog over ~REVEAL_WINDOW_S,
+    // which is deliberately a touch longer than the slow poll interval (120ms) so a batch is still revealing when
+    // the next lands → continuous flow, no chunk-pause-chunk. It self-corrects to the model's pace (steady-state
+    // backlog ≈ rate × window, ~a fifth of a second behind, imperceptible; a big burst drains fast). A small
+    // floor flushes a trailing few bytes promptly instead of asymptoting. Resets with the buffer between turns.
+    const REVEAL_WINDOW_S: f64 = 0.16;
+    const REVEAL_FLOOR_BPS: f64 = 45.0; // minimum reveal speed (bytes/sec) so the tail of a batch doesn't crawl
+    const len_f: f64 = @floatFromInt(inflight_full.len);
+    if (ui.stream_reveal > len_f) ui.stream_reveal = len_f; // buffer shrank (commit / new turn / conv switch)
+    if (ui.stream_reveal < len_f) {
+        const dt: f64 = @min(@as(f64, rl.getFrameTime()), 0.1); // guard a first-frame / hitch spike
+        const backlog = len_f - ui.stream_reveal;
+        const adv = @max(backlog * (dt / REVEAL_WINDOW_S), REVEAL_FLOOR_BPS * dt);
+        ui.stream_reveal = @min(len_f, ui.stream_reveal + adv);
     }
     // never cut a multibyte UTF-8 glyph mid-sequence — back up to the last char boundary at/under the reveal
-    var reveal = ui.stream_reveal;
+    var reveal: usize = @intFromFloat(ui.stream_reveal);
+    if (reveal > inflight_full.len) reveal = inflight_full.len;
     while (reveal > 0 and reveal < inflight_full.len and (inflight_full[reveal] & 0xC0) == 0x80) reveal -= 1;
     const inflight = inflight_full[0..reveal];
 
