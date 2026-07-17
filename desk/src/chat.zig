@@ -4522,7 +4522,11 @@ pub const Chat = struct {
                                 @memcpy(row.id[0..p.raw.len], p.raw); // safeSeg ids carry no escapes
                                 row.id_len = @intCast(p.raw.len);
                             } else if (p.is_str and std.mem.eql(u8, p.key, "title")) {
-                                row.title_len = @intCast(scan.unescapeInto(p.raw, &row.title).len);
+                                // the server falls back to the id as a title for a message-less conv — a storage
+                                // key, not a name; drop it so the row reads "New chat", not "c6a5a…" (id is set
+                                // first in the server's object order, so idStr() is populated here)
+                                const tl = scan.unescapeInto(p.raw, &row.title).len;
+                                row.title_len = if (std.mem.eql(u8, row.title[0..tl], row.idStr())) 0 else @intCast(tl);
                             } else if (!p.is_str and std.mem.eql(u8, p.key, "updated")) {
                                 row.mtime_s = std.fmt.parseInt(i64, p.raw, 10) catch 0;
                             }
@@ -4622,7 +4626,10 @@ pub const Chat = struct {
         const arr = std.mem.indexOf(u8, resp.body, "\"messages\":[") orelse return false;
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
-        // title: the sidebar row refreshConvs merged from the server list (or the id when it hasn't landed yet)
+        // title: the sidebar row refreshConvs already resolved (a real name, never the id). When it hasn't been
+        // resolved yet, write an EMPTY title line — NEVER the conv id — and let refreshConvs name the row from
+        // the first message on the next scan. (The old id fallback here is exactly what polluted title lines
+        // with the storage key and made the sidebar show "c6a5a…" instead of what the chat was about.)
         var titleb: [64]u8 = undefined;
         var title_n: usize = 0;
         {
@@ -4631,14 +4638,17 @@ pub const Chat = struct {
             var i: usize = 0;
             while (i < self.store.conv_count) : (i += 1) {
                 if (std.mem.eql(u8, self.store.convs[i].idStr(), id)) {
-                    title_n = self.store.convs[i].title_len;
-                    @memcpy(titleb[0..title_n], self.store.convs[i].title[0..title_n]);
+                    // a row whose title is still the id (from an older mirror) is NOT a usable title
+                    if (self.store.convs[i].title_len > 0 and !std.mem.eql(u8, self.store.convs[i].titleStr(), id)) {
+                        title_n = self.store.convs[i].title_len;
+                        @memcpy(titleb[0..title_n], self.store.convs[i].title[0..title_n]);
+                    }
                     break;
                 }
             }
         }
         jb.appendSlice(self.gpa, "{\"title\":\"") catch return false;
-        escJson(&jb, self.gpa, if (title_n > 0) titleb[0..title_n] else id);
+        if (title_n > 0) escJson(&jb, self.gpa, titleb[0..title_n]);
         jb.appendSlice(self.gpa, "\"}\n") catch return false;
         var cur = arr + "\"messages\":[".len;
         while (scan.nextJsonObj(resp.body, &cur)) |obj| {
