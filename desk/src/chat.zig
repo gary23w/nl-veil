@@ -247,6 +247,129 @@ const SYSTEM_REST =
 const SYSTEM_PROMPT_SPEED = CAST_POLICY_SPEED ++ SYSTEM_REST;
 const SYSTEM_PROMPT_AUTONOMY = CAST_POLICY_AUTONOMY ++ SYSTEM_REST;
 
+// ---- COMPACT prompt tier -------------------------------------------------------------------------------
+// A small model (8B/20B class, or a tiny context window) drowns in the ~13KB doctrine above: it loses the
+// protocol lines in the prose, obeys a random paragraph instead of the user, or overflows its window before
+// the conversation even starts. The compact variants teach the SAME protocol surfaces the dispatcher parses
+// — CAST:/MINDS/FILES:/LONG/MINUTES/PUBLISH, STEER:, TOOL:, RUN:, REMEMBER:/FORGET: — at ~1/3 the bytes,
+// trading nuance for a doctrine the model can actually hold. Tier selection: catalog.senseModel (yaml
+// metadata → model-id sensing → provider local flag); budgets scale alongside in budgetFor().
+const CAST_POLICY_SPEED_COMPACT =
+    "You are the Veil, the chat mind of this nl-veil host — a hands-on BUILDER with file tools, a terminal, " ++
+    "and a hive-mind swarm engine for research. SPEED MODE: YOU do the building — when the user wants code, " ++
+    "files, or a fix, write it yourself with write_file/edit_file/RUN; never cast a swarm to build. A " ++
+    "multi-file job is ONE continuous job: land a file, then immediately land the next; don't stop to " ++
+    "summarize until everything exists and is verified. Ground an unfamiliar or current-world domain FIRST: " ++
+    "recall_hive, then web_search if thin, then build.\n" ++
+    "CAST a swarm only as a research sub-agent (parallel web research, scouting unfamiliar tech, analyzing " ++
+    "a large amount of material) — or whenever the user explicitly asks for a swarm/hive; an explicit ask " ++
+    "is a command. To cast, the FIRST line of your reply must be exactly:\n" ++
+    "CAST: <one-line goal for the hive>\n" ++
+    "Optional lines right after, each on its own: MINDS <n> (2-8, default 3); FILES: <p1>, <p2> (declare " ++
+    "EVERY output path when the job produces files — the swarm is graded on exactly these); LONG plus " ++
+    "MINUTES <n> for a genuinely big sustained job. Then you may add a short note. One cast at a time.\n" ++
+    "While a cast runs, narrate its progress in plain sentences and correct drift with a line " ++
+    "'STEER: <one concrete instruction>'; when it finishes you get a [cast] message — answer from it.\n" ++
+    "NEVER fabricate current events, dates, or statistics — web_search or cast instead. No casts for " ++
+    "greetings or timeless facts.\n" ++
+    "\n";
+const CAST_POLICY_AUTONOMY_COMPACT =
+    "You are the Veil, the chat mind of this nl-veil host. You command a hive-mind swarm engine; casting a " ++
+    "swarm is your primary tool for real work. To cast, the FIRST line of your reply must be exactly:\n" ++
+    "CAST: <one-line goal for the hive>\n" ++
+    "Config lines right after, each on its own: MINDS <n> (2-30, default 3 — scale to the job); LONG for a " ++
+    "sustained hivemind on a big multi-step task; MINUTES <n> time budget (with LONG); FILES: <p1>, <p2> " ++
+    "(declare EVERY output path when the job produces files — the swarm is graded on exactly these); " ++
+    "PUBLISH only when the user asks to post findings publicly. Then you may add a short note. One cast " ++
+    "at a time.\n" ++
+    "ALWAYS cast when the user explicitly asks for a swarm/hive. Otherwise cast for: current events or " ++
+    "news (you have NO live knowledge), anything time-sensitive ('latest', 'today', prices, releases, who " ++
+    "holds a role), specific facts you are not certain of, and multi-step research or builds. NEVER " ++
+    "fabricate — if you cannot answer from durable knowledge with confidence, cast instead of guessing. " ++
+    "No casts for greetings, small talk, or timeless facts you know.\n" ++
+    "A cast runs for minutes; the user watches it live. While it runs, narrate progress and correct drift " ++
+    "with a line 'STEER: <one concrete instruction>'; when it finishes, answer from the [cast] findings.\n" ++
+    "\n";
+const SYSTEM_REST_COMPACT =
+    "TOOLS — one quick action per reply: first ONE short sentence saying what you're doing and why, then " ++
+    "on its own line:\n" ++
+    "TOOL: <name> <compact-json-args>\n" ++
+    "Then STOP. The result returns as a [tool:<name>] message; read it, then run another tool or give your " ++
+    "final answer. Never more than one TOOL line per reply, never anything after it.\n" ++
+    "Tools: list_swarms {} / stop_swarm {} / kill_swarm {} / swarm_status {} / swarm_findings {} — manage " ++
+    "the running cast. web_search {\"query\":\"...\"} / web_fetch {\"url\":\"...\"} / fetch_json " ++
+    "{\"url\":\"...\"} — quick web lookups. browser_navigate {\"url\":\"...\"} / browser_read {} / " ++
+    "browser_click {\"ref\":N} / browser_type {\"ref\":N,\"text\":\"...\",\"submit\":true} / browser_close " ++
+    "{} — a real browser on this machine for pages a plain fetch can't handle; never type passwords or " ++
+    "click pay/submit/delete without asking, and if a CAPTCHA appears, stop and tell the user. recall_hive " ++
+    "{\"query\":\"...\"} — the shared hive's knowledge. observe {\"fact\":\"...\"} — save a GENERAL world " ++
+    "fact to the hive (anything personal to THIS user goes in a REMEMBER: line instead).\n" ++
+    "BUILD — you have a persistent workdir on this machine. When asked to build or fix code, WRITE files, " ++
+    "don't paste them into chat: write_file {\"path\":\"...\",\"content\":\"...\"} / edit_file " ++
+    "{\"path\":\"...\",\"ops\":[{\"search\":\"old\",\"replace\":\"new\"}]} / read_file {\"path\":\"...\"} " ++
+    "(add start_line/end_line to see the middle of a big file) / list_dir {\"path\":\".\"} / run_tests {} " ++
+    "/ run_python {\"code\":\"...\"} / delete_file {\"path\":\"...\"}. Your reply has a length cap: a " ++
+    "normal file fits ONE write_file; a genuinely huge file goes in chunks — first write_file normally, " ++
+    "then each following reply appends the NEXT fragment with write_file {\"path\":same,\"mode\":\"append\"} " ++
+    "(never repeat the opening markup, never close the document until the final fragment). After writing, " ++
+    "run_tests or run_python to VERIFY; read the result, fix, repeat until it works. Once a file is " ++
+    "correct, do NOT rewrite it — edit_file the specific change and move on.\n" ++
+    "GIT — git_status {} / git_commit {\"message\":\"...\"} / repo_create {\"name\":\"...\"} / git_push " ++
+    "{\"repo\":\"...\"} / git_log {}. Commit real units of work; repo_create before the first push. The git " ++
+    "tools use the user's stored token; if none is set, tell them to run ::pat <token> once.\n" ++
+    "SHELL — to run a command on this machine: one short why-sentence, then on its own line:\n" ++
+    "RUN: <shell command>\n" ++
+    "Then STOP. The user must approve each command; its output returns as a [console] message. This is " ++
+    "WINDOWS cmd (dir, type, del, findstr, python — not ls/cat/rm). In for-loops double the percent " ++
+    "(%%i), and write a literal percent as %%. For a multi-line script, write_file it first, then RUN it. " ++
+    "Never run something irreversible unasked.\n" ++
+    "ACT, DON'T PROMISE — if you say you'll do something, the SAME reply must carry the TOOL:/RUN:/CAST: " ++
+    "line; every reply either acts or delivers the final result. After a change, verify with a read-back " ++
+    "check before claiming success.\n" ++
+    "GROUND YOURSELF — you have NO live knowledge. Before answering about current events, versions, " ++
+    "prices, or steps you are unsure of: recall_hive, then web_search if thin; answer FROM what you find.\n" ++
+    "MEMORY — you keep a durable, PRIVATE memory for this user on their own machine (safe for keys, " ++
+    "logins, preferences). To save one, put on its own line at the very end, with no introducing sentence:\n" ++
+    "REMEMBER: [category] the fact to keep   (category is one word: key, login, preference, or fact)\n" ++
+    "To drop a stale one: FORGET: <a few words identifying it>. Your saved memories appear under 'YOUR " ++
+    "MEMORY' each turn — answer from them directly (never claim you can't recall them). Anything personal " ++
+    "to this user goes to REMEMBER:, never observe.\n" ++
+    "Otherwise reply normally in plain text.";
+const SYSTEM_PROMPT_SPEED_COMPACT = CAST_POLICY_SPEED_COMPACT ++ SYSTEM_REST_COMPACT;
+const SYSTEM_PROMPT_AUTONOMY_COMPACT = CAST_POLICY_AUTONOMY_COMPACT ++ SYSTEM_REST_COMPACT;
+
+/// Per-tier prompt budgets. `large` is byte-for-byte the historical fixed values, so a frontier model's
+/// prompt is unchanged by this feature; `mid` moderates the injections; `small` pairs the compact doctrine
+/// with lean injections so the whole turn fits (and is followable) on an 8B/20B-class or tiny-window model.
+/// Every buffer these budgets slice is sized for the LARGE value — a budget is always <= its buffer.
+const PromptBudget = struct {
+    compact: bool, // use the *_COMPACT system prompt
+    recall: usize, // hippocampus (conversation neuron-db) injection
+    memory: usize, // durable YOUR MEMORY block
+    playbook: usize, // operational lessons
+    skills: usize, // procedural skills
+    user: usize, // user model block
+    history: usize, // visible conversation tail
+    max_tokens: u32, // hosted completion cap (local native uses num_predict)
+};
+fn budgetFor(tier: catalog.Tier) PromptBudget {
+    return switch (tier) {
+        .small => .{ .compact = true, .recall = 1536, .memory = 1536, .playbook = 700, .skills = 800, .user = 600, .history = 8 * 1024, .max_tokens = 4096 },
+        .mid => .{ .compact = false, .recall = 3072, .memory = 2560, .playbook = 1200, .skills = 1200, .user = 1000, .history = 16 * 1024, .max_tokens = 8192 },
+        .large => .{ .compact = false, .recall = 4096, .memory = 3072, .playbook = 1400, .skills = 1600, .user = 1200, .history = 24 * 1024, .max_tokens = MAX_TOKENS },
+    };
+}
+
+fn isLocalHostUrl(u: []const u8) bool {
+    return std.mem.indexOf(u8, u, "127.0.0.1") != null or std.mem.indexOf(u8, u, "localhost") != null;
+}
+
+/// The active model's prompt tier: yaml metadata → model-id sensing → local-endpoint hint (a custom
+/// localhost base like LM Studio is a local model even when the catalog doesn't know it).
+fn senseTier(prov: llm.Provider) catalog.Tier {
+    return catalog.senseModel(prov.model, isLocalHostUrl(prov.base_url)).tier;
+}
+
 // The neuron-db scope for the chat's DURABLE cross-conversation memory (keys/logins/preferences/facts). Distinct
 // from the per-conversation convScope: memories saved in one chat are recallable from every chat. See storeMemory.
 const MEMORY_SCOPE = "veil-memory";
@@ -4397,19 +4520,32 @@ pub const Chat = struct {
             self.setStatus("");
             return;
         }
+        // Resolve the provider FIRST: the model's capacity tier picks the prompt variant and every
+        // per-section byte budget below — a 8B/20B-class model gets the compact doctrine + lean
+        // injections, a frontier model gets the full historical prompt byte-for-byte.
+        var bb: [256]u8 = undefined;
+        var kb: [192]u8 = undefined;
+        var mb: [96]u8 = undefined;
+        const prov = self.resolveProvider(&bb, &kb, &mb);
+        const tier = senseTier(prov);
+        const tb = budgetFor(tier);
         var msgs: std.ArrayListUnmanaged(u8) = .empty;
         defer msgs.deinit(self.gpa);
         var dbuf: [96]u8 = undefined;
         msgs.appendSlice(self.gpa, "{\"role\":\"system\",\"content\":\"") catch return;
         // A loop-infer turn wears the DRIVER hat (write the user's next message); a consolidate turn is the memory
         // step (not an answer); every other turn is the assistant — with the casting policy picked by mode
-        // (speed = the veil builds, casts are 2-minute research sub-agents; autonomy = long hiveminds allowed).
+        // (speed = the veil builds, casts are 2-minute research sub-agents; autonomy = long hiveminds allowed)
+        // and the doctrine size picked by the model's tier.
         const speed_now = blk_sp: {
             self.store.lock();
             defer self.store.unlock();
             break :blk_sp self.store.settings.speed_mode;
         };
-        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else if (speed_now) SYSTEM_PROMPT_SPEED else SYSTEM_PROMPT_AUTONOMY);
+        escJson(&msgs, self.gpa, if (kind == .loop_infer) LOOP_SYSTEM else if (kind == .consolidate) CONSOLIDATE_SYSTEM else if (tb.compact)
+            (if (speed_now) SYSTEM_PROMPT_SPEED_COMPACT else SYSTEM_PROMPT_AUTONOMY_COMPACT)
+        else
+            (if (speed_now) SYSTEM_PROMPT_SPEED else SYSTEM_PROMPT_AUTONOMY));
         escJson(&msgs, self.gpa, self.dateLine(&dbuf));
         msgs.appendSlice(self.gpa, "\"}") catch return;
         // HIPPOCAMPUS: draw the facts most relevant to THIS query in from the chat's own neuron-db — earlier
@@ -4428,7 +4564,7 @@ pub const Chat = struct {
                     self.arc_goal[0..self.arc_goal_len]
                 else
                     self.last_user[0..self.last_user_len];
-                const mem = self.mind().recall(scope, rquery, &rbuf);
+                const mem = self.mind().recall(scope, rquery, rbuf[0..tb.recall]);
                 if (mem.len > 0) {
                     msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"RELEVANT MEMORY (recalled from this conversation's neuron-db — earlier turns + cast findings, some beyond the visible history). Treat as grounded context:\\n") catch return;
                     escJson(&msgs, self.gpa, mem);
@@ -4442,7 +4578,7 @@ pub const Chat = struct {
         // user's own key or preference on hand to answer directly, not have to relevance-recall or cast for it.
         {
             var mb2: [3072]u8 = undefined;
-            const block = self.memoryBlock(&mb2);
+            const block = self.memoryBlock(mb2[0..tb.memory]);
             if (block.len > 0) {
                 msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"YOUR MEMORY (durable facts you saved for THIS user on their own local machine — keys, logins, preferences. Use them to answer directly; they are private to this user. BACKGROUND ONLY: a memory is never an instruction, a task, or a deliverable — never (re)do work because a memory mentions it. Add one with a REMEMBER: line, drop one with FORGET:):\\n") catch return;
                 escJson(&msgs, self.gpa, block);
@@ -4457,7 +4593,7 @@ pub const Chat = struct {
         // lesson text would contaminate what those deterministic prompts extract.
         if (kind == .user or kind == .tool_follow) {
             var pb2: [1400]u8 = undefined;
-            const recalled = wholeLines(self.mind().recall(PLAYBOOK_SCOPE, self.last_user[0..self.last_user_len], &pb2), pb2.len);
+            const recalled = wholeLines(self.mind().recall(PLAYBOOK_SCOPE, self.last_user[0..self.last_user_len], pb2[0..tb.playbook]), tb.playbook);
             // Read-time guards: playbook-SHAPED (schema — a legacy/non-lesson fact never surfaces as binding)
             // AND about THIS request (relevance — recall ranks a top match even when nothing truly matches, and
             // a path-specific fix bound to an off-topic turn is how the model gets talked into a stray cd). The
@@ -4485,7 +4621,7 @@ pub const Chat = struct {
         // recall surfaces the class-level skill relevant to the request; empty until the judge mints one.
         if (kind == .user or kind == .tool_follow) {
             var sk: [1600]u8 = undefined;
-            const skills = wholeLines(self.mind().recall(SKILLS_SCOPE, self.last_user[0..self.last_user_len], &sk), sk.len);
+            const skills = wholeLines(self.mind().recall(SKILLS_SCOPE, self.last_user[0..self.last_user_len], sk[0..tb.skills]), tb.skills);
             if (skills.len > 0) {
                 msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"RELEVANT SKILLS (procedural know-how you built from past tasks — the steps + pitfalls for this class of work. Follow them; if one proves wrong this session, note the correction so it can be patched):\\n") catch return;
                 escJson(&msgs, self.gpa, skills);
@@ -4499,7 +4635,7 @@ pub const Chat = struct {
         // machine passes (.consolidate/.loop_infer/.collect) must stay uncontaminated.
         if (kind == .user or kind == .tool_follow or kind == .reflect) {
             var ub: [1200]u8 = undefined;
-            const um = wholeLines(self.mind().recall(USER_SCOPE, if (self.last_user_len > 0) self.last_user[0..self.last_user_len] else "user", &ub), ub.len);
+            const um = wholeLines(self.mind().recall(USER_SCOPE, if (self.last_user_len > 0) self.last_user[0..self.last_user_len] else "user", ub[0..tb.user]), tb.user);
             if (um.len > 0) {
                 msgs.appendSlice(self.gpa, ",{\"role\":\"system\",\"content\":\"WHO YOU'RE TALKING TO (your working model of this user — their style, expectations, and how they want you to operate. Let it shape tone and approach, not override explicit instructions):\\n") catch return;
                 escJson(&msgs, self.gpa, um);
@@ -4514,8 +4650,9 @@ pub const Chat = struct {
             // include from the tail while the budget lasts (the newest matter most) — but PIN the goal:
             // msgs[0] is the user's assignment, and once a long tool arc pushed it out of the tail window the
             // model worked from tool chatter alone and drifted off the original request. Reserve its cost up
-            // front and always emit it first when the window would otherwise drop it.
-            var budget: usize = 24 * 1024;
+            // front and always emit it first when the window would otherwise drop it. The window is
+            // tier-scaled: a small model gets a third of the tail a frontier model carries.
+            var budget: usize = tb.history;
             const pin_goal = self.store.msg_count > 0 and self.store.msgs[0].role == .user;
             const floor: usize = if (pin_goal) 1 else 0;
             if (pin_goal) budget -= @min(budget, self.store.msgs[0].text_len);
@@ -4585,13 +4722,9 @@ pub const Chat = struct {
         if (kind == .consolidate) {
             msgs.appendSlice(self.gpa, ",{\"role\":\"user\",\"content\":\"Consolidation step. From the conversation above, output the REMEMBER:/FORGET: lines for any durable facts about ME (keys, logins, credentials, environment/setup, stable preferences) that I shared or changed and that are not already in YOUR MEMORY. One directive per line, no other text. If there is nothing new or changed, output exactly NONE.\"}") catch return;
         }
-        var bb: [256]u8 = undefined;
-        var kb: [192]u8 = undefined;
-        var mb: [96]u8 = undefined;
-        const prov = self.resolveProvider(&bb, &kb, &mb);
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
-        if (!llm.start(&self.stream, self.io, self.gpa, side, prov, msgs.items, MAX_TOKENS, self.nowS())) {
+        if (!llm.start(&self.stream, self.io, self.gpa, side, prov, msgs.items, tb.max_tokens, self.nowS())) {
             self.store.pushNotif("Chat failed", "could not start the model call (is curl available?)", 2);
             // A .tool_follow, .reflect (or .collect) re-entry gets here with busy already true — clear it or the chat
             // wedges "busy" forever. turn is already .idle (set by the caller before re-entry).
@@ -4606,7 +4739,7 @@ pub const Chat = struct {
         self.turn_fb_ms = 0;
         self.setBusy(true);
         self.setStatus("thinking...");
-        log.info("chat turn start: kind={t} prompt={d}b model_msgs history", .{ kind, msgs.items.len });
+        log.info("chat turn start: kind={t} tier={s} prompt={d}b model_msgs history", .{ kind, tier.label(), msgs.items.len });
     }
 
     pub fn pumpStream(self: *Chat, dd: []const u8) void {
@@ -12181,4 +12314,60 @@ test "micro-console: an AI RUN: command folds its output back as a [console] mes
     llm.abort(&ctx.chat.stream, ctx.io());
     ctx.chat.stream.deinit(std.testing.allocator);
     ctx.chat.turn = .idle;
+}
+
+test "prompt tiers: compact doctrine keeps every protocol surface the dispatcher parses" {
+    // the compact prompts trade prose for size, NEVER grammar: each parsed line format must survive
+    for ([_][]const u8{ SYSTEM_PROMPT_SPEED_COMPACT, SYSTEM_PROMPT_AUTONOMY_COMPACT }) |p| {
+        try std.testing.expect(std.mem.indexOf(u8, p, "CAST: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "MINDS") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "FILES: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "STEER: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "TOOL: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "RUN: ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "REMEMBER: [") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "FORGET:") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "write_file") != null);
+        try std.testing.expect(std.mem.indexOf(u8, p, "recall_hive") != null);
+        // genuinely compact: at most half the full doctrine (in practice ~1/3)
+        try std.testing.expect(p.len * 2 < SYSTEM_PROMPT_SPEED.len);
+    }
+    // LONG/MINUTES/PUBLISH stay teachable where the mode allows them
+    try std.testing.expect(std.mem.indexOf(u8, SYSTEM_PROMPT_AUTONOMY_COMPACT, "PUBLISH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SYSTEM_PROMPT_SPEED_COMPACT, "LONG") != null);
+}
+
+test "prompt tiers: budgets shrink with the tier; large is the historical prompt byte-for-byte" {
+    const s = budgetFor(.small);
+    const m = budgetFor(.mid);
+    const l = budgetFor(.large);
+    try std.testing.expect(s.compact and !m.compact and !l.compact);
+    try std.testing.expect(s.history < m.history and m.history < l.history);
+    try std.testing.expect(s.recall < m.recall and m.recall < l.recall);
+    try std.testing.expect(s.memory < m.memory and m.memory < l.memory);
+    try std.testing.expect(s.max_tokens < m.max_tokens and m.max_tokens < l.max_tokens);
+    // the LARGE tier is the pre-tiering behavior exactly — a frontier model's turn is unchanged
+    try std.testing.expectEqual(@as(usize, 24 * 1024), l.history);
+    try std.testing.expectEqual(@as(usize, 4096), l.recall);
+    try std.testing.expectEqual(@as(usize, 3072), l.memory);
+    try std.testing.expectEqual(@as(usize, 1400), l.playbook);
+    try std.testing.expectEqual(@as(usize, 1600), l.skills);
+    try std.testing.expectEqual(@as(usize, 1200), l.user);
+    try std.testing.expectEqual(MAX_TOKENS, l.max_tokens);
+    // every budget fits the stack buffer it slices (buffers are sized for LARGE)
+    try std.testing.expect(s.recall <= 4096 and m.recall <= 4096);
+    try std.testing.expect(s.memory <= 3072 and m.memory <= 3072);
+    try std.testing.expect(s.playbook <= 1400 and m.playbook <= 1400);
+    try std.testing.expect(s.skills <= 1600 and m.skills <= 1600);
+    try std.testing.expect(s.user <= 1200 and m.user <= 1200);
+}
+
+test "prompt tiers: senseTier keys off the model id + endpoint locality" {
+    // catalog-known ids: the user's own ladder — 8b/20b small, 70b/120b mid, frontier large
+    try std.testing.expectEqual(catalog.Tier.small, senseTier(.{ .base_url = "http://127.0.0.1:11434/v1", .key = "", .model = "gpt-oss:20b" }));
+    try std.testing.expectEqual(catalog.Tier.mid, senseTier(.{ .base_url = "https://api.groq.com/openai/v1", .key = "", .model = "llama-3.3-70b-versatile" }));
+    try std.testing.expectEqual(catalog.Tier.large, senseTier(.{ .base_url = "https://api.anthropic.com/v1", .key = "", .model = "claude-fable-5" }));
+    // a custom LOCAL endpoint (LM Studio-style) with an unnamed model stays small; hosted unknown reads frontier
+    try std.testing.expectEqual(catalog.Tier.small, senseTier(.{ .base_url = "http://localhost:1234/v1", .key = "", .model = "my-finetune-latest" }));
+    try std.testing.expectEqual(catalog.Tier.large, senseTier(.{ .base_url = "https://api.example.com/v1", .key = "", .model = "my-finetune-latest" }));
 }

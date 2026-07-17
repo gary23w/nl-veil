@@ -136,8 +136,10 @@ providers:
     keyless: true
     local: true
     models:
+      # dry runs exercise the FULL prompt shape — pin large so mock output never depends on tier scaling
       - id: mock
         label: mock
+        tier: large
 
   # Hugging Face Inference Providers — one hf_ token routes to hundreds of open models across partner
   # providers. OpenAI-compatible, so it flows through the standard BYOK path. A model id may carry a

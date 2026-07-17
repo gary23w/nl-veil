@@ -14,6 +14,12 @@ const modelcfg = @import("modelcfg");
 pub const Model = modelcfg.Model;
 pub const Provider = modelcfg.Provider;
 
+/// Model capacity sensing (params/ctx/tier from yaml metadata or the model id) — the desk keys its
+/// prompt variant + per-section budgets off this; see chat.zig budgetFor.
+pub const Tier = modelcfg.Tier;
+pub const ModelSense = modelcfg.ModelSense;
+pub const senseModel = modelcfg.senseModel;
+
 /// THE provider list — a comptime slice from models.yaml. Array-style access (`providers[i]`,
 /// `providers.len`, `for (providers)`) works exactly as the old in-file array did.
 pub const providers = modelcfg.providers;

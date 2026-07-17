@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const llm = @import("llm.zig");
+const modelcfg = @import("modelcfg.zig");
 const httpc = @import("httpc.zig");
 const tools = @import("tools.zig");
 const commons = @import("commons.zig");
@@ -668,20 +669,38 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         "the startup probe saw this HOSTED backend emit tool calls as TEXT instead of structured tool_calls — write_file is STRIPPED from the build schema; files ride fenced blocks and the narrated-write salvage commits them (no more per-file salvage roulette)");
     {
         // BUDGET COHERENCE: the per-turn completion budget and every prompt-section byte budget derive from
-        // the PROBED window instead of fixed literals — a genuinely small-ctx model must not be handed a
-        // 32k-shaped prompt plus an 8k completion budget. On a full-window backend (or unprobed) everything
-        // stays exactly as before (scale 1.0). NL_MAX_TOKENS overrides the completion budget directly.
+        // the model's REAL capacity instead of fixed literals — a genuinely small-ctx model must not be
+        // handed a 32k-shaped prompt plus an 8k completion budget, and a small-PARAM model (8B/20B class)
+        // must not be buried under frontier-sized doctrine sections even when its window is huge. The live
+        // probe (Ollama /api/show) is ground truth where it exists; modelcfg.senseModel covers hosted and
+        // unprobed backends from yaml metadata + the model id itself. On a frontier-tier full-window backend
+        // everything stays exactly as before (scale 1.0). NL_MAX_TOKENS overrides the completion budget.
         const bc = llm.capsSnapshot();
-        const ctx_eff: u32 = if (bc.ctx_tokens > 0) @min(bc.ctx_tokens, 32768) else 32768;
-        w.clip_scale = std.math.clamp(@as(f32, @floatFromInt(ctx_eff)) / 32768.0, 0.25, 1.0);
-        w.max_tokens_eff = @max(1024, @as(u32, @intFromFloat(8192.0 * w.clip_scale)));
+        const local_base = std.mem.indexOf(u8, w.base_url, "127.0.0.1") != null or std.mem.indexOf(u8, w.base_url, "localhost") != null;
+        const sense = modelcfg.senseModel(w.model, local_base);
+        const ctx_known: u32 = if (bc.ctx_tokens > 0) bc.ctx_tokens else sense.ctx_k * 1024;
+        const ctx_eff: u32 = @min(ctx_known, 32768);
+        const ctx_scale = std.math.clamp(@as(f32, @floatFromInt(ctx_eff)) / 32768.0, 0.25, 1.0);
+        // probed parameter count beats the name-derived tier (same thresholds as modelcfg: ≤24B small, ≤199B mid)
+        const tier: modelcfg.Tier = if (bc.param_count > 0)
+            (if (bc.param_count <= 24_500_000_000) .small else if (bc.param_count <= 199_500_000_000) .mid else .large)
+        else
+            sense.tier;
+        const tier_scale: f32 = switch (tier) {
+            .small => 0.55,
+            .mid => 0.8,
+            .large => 1.0,
+        };
+        w.clip_scale = @min(ctx_scale, tier_scale);
+        // the completion budget follows the WINDOW only — a small model still needs full room to write files
+        w.max_tokens_eff = @max(1024, @as(u32, @intFromFloat(8192.0 * ctx_scale)));
         if (environ.get("NL_MAX_TOKENS")) |mts| {
             if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| {
                 w.max_tokens_eff = std.math.clamp(v, 256, 32768);
             } else |_| {}
         }
         if (live and (w.max_tokens_eff != 8192 or w.clip_scale < 1.0))
-            w.act("engine", 0, "budget", "ctx-scaled", std.fmt.allocPrint(gpa, "probed ctx={d} -> max_tokens={d}, prompt-section scale={d:.2} (set NL_MAX_TOKENS to override the completion budget)", .{ ctx_eff, w.max_tokens_eff, w.clip_scale }) catch "budget");
+            w.act("engine", 0, "budget", "ctx-scaled", std.fmt.allocPrint(gpa, "ctx={d} tier={s} -> max_tokens={d}, prompt-section scale={d:.2} (set NL_MAX_TOKENS to override the completion budget)", .{ ctx_eff, tier.label(), w.max_tokens_eff, w.clip_scale }) catch "budget");
     }
     if (live) {
         // PREFLIGHT: every model call and web fetch shells out to curl — a missing curl fails as a cryptic
