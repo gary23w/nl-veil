@@ -87,6 +87,9 @@ pub const Settings = struct {
     // chat pane collapse state (persisted with the chat settings)
     chat_left_open: bool = true,
     chat_right_open: bool = true,
+    // chat pane widths — user drag-resizable, persisted (defaults match CHAT_LEFT_W/CHAT_RIGHT_W in main.zig)
+    chat_left_w: u16 = 230,
+    chat_right_w: u16 = 320,
     shell_always_allow: bool = false, // "Bypass" chosen once → the veil's RUN: shell commands skip the approval prompt
     // SPEED MODE (default ON): the chat BUILDS projects itself with its file tools, and casts are quick
     // research sub-agents capped at 2 minutes. OFF = the autonomy posture: the chat may deploy long

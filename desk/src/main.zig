@@ -99,6 +99,7 @@ const RightTab = enum { activity, memory }; // the right pane's inner tabs (Swar
 const SchedInner = enum { tasks, build }; // the Tasks tab's inner tabs (task list | builder form)
 const SwarmInner = enum { live, deploy }; // the Swarm tab's inner tabs (live view | deploy form)
 const ChatsInner = enum { chats, sched }; // the chat LEFT pane's inner tabs (conversations | scheduled tasks)
+const PaneDrag = enum { none, left, right }; // which side-panel divider is being drag-resized (else none)
 
 /// UI-thread-only interaction state (the Store holds the machine's state; this holds the cursor's).
 const Ui = struct {
@@ -137,7 +138,10 @@ const Ui = struct {
     chat_follow: bool = true,
     chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
+    chat_file_hscroll: f32 = 0, // HORIZONTAL scroll offset (px) for the chat Files content viewer
+    chat_file_hgrab: bool = false, // dragging the Files viewer horizontal scrollbar thumb
     chat_file_list_scroll: f32 = 0, // scroll offset (px) for the chat Files LEFT file list
+    pane_drag: PaneDrag = .none, // which side-panel divider is being dragged (drag-to-resize)
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
     conv_scroll: f32 = 0, // scroll offset for the Chats list (left pane)
@@ -436,7 +440,7 @@ pub fn main() !void {
         mono_loaded = true;
     }
     applyChatVariantFonts(false, false); // bold + italic chat faces; the settings reconcile below re-applies
-    // Window + taskbar icon from assets/icon.png (with a procedural fallback).
+    // Window + taskbar icon from assets/icon48x48.png (with a procedural fallback).
     const icon = makeIcon();
     rl.setWindowIcon(icon);
     rl.unloadImage(icon);
@@ -1071,10 +1075,10 @@ fn applyChatVariantFonts(dyslexia: bool, bold: bool) void {
 
 fn makeIcon() rl.Image {
     const candidates = [_][:0]const u8{
-        "assets/icon.png",
-        "desk/assets/icon.png",
-        "../assets/icon.png",
-        "../desk/assets/icon.png",
+        "assets/icon48x48.png",
+        "desk/assets/icon48x48.png",
+        "../assets/icon48x48.png",
+        "../desk/assets/icon48x48.png",
     };
     for (candidates) |path| {
         if (rl.loadImage(path)) |img| return img else |_| {}
@@ -1765,9 +1769,27 @@ fn drawRoster(store: *Store, r: t.Rect) void {
 
 // -------------------------------------------------------------------------------- chat
 
-const CHAT_LEFT_W: f32 = 230;
-const CHAT_RIGHT_W: f32 = 320;
+const CHAT_LEFT_W: f32 = 230; // default left pane width (drag-to-resize; persisted in settings.chat_left_w)
+const CHAT_RIGHT_W: f32 = 320; // default right pane width (drag-to-resize; persisted in settings.chat_right_w)
 const CHAT_STRIP_W: f32 = 24;
+const CHAT_LEFT_MIN: f32 = 150;
+const CHAT_LEFT_MAX: f32 = 460;
+const CHAT_RIGHT_MIN: f32 = 210;
+const CHAT_RIGHT_MAX: f32 = 560;
+
+/// A draggable pane divider: a thin grip line at (x) over [y, y+h]. Brightens when the divider is hot or
+/// being dragged. Drawn AFTER the panes so their fills don't overpaint it.
+fn drawPaneGrip(x: f32, y: f32, h: f32, active: bool) void {
+    const c = if (active) t.blue else t.border;
+    const a: u8 = if (active) 230 else 80;
+    t.fillRect(@intFromFloat(x - 1), @intFromFloat(y + 2), 2, @intFromFloat(h - 4), t.withAlpha(c, a));
+    if (active) { // three grip dots at mid-height signal "grab me"
+        var i: i32 = -1;
+        while (i <= 1) : (i += 1) {
+            rl.drawCircle(@intFromFloat(x), @intFromFloat(y + h / 2 + @as(f32, @floatFromInt(i)) * 6), 1.7, t.blue);
+        }
+    }
+}
 
 /// The Chat tab: three panes. Left = conversations (create/select/rename/delete, collapsible), center =
 /// the message stream + input, right = live swarm-cast activity (collapsible). Pane open state persists
@@ -1825,6 +1847,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     @memcpy(con_cwd_buf[0..con_cwd_n], store.console_cwd[0..con_cwd_n]);
     var left_open = store.settings.chat_left_open;
     var right_open = store.settings.chat_right_open;
+    // User-resizable pane widths (defaults seeded to CHAT_LEFT_W/CHAT_RIGHT_W), clamped to sane bounds.
+    var left_w_open: f32 = std.math.clamp(@as(f32, @floatFromInt(store.settings.chat_left_w)), CHAT_LEFT_MIN, CHAT_LEFT_MAX);
+    var right_w_open: f32 = std.math.clamp(@as(f32, @floatFromInt(store.settings.chat_right_w)), CHAT_RIGHT_MIN, CHAT_RIGHT_MAX);
     store.unlock();
 
     // RESPONSIVE COLLAPSE: both side panes at full width can starve the center column on a narrow window —
@@ -1833,23 +1858,74 @@ fn drawChat(store: *Store, body: t.Rect) void {
     // their strip state (a first-class supported layout), right pane first then left, until the center keeps
     // a usable minimum. Derived from the live window width each frame, so widening the window restores them.
     const min_center: f32 = 260;
-    const lwf: f32 = if (left_open) CHAT_LEFT_W else CHAT_STRIP_W; // left width before any collapse
-    if (lwf + (if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W) + pad * 4 + min_center > body.width) right_open = false;
-    if (lwf + (if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W) + pad * 4 + min_center > body.width) left_open = false;
+    const lwf: f32 = if (left_open) left_w_open else CHAT_STRIP_W; // left width before any collapse
+    if (lwf + (if (right_open) right_w_open else CHAT_STRIP_W) + pad * 4 + min_center > body.width) right_open = false;
+    if (lwf + (if (right_open) right_w_open else CHAT_STRIP_W) + pad * 4 + min_center > body.width) left_open = false;
 
-    const left_w: f32 = if (left_open) CHAT_LEFT_W else CHAT_STRIP_W;
-    const right_w: f32 = if (right_open) CHAT_RIGHT_W else CHAT_STRIP_W;
     const ph = body.height - pad * 2;
-    const left = t.Rect{ .x = pad, .y = body.y + pad, .width = left_w, .height = ph };
+    const yv = body.y + pad;
+    // DRAG-TO-RESIZE: grab the divider at an open pane's inner edge to resize it; the width persists on
+    // release. Handled before the rects are finalized so the drag tracks the cursor within the same frame.
+    const mx = rl.getMousePosition().x;
+    const m_down = rl.isMouseButtonDown(.left);
+    const m_press = rl.isMouseButtonPressed(.left);
+    var l_active = false;
+    var r_active = false;
+    // If a pane collapsed (responsive or via the chevron) while its divider was mid-drag, drop the drag so
+    // pane_drag can't latch — the drag blocks below only run while the pane is open.
+    if (ui.pane_drag == .left and !left_open) ui.pane_drag = .none;
+    if (ui.pane_drag == .right and !right_open) ui.pane_drag = .none;
+    if (left_open) {
+        const div = pad + left_w_open;
+        const hot = t.hovering(.{ .x = div - 3, .y = yv, .width = 6, .height = ph }) and ui.pane_drag == .none;
+        l_active = hot or ui.pane_drag == .left;
+        if (l_active) t.wantCursor(.resize_ew);
+        if (hot and m_press) ui.pane_drag = .left;
+        if (ui.pane_drag == .left) {
+            if (m_down) {
+                // Track the cursor AND commit to the store every frame: left_w below uses it this frame, and
+                // next frame re-seeds from the live width instead of snapping back to the pre-drag value.
+                left_w_open = std.math.clamp(mx - pad, CHAT_LEFT_MIN, CHAT_LEFT_MAX);
+                store.lock();
+                store.settings.chat_left_w = @intFromFloat(left_w_open);
+                store.unlock();
+            } else {
+                ui.pane_drag = .none;
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // flush the final width to disk
+            }
+        }
+    }
+    if (right_open) {
+        const div = body.width - pad - right_w_open;
+        const hot = t.hovering(.{ .x = div - 3, .y = yv, .width = 6, .height = ph }) and ui.pane_drag == .none;
+        r_active = hot or ui.pane_drag == .right;
+        if (r_active) t.wantCursor(.resize_ew);
+        if (hot and m_press) ui.pane_drag = .right;
+        if (ui.pane_drag == .right) {
+            if (m_down) {
+                right_w_open = std.math.clamp(body.width - pad - mx, CHAT_RIGHT_MIN, CHAT_RIGHT_MAX);
+                store.lock();
+                store.settings.chat_right_w = @intFromFloat(right_w_open);
+                store.unlock();
+            } else {
+                ui.pane_drag = .none;
+                store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // flush the final width to disk
+            }
+        }
+    }
+
+    const left_w: f32 = if (left_open) left_w_open else CHAT_STRIP_W;
+    const right_w: f32 = if (right_open) right_w_open else CHAT_STRIP_W;
+    const left = t.Rect{ .x = pad, .y = yv, .width = left_w, .height = ph };
     // The right column stacks the swarm-activity panel over a micro-console (only when the pane is open and
     // there's room). The console gets ~40% of the height, clamped to a sane band.
     const con_h: f32 = if (right_open and ph > 380) @min(280, ph * 0.42) else 0;
     const con_gap: f32 = if (con_h > 0) pad else 0;
-    const right = t.Rect{ .x = body.width - pad - right_w, .y = body.y + pad, .width = right_w, .height = ph - con_h - con_gap };
+    const right = t.Rect{ .x = body.width - pad - right_w, .y = yv, .width = right_w, .height = ph - con_h - con_gap };
     const console = t.Rect{ .x = right.x, .y = right.y + right.height + con_gap, .width = right_w, .height = con_h };
     // Final safety net: even with both panes collapsed to strips, an extreme window must never feed a
     // negative width downstream (monoCols underflow / degenerate panel rect). 28 keeps view.width-28 >= 0.
-    const center = t.Rect{ .x = left.x + left_w + pad, .y = body.y + pad, .width = @max(28, right.x - (left.x + left_w) - pad * 2), .height = ph };
+    const center = t.Rect{ .x = left.x + left_w + pad, .y = yv, .width = @max(28, right.x - (left.x + left_w) - pad * 2), .height = ph };
 
     // The in-flight reply, with any live reasoning prepended as a blockquote so thinking shows line-by-line.
     // Sized for the draft-mode worst case: quoted reasoning (4096 + "> " per line) + separator + "— drafting —"
@@ -1902,6 +1978,9 @@ fn drawChat(store: *Store, body: t.Rect) void {
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
+    // resize grips over the pane inner edges — drawn last so the pane fills don't overpaint them
+    if (left_open) drawPaneGrip(pad + left_w, yv, ph, l_active);
+    if (right_open) drawPaneGrip(body.width - pad - right_w, yv, ph, r_active);
 }
 
 /// Push a just-run command into the You-shell history ring (skipping an immediate repeat — the arrow-up +
@@ -2488,7 +2567,7 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
         // thought dots — both paced by real stream activity (see thinkEnergy)
         if (cursor and role == .veil) lx += drawThinkingMark(lx, yy);
         t.text(roleLabel(role), @intFromFloat(lx), @intFromFloat(yy), 11, roleColor(role));
-        if (cursor and role == .veil) drawThinkingDots(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 14, yy);
+        if (cursor and role == .veil) drawThinkingActivity(lx + @as(f32, @floatFromInt(t.measure(roleLabel(role), 11))) + 14, yy);
     }
     yy += MSG_HEAD_H;
     if (is_console) return renderConsole(view, yy, text_, fsz, draw);
@@ -2830,6 +2909,10 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
     const x_base = view.x + 14;
     const max_x = view.x + view.width - 12;
     const space_w: f32 = @floatFromInt(@max(2, t.measureStyled(t.z(" ", .{}), size, base_kind)));
+    // Inline code renders in the MONO face; a proportional space between wide mono glyphs looks cramped and
+    // lets adjacent code chips visually merge. Use the (wider) mono space for any gap flanking a code span so
+    // `npx tsc --noEmit` reads with terminal-like breathing room. Prose spacing is untouched.
+    const code_space_w: f32 = @floatFromInt(@max(2, t.measureStyled(t.z(" ", .{}), size, .mono)));
     var x = x_base + first_indent;
     var row_x0 = x;
     var row_text: [1024]u8 = undefined; // the row's plain bytes, for the selection/copy capture
@@ -2837,6 +2920,7 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
     var rows: u32 = 0;
     var line_start = true;
     var pending_space = false;
+    var prev_code = false; // did the previous word's last span render as code? (widens the following space)
     var sidx: usize = 0; // monotone span cursor (spans are ordered by offset)
 
     const n = il.text_len;
@@ -2877,7 +2961,16 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
                 p = pe;
             }
         }
-        const sw: f32 = if (pending_space) space_w else 0;
+        // a space flanked by a code span (previous word ended code, or the next word starts code) gets the
+        // wider mono-space width so code doesn't jam against its neighbors
+        var next_code = false;
+        {
+            var si = sidx;
+            while (si + 1 < il.span_count and pos >= il.spans[si].off + il.spans[si].len) si += 1;
+            if (si < il.span_count and pos >= il.spans[si].off and pos < il.spans[si].off + il.spans[si].len)
+                next_code = il.spans[si].style.code;
+        }
+        const sw: f32 = if (pending_space) (if (prev_code or next_code) @max(space_w, code_space_w) else space_w) else 0;
         if (!line_start and x + sw + ww > max_x) { // wrap BEFORE this word
             if (draw) captureSelLine(inView(view, yy, line_h), yy, row_x0, size, false, row_text[0..row_len]);
             yy += line_h;
@@ -2946,6 +3039,7 @@ fn renderInline(view: t.Rect, y0: f32, il: *const md.Inline, size: i32, line_h: 
                     line_start = true;
                 }
             }
+            prev_code = sp.style.code; // remember the word's trailing style for the next space's width
             p = pe;
         }
         pos = wend;
@@ -2974,17 +3068,58 @@ fn drawThinkingMark(x: f32, y: f32) f32 {
     return 26;
 }
 
-/// Three thought dots in a staggered wave after the label — their tempo and brightness follow the same
-/// live energy as the mark (quick while tokens land, a slow ember while the model thinks).
-fn drawThinkingDots(x: f32, y: f32) void {
-    const tm = rl.getTime();
-    const e: f64 = thinkEnergy();
+/// A rotating set of playful gerunds (in the spirit of the Claude Code CLI) shown while the veil works, so
+/// the wait reads as a lively, transforming process rather than a frozen spinner. Cycles on a slow clock,
+/// independent of stream energy so the word is legible.
+const think_words = [_][:0]const u8{
+    "Discombobulating", "Transforming",  "Percolating",   "Conjuring",     "Synthesizing",
+    "Ruminating",       "Coalescing",    "Weaving",       "Distilling",    "Effervescing",
+    "Galvanizing",      "Kindling",      "Marinating",    "Orchestrating", "Simmering",
+    "Tessellating",     "Unfurling",     "Whirring",      "Cogitating",    "Shimmering",
+    "Manifesting",      "Noodling",      "Crystallizing", "Reticulating",  "Percolating",
+};
+
+fn thinkWord() [:0]const u8 {
+    const period: f64 = 2.4; // seconds per word
+    const n: f64 = @floatFromInt(think_words.len);
+    const idx: usize = @intFromFloat(@mod(rl.getTime() / period, n));
+    return think_words[@min(idx, think_words.len - 1)];
+}
+
+/// A compact spinner built from orbiting dots (not a braille glyph the font atlas might lack): three dots
+/// circling a center, brightening as they crest. `tm` is the caller's clock in seconds.
+fn drawSpinner(cx: f32, cy: f32, tm: f64, c: t.Color) void {
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        const ph = @sin(tm * (1.8 + 3.2 * e) + @as(f64, @floatFromInt(i)) * 0.9);
-        const a: u8 = @intFromFloat(55.0 + (95.0 + 75.0 * e) * @abs(ph));
-        rl.drawCircle(@intFromFloat(x + @as(f32, @floatFromInt(i)) * 8.0), @intFromFloat(y + 7), 1.8, t.withAlpha(t.magenta, a));
+        const ang = tm * 4.2 + @as(f64, @floatFromInt(i)) * (std.math.tau / 3.0);
+        const px = cx + @as(f32, @floatCast(@cos(ang))) * 4.5;
+        const py = cy + @as(f32, @floatCast(@sin(ang))) * 4.5;
+        const a: u8 = @intFromFloat(80.0 + 150.0 * (0.5 + 0.5 * @sin(ang)));
+        rl.drawCircle(@intFromFloat(px), @intFromFloat(py), 2.0, t.withAlpha(c, a));
     }
+}
+
+/// The live reply's activity indicator after the "veil" label: a shimmer bar of dots with a traveling bright
+/// crest (a "loading bar" pulse) plus a slowly-cycling gerund — both quicker/brighter while tokens land, an
+/// ember while the model thinks (see thinkEnergy). Purely decorative, so it never affects message layout.
+fn drawThinkingActivity(x: f32, y: f32) void {
+    const tm = rl.getTime();
+    const e: f64 = thinkEnergy();
+    const dots: usize = 9;
+    const dw: f32 = 5.5;
+    const span: f64 = @floatFromInt(dots + 3);
+    const crest = @mod(tm * (1.2 + 2.4 * e), 1.0) * span - 1.5; // traveling bright center
+    var i: usize = 0;
+    while (i < dots) : (i += 1) {
+        const d = @abs(@as(f64, @floatFromInt(i)) - crest);
+        const glow = std.math.clamp(1.0 - d / 2.4, 0.0, 1.0);
+        const a: u8 = @intFromFloat(40.0 + (150.0 * glow) * (0.55 + 0.45 * e));
+        const rad: f32 = @floatCast(1.5 + 1.5 * glow);
+        rl.drawCircle(@intFromFloat(x + @as(f32, @floatFromInt(i)) * dw), @intFromFloat(y + 7), rad, t.withAlpha(t.magenta, a));
+    }
+    const word = thinkWord();
+    const wa: u8 = @intFromFloat(120.0 + 90.0 * (0.5 + 0.5 * @sin(tm * 2.0))); // gentle breathing
+    t.text(word, @intFromFloat(x + @as(f32, @floatFromInt(dots)) * dw + 8), @intFromFloat(y + 1), 11, t.withAlpha(t.magenta, wa));
 }
 
 fn roleLabel(role: store_mod.ChatRole) [:0]const u8 {
@@ -3042,10 +3177,28 @@ fn firstLine(s: []const u8) []const u8 {
 /// noisy for the chat). One line only; the % + phase come from `status`.
 fn renderCastLive(view: t.Rect, y0: f32, status: []const u8, draw: bool) f32 {
     if (draw and inView(view, y0, MSG_LINE_H + 2)) {
-        t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(y0 - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H + 2), t.withAlpha(t.green, 34));
-        const spin = [_][]const u8{ "|", "/", "-", "\\" };
-        const s = spin[@as(usize, @intFromFloat(@mod(rl.getTime() * 6.0, 4.0)))];
-        t.text(t.z("{s} the hive is working — {s}  (live detail in Swarm activity)", .{ s, if (status.len > 0) status else "casting" }), @intFromFloat(view.x + 14), @intFromFloat(y0), 12, t.green);
+        const bx = view.x + 8;
+        const bw = view.width - 16;
+        const by = y0 - 2;
+        const bh = MSG_LINE_H + 2;
+        t.fillRect(@intFromFloat(bx), @intFromFloat(by), @intFromFloat(bw), @intFromFloat(bh), t.withAlpha(t.green, 30));
+        // a soft shimmer band sweeping the bar so "working" reads as alive; clamped to the bar rather than
+        // scissored, since renderCastLive draws inside the chat body's scissor (endScissorMode would disable it)
+        const tm = rl.getTime();
+        const sweep: f32 = @floatCast(@mod(tm * 0.5, 1.0));
+        const sx = bx + sweep * bw;
+        var k: i32 = -4;
+        while (k <= 4) : (k += 1) {
+            const bxi = sx + @as(f32, @floatFromInt(k)) * 9.0;
+            const x1 = @max(bx, bxi);
+            const x2 = @min(bx + bw, bxi + 9.0);
+            if (x2 <= x1) continue;
+            const fade = 1.0 - @abs(@as(f32, @floatFromInt(k))) / 5.0;
+            const a: u8 = @intFromFloat(26.0 * fade);
+            t.fillRect(@intFromFloat(x1), @intFromFloat(by), @intFromFloat(x2 - x1), @intFromFloat(bh), t.withAlpha(t.green, a));
+        }
+        drawSpinner(view.x + 17, y0 + 6, tm, t.green);
+        t.text(t.z("the hive is working — {s}  (live detail in Swarm activity)", .{if (status.len > 0) status else "casting"}), @intFromFloat(view.x + 32), @intFromFloat(y0), 12, t.green);
     }
     return y0 + MSG_LINE_H + 6 + MSG_GAP_H;
 }
@@ -4930,6 +5083,313 @@ fn fmtSize(sz: u64) [:0]const u8 {
 /// The Chat FILES inner tab — a two-pane viewer for the files THIS conversation built (its {conv}/work dir),
 /// mirroring the Swarm file viewer but fed by the chat worker's Store.chat_files channel. An "Open folder"
 /// button reveals the dir in the OS file browser. The chat worker owns the IO; this only reads the Store.
+// ---- Files viewer syntax highlighting -------------------------------------------------------------
+// A compact, dependency-free highlighter for the chat Files code viewer. One pass per line classifies
+// each byte into a color index (keyword / type / string / number / comment / function / default); the
+// draw loop coalesces equal-color runs and positions each by character column (monospace, so x = col*charw
+// — exact, and horizontal panning is just a base_x shift). Cross-line constructs (block comments, backtick
+// templates, python triple-strings) thread through HlState so the caller carries state from the top of the
+// file to the first visible line. ASCII-oriented: code is overwhelmingly ASCII, and a rare multibyte glyph
+// only nudges a column, never crashes.
+
+const HlLang = enum { generic, zig, web, python, cish, json, css, shell };
+
+const HlState = struct {
+    in_block: bool = false, // inside an unclosed /* ... */
+    in_str: bool = false, // inside an unclosed multiline string (backtick / python triple-quote)
+    str_delim: u8 = '`', // the delimiter that opened it
+    str_triple: bool = false, // python ''' / """ (needs three to close)
+};
+
+const HL_DEF: u8 = 0;
+const HL_KW: u8 = 1;
+const HL_TYPE: u8 = 2;
+const HL_STR: u8 = 3;
+const HL_NUM: u8 = 4;
+const HL_COMMENT: u8 = 5;
+const HL_FUNC: u8 = 6;
+
+fn hlColor(idx: u8) t.Color {
+    return switch (idx) {
+        HL_KW => t.magenta,
+        HL_TYPE => t.cyan,
+        HL_STR => t.green,
+        HL_NUM => t.orange,
+        HL_COMMENT => t.comment,
+        HL_FUNC => t.blue,
+        else => t.fg_dim,
+    };
+}
+
+const KW_ZIG = [_][]const u8{ "fn", "const", "var", "pub", "return", "if", "else", "while", "for", "switch", "struct", "enum", "union", "error", "try", "catch", "errdefer", "defer", "comptime", "inline", "and", "or", "orelse", "unreachable", "break", "continue", "test", "async", "await", "suspend", "resume", "nosuspend", "export", "extern", "packed", "threadlocal", "volatile", "allowzero", "noalias", "anytype", "anyframe", "usingnamespace", "opaque", "asm", "align", "callconv", "linksection" };
+const TY_ZIG = [_][]const u8{ "void", "bool", "type", "anyerror", "anyopaque", "noreturn", "comptime_int", "comptime_float", "usize", "isize", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f16", "f32", "f64", "f80", "f128", "c_int", "c_uint", "c_long", "c_ulong", "c_char" };
+const KW_WEB = [_][]const u8{ "const", "let", "var", "function", "return", "if", "else", "for", "while", "do", "switch", "case", "break", "continue", "class", "extends", "implements", "interface", "type", "enum", "import", "export", "from", "as", "default", "new", "this", "super", "async", "await", "yield", "try", "catch", "finally", "throw", "typeof", "instanceof", "in", "of", "delete", "void", "static", "get", "set", "public", "private", "protected", "readonly", "abstract", "namespace", "declare", "keyof", "infer", "satisfies", "require", "module" };
+const TY_WEB = [_][]const u8{ "string", "number", "boolean", "any", "unknown", "never", "object", "symbol", "bigint", "Promise", "Array", "Record", "Partial", "Readonly", "Pick", "Omit", "Map", "Set", "Date", "RegExp", "Error", "JSON", "Math", "console", "window", "document", "React" };
+const KW_PY = [_][]const u8{ "def", "class", "return", "if", "elif", "else", "for", "while", "import", "from", "as", "with", "try", "except", "finally", "raise", "pass", "break", "continue", "in", "is", "not", "and", "or", "lambda", "yield", "async", "await", "global", "nonlocal", "del", "assert", "print", "self", "cls", "match", "case" };
+const TY_PY = [_][]const u8{ "int", "str", "float", "bool", "list", "dict", "tuple", "set", "bytes", "object", "type" };
+const KW_CISH = [_][]const u8{ "int", "char", "short", "long", "unsigned", "signed", "float", "double", "void", "struct", "union", "enum", "typedef", "static", "const", "volatile", "extern", "register", "return", "if", "else", "for", "while", "do", "switch", "case", "default", "goto", "sizeof", "fn", "let", "mut", "pub", "impl", "trait", "use", "mod", "match", "func", "package", "import", "type", "interface", "map", "chan", "go", "defer", "class", "public", "private", "protected", "new", "this", "namespace", "template", "using", "auto" };
+const KW_SH = [_][]const u8{ "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done", "case", "esac", "function", "in", "return", "export", "local", "readonly", "echo", "cd", "set", "unset", "source", "alias" };
+const HL_LITERALS = [_][]const u8{ "true", "false", "null", "undefined", "None", "True", "False", "NaN", "nil" };
+
+fn hlInList(word: []const u8, list: []const []const u8) bool {
+    for (list) |w| {
+        if (std.mem.eql(u8, w, word)) return true;
+    }
+    return false;
+}
+
+fn hlKeywords(lang: HlLang) []const []const u8 {
+    return switch (lang) {
+        .zig => &KW_ZIG,
+        .web => &KW_WEB,
+        .python => &KW_PY,
+        .cish => &KW_CISH,
+        .shell => &KW_SH,
+        else => &[_][]const u8{},
+    };
+}
+fn hlTypes(lang: HlLang) []const []const u8 {
+    return switch (lang) {
+        .zig => &TY_ZIG,
+        .web => &TY_WEB,
+        .python => &TY_PY,
+        else => &[_][]const u8{},
+    };
+}
+
+fn hlLangFor(path: []const u8) HlLang {
+    var dot: usize = path.len;
+    var k: usize = path.len;
+    while (k > 0) : (k -= 1) {
+        const ch = path[k - 1];
+        if (ch == '.') {
+            dot = k;
+            break;
+        }
+        if (ch == '/' or ch == '\\') break;
+    }
+    if (dot >= path.len) return .generic;
+    const ext = path[dot..];
+    const eq = std.ascii.eqlIgnoreCase;
+    if (eq(ext, "zig")) return .zig;
+    if (eq(ext, "ts") or eq(ext, "tsx") or eq(ext, "js") or eq(ext, "jsx") or eq(ext, "mjs") or eq(ext, "cjs")) return .web;
+    if (eq(ext, "py")) return .python;
+    if (eq(ext, "json")) return .json;
+    if (eq(ext, "css") or eq(ext, "scss")) return .css;
+    if (eq(ext, "sh") or eq(ext, "bash") or eq(ext, "ps1")) return .shell;
+    if (eq(ext, "c") or eq(ext, "h") or eq(ext, "cpp") or eq(ext, "cc") or eq(ext, "hpp") or eq(ext, "rs") or eq(ext, "go") or eq(ext, "java")) return .cish;
+    return .generic;
+}
+
+fn hlIdentByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+fn hlIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_' or c == '$';
+}
+
+fn hlWordClass(lang: HlLang, word: []const u8, line: []const u8, after: usize) u8 {
+    if (hlInList(word, &HL_LITERALS)) return HL_NUM;
+    if (hlInList(word, hlKeywords(lang))) return HL_KW;
+    if (hlInList(word, hlTypes(lang))) return HL_TYPE;
+    if (word.len > 0 and word[0] >= 'A' and word[0] <= 'Z') return HL_TYPE; // Capitalized → type / constructor
+    var k = after;
+    while (k < line.len and (line[k] == ' ' or line[k] == '\t')) : (k += 1) {}
+    if (k < line.len and line[k] == '(') return HL_FUNC; // call / definition
+    return HL_DEF;
+}
+
+var hl_col: [8192]u8 = undefined; // per-line color-index scratch (bytes beyond this render uncolored)
+
+/// Classify one line into hl_col[0..min(len, cap)] and advance the cross-line HlState. Returns the count
+/// of classified bytes.
+fn hlClassify(lang: HlLang, line: []const u8, st: *HlState) usize {
+    const n = @min(line.len, hl_col.len);
+    @memset(hl_col[0..n], HL_DEF);
+    var i: usize = 0;
+    if (st.in_str) { // continue a multiline string opened on a previous line
+        while (i < n) {
+            hl_col[i] = HL_STR;
+            if (st.str_triple) {
+                if (i + 2 < n and line[i] == st.str_delim and line[i + 1] == st.str_delim and line[i + 2] == st.str_delim) {
+                    hl_col[i + 1] = HL_STR;
+                    hl_col[i + 2] = HL_STR;
+                    i += 3;
+                    st.in_str = false;
+                    break;
+                }
+            } else {
+                if (line[i] == '\\' and i + 1 < n) {
+                    hl_col[i + 1] = HL_STR;
+                    i += 2;
+                    continue;
+                }
+                if (line[i] == st.str_delim) {
+                    i += 1;
+                    st.in_str = false;
+                    break;
+                }
+            }
+            i += 1;
+        }
+        if (st.in_str) return n;
+    }
+    if (st.in_block) { // continue an unclosed block comment
+        while (i < n) {
+            hl_col[i] = HL_COMMENT;
+            if (i + 1 < n and line[i] == '*' and line[i + 1] == '/') {
+                hl_col[i + 1] = HL_COMMENT;
+                i += 2;
+                st.in_block = false;
+                break;
+            }
+            i += 1;
+        }
+        if (st.in_block) return n;
+    }
+    const slashc = lang == .zig or lang == .web or lang == .cish;
+    const hashc = lang == .python or lang == .shell or lang == .generic;
+    while (i < n) {
+        const c = line[i];
+        if ((slashc and c == '/' and i + 1 < n and line[i + 1] == '/') or (hashc and c == '#')) { // line comment
+            while (i < n) : (i += 1) hl_col[i] = HL_COMMENT;
+            break;
+        }
+        if ((slashc or lang == .css) and c == '/' and i + 1 < n and line[i + 1] == '*') { // block comment
+            hl_col[i] = HL_COMMENT;
+            hl_col[i + 1] = HL_COMMENT;
+            var j = i + 2;
+            var closed = false;
+            while (j < n) {
+                hl_col[j] = HL_COMMENT;
+                if (j + 1 < n and line[j] == '*' and line[j + 1] == '/') {
+                    hl_col[j + 1] = HL_COMMENT;
+                    j += 2;
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if (!closed) st.in_block = true;
+            i = j;
+            continue;
+        }
+        if (c == '"' or c == '\'' or c == '`') { // strings
+            if (lang == .python and (c == '"' or c == '\'') and i + 2 < n and line[i + 1] == c and line[i + 2] == c) { // triple-quote
+                hl_col[i] = HL_STR;
+                hl_col[i + 1] = HL_STR;
+                hl_col[i + 2] = HL_STR;
+                var j = i + 3;
+                var closed = false;
+                while (j < n) {
+                    hl_col[j] = HL_STR;
+                    if (j + 2 < n and line[j] == c and line[j + 1] == c and line[j + 2] == c) {
+                        hl_col[j + 1] = HL_STR;
+                        hl_col[j + 2] = HL_STR;
+                        j += 3;
+                        closed = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if (!closed) {
+                    st.in_str = true;
+                    st.str_delim = c;
+                    st.str_triple = true;
+                }
+                i = j;
+                continue;
+            }
+            hl_col[i] = HL_STR;
+            var j = i + 1;
+            var closed = false;
+            while (j < n) {
+                hl_col[j] = HL_STR;
+                if (line[j] == '\\' and j + 1 < n) {
+                    hl_col[j + 1] = HL_STR;
+                    j += 2;
+                    continue;
+                }
+                if (line[j] == c) {
+                    j += 1;
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if (!closed and c == '`') {
+                st.in_str = true;
+                st.str_delim = '`';
+                st.str_triple = false;
+            }
+            i = j;
+            continue;
+        }
+        if (c >= '0' and c <= '9' and (i == 0 or !hlIdentByte(line[i - 1]))) { // number
+            var j = i;
+            while (j < n) : (j += 1) {
+                const d = line[j];
+                const exp_sign = (d == '+' or d == '-') and j > i and (line[j - 1] == 'e' or line[j - 1] == 'E');
+                if (!(hlIdentByte(d) or d == '.' or exp_sign)) break;
+                hl_col[j] = HL_NUM;
+            }
+            i = j;
+            continue;
+        }
+        if (lang == .css and c == '#') { // css hex color
+            var j = i;
+            while (j < n and (hlIdentByte(line[j]) or line[j] == '#')) : (j += 1) hl_col[j] = HL_NUM;
+            i = j;
+            continue;
+        }
+        if (hlIdentStart(c)) { // identifier / keyword / type / function
+            var j = i + 1;
+            while (j < n and hlIdentByte(line[j])) : (j += 1) {}
+            const cls = hlWordClass(lang, line[i..j], line, j);
+            @memset(hl_col[i..j], cls);
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    return n;
+}
+
+/// Draw one code line syntax-colored at (base_x, y): coalesce equal-color runs, position each by column so
+/// horizontal panning is a base_x shift. The caller's scissor clips off-viewport pixels. `st` threads
+/// cross-line state; a run longer than the fold buffer is drawn in column-aligned chunks.
+fn drawCodeLine(line: []const u8, base_x: f32, y: f32, size: i32, charw: f32, lang: HlLang, st: *HlState) void {
+    const n = hlClassify(lang, line, st);
+    var buf: [512]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) {
+        const col = hl_col[i];
+        var j = i + 1;
+        while (j < n and hl_col[j] == col) : (j += 1) {}
+        var s = i;
+        while (s < j) {
+            const e = @min(j, s + 400);
+            const rn = t.foldAscii(buf[0 .. buf.len - 1], line[s..e]);
+            buf[rn] = 0;
+            const rx = base_x + @as(f32, @floatFromInt(s)) * charw;
+            t.textMono(buf[0..rn :0], @intFromFloat(rx), @intFromFloat(y), size, hlColor(col));
+            s = e;
+        }
+        i = j;
+    }
+    if (line.len > n) { // pathologically long line: draw the uncolored tail
+        var s = n;
+        while (s < line.len) {
+            const e = @min(line.len, s + 400);
+            const rn = t.foldAscii(buf[0 .. buf.len - 1], line[s..e]);
+            buf[rn] = 0;
+            const rx = base_x + @as(f32, @floatFromInt(s)) * charw;
+            t.textMono(buf[0..rn :0], @intFromFloat(rx), @intFromFloat(y), size, t.fg_dim);
+            s = e;
+        }
+    }
+}
+
 fn drawChatFiles(store: *Store, r: t.Rect) void {
     t.panelBordered(r, t.bg_dark, t.border);
     const hdr_h: f32 = 30;
@@ -4987,6 +5447,7 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
             if (hot and rl.isMouseButtonPressed(.left)) {
                 store.pushChatCmd(store_mod.mkChatCmd(.chat_open_file, "", f.pathStr()));
                 ui.chat_file_scroll = 0;
+                ui.chat_file_hscroll = 0;
             }
         }
     }
@@ -5009,24 +5470,72 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
     rl.beginScissorMode(@intFromFloat(view.x), @intFromFloat(view.y), @intFromFloat(view.width), @intFromFloat(view.height));
     defer rl.endScissorMode();
     const line_h: f32 = 17;
-    const visible: usize = @intFromFloat(view.height / line_h);
+    const csz: i32 = 13;
+    // exact FRACTIONAL monospace advance (glyph step incl. spacing): the integer measureMono truncates each
+    // call by <1px, which compounds into visible drift when multiplied by a column index — so colored runs
+    // positioned at col*charw would slide off the text on long lines. measureMonoF keeps it sub-pixel exact.
+    const charw: f32 = t.measureMonoF(t.z("MM", .{}), csz) - t.measureMonoF(t.z("M", .{}), csz);
+    // one pass: line count + longest line length (drives the horizontal content width)
     var total_lines: usize = 1;
-    for (content[0..cl]) |ch| {
-        if (ch == '\n') total_lines += 1;
+    var max_len: usize = 0;
+    {
+        var cur: usize = 0;
+        for (content[0..cl]) |ch| {
+            if (ch == '\n') {
+                if (cur > max_len) max_len = cur;
+                cur = 0;
+                total_lines += 1;
+            } else cur += 1;
+        }
+        if (cur > max_len) max_len = cur;
     }
+    const content_w: f32 = @as(f32, @floatFromInt(max_len)) * charw + 4;
+    const h_over = content_w > view.width;
+    const hbar_h: f32 = if (h_over) 10 else 0;
+    const text_h: f32 = view.height - hbar_h;
+    const visible: usize = if (text_h > line_h) @intFromFloat(text_h / line_h) else 1; // guard @intFromFloat on a degenerate (short-window) pane
+    // scroll input: Shift+wheel pans horizontally, plain wheel scrolls vertically
+    const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
     const wheel = rl.getMouseWheelMove();
-    if (wheel != 0 and t.hovering(view)) ui.chat_file_scroll -= wheel * 3;
+    if (wheel != 0 and t.hovering(view)) {
+        if (shift) ui.chat_file_hscroll -= wheel * charw * 3 else ui.chat_file_scroll -= wheel * 3;
+    }
     if (ui.chat_file_scroll < 0) ui.chat_file_scroll = 0;
     const maxs: f32 = if (total_lines > visible) @floatFromInt(total_lines - visible) else 0;
     if (ui.chat_file_scroll > maxs) ui.chat_file_scroll = maxs;
+    const hmax: f32 = if (h_over) content_w - view.width + 4 else 0;
+    // horizontal scrollbar — click / drag the track to pan (the discoverable control for long lines)
+    if (h_over) {
+        const track = t.Rect{ .x = view.x, .y = view.y + view.height - 7, .width = view.width - 2, .height = 6 };
+        t.panel(track, t.withAlpha(t.border, 120));
+        const thumb_w = @max(28.0, track.width * (view.width / content_w));
+        const travel = track.width - thumb_w;
+        if (rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.chat_file_hgrab = true;
+        if (!rl.isMouseButtonDown(.left)) ui.chat_file_hgrab = false;
+        if (ui.chat_file_hgrab and travel > 0) {
+            const rel = std.math.clamp((rl.getMousePosition().x - track.x - thumb_w / 2) / travel, 0.0, 1.0);
+            ui.chat_file_hscroll = rel * hmax;
+        }
+        if (t.hovering(track)) t.wantCursor(.pointing_hand);
+        const hx = if (hmax > 0) track.x + (ui.chat_file_hscroll / hmax) * travel else track.x;
+        t.panel(.{ .x = hx, .y = track.y, .width = thumb_w, .height = track.height }, t.fg_dim);
+    }
+    if (ui.chat_file_hscroll < 0) ui.chat_file_hscroll = 0;
+    if (ui.chat_file_hscroll > hmax) ui.chat_file_hscroll = hmax;
     const skip: usize = @intFromFloat(ui.chat_file_scroll);
+    const lang = hlLangFor(selfile[0..sfl]);
+    const xoff: f32 = view.x + 2 - ui.chat_file_hscroll;
+    var st: HlState = .{};
     var yy: f32 = view.y;
     var it = std.mem.splitScalar(u8, content[0..cl], '\n');
     var ln: usize = 0;
     while (it.next()) |line| : (ln += 1) {
-        if (ln < skip) continue;
-        if (yy > view.y + view.height - line_h) break;
-        t.textMonoClip(line, @intFromFloat(view.x + 2), @intFromFloat(yy), 13, t.fg_dim, @intFromFloat(view.width - 6));
+        if (ln < skip) {
+            _ = hlClassify(lang, line, &st); // advance cross-line comment/string state without drawing
+            continue;
+        }
+        if (yy > view.y + text_h - line_h) break;
+        drawCodeLine(line, xoff, yy, csz, charw, lang, &st);
         yy += line_h;
     }
     if (cl == 0) t.text(t.z("(empty or still being written)", .{}), @intFromFloat(view.x + 2), @intFromFloat(view.y), 12, t.comment);
