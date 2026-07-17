@@ -68,8 +68,8 @@ const ADMIN_TOOLS = [_][]const u8{
     "run_python",      "run_tests",        "patch_system", "make_tool",     "propose_change",
     "simulate_change", "stage_delivery",   "osint_scan",   "host_status",   "host_command",
     "host_explore",    "browser_navigate", "browser_read", "browser_click", "browser_type",
-    "browser_eval",    "browser_close",    "pixel_ingest", "pixel_search",  "mcp_discover",
-    "mcp_call",
+    "browser_eval",    "browser_close",    "pixel_ingest", "pixel_capture", "pixel_search",
+    "mcp_discover",    "mcp_call",
 };
 
 fn toolSafe(name: []const u8) bool {
