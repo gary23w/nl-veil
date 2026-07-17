@@ -2928,8 +2928,11 @@ fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u
     const CLIENT_ACK_TIMEOUT_S: i64 = 20; // no ack at all → nothing is attached in client mode; fail fast
     const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // patience from t0 AND from each fresh ack/heartbeat
     var acked = false;
-    return awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked) orelse
-        gpa.dupe(u8, if (acked)
+    var stopped = false;
+    return awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped) orelse
+        gpa.dupe(u8, if (stopped)
+            "(STOP requested by the user — this tool call was canceled, not failed. Do NOT retry it; acknowledge the stop and end the turn.)"
+        else if (acked)
             "(the client started this tool but stopped answering before returning a result — it may have crashed mid-run; verify the state before retrying)"
         else
             "(no desk/CLI client picked up this tool call — the client that started this conversation looks disconnected)") catch emptyRes();
@@ -2947,13 +2950,20 @@ const CLIENT_HARD_CAP_S: i64 = 1200;
 /// posts for this id (the desk heartbeats while its tool subprocess runs) extends it to now + `ack_patience_s`,
 /// capped at CLIENT_HARD_CAP_S total. `saw_ack` (optional) reports whether the client ever acked, so the caller
 /// can tell "client gone" from "client died mid-run". gpa-owned result; null = stopped or timed out.
-fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, start_offset: usize, no_ack_timeout_s: i64, ack_patience_s: i64, saw_ack: ?*bool) ?[]u8 {
+fn awaitClientResult(app: *App, conv_dir: []const u8, id: []const u8, ctrl_cursor: usize, start_offset: usize, no_ack_timeout_s: i64, ack_patience_s: i64, saw_ack: ?*bool, saw_stop: ?*bool) ?[]u8 {
     const t0 = nowSecs(app.io);
     var deadline = t0 + no_ack_timeout_s;
     const hard_cap = t0 + CLIENT_HARD_CAP_S;
     var cursor: usize = start_offset;
     while (nowSecs(app.io) < @min(deadline, hard_cap)) {
-        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) return null;
+        if (stopRequestedSince(app, conv_dir, ctrl_cursor)) {
+            // A user STOP, not a client failure — report which. Conflated, every remaining delegation in the
+            // batch instant-failed as "(no desk/CLI client picked up …)", the model read a transient bridge
+            // loss and RETRIED against the user's stop (observed live: Stop presses reading as write_file
+            // "failures" in bursts while the desk executed everything it was actually asked).
+            if (saw_stop) |ss| ss.* = true;
+            return null;
+        }
         const chan = scanToolChannel(app, conv_dir, id, &cursor);
         if (chan.result) |r| return r;
         if (chan.acks > 0) { // fresh acks since the last poll — client is alive and working
@@ -3020,7 +3030,7 @@ fn syncExchange(app: *App, conv_dir: []const u8, workdir: []const u8, ctrl_curso
     if (!built) return null;
     const start_offset = toolResultsLen(app, conv_dir);
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null) orelse return null;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return null;
     defer gpa.free(resp);
     const parsed = std.json.parseFromSlice(cync.ManifestResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return null;
     const shared = std.mem.eql(u8, std.mem.trim(u8, parsed.value.probe, " \r\n\t"), token);
@@ -3103,7 +3113,7 @@ fn pullClientFilesRooted(app: *App, conv_dir: []const u8, workdir: []const u8, c
     if (!built) return 0;
     const start_offset = toolResultsLen(app, conv_dir);
     emitEvent(app, conv_dir, ev.items);
-    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null) orelse return 0;
+    const resp = awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, SYNC_WAIT_S, SYNC_WAIT_S, null, null) orelse return 0;
     defer gpa.free(resp);
     const parsed = std.json.parseFromSlice(cync.PullResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch return 0;
     defer parsed.deinit();
