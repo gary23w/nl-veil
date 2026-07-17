@@ -3620,15 +3620,29 @@ pub const Chat = struct {
     fn cmdSaveKey(self: *Chat, dd: []const u8, key: []const u8) void {
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
-        const ok = secrets.save(self.io, self.gpa, side, key);
+        // Save under the CURRENTLY-SELECTED provider's own slot, not one shared file — otherwise a key saved
+        // while DeepSeek is selected is silently reused for (and mismatched with) every other provider.
+        var kind: u8 = 0;
+        var byok: u8 = 0;
         {
+            self.store.lock();
+            defer self.store.unlock();
+            kind = self.store.settings.chat_kind;
+            byok = self.store.settings.chat_byok;
+        }
+        const slug = keySlug(kind, byok);
+        const ok = slug.len > 0 and secrets.saveFor(self.io, self.gpa, side, slug, key);
+        if (ok) {
             self.store.lock();
             defer self.store.unlock();
             const n = @min(key.len, self.store.settings.chat_key.len);
             @memcpy(self.store.settings.chat_key[0..n], key[0..n]);
             self.store.settings.chat_key_len = @intCast(n);
         }
-        if (ok) self.store.pushNotif("Key saved", "stored in the local (user-private) store", 1) else self.store.pushNotif("Key NOT saved", "could not write the local store", 2);
+        if (ok)
+            self.store.pushNotif("Key saved", "stored for this provider in the local (user-private) store", 1)
+        else
+            self.store.pushNotif("Key NOT saved", if (slug.len == 0) "a local model needs no key" else "could not write the local store", 2);
     }
 
     /// Store the GitHub PAT (plaintext-local — this is a local, login-gated app). It goes to the local store the
@@ -3751,6 +3765,10 @@ pub const Chat = struct {
             log.warn("chat: could not persist settings", .{});
         };
         self.syncBrowserPref(browser_headful);
+        // A settings save may have SWITCHED the chat provider — reload THAT provider's own key into
+        // settings.chat_key so the "key set" indicator and the key actually sent always match the selected
+        // provider, and never linger from the one before it.
+        self.loadKey(dd);
     }
 
     /// Mirror the "show browser window" choice to a small prefs file the local browser daemon reads at each
@@ -3842,16 +3860,33 @@ pub const Chat = struct {
         s.server_chat = std.mem.indexOf(u8, data, "\"srv_brain\":false") == null;
     }
 
+    /// Load the CURRENTLY-SELECTED provider's key into settings.chat_key (what resolveProvider sends and the
+    /// "key set" indicator shows). Called at startup and after every settings change, so switching provider
+    /// swaps in that provider's own key — or CLEARS it (len 0) when that provider has none, so another
+    /// provider's key never lingers as a mismatch. Local (Ollama) needs no key → always cleared.
     fn loadKey(self: *Chat, dd: []const u8) void {
         var sb: [600]u8 = undefined;
         const side = sideDir(dd, &sb);
+        var kind: u8 = 0;
+        var byok: u8 = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            kind = self.store.settings.chat_kind;
+            byok = self.store.settings.chat_byok;
+        }
+        const slug = keySlug(kind, byok);
         var kb: [192]u8 = undefined;
-        const n = secrets.load(self.io, self.gpa, side, &kb);
-        if (n == 0) return;
+        var n: usize = 0;
+        if (slug.len > 0) {
+            n = secrets.loadFor(self.io, self.gpa, side, slug, &kb);
+            if (n == 0) n = secrets.migrateLegacy(self.io, self.gpa, side, slug, &kb); // one-time upgrade from the old shared key
+        }
         self.store.lock();
         defer self.store.unlock();
-        @memcpy(self.store.settings.chat_key[0..n], kb[0..n]);
-        self.store.settings.chat_key_len = @intCast(n);
+        const m = @min(n, self.store.settings.chat_key.len);
+        @memcpy(self.store.settings.chat_key[0..m], kb[0..m]);
+        self.store.settings.chat_key_len = @intCast(m); // 0 clears — this provider has no saved key
     }
 
     // ------------------------------------------------------------------------------ conversations on disk
@@ -9398,6 +9433,18 @@ pub fn castProviderId(kind: u8, byok: u8) []const u8 {
         1 => catalog.providers[@min(byok, catalog.providers.len - 1)].key,
         2 => "openai",
         else => "ollama",
+    };
+}
+
+/// The at-rest key SLOT for the current chat provider — each BYOK cloud provider keeps its OWN saved key so
+/// switching providers never reuses (or mismatches) another's key. "" = local (Ollama), which needs none.
+/// Unlike castProviderId, the custom URL gets its own "custom" slot (not aliased to "openai") so a custom
+/// endpoint's key can never collide with the OpenAI BYOK key.
+pub fn keySlug(kind: u8, byok: u8) []const u8 {
+    return switch (kind) {
+        1 => catalog.providers[@min(byok, catalog.providers.len - 1)].key,
+        2 => "custom",
+        else => "", // local — no key
     };
 }
 
