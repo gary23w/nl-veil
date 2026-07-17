@@ -141,6 +141,9 @@ const Ui = struct {
     chat_file_hscroll: f32 = 0, // HORIZONTAL scroll offset (px) for the chat Files content viewer
     chat_file_hgrab: bool = false, // dragging the Files viewer horizontal scrollbar thumb
     chat_file_list_scroll: f32 = 0, // scroll offset (px) for the chat Files LEFT file list
+    llm_scroll: f32 = 0, // Dashboard LLM BREAKDOWN vertical scroll (the model list can exceed its panel)
+    tbl_hscroll: [4]TblHScroll = .{ .{}, .{}, .{}, .{} }, // per chat-table horizontal scroll (content-keyed FIFO)
+    tbl_hgrab: u64 = 0, // id of the chat table whose h-scrollbar thumb is being dragged (0 = none)
     pane_drag: PaneDrag = .none, // which side-panel divider is being dragged (drag-to-resize)
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
@@ -255,8 +258,11 @@ const Ui = struct {
     details_scroll: f32 = 0, // swarm Details tab: the goal + config + blueprint can outgrow the panel
 
     const Focus = enum { none, chat, d_name, d_key, d_cfacct, d_goal, d_gateway, c_input, c_rename, s_model, s_url, s_ckey, s_cfacct, s_tkey, s_pkey, s_host, s_port, con_input, sc_name, sc_prompt, sc_details, sc_base, sc_model, sc_key };
+    // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
+    // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
+    const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
     const Field = struct {
-        buf: [1200]u8 = [_]u8{0} ** 1200,
+        buf: [4096]u8 = [_]u8{0} ** 4096, // 4K: the chat composer's char budget scales up to ~4000 for large models
         len: usize = 0,
         cur: usize = 0, // caret byte index (0..=len), kept on a UTF-8 codepoint boundary
         sel: ?usize = null, // selection anchor; the selection is [min(cur,sel), max(cur,sel))
@@ -1629,16 +1635,33 @@ fn drawLlmTable(store: *Store, r: t.Rect) void {
     const cx_in = r.x + r.width - 162;
     const cx_out = r.x + r.width - 108;
     const cx_spd = r.x + r.width - 56;
-    var yy = r.y + 32;
-    t.text(t.z("calls", .{}), @intFromFloat(cx_calls), @intFromFloat(yy), 11, t.comment);
-    t.text(t.z("in", .{}), @intFromFloat(cx_in), @intFromFloat(yy), 11, t.comment);
-    t.text(t.z("out", .{}), @intFromFloat(cx_out), @intFromFloat(yy), 11, t.comment);
-    t.text(t.z("tok/s", .{}), @intFromFloat(cx_spd), @intFromFloat(yy), 11, t.comment);
-    yy += 18;
-    rl.beginScissorMode(@intFromFloat(r.x), @intFromFloat(yy - 2), @intFromFloat(r.width), @intFromFloat(r.y + r.height - yy));
+    const hdr_y = r.y + 32;
+    t.text(t.z("calls", .{}), @intFromFloat(cx_calls), @intFromFloat(hdr_y), 11, t.comment);
+    t.text(t.z("in", .{}), @intFromFloat(cx_in), @intFromFloat(hdr_y), 11, t.comment);
+    t.text(t.z("out", .{}), @intFromFloat(cx_out), @intFromFloat(hdr_y), 11, t.comment);
+    t.text(t.z("tok/s", .{}), @intFromFloat(cx_spd), @intFromFloat(hdr_y), 11, t.comment);
+    // The model list can outgrow the panel — make it vertically SCROLLABLE. rowH = model line (16) + optional
+    // host line (14) + gap (4). content_h drives the scroll clamp + the thumb; a plain wheel over the panel pans.
+    const top = r.y + 50;
+    const bot = r.y + r.height - 6;
+    const visible_h = @max(0, bot - top);
+    var content_h: f32 = 0;
+    for (rows[0..n]) |*m| content_h += 20 + (if (m.base_len > 0) @as(f32, 14) else 0);
+    const max_scroll = @max(0, content_h - visible_h);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and max_scroll > 0 and t.hovering(r)) ui.llm_scroll -= wheel * 24;
+    if (ui.llm_scroll < 0) ui.llm_scroll = 0;
+    if (ui.llm_scroll > max_scroll) ui.llm_scroll = max_scroll;
+
+    rl.beginScissorMode(@intFromFloat(r.x), @intFromFloat(top - 2), @intFromFloat(r.width), @intFromFloat(visible_h + 2));
     defer rl.endScissorMode();
+    var yy = top - ui.llm_scroll;
     for (rows[0..n]) |*m| {
-        if (yy > r.y + r.height - 14) break;
+        const row_h: f32 = 20 + (if (m.base_len > 0) @as(f32, 14) else 0);
+        if (yy > bot or yy + row_h < top) {
+            yy += row_h; // cull off-screen rows but keep advancing so positions stay stable
+            continue;
+        }
         t.textClip(m.modelStr(), @intFromFloat(r.x + 14), @intFromFloat(yy), 12, t.fg, @intFromFloat(@max(40, cx_calls - r.x - 22)));
         var b1: [24]u8 = undefined;
         var b2: [24]u8 = undefined;
@@ -1650,11 +1673,18 @@ fn drawLlmTable(store: *Store, r: t.Rect) void {
         t.text(t.z("{d}", .{spd}), @intFromFloat(cx_spd), @intFromFloat(yy), 12, t.green);
         yy += 16;
         // the provider host under the model, quieter — the same model id can live on two providers
-        if (m.base_len > 0 and yy <= r.y + r.height - 12) {
+        if (m.base_len > 0) {
             t.textClip(m.baseStr(), @intFromFloat(r.x + 14), @intFromFloat(yy), 10, t.withAlpha(t.comment, 180), @intFromFloat(@max(40, cx_calls - r.x - 22)));
             yy += 14;
         }
         yy += 4;
+    }
+    // vertical scrollbar (only when the list overflows) — a thin thumb hugging the panel's right edge
+    if (max_scroll > 0 and content_h > 0) {
+        const thumb_h = @max(24.0, visible_h * (visible_h / content_h));
+        const travel = visible_h - thumb_h;
+        const ty = top + (ui.llm_scroll / max_scroll) * travel;
+        t.panel(.{ .x = r.x + r.width - 5, .y = ty, .width = 4, .height = thumb_h }, t.fg_dim);
     }
 }
 
@@ -2761,21 +2791,48 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     return yy + MSG_GAP_H;
 }
 
-/// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns,
-/// FITTED to the viewport: when the natural column widths overflow the message area, columns shrink
-/// (widest first, floor of 5 chars) and long cells clip with ".." — every column stays visible and
-/// aligned at any window size, instead of the old whole-line right-edge amputation that left broken
-/// fragments of the last columns. Re-fits every frame, so resizing the window re-flows the table live.
+/// The chat composer's soft character budget for the current (input) model. A small 8B-class model degrades on
+/// long prompts while a frontier one shrugs them off, so the limit is sensed from the model's tier: small → 500,
+/// mid → 2000, large/frontier → 4000. It only warns (the [4096]u8 buffer is the hard cap), and it's the reason
+/// the composer buffer was grown past the old 1200 — so a big model's budget is actually reachable.
+fn inputCharLimit(model: []const u8, is_local: bool) usize {
+    return switch (catalog.senseModel(model, is_local).tier) {
+        .small => 500,
+        .mid => 2000,
+        .large => 4000,
+    };
+}
+
+/// The horizontal-scroll offset (px) for chat table `id` — a tiny content-keyed FIFO so each wide table keeps
+/// its own scroll across frames (and across vertical scroll / stream-settle). Draw-pass only (mutates ui). A
+/// brand-new id evicts the oldest slot.
+fn tblScrollOff(id: u64) *f32 {
+    for (&ui.tbl_hscroll) |*s| {
+        if (s.id == id) return &s.off;
+    }
+    var k: usize = ui.tbl_hscroll.len - 1;
+    while (k > 0) : (k -= 1) ui.tbl_hscroll[k] = ui.tbl_hscroll[k - 1];
+    ui.tbl_hscroll[0] = .{ .id = id, .off = 0 };
+    return &ui.tbl_hscroll[0].off;
+}
+
+/// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns at their
+/// NATURAL width. When the table is wider than the message band it SCROLLS HORIZONTALLY — Shift+wheel over the
+/// table pans it, and a draggable scrollbar sits under it — instead of shrinking columns and amputating cells
+/// with "..". Each table keeps its own offset (keyed by a content hash). Rows that fit are drawn as before.
 fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: bool) f32 {
     var yy = y0;
     const MAXC = 10;
-    const COL_MIN: usize = 5;
     var colw: [MAXC]usize = [_]usize{0} ** MAXC;
     var ncols: usize = 0;
-    // pass 1: natural column widths (in bytes ~ mono chars)
+    var header_bytes: []const u8 = "";
+    var nrows: usize = 0;
+    // pass 1: NATURAL column widths (bytes ~ mono chars). No shrink-to-fit — an over-wide table scrolls.
     for (rows) |row| {
         const tl = std.mem.trim(u8, row, " \r\t");
         if (md.isTableSep(tl)) continue;
+        if (header_bytes.len == 0) header_bytes = tl; // the first data row (header) keys this table's scroll
+        nrows += 1;
         var it = std.mem.splitScalar(u8, md.tableInner(tl), '|');
         var ci_: usize = 0;
         while (it.next()) |cell| {
@@ -2788,27 +2845,44 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
         if (ci_ > ncols) ncols = ci_;
     }
     if (ncols == 0) return yy;
-    // fit: shrink the widest column one char at a time until the row fits the viewport's mono columns
     const char_w = @max(1, t.measureMono("M", fsz));
+    const cw_f: f32 = @floatFromInt(char_w);
+    // avail_chars = how many mono chars are visible (the horizontal draw window). Overflow is judged in PIXELS
+    // against the SAME band the scroll extent uses (view.width - 28), so a table that overflows always gets a
+    // real scroll range — no near-fit window where the thumb would fill the track and then travel backwards.
     const avail_chars: usize = @intCast(@max(16, @divTrunc(@as(i32, @intFromFloat(view.width - 40)), char_w)));
-    var total: usize = 3 * (ncols - 1);
-    for (colw[0..ncols]) |cw| total += cw;
-    while (total > avail_chars) {
-        var widest: usize = 0;
-        for (colw[0..ncols], 0..) |cw, i| {
-            if (cw > colw[widest]) widest = i;
-        }
-        if (colw[widest] <= COL_MIN) break; // every column at the floor — physically can't fit; clip the tail
-        colw[widest] -= 1;
-        total -= 1;
+    var natural_chars: usize = 3 * (ncols - 1);
+    for (colw[0..ncols]) |cw| natural_chars += cw;
+    const natural_px: f32 = @as(f32, @floatFromInt(natural_chars)) * cw_f;
+    const inner_px: f32 = view.width - 28;
+    const h_over = natural_px > inner_px;
+    const hmax: f32 = if (h_over) @max(0, natural_px - inner_px + 8) else 0;
+    const hbar_h: f32 = if (h_over) 9 else 0;
+    const table_h: f32 = @as(f32, @floatFromInt(nrows)) * MSG_LINE_H;
+    // Only an ON-SCREEN table touches the scroll FIFO / handles input — else >4 wide tables in one conversation
+    // would evict each other's offsets every frame (yy is still y0 here; pass 2 advances it below).
+    const tbl_visible = inView(view, yy, table_h + hbar_h);
+    const tbl_id: u64 = std.hash.Wyhash.hash(@intCast(ncols), header_bytes);
+    var off_ptr: ?*f32 = null;
+    var hoff: f32 = 0;
+    if (draw and h_over and tbl_visible) {
+        off_ptr = tblScrollOff(tbl_id);
+        hoff = off_ptr.?.*;
+        // Shift+wheel pans the hovered table (plain wheel still scrolls the chat — see drawChat's wheel guard)
+        const trect = t.Rect{ .x = view.x + 8, .y = yy - 2, .width = view.width - 16, .height = table_h + hbar_h };
+        const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
+        const wheel = rl.getMouseWheelMove();
+        if (shift and wheel != 0 and t.hovering(trect)) hoff -= wheel * cw_f * 3;
     }
-    // pass 2: draw each non-separator row as padded, joined cells, each CELL clipped to its fitted width
+
+    // pass 2: draw each non-separator row. Overflowing tables draw only the VISIBLE slice at the h-offset (no
+    // per-row scissor: the chat body scissor clips the sides and textMonoClip caps the right edge).
     var header = true;
     var body_row: usize = 0; // zebra counter (data rows only)
     for (rows) |row| {
         const tl = std.mem.trim(u8, row, " \r\t");
         if (md.isTableSep(tl)) continue;
-        var lb: [1024]u8 = undefined;
+        var lb: [4096]u8 = undefined;
         var w: usize = 0;
         var it = std.mem.splitScalar(u8, md.tableInner(tl), '|');
         var ci_: usize = 0;
@@ -2820,19 +2894,11 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
                 w += sep.len;
             }
             var cb: [256]u8 = undefined;
-            var cl = md.cleanInline(&cb, cell);
-            if (cl > colw[ci_]) {
-                // clip to the fitted column with a ".." tail so a shrunk cell reads as clipped, not broken
-                cl = colw[ci_];
-                if (cl >= 2) {
-                    cb[cl - 1] = '.';
-                    cb[cl - 2] = '.';
-                }
-            }
+            const cl = md.cleanInline(&cb, cell);
             const take = @min(cl, lb.len - w);
             @memcpy(lb[w .. w + take], cb[0..take]);
             w += take;
-            // pad to the column width (skip padding the final column)
+            // pad to the natural column width (skip padding the final column)
             if (ci_ + 1 < ncols and colw[ci_] > cl) {
                 const pad = @min(colw[ci_] - cl, lb.len - w);
                 @memset(lb[w .. w + pad], ' ');
@@ -2847,12 +2913,42 @@ fn renderTable(view: t.Rect, y0: f32, rows: []const []const u8, fsz: i32, draw: 
                 // zebra striping: alternate data rows get a whisper of fill so wide tables stay scannable
                 t.fillRect(@intFromFloat(view.x + 8), @intFromFloat(yy - 2), @intFromFloat(view.width - 16), @intFromFloat(MSG_LINE_H), t.withAlpha(t.bg_hl, 55));
             }
-            t.textMonoClip(lb[0..w], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, if (header) t.fg else t.fg_dim, @intFromFloat(view.width - 26));
+            const col = if (header) t.fg else t.fg_dim;
+            if (h_over) {
+                const start: usize = @min(w, @as(usize, @intFromFloat(@max(0, hoff) / cw_f)));
+                const end: usize = @min(w, start + avail_chars + 4);
+                const x_draw = view.x + 14 - hoff + @as(f32, @floatFromInt(start)) * cw_f;
+                const right = view.x + view.width - 14;
+                if (end > start and x_draw < right) t.textMonoClip(lb[start..end], @intFromFloat(x_draw), @intFromFloat(yy), fsz, col, @intFromFloat(@max(0, right - x_draw)));
+            } else {
+                t.textMonoClip(lb[0..w], @intFromFloat(view.x + 14), @intFromFloat(yy), fsz, col, @intFromFloat(view.width - 26));
+            }
         }
         yy += MSG_LINE_H;
         if (!header) body_row += 1;
         header = false;
     }
+
+    // horizontal scrollbar under the table (draw pass, overflow + on-screen only) — click/drag the track to pan
+    if (draw and h_over and tbl_visible) {
+        const track = t.Rect{ .x = view.x + 8, .y = yy + 1, .width = view.width - 16, .height = 6 };
+        t.panel(track, t.withAlpha(t.border, 120));
+        const thumb_w = @max(28.0, track.width * (inner_px / natural_px));
+        const travel = track.width - thumb_w;
+        if (rl.isMouseButtonPressed(.left) and t.hovering(track)) ui.tbl_hgrab = tbl_id;
+        if (!rl.isMouseButtonDown(.left) and ui.tbl_hgrab == tbl_id) ui.tbl_hgrab = 0;
+        if (ui.tbl_hgrab == tbl_id and travel > 0) {
+            const rel = std.math.clamp((rl.getMousePosition().x - track.x - thumb_w / 2) / travel, 0.0, 1.0);
+            hoff = rel * hmax;
+        }
+        if (t.hovering(track)) t.wantCursor(.pointing_hand);
+        if (hoff < 0) hoff = 0;
+        if (hoff > hmax) hoff = hmax;
+        const hx = if (hmax > 0) track.x + (hoff / hmax) * travel else track.x;
+        t.panel(.{ .x = hx, .y = track.y, .width = thumb_w, .height = track.height }, t.fg_dim);
+        if (off_ptr) |p| p.* = hoff; // persist the (possibly dragged / clamped) offset
+    }
+    yy += hbar_h;
     return yy + 4;
 }
 
@@ -3481,8 +3577,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (cast_live) total += renderCastLive(view, 0, status, false);
 
     const max_scroll = if (total > view.height) total - view.height else 0;
+    // Release any table-scrollbar drag on mouse-up here, ONCE per frame and unconditionally — renderTable's own
+    // release is gated on the table being on-screen, so a table dragged off-screen and released there would
+    // otherwise leave tbl_hgrab stuck and hijack a later click when it scrolls back into view.
+    if (!rl.isMouseButtonDown(.left)) ui.tbl_hgrab = 0;
     const wheel = rl.getMouseWheelMove();
-    if (wheel != 0 and t.hovering(view)) {
+    // Shift+wheel is reserved for panning a wide markdown table horizontally (renderTable) — so a plain wheel
+    // scrolls the conversation, and Shift+wheel over a table pans it instead of also moving the chat.
+    if (wheel != 0 and t.hovering(view) and !(rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift))) {
         ui.chat_scroll -= wheel * 3 * MSG_LINE_H;
         ui.chat_follow = false;
     }
@@ -3714,6 +3816,32 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - 16, 18))); // textArea's 18px line pitch
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
     textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows);
+    // MODEL-SCALED CHARACTER BUDGET: a live count in the composer's bottom-right against a limit sensed from the
+    // current (coding/input) model — a small 8B model gets ~500, a frontier one ~4000 (inputCharLimit). Soft: it
+    // only recolors (dim → orange near the cap → red over); the [4096]u8 buffer is the hard stop. Shown while
+    // composing or focused so an idle empty box stays clean.
+    if (ui.c_input.len > 0 or ui.focus == .c_input) {
+        var mbuf: [96]u8 = undefined;
+        var mlen: usize = 0;
+        var is_local = false;
+        {
+            store.lock();
+            const s = &store.settings;
+            mlen = @min(s.chat_model_len, mbuf.len);
+            @memcpy(mbuf[0..mlen], s.chat_model[0..mlen]);
+            is_local = s.chat_kind == 0;
+            store.unlock();
+        }
+        const limit = inputCharLimit(mbuf[0..mlen], is_local);
+        const used = ui.c_input.len;
+        const label = t.z("{d}/{d}", .{ used, limit });
+        const lw: f32 = @floatFromInt(t.measure(label, 11));
+        const col = if (used > limit) t.red else if (used * 5 > limit * 4) t.orange else t.withAlpha(t.comment, 150);
+        const lx = cf.x + cf.width - lw - 8;
+        const ly = cf.y + cf.height - 16;
+        t.fillRect(@intFromFloat(lx - 4), @intFromFloat(ly - 1), @intFromFloat(lw + 8), 14, t.withAlpha(t.bg, 210)); // faint backdrop so it stays legible over typed text
+        t.text(label, @intFromFloat(lx), @intFromFloat(ly), 11, col);
+    }
     // Shift+Enter inserts a literal newline in EVERY turn state (drafting a multi-paragraph or blank-line
     // message / steer) — every send/post key below gates on !shift, so this never doubles with a send.
     if (ui.focus == .c_input and (rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter)) and

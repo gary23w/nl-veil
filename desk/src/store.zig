@@ -588,7 +588,7 @@ pub const ChatCommand = struct {
     kind: ChatCmdKind = .none,
     id: [96]u8 = [_]u8{0} ** 96, // conversation id or cast run rel-path
     id_len: u8 = 0,
-    text: [1600]u8 = [_]u8{0} ** 1600, // message text / new title / api key
+    text: [4096]u8 = [_]u8{0} ** 4096, // message text (up to the large-model input budget) / new title / api key
     text_len: u16 = 0,
 
     pub fn idStr(c: *const ChatCommand) []const u8 {
