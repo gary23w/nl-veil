@@ -2544,7 +2544,9 @@ pub const Chat = struct {
     // the UI can show where the next command will run.
 
     /// The You shell's EFFECTIVE current directory: the user's own `cd` target if set, else this chat's build
-    /// workdir, else the app's own cwd resolved absolute ("" only if even that fails).
+    /// workdir, else the app's own cwd resolved absolute ("" only if even that fails). The cwd fallback opens
+    /// "." for a REAL handle first — realPath on the Dir.cwd() pseudo-handle (AT_FDCWD) fails on POSIX, which
+    /// silently emptied the cwd and made relative `cd` resolve against "/" (caught by CI on Linux).
     fn consoleEffCwd(self: *Chat, buf: []u8) []const u8 {
         if (self.console_cwd_len > 0) {
             const n = @min(self.console_cwd_len, buf.len);
@@ -2556,7 +2558,9 @@ pub const Chat = struct {
             @memcpy(buf[0..n], self.build_dir[0..n]);
             return buf[0..n];
         }
-        const n = Io.Dir.cwd().realPath(self.io, buf) catch return "";
+        var d = Io.Dir.cwd().openDir(self.io, ".", .{}) catch return "";
+        defer d.close(self.io);
+        const n = d.realPath(self.io, buf) catch return "";
         return buf[0..n];
     }
 
@@ -2628,8 +2632,10 @@ pub const Chat = struct {
     /// directory. Quotes and the cmd-ism `/d` are tolerated so muscle memory from both shells works.
     fn consoleCd(self: *Chat, arg0: []const u8) void {
         var arg = arg0;
-        if (arg.len >= 2 and (arg[0] == '/' or arg[0] == '-') and (arg[1] == 'd' or arg[1] == 'D'))
-            arg = std.mem.trimStart(u8, arg[2..], " \t"); // `cd /d X` — the drive switch is implicit here
+        // `cd /d X` — cmd's drive switch is implicit here. Only strip a `/d` FOLLOWED BY WHITESPACE, so a
+        // real POSIX path like `cd /data` (or a dir literally named "/d") is never mangled.
+        if (arg.len >= 3 and arg[0] == '/' and (arg[1] == 'd' or arg[1] == 'D') and (arg[2] == ' ' or arg[2] == '\t'))
+            arg = std.mem.trimStart(u8, arg[2..], " \t");
         if (arg.len >= 2 and ((arg[0] == '"' and arg[arg.len - 1] == '"') or (arg[0] == '\'' and arg[arg.len - 1] == '\'')))
             arg = arg[1 .. arg.len - 1];
         var eb: [400]u8 = undefined;
@@ -12739,6 +12745,16 @@ test "micro-console: cd/pwd/cls builtins keep a persistent cwd in-process (no sp
     ctx.chat.consoleStart(dd, false, "pwd");
     try std.testing.expect(ctx.chat.console == null);
     try std.testing.expect(consoleScrollHas(ctx.store, false, "subdir"));
+    // cmd muscle memory: a `/d ` SWITCH (with whitespace) strips in front of an absolute target on any OS —
+    // while a plain `/d...`-shaped POSIX path would stay intact (only the spaced form is the switch)
+    var abs_buf: [400]u8 = undefined;
+    const abs_n = ctx.chat.console_cwd_len;
+    @memcpy(abs_buf[0..abs_n], ctx.chat.console_cwd[0..abs_n]);
+    ctx.chat.console_cwd_len = 0; // back on the app cwd
+    var cdb: [420]u8 = undefined;
+    const cdcmd = std.fmt.bufPrint(&cdb, "cd /d {s}", .{abs_buf[0..abs_n]}) catch unreachable;
+    ctx.chat.consoleStart(dd, false, cdcmd);
+    try std.testing.expect(std.mem.endsWith(u8, ctx.chat.console_cwd[0..ctx.chat.console_cwd_len], "subdir"));
     // a bad target is refused and the cwd stays put
     const before = ctx.chat.console_cwd_len;
     ctx.chat.consoleStart(dd, false, "cd definitely-not-a-real-dir-xyz");
