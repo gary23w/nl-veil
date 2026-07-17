@@ -167,6 +167,21 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     var from: usize = 0;
     const q = try req.query();
     if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
+    // SIZE PROBE (from == max u64): answer the events file's TOTAL length as tiny JSON instead of a body.
+    // The desk baselines its server-turn watch at the TAIL with this — transferring the whole backlog broke
+    // on long conversations (the desk HTTP client caps one response at 1MB, so a from=0 fetch of a bigger
+    // file could NEVER complete; the silently-0 cursor then replayed history as live delegations — the
+    // tool-bridge bug). An older desk never sends the sentinel; an older server treats it as past-the-end
+    // and returns an empty 200, which the new desk detects and falls back from. Probe answers 200 even for
+    // a not-yet-written events file (len 0) — the conv-dir 404 above still gates unknown conversations.
+    if (from == std.math.maxInt(u64)) {
+        var size: usize = 0;
+        if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
+            defer f.close(app.io);
+            size = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
+        } else |_| {}
+        return res.json(.{ .ok = true, .len = size }, .{});
+    }
     // POSITIONAL read from the client's cursor `from` — NOT the whole file. A persistent afk turn appends
     // events.jsonl indefinitely; reading the whole file under a fixed cap returns EMPTY once it crosses the cap.
     // The file only grows, so `from` stays valid; one poll's payload is bounded (the desk catches up across polls
@@ -177,7 +192,9 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         defer f.close(app.io);
         const size: usize = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
         if (size > from) {
-            const want = @min(size - from, 8 << 20); // cap one response; the client re-polls for the rest
+            // PAGE bound UNDER the desk httpc's 1MB response cap (was 8MB — a burst bigger than the client
+            // could swallow wedged its poll forever: the delta only grows). Catch-up pages across polls.
+            const want = @min(size - from, 512 << 10);
             if (res.arena.alloc(u8, want)) |buf| {
                 const n = f.readPositionalAll(app.io, buf, from) catch 0;
                 body = buf[0..n];
