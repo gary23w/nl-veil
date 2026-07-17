@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const crypto = @import("../../config/key_vault.zig");
 const NeuronLedger = @import("../../plan/neurons.zig").NeuronLedger;
+const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
 
 const log = std.log.scoped(.supervisor);
 
@@ -402,6 +403,14 @@ pub const Supervisor = struct {
         // retention GC) would wipe the user's files. For those, strip only the cast's own metadata (so retention
         // stops re-listing it and a re-cast starts from a clean slate) and LEAVE the deliverables under work/.
         if (std.mem.indexOf(u8, path, "_chat/builds") != null or std.mem.indexOf(u8, path, "_chat\\builds") != null) {
+            self.cleanCastMeta(path);
+            return true;
+        }
+        // A SCHEDULED task's run dir (`.../_sched/{task}/runs/{stamp}`) is the task's PERMANENT artifact store
+        // — same rule as a chat build dir: strip the cast's own metadata, never tree-delete the user's files.
+        if ((std.mem.indexOf(u8, path, "_sched/") != null or std.mem.indexOf(u8, path, "_sched\\") != null) and
+            (std.mem.indexOf(u8, path, "/runs/") != null or std.mem.indexOf(u8, path, "\\runs\\") != null))
+        {
             self.cleanCastMeta(path);
             return true;
         }
@@ -871,7 +880,20 @@ fn idMatchesRunDir(run_dir: []const u8, id: []const u8) bool {
     if (id.len == 0) return false;
     const trimmed = std.mem.trimEnd(u8, run_dir, "/\\");
     const base = if (std.mem.lastIndexOfAny(u8, trimmed, "/\\")) |i| trimmed[i + 1 ..] else trimmed;
-    return std.mem.eql(u8, base, id);
+    if (std.mem.eql(u8, base, id)) return true;
+    // A SCHEDULED run's cast builds under `.../_sched/{task}/runs/{stamp}` (paths.zig), so its basename is the
+    // bare stamp, not the conv id. Match the mapped tail instead, tolerant of either slash form in run_dir.
+    var tb: [160]u8 = undefined;
+    const tail = cpaths.schedRunTail(&tb, id) orelse return false;
+    if (trimmed.len < tail.len) return false;
+    const cand = trimmed[trimmed.len - tail.len ..];
+    for (cand, tail) |c, t| {
+        const cn = if (c == '\\') '/' else c;
+        if (cn != t) return false;
+    }
+    // the char before the tail must be a separator (or the tail is the whole path) — no substring aliasing
+    const before = trimmed.len - tail.len;
+    return before == 0 or trimmed[before - 1] == '/' or trimmed[before - 1] == '\\';
 }
 
 /// Read at most `buf.len` bytes from the END of the file at `path` (positional read at size-buf.len).
@@ -894,6 +916,11 @@ test "idMatchesRunDir: basename hits on both slash forms, misses on substrings a
     try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", "conv4"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", "builds"));
     try std.testing.expect(!idMatchesRunDir("data/u1/_chat/builds/conv42", ""));
+    // a scheduled conv id matches its task-tree run dir (whose basename is the bare stamp), both slash forms
+    try std.testing.expect(idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "scheduled_news-0715_07171400"));
+    try std.testing.expect(idMatchesRunDir("data\\u1\\_sched\\news-0715\\runs\\07171400", "scheduled_news-0715_07171400"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_sched/news-0715/runs/07171400", "scheduled_news-0715_07179999"));
+    try std.testing.expect(!idMatchesRunDir("data/u1/_sched/xnews-0715/runs/07171400", "scheduled_news-0715_07171400"));
 }
 
 test "readTail: whole small file; only the last bytes of a big one; null for a missing path" {

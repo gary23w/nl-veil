@@ -21,6 +21,7 @@ const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
 const osc = @import("../oscillation.zig");
 const sup_mod = @import("../control/supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
+const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -297,15 +298,19 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
     // (`.../builds/{conv}`, worker builds in `{run_dir}/work`) — so the chat's OWN build tools and a hive cast
     // co-edit ONE tree, and vcs.zig's `.vcs` history for that tree lives in the SAME place the worker process
     // would put it.
+    // (A SCHEDULED run's conv redirects into its task's permanent _sched/{task}/runs/{stamp} tree — paths.zig.)
+    var rrb: [700]u8 = undefined;
     const run_root = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "{s}/builds/{s}", .{ base, conv })
+        try res.arena.dupe(u8, cpaths.buildRootFromChatBase(&rrb, base, conv))
     else
         base;
+    if (conv.len > 0 and run_root.len == 0) return serverErr(res, "could not resolve the build workdir");
     const workdir = try std.fmt.allocPrint(res.arena, "{s}/work", .{run_root});
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
     // data-relative form the desktop can cd its console into (shared filesystem, same machine)
+    var wrb: [256]u8 = undefined;
     const workdir_rel = if (conv.len > 0)
-        try std.fmt.allocPrint(res.arena, "u{d}/_chat/builds/{s}/work", .{ uid, conv })
+        try std.fmt.allocPrint(res.arena, "{s}/work", .{cpaths.buildRootRel(&wrb, uid, conv)})
     else
         try std.fmt.allocPrint(res.arena, "u{d}/_chat/work", .{uid});
     const db = try std.fmt.allocPrint(res.arena, "{s}/hive.sqlite", .{base});
