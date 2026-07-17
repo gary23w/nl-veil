@@ -629,7 +629,12 @@ const DelegProc = struct {
     id_len: usize = 0,
     tool: [64]u8 = undefined, // tool name, for the status line
     tool_len: usize = 0,
-    base: [340]u8 = undefined, // sink path stem; "<base>.out"/".err" capture the subprocess's streams
+    // The ORIGIN conversation this tool_request came from — captured at launch so the async result POSTs back to
+    // the RIGHT conversation's turn, not "whatever conv is active when the subprocess exits". With one conversation
+    // this equals conv_active; it becomes load-bearing the moment a second conversation can run in the background.
+    conv: [64]u8 = undefined,
+    conv_len: usize = 0,
+    base: [352]u8 = undefined, // per-conv sink stem; "<base>.out"/".err" capture the subprocess's streams
     base_len: usize = 0,
     args_file: [900]u8 = undefined, // staged args JSON (deleted once the child is dead)
     af_len: usize = 0,
@@ -643,7 +648,37 @@ const DelegProc = struct {
     fn baseStr(p: *const DelegProc) []const u8 {
         return p.base[0..p.base_len];
     }
+    fn convStr(p: *const DelegProc) []const u8 {
+        return p.conv[0..p.conv_len];
+    }
 };
+
+/// One queued tool_request (a server retry landing while a tool is already in flight) paired with its ORIGIN
+/// conversation, so the queued frame launches + posts back against the conversation it belongs to.
+const QueuedTool = struct {
+    conv: [64]u8 = undefined,
+    conv_len: usize = 0,
+    line: []u8, // heap-owned full tool_request frame
+    fn convStr(q: *const QueuedTool) []const u8 {
+        return q.conv[0..q.conv_len];
+    }
+};
+
+/// A server turn running in the BACKGROUND (a conversation the user switched away from while it was still
+/// working). The desk does NOT render it — it only keeps SERVICING the turn's delegated tool_requests (so the
+/// server-side turn doesn't stall waiting on this client) and watches for {done} to retire the slot. Its
+/// transcript stays authoritative server-side and is re-mirrored when the user switches back (see cmdSelectConv).
+const BgTurn = struct {
+    conv: [64]u8 = undefined,
+    conv_len: usize = 0,
+    from: usize = 0, // events.jsonl byte cursor — only frames past here are new
+    fails: u8 = 0, // consecutive poll failures; retire the slot past a bound so a dead server can't pin it
+    done: bool = false, // saw {done} — the turn finished server-side; the sidebar shows it as ready-to-read
+    fn convStr(b: *const BgTurn) []const u8 {
+        return b.conv[0..b.conv_len];
+    }
+};
+const MAX_BG_TURNS = 3;
 
 pub const Chat = struct {
     io: Io,
@@ -764,7 +799,11 @@ pub const Chat = struct {
     // console — plus a small FIFO for tool_requests that land while one is still running (a server retry after
     // its own timeout). Queued frames are heap-owned copies; each is acked so the server keeps waiting.
     deleg: ?DelegProc = null,
-    deleg_q: [4]?[]u8 = .{null} ** 4,
+    deleg_q: [4]?QueuedTool = .{null} ** 4,
+    // BACKGROUND server turns: conversations left running when the user switched away. pumpBackground services
+    // their delegated tools (via the shared deleg executor + queue) so they finish server-side; they never
+    // render. A conv is added here on switch-away (cmdSelectConv) and removed on switch-back or {done}.
+    bg: [MAX_BG_TURNS]BgTurn = @splat(.{}),
     // COMMAND APPROVAL: a veil RUN: shell command parked awaiting the user's Approve/Bypass/Deny. While set,
     // the turn is held busy (awaitingShellApproval) and no new turn/loop/switch starts. Copied off the stream.
     pending_cmd: [1024]u8 = undefined,
@@ -922,6 +961,8 @@ pub const Chat = struct {
             //                          type out smoothly. No-op unless sc_active.
             self.pumpConsole(dd); // poll any in-flight micro-console command (never blocks the loop)
             self.pumpDelegated(dd); // poll any in-flight server-delegated tool (same non-blocking pattern)
+            if (tick % 10 == 2) self.pumpBackground(dd); // ~1Hz: service BACKGROUND server turns' delegated tools
+            //                                              so conversations the user switched away from finish
             // ~1Hz auto-loop backstop: a .loop_kick that lands the instant a turn is finishing hits maybeLoop's
             // `turn != .idle` guard and is lost — the settle-point call can't recover it if the turn had already
             // settled. Re-checking every idle tick self-heals that gap (maybeLoop no-ops unless loop is on AND the
@@ -1560,6 +1601,115 @@ pub const Chat = struct {
         }
     }
 
+    /// Is `conv` the on-screen (active) conversation? Delegated-tool STATUS updates and stream rendering only
+    /// apply to the foreground; a background turn's tool must not clobber the foreground's status line.
+    fn isForeground(self: *Chat, conv: []const u8) bool {
+        self.store.lock();
+        defer self.store.unlock();
+        const a = self.store.conv_active[0..self.store.conv_active_len];
+        return a.len == conv.len and std.mem.eql(u8, a, conv);
+    }
+
+    /// True if `conv` currently occupies a background-turn slot.
+    fn bgHasConv(self: *Chat, conv: []const u8) bool {
+        for (&self.bg) |*b| {
+            if (b.conv_len > 0 and std.mem.eql(u8, b.convStr(), conv)) return true;
+        }
+        return false;
+    }
+
+    /// Adopt a still-running server turn into a background slot (called when the user switches away from it).
+    /// Baselines the event cursor at `from` so pumpBackground only sees NEW frames. No-op if already tracked or
+    /// no slot is free (the turn still completes server-side; it just won't have its client tools serviced — the
+    /// server's own delegateTool timeout then degrades that one turn rather than hanging).
+    fn bgAdd(self: *Chat, conv: []const u8, from: usize) void {
+        if (conv.len == 0 or conv.len > 64 or self.bgHasConv(conv)) return;
+        for (&self.bg) |*b| {
+            if (b.conv_len != 0) continue;
+            b.* = .{ .from = from };
+            b.conv_len = conv.len;
+            @memcpy(b.conv[0..conv.len], conv);
+            log.info("bg: adopting {s} as a background server turn", .{conv[0..@min(conv.len, 48)]});
+            return;
+        }
+        log.warn("bg: no free background slot for {s} — its client tools won't be serviced while backgrounded", .{conv[0..@min(conv.len, 48)]});
+    }
+
+    /// Drop `conv` from the background slots (switched back to it, or it was aborted). Returns true if it was one.
+    fn bgRemove(self: *Chat, conv: []const u8) bool {
+        for (&self.bg) |*b| {
+            if (b.conv_len > 0 and std.mem.eql(u8, b.convStr(), conv)) {
+                b.* = .{};
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Service ONE background conversation's frame: run its delegated tools / sync answers so the server turn
+    /// keeps moving, and report whether this frame was the turn's {done}. Deliberately does NOT render (no
+    /// tokens/messages/status) — a background turn is invisible until the user switches back and re-mirrors it.
+    fn serviceBgFrame(self: *Chat, dd: []const u8, conv: []const u8, line_raw: []const u8) bool {
+        const line = std.mem.trim(u8, line_raw, " \r\n\t");
+        if (line.len == 0) return false;
+        const kind = scRawField(line, "kind") orelse return false;
+        if (std.mem.eql(u8, kind, "tool_request")) {
+            const id = scRawField(line, "id") orelse return false;
+            const tool = scRawField(line, "tool") orelse return false;
+            self.startDelegatedTool(dd, conv, id, tool, line);
+        } else if (std.mem.eql(u8, kind, "sync_request")) {
+            const id = scRawField(line, "id") orelse return false;
+            self.answerSyncRequest(dd, conv, id, line);
+        } else if (std.mem.eql(u8, kind, "file_pull")) {
+            const id = scRawField(line, "id") orelse return false;
+            self.answerFilePull(dd, conv, id, line);
+        } else if (std.mem.eql(u8, kind, "done")) {
+            return true;
+        }
+        return false; // token/message/status/tool/error/file_sync — not serviced in the background
+    }
+
+    /// Poll every active BACKGROUND turn and service its delegated frames, so conversations the user switched
+    /// away from still make progress server-side. ~1Hz from run() (tool_requests aren't latency-sensitive here).
+    /// Advances each slot's cursor past complete lines only; retires a slot on {done} (kept for the sidebar badge)
+    /// or after too many failed polls. Shares the ONE deleg executor + queue with the foreground (bounded work).
+    fn pumpBackground(self: *Chat, dd: []const u8) void {
+        for (&self.bg) |*b| {
+            if (b.conv_len == 0 or b.done) continue;
+            const conv = b.convStr();
+            const resp = self.runner().chatEvents(self.io, self.gpa, conv, b.from) orelse {
+                b.fails +%= 1;
+                if (b.fails >= SC_MAX_FAILS) {
+                    log.info("bg: retiring {s} (server unreachable)", .{conv[0..@min(conv.len, 48)]});
+                    b.* = .{};
+                }
+                continue;
+            };
+            defer if (resp.body.len > 0) self.gpa.free(resp.body);
+            if (resp.status != 200) {
+                b.fails +%= 1;
+                if (b.fails >= SC_MAX_FAILS) b.* = .{};
+                continue;
+            }
+            b.fails = 0;
+            const bodyb = resp.body;
+            var consumed: usize = 0;
+            var start: usize = 0;
+            var saw_done = false;
+            while (std.mem.indexOfScalarPos(u8, bodyb, start, '\n')) |nl| {
+                const line = bodyb[start..nl];
+                consumed = nl + 1;
+                start = nl + 1;
+                if (self.serviceBgFrame(dd, conv, line)) saw_done = true;
+            }
+            b.from += consumed;
+            if (saw_done) {
+                b.done = true; // finished server-side — keep the slot so the sidebar can badge it "ready"
+                log.info("bg: {s} finished server-side", .{conv[0..@min(conv.len, 48)]});
+            }
+        }
+    }
+
     /// Append a streamed delta to the in-flight reply (is_reason=false) or reasoning (is_reason=true) buffer — the
     /// SAME buffers the local engine streams into, so main.zig renders them growing live (the reply "types out").
     /// Appends until full; a reply longer than the buffer caps the live preview, but the final {kind:message}
@@ -1766,7 +1916,7 @@ pub const Chat = struct {
             self.scCommitText(dd);
             const id = scRawField(line, "id") orelse return;
             const tool = scRawField(line, "tool") orelse return;
-            self.startDelegatedTool(dd, id, tool, line);
+            self.startDelegatedTool(dd, self.sc_conv[0..self.sc_conv_len], id, tool, line);
             return;
         }
         if (std.mem.eql(u8, kind, "file_sync")) {
@@ -1779,13 +1929,13 @@ pub const Chat = struct {
             // workdir-sync manifest exchange (server diffs before transferring; the probe detects a shared
             // disk). A `root` on the frame is a sync_dir projection: manifest THAT absolute client folder.
             const id = scRawField(line, "id") orelse return;
-            self.answerSyncRequest(dd, id, line);
+            self.answerSyncRequest(dd, self.sc_conv[0..self.sc_conv_len], id, line);
             return;
         }
         if (std.mem.eql(u8, kind, "file_pull")) {
             // the server wants these files (a cast's workdir sync, or a sync_dir projection's contents)
             const id = scRawField(line, "id") orelse return;
-            self.answerFilePull(dd, id, line);
+            self.answerFilePull(dd, self.sc_conv[0..self.sc_conv_len], id, line);
             return;
         }
         // any other kind: not rendered.
@@ -1823,10 +1973,25 @@ pub const Chat = struct {
         if (self.build_dir_len == 0) self.syncBuildDir(dd);
     }
 
-    /// Resolve this conv's delegated workdir (the same path launchDelegated roots tools at), creating it.
-    fn delegatedWorkdir(self: *Chat, dd: []const u8, buf: []u8) []const u8 {
+    /// The server-relative build root ({uid}/_chat/builds/{conv}) for an EXPLICIT conversation — the origin-conv
+    /// twin of chatBuildRel (which resolves the on-screen active conv). Used by the delegated-tool + sync paths so
+    /// a tool always runs in ITS conversation's workdir, not whichever conv happens to be on screen.
+    fn buildRelFor(self: *Chat, conv: []const u8, buf: []u8) []const u8 {
+        if (conv.len == 0) return "";
+        var uid: []const u8 = "u1";
+        if (self.build_dir_len > 0) {
+            const bd = self.build_dir[0..self.build_dir_len];
+            if (std.mem.indexOfScalar(u8, bd, '/')) |sl| {
+                if (sl > 1 and bd[0] == 'u') uid = bd[0..sl];
+            }
+        }
+        return std.fmt.bufPrint(buf, "{s}/_chat/builds/{s}", .{ uid, conv }) catch "";
+    }
+
+    /// Resolve `conv`'s delegated workdir (the same path launchDelegated roots tools at), creating it.
+    fn delegatedWorkdir(self: *Chat, conv: []const u8, dd: []const u8, buf: []u8) []const u8 {
         var relb: [180]u8 = undefined;
-        const rel = self.chatBuildRel(&relb);
+        const rel = self.buildRelFor(conv, &relb);
         const wd = if (rel.len > 0)
             (std.fmt.bufPrint(buf, "{s}/{s}/work", .{ dd, rel }) catch dd)
         else
@@ -1840,44 +2005,44 @@ pub const Chat = struct {
     /// post the manifest (+ probe echo) it prints. On ANY failure post an EMPTY manifest — the server then
     /// degrades to a full push instead of stalling to its timeout. The desk stays a dumb pipe: hashing, caps,
     /// the probe read, and root validation all live in the shared sync module the spawned verb calls.
-    fn answerSyncRequest(self: *Chat, dd: []const u8, id: []const u8, line: []const u8) void {
+    fn answerSyncRequest(self: *Chat, dd: []const u8, conv: []const u8, id: []const u8, line: []const u8) void {
         var rb: [512]u8 = undefined;
         var wdb: [820]u8 = undefined;
         const workdir = if (scRawField(line, "root")) |raw|
             scUnescape(raw, &rb)
         else
-            self.delegatedWorkdir(dd, &wdb);
+            self.delegatedWorkdir(conv, dd, &wdb);
         var binb: [1100]u8 = undefined;
         const bin = self.veilBinPath(&binb);
         const argv = [_][]const u8{ bin, "sync-manifest", "--workdir", workdir };
         const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(1 << 20), .stderr_limit = .limited(8 << 10) }) catch {
-            self.postToolResult(id, "{\"probe\":\"\",\"files\":[]}");
+            self.postToolResult(conv, id, "{\"probe\":\"\",\"files\":[]}");
             return;
         };
         defer self.gpa.free(r.stdout);
         defer self.gpa.free(r.stderr);
-        self.postToolResult(id, if (r.stdout.len > 0) r.stdout else "{\"probe\":\"\",\"files\":[]}");
+        self.postToolResult(conv, id, if (r.stdout.len > 0) r.stdout else "{\"probe\":\"\",\"files\":[]}");
     }
 
     /// Answer a {kind:"file_pull"} frame: stage the frame as the args file, spawn `veil sync-read`, and post
     /// the batched contents it prints. A `root` on the frame reads from that absolute client folder (sync_dir;
     /// validated by the subcommand). Empty batch on any failure — the hive casts with what the server has.
-    fn answerFilePull(self: *Chat, dd: []const u8, id: []const u8, line: []const u8) void {
+    fn answerFilePull(self: *Chat, dd: []const u8, conv: []const u8, id: []const u8, line: []const u8) void {
         var rb: [512]u8 = undefined;
         var wdb: [820]u8 = undefined;
         const workdir = if (scRawField(line, "root")) |raw|
             scUnescape(raw, &rb)
         else
-            self.delegatedWorkdir(dd, &wdb);
+            self.delegatedWorkdir(conv, dd, &wdb);
         // stage the frame in the DESK's own sidecar dir, never in `workdir` — a rooted sync reads a projected
         // source folder that must stay untouched (read-only contract; may be an immutable system)
         var afb: [900]u8 = undefined;
         const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-desk/.veil-sync-pull.json", .{dd}) catch {
-            self.postToolResult(id, "{\"files\":[]}");
+            self.postToolResult(conv, id, "{\"files\":[]}");
             return;
         };
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = args_file, .data = line }) catch {
-            self.postToolResult(id, "{\"files\":[]}");
+            self.postToolResult(conv, id, "{\"files\":[]}");
             return;
         };
         defer Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
@@ -1886,12 +2051,12 @@ pub const Chat = struct {
         self.setStatus("sending your files to the hive...");
         const argv = [_][]const u8{ bin, "sync-read", "--workdir", workdir, "--args-file", args_file };
         const r = std.process.run(self.gpa, self.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 20), .stderr_limit = .limited(8 << 10) }) catch {
-            self.postToolResult(id, "{\"files\":[]}");
+            self.postToolResult(conv, id, "{\"files\":[]}");
             return;
         };
         defer self.gpa.free(r.stdout);
         defer self.gpa.free(r.stderr);
-        self.postToolResult(id, if (r.stdout.len > 0) r.stdout else "{\"files\":[]}");
+        self.postToolResult(conv, id, if (r.stdout.len > 0) r.stdout else "{\"files\":[]}");
     }
 
     /// Resolve the `veil` server binary to invoke as `veil exec-tool` — it hosts the ONE tool executor, so the desk
@@ -1917,29 +2082,35 @@ pub const Chat = struct {
     /// Accept a server-delegated tool call. If the executor slot is free, launch it asynchronously; if a tool
     /// is already running (a server retry after its own timeout is the only real path here), ack the new id so
     /// the server keeps waiting and queue the frame — pumpDelegated starts it once the current one finishes.
-    fn startDelegatedTool(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
+    fn startDelegatedTool(self: *Chat, dd: []const u8, conv: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
         if (self.deleg != null) {
-            self.postToolAck(id); // "client alive, will get to it" — stops the server's no-ack fast-fail
+            self.postToolAck(conv, id); // "client alive, will get to it" — stops the server's no-ack fast-fail
             for (&self.deleg_q) |*slot| {
                 if (slot.* == null) {
-                    slot.* = self.gpa.dupe(u8, line) catch break;
+                    const dup = self.gpa.dupe(u8, line) catch break;
+                    var q: QueuedTool = .{ .line = dup };
+                    q.conv_len = @min(conv.len, q.conv.len);
+                    @memcpy(q.conv[0..q.conv_len], conv[0..q.conv_len]);
+                    slot.* = q;
                     return;
                 }
             }
-            self.postToolResult(id, "(desk: the delegated-tool queue is full — a previous tool is still running; re-request this call)");
+            self.postToolResult(conv, id, "(desk: the delegated-tool queue is full — a previous tool is still running; re-request this call)");
             return;
         }
-        self.launchDelegated(dd, id, tool, line);
+        self.launchDelegated(dd, conv, id, tool, line);
     }
 
     /// Launch a server-delegated tool on THIS machine as an INDEPENDENT OS process (pumpDelegated posts its
     /// result back once it exits). `line` is the full tool_request frame (we pull "args" off it here so the
     /// caller needn't heap-unescape). Rooted at this conv's build workdir — the SAME path the server would
     /// use — so files the tool writes land where the Files tab reads them.
-    fn launchDelegated(self: *Chat, dd: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
+    fn launchDelegated(self: *Chat, dd: []const u8, conv: []const u8, id: []const u8, tool: []const u8, line: []const u8) void {
         // 1) workdir = {dd}/{uid}/_chat/builds/{conv}/work (created on demand). Falls back to dd if unresolvable.
+        //    Rooted at the ORIGIN conversation's build dir (buildRelFor conv), not the on-screen one, so a tool
+        //    always writes into its own conversation's tree even if another chat is in focus.
         var relb: [180]u8 = undefined;
-        const rel = self.chatBuildRel(&relb);
+        const rel = self.buildRelFor(conv, &relb);
         var wdb: [820]u8 = undefined;
         const workdir = if (rel.len > 0)
             (std.fmt.bufPrint(&wdb, "{s}/{s}/work", .{ dd, rel }) catch dd)
@@ -1951,38 +2122,43 @@ pub const Chat = struct {
         //    `veil exec-tool --args-file` reads. Off the argv: large + may contain quotes/newlines.
         const raw = scRawField(line, "args") orelse "{}";
         const argsbuf = self.gpa.alloc(u8, raw.len + 1) catch {
-            self.postToolResult(id, "(desk: out of memory building tool args)");
+            self.postToolResult(conv, id, "(desk: out of memory building tool args)");
             return;
         };
         defer self.gpa.free(argsbuf);
         const args_json = scUnescape(raw, argsbuf);
         var afb: [900]u8 = undefined;
         const args_file = std.fmt.bufPrint(&afb, "{s}/.veil-tool-args.json", .{workdir}) catch {
-            self.postToolResult(id, "(desk: tool args path too long)");
+            self.postToolResult(conv, id, "(desk: tool args path too long)");
             return;
         };
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = args_file, .data = args_json }) catch {
-            self.postToolResult(id, "(desk: could not stage tool args)");
+            self.postToolResult(conv, id, "(desk: could not stage tool args)");
             return;
         };
 
-        // 3) sink files beside the console's (separate stems — a RUN: command and a delegated tool can overlap).
-        var bb: [340]u8 = undefined;
-        const base = std.fmt.bufPrint(&bb, "{s}/.veil-desk/deleg", .{dd}) catch {
-            self.postToolResult(id, "(desk: could not prepare the tool sinks)");
+        // 3) sink files — PER-CONVERSATION stem ({dd}/.veil-desk/deleg-{conv}) so two conversations' delegated
+        //    tools running at once never clobber each other's captured stdout/stderr. conv is safeSeg'd
+        //    (alnum/-/_), so it is filename-safe. Falls back to the shared stem if the conv is somehow empty.
+        var bb: [352]u8 = undefined;
+        const base = (if (conv.len > 0)
+            std.fmt.bufPrint(&bb, "{s}/.veil-desk/deleg-{s}", .{ dd, conv })
+        else
+            std.fmt.bufPrint(&bb, "{s}/.veil-desk/deleg", .{dd})) catch {
+            self.postToolResult(conv, id, "(desk: could not prepare the tool sinks)");
             return;
         };
-        var ob: [352]u8 = undefined;
-        var eb2: [352]u8 = undefined;
+        var ob: [360]u8 = undefined;
+        var eb2: [360]u8 = undefined;
         const outp = std.fmt.bufPrint(&ob, "{s}.out", .{base}) catch return;
         const errp = std.fmt.bufPrint(&eb2, "{s}.err", .{base}) catch return;
         const of = Io.Dir.cwd().createFile(self.io, outp, .{}) catch {
-            self.postToolResult(id, "(desk: could not open the tool output file)");
+            self.postToolResult(conv, id, "(desk: could not open the tool output file)");
             return;
         };
         const ef = Io.Dir.cwd().createFile(self.io, errp, .{}) catch {
             of.close(self.io);
-            self.postToolResult(id, "(desk: could not open the tool output file)");
+            self.postToolResult(conv, id, "(desk: could not open the tool output file)");
             return;
         };
 
@@ -2002,7 +2178,7 @@ pub const Chat = struct {
             ef.close(self.io);
             Io.Dir.cwd().deleteFile(self.io, args_file) catch {};
             var eb: [256]u8 = undefined;
-            self.postToolResult(id, std.fmt.bufPrint(&eb, "(desk: could not run '{s} exec-tool' ({s}) — is the veil binary reachable?)", .{ bin[0..@min(bin.len, 120)], @errorName(e) }) catch "(desk: exec-tool failed to run)");
+            self.postToolResult(conv, id, std.fmt.bufPrint(&eb, "(desk: could not run '{s} exec-tool' ({s}) — is the veil binary reachable?)", .{ bin[0..@min(bin.len, 120)], @errorName(e) }) catch "(desk: exec-tool failed to run)");
             return;
         };
         of.close(self.io); // the child holds its own copies
@@ -2014,6 +2190,8 @@ pub const Chat = struct {
         @memcpy(p.id[0..p.id_len], id[0..p.id_len]);
         p.tool_len = @min(tool.len, p.tool.len);
         @memcpy(p.tool[0..p.tool_len], tool[0..p.tool_len]);
+        p.conv_len = @min(conv.len, p.conv.len);
+        @memcpy(p.conv[0..p.conv_len], conv[0..p.conv_len]);
         p.base_len = @min(base.len, p.base.len);
         @memcpy(p.base[0..p.base_len], base[0..p.base_len]);
         p.af_len = @min(args_file.len, p.args_file.len);
@@ -2021,9 +2199,13 @@ pub const Chat = struct {
         self.deleg = p;
 
         // pickup ack: ends the server's short "is any client attached?" window; heartbeats take over from here
-        self.postToolAck(id);
-        var stbuf: [96]u8 = undefined;
-        self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
+        self.postToolAck(conv, id);
+        // Only the FOREGROUND conversation's tool drives the shared status line — a background turn's tool runs
+        // silently (it is shown via the sidebar, not the status bar of the chat the user is currently reading).
+        if (self.isForeground(conv)) {
+            var stbuf: [96]u8 = undefined;
+            self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine...", .{tool[0..@min(tool.len, 48)]}) catch "running tool locally...");
+        }
         log.info("delegated: launched {s} (id={s})", .{ tool[0..@min(tool.len, 48)], id[0..@min(id.len, 60)] });
     }
 
@@ -2049,14 +2231,16 @@ pub const Chat = struct {
                 self.finishDelegated(dd, "(desk: the delegated tool flooded its output and was stopped)");
                 return;
             }
-            var stbuf: [96]u8 = undefined;
-            self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine... {d}s", .{ p.toolStr()[0..@min(p.tool_len, 48)], now - p.started_s }) catch "running tool locally...");
+            if (self.isForeground(p.convStr())) {
+                var stbuf: [96]u8 = undefined;
+                self.setStatus(std.fmt.bufPrint(&stbuf, "running {s} on this machine... {d}s", .{ p.toolStr()[0..@min(p.tool_len, 48)], now - p.started_s }) catch "running tool locally...");
+            }
             if (now - p.last_hb_s >= DELEG_HEARTBEAT_S) {
                 p.last_hb_s = now;
-                self.postToolAck(p.idStr());
+                self.postToolAck(p.convStr(), p.idStr());
                 for (self.deleg_q) |slot| {
-                    const qline = slot orelse continue;
-                    if (scRawField(qline, "id")) |qid| self.postToolAck(qid);
+                    const q = slot orelse continue;
+                    if (scRawField(q.line, "id")) |qid| self.postToolAck(q.convStr(), qid);
                 }
             }
             return;
@@ -2071,8 +2255,8 @@ pub const Chat = struct {
     /// note that overrides whatever partial output exists), clean up, and start the next queued request.
     fn finishDelegated(self: *Chat, dd: []const u8, forced: ?[]const u8) void {
         const p = if (self.deleg) |*pp| pp else return;
-        var ob: [352]u8 = undefined;
-        var eb: [352]u8 = undefined;
+        var ob: [360]u8 = undefined; // base (per-conv, up to 352) + ".out"/".err" must fit
+        var eb: [360]u8 = undefined;
         const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch "";
         const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch "";
         const scratch: ?[]u8 = self.gpa.alloc(u8, DELEG_RESULT_CAP + (32 << 10)) catch null;
@@ -2087,6 +2271,10 @@ pub const Chat = struct {
         var idb: [160]u8 = undefined;
         const idn = p.id_len;
         @memcpy(idb[0..idn], p.id[0..idn]);
+        var cvb: [64]u8 = undefined; // capture the ORIGIN conv too — deleg is nulled before we post the result
+        const cvn = p.conv_len;
+        @memcpy(cvb[0..cvn], p.conv[0..cvn]);
+        const conv = cvb[0..cvn];
         const elapsed = self.nowS() - p.started_s;
         var tn: [64]u8 = undefined;
         const tnn = p.tool_len;
@@ -2094,31 +2282,32 @@ pub const Chat = struct {
         self.deleg = null; // clear BEFORE posting — postToolResult can take a beat and state must be settled
 
         if (forced) |msg| {
-            self.postToolResult(idb[0..idn], msg);
+            self.postToolResult(conv, idb[0..idn], msg);
         } else if (out.len > 0) {
-            self.postToolResult(idb[0..idn], out);
+            self.postToolResult(conv, idb[0..idn], out);
         } else if (stderr.len > 0) {
             var sb: [640]u8 = undefined;
-            self.postToolResult(idb[0..idn], std.fmt.bufPrint(&sb, "(tool produced no output; stderr: {s})", .{stderr[0..@min(stderr.len, 600)]}) catch "(tool produced no output)");
+            self.postToolResult(conv, idb[0..idn], std.fmt.bufPrint(&sb, "(tool produced no output; stderr: {s})", .{stderr[0..@min(stderr.len, 600)]}) catch "(tool produced no output)");
         } else {
-            self.postToolResult(idb[0..idn], ""); // empty is a valid result (e.g. a silent write); the turn must still resume
+            self.postToolResult(conv, idb[0..idn], ""); // empty is a valid result (e.g. a silent write); the turn must still resume
         }
-        self.setStatus("");
+        if (self.isForeground(conv)) self.setStatus(""); // don't clear the foreground's status for a background tool
         log.info("delegated: {s} finished in {d}s ({d}b out, {d}b err)", .{ tn[0..tnn], elapsed, out.len, stderr.len });
         self.delegDequeue(dd); // a queued retry (already acked) runs now
     }
 
-    /// Start the oldest queued tool_request frame, if any (the slot must be free). Frames are heap-owned dupes.
+    /// Start the oldest queued tool_request frame, if any (the slot must be free). Frames are heap-owned dupes,
+    /// each paired with its ORIGIN conversation so it launches against the right chat.
     fn delegDequeue(self: *Chat, dd: []const u8) void {
         if (self.deleg != null) return;
-        const line = self.deleg_q[0] orelse return;
+        const q = self.deleg_q[0] orelse return;
         var i: usize = 0;
         while (i + 1 < self.deleg_q.len) : (i += 1) self.deleg_q[i] = self.deleg_q[i + 1];
         self.deleg_q[self.deleg_q.len - 1] = null;
-        defer self.gpa.free(line);
-        const id = scRawField(line, "id") orelse return;
-        const tool = scRawField(line, "tool") orelse return;
-        self.launchDelegated(dd, id, tool, line);
+        defer self.gpa.free(q.line);
+        const id = scRawField(q.line, "id") orelse return;
+        const tool = scRawField(q.line, "tool") orelse return;
+        self.launchDelegated(dd, q.convStr(), id, tool, q.line);
     }
 
     /// Kill any in-flight delegated tool and drop the queue WITHOUT posting results — for shutdown and for
@@ -2126,23 +2315,23 @@ pub const Chat = struct {
     fn delegCancel(self: *Chat) void {
         if (self.deleg) |*p| {
             p.child.kill(self.io);
-            var ob: [352]u8 = undefined;
-            var eb: [352]u8 = undefined;
+            var ob: [360]u8 = undefined; // base (per-conv, up to 352) + ".out"/".err" must fit
+            var eb: [360]u8 = undefined;
             if (std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()})) |outp| Io.Dir.cwd().deleteFile(self.io, outp) catch {} else |_| {}
             if (std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()})) |errp| Io.Dir.cwd().deleteFile(self.io, errp) catch {} else |_| {}
             Io.Dir.cwd().deleteFile(self.io, p.args_file[0..p.af_len]) catch {};
             self.deleg = null;
         }
         for (&self.deleg_q) |*slot| {
-            if (slot.*) |l| self.gpa.free(l);
+            if (slot.*) |q| self.gpa.free(q.line);
             slot.* = null;
         }
     }
 
     /// Combined byte size of the delegated tool's two sink files (the output-flood guard). 0 on stat errors.
     fn delegSinkBytes(self: *Chat, p: *const DelegProc) u64 {
-        var ob: [352]u8 = undefined;
-        var eb: [352]u8 = undefined;
+        var ob: [360]u8 = undefined; // base (per-conv, up to 352) + ".out"/".err" must fit
+        var eb: [360]u8 = undefined;
         const outp = std.fmt.bufPrint(&ob, "{s}.out", .{p.baseStr()}) catch return 0;
         const errp = std.fmt.bufPrint(&eb, "{s}.err", .{p.baseStr()}) catch return 0;
         var total: u64 = 0;
@@ -2167,9 +2356,8 @@ pub const Chat = struct {
 
     /// POST {"id":..,"ack":true} — the cheap pickup/heartbeat signal the server's awaitClientResult counts to
     /// tell "client working" from "client gone". Fire-and-forget: a dropped ack only shortens its patience.
-    fn postToolAck(self: *Chat, id: []const u8) void {
-        var convb: [96]u8 = undefined;
-        const conv = self.convScope(&convb);
+    /// `conv` is the tool_request's ORIGIN conversation (the caller threads it), NOT the on-screen active conv.
+    fn postToolAck(self: *Chat, conv: []const u8, id: []const u8) void {
         if (conv.len == 0) return;
         var bb: [400]u8 = undefined;
         var w = Io.Writer.fixed(&bb);
@@ -2187,10 +2375,9 @@ pub const Chat = struct {
 
     /// POST {"id":..,"result":..} to /tool_result so the blocked server turn continues. Best-effort: if the post
     /// fails, the server's delegateTool times out (180s) rather than hanging forever — but that's a degraded turn,
-    /// so this is the one call in the delegation path that must not silently drop.
-    fn postToolResult(self: *Chat, id: []const u8, result: []const u8) void {
-        var convb: [96]u8 = undefined;
-        const conv = self.convScope(&convb);
+    /// so this is the one call in the delegation path that must not silently drop. `conv` is the tool_request's
+    /// ORIGIN conversation (threaded by the caller), so a result never posts to the wrong conversation's turn.
+    fn postToolResult(self: *Chat, conv: []const u8, id: []const u8, result: []const u8) void {
         if (conv.len == 0) return;
         const cap = id.len * 2 + result.len * 2 + 64;
         const body = self.gpa.alloc(u8, cap) catch return;
