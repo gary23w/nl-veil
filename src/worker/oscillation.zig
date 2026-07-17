@@ -671,6 +671,14 @@ pub fn cleanFactInto(buf: []u8, fact: []const u8) ?[]const u8 {
     }
     while (w > 0 and (buf[w - 1] & 0xC0) == 0x80) w -= 1; // a clip that fell inside a codepoint backs out of it
     if (alnum < 12) return null;
+    // Soften SEMICOLONS (only): the core also atomizes on "; ", which is THE code shredder — any observed
+    // fact quoting code ("const x = y; if (!p) { …") split into one junk row per statement (seen live even
+    // post-normalization). Prose almost never needs ";"-splitting, while "."-atomization (kept) is the fine
+    // weave working as designed.
+    var i: usize = 0;
+    while (i + 1 < w) : (i += 1) {
+        if (buf[i] == ';' and buf[i + 1] == ' ') buf[i] = ',';
+    }
     return buf[0..w];
 }
 
@@ -688,6 +696,12 @@ test "cleanFactInto: folds newlines, collapses runs, drops junk, clips at the bu
     try std.testing.expectEqualStrings(
         "npm MUST be run via shell=True on this Windows machine",
         cleanFactInto(&b, "npm MUST be run via shell=True on this Windows machine").?,
+    );
+    // semicolons soften so quoted CODE stays ONE fact (the core would split each "; " statement into its
+    // own junk row); periods are untouched — sentence atomization is the fine weave by design
+    try std.testing.expectEqualStrings(
+        "build failed: const a = q(id), if (!a) { return 404, } exited code 1. See lib/db.ts",
+        cleanFactInto(&b, "build failed: const a = q(id);\nif (!a) { return 404; }\nexited code 1. See lib/db.ts").?,
     );
     // overflow clips inside the buffer without tearing anything
     var big: [200]u8 = undefined;
