@@ -22,6 +22,7 @@ test {
     _ = @import("worker/mcp/discovery.zig");
     _ = @import("worker/metrics.zig");
     _ = @import("worker/modelcfg.zig");
+    _ = @import("worker/rate.zig");
     _ = @import("worker/rerank.zig");
     _ = @import("worker/rsi.zig");
     _ = @import("worker/run.zig");

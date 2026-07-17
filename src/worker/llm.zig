@@ -7,6 +7,7 @@
 //! (a pre-built messages array + a tools array → content OR parsed tool_calls).
 const std = @import("std");
 const httpc = @import("httpc.zig");
+const rate = @import("rate.zig");
 
 pub const Reply = struct {
     content: []u8,
@@ -107,7 +108,7 @@ pub const Step = struct {
 /// inference is much SLOWER (seconds–minutes, CPU/partial-GPU) and never rate-limits, so the client must NOT
 /// use the short hosted timeout + transient-retry; and a THINKING model spends part of its token budget on
 /// hidden reasoning, so tiny max_tokens calls return empty.
-fn isLocal(base_url: []const u8) bool {
+pub fn isLocal(base_url: []const u8) bool {
     return std.mem.indexOf(u8, base_url, "localhost") != null or
         std.mem.indexOf(u8, base_url, "127.0.0.1") != null or
         std.mem.indexOf(u8, base_url, "0.0.0.0") != null or
@@ -163,6 +164,9 @@ fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
 fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Reply {
     const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
     defer gpa.free(url);
+    // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before sending.
+    // Local backends never rate-limit, so they skip it (and keep their long, retry-free timeout).
+    if (!isLocal(base_url)) rate.acquire(io, base_url);
     return postUrl(gpa, io, run_dir, tag, url, key, body, isLocal(base_url));
 }
 
@@ -228,10 +232,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     jstr(gpa, &msgs, user) catch return oom(gpa);
     msgs.appendSlice(gpa, "}") catch return oom(gpa);
     const mt = effTokens(base_url, model, max_tokens);
-    const temp_frag = if (temperature >= 0)
-        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return oom(gpa)
-    else
-        gpa.dupe(u8, "") catch return oom(gpa);
+    const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
@@ -246,10 +247,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     if (isOllama(base_url)) return completeOllamaNative(gpa, io, run_dir, tag, base_url, key, model, messages_json, tools_json, max_tokens, temperature);
     const mt = effTokens(base_url, model, max_tokens);
-    const temp_frag = if (temperature >= 0)
-        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
-    else
-        gpa.dupe(u8, "") catch return stepErr(gpa, "oom");
+    const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (Kimi temp=1, etc.)
     defer gpa.free(temp_frag);
     const body = if (tools_json.len > 0)
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt }) catch return stepErr(gpa, "oom")
@@ -261,10 +259,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
     const np: u32 = if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens;
-    const temp_frag = if (temperature >= 0)
-        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return stepErr(gpa, "oom")
-    else
-        gpa.dupe(u8, "") catch return stepErr(gpa, "oom");
+    const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware
     defer gpa.free(temp_frag);
     var root = trimSlash(base_url);
     if (std.mem.endsWith(u8, root, "/v1")) root = root[0 .. root.len - 3];
@@ -700,9 +695,178 @@ fn largeToolCallVerdict(raw: []const u8) bool {
     return true;
 }
 
+// ---- SELF-HEALING provider quirks -----------------------------------------------------------------------
+// Some BYOK models reject a request PARAMETER our default request carries — e.g. Kimi's kimi-k3 accepts only
+// temperature=1, and some reasoning models reject `temperature` outright. On such a provider error we read
+// the constraint out of the error text, rewrite the request to satisfy it, retry ONCE, and LEARN the quirk
+// (per model, process-global) so every later request pre-applies it and never pays the failed round-trip
+// again. A GENERAL mechanism seeded with the temperature rules — add detectQuirk cases as constraints surface.
+
+const TempRule = enum { keep, force, drop };
+const Quirk = struct { temp: TempRule = .keep, temp_val: f32 = 1.0 };
+
+const QuirkSlot = struct { hash: u64 = 0, q: Quirk = .{} };
+var quirk_tbl: [128]QuirkSlot = @splat(.{});
+var quirk_mtx: std.Io.Mutex = .init;
+
+fn learnQuirk(io: std.Io, model: []const u8, q: Quirk) void {
+    if (model.len == 0) return;
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    for (&quirk_tbl) |*e| if (e.hash == h) {
+        e.q = q;
+        return;
+    };
+    for (&quirk_tbl) |*e| if (e.hash == 0) {
+        e.* = .{ .hash = h, .q = q };
+        return;
+    };
+    quirk_tbl[0] = .{ .hash = h, .q = q }; // table full — recycle slot 0 rather than lose the newest lesson
+}
+
+fn quirkFor(io: std.Io, model: []const u8) Quirk {
+    if (model.len == 0) return .{};
+    const h = std.hash.Wyhash.hash(0x9e37, model);
+    quirk_mtx.lockUncancelable(io);
+    defer quirk_mtx.unlock(io);
+    for (&quirk_tbl) |*e| if (e.hash == h) return e.q;
+    return .{};
+}
+
+/// Read a PARAM-CONSTRAINT quirk out of a provider's error message (case-insensitive). null = not a
+/// constraint we know how to heal. Seeded with the temperature rules: the observed Kimi "only 1 is allowed"
+/// case (pin to 1) and the common reasoning-model "temperature unsupported" case (drop it). Pure — tested.
+fn detectQuirk(msg: []const u8) ?Quirk {
+    var lb: [220]u8 = undefined;
+    const n = @min(msg.len, lb.len);
+    const m = std.ascii.lowerString(lb[0..n], msg[0..n]);
+    if (std.mem.indexOf(u8, m, "temperature") == null) return null;
+    // pinned to a value: "only 1 is allowed", "must be 1", "only the default (1)", "equal to 1". Trailing
+    // spaces on the "1" tokens keep them from matching "10"/"1.5" etc. (a word boundary without a regex).
+    if (std.mem.indexOf(u8, m, "1 is allowed") != null or std.mem.indexOf(u8, m, "only 1 ") != null or
+        std.mem.indexOf(u8, m, "must be 1 ") != null or std.mem.indexOf(u8, m, "must be 1.") != null or
+        std.mem.indexOf(u8, m, "default (1)") != null or std.mem.indexOf(u8, m, "equal to 1") != null)
+        return .{ .temp = .force, .temp_val = 1.0 };
+    // rejected OUTRIGHT (not a range/clamp constraint): "does not support temperature", "temperature is not
+    // supported", "unsupported". Deliberately NOT "cannot"/"not allowed" — those also phrase clamp limits
+    // ("temperature cannot exceed 2"), where dropping the field is the wrong (and permanently-learned) fix.
+    if (std.mem.indexOf(u8, m, "not support") != null or std.mem.indexOf(u8, m, "unsupported") != null or
+        std.mem.indexOf(u8, m, "does not accept") != null)
+        return .{ .temp = .drop };
+    return null;
+}
+
+/// The model id inside a request body (`"model":"…"`), or null. Pure — tested.
+fn bodyModel(body: []const u8) ?[]const u8 {
+    const k = "\"model\":\"";
+    const s = (std.mem.indexOf(u8, body, k) orelse return null) + k.len;
+    const e = std.mem.indexOfScalarPos(u8, body, s, '"') orelse return null;
+    return body[s..e];
+}
+
+/// Rewrite `body` to satisfy `q`; gpa-owned new body, or null when nothing would change (so no wasted
+/// retry). Pure string surgery on the engine-built JSON (its shape is predictable). Tested.
+fn applyQuirk(gpa: std.mem.Allocator, body: []const u8, q: Quirk) ?[]u8 {
+    switch (q.temp) {
+        .keep => return null,
+        .force => {
+            var vb: [24]u8 = undefined;
+            // whole numbers clean ("1" not "1.00" — some providers demand exactly "1"). The >=0 and <1e6
+            // bounds keep @intFromFloat from panicking in ReleaseSafe on a negative/huge value (matches
+            // tempFragOwned); today temp_val is only ever 1.0, but a future detectQuirk case might differ.
+            const vs = if (q.temp_val == @floor(q.temp_val) and q.temp_val >= 0 and q.temp_val < 1_000_000)
+                std.fmt.bufPrint(&vb, "{d}", .{@as(u64, @intFromFloat(q.temp_val))}) catch return null
+            else
+                std.fmt.bufPrint(&vb, "{d:.2}", .{q.temp_val}) catch return null;
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(gpa); // frees the buffer on an early `return null`; toOwnedSlice empties `out` first, so success frees nothing
+            if (std.mem.indexOf(u8, body, "\"temperature\":")) |ti| {
+                const after = ti + "\"temperature\":".len;
+                var e = after;
+                while (e < body.len and body[e] != ',' and body[e] != '}') e += 1;
+                if (std.mem.eql(u8, body[after..e], vs)) return null; // already the required value
+                out.appendSlice(gpa, body[0..after]) catch return null;
+                out.appendSlice(gpa, vs) catch return null;
+                out.appendSlice(gpa, body[e..]) catch return null;
+            } else {
+                const close = std.mem.lastIndexOfScalar(u8, body, '}') orelse return null;
+                out.appendSlice(gpa, body[0..close]) catch return null;
+                out.appendSlice(gpa, ",\"temperature\":") catch return null;
+                out.appendSlice(gpa, vs) catch return null;
+                out.appendSlice(gpa, body[close..]) catch return null;
+            }
+            return out.toOwnedSlice(gpa) catch null;
+        },
+        .drop => {
+            const ti = std.mem.indexOf(u8, body, "\"temperature\":") orelse return null; // nothing to drop
+            var start = ti;
+            var e = ti + "\"temperature\":".len;
+            while (e < body.len and body[e] != ',' and body[e] != '}') e += 1;
+            if (start > 0 and body[start - 1] == ',') {
+                start -= 1; // consume the leading comma with the field
+            } else if (e < body.len and body[e] == ',') {
+                e += 1; // temperature was first → consume the trailing comma instead
+            }
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(gpa); // frees the buffer on an early `return null`; toOwnedSlice empties `out` first, so success frees nothing
+            out.appendSlice(gpa, body[0..start]) catch return null;
+            out.appendSlice(gpa, body[e..]) catch return null;
+            return out.toOwnedSlice(gpa) catch null;
+        },
+    }
+}
+
+/// On a provider error, try to heal a PARAM constraint: detect it, rewrite + retry ONCE, and learn the quirk
+/// so future requests pre-apply it. Returns the healed Step, or null when the error is not a quirk we can fix.
+fn healParamError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, err_text: []const u8) ?Step {
+    const q = detectQuirk(err_text) orelse return null;
+    const healed = applyQuirk(gpa, body, q) orelse return null;
+    defer gpa.free(healed);
+    if (bodyModel(body)) |m| learnQuirk(io, m, q); // remember for every future request to this model
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, healed, false); // retry once, never re-heal
+}
+
+/// Effective temperature for `model` after any LEARNED quirk (<0 ⇒ omit the field).
+fn effTemp(io: std.Io, model: []const u8, temperature: f32) f32 {
+    const q = quirkFor(io, model);
+    return switch (q.temp) {
+        .force => q.temp_val,
+        .drop => -1,
+        .keep => temperature,
+    };
+}
+
+/// Build the `,"temperature":N` body fragment for `model`, applying any learned quirk and emitting whole
+/// numbers cleanly (some providers reject "1.00" where they demand exactly "1"). gpa-owned + freeable;
+/// empty slice = omit the field (caller passed <0, or the model is known to reject temperature).
+fn tempFragOwned(gpa: std.mem.Allocator, io: std.Io, model: []const u8, temperature: f32) []u8 {
+    const t = effTemp(io, model, temperature);
+    if (t < 0) return gpa.dupe(u8, "") catch @constCast("");
+    var vb: [24]u8 = undefined;
+    const vs = if (t == @floor(t) and t >= 0 and t < 1_000_000)
+        std.fmt.bufPrint(&vb, "{d}", .{@as(u64, @intFromFloat(t))}) catch "1"
+    else
+        std.fmt.bufPrint(&vb, "{d:.2}", .{t}) catch "1";
+    return std.fmt.allocPrint(gpa, ",\"temperature\":{s}", .{vs}) catch (gpa.dupe(u8, "") catch @constCast(""));
+}
+
 fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, body, true);
+}
+
+fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, heal_ok: bool) Step {
     const r = post(gpa, io, run_dir, tag, base_url, key, body);
-    if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
+    if (!r.ok) {
+        // HTTP-level error (some providers return the constraint here, not in a JSON error field) — try to heal.
+        if (heal_ok) {
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, body, r.content)) |s| {
+                gpa.free(r.content);
+                return s;
+            }
+        }
+        return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
+    }
     defer gpa.free(r.content);
 
     const Resp = struct {
@@ -736,7 +900,13 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
         meterTL(u.prompt_tokens, u.completion_tokens);
         _ = calls_made.fetchAdd(1, .monotonic);
     }
-    if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
+    if (parsed.value.@"error") |e| {
+        // a JSON error field (HTTP 200 with an {"error":…} body, as Kimi returns) — try to heal the constraint.
+        if (heal_ok) {
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, body, e.message)) |s| return s;
+        }
+        return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
+    }
     if (parsed.value.choices.len == 0) return stepErr(gpa, "no choices in LLM response");
     const msg = parsed.value.choices[0].message;
 
@@ -775,6 +945,27 @@ fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
 pub const DeltaKind = enum { content, reasoning, tool_progress };
 
 const STREAM_STAT = "\n__VEILSTAT__"; // curl -w appends this + the 3-digit HTTP code once the transfer ends
+
+/// The HTTP status curl appended as "\n__VEILSTAT__<code>" at the very end of the sink file (null if absent). A
+/// small POSITIONAL tail read — the sentinel is the last ~16 bytes, and the stream body can be many MB, so this
+/// must not read the whole file. statFile for the size (a fresh handle's length() reads 0 on Windows/Io).
+fn trailingStatusCode(io: std.Io, path: []const u8) ?u16 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    const size: usize = std.math.cast(usize, st.size) orelse return null;
+    if (size == 0) return null;
+    const want = @min(size, @as(usize, 128));
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    var buf: [128]u8 = undefined;
+    const n = f.readPositionalAll(io, buf[0..want], size - want) catch return null;
+    const tail = buf[0..n];
+    const at = std.mem.lastIndexOf(u8, tail, "__VEILSTAT__") orelse return null;
+    const after = tail[at + "__VEILSTAT__".len ..];
+    var end: usize = 0;
+    while (end < after.len and std.ascii.isDigit(after[end])) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u16, after[0..end], 10) catch null;
+}
 
 /// A hosted (OpenAI/DeepSeek) SSE tool call assembled across streamed deltas. The first delta for an `index`
 /// carries id + function.name (+ maybe an args head); later deltas append raw fragments to `args`. Assembling
@@ -1277,10 +1468,7 @@ fn streamAttempt(
 
     // ---- body: the SAME shape complete() builds, plus "stream":true (and, on the hosted path,
     // stream_options.include_usage so the terminal chunk still carries the token meter). ----
-    const temp_frag = if (temperature >= 0)
-        std.fmt.allocPrint(gpa, ",\"temperature\":{d:.2}", .{temperature}) catch return null
-    else
-        gpa.dupe(u8, "") catch return null;
+    const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (streamed path)
     defer gpa.free(temp_frag);
 
     const body = blk: {
@@ -1319,6 +1507,10 @@ fn streamAttempt(
 
     const data_at = std.fmt.allocPrint(gpa, "@{s}", .{reqpath}) catch return null;
     defer gpa.free(data_at);
+
+    // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before this request
+    // reaches the wire. Local backends never rate-limit. (A fallback to complete() re-paces at its own post().)
+    if (!local) rate.acquire(io, base_url);
 
     const stream_max_s: u32 = if (local) 240 else 90; // parity with post()/postUrl's --max-time
     var tt_buf: [16]u8 = undefined;
@@ -1442,6 +1634,15 @@ fn streamAttempt(
         io.sleep(.{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {}; // 20ms: pick up new stream bytes fast for the desk's ~30Hz poll
     }
 
+    // PROVIDER BACK-OFF: curl appended "\n__VEILSTAT__<code>" with the final HTTP status. On 429/503, record a
+    // per-host cooldown so EVERY concurrent turn to this provider backs off together instead of retrying in
+    // lockstep (and so the complete() fallback below waits it out). Hosted only; a clean 2xx sets nothing.
+    if (!local) {
+        if (trailingStatusCode(io, outpath)) |code| {
+            if (code == 429 or code == 503) rate.note429(io, base_url, 0);
+        }
+    }
+
     // ABORTED mid-stream (chat Stop): return whatever already streamed as a partial Step — do NOT fall back to
     // complete() (that re-runs the whole inference, defeating the abort) and do NOT take the empty→null path
     // below. ok=true with partial (possibly empty) content; the caller's next stop check commits this.
@@ -1541,6 +1742,53 @@ pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []cons
         i += 1;
     }
     try list.append(gpa, '"');
+}
+
+test "self-healing quirks: detect temperature constraints, rewrite the body, extract the model" {
+    const gpa = std.testing.allocator;
+
+    // the observed Kimi error → pin temperature to 1
+    const kimi = detectQuirk("invalid temperature: only 1 is allowed for this model").?;
+    try std.testing.expectEqual(TempRule.force, kimi.temp);
+    try std.testing.expectEqual(@as(f32, 1.0), kimi.temp_val);
+    // a reasoning-model "unsupported" phrasing → drop temperature
+    try std.testing.expectEqual(TempRule.drop, detectQuirk("temperature is not supported with this model").?.temp);
+    // an unrelated error is not a quirk we heal
+    try std.testing.expect(detectQuirk("rate limit exceeded, please retry") == null);
+    try std.testing.expect(detectQuirk("context length exceeded") == null);
+    // a CLAMP/RANGE constraint is NOT a drop: dropping temperature would be the wrong, permanently-learned
+    // fix — surface it instead so the caller (or a future rule) handles the real bound.
+    try std.testing.expect(detectQuirk("temperature cannot exceed 2") == null);
+    try std.testing.expect(detectQuirk("temperature must be between 0 and 2") == null);
+    // the value-pin tokens don't misfire on multi-digit values
+    try std.testing.expect(detectQuirk("temperature: only 10 is the cap") == null);
+
+    // FORCE rewrites the sent value to a CLEAN whole number (providers reject "1.00" where they want "1")
+    const b1 = applyQuirk(gpa, "{\"model\":\"kimi-k3\",\"messages\":[],\"temperature\":0.50,\"max_tokens\":8}", kimi).?;
+    defer gpa.free(b1);
+    try std.testing.expectEqualStrings("{\"model\":\"kimi-k3\",\"messages\":[],\"temperature\":1,\"max_tokens\":8}", b1);
+    // already at the required value → null (no wasted retry)
+    try std.testing.expect(applyQuirk(gpa, "{\"model\":\"x\",\"temperature\":1,\"max_tokens\":8}", kimi) == null);
+    // FORCE with no temperature field present → insert it before the closing brace
+    const b2 = applyQuirk(gpa, "{\"model\":\"x\",\"max_tokens\":8}", kimi).?;
+    defer gpa.free(b2);
+    try std.testing.expectEqualStrings("{\"model\":\"x\",\"max_tokens\":8,\"temperature\":1}", b2);
+
+    // DROP removes the field AND its leading comma
+    const drop = Quirk{ .temp = .drop };
+    const b3 = applyQuirk(gpa, "{\"model\":\"x\",\"messages\":[],\"temperature\":0.50,\"max_tokens\":8}", drop).?;
+    defer gpa.free(b3);
+    try std.testing.expectEqualStrings("{\"model\":\"x\",\"messages\":[],\"max_tokens\":8}", b3);
+    // DROP when temperature is first → consumes the TRAILING comma instead
+    const b4 = applyQuirk(gpa, "{\"temperature\":0.50,\"model\":\"x\"}", drop).?;
+    defer gpa.free(b4);
+    try std.testing.expectEqualStrings("{\"model\":\"x\"}", b4);
+    // DROP with nothing to remove → null
+    try std.testing.expect(applyQuirk(gpa, "{\"model\":\"x\",\"max_tokens\":8}", drop) == null);
+
+    // the model id rides out of the request body for the learn step
+    try std.testing.expectEqualStrings("kimi-k3", bodyModel("{\"model\":\"kimi-k3\",\"messages\":[]}").?);
+    try std.testing.expect(bodyModel("{\"messages\":[]}") == null);
 }
 
 test "jstr sanitizes invalid UTF-8 and stays valid JSON" {

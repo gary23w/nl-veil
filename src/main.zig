@@ -24,6 +24,7 @@ const chat_tools = @import("worker/chat/tools.zig");
 const chat_service = @import("worker/chat/service.zig");
 const sched = @import("worker/sched.zig");
 const metrics = @import("worker/metrics.zig");
+const rate = @import("worker/rate.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
@@ -240,6 +241,9 @@ pub fn main(init: std.process.Init) !void {
     sup.ledger = &ledger;
     const readopted = sup.reattach(paths.data);
     const retention_days: u32 = if (init.environ_map.get("NL_RETENTION_DAYS")) |v| (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 14) else 14;
+    // BYOK rate limiter: optional per-provider requests/min cap. Unset/0 = unlimited (the 429 cooldown is always
+    // active regardless). Local models never rate-limit, so this only ever shapes hosted traffic.
+    rate.configure(if (init.environ_map.get("NL_RATE_RPM")) |v| (std.fmt.parseInt(i32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 0) else 0);
     if (retention_days > 0) {
         const swept = sup.pruneOldRuns(paths.data, retention_days);
         if (swept > 0) log.info("retention: pruned {d} stale run dir(s) at startup (>= {d}d inactive)", .{ swept, retention_days });
