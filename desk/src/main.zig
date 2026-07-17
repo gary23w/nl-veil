@@ -131,6 +131,7 @@ const Ui = struct {
     chat_follow: bool = true,
     chat_inner: ChatInner = .chat, // center pane: conversation | Metrics (perf graphs) | Files (this chat's build dir)
     chat_file_scroll: f32 = 0, // scroll offset for the chat Files content viewer
+    chat_file_list_scroll: f32 = 0, // scroll offset (px) for the chat Files LEFT file list
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
     conv_scroll: f32 = 0, // scroll offset for the Chats list (left pane)
@@ -216,6 +217,7 @@ const Ui = struct {
     con_hist_draft_len: usize = 0,
     // Files tab view state
     file_scroll: f32 = 0,
+    file_list_scroll: f32 = 0, // scroll offset (px) for the swarm Files LEFT file list
     // deploy dropdowns
     open_dd: DdKind = .none,
     dd_rect: t.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
@@ -4786,17 +4788,28 @@ fn drawFiles(store: *Store, r: t.Rect) void {
     const trunc = store.file_content_trunc;
     store.unlock();
 
-    // ---- left: file list ----
+    // ---- left: file list (scrollable — a node_modules tree runs to hundreds of files) ----
     {
-        rl.beginScissorMode(@intFromFloat(r.x + 1), @intFromFloat(r.y + 1), @intFromFloat(list_w - 2), @intFromFloat(r.height - 2));
+        const list_region = t.Rect{ .x = r.x + 1, .y = r.y + 1, .width = list_w - 2, .height = r.height - 2 };
+        rl.beginScissorMode(@intFromFloat(list_region.x), @intFromFloat(list_region.y), @intFromFloat(list_region.width), @intFromFloat(list_region.height));
         defer rl.endScissorMode();
         if (nfiles == 0) {
             t.text(t.z("no files yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 12), 13, t.comment);
         }
-        var yy: f32 = r.y + 6;
         const row_h: f32 = 30;
+        // wheel scroll (px), clamped so the last rows can always be reached. getMouseWheelMove isn't consumed
+        // on read, so the content pane below can read it too — hover gates which one actually moves.
+        const list_content_h: f32 = @as(f32, @floatFromInt(nfiles)) * row_h + 12;
+        const list_maxs: f32 = if (list_content_h > list_region.height) list_content_h - list_region.height else 0;
+        const lwheel = rl.getMouseWheelMove();
+        if (lwheel != 0 and t.hovering(list_region)) ui.file_list_scroll -= lwheel * row_h * 3;
+        if (ui.file_list_scroll < 0) ui.file_list_scroll = 0;
+        if (ui.file_list_scroll > list_maxs) ui.file_list_scroll = list_maxs;
+        var yy: f32 = r.y + 6 - ui.file_list_scroll;
         var i: usize = 0;
-        while (i < nfiles and yy < r.y + r.height - 4) : (i += 1) {
+        while (i < nfiles) : (i += 1) {
+            defer yy += row_h;
+            if (yy + row_h < r.y or yy > r.y + r.height) continue; // cull rows fully outside the view (draw + hit-test)
             const f = &files[i];
             const rr = t.Rect{ .x = r.x + 5, .y = yy, .width = list_w - 10, .height = row_h - 4 };
             const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
@@ -4809,7 +4822,6 @@ fn drawFiles(store: *Store, r: t.Rect) void {
                 store.pushCmd(store_mod.mkCmd(.open_file, "", f.pathStr()));
                 ui.file_scroll = 0;
             }
-            yy += row_h;
         }
     }
 
@@ -4905,17 +4917,26 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
     const trunc = store.chat_file_content_trunc;
     store.unlock();
 
-    // ---- left: file list ----
+    // ---- left: file list (scrollable) ----
     {
-        rl.beginScissorMode(@intFromFloat(body.x + 1), @intFromFloat(body.y + 1), @intFromFloat(list_w - 2), @intFromFloat(body.height - 2));
+        const list_region = t.Rect{ .x = body.x + 1, .y = body.y + 1, .width = list_w - 2, .height = body.height - 2 };
+        rl.beginScissorMode(@intFromFloat(list_region.x), @intFromFloat(list_region.y), @intFromFloat(list_region.width), @intFromFloat(list_region.height));
         defer rl.endScissorMode();
         if (nfiles == 0) {
             t.text(t.z("no files built in this chat yet", .{}), @intFromFloat(body.x + 12), @intFromFloat(body.y + 12), 13, t.comment);
         }
-        var yy: f32 = body.y + 6;
         const row_h: f32 = 30;
+        const list_content_h: f32 = @as(f32, @floatFromInt(nfiles)) * row_h + 12;
+        const list_maxs: f32 = if (list_content_h > list_region.height) list_content_h - list_region.height else 0;
+        const lwheel = rl.getMouseWheelMove();
+        if (lwheel != 0 and t.hovering(list_region)) ui.chat_file_list_scroll -= lwheel * row_h * 3;
+        if (ui.chat_file_list_scroll < 0) ui.chat_file_list_scroll = 0;
+        if (ui.chat_file_list_scroll > list_maxs) ui.chat_file_list_scroll = list_maxs;
+        var yy: f32 = body.y + 6 - ui.chat_file_list_scroll;
         var i: usize = 0;
-        while (i < nfiles and yy < body.y + body.height - 4) : (i += 1) {
+        while (i < nfiles) : (i += 1) {
+            defer yy += row_h;
+            if (yy + row_h < body.y or yy > body.y + body.height) continue; // cull rows outside the view
             const f = &files[i];
             const rr = t.Rect{ .x = body.x + 5, .y = yy, .width = list_w - 10, .height = row_h - 4 };
             const is_sel = std.mem.eql(u8, f.pathStr(), selfile[0..sfl]);
@@ -4928,7 +4949,6 @@ fn drawChatFiles(store: *Store, r: t.Rect) void {
                 store.pushChatCmd(store_mod.mkChatCmd(.chat_open_file, "", f.pathStr()));
                 ui.chat_file_scroll = 0;
             }
-            yy += row_h;
         }
     }
 
