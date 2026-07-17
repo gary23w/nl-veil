@@ -4467,8 +4467,12 @@ pub const Chat = struct {
             // text, else left empty for the render's "New chat" fallback. NEVER the raw conv id — a chat must
             // always show a human name (the id is a storage key). Some mirrors wrote the id straight into the
             // title line (mirrorServerConv's old id fallback), so a title that EQUALS the id counts as "no title".
-            if (Io.Dir.cwd().readFileAlloc(self.io, fp, self.gpa, .limited(4 << 10)) catch null) |head| {
-                defer self.gpa.free(head);
+            // Read a bounded PREFIX (readSinkHead), never readFileAlloc(.limited): a conv file grows past a few
+            // KB as messages accrue, and a size-limited whole-file read then ERRORS — which is exactly why every
+            // conversation lost its name once it got long enough (title read failed → fell back to the id).
+            var headbuf: [4096]u8 = undefined;
+            {
+                const head = self.readSinkHead(fp, &headbuf);
                 const nl = std.mem.indexOfScalar(u8, head, '\n') orelse head.len;
                 var titled = false;
                 if (llm.jsonUnescape(self.gpa, head[0..nl], "title")) |t| {
