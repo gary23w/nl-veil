@@ -19,6 +19,13 @@
 #   needs_account  the base URL carries an {account} placeholder (Cloudflare Workers AI)
 #   keyless        the SERVER accepts a deploy without a key (local endpoints / server-side creds)
 #   local          the provider runs on the user's machine (no internet egress)
+#
+# Per-model OPTIONAL capacity metadata (drives the size-adaptive prompts — see modelcfg.senseModel):
+#   params_b       parameter count in billions (rounded)
+#   ctx_k          context window in K tokens
+#   tier           explicit prompt-tier pin: small | mid | large (wins over every inference)
+# Only state what the model id itself doesn't already say — names like "8b"/"70b"/"128k" are sensed
+# automatically, hosted frontier names default to large, local unnamed models default to small.
 
 defaults:
   local_model: gpt-oss:20b
@@ -217,8 +224,11 @@ providers:
     base: https://openrouter.ai/api/v1
     needs_key: true
     models:
+      # the rotating router can hand back anything from an 8B to a frontier model — pin the compact
+      # prompt tier so the weakest draw still works (a large draw just gets the leaner doctrine)
       - id: openrouter/free
         label: Free (rotating free tier)
+        tier: small
       - id: meta-llama/llama-3.3-70b-instruct:free
         label: Llama 3.3 70B (free)
       - id: qwen/qwen3-coder:free
