@@ -21,6 +21,7 @@ const httpz = @import("httpz");
 const http = @import("../../gateway/http.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
+const llm = @import("../llm.zig");
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -263,6 +264,17 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
                 eff_base = cf.base_url; // authoritative account base (the desk may have sent the "cloudflare" sentinel)
             }
         }
+    }
+
+    // LOCAL-MODEL ADMISSION: a hosted backend fans out up to MAX_ACTIVE_TURNS, but a local model is one process
+    // that can't parallelize — admit at most this machine's local budget at a time. Checked AFTER the per-conv
+    // claim, so on rejection we must release that claim before returning 409. Hosted turns skip this entirely.
+    const is_local = llm.isLocal(eff_base);
+    if (is_local and !chat_engine.tryClaimLocal(app)) {
+        chat_engine.endTurn(app.io, seg); // give back the per-conv slot tryBeginTurn just took
+        res.status = 409;
+        const msg = try std.fmt.allocPrint(res.arena, "local model busy — this machine's budget of {d} concurrent local chat(s) is full. Finish or stop one, or use a hosted/BYOK model for unlimited parallel chats.", .{chat_engine.localChatBudget(app)});
+        return res.json(.{ .ok = false, .err = msg }, .{});
     }
 
     // Fire the turn on a background thread and return 202 AT ONCE, so the desk streams the turn's event frames

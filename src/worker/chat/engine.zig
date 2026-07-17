@@ -1680,8 +1680,9 @@ pub fn isTurnLive(io: std.Io, conv: []const u8) bool {
 }
 
 /// Release the in-flight slot for `conv` (matches tryBeginTurn). Copies nothing — safe to call before freeing any
-/// backing storage `conv` points into.
-fn endTurn(io: std.Io, conv: []const u8) void {
+/// backing storage `conv` points into. Pub so postMessage can release the slot when a LATER admission gate (the
+/// local-model budget) rejects the turn after tryBeginTurn already claimed it.
+pub fn endTurn(io: std.Io, conv: []const u8) void {
     if (conv.len == 0 or conv.len > 64) return;
     turn_mtx.lockUncancelable(io);
     defer turn_mtx.unlock(io);
@@ -1691,6 +1692,98 @@ fn endTurn(io: std.Io, conv: []const u8) void {
             return;
         }
     }
+}
+
+// ---------------------------------------------------------------- local-model admission (capability-tiered)
+// A hosted provider fans out freely (up to MAX_ACTIVE_TURNS) — its concurrency is the provider's problem. A
+// LOCAL model backend (Ollama/llama.cpp on loopback) is the opposite: ONE process doing one forward pass at a
+// time, its weights already filling most of the machine's RAM/VRAM. Two concurrent local turns don't run in
+// parallel — they queue inside the model server or thrash its KV cache, so admitting them just deepens a queue
+// no one can see. Local turns therefore get a SEPARATE, machine-sized budget: qualify the box once and admit
+// at most that many at a time, rejecting the rest with 409 (the desk falls back to its own engine, or the user
+// waits) instead of piling onto a model that cannot parallelize. Hosted turns never touch this gate.
+var local_mtx: std.Io.Mutex = .init;
+var local_inflight: u32 = 0;
+var local_budget_cache: u32 = 0; // 0 = not computed yet; memoized on first read (hardware is fixed for the run)
+
+/// Total physical RAM in gibibytes (0 if it can't be determined). Windows: GlobalMemoryStatusEx; other OSes
+/// return 0 → the budget falls back to the conservative floor of 1.
+fn totalPhysicalRamGiB() u64 {
+    if (builtin.os.tag != .windows) return 0;
+    const win = struct {
+        const MEMORYSTATUSEX = extern struct {
+            dwLength: u32,
+            dwMemoryLoad: u32,
+            ullTotalPhys: u64,
+            ullAvailPhys: u64,
+            ullTotalPageFile: u64,
+            ullAvailPageFile: u64,
+            ullTotalVirtual: u64,
+            ullAvailVirtual: u64,
+            ullAvailExtendedVirtual: u64,
+        };
+        extern "kernel32" fn GlobalMemoryStatusEx(buffer: *MEMORYSTATUSEX) callconv(.c) i32;
+    };
+    var ms: win.MEMORYSTATUSEX = undefined;
+    ms.dwLength = @sizeOf(win.MEMORYSTATUSEX);
+    if (win.GlobalMemoryStatusEx(&ms) == 0) return 0;
+    return ms.ullTotalPhys / (1 << 30);
+}
+
+/// Concurrent-local-turn budget from the qualified machine: RAM is the binding resource (model weights + a KV
+/// cache per parallel slot), cores a secondary gate. Deliberately conservative — a mis-high budget OOMs or
+/// thrashes the model server, a mis-low one just serializes (safe). Always >= 1.
+fn deriveLocalBudget(ram_gib: u64, cores: u32) u32 {
+    if (ram_gib == 0) return 1; // couldn't qualify → one at a time
+    if (ram_gib >= 64 and cores >= 16) return 3;
+    if (ram_gib >= 32 and cores >= 12) return 2;
+    return 1;
+}
+
+/// How many concurrent LOCAL-model chat turns this machine may run. `NL_LOCAL_CHAT_BUDGET` (parent env) overrides
+/// with an explicit number; otherwise it is derived from RAM + cores. Memoized — the hardware doesn't change.
+pub fn localChatBudget(app: *App) u32 {
+    if (local_budget_cache != 0) return local_budget_cache;
+    var budget: u32 = 0;
+    if (app.sup.parent_env) |env| {
+        if (env.get("NL_LOCAL_CHAT_BUDGET")) |v| {
+            const t = std.mem.trim(u8, v, " \r\n\t");
+            if (std.fmt.parseInt(u32, t, 10)) |n| budget = n else |_| {}
+        }
+    }
+    if (budget == 0) {
+        const cores: u32 = @intCast(std.Thread.getCpuCount() catch 1);
+        budget = deriveLocalBudget(totalPhysicalRamGiB(), cores);
+    }
+    budget = std.math.clamp(budget, 1, MAX_ACTIVE_TURNS);
+    local_budget_cache = budget;
+    return budget;
+}
+
+/// Claim one local-model turn slot. Returns false when the machine's local budget is already full (caller 409s
+/// rather than pile onto a model that can't parallelize). Every success MUST be paired with releaseLocal.
+pub fn tryClaimLocal(app: *App) bool {
+    const budget = localChatBudget(app);
+    local_mtx.lockUncancelable(app.io);
+    defer local_mtx.unlock(app.io);
+    if (local_inflight >= budget) return false;
+    local_inflight += 1;
+    return true;
+}
+
+/// Release a local-model turn slot claimed by tryClaimLocal. Saturating (never underflows past 0).
+pub fn releaseLocal(io: std.Io) void {
+    local_mtx.lockUncancelable(io);
+    defer local_mtx.unlock(io);
+    if (local_inflight > 0) local_inflight -= 1;
+}
+
+test "deriveLocalBudget: conservative floor, scales with RAM+cores" {
+    try std.testing.expectEqual(@as(u32, 1), deriveLocalBudget(0, 32)); // unqualified machine → 1
+    try std.testing.expectEqual(@as(u32, 1), deriveLocalBudget(16, 8)); // modest box → 1
+    try std.testing.expectEqual(@as(u32, 2), deriveLocalBudget(32, 12));
+    try std.testing.expectEqual(@as(u32, 3), deriveLocalBudget(64, 16));
+    try std.testing.expectEqual(@as(u32, 1), deriveLocalBudget(64, 8)); // big RAM but few cores → still 1
 }
 
 /// Owned arguments for a background turn: one backing `blob` holds every string arg (the request arena that
@@ -1713,6 +1806,7 @@ pub const TurnArgs = struct {
 fn turnThread(args: *TurnArgs) void {
     runTurn(args.app, args.uid, args.conv, args.base_url, args.key, args.model, args.text, args.loop, args.tool_client);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
+    if (llm.isLocal(args.base_url)) releaseLocal(args.app.io); // release the machine-sized local-model slot
     const gpa = args.app.gpa;
     gpa.free(args.blob);
     gpa.destroy(args);
@@ -1732,12 +1826,14 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, ke
     const args = gpa.create(TurnArgs) catch {
         runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
         endTurn(app.io, conv);
+        if (llm.isLocal(base_url)) releaseLocal(app.io);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
         runTurn(app, uid, conv, base_url, key, model, text, loop, tool_client);
         endTurn(app.io, conv);
+        if (llm.isLocal(base_url)) releaseLocal(app.io);
         return;
     };
     var o: usize = 0;
@@ -3683,13 +3779,18 @@ fn storeDurableMemory(app: *App, cat_in: []const u8, fact_in: []const u8) void {
     http.appendFile(app.io, gpa, path, jb.items) catch {};
 }
 
-/// Drop durable memories whose text contains `match` (case-insensitive) — whole-file rewrite.
+/// Drop durable memories whose text contains `match` (case-insensitive) — whole-file rewrite. Held under the
+/// append lock across read AND write: this rewrite must be mutually exclusive with storeDurableMemory's
+/// appendFile, or a concurrent chat's append that lands between this read and this write is clobbered (the
+/// durable-store lost-update race that opens up once two conversations run at once).
 fn forgetDurableMemory(app: *App, match_in: []const u8) void {
     const gpa = app.gpa;
     const match = std.mem.trim(u8, match_in, " \r\n\t");
     if (match.len < 2) return;
     var pb: [700]u8 = undefined;
     const path = memoriesPath(app, &pb) orelse return;
+    http.appendLock(app.io);
+    defer http.appendUnlock(app.io);
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
     defer gpa.free(data);
     var out: std.ArrayListUnmanaged(u8) = .empty;
