@@ -880,9 +880,19 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         }
         var shared = false;
         if (ctx.share_obs) {
+            // scout/operator: contributing to the hive IS the job — observe flows straight to it.
             shared = hiveStore(ctx, p.value.fact);
             if (!shared) _ = ctx.mem.observe(ctx.scope, p.value.fact);
+        } else if (ctx.hive_guard) {
+            // CHAT: observe is CONVERSATION-LOCAL — it writes only this conversation's own partition. The
+            // shared cross-conversation KNOWLEDGE hive is OPT-IN via the explicit `share` tool, so N unrelated
+            // chats running concurrently don't interleave their findings into one bleed-prone scope (the
+            // cross-task-recall failure class). Swarm minds keep the one-hive-mind dual-write below.
+            _ = ctx.mem.observe(ctx.scope, p.value.fact);
+            ctx.observed.* += 1;
+            return dupe(gpa, "stored in this conversation's memory. To contribute a REUSABLE fact to the shared cross-conversation hive (recallable from other chats), use `share` instead.");
         } else {
+            // swarm mind (one hive mind): observe ALSO deposits into the shared KNOWLEDGE hive.
             _ = ctx.mem.observe(ctx.scope, p.value.fact);
             shared = hiveStore(ctx, p.value.fact);
         }

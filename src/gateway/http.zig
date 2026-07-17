@@ -90,6 +90,17 @@ pub fn sessionToken(req: *httpz.Request) ?[]const u8 {
 /// appendFile; this covers only the gateway/chat/control callers.)
 var append_mtx: std.Io.Mutex = .init;
 
+/// Hold the append lock across a caller's own read-modify-write of an append-log file. A whole-file rewrite
+/// (e.g. dropping a durable-memory line) must be mutually exclusive with appendFile: without this a concurrent
+/// append that lands between the rewrite's read and its write is clobbered. The caller MUST NOT call appendFile
+/// while holding it (std.Io.Mutex is non-reentrant → deadlock); do the read + writeFile directly, then unlock.
+pub fn appendLock(io: std.Io) void {
+    append_mtx.lockUncancelable(io);
+}
+pub fn appendUnlock(io: std.Io) void {
+    append_mtx.unlock(io);
+}
+
 pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     _ = alloc; // no scratch buffer needed for a positioned append
     append_mtx.lockUncancelable(io);
