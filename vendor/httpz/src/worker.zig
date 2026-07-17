@@ -212,6 +212,11 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             conn.address = ip_address;
             conn.handover = .unknown;
             conn.stream = .{ .socket = .{ .handle = socket, .address = ip_address } };
+            // Parity with the NonBlocking accept path: a pooled conn keeps its old count, and the keepalive
+            // decision in Server.handleRequest compares request_count against config.timeout.request_count.
+            // Without this (and the per-request increment below) blocking mode never counts at all, so a
+            // request_count cap in the config was silently ignored and keep-alive connections never recycled.
+            conn.request_count = 1;
 
             var is_keepalive = false;
             while (true) {
@@ -323,6 +328,7 @@ pub fn Blocking(comptime S: type, comptime WSH: type) type {
             }
 
             metrics.request();
+            conn.request_count += 1; // parity with NonBlocking's processHTTPData — feeds the keepalive/close decision
             self.server.handleRequest(conn, thread_buf);
             return conn.handover;
         }
