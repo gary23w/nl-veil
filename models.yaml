@@ -250,8 +250,10 @@ providers:
 
   # Moonshot AI (Kimi) — the FIRST-party Kimi API, OpenAI-compatible chat/completions with Bearer auth (so it
   # flows through the standard BYOK path like DeepSeek/Z.AI). kimi-k3 is the flagship (2.8T params, 1M-token
-  # context, reasoning + vision); the k2.x line is coding / agent / multimodal; moonshot-v1-* are the classic
-  # text + vision-preview models. Docs: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
+  # context, reasoning + vision); the k2.x line is coding / agent. ONLY these four ids exist on the live API
+  # (GET /v1/models, verified 2026-07-17) — the legacy moonshot-v1-* ids and kimi-k2.5 return "Not found the
+  # model or Permission denied", so listing them just hands the user a dead dropdown entry.
+  # Docs: https://platform.kimi.ai/docs/guide/kimi-k3-quickstart
   - key: moonshot
     label: Kimi (Moonshot AI)
     base: https://api.moonshot.ai/v1
@@ -265,19 +267,3 @@ providers:
         label: Kimi K2.7 Code (highspeed)
       - id: kimi-k2.6
         label: Kimi K2.6
-      - id: kimi-k2.5
-        label: Kimi K2.5
-      - id: moonshot-v1-auto
-        label: Moonshot v1 (auto ctx)
-      - id: moonshot-v1-128k
-        label: Moonshot v1 128k
-      - id: moonshot-v1-32k
-        label: Moonshot v1 32k
-      - id: moonshot-v1-8k
-        label: Moonshot v1 8k
-      - id: moonshot-v1-128k-vision-preview
-        label: Moonshot v1 128k Vision
-      - id: moonshot-v1-32k-vision-preview
-        label: Moonshot v1 32k Vision
-      - id: moonshot-v1-8k-vision-preview
-        label: Moonshot v1 8k Vision
