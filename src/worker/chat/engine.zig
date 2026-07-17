@@ -3191,11 +3191,14 @@ fn runInnerAgentic(
                 // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
                 if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, steer_cursor.*);
                 // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled
-                // in-process via deploy_service + app.sup, NOT the mind-tool executor. Everything else executes
-                // as a mind tool: in CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so
-                // file/shell/code tools act on the USER's machine; otherwise it runs here (a hive/server turn).
+                // in-process via deploy_service + app.sup, NOT the mind-tool executor. get_credential is also
+                // SERVER-side always: its store is the server's memories.jsonl, and the client executor has no
+                // durable_path — delegated, it refused every fetch (observed: a desk chat could not retrieve
+                // its Discourse key and built around the failure). Everything else executes as a mind tool: in
+                // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
+                // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
                 break :blk orchTool(app, uid, conv, conv_dir, steer_cursor.*, base_url, key, model, c.name, c.args, tool_client) orelse
-                    (if (tool_client) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
+                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             // TOOL-PERFORMANCE LEARNING: record only genuinely-executed calls (dedup/budget guards never ran the
