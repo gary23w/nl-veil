@@ -58,6 +58,37 @@ pub const Notif = struct {
     }
 };
 
+/// One overridable provider role (thinking / prompting) in the model trio. Mirrors the base chat_* fields.
+/// An unset role (`set` false or a blank model) falls back to the base/coding provider — see resolveProviderFor
+/// in chat.zig. The api key is NOT persisted here: like the base chat_key it lives in the OS secret store keyed
+/// by the (kind,byok) provider slug, and loadKey copies it into `key`/`key_len` in memory at startup + on save.
+pub const RoleCfg = struct {
+    set: bool = false, // has the user configured this role? false ⇒ inherit the base/coding provider
+    kind: u8 = 0, // 0 local (Ollama) / 1 BYOK (catalog provider) / 2 custom URL — same encoding as chat_kind
+    byok: u8 = 0, // catalog.providers index when kind==1
+    base: [192]u8 = [_]u8{0} ** 192, // custom endpoint (OpenAI-compatible /v1 root)
+    base_len: u8 = 0,
+    model: [96]u8 = [_]u8{0} ** 96,
+    model_len: u8 = 0,
+    cf_account: [64]u8 = [_]u8{0} ** 64,
+    cf_account_len: u8 = 0,
+    key: [192]u8 = [_]u8{0} ** 192, // in-memory only (from secrets.zig); never written to settings.json
+    key_len: u8 = 0,
+
+    pub fn baseStr(r: *const RoleCfg) []const u8 {
+        return r.base[0..r.base_len];
+    }
+    pub fn modelStr(r: *const RoleCfg) []const u8 {
+        return r.model[0..r.model_len];
+    }
+    pub fn keyStr(r: *const RoleCfg) []const u8 {
+        return r.key[0..r.key_len];
+    }
+    pub fn cfAccountStr(r: *const RoleCfg) []const u8 {
+        return r.cf_account[0..r.cf_account_len];
+    }
+};
+
 pub const Settings = struct {
     data_dir: [512]u8 = [_]u8{0} ** 512,
     data_dir_len: u16 = 0,
@@ -84,6 +115,13 @@ pub const Settings = struct {
     chat_key_len: u8 = 0,
     cf_account: [64]u8 = [_]u8{0} ** 64, // Cloudflare account id — built into the Workers AI base_url (not a secret)
     cf_account_len: u8 = 0,
+    // MODEL TRIO: the base chat_* fields above ARE the "coding" model (and, when unified, the model for all
+    // three roles). When chat_unified is false, chat_think / chat_prompt override the "thinking" (planning +
+    // context housekeeping) and "prompting" (auto-loop self-prompt-back) roles. Default unified = today's
+    // single-model behavior; an old settings.json (no trio keys) loads as unified with both roles unset.
+    chat_unified: bool = true,
+    chat_think: RoleCfg = .{},
+    chat_prompt: RoleCfg = .{},
     // chat pane collapse state (persisted with the chat settings)
     chat_left_open: bool = true,
     chat_right_open: bool = true,
@@ -138,6 +176,93 @@ pub const Settings = struct {
     }
     pub fn cfAccount(s: *const Settings) []const u8 {
         return s.cf_account[0..s.cf_account_len];
+    }
+
+    // ---- MODEL TRIO role accessors: role 0 = base/coding (the chat_* fields), 1 = thinking, 2 = prompting ----
+    pub fn kindFor(s: *const Settings, role: u8) u8 {
+        return switch (role) {
+            1 => s.chat_think.kind,
+            2 => s.chat_prompt.kind,
+            else => s.chat_kind,
+        };
+    }
+    pub fn byokFor(s: *const Settings, role: u8) u8 {
+        return switch (role) {
+            1 => s.chat_think.byok,
+            2 => s.chat_prompt.byok,
+            else => s.chat_byok,
+        };
+    }
+    pub fn modelStrFor(s: *const Settings, role: u8) []const u8 {
+        return switch (role) {
+            1 => s.chat_think.modelStr(),
+            2 => s.chat_prompt.modelStr(),
+            else => s.chatModel(),
+        };
+    }
+    pub fn keyLenFor(s: *const Settings, role: u8) usize {
+        return switch (role) {
+            1 => s.chat_think.key_len,
+            2 => s.chat_prompt.key_len,
+            else => s.chat_key_len,
+        };
+    }
+    /// Set a role's provider kind, marking an override role (1/2) as configured (`set`).
+    pub fn setKindFor(s: *Settings, role: u8, v: u8) void {
+        switch (role) {
+            1 => {
+                s.chat_think.kind = v;
+                s.chat_think.set = true;
+            },
+            2 => {
+                s.chat_prompt.kind = v;
+                s.chat_prompt.set = true;
+            },
+            else => s.chat_kind = v,
+        }
+    }
+    pub fn setByokFor(s: *Settings, role: u8, v: u8) void {
+        switch (role) {
+            1 => {
+                s.chat_think.byok = v;
+                s.chat_think.set = true;
+            },
+            2 => {
+                s.chat_prompt.byok = v;
+                s.chat_prompt.set = true;
+            },
+            else => s.chat_byok = v,
+        }
+    }
+    pub fn setModelFor(s: *Settings, role: u8, m: []const u8) void {
+        switch (role) {
+            1 => {
+                const n = @min(m.len, s.chat_think.model.len);
+                @memcpy(s.chat_think.model[0..n], m[0..n]);
+                s.chat_think.model_len = @intCast(n);
+                s.chat_think.set = true;
+            },
+            2 => {
+                const n = @min(m.len, s.chat_prompt.model.len);
+                @memcpy(s.chat_prompt.model[0..n], m[0..n]);
+                s.chat_prompt.model_len = @intCast(n);
+                s.chat_prompt.set = true;
+            },
+            else => {
+                const n = @min(m.len, s.chat_model.len);
+                @memcpy(s.chat_model[0..n], m[0..n]);
+                s.chat_model_len = @intCast(n);
+            },
+        }
+    }
+    /// Whether an override role (1=thinking, 2=prompting) has its own config. Role 0 (base/coding) is always
+    /// "set". An unset override role inherits the coding provider (resolveProviderFor falls back).
+    pub fn roleSet(s: *const Settings, role: u8) bool {
+        return switch (role) {
+            1 => s.chat_think.set,
+            2 => s.chat_prompt.set,
+            else => true,
+        };
     }
 };
 
