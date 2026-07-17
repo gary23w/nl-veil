@@ -358,16 +358,16 @@ fn ensureMarkTexture() void {
     mark_tex_attempted = true;
     // The desk cwd varies (repo root, zig-out/bin, Explorer double-click), so try the icon relative to each.
     // icon16x16.png is the brand mark used for BOTH the titlebar client icon (drawMark) and the chat veil mark
-    // (drawMarkPulse); icon.png is a legacy fallback so an older asset set still renders something.
+    // (drawMarkPulse); icon48x48.png is a larger fallback (downscaled) so a partial asset set still renders.
     const candidates = [_][:0]const u8{
         "assets/icon16x16.png",
         "desk/assets/icon16x16.png",
         "../assets/icon16x16.png",
         "../desk/assets/icon16x16.png",
-        "assets/icon.png",
-        "desk/assets/icon.png",
-        "../assets/icon.png",
-        "../desk/assets/icon.png",
+        "assets/icon48x48.png",
+        "desk/assets/icon48x48.png",
+        "../assets/icon48x48.png",
+        "../desk/assets/icon48x48.png",
     };
     for (candidates) |path| {
         if (rl.loadImage(path)) |loaded| {
@@ -459,6 +459,12 @@ pub fn textMono(s: [:0]const u8, x: i32, y: i32, size: i32, c: Color) void {
 }
 pub fn measureMono(s: [:0]const u8, size: i32) i32 {
     return @intFromFloat(rl.measureTextEx(theMono(), s, scaledMono(size), 0.5).x);
+}
+/// Fractional mono width — the true sub-pixel advance raylib draws with. Callers that position text by
+/// column (x = col * advance) MUST use this, not measureMono: the integer truncation there is <1px per call
+/// but accumulates into visible drift when multiplied by a column index over a long line.
+pub fn measureMonoF(s: [:0]const u8, size: i32) f32 {
+    return rl.measureTextEx(theMono(), s, scaledMono(size), 0.5).x;
 }
 /// Monospace clip helper for the console.
 pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i32) void {
@@ -770,7 +776,7 @@ pub fn winButton(r: Rect, glyph: [:0]const u8, danger: bool) bool {
     return hot and rl.isMouseButtonPressed(.left);
 }
 
-/// The nl-veil mark: use assets/icon.png when available; fall back to the procedural bust if loading fails.
+/// The nl-veil mark: use assets/icon48x48.png when available; fall back to the procedural bust if loading fails.
 /// cx,cy is the center; `s` the half-size.
 pub fn drawMark(cx: f32, cy: f32, s: f32, tile: bool) void {
     if (tile) rl.drawRectangleRounded(.{ .x = cx - s, .y = cy - s, .width = s * 2, .height = s * 2 }, 0.32, 8, bg_hl);

@@ -311,10 +311,10 @@ const WindowsTray = struct {
     fn loadIconFromPng(self: *WindowsTray) ?*anyopaque {
         _ = self;
         const candidates = [_][:0]const u8{
-            "assets/icon.png",
-            "desk/assets/icon.png",
-            "../assets/icon.png",
-            "../desk/assets/icon.png",
+            "assets/icon48x48.png",
+            "desk/assets/icon48x48.png",
+            "../assets/icon48x48.png",
+            "../desk/assets/icon48x48.png",
         };
         for (candidates) |path| {
             if (rl.loadImage(path)) |loaded| {

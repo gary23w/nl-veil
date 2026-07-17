@@ -20,6 +20,7 @@ const gitvc = @import("gitvc.zig");
 const catalog = @import("catalog.zig");
 const log = @import("log.zig");
 const neurondb = @import("neuron.zig");
+const mdutil = @import("mdutil.zig");
 
 const Store = store_mod.Store;
 
@@ -4292,6 +4293,8 @@ pub const Chat = struct {
         var font_bold = false;
         var narrator = false;
         var browser_headful = false;
+        var leftw: u16 = 230;
+        var rightw: u16 = 320;
         var cfa: [64]u8 = undefined;
         var cfa_n: usize = 0;
         {
@@ -4317,6 +4320,8 @@ pub const Chat = struct {
             font_bold = s.font_bold;
             narrator = s.narrator;
             browser_headful = s.browser_headful;
+            leftw = s.chat_left_w;
+            rightw = s.chat_right_w;
         }
         var port: u16 = 8787;
         var host: [64]u8 = undefined;
@@ -4347,7 +4352,7 @@ pub const Chat = struct {
         // BROKEN toggle wrote `local_brain:true` on every idle frame (it read the checkbox's click flag as
         // the new value), so every install with that build got silently pinned local and could never turn
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{}}}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"leftw\":{d},\"rightw\":{d}}}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, leftw, rightw }) catch return;
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/settings.json", .{dd}) catch return;
         Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = jb.items }) catch {
@@ -4437,6 +4442,13 @@ pub const Chat = struct {
         self.syncBrowserPref(s.browser_headful); // reflect the persisted choice to the daemon prefs file at startup
         if (jInt(data, "font_scale")) |v| {
             if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
+        }
+        // drag-resized pane widths (absent = keep the defaults); bounds just reject a garbage hand-edit
+        if (jInt(data, "leftw")) |v| {
+            if (v >= 120 and v <= 640) s.chat_left_w = @intCast(v);
+        }
+        if (jInt(data, "rightw")) |v| {
+            if (v >= 180 and v <= 700) s.chat_right_w = @intCast(v);
         }
         // SERVER CHAT is the default and the primary path: the brain runs in the backend and delegates every tool
         // call to THIS client's harness (`veil exec-tool`), so the veil acts on the user's machine while the desk
@@ -7292,12 +7304,52 @@ pub const Chat = struct {
         self.cast_server_owned = false;
     }
 
+    /// Mirror the ACTIVE conversation's chat plan into the store's checklist. Scans back through recent veil
+    /// messages, parsing each candidate under the lock; the NEWEST one that yields >=2 rows wins — so a stray
+    /// "[]const u8" that only HINTS a plan can't shadow a real plan further back. Publishes it and returns true
+    /// so watchPlan skips the server board; returns false when no chat plan exists → the board is used instead.
+    fn publishPlanFromChat(self: *Chat) bool {
+        var rows: [store_mod.MAX_PLAN]store_mod.PlanRow = undefined;
+        var count: usize = 0;
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            var i = self.store.msg_count;
+            var examined: usize = 0;
+            while (i > 0 and examined < 40) {
+                i -= 1;
+                examined += 1;
+                const m = &self.store.msgs[i];
+                if (m.role != .veil) continue;
+                const s = m.textStr();
+                if (!planHint(s)) continue; // cheap pre-filter before the line-by-line parse
+                const n = parsePlanInto(rows[0..], s);
+                if (n >= 2) {
+                    count = n;
+                    break;
+                }
+            }
+        }
+        if (count == 0) return false; // no chat plan → let watchPlan read the server board
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            @memcpy(self.store.plan[0..count], rows[0..count]);
+            self.store.plan_count = count;
+        }
+        self.plan_size = 0; // if a later tick falls back to the board, force a fresh read
+        return true;
+    }
+
     /// Publish the ACTIVE conversation's server plan-board ({conv}/plan.jsonl) into the store so the right pane
     /// renders a live checklist (the user asked to SEE plan progress throughout the chat, not just the plan
     /// message). ~1Hz with a size cache: an unchanged board costs one statFile; a conv switch (plan_conv key
     /// mismatch) forces a re-read; an absent/empty board publishes 0 rows. The server rewrites the whole file per
     /// subtask update (non-atomic) — the skip-bad-lines parse self-heals a torn read on the next tick.
     fn watchPlan(self: *Chat, dd: []const u8) void {
+        // MIRROR THE CHAT: if the veil wrote a plan in its message, show THAT (the server board is often stale
+        // or absent for chat turns). Only when no chat plan exists do we fall through to the plan.jsonl board.
+        if (self.publishPlanFromChat()) return;
         var cb: [64]u8 = undefined;
         const conv = self.convScope(&cb);
         if (conv.len == 0 or conv.len > self.plan_conv.len) {
@@ -10697,6 +10749,107 @@ test "wesc keeps the JSON body valid UTF-8 (folds CP1252, preserves real UTF-8)"
     try std.testing.expect(std.mem.indexOf(u8, out, "a - b") != null); // 0x97 -> '-'
     try std.testing.expect(std.mem.indexOf(u8, out, "\xe2\x80\x94") != null); // real em dash preserved
     try std.testing.expect(std.mem.indexOf(u8, out, "\\\"q\\\"") != null); // quote escaped
+}
+
+// ---- chat-plan mirroring: recognise a "Plan" checklist the veil wrote so the right pane can reflect it ----
+
+const PlanItem = struct { text: []const u8, done: bool, checkbox: bool };
+
+/// A "Plan" header line: "Plan", "Plan:", "## Plan", "**Plan (2/5)**" — leading #/*/space stripped, then a
+/// case-insensitive "plan" followed by end / ':' / space / '*'.
+fn isPlanHeader(line: []const u8) bool {
+    const s = std.mem.trimStart(u8, line, "#* \t");
+    if (!std.ascii.startsWithIgnoreCase(s, "plan")) return false;
+    const rest = s[4..];
+    if (rest.len == 0) return true;
+    const c = rest[0];
+    return c == ':' or c == ' ' or c == '*' or c == '\t';
+}
+
+/// One list item: "N." / "N)" / "-" / "*" / "+" marker, an optional "[ ]"/"[]"/"[x]" checkbox, then text.
+/// null when the line is not a list item. `checkbox`/`done` report the checkbox state (for status + whether a
+/// bare run counts as a plan).
+fn parsePlanItem(line: []const u8) ?PlanItem {
+    if (line.len == 0) return null;
+    var s = line;
+    if (s[0] >= '0' and s[0] <= '9') {
+        var k: usize = 0;
+        while (k < s.len and s[k] >= '0' and s[k] <= '9') k += 1;
+        if (k >= s.len or (s[k] != '.' and s[k] != ')')) return null;
+        s = s[k + 1 ..];
+    } else if (s[0] == '-' or s[0] == '*' or s[0] == '+') {
+        s = s[1..];
+    } else return null;
+    if (s.len == 0 or (s[0] != ' ' and s[0] != '\t')) return null; // a marker needs a trailing space
+    s = std.mem.trimStart(u8, s, " \t");
+    var done = false;
+    var checkbox = false;
+    if (s.len >= 2 and s[0] == '[') {
+        if (s[1] == ']') {
+            checkbox = true;
+            s = s[2..];
+        } else if (s.len >= 3 and s[2] == ']') {
+            if (s[1] == ' ') {
+                checkbox = true;
+                s = s[3..];
+            } else if (s[1] == 'x' or s[1] == 'X') {
+                checkbox = true;
+                done = true;
+                s = s[3..];
+            }
+        }
+        s = std.mem.trimStart(u8, s, " \t");
+    }
+    if (s.len == 0) return null;
+    return .{ .text = s, .done = done, .checkbox = checkbox };
+}
+
+/// Parse the LAST "Plan" block in `txt` (a "Plan:" header + list items, or a bare run of checkbox items) into
+/// `dst`, returning the row count (capped to dst.len). A header or a fresh checkbox run resets the accumulator
+/// so a later plan supersedes an earlier one within the same message.
+fn parsePlanInto(dst: []store_mod.PlanRow, txt: []const u8) usize {
+    var n: usize = 0;
+    var in_plan = false;
+    var it = std.mem.splitScalar(u8, txt, '\n');
+    while (it.next()) |raw| {
+        if (n >= dst.len) break;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (isPlanHeader(line)) {
+            in_plan = true;
+            n = 0;
+            continue;
+        }
+        if (parsePlanItem(line)) |item| {
+            if (!in_plan and item.checkbox) { // a bare checkbox run also starts a plan block
+                in_plan = true;
+                n = 0;
+            }
+            if (in_plan) {
+                var row = store_mod.PlanRow{};
+                const cl = mdutil.cleanInline(row.text[0..], item.text);
+                row.text_len = @intCast(@min(cl, row.text.len));
+                row.route_len = 0; // a chat plan carries no route tag
+                row.status = if (item.done) .done else .pending;
+                dst[n] = row;
+                n += 1;
+            }
+        } else if (line.len > 0 and in_plan and n > 0) {
+            in_plan = false; // a non-empty, non-item line ends the block
+        }
+    }
+    return n;
+}
+
+/// Cheap pre-filter (checkbox glyphs or a "Plan" header) so publishPlanFromChat only deep-parses a message
+/// that plausibly holds a plan.
+fn planHint(txt: []const u8) bool {
+    if (std.mem.indexOf(u8, txt, "[ ]") != null) return true;
+    if (std.mem.indexOf(u8, txt, "[]") != null) return true;
+    if (std.mem.indexOf(u8, txt, "[x]") != null) return true;
+    if (std.mem.indexOf(u8, txt, "[X]") != null) return true;
+    if (std.ascii.startsWithIgnoreCase(std.mem.trimStart(u8, txt, " #*\t"), "plan")) return true;
+    if (std.mem.indexOf(u8, txt, "\nPlan") != null or std.mem.indexOf(u8, txt, "\nplan") != null) return true;
+    return false;
 }
 
 fn jInt(line: []const u8, key: []const u8) ?i64 {
