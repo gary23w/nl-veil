@@ -24,7 +24,10 @@ pub fn swarmEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
     const slice = if (from <= data.len) data[from..] else data[0..0];
     res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{data.len}));
-    res.content_type = .EVENTS;
+    // .TEXT, deliberately NOT .EVENTS: bounded poll body. An empty .EVENTS response carries no Content-Length
+    // (SSE framing = body ends at close), so a keep-alive client (the web console's poll loop) blocked until
+    // the 60s idle reap on every empty poll. swarmStream below is the real SSE endpoint and keeps .EVENTS.
+    res.content_type = .TEXT;
     res.body = slice;
 }
 

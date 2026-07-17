@@ -78,6 +78,8 @@ pub fn adminAudit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     else |e|
         @errorName(e);
     res.header("X-Audit-Integrity", integ);
-    res.content_type = .EVENTS;
+    // .TEXT, not .EVENTS: a one-shot jsonl dump. An empty .EVENTS response is sent without Content-Length
+    // (SSE framing), leaving a keep-alive client hanging for the body until the 60s idle reap.
+    res.content_type = .TEXT;
     res.body = data;
 }
