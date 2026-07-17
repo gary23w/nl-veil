@@ -1476,12 +1476,17 @@ pub const Chat = struct {
         };
         if (!bok) return false; // couldn't build the request → local fallback
 
-        // Baseline cursor: only frames written AFTER this send are new (prior frames are already rendered/empty).
-        var from0: usize = 0;
-        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
-            from0 = er.body.len;
-            if (er.body.len > 0) self.gpa.free(er.body);
-        }
+        // Baseline cursor: only frames written AFTER this send are new. The tail comes from eventsTailCursor
+        // (drained, never one capped fetch) — a short/failed probe used to arm the watch far BEHIND the tail,
+        // so the desk replayed ancient frames (re-running historical tool_requests as fresh delegations!) and
+        // never reached the live turn's requests before the server timed them out ("the desk client dropped
+        // that call" — observed live on chirper after a desk restart). Unreachable → local engine, never a
+        // poisoned watch. Re-sending into the already-watched conv resumes from its cursor (skips the drain).
+        const prior: usize = if (self.sc_conv_len == conv.len and std.mem.eql(u8, self.sc_conv[0..self.sc_conv_len], conv)) self.sc_from else 0;
+        const from0 = self.eventsTailCursor(conv, prior) orelse {
+            log.warn("server chat: cannot baseline the events cursor for {s} — using the local engine this turn", .{conv[0..@min(conv.len, 48)]});
+            return false;
+        };
 
         self.setBusy(true);
         self.setStatus("server turn running...");
@@ -3707,6 +3712,26 @@ pub const Chat = struct {
         if (self.mirror_live and !self.sc_active and id.len <= self.sc_conv.len) self.attachServerTurn(dd, id);
     }
 
+    /// The conversation's events.jsonl TAIL position, by draining the BOUNDED events endpoint until an empty
+    /// body. One fetch's body.len is NOT the tail: the server caps a response (8MB), so a big file
+    /// under-counts — and a failed probe used to yield 0. Both armed the watch behind the tail, and the desk
+    /// then serviced HISTORICAL tool_request frames as if live (re-executing old tools) while the real turn's
+    /// delegations timed out server-side. null = unreachable: the caller must not arm a server watch at all.
+    /// A 404 (no conv dir / no events file yet) is a genuinely empty tail: 0.
+    fn eventsTailCursor(self: *Chat, conv: []const u8, start: usize) ?usize {
+        var cur = start;
+        var probes: usize = 0;
+        while (probes < 40) : (probes += 1) { // 40 × the server's 8MB response cap ≫ any real events file
+            const er = self.runner().chatEvents(self.io, self.gpa, conv, cur) orelse return null;
+            defer if (er.body.len > 0) self.gpa.free(er.body);
+            if (er.status == 404) return 0;
+            if (er.status != 200) return null;
+            if (er.body.len == 0) return cur;
+            cur += er.body.len;
+        }
+        return cur; // pathologically large file — at worst still behind, but monotone and close
+    }
+
     /// Attach the server-chat poller to a turn THIS desk did not fire (a scheduled run in progress). Baselines
     /// the event cursor at the CURRENT end of events.jsonl — the mirror already showed everything committed;
     /// only new frames stream in (an in-flight message's earlier tokens arrive when it commits as a whole).
@@ -3714,11 +3739,13 @@ pub const Chat = struct {
     /// steers, and {done} (or the silence failsafe) disarms.
     fn attachServerTurn(self: *Chat, dd: []const u8, conv: []const u8) void {
         _ = dd;
-        var from0: usize = 0;
-        if (self.runner().chatEvents(self.io, self.gpa, conv, 0)) |er| {
-            from0 = er.body.len;
-            if (er.body.len > 0) self.gpa.free(er.body);
-        }
+        // TAIL, not one capped fetch: attaching behind the tail replays the conversation's ENTIRE history of
+        // tool_requests as fresh delegations (side effects re-executed). Unreachable → stay on the frozen
+        // mirror; a later poll/select can attach once the server answers.
+        const from0 = self.eventsTailCursor(conv, 0) orelse {
+            log.warn("server chat: cannot baseline the events cursor for {s} — not attaching to the live turn", .{conv[0..@min(conv.len, 48)]});
+            return;
+        };
         @memcpy(self.sc_conv[0..conv.len], conv);
         self.sc_conv_len = conv.len;
         self.sc_from = from0;
