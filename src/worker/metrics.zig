@@ -64,7 +64,7 @@ pub fn hostOf(base_url: []const u8) []const u8 {
 /// Append this turn's usage line (called from engine.emitUsage with the turn's token deltas). Quietly does
 /// nothing when the thread has no armed context or the turn moved zero tokens. The append is one whole
 /// line via http.appendFile — the same torn-write-free discipline events.jsonl uses.
-pub fn record(app: *App, tokens_in: u64, tokens_out: u64, now_s: i64) void {
+pub fn record(app: *App, tokens_in: u64, tokens_out: u64, tokens_cached: u64, now_s: i64) void {
     if (cur.uid == 0) return;
     if (tokens_in == 0 and tokens_out == 0) return;
     const gpa = app.gpa;
@@ -81,7 +81,9 @@ pub fn record(app: *App, tokens_in: u64, tokens_out: u64, now_s: i64) void {
     line.appendSlice(gpa, ",\"base\":") catch return;
     http.jstr(gpa, &line, cur.base[0..cur.base_len]) catch return;
     const dur = if (now_s > cur.started and cur.started > 0) now_s - cur.started else 0;
-    line.print(gpa, ",\"in\":{d},\"out\":{d},\"s\":{d},\"sched\":{d}}}\n", .{ tokens_in, tokens_out, dur, @as(u8, if (cur.is_sched) 1 else 0) }) catch return;
+    // `cached`: the provider-cache share of `in` (DeepSeek/Moonshot/OpenAI all report it — llm.zig folds the
+    // dialects). A hosted model whose cached share sits near zero is re-prefilling the whole prompt every call.
+    line.print(gpa, ",\"in\":{d},\"out\":{d},\"cached\":{d},\"s\":{d},\"sched\":{d}}}\n", .{ tokens_in, tokens_out, tokens_cached, dur, @as(u8, if (cur.is_sched) 1 else 0) }) catch return;
     http.appendFile(app.io, gpa, path, line.items) catch {};
 }
 
@@ -100,6 +102,7 @@ const Row = struct {
     base: []const u8 = "",
     in: u64 = 0,
     out: u64 = 0,
+    cached: u64 = 0, // provider-cache share of `in` (absent on pre-cached lines — defaults 0)
     s: i64 = 0,
     sched: u8 = 0,
 };
@@ -113,6 +116,7 @@ const ModelAgg = struct {
     calls: u64 = 0,
     in: u64 = 0,
     out: u64 = 0,
+    cached: u64 = 0,
     secs: u64 = 0,
     last_ts: i64 = 0,
 };
@@ -142,6 +146,7 @@ pub fn getLlm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         tot.calls += 1;
         tot.in += r.in;
         tot.out += r.out;
+        tot.cached += r.cached;
         tot.secs += @intCast(@max(r.s, 0));
         // per-(model, base) bucket
         var found = false;
@@ -184,7 +189,7 @@ pub fn getLlm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try http.jstr(app.gpa, &out, m.model);
         try out.appendSlice(app.gpa, ",\"base\":");
         try http.jstr(app.gpa, &out, m.base);
-        try out.print(app.gpa, ",\"calls\":{d},\"in\":{d},\"out\":{d},\"secs\":{d},\"last_ts\":{d}}}", .{ m.calls, m.in, m.out, m.secs, m.last_ts });
+        try out.print(app.gpa, ",\"calls\":{d},\"in\":{d},\"out\":{d},\"cached\":{d},\"secs\":{d},\"last_ts\":{d}}}", .{ m.calls, m.in, m.out, m.cached, m.secs, m.last_ts });
     }
     try out.appendSlice(app.gpa, "],\"days\":[");
     for (days, 0..) |d, i| {
@@ -192,7 +197,7 @@ pub fn getLlm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         const day = today - @as(i64, @intCast(DAYS - 1 - i));
         try out.print(app.gpa, "{{\"d\":{d},\"in\":{d},\"out\":{d},\"calls\":{d}}}", .{ day, d.in, d.out, d.calls });
     }
-    try out.print(app.gpa, "],\"totals\":{{\"calls\":{d},\"in\":{d},\"out\":{d},\"secs\":{d}}}}}", .{ tot.calls, tot.in, tot.out, tot.secs });
+    try out.print(app.gpa, "],\"totals\":{{\"calls\":{d},\"in\":{d},\"out\":{d},\"cached\":{d},\"secs\":{d}}}}}", .{ tot.calls, tot.in, tot.out, tot.cached, tot.secs });
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, out.items);
 }
@@ -201,6 +206,7 @@ fn bump(m: *ModelAgg, r: Row) void {
     m.calls += 1;
     m.in += r.in;
     m.out += r.out;
+    m.cached += r.cached;
     m.secs += @intCast(@max(r.s, 0));
     if (r.ts > m.last_ts) m.last_ts = r.ts;
 }
