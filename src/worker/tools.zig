@@ -234,6 +234,16 @@ pub const ToolCtx = struct {
     // session, so the daemon does). A LONG-LIVED process (the server's /chat/tool endpoint, a swarm worker) keeps
     // the session IN-PROCESS — spawning a daemon from it just piles up unreachable daemons.
     browser_daemon: bool = false,
+    // CROSS-CONVERSATION HIVE GUARD: set by the CHAT surfaces, whose mem db (the per-user chat hive) is shared
+    // across ALL of a user's conversations — there, a KNOWLEDGE-scope write leaks between unrelated tasks.
+    // Conversation-local project state (file paths, line numbers, workdir layout) stays in ctx.scope, and what
+    // does globalize is provenance-tagged with source+date instead of "[chat r0]". Swarm workers keep this OFF:
+    // their db is per-swarm, where cross-mind file facts are the whole point of the hive.
+    hive_guard: bool = false,
+    // Path to the user's durable memory store ({data}/.veil-desk/memories.jsonl) for get_credential — set ONLY
+    // by the CHAT surfaces (the veil acting as the user). Empty everywhere else: a swarm mind structurally
+    // cannot fetch user credentials, matching the no-creds-in-hive egress design.
+    durable_path: []const u8 = "",
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -268,13 +278,235 @@ fn writeWorkFileAtomic(ctx: *ToolCtx, full: []const u8, data: []const u8) bool {
     return true;
 }
 
+/// File extensions that mark a fact as naming a concrete project file. Deliberately code/asset-shaped: a
+/// fact naming one of these pins a BUILD's contents, which is meaningless outside its own conversation.
+const PROJECT_EXTS = [_][]const u8{ "zig", "js", "mjs", "cjs", "ts", "tsx", "jsx", "py", "rb", "go", "rs", "c", "h", "cc", "cpp", "hpp", "cs", "java", "kt", "swift", "php", "lua", "sh", "ps1", "bat", "cmd", "html", "htm", "css", "scss", "md", "txt", "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "sql", "csv", "tsv", "xml", "svg", "png", "jpg", "jpeg", "gif", "ico", "wasm", "exe", "dll", "zip" };
+
+fn knownProjectExt(ext: []const u8) bool {
+    for (&PROJECT_EXTS) |e| {
+        if (std.mem.eql(u8, e, ext)) return true;
+    }
+    return false;
+}
+
+/// A filename with a code/asset extension, outside a URL. URL-bearing facts are exempt from this rule:
+/// they are the hive's legitimate content (web findings), and page paths in links (".html", "/guides/")
+/// are not project files. A Capitalized stem ("Three.js", "Node.js", "D3.js") is a LIBRARY name, not a file.
+fn factNamesProjectFile(fact: []const u8) bool {
+    if (std.mem.indexOf(u8, fact, "://") != null) return false;
+    var i: usize = 1;
+    while (i + 1 < fact.len) : (i += 1) {
+        if (fact[i] != '.') continue;
+        const prev = fact[i - 1];
+        if (!std.ascii.isAlphanumeric(prev) and prev != '_' and prev != '-') continue;
+        var j = i + 1;
+        while (j < fact.len and j - i <= 5 and std.ascii.isAlphanumeric(fact[j])) j += 1;
+        if (j == i + 1) continue; // bare dot
+        if (j < fact.len and (std.ascii.isAlphanumeric(fact[j]) or fact[j] == '.')) continue; // longer word / version dots
+        var ebuf: [6]u8 = undefined;
+        if (!knownProjectExt(std.ascii.lowerString(&ebuf, fact[i + 1 .. j]))) continue;
+        var s = i;
+        while (s > 0 and (std.ascii.isAlphanumeric(fact[s - 1]) or fact[s - 1] == '_' or fact[s - 1] == '-')) s -= 1;
+        if (std.ascii.isUpper(fact[s])) continue;
+        return true;
+    }
+    return false;
+}
+
+/// A source-position reference: "line 215", "lines 130-210", "line ~1380". Word-boundary guarded so
+/// "deadline 2026" / "airline 5" / "line-height" never match.
+fn factNamesLineNumber(fact: []const u8) bool {
+    var i: usize = 0;
+    while (std.ascii.findIgnoreCasePos(fact, i, "line")) |at| {
+        i = at + 4;
+        if (at > 0 and std.ascii.isAlphabetic(fact[at - 1])) continue;
+        var j = i;
+        if (j < fact.len and (fact[j] == 's' or fact[j] == 'S')) j += 1;
+        while (j < fact.len and (fact[j] == ' ' or fact[j] == '~' or fact[j] == '#' or fact[j] == ':')) j += 1;
+        if (j < fact.len and std.ascii.isDigit(fact[j])) return true;
+    }
+    return false;
+}
+
+/// TRUE when a fact is CONVERSATION-LOCAL PROJECT STATE — it pins concrete files, source positions, or the
+/// workdir's layout. Inside its own conversation such a fact is ground truth; recalled into a DIFFERENT one
+/// it reads as "your existing codebase" and seeds a wholesale resurrection of the old project (observed
+/// live: a fresh "build me a business" chat adopted a two-day-old FPS build because the shared hive
+/// described its files). Lexical and conservative — what it misses, the read-side relevance bar catches.
+pub fn convLocalFact(fact: []const u8) bool {
+    const phrases = [_][]const u8{ "working directory", "workdir", "directory contains", "current directory", "this directory" };
+    for (&phrases) |p| {
+        if (std.ascii.findIgnoreCase(fact, p) != null) return true;
+    }
+    return factNamesLineNumber(fact) or factNamesProjectFile(fact);
+}
+
+test "convLocalFact pins files/lines/workdir, passes general knowledge" {
+    // the four hive facts that derailed the observed run
+    try std.testing.expect(convLocalFact("index.html is a ~1500-line THREE.js FPS game (Neo-Pulse Arena) with wave-based spawning"));
+    try std.testing.expect(convLocalFact("WEAPON CONFIG insertion point: around line 215, currently has a simple array"));
+    try std.testing.expect(convLocalFact("The game loop is in animate() at line ~1380."));
+    try std.testing.expect(convLocalFact("The working directory contains a Cosmic Oracle fortune-teller script"));
+    try std.testing.expect(convLocalFact("client/js/game.js holds the render loop"));
+    // reusable knowledge must keep flowing to the hive
+    try std.testing.expect(!convLocalFact("Windows 11 memory optimization: disable startup apps and visual effects"));
+    try std.testing.expect(!convLocalFact("Three.js supports WebGPU rendering since r160"));
+    try std.testing.expect(!convLocalFact("Monetization guide at https://example.com/guides/indie-games.html"));
+    try std.testing.expect(!convLocalFact("Microtransactions were 58% of gaming revenue in 2024; the deadline 2026 estimate is higher"));
+    try std.testing.expect(!convLocalFact("CSS line-height best practice is 1.5 for body text"));
+}
+
+/// A secret-shaped token: an unbroken [A-Za-z0-9_-]{20,} run containing both letters and digits — API keys,
+/// PATs, hex secrets. Domains and URLs break at dots/slashes and prose at spaces, so ordinary text is clear.
+/// Scans from `i`, returning the run end; sets `hit` when the run qualifies.
+fn secretRunEnd(text: []const u8, i: usize, hit: *bool) usize {
+    var j = i;
+    var letters = false;
+    var digits = false;
+    while (j < text.len) : (j += 1) {
+        const c = text[j];
+        if (std.ascii.isAlphabetic(c)) {
+            letters = true;
+        } else if (std.ascii.isDigit(c)) {
+            digits = true;
+        } else if (c != '_' and c != '-') break;
+    }
+    hit.* = (j - i >= 20 and letters and digits);
+    return j;
+}
+
+pub fn hasSecretToken(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') {
+            i += 1;
+            continue;
+        }
+        var hit = false;
+        i = secretRunEnd(text, i, &hit);
+        if (hit) return true;
+    }
+    return false;
+}
+
+/// Copy of `text` with every secret-shaped token replaced by "[withheld]" — what the prompt may show of a
+/// credential entry (the name survives, the value never does). gpa-owned.
+pub fn maskSecretTokens(gpa: std.mem.Allocator, text: []const u8) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') {
+            out.append(gpa, c) catch break;
+            i += 1;
+            continue;
+        }
+        var hit = false;
+        const j = secretRunEnd(text, i, &hit);
+        if (hit) out.appendSlice(gpa, "[withheld]") catch {} else out.appendSlice(gpa, text[i..j]) catch {};
+        i = j;
+    }
+    return out.toOwnedSlice(gpa) catch &[_]u8{};
+}
+
+/// A durable entry whose VALUE must stay out of broadcast prompts: category "key", or any text carrying a
+/// secret-shaped token (a miscategorized credential). Workflow facts that merely TALK about auth ("requires
+/// Api-Key headers") carry no value and keep riding the prompt.
+pub fn secretiveDurable(cat: []const u8, text: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, cat, " \r\n\t"), "key")) return true;
+    return hasSecretToken(text);
+}
+
+test "secretiveDurable + maskSecretTokens withhold key values, pass workflow facts" {
+    try std.testing.expect(secretiveDurable("key", "Discourse API key for a forum: aaaa1111bbbb2222cccc3333"));
+    try std.testing.expect(secretiveDurable("fact", "my token is ghp_abc123abc123abc123abc123abc123")); // miscategorized
+    try std.testing.expect(!secretiveDurable("fact", "Discourse API requires Api-Key/Api-Username headers and a CSRF token from /session/csrf.json"));
+    try std.testing.expect(!secretiveDurable("preference", "preferred deploy region is us-west-2"));
+    const gpa = std.testing.allocator;
+    const masked = maskSecretTokens(gpa, "GitHub personal access token: ghp_abc123abc123abc123abc123abc123");
+    defer if (masked.len > 0) gpa.free(masked);
+    try std.testing.expectEqualStrings("GitHub personal access token: [withheld]", masked);
+    const clear = maskSecretTokens(gpa, "internationalization efforts span 12345678901234567890 rows");
+    defer if (clear.len > 0) gpa.free(clear);
+    try std.testing.expect(std.mem.indexOf(u8, clear, "[withheld]") == null);
+}
+
+/// Render the wall-clock date as "yyyy-mm-dd" — the provenance stamp for facts a conversation globalizes.
+fn dateStamp(io: std.Io, buf: []u8) []const u8 {
+    const secs = std.Io.Timestamp.now(io, .real).toSeconds();
+    if (secs <= 0) return "undated";
+    const yd = (std.time.epoch.EpochSeconds{ .secs = @intCast(secs) }).getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ yd.year, md.month.numeric(), @as(u32, md.day_index) + 1 }) catch "undated";
+}
+
 /// Write a fact to the SHARED hive, TAGGED with who/when ("[Noor r7] ..."). A hive fact is a mind's own first-person
 /// sentence; tagging it tells every reader it is a TEAMMATE's report, not their own memory — preventing the identity
 /// merge where one mind absorbs another's "I" as its own. The tag also gives a free recency stamp for the read path.
-fn hiveStore(ctx: *ToolCtx, fact: []const u8) void {
+/// Returns false when the cross-conversation guard kept the fact OUT of the hive (conversation-local project
+/// state on a chat surface) — the caller decides where it lives instead.
+fn hiveStore(ctx: *ToolCtx, fact: []const u8) bool {
+    if (ctx.hive_guard) {
+        if (convLocalFact(fact)) return false;
+        // What a CHAT globalizes carries source + date ("[chat:c6a59 2026-07-16] ..."), not "[chat r0]" —
+        // a later conversation must be able to see the fact is FOREIGN and how stale it is.
+        var db: [12]u8 = undefined;
+        const tagged = std.fmt.allocPrint(ctx.gpa, "[{s} {s}] {s}", .{ ctx.scope, dateStamp(ctx.io, &db), fact }) catch fact;
+        defer if (tagged.ptr != fact.ptr) ctx.gpa.free(tagged);
+        _ = ctx.mem.observe(ctx.learn_scope, tagged);
+        return true;
+    }
     const tagged = std.fmt.allocPrint(ctx.gpa, "[{s} r{d}] {s}", .{ ctx.mind, ctx.round, fact }) catch fact;
     defer if (tagged.ptr != fact.ptr) ctx.gpa.free(tagged);
     _ = ctx.mem.observe(ctx.learn_scope, tagged);
+    return true;
+}
+
+/// On-demand durable-credential fetch (CHAT surfaces only — ctx.durable_path is empty everywhere a swarm
+/// mind runs). Stored credential VALUES are withheld from every broadcast prompt (the desk/engine mask them
+/// in the YOUR MEMORY block); this tool is the single retrieval path, so a value enters model context only
+/// in the turn that actually uses it — instead of riding to the provider on every call of every chat.
+fn getCredential(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    if (ctx.durable_path.len == 0) return dupe(gpa, "no durable credential store on this surface (swarm minds never hold user credentials)");
+    const A = struct { query: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    const q = std.mem.trim(u8, p.value.query, " \r\n\t");
+    if (q.len < 3) return dupe(gpa, "name the credential: pass a few identifying words (the service, domain, or masked label from YOUR MEMORY)");
+    const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ctx.durable_path, gpa, .limited(256 << 10)) catch return dupe(gpa, "no durable memory store found");
+    defer gpa.free(data);
+    const M = struct { cat: []const u8 = "", text: []const u8 = "" };
+    var best: ?[]u8 = null;
+    var best_score: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        if (ln.len == 0 or ln[0] != '{') continue;
+        const e = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer e.deinit();
+        const tx = std.mem.trim(u8, e.value.text, " \r\n\t");
+        if (tx.len == 0 or !secretiveDurable(e.value.cat, tx)) continue;
+        var score: usize = 0;
+        var wit = std.mem.tokenizeAny(u8, q, " \t,.:;\"'");
+        while (wit.next()) |w| {
+            if (w.len < 3) continue;
+            if (std.ascii.findIgnoreCase(tx, w) != null) score += 1;
+        }
+        if (score == 0) continue;
+        if (score >= best_score) { // >= so the NEWEST of tied entries wins (file order = oldest first)
+            if (best) |b| gpa.free(b);
+            best = gpa.dupe(u8, tx) catch null;
+            best_score = score;
+        }
+    }
+    if (best) |b| {
+        defer gpa.free(b);
+        return std.fmt.allocPrint(gpa, "{s}\n(handle with care: use it directly in the call that needs it; NEVER echo it into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use)", .{b}) catch dupe(gpa, "(credential found but could not be rendered)");
+    }
+    return dupe(gpa, "no stored credential matches that description — check YOUR MEMORY's withheld entries or ask the user");
 }
 
 /// The swarm-shared skill library lives in its own neuron-db scope (in the per-swarm mind.sqlite), so every
@@ -517,7 +749,8 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory. Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}
+    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory. Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"get_credential","description":"Fetch ONE stored credential VALUE from the user's durable memory (the YOUR MEMORY entries shown masked as '[withheld]'). Values never ride in prompts by default — call this in the turn that actually needs one, then use it directly in that call. NEVER echo a fetched credential into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"a few identifying words — the service or domain from the masked entry"}},"required":["query"]}}}
 ;
 
 /// The SCOUT's tool set — a RESEARCH-ONLY subset of SCHEMA. The build tools (run_python, write_file) are
@@ -610,6 +843,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.startsWith(u8, name, "mcp_")) return mcpDispatch(ctx, name, args_json);
     if (std.mem.eql(u8, name, "propose_change")) return proposeChange(ctx, args_json);
     if (std.mem.eql(u8, name, "simulate_change")) return simulateChange(ctx, args_json);
+    if (std.mem.eql(u8, name, "get_credential")) return getCredential(ctx, args_json);
     if (std.mem.eql(u8, name, "observe")) {
         const A = struct { fact: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
@@ -620,13 +854,16 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             ctx.observed.* += 1;
             return dupe(gpa, "noted — will be checked against what actually happened before it enters memory");
         }
+        var shared = false;
         if (ctx.share_obs) {
-            hiveStore(ctx, p.value.fact);
+            shared = hiveStore(ctx, p.value.fact);
+            if (!shared) _ = ctx.mem.observe(ctx.scope, p.value.fact);
         } else {
             _ = ctx.mem.observe(ctx.scope, p.value.fact);
-            hiveStore(ctx, p.value.fact);
+            shared = hiveStore(ctx, p.value.fact);
         }
         ctx.observed.* += 1;
+        if (!shared) return dupe(gpa, "stored in this conversation's own memory (kept OUT of the cross-conversation hive: the fact pins this build's files/lines/workdir, which mean nothing in other tasks)");
         const total = ctx.mem.factCount(KNOWLEDGE_SCOPE);
         return std.fmt.allocPrint(gpa, "stored — shared with the hive ({d} collective facts)", .{total}) catch dupe(gpa, "stored, shared with the hive");
     }
@@ -652,7 +889,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             sink.push(.fact, p.value.fact, "");
             return dupe(gpa, "noted — will be checked against what actually happened before it's shared with the hive");
         }
-        hiveStore(ctx, p.value.fact);
+        if (!hiveStore(ctx, p.value.fact)) {
+            _ = ctx.mem.observe(ctx.scope, p.value.fact);
+            return dupe(gpa, "kept in this conversation's own memory instead of the hive — the fact pins THIS build's files/lines, which are meaningless in other tasks; share only reusable knowledge");
+        }
         const total = ctx.mem.factCount(KNOWLEDGE_SCOPE);
         return std.fmt.allocPrint(gpa, "shared with the hive ({d} collective facts; every teammate can now recall_hive it)", .{total}) catch dupe(gpa, "shared");
     }

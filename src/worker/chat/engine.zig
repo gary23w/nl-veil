@@ -162,7 +162,10 @@ const SYSTEM_PROMPT =
     "To drop a fact that is now wrong: `FORGET: <a few words identifying it>`. These lines are STRIPPED from what " ++
     "the user sees, so do NOT also write a prose header like \"I've remembered:\" -- just emit the bare REMEMBER:/" ++
     "FORGET: line(s). Use them proactively when the user reveals a durable fact (e.g. they mention deploying to " ++
-    "us-west-2 -> `REMEMBER: [preference] deploys to us-west-2`). Facts already under YOUR MEMORY need no repeat.";
+    "us-west-2 -> `REMEMBER: [preference] deploys to us-west-2`). Facts already under YOUR MEMORY need no repeat. " ++
+    "Credential VALUES are withheld from prompts -- YOUR MEMORY shows them masked as [withheld]; when a task " ++
+    "actually needs one, fetch it with get_credential and use it directly in that call. Never repeat a fetched " ++
+    "value into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.";
 
 /// The chat turn's tool surface = the shared mind-tool SCHEMA + the veil's ORCHESTRATION verbs (cast / steer /
 /// stop / status). The orchestration verbs are handled in-process by orchTool (deploy_service + app.sup), NOT by
@@ -395,6 +398,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     ledgerBootstrap(app, workdir, &file_ledger);
     const db = std.fmt.allocPrint(gpa, "{s}/hive.sqlite", .{base}) catch return;
     defer gpa.free(db);
+    var durable_pb: [700]u8 = undefined; // backs ctx.durable_path for the turn (same lifetime pattern as db)
 
     var counters = [_]u32{0} ** 5;
     var ctx = tools.ToolCtx{
@@ -414,6 +418,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         .scope = mem_scope,
         .mind = "chat",
         .round = 0,
+        // The chat hive db is shared across ALL of this user's conversations: keep conversation-local
+        // project state (files/lines/workdir) out of the global KNOWLEDGE scope, and provenance-tag what
+        // does globalize — the read side (stepWeave) relevance-gates the same scope.
+        .hive_guard = true,
+        // get_credential's store: the chat veil acts AS the user, so it may fetch a withheld credential
+        // value in the turn that needs it (values are masked out of every broadcast prompt).
+        .durable_path = memoriesPath(app, &durable_pb) orelse "",
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
@@ -628,6 +639,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     var echo_guard: [24]EchoRec = @splat(.{});
     var call_ledger: std.ArrayListUnmanaged(u64) = .empty;
     defer call_ledger.deinit(gpa);
+    // FOREIGN-KNOWLEDGE LEDGER (turn-scoped): every cross-task hive note injected this turn, kept verbatim
+    // for the conflict check — a read_file NOT FOUND on a path this text mentions means the model is chasing
+    // ANOTHER task's files, and it gets told so (once per turn).
+    var foreign_mem: std.ArrayListUnmanaged(u8) = .empty;
+    defer foreign_mem.deinit(gpa);
+    var foreign_warned = false;
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
         // CONTROL (between drive steps): a `stop` op ends the turn; a `steer`/`say` op injects the user's text as a
@@ -661,11 +678,21 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
                     // FINE-NEEDLE WEAVE: the subtask enters with the engine's ground truth + the facts this
                     // conversation already observed about it — not a cold restatement of the task text.
                     const weave = stepWeave(gpa, &ctx, &file_ledger, instr);
-                    defer if (weave.len > 0) gpa.free(weave);
+                    defer if (weave.step.len > 0) gpa.free(weave.step);
+                    defer if (weave.hive.len > 0) gpa.free(weave.hive);
+                    // Cross-task knowledge rides as the ENGINE's own system note, never inside the user-role
+                    // step text — appended there, the model read it as "the user mentioned…" and adopted it.
+                    if (weave.hive.len > 0) {
+                        conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :outer;
+                        http.jstr(gpa, &conv_buf, weave.hive) catch break :outer;
+                        conv_buf.append(gpa, '}') catch break :outer;
+                        foreign_mem.appendSlice(gpa, weave.hive) catch {};
+                        foreign_mem.append(gpa, '\n') catch {};
+                    }
                     var stept: std.ArrayListUnmanaged(u8) = .empty;
                     defer stept.deinit(gpa);
                     stept.appendSlice(gpa, instr) catch break :outer;
-                    if (weave.len > 0) stept.appendSlice(gpa, weave) catch {};
+                    if (weave.step.len > 0) stept.appendSlice(gpa, weave.step) catch {};
                     conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
                     http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
                     conv_buf.append(gpa, '}') catch break :outer;
@@ -709,7 +736,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, base_url, key, model, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -972,11 +999,20 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
         // folded the evidence and nothing re-surfaced it.
         {
             const weave = stepWeave(gpa, &ctx, &file_ledger, next_step);
-            defer if (weave.len > 0) gpa.free(weave);
+            defer if (weave.step.len > 0) gpa.free(weave.step);
+            defer if (weave.hive.len > 0) gpa.free(weave.hive);
+            // Cross-task knowledge as the engine's own system note — never inside the user-role step text.
+            if (weave.hive.len > 0) {
+                conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :outer;
+                http.jstr(gpa, &conv_buf, weave.hive) catch break :outer;
+                conv_buf.append(gpa, '}') catch break :outer;
+                foreign_mem.appendSlice(gpa, weave.hive) catch {};
+                foreign_mem.append(gpa, '\n') catch {};
+            }
             var stept: std.ArrayListUnmanaged(u8) = .empty;
             defer stept.deinit(gpa);
             stept.appendSlice(gpa, next_step) catch break :outer;
-            if (weave.len > 0) stept.appendSlice(gpa, weave) catch {};
+            if (weave.step.len > 0) stept.appendSlice(gpa, weave.step) catch {};
             conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
             http.jstr(gpa, &conv_buf, stept.items) catch break :outer;
             conv_buf.append(gpa, '}') catch break :outer;
@@ -1210,6 +1246,33 @@ fn argsPath(args: []const u8) ?[]const u8 {
     return p;
 }
 
+/// The last path segment (either separator): "client/js/game.js" → "game.js".
+fn pathBase(p: []const u8) []const u8 {
+    var i = p.len;
+    while (i > 0) : (i -= 1) {
+        if (p[i - 1] == '/' or p[i - 1] == '\\') break;
+    }
+    return p[i..];
+}
+
+/// Does the turn's injected cross-task knowledge mention this path's basename? A hit means a NOT-FOUND read
+/// of the path was chasing another task's files. Basenames under 4 chars are too generic to pin that on.
+fn foreignMentions(foreign: []const u8, path: []const u8) bool {
+    if (foreign.len == 0) return false;
+    const base = pathBase(path);
+    if (base.len < 4) return false;
+    return std.mem.indexOf(u8, foreign, base) != null;
+}
+
+test "foreignMentions matches basenames from injected cross-task knowledge" {
+    const foreign = "KNOWLEDGE FROM OTHER TASKS: index.html is a Three.js FPS game (Neo-Pulse Arena)";
+    try std.testing.expect(foreignMentions(foreign, "index.html"));
+    try std.testing.expect(foreignMentions(foreign, "client/index.html"));
+    try std.testing.expect(!foreignMentions(foreign, "business_model.md"));
+    try std.testing.expect(!foreignMentions("", "index.html"));
+    try std.testing.expect(!foreignMentions(foreign, "a.js")); // too short to pin a conflict on
+}
+
 /// Append one landed mutation to {conv_dir}/files.jsonl — the per-conv ledger file (same whole-line append
 /// idiom as messages.jsonl, so a concurrent reader never sees a partial object).
 fn ledgerPersist(app: *App, conv_dir: []const u8, tool: []const u8, path: []const u8, bytes: u64) void {
@@ -1320,13 +1383,136 @@ fn ledgerBlock(gpa: std.mem.Allocator, ledger: *const FileLedger, out: *std.Arra
     out.append(gpa, ']') catch return;
 }
 
-/// The FINE-NEEDLE WEAVE for one drive step: engine ground truth (the file ledger) + per-step associative
-/// recall from the conversation's own neuron-db partition, appended to the synthetic step text — the model
-/// re-enters every step knowing what already exists on disk and what it already learned, instead of
-/// re-exploring, re-writing, or confabulating success. Returns gpa-owned text ("" = nothing to weave).
-fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLedger, step_text: []const u8) []u8 {
+/// One drive step's woven context; both halves gpa-owned ("" = absent). `step` — the engine's file-ledger
+/// ground truth + the conversation's OWN recalled records — rides inside the step text as before. `hive` —
+/// cross-task knowledge — is emitted by the CALLER as the engine's own system note: appended to the
+/// user-role step text it read as "the user mentioned…" and a fresh conversation adopted an old task's
+/// project wholesale (the observed derailment).
+const StepWeave = struct { step: []u8 = &[_]u8{}, hive: []u8 = &[_]u8{} };
+
+/// Header for cross-task hive knowledge — names the source, disclaims user authorship, and pre-empts the
+/// two observed failure readings (treating it as the user's words / treating its files as present here).
+const HIVE_FOREIGN_HEADER = "KNOWLEDGE FROM OTHER TASKS (engine-recalled from the shared hive; the user did NOT say this). It may be stale or irrelevant — ignore it unless the user's request explicitly refers to it. Files or projects it mentions do NOT exist in this conversation unless ENGINE GROUND TRUTH / list_dir shows them; never adopt them as the goal:\n";
+
+/// Stop list for the relevance bar: the drive loop's own steering vocabulary (subtask templates, afk
+/// nudges, ground-truth blocks) plus generic function words. Terms shorter than 4 chars never reach the
+/// list, so only 4+ entries appear.
+const HIVE_STOP = [_][]const u8{
+    // steering-template vocabulary (subtaskInstruction, AFK_DRIVE_TMPL, AFK_STUCK_TMPL, ledger blocks)
+    "work",    "working",   "subtask",  "step",    "plan",     "route",        "suggested", "hive",   "cast",        "swarm",
+    "steer",   "build",     "built",    "done",    "briefly",  "inline",       "directly",  "tool",   "tools",       "write",
+    "edit",    "file",      "files",    "python",  "research", "learn",        "look",      "first",  "keep",        "going",
+    "toward",  "goal",      "verify",   "latest",  "single",   "most",         "valuable",  "next",   "improvement", "repeated",
+    "last",    "different", "approach", "recall",  "search",   "actual",       "blocker",   "engine", "ground",      "truth",
+    "list",    "exist",     "exists",   "workdir", "written",  "conversation",
+    // generic function words
+    "this",      "that",   "with",        "from",
+    "into",    "your",      "have",     "will",    "then",     "than",         "they",      "them",   "what",        "when",
+    "where",   "which",     "should",   "would",   "could",    "about",        "after",     "before", "using",       "their",
+    "there",   "here",      "only",     "also",    "just",     "been",         "were",      "does",   "doing",       "each",
+    "every",   "other",     "some",     "more",    "much",     "many",         "very",      "over",   "under",       "between",
+    "because", "while",     "still",    "already", "without",  "within",
+};
+
+fn hiveStopWord(w: []const u8) bool {
+    for (&HIVE_STOP) |s| {
+        if (std.mem.eql(u8, s, w)) return true;
+    }
+    return false;
+}
+
+/// Next lowercase alnum run of `s` from `pos` into `buf` (clipped to buf.len — both sides of the match
+/// clip identically, so comparisons stay consistent). null at end of input.
+fn nextTerm(s: []const u8, pos: *usize, buf: []u8) ?[]const u8 {
+    var i = pos.*;
+    while (i < s.len and !std.ascii.isAlphanumeric(s[i])) i += 1;
+    var n: usize = 0;
+    while (i < s.len and std.ascii.isAlphanumeric(s[i])) : (i += 1) {
+        if (n < buf.len) {
+            buf[n] = std.ascii.toLower(s[i]);
+            n += 1;
+        }
+    }
+    pos.* = i;
+    if (n == 0) return null;
+    return buf[0..n];
+}
+
+/// DISCRIMINATIVE-RELEVANCE BAR for cross-task knowledge: keep only the fact lines that share vocabulary
+/// with the step cue — at least two distinct content terms, or one long (8+ chars) one. Saturation-spread
+/// assoc on a small scope returns its argmax for ANY cue; unfiltered, a fresh conversation's step 1
+/// inherited a two-day-old FPS project because the hive happened to contain one. gpa-owned ("" = nothing).
+fn hiveRelevant(gpa: std.mem.Allocator, cue: []const u8, facts: []const u8) []u8 {
+    var terms: [24][24]u8 = undefined;
+    var term_len: [24]usize = @splat(0);
+    var nterms: usize = 0;
+    {
+        var pos: usize = 0;
+        var tb: [24]u8 = undefined;
+        collect: while (nextTerm(cue, &pos, &tb)) |t| {
+            if (t.len < 4 or hiveStopWord(t)) continue;
+            for (terms[0..nterms], term_len[0..nterms]) |ex, el| {
+                if (std.mem.eql(u8, ex[0..el], t)) continue :collect;
+            }
+            if (nterms >= terms.len) break;
+            @memcpy(terms[nterms][0..t.len], t);
+            term_len[nterms] = t.len;
+            nterms += 1;
+        }
+    }
+    if (nterms == 0) return &[_]u8{};
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
+    var it = std.mem.splitScalar(u8, facts, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len == 0) continue;
+        var hit: [24]bool = @splat(false);
+        var distinct: usize = 0;
+        var longest: usize = 0;
+        var pos: usize = 0;
+        var tb: [24]u8 = undefined;
+        while (nextTerm(t, &pos, &tb)) |w| {
+            if (w.len < 4) continue;
+            for (terms[0..nterms], term_len[0..nterms], 0..) |ex, el, ti| {
+                if (hit[ti] or !std.mem.eql(u8, ex[0..el], w)) continue;
+                hit[ti] = true;
+                distinct += 1;
+                longest = @max(longest, el);
+            }
+        }
+        if (distinct >= 2 or (distinct >= 1 and longest >= 8)) {
+            if (out.items.len > 0) out.append(gpa, '\n') catch {};
+            out.appendSlice(gpa, t) catch {};
+        }
+    }
+    return out.toOwnedSlice(gpa) catch &[_]u8{};
+}
+
+test "hiveRelevant drops off-cue facts, keeps cue-sharing ones" {
+    const gpa = std.testing.allocator;
+    const facts = "[chat r0] index.html is a Three.js FPS game (Neo-Pulse Arena) with wave spawning\n[chat r0] Canadian wildfire seasons have been historically severe\n";
+    // the observed derailment cue: a business-planning step shares no discriminative vocabulary
+    const none = hiveRelevant(gpa, "Work this subtask now - step 1 of 10 in your plan: Define business idea and value proposition", facts);
+    defer if (none.len > 0) gpa.free(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+    // a cue that actually refers to the old game keeps the game line and drops the wildfire one
+    const kept = hiveRelevant(gpa, "continue the three.js fps game neo pulse arena weapon system", facts);
+    defer if (kept.len > 0) gpa.free(kept);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "Neo-Pulse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kept, "wildfire") == null);
+}
+
+/// The FINE-NEEDLE WEAVE for one drive step: engine ground truth (the file ledger) + per-step associative
+/// recall from the conversation's own neuron-db partition — the model re-enters every step knowing what
+/// already exists on disk and what it already learned, instead of re-exploring, re-writing, or
+/// confabulating success. Cross-task hive knowledge comes back in the SEPARATE `hive` half, relevance-
+/// gated and provenance-framed, for the caller to emit as an engine note.
+fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLedger, step_text: []const u8) StepWeave {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var hive_out: std.ArrayListUnmanaged(u8) = .empty;
+    defer hive_out.deinit(gpa);
     ledgerBlock(gpa, ledger, &out);
     // Per-step recall: the step text is the cue; the conversation's own observed facts (tool findings, file
     // facts, user turns — including ones already compacted out of the context window) come back exactly when
@@ -1342,18 +1528,25 @@ fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLed
         out.append(gpa, ']') catch {};
     } else {
         // The conversation's own partition abstained — thread OUTWARD across the shared KNOWLEDGE hive
-        // (where the observe tool dual-writes and every swarm deposits findings), same saturation spread:
-        // a step with no conversation-local memory still inherits what the wider system already learned.
+        // (where every conversation's observes and swarm deposits land). That scope is CROSS-TASK by
+        // construction, so what comes back must clear the relevance bar, and it never rides inside the
+        // step text: it returns as the engine's own provenance-framed note.
         const hive = ctx.mem.assoc(tools.KNOWLEDGE_SCOPE, step_text, osc.Mem.SATURATE_HOPS, 4);
         defer if (hive.len > 0) gpa.free(hive);
         if (hive.len > 0) {
             scrubUtf8(hive);
-            out.appendSlice(gpa, "\n[RELEVANT KNOWLEDGE (shared hive): ") catch {};
-            out.appendSlice(gpa, clipBytes(hive, 500)) catch {};
-            out.append(gpa, ']') catch {};
+            const kept = hiveRelevant(gpa, step_text, hive);
+            defer if (kept.len > 0) gpa.free(kept);
+            if (kept.len > 0) {
+                hive_out.appendSlice(gpa, HIVE_FOREIGN_HEADER) catch {};
+                hive_out.appendSlice(gpa, clipBytes(kept, 500)) catch {};
+            }
         }
     }
-    return out.toOwnedSlice(gpa) catch &[_]u8{};
+    return .{
+        .step = out.toOwnedSlice(gpa) catch &[_]u8{},
+        .hive = hive_out.toOwnedSlice(gpa) catch &[_]u8{},
+    };
 }
 
 /// A continuation-shaped user turn ("continue", "resume", the desk's auto-loop arm note) carries no recall
@@ -2759,6 +2952,10 @@ fn runInnerAgentic(
     // FILE LEDGER (turn+conv-scoped, owned by runTurn): landed file mutations captured at this pass's
     // dispatch point — the ground-truth half of the fine-needle memory weave.
     file_ledger: *FileLedger,
+    // FOREIGN-KNOWLEDGE CONFLICT inputs (turn-scoped, owned by runTurn): the cross-task hive text injected
+    // this turn, and the once-per-turn latch for its conflict note.
+    foreign_mem: []const u8,
+    foreign_warned: *bool,
 ) InnerResult {
     const gpa = app.gpa;
     const empty: []u8 = &[_]u8{};
@@ -3041,13 +3238,16 @@ fn runInnerAgentic(
                     victim.* = .{ .sig = call_h, .res = rh, .count = 1 };
                 }
             }
-            emitToolState(app, conv_dir, c.name, "done", clipBytes(result, 200));
+            // A fetched credential value must never land in the event stream (events.jsonl outlives the turn).
+            emitToolState(app, conv_dir, c.name, "done", if (std.mem.eql(u8, c.name, "get_credential")) "(credential value withheld from the event log)" else clipBytes(result, 200));
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
             // — "(...)" notes and `"ok":false` payloads — and never observe assistant reply content (confab fix).
+            // get_credential results are excluded wholesale: a secret persisted as a memory fact would recirculate
+            // through recall into later prompts, exactly what on-demand fetch exists to prevent.
             // QUEUED, not observed inline: each observe spawns a subprocess, which serialized big tool batches.
             // runTurn flushes the queue at turn exit (bounded — a runaway afk turn can't hoard notes forever).
-            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and tool_obs.items.len < 200) {
+            if (result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null and !std.mem.eql(u8, c.name, "get_credential") and tool_obs.items.len < 200) {
                 // CUE THREADING: the fact carries the call's ARGS head alongside the result — the query
                 // terms, the path, the URL. neuron-db is lexical-associative: a later step phrased like the
                 // ORIGINAL CUE can only hop to this finding if the cue's words live in the fact. Without
@@ -3107,6 +3307,25 @@ fn runInnerAgentic(
                             if (!note_ok) post_note.clearRetainingCapacity();
                             emitKV(app, conv_dir, "status", "text", "ground-truth conflict: a ledgered file read back NOT FOUND — steering the model to reconcile");
                         }
+                    } else if (!foreign_warned.* and post_note.items.len == 0 and foreignMentions(foreign_mem, rp)) {
+                        // FOREIGN-MEMORY CONFLICT (anti-adoption): the model probed a file that exists ONLY in
+                        // this turn's injected cross-task knowledge — the disk just proved that memory belongs
+                        // to a DIFFERENT task. Left unreconciled, the observed failure was to rebuild the old
+                        // project from its remembered description; contradict the memory mechanically instead.
+                        foreign_warned.* = true;
+                        var nb3: [560]u8 = undefined;
+                        const cn = std.fmt.bufPrint(&nb3, "FOREIGN-MEMORY CONFLICT: {s} does NOT exist in this conversation — it comes from the injected cross-task knowledge (shared hive), which describes a DIFFERENT task's build. Drop that memory now: do not re-create its files and do not adopt its project as this conversation's goal. This conversation's real state is ONLY what ENGINE GROUND TRUTH / list_dir shows.", .{clipBytes(rp, 240)}) catch "FOREIGN-MEMORY CONFLICT: that file exists only in cross-task hive knowledge, not in this conversation — drop the foreign memory and work from ENGINE GROUND TRUTH.";
+                        var scratch: std.ArrayListUnmanaged(u8) = .empty;
+                        defer scratch.deinit(gpa);
+                        const note_ok = blk_fn: {
+                            scratch.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :blk_fn false;
+                            http.jstr(gpa, &scratch, cn) catch break :blk_fn false;
+                            scratch.append(gpa, '}') catch break :blk_fn false;
+                            post_note.appendSlice(gpa, scratch.items) catch break :blk_fn false;
+                            break :blk_fn true;
+                        };
+                        if (!note_ok) post_note.clearRetainingCapacity();
+                        emitKV(app, conv_dir, "status", "text", "foreign-memory conflict: the model probed a file that exists only in another task's knowledge — steering it to drop that memory");
                     }
                 }
             }
@@ -3274,6 +3493,7 @@ fn injectDurableMemory(app: *App, conv_buf: *std.ArrayListUnmanaged(u8)) void {
     block.appendSlice(gpa, "YOUR MEMORY (durable facts this user asked you to keep across conversations — keys, logins, preferences, environment). Use them; do not re-REMEMBER what's already here:\n") catch return;
     const M = struct { cat: []const u8 = "", text: []const u8 = "" };
     var any = false;
+    var withheld: usize = 0;
     for (slices.items[from..]) |ln| {
         const p = std.json.parseFromSlice(M, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
@@ -3286,11 +3506,25 @@ fn injectDurableMemory(app: *App, conv_buf: *std.ArrayListUnmanaged(u8)) void {
             block.appendSlice(gpa, p.value.cat) catch break;
             block.appendSlice(gpa, "] ") catch break;
         }
-        block.appendSlice(gpa, tx) catch break;
+        // CREDENTIAL VALUES never ride the broadcast prompt (observed: two live keys shipped to a
+        // third-party provider on EVERY call of every conversation). The entry stays visible — value
+        // masked — so the model knows it exists; get_credential fetches it in the turn that needs it.
+        if (tools.secretiveDurable(p.value.cat, tx)) {
+            const masked = tools.maskSecretTokens(gpa, tx);
+            defer if (masked.len > 0) gpa.free(masked);
+            if (std.mem.eql(u8, masked, tx)) {
+                // nothing maskable (a short secret): show only the entry's name — head up to the colon
+                const cut = std.mem.indexOfScalar(u8, tx, ':') orelse @min(tx.len, 40);
+                block.appendSlice(gpa, tx[0..cut]) catch break;
+                block.appendSlice(gpa, ": [withheld]") catch break;
+            } else block.appendSlice(gpa, masked) catch break;
+            withheld += 1;
+        } else block.appendSlice(gpa, tx) catch break;
         block.append(gpa, '\n') catch break;
         any = true;
     }
     if (!any) return;
+    if (withheld > 0) block.appendSlice(gpa, "(the [withheld] credential values above never ride in prompts — when, and only when, a task needs one, call get_credential with a few identifying words)\n") catch {};
     conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
     http.jstr(gpa, conv_buf, block.items) catch return;
     conv_buf.append(gpa, '}') catch return;

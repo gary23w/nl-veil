@@ -331,6 +331,11 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .scope = mem_scope,
         .mind = "chat",
         .round = 0,
+        // Same cross-conversation guard as the server drive loop's ctx: this db is the per-user chat hive,
+        // so a delegated observe must not globalize conversation-local project state either.
+        .hive_guard = true,
+        // Same durable store as the engine ctx — a desk-delegated get_credential resolves identically.
+        .durable_path = std.fmt.allocPrint(res.arena, "{s}/.veil-desk/memories.jsonl", .{app.data}) catch "",
         .mem = blk_mem: {
             var m = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
             m.trust = true; // trust-weighted assoc ranking, matching the server drive loop's Mem
