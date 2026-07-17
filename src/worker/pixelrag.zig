@@ -159,6 +159,84 @@ fn clip(s: []const u8, n: usize) []const u8 {
     return if (s.len > n) s[0..n] else s;
 }
 
+const RCResp = struct { ok: bool = false, url: []const u8 = "", tiles: []const RTile = &.{}, @"error": []const u8 = "" };
+
+/// Snapshot the browser's CURRENT page — NO navigation, so the live post-interaction state (the logged-in
+/// feed, the open modal, the just-submitted form's result) is tiled and indexed exactly as it stands. The
+/// verify half of browser-driven web-app testing: interact with browser_*, then capture, then pixel_search /
+/// read the tiles. Mirrors ingest's daemon/in-process split; each capture gets its own doc generation
+/// (suffix) unless the caller names a doc_id, so successive snapshots stay distinguishable.
+pub fn capture(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, run_dir: []const u8, mem: Mem, doc_id_in: []const u8, use_daemon: bool) []u8 {
+    var url_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer url_buf.deinit(gpa);
+    var indexed: u32 = 0;
+    var total_chars: usize = 0;
+    var tile_count: usize = 0;
+    var manifest_add: std.ArrayListUnmanaged(u8) = .empty;
+    defer manifest_add.deinit(gpa);
+    var tmp_doc: [64]u8 = undefined;
+    var doc_id: []const u8 = std.mem.trim(u8, doc_id_in, " \r\n\t");
+
+    if (use_daemon) {
+        const params = std.fmt.allocPrint(gpa, "{{\"tile_h\":{d},\"max_tiles\":{d}}}", .{ TILE_H, MAX_TILES }) catch return dupe(gpa, "oom");
+        defer gpa.free(params);
+        const resp = browser_host.forward(gpa, io, env, run_dir, "rendertilescurrent", params);
+        defer gpa.free(resp);
+        const parsed = std.json.parseFromSlice(RCResp, gpa, resp, .{ .ignore_unknown_fields = true }) catch
+            return std.fmt.allocPrint(gpa, "pixel_capture render failed: {s}", .{clip(resp, 200)}) catch dupe(gpa, "render failed");
+        defer parsed.deinit();
+        if (!parsed.value.ok) {
+            // A long-lived local-host daemon that predates this action answers "unknown action" — say so usefully.
+            if (std.mem.indexOf(u8, resp, "unknown action") != null)
+                return dupe(gpa, "pixel_capture: the local-host browser daemon is an older build without this action — restart the daemon (quit + reopen the desk, or kill the veil local-host process) and retry");
+            return std.fmt.allocPrint(gpa, "pixel_capture render failed: {s}", .{clip(resp, 200)}) catch dupe(gpa, "render failed");
+        }
+        url_buf.appendSlice(gpa, parsed.value.url) catch {};
+        doc_id = captureDocId(gpa, io, &tmp_doc, doc_id, url_buf.items);
+        const Dec = std.base64.standard.Decoder;
+        tile_count = parsed.value.tiles.len;
+        for (parsed.value.tiles) |t| {
+            const n = Dec.calcSizeForSlice(t.png) catch continue;
+            const png = gpa.alloc(u8, n) catch continue;
+            defer gpa.free(png);
+            Dec.decode(png, t.png) catch continue;
+            total_chars += indexOne(gpa, io, run_dir, mem, doc_id, t.index, png, t.text, &manifest_add, &indexed);
+        }
+    } else {
+        const snap = browser_mgr.renderTilesCurrent(gpa, io, env, run_dir, TILE_H, MAX_TILES) catch |e|
+            return std.fmt.allocPrint(gpa, "pixel_capture failed to render: {s}", .{@errorName(e)}) catch dupe(gpa, "render failed");
+        defer browser_mgr.freeSnapshot(gpa, snap);
+        url_buf.appendSlice(gpa, snap.url) catch {};
+        doc_id = captureDocId(gpa, io, &tmp_doc, doc_id, url_buf.items);
+        tile_count = snap.tiles.len;
+        for (snap.tiles) |t| total_chars += indexOne(gpa, io, run_dir, mem, doc_id, t.index, t.png, t.text, &manifest_add, &indexed);
+    }
+
+    // evaluate() may hand the href back as a quoted JSON string — normalize for the blank-page check + report
+    const url = std.mem.trim(u8, url_buf.items, " \"\r\n\t");
+    if (url.len == 0 or std.mem.startsWith(u8, url, "about:blank"))
+        return dupe(gpa, "pixel_capture: no page is open in the browser — browser_navigate somewhere (and interact) first, THEN capture the state you want to verify");
+
+    if (manifest_add.items.len > 0) appendManifest(gpa, io, run_dir, manifest_add.items);
+    log.info("pixel_capture {s}: {d} tiles, {d} indexed of {s} (daemon={})", .{ doc_id, tile_count, indexed, clip(url, 120), use_daemon });
+    const url_lit = std.json.Stringify.valueAlloc(gpa, url, .{}) catch (gpa.dupe(u8, "\"\"") catch return dupe(gpa, "captured"));
+    defer gpa.free(url_lit);
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"doc_id\":\"{s}\",\"url\":{s},\"tiles\":{d},\"indexed\":{d},\"chars\":{d},\"note\":\"snapshot of the LIVE page state (nothing was reloaded) — retrieve with pixel_search, or read the tile images under .pixelrag/{s}/\"}}", .{ doc_id, url_lit, tile_count, indexed, total_chars, doc_id }) catch dupe(gpa, "captured");
+}
+
+/// The doc id for one capture: the caller's explicit id verbatim, else the url-derived base plus a short
+/// random generation suffix — successive captures of the same page (a test loop) must not collapse into one
+/// document, or stale states would shadow fresh ones in search results.
+fn captureDocId(gpa: std.mem.Allocator, io: std.Io, buf: *[64]u8, explicit: []const u8, url: []const u8) []const u8 {
+    if (explicit.len > 0) return explicit;
+    const base = resolveDocId(gpa, "", if (url.len > 0) url else "live");
+    defer gpa.free(base);
+    var r: [2]u8 = undefined;
+    io.random(&r);
+    const out = std.fmt.bufPrint(buf, "{s}-s{s}", .{ base[0..@min(base.len, 56)], std.fmt.bytesToHex(r, .lower) }) catch return "live-capture";
+    return out;
+}
+
 fn manifestPath(gpa: std.mem.Allocator, run_dir: []const u8) ?[]u8 {
     return std.fmt.allocPrint(gpa, "{s}/.pixelrag/index.jsonl", .{run_dir}) catch null;
 }
