@@ -356,7 +356,14 @@ fn ensureMarkTexture() void {
     if (mark_tex_attempted) return;
     log.trace("theme.ensureMarkTexture loading", .{});
     mark_tex_attempted = true;
+    // The desk cwd varies (repo root, zig-out/bin, Explorer double-click), so try the icon relative to each.
+    // icon16x16.png is the brand mark used for BOTH the titlebar client icon (drawMark) and the chat veil mark
+    // (drawMarkPulse); icon.png is a legacy fallback so an older asset set still renders something.
     const candidates = [_][:0]const u8{
+        "assets/icon16x16.png",
+        "desk/assets/icon16x16.png",
+        "../assets/icon16x16.png",
+        "../desk/assets/icon16x16.png",
         "assets/icon.png",
         "desk/assets/icon.png",
         "../assets/icon.png",
@@ -367,8 +374,10 @@ fn ensureMarkTexture() void {
             var img = loaded;
             defer rl.unloadImage(img);
             scrubTransparentRgb(&img);
-            if (rl.loadTextureFromImage(img)) |tex| {
-                rl.setTextureFilter(tex, .bilinear);
+            if (rl.loadTextureFromImage(img)) |loaded_tex| {
+                var tex = loaded_tex;
+                rl.genTextureMipmaps(&tex); // the source is high-res; mipmaps keep the ~13-18px mark crisp
+                rl.setTextureFilter(tex, .trilinear);
                 mark_tex = tex;
                 return;
             } else |_| {}
