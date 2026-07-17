@@ -359,17 +359,10 @@ pub const Tile = struct {
     text: []u8, // gpa-owned band text
 };
 
-/// Render `url` and tile the full page into fixed-height screenshot tiles, each paired with the visible text
-/// in its band (Pixel RAG's render+ingest stage). Locks the session for the whole render so it is atomic vs
-/// concurrent browser tool calls. Caller frees each tile's png+text and the returned slice (freeTiles).
-pub fn renderTiles(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, url: []const u8, tile_h: i64, max_tiles: u32) Error![]Tile {
-    g_mu.lockUncancelable(io);
-    defer g_mu.unlock(io);
-    const s = try ensure(gpa, io, env, key);
-
-    const final = try s.navigate(url);
-    gpa.free(final);
-
+/// The tiling body shared by renderTiles (fresh navigation) and renderTilesCurrent (the page AS IS):
+/// document metrics → bounded fixed-height clip screenshots, each paired with its band text. Caller holds
+/// g_mu and frees the tiles (freeTiles).
+fn tileNow(gpa: std.mem.Allocator, s: *Session, tile_h: i64, max_tiles: u32) Error![]Tile {
     // Full document height → number of tiles (bounded).
     var doc_w: f64 = 1280;
     var doc_h: i64 = tile_h;
@@ -409,8 +402,45 @@ pub fn renderTiles(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.E
             break;
         };
     }
-    log.info("browser: rendered {d} tile(s) for {s}", .{ tiles.items.len, url });
     return tiles.toOwnedSlice(gpa) catch error.OutOfMemory;
+}
+
+/// Render `url` and tile the full page into fixed-height screenshot tiles, each paired with the visible text
+/// in its band (Pixel RAG's render+ingest stage). Locks the session for the whole render so it is atomic vs
+/// concurrent browser tool calls. Caller frees each tile's png+text and the returned slice (freeTiles).
+pub fn renderTiles(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, url: []const u8, tile_h: i64, max_tiles: u32) Error![]Tile {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+
+    const final = try s.navigate(url);
+    gpa.free(final);
+
+    const tiles = try tileNow(gpa, s, tile_h, max_tiles);
+    log.info("browser: rendered {d} tile(s) for {s}", .{ tiles.len, url });
+    return tiles;
+}
+
+pub const Snapshot = struct { url: []u8, tiles: []Tile };
+
+/// Tile the session's CURRENT page — NO navigation, so the live state the preceding browser_* interactions
+/// produced (SPA state, logged-in session, an open modal, half-filled form) is captured exactly as it stands.
+/// This is the seam that makes the browser and Pixel RAG one instrument: interact, then capture what actually
+/// rendered. Returns the page's current URL alongside the tiles (caller frees via freeSnapshot).
+pub fn renderTilesCurrent(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, tile_h: i64, max_tiles: u32) Error!Snapshot {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+    const href = s.evaluate("location.href") catch (gpa.dupe(u8, "") catch return error.OutOfMemory);
+    errdefer gpa.free(href);
+    const tiles = try tileNow(gpa, s, tile_h, max_tiles);
+    log.info("browser: snapshot {d} tile(s) of the current page {s}", .{ tiles.len, href });
+    return .{ .url = href, .tiles = tiles };
+}
+
+pub fn freeSnapshot(gpa: std.mem.Allocator, snap: Snapshot) void {
+    gpa.free(snap.url);
+    freeTiles(gpa, snap.tiles);
 }
 
 pub fn freeTiles(gpa: std.mem.Allocator, tiles: []Tile) void {
@@ -557,6 +587,10 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
         const th: i64 = pInt(p, "tile_h") orelse 1600;
         const mt: u32 = if (pInt(p, "max_tiles")) |m| @intCast(@max(1, @min(64, m))) else 12;
         return renderTilesJson(gpa, io, env, key, url, th, mt);
+    } else if (std.mem.eql(u8, action, "rendertilescurrent")) {
+        const th: i64 = pInt(p, "tile_h") orelse 1600;
+        const mt: u32 = if (pInt(p, "max_tiles")) |m| @intCast(@max(1, @min(64, m))) else 12;
+        return renderTilesCurrentJson(gpa, io, env, key, th, mt);
     }
     return errJson(gpa, "unknown action");
 }
@@ -572,6 +606,35 @@ fn renderTilesJson(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.E
     out.appendSlice(gpa, "{\"ok\":true,\"tiles\":[") catch return errJson(gpa, "oom");
     const Enc = std.base64.standard.Encoder;
     for (tiles, 0..) |t, i| {
+        if (i > 0) out.append(gpa, ',') catch break;
+        const b64 = gpa.alloc(u8, Enc.calcSize(t.png.len)) catch break;
+        defer gpa.free(b64);
+        _ = Enc.encode(b64, t.png);
+        const text_lit = std.json.Stringify.valueAlloc(gpa, t.text, .{}) catch (gpa.dupe(u8, "\"\"") catch break);
+        defer gpa.free(text_lit);
+        const seg = std.fmt.allocPrint(gpa, "{{\"index\":{d},\"y\":{d},\"png\":\"{s}\",\"text\":{s}}}", .{ t.index, t.y, b64, text_lit }) catch break;
+        defer gpa.free(seg);
+        out.appendSlice(gpa, seg) catch break;
+    }
+    out.appendSlice(gpa, "]}") catch return errJson(gpa, "oom");
+    return out.toOwnedSlice(gpa) catch errJson(gpa, "oom");
+}
+
+/// The CURRENT-page render stage as a dispatch action (pixel_capture's daemon path): tile the page AS IS —
+/// no navigation — and return the live URL + each tile as base64 PNG + band text, so a client-side capture
+/// (short-lived exec-tool subprocess) snapshots the persistent daemon browser's real state. gpa-owned JSON.
+fn renderTilesCurrentJson(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, tile_h: i64, max_tiles: u32) []u8 {
+    const snap = renderTilesCurrent(gpa, io, env, key, tile_h, max_tiles) catch |e| return errJson(gpa, @errorName(e));
+    defer freeSnapshot(gpa, snap);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    const url_lit = std.json.Stringify.valueAlloc(gpa, snap.url, .{}) catch (gpa.dupe(u8, "\"\"") catch return errJson(gpa, "oom"));
+    defer gpa.free(url_lit);
+    out.appendSlice(gpa, "{\"ok\":true,\"url\":") catch return errJson(gpa, "oom");
+    out.appendSlice(gpa, url_lit) catch return errJson(gpa, "oom");
+    out.appendSlice(gpa, ",\"tiles\":[") catch return errJson(gpa, "oom");
+    const Enc = std.base64.standard.Encoder;
+    for (snap.tiles, 0..) |t, i| {
         if (i > 0) out.append(gpa, ',') catch break;
         const b64 = gpa.alloc(u8, Enc.calcSize(t.png.len)) catch break;
         defer gpa.free(b64);

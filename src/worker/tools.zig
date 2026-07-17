@@ -738,8 +738,9 @@ pub const BROWSER_SCHEMA =
 /// Pixel RAG tools (Feature 1 — screenshot-to-data retrieval). Injected at runtime alongside BROWSER_SCHEMA
 /// when NL_BROWSER_DRIVER is set (they render pages in the same browser). Comma-joined, no outer brackets.
 pub const PIXEL_SCHEMA =
-    \\{"type":"function","function":{"name":"pixel_ingest","description":"Ingest a web page as RENDERED screenshot tiles (not parsed HTML): the page is loaded in a real browser, tiled into images, and each tile's text is indexed for retrieval. Use it to make a visually complex page (dashboards, tables, charts, docs) searchable when plain text extraction would lose the layout. Returns the doc_id and tile count.","parameters":{"type":"object","properties":{"url":{"type":"string"},"doc_id":{"type":"string","description":"optional id for this document (auto-derived from the url if omitted)"}},"required":["url"]}}},
-    \\{"type":"function","function":{"name":"pixel_search","description":"Search pages you previously pixel_ingested and return the best-matching screenshot tiles — each result has the tile's image path, a text excerpt, and a score. Call pixel_ingest on a page first.","parameters":{"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer","description":"max results (default 4)"}},"required":["query"]}}}
+    \\{"type":"function","function":{"name":"pixel_ingest","description":"Ingest a web page as RENDERED screenshot tiles (not parsed HTML): the page is loaded FRESH in a real browser, tiled into images, and each tile's text is indexed for retrieval. Use it to make a visually complex page (dashboards, tables, charts, docs) searchable when plain text extraction would lose the layout. NOTE: this NAVIGATES the browser (resetting any live page state) — to snapshot the page you are currently interacting with, use pixel_capture instead. Returns the doc_id and tile count.","parameters":{"type":"object","properties":{"url":{"type":"string"},"doc_id":{"type":"string","description":"optional id for this document (auto-derived from the url if omitted)"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"pixel_capture","description":"Snapshot the browser page EXACTLY AS IT IS RIGHT NOW — nothing is reloaded — into screenshot tiles + indexed text. This is how you visually VERIFY a web app's live state while testing it: browser_navigate / click / type to drive the app, then pixel_capture, then pixel_search (or read the returned tile text) to confirm what actually rendered — the logged-in feed, the open modal, the submitted form's result. Each capture gets its own doc generation, so before/after snapshots stay comparable.","parameters":{"type":"object","properties":{"doc_id":{"type":"string","description":"optional stable id for this snapshot (auto: derived from the page url + a generation suffix)"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"pixel_search","description":"Search pages you previously pixel_ingested or pixel_captured and return the best-matching screenshot tiles — each result has the tile's image path, a text excerpt, and a score. Call pixel_ingest or pixel_capture first.","parameters":{"type":"object","properties":{"query":{"type":"string"},"k":{"type":"integer","description":"max results (default 4)"}},"required":["query"]}}}
 ;
 
 /// MCP tools (round 2): let RSI find + use the AI-ready MCP servers / runtimes installed on the user's machine.
@@ -1282,6 +1283,13 @@ fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         // browser); else render in-process (server/swarm/CLI-direct keep their own session).
         return pixelrag.ingest(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, url, p.value.doc_id, ctx.browser_daemon);
     }
+    if (std.mem.eql(u8, name, "pixel_capture")) {
+        const A = struct { doc_id: []const u8 = "" };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch
+            return dupe(gpa, "pixel_capture: could not parse args JSON");
+        defer p.deinit();
+        return pixelrag.capture(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, p.value.doc_id, ctx.browser_daemon);
+    }
     if (std.mem.eql(u8, name, "pixel_search")) {
         const A = struct { query: []const u8 = "", k: u32 = 4 };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
@@ -1373,7 +1381,7 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
 fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "browser_navigate", "browser_read", "browser_click", "browser_type", "browser_eval", "browser_close", "pixel_ingest", "pixel_search", "mcp_discover", "mcp_call" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "browser_navigate", "browser_read", "browser_click", "browser_type", "browser_eval", "browser_close", "pixel_ingest", "pixel_capture", "pixel_search", "mcp_discover", "mcp_call" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
 }
