@@ -10,6 +10,7 @@ test {
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
+    _ = @import("worker/chat/paths.zig");
     _ = @import("worker/chat/plan.zig");
     _ = @import("worker/chat/sync.zig");
     _ = @import("worker/chat/toolperf.zig");

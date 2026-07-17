@@ -31,6 +31,7 @@ const builtin = @import("builtin");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const chat_engine = @import("chat/engine.zig");
+const cpaths = @import("chat/paths.zig"); // conv → build-tree mapping: a run builds in _sched/{task}/runs/{stamp}
 
 const App = http.App;
 const badReq = http.badReq;
@@ -446,6 +447,15 @@ pub fn createFromSpec(app: *App, alloc: std.mem.Allocator, uid: u64, s: CreateSp
         .api_key = s.api_key,
     };
     if (!saveTask(app, alloc, uid, t)) return .{ .err = "could not write the task file" };
+    // The task's PERMANENT working directory, created up front so it exists (and is browsable) before the
+    // first run: {data}/u{uid}/_sched/{id}/runs/ — each run adds its own timestamped subdir under runs/.
+    // The tick/list loops only look at *.json FILES in _sched/, so the directory is inert to scheduling.
+    {
+        var db: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&db, "{s}/u{d}/_sched/{s}/runs", .{ app.data, uid, id })) |wd| {
+            _ = std.Io.Dir.cwd().createDirPathStatus(app.io, wd, .default_dir) catch {};
+        } else |_| {}
+    }
     return .{ .id = alloc.dupe(u8, id) catch return .{ .err = "out of memory" } };
 }
 
@@ -613,11 +623,13 @@ pub fn recordRunOutcome(app: *App, uid: u64, id: []const u8, ok: bool, note: []c
 }
 
 /// Compose one run's FIRST MESSAGE: the prompt, the pinned details, then an engine-authored RUN CONTEXT block —
-/// the task's own id, run number, cadence, the previous run's recorded outcome, a SELF-HEAL directive when the
-/// task is failing, and the standing self-improvement contract (revise yourself via schedule_update). The id is
-/// what makes self-revision DETERMINISTIC: without it the run would have to fish its own identity out of
-/// schedule_list by name. gpa-owned; null only on OOM. Pure of I/O — unit-tested below.
-pub fn buildRunMessage(gpa: std.mem.Allocator, t: *const Task) ?[]u8 {
+/// the task's own id, run number, cadence, the previous run's recorded outcome, this run's PERMANENT working
+/// directory (when the caller resolved one), a SELF-HEAL directive when the task is failing, and the standing
+/// self-improvement contract (revise yourself via schedule_update). The id is what makes self-revision
+/// DETERMINISTIC: without it the run would have to fish its own identity out of schedule_list by name.
+/// `run_rel` is the data-relative run root ("u1/_sched/{task}/runs/{stamp}") or "" to omit the workdir block.
+/// gpa-owned; null only on OOM. Pure of I/O — unit-tested below.
+pub fn buildRunMessage(gpa: std.mem.Allocator, t: *const Task, run_rel: []const u8) ?[]u8 {
     var text: std.ArrayListUnmanaged(u8) = .empty;
     defer text.deinit(gpa);
     const fail = build: {
@@ -638,6 +650,11 @@ pub fn buildRunMessage(gpa: std.mem.Allocator, t: *const Task) ?[]u8 {
         text.appendSlice(gpa, ").\n") catch break :build true;
         const st = std.mem.trim(u8, t.last_status, " \r\n\t");
         if (st.len > 0) text.print(gpa, "Previous run outcome: {s}\n", .{st}) catch break :build true;
+        if (run_rel.len > 0) {
+            // The permanent task dir is the run root minus its "/runs/{stamp}" tail.
+            const task_rel = if (std.mem.lastIndexOf(u8, run_rel, "/runs/")) |i| run_rel[0..i] else run_rel;
+            text.print(gpa, "WORKDIR (permanent): this run's files land in \"{s}/work\" under the server data dir and are KEPT after the run — every run of this task gets its own timestamped folder under \"{s}/runs/\". Save anything worth keeping (reports, collected data, scripts, logs) as FILES via write_file; also record reusable knowledge with observe, because later runs read the task memory, not this folder.\n", .{ run_rel, task_rel }) catch break :build true;
+        }
         if (t.fail_streak > 0)
             text.print(gpa, "SELF-HEAL FIRST: the last {d} run(s) of this task FAILED in a row. Before working the task, diagnose and FIX the cause — verify inputs, tools, and approach; simplify whatever keeps breaking — and record what you fixed with observe so the repair sticks.\n", .{t.fail_streak}) catch break :build true;
         text.appendSlice(gpa, "STANDING DIRECTIVE — this task must be SELF-HEALING and SELF-IMPROVING across runs: " ++
@@ -698,14 +715,27 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     var cb: [64]u8 = undefined;
     const conv = convIdFor(&cb, t.id, now + localOffsetSecs());
 
+    // The run's PERMANENT working directory: every resolver maps this conv into the task's own tree
+    // ({data}/u{uid}/_sched/{task}/runs/{stamp} — paths.zig), so create it now and tell the run about it.
+    // Creation failure is non-fatal: the engine's own createDirPathStatus retries on first tool use.
+    var rb: [256]u8 = undefined;
+    const run_rel = cpaths.buildRootRel(&rb, uid, conv);
+    if (run_rel.len > 0) {
+        var ab: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&ab, "{s}/{s}/work", .{ app.data, run_rel })) |wd| {
+            _ = std.Io.Dir.cwd().createDirPathStatus(app.io, wd, .default_dir) catch {};
+        } else |_| {}
+    }
+
     // First message = the prompt + pinned details + the engine-authored RUN CONTEXT (buildRunMessage): the run
-    // knows its OWN task id, run number, cadence, and the previous run's recorded outcome — the mechanical
-    // ground the self-heal/self-improve loop stands on (schedule_update needs the id; repair posture needs the
-    // outcome). Each minted conversation stays self-contained: everything the run may know about its task is IN
-    // the message. The run fires with the AUTO-LOOP ARMED (loop=1 below), so the drive loop carries it through
-    // ambiguity to a completed deliverable, and the engine injects the task's memory (recall) + records
-    // outcomes/lessons (see runTurn's sched branches) — autonomy and learning are ENGINE mechanics.
-    const text = buildRunMessage(app.gpa, t) orelse return null;
+    // knows its OWN task id, run number, cadence, the previous run's recorded outcome, and its permanent
+    // per-run workdir — the mechanical ground the self-heal/self-improve loop stands on (schedule_update needs
+    // the id; repair posture needs the outcome). Each minted conversation stays self-contained: everything the
+    // run may know about its task is IN the message. The run fires with the AUTO-LOOP ARMED (loop=1 below), so
+    // the drive loop carries it through ambiguity to a completed deliverable, and the engine injects the task's
+    // memory (recall) + records outcomes/lessons (see runTurn's sched branches) — autonomy and learning are
+    // ENGINE mechanics.
+    const text = buildRunMessage(app.gpa, t, run_rel) orelse return null;
     defer app.gpa.free(text);
 
     const pr = resolveProvider(app, alloc, uid, t);
@@ -1225,10 +1255,11 @@ test "applySpecToTask: absent keeps, present replaces + validates the FINAL shap
 
 test "buildRunMessage: prompt + details + run context (id, run number, cadence, outcome, heal posture)" {
     const gpa = std.testing.allocator;
-    // healthy task: context names the id + cadence + standing directive, but NO self-heal block
+    // healthy task: context names the id + cadence + standing directive, but NO self-heal block; a blank
+    // run_rel omits the workdir block entirely
     {
         const t = Task{ .id = "digest-0301070500", .name = "Digest", .prompt = "Do the digest.", .details = "use source X", .kind = "every", .every_min = 60, .runs = 4 };
-        const msg = buildRunMessage(gpa, &t).?;
+        const msg = buildRunMessage(gpa, &t, "").?;
         defer gpa.free(msg);
         try std.testing.expect(std.mem.startsWith(u8, msg, "Do the digest."));
         try std.testing.expect(std.mem.indexOf(u8, msg, "Key details / data to use:\nuse source X") != null);
@@ -1239,15 +1270,24 @@ test "buildRunMessage: prompt + details + run context (id, run number, cadence, 
         try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEALING and SELF-IMPROVING") != null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEAL FIRST") == null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "Previous run outcome") == null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "WORKDIR") == null);
     }
     // failing task: previous outcome + repair posture lead the run; empty details adds no details block
     {
         const t = Task{ .id = "digest-0301070500", .name = "Digest", .prompt = "Do the digest.", .kind = "daily", .hm = "09:30", .runs = 9, .last_status = "FAILED: the model call errored mid-turn", .fail_streak = 3 };
-        const msg = buildRunMessage(gpa, &t).?;
+        const msg = buildRunMessage(gpa, &t, "").?;
         defer gpa.free(msg);
         try std.testing.expect(std.mem.indexOf(u8, msg, "Key details") == null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "runs daily at 09:30") != null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "Previous run outcome: FAILED: the model call errored mid-turn") != null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "SELF-HEAL FIRST: the last 3 run(s) of this task FAILED in a row") != null);
+    }
+    // a resolved run_rel adds the permanent-workdir block, naming this run's dir AND the task's runs/ fan-out
+    {
+        const t = Task{ .id = "digest-0301070500", .name = "Digest", .prompt = "Do the digest.", .kind = "every", .every_min = 60 };
+        const msg = buildRunMessage(gpa, &t, "u1/_sched/digest-0301070500/runs/07171400").?;
+        defer gpa.free(msg);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "WORKDIR (permanent): this run's files land in \"u1/_sched/digest-0301070500/runs/07171400/work\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, msg, "timestamped folder under \"u1/_sched/digest-0301070500/runs/\"") != null);
     }
 }

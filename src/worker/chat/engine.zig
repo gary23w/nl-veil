@@ -27,6 +27,7 @@ const toolperf = @import("toolperf.zig"); // per-machine tool latency/reliabilit
 const deploy_service = @import("../deploy/service.zig");
 const sched = @import("../sched.zig"); // mutual import (sched spawns turns here); Zig resolves it lazily
 const metrics = @import("../metrics.zig"); // per-turn LLM usage lines behind the desk Dashboard
+const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
 
 // Raw-thread sleep (supervisor.zig's threadSleepMs twin): the chat turn runs on a raw detached std.Thread
 // (spawnTurn), where io.sleep throws and a swallowed error busy-spins a core. Win32 Sleep on Windows.
@@ -387,8 +388,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, base_url: []const u8, key:
     // reflect, the agentic loop) — finishTurn emits the delta as this turn's usage at every completion path.
     const usage_t0 = llm.tokensSnapshot();
 
-    // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree) ----
-    const run_root = std.fmt.allocPrint(gpa, "{s}/builds/{s}", .{ base, conv }) catch return;
+    // ---- ToolCtx: byte-for-byte the chat_tools.runMindTool construction (per-uid store, builds/{conv} tree;
+    // a SCHEDULED run's tree lives under its task's permanent _sched/{task}/runs/{stamp} dir — see paths.zig) ----
+    var rrb: [700]u8 = undefined;
+    const run_root_m = cpaths.buildRootFromChatBase(&rrb, base, conv);
+    if (run_root_m.len == 0) return;
+    const run_root = gpa.dupe(u8, run_root_m) catch return;
     defer gpa.free(run_root);
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_root}) catch return;
     defer gpa.free(workdir);
@@ -2293,7 +2298,10 @@ fn syncDirTool(app: *App, conv: []const u8, conv_dir: []const u8, ctrl_cursor: u
     const base_name = if (p.value.as.len > 0) p.value.as else std.fs.path.basename(src);
     if (base_name.len == 0 or !cync.safeSyncPath(base_name)) return orchErr(gpa, "sync_dir: bad 'as' — a workdir-relative folder name (e.g. mygame)");
     const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return orchErr(gpa, "sync_dir: cannot resolve the workdir");
-    const dest = std.fmt.allocPrint(gpa, "{s}/builds/{s}/work/{s}", .{ conv_dir[0..at], conv, base_name }) catch return orchErr(gpa, "sync_dir: out of memory");
+    var drb: [700]u8 = undefined;
+    const droot = cpaths.buildRootFromChatBase(&drb, conv_dir[0..at], conv); // scheduled runs project into their task tree
+    if (droot.len == 0) return orchErr(gpa, "sync_dir: cannot resolve the workdir");
+    const dest = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ droot, base_name }) catch return orchErr(gpa, "sync_dir: out of memory");
     defer gpa.free(dest);
     const got = pullClientFilesRooted(app, conv_dir, dest, ctrl_cursor, src);
     if (got < 0) return orchErr(gpa, "sync_dir: the client did not answer — is the desk/CLI still connected?");
@@ -2491,10 +2499,14 @@ fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
     if (tool_client) {
         const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/");
         if (at) |i| {
+            var rb: [700]u8 = undefined;
+            const root = cpaths.buildRootFromChatBase(&rb, conv_dir[0..i], conv);
             var wb: [1400]u8 = undefined;
-            if (std.fmt.bufPrint(&wb, "{s}/builds/{s}/work", .{ conv_dir[0..i], conv })) |work| {
-                pullClientFiles(app, conv_dir, work, ctrl_cursor);
-            } else |_| {}
+            if (root.len > 0) {
+                if (std.fmt.bufPrint(&wb, "{s}/work", .{root})) |work| {
+                    pullClientFiles(app, conv_dir, work, ctrl_cursor);
+                } else |_| {}
+            }
         }
     }
 

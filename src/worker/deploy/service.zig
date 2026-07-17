@@ -11,6 +11,7 @@ const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const modelcfg = @import("../modelcfg.zig");
 const tail_fanout = @import("../control/fanout.zig");
+const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
 const App = http.App;
 const requireUser = http.requireUser;
 const badReq = http.badReq;
@@ -524,8 +525,9 @@ pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq)
     // folder the chat's own build tools (and the desktop console) use — the cast and the chat co-edit one tree
     // instead of the cast disappearing into a throwaway `{hex}/work`. Blank/unsafe conv → default per-swarm dir.
     const conv = safeConv(arena, rq.dir);
+    var brb: [256]u8 = undefined;
     const build_override = if (conv.len > 0)
-        (std.fmt.allocPrint(arena, "{s}/u{d}/_chat/builds/{s}", .{ app.data, u.id, conv }) catch return failSrv("out of memory"))
+        (std.fmt.allocPrint(arena, "{s}/{s}", .{ app.data, cpaths.buildRootRel(&brb, u.id, conv) }) catch return failSrv("out of memory"))
     else
         "";
     if (build_override.len > 0) {
