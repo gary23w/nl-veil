@@ -517,6 +517,334 @@ pub fn cleanInline(dst: []u8, src: []const u8) usize {
     return w;
 }
 
+// ---- styled inline spans — the chat renderer's REAL typography path -------------------------------------
+// cleanInline above STRIPS markers to plain text (still used for mono table cells); parseInline below is the
+// full replacement for the reading surface: it resolves the same inline grammar but KEEPS the structure as
+// styled spans (bold/italic/inline-code/strikethrough/links with their urls), so the renderer can draw real
+// weights, faces, code chips, and clickable links. Same robustness contract as everything in this file:
+// bounded buffers, no allocation, hostile input degrades to readable literals — never a crash.
+
+pub const Style = packed struct(u8) {
+    bold: bool = false,
+    italic: bool = false,
+    code: bool = false,
+    strike: bool = false,
+    link: bool = false,
+    _pad: u3 = 0,
+
+    pub fn eqlS(a: Style, b: Style) bool {
+        return @as(u8, @bitCast(a)) == @as(u8, @bitCast(b));
+    }
+};
+
+pub const NO_URL: u8 = 255;
+pub const Span = struct { off: u16 = 0, len: u16 = 0, style: Style = .{}, url: u8 = NO_URL };
+pub const MAX_SPANS = 48;
+pub const MAX_URLS = 6;
+
+/// One parsed line: display bytes + style runs over them. Stack-friendly (~6KB); reused per line.
+pub const Inline = struct {
+    text: [2048]u8 = undefined, // display bytes: math resolved, markers stripped, <br> → '\n' (hard break)
+    text_len: usize = 0,
+    spans: [MAX_SPANS]Span = undefined,
+    span_count: usize = 0,
+    urls: [MAX_URLS][512]u8 = undefined,
+    url_lens: [MAX_URLS]usize = [_]usize{0} ** MAX_URLS,
+    url_count: usize = 0,
+
+    pub fn textOf(il: *const Inline, sp: Span) []const u8 {
+        return il.text[sp.off .. sp.off + sp.len];
+    }
+    pub fn urlOf(il: *const Inline, sp: Span) ?[]const u8 {
+        if (sp.url == NO_URL or sp.url >= il.url_count) return null;
+        return il.urls[sp.url][0..il.url_lens[sp.url]];
+    }
+};
+
+/// The next run of `fence` consecutive backticks at/after `from`, or null.
+fn findFenceRun(s: []const u8, from: usize, fence: usize) ?usize {
+    var i = from;
+    while (i + fence <= s.len) : (i += 1) {
+        if (s[i] != '`') continue;
+        if (fence == 2 and s[i + 1] != '`') continue;
+        return i;
+    }
+    return null;
+}
+
+/// Is there a viable CLOSING marker (`m` × count, outside code, with a non-space char before it) ahead of
+/// `from`? Openers only activate when their pair exists — an unmatched `**` stays a literal, instead of
+/// silently restyling the rest of the line.
+fn findPair(w: []const u8, mask: []const bool, from: usize, m: u8, count: usize) bool {
+    var i = from;
+    while (i + count <= w.len) : (i += 1) {
+        if (mask[i]) continue;
+        if (w[i] != m) continue;
+        if (count == 2 and (w[i + 1] != m or mask[i + 1])) continue;
+        const prv: u8 = if (i > 0) w[i - 1] else ' ';
+        if (prv == ' ' or prv == m) continue;
+        return true;
+    }
+    return false;
+}
+
+const LinkParts = struct { label_end: usize, next: usize, url_from: usize, url_to: usize };
+
+/// A well-formed "[label](url)" at `open` (open points at '['): the label-end index, the index past ')',
+/// and the url range. null → the '[' is a literal.
+fn parseLinkAt(w: []const u8, open: usize) ?LinkParts {
+    var rb = open + 1;
+    while (rb < w.len and w[rb] != ']') : (rb += 1) {
+        if (w[rb] == '[') return null; // nested '[' — treat the whole thing as literal text
+    }
+    if (rb >= w.len or rb == open + 1) return null; // no ']' / empty label
+    if (rb + 1 >= w.len or w[rb + 1] != '(') return null;
+    var rp = rb + 2;
+    while (rp < w.len and w[rp] != ')') : (rp += 1) {}
+    if (rp >= w.len) return null;
+    return .{ .label_end = rb, .next = rp + 1, .url_from = rb + 2, .url_to = rp };
+}
+
+fn storeUrl(out: *Inline, url_raw: []const u8) ?u8 {
+    if (out.url_count >= MAX_URLS) return null;
+    var u = std.mem.trim(u8, url_raw, " ");
+    if (std.mem.indexOfScalar(u8, u, ' ')) |sp| u = u[0..sp]; // drop a `"title"` tail
+    if (u.len == 0) return null;
+    const idx: u8 = @intCast(out.url_count);
+    const n = @min(u.len, out.urls[idx].len);
+    @memcpy(out.urls[idx][0..n], u[0..n]);
+    out.url_lens[idx] = n;
+    out.url_count += 1;
+    return idx;
+}
+
+const Emitter = struct {
+    out: *Inline,
+    cur: Style = .{},
+    cur_url: u8 = NO_URL,
+    span_start: usize = 0,
+
+    fn flush(e: *Emitter) void {
+        const len = e.out.text_len - e.span_start;
+        if (len == 0) return;
+        if (e.out.span_count < MAX_SPANS) {
+            e.out.spans[e.out.span_count] = .{
+                .off = @intCast(e.span_start),
+                .len = @intCast(len),
+                .style = e.cur,
+                .url = e.cur_url,
+            };
+            e.out.span_count += 1;
+        } else {
+            // span table full — grow the LAST span instead (style detail degrades, text never drops)
+            const last = &e.out.spans[MAX_SPANS - 1];
+            last.len = @intCast(e.out.text_len - last.off);
+        }
+        e.span_start = e.out.text_len;
+    }
+
+    fn put(e: *Emitter, b: u8, want: Style, url: u8) void {
+        if (!e.cur.eqlS(want) or e.cur_url != url) {
+            e.flush();
+            e.cur = want;
+            e.cur_url = url;
+        }
+        if (e.out.text_len < e.out.text.len) {
+            e.out.text[e.out.text_len] = b;
+            e.out.text_len += 1;
+        }
+    }
+};
+
+/// Parse one source line into display text + styled spans. Grammar (pragmatic GFM subset, matching what
+/// models actually emit): `code`/``code`` (verbatim — no math, no emphasis inside), **bold** __bold__,
+/// *italic* _italic_ (word-flanked; snake_case and `a * b` survive), ~~strike~~, [label](url), ![alt](url),
+/// bare http(s):// autolinks, <br> → hard break, LaTeX-ish math via mathToUnicode outside code. Unpaired
+/// markers stay literal. Always produces at least one span when any text survives.
+pub fn parseInline(out: *Inline, src: []const u8) void {
+    out.text_len = 0;
+    out.span_count = 0;
+    out.url_count = 0;
+    const trimmed = std.mem.trim(u8, src, " \t\r");
+
+    // ---- phase A: lift out `code` spans (verbatim), math-convert everything else, into work[] + mask ----
+    var work: [2048]u8 = undefined;
+    var mask: [2048]bool = undefined; // true = this byte belongs to an inline-code span
+    var wn: usize = 0;
+    {
+        var i: usize = 0;
+        while (i < trimmed.len and wn < work.len) {
+            if (trimmed[i] == '`') {
+                const fence: usize = if (i + 1 < trimmed.len and trimmed[i + 1] == '`') 2 else 1;
+                const open_end = i + fence;
+                if (findFenceRun(trimmed, open_end, fence)) |close| {
+                    var body = trimmed[open_end..close];
+                    if (fence == 2 and body.len >= 2 and body[0] == ' ' and body[body.len - 1] == ' ')
+                        body = body[1 .. body.len - 1]; // `` ` `` convention: symmetric pad space trims
+                    for (body) |bc| {
+                        if (wn >= work.len) break;
+                        work[wn] = if (bc == '\n' or bc == '\t') ' ' else bc;
+                        mask[wn] = true;
+                        wn += 1;
+                    }
+                    i = close + fence;
+                    continue;
+                }
+                var k: usize = 0; // no closer — literal backtick(s)
+                while (k < fence and wn < work.len) : (k += 1) {
+                    work[wn] = '`';
+                    mask[wn] = false;
+                    wn += 1;
+                }
+                i = open_end;
+                continue;
+            }
+            var j = i;
+            while (j < trimmed.len and trimmed[j] != '`') j += 1;
+            const chunk = trimmed[i..j];
+            var mbuf: [4096]u8 = undefined;
+            const mathed = if (chunk.len <= 3500 and hasMath(chunk)) mbuf[0..mathToUnicode(&mbuf, chunk)] else chunk;
+            for (mathed) |mc| {
+                if (wn >= work.len) break;
+                work[wn] = mc;
+                mask[wn] = false;
+                wn += 1;
+            }
+            i = j;
+        }
+    }
+
+    // ---- phase B: emphasis/link scan over work[], emitting bytes + style runs ----
+    var e = Emitter{ .out = out };
+    var st = Style{};
+    var link_end: usize = std.math.maxInt(usize); // work-index where the open link's label ends
+    var link_resume: usize = std.math.maxInt(usize); // work-index to continue from after the label (skips "(url)")
+    var i: usize = 0;
+    while (i < wn) {
+        // an open [label](...) ends here — drop the link style and jump past its "(url)" tail
+        if (st.link and i == link_end) {
+            st.link = false;
+            i = link_resume;
+            continue;
+        }
+        const c = work[i];
+        if (mask[i]) {
+            var want = st;
+            want.code = true; // code renders mono regardless; surrounding emphasis rides along
+            e.put(c, want, if (st.link) e.cur_url else NO_URL);
+            i += 1;
+            continue;
+        }
+        {
+            // <br> family → hard break
+            if (c == '<' and (mdstarts(work[i..wn], "<br>") or mdstarts(work[i..wn], "<br/>") or mdstarts(work[i..wn], "<br />"))) {
+                while (e.out.text_len > 0 and e.out.text[e.out.text_len - 1] == ' ') e.out.text_len -= 1; // no trailing pad on the broken line
+                e.put('\n', st, NO_URL);
+                const gt = std.mem.indexOfScalarPos(u8, work[0..wn], i, '>') orelse wn - 1;
+                i = gt + 1;
+                continue;
+            }
+            // doubled markers: **bold** __bold__ ~~strike~~
+            if ((c == '*' or c == '_' or c == '~') and i + 1 < wn and work[i + 1] == c and !mask[i + 1]) {
+                const strike = c == '~';
+                const active = if (strike) st.strike else st.bold;
+                if (!active) {
+                    const nxt: u8 = if (i + 2 < wn) work[i + 2] else ' ';
+                    if (nxt != ' ' and findPair(work[0..wn], mask[0..wn], i + 2, c, 2)) {
+                        if (strike) st.strike = true else st.bold = true;
+                        i += 2;
+                        continue;
+                    }
+                } else {
+                    const prv: u8 = if (e.out.text_len > 0) e.out.text[e.out.text_len - 1] else ' ';
+                    if (prv != ' ') {
+                        if (strike) st.strike = false else st.bold = false;
+                        i += 2;
+                        continue;
+                    }
+                }
+                if (c == '~') { // a literal ~~ (no pair): fall through as ordinary bytes
+                    e.put(c, st, if (st.link) e.cur_url else NO_URL);
+                    i += 1;
+                    continue;
+                }
+                // literal * / _ pair — emit this one; the loop revisits the second
+                e.put(c, st, if (st.link) e.cur_url else NO_URL);
+                i += 1;
+                continue;
+            }
+            // single * / _ → italic (word-flanked; snake_case '_' survives)
+            if (c == '*' or c == '_') {
+                const prv: u8 = if (e.out.text_len > 0) e.out.text[e.out.text_len - 1] else ' ';
+                const nxt: u8 = if (i + 1 < wn) work[i + 1] else ' ';
+                if (!st.italic) {
+                    const snake = c == '_' and isAlnum(prv);
+                    if (!snake and nxt != ' ' and nxt != c and findPair(work[0..wn], mask[0..wn], i + 1, c, 1)) {
+                        st.italic = true;
+                        i += 1;
+                        continue;
+                    }
+                } else {
+                    const snake = c == '_' and isAlnum(nxt);
+                    if (!snake and prv != ' ') {
+                        st.italic = false;
+                        i += 1;
+                        continue;
+                    }
+                }
+                e.put(c, st, if (st.link) e.cur_url else NO_URL);
+                i += 1;
+                continue;
+            }
+            // [label](url) / ![alt](url)
+            if (!st.link and (c == '[' or (c == '!' and i + 1 < wn and work[i + 1] == '[' and !mask[i + 1]))) {
+                const open = if (c == '!') i + 1 else i;
+                if (parseLinkAt(work[0..wn], open)) |lk| {
+                    if (storeUrl(out, work[lk.url_from..lk.url_to])) |uidx| {
+                        st.link = true;
+                        e.flush();
+                        e.cur_url = uidx; // the label's spans carry this url
+                        link_end = lk.label_end;
+                        link_resume = lk.next;
+                        i = open + 1;
+                        continue;
+                    }
+                }
+                // malformed / url table full — the bracket is literal
+            }
+            // bare autolink
+            if (!st.link and c == 'h' and (mdstarts(work[i..wn], "http://") or mdstarts(work[i..wn], "https://"))) {
+                var end = i;
+                while (end < wn and work[end] != ' ' and work[end] != '\n' and !mask[end]) end += 1;
+                var trimmed_end = end;
+                while (trimmed_end > i and (work[trimmed_end - 1] == '.' or work[trimmed_end - 1] == ',' or
+                    work[trimmed_end - 1] == ';' or work[trimmed_end - 1] == ':' or work[trimmed_end - 1] == '!' or
+                    work[trimmed_end - 1] == '?' or work[trimmed_end - 1] == ')' or work[trimmed_end - 1] == '"' or
+                    work[trimmed_end - 1] == '\'')) trimmed_end -= 1;
+                if (trimmed_end > i + 8) {
+                    if (storeUrl(out, work[i..trimmed_end])) |uidx| {
+                        var want = st;
+                        want.link = true;
+                        var k = i; // emit the whole url in one styled run — its _ and * are literal url bytes
+                        while (k < trimmed_end) : (k += 1) e.put(work[k], want, uidx);
+                        i = trimmed_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        // ordinary byte (collapse runs of spaces outside code)
+        if (c == ' ' and e.out.text_len > 0 and e.out.text[e.out.text_len - 1] == ' ') {
+            i += 1;
+            continue;
+        }
+        e.put(c, st, if (st.link) e.cur_url else NO_URL);
+        i += 1;
+    }
+    while (out.text_len > 0 and out.text[out.text_len - 1] == ' ') out.text_len -= 1; // trailing pad
+    e.flush();
+}
+
 // ---- tests ----
 
 test "isHr recognises rules but not bullets or text" {
@@ -599,6 +927,127 @@ test "cleanInline runs math then emphasis, keeps snake_case" {
     try std.testing.expectEqualStrings("x\u{1D62}", b[0..cleanInline(&b, "$x_i$")]);
     // math + real emphasis on the same line
     try std.testing.expectEqualStrings("area = \u{03C0} r\u{00B2}", b[0..cleanInline(&b, "**area** = $\\pi r^2$")]);
+}
+
+// ---- parseInline (styled spans) ----
+
+fn spanText(il: *const Inline, idx: usize) []const u8 {
+    return il.textOf(il.spans[idx]);
+}
+
+test "parseInline: bold/italic/code split into styled runs; plain text stays one span" {
+    var il: Inline = .{};
+    parseInline(&il, "**bold** and *em* and `code`");
+    try std.testing.expectEqualStrings("bold and em and code", il.text[0..il.text_len]);
+    try std.testing.expectEqual(@as(usize, 5), il.span_count);
+    try std.testing.expectEqualStrings("bold", spanText(&il, 0));
+    try std.testing.expect(il.spans[0].style.bold and !il.spans[0].style.italic);
+    try std.testing.expectEqualStrings(" and ", spanText(&il, 1));
+    try std.testing.expect(!il.spans[1].style.bold);
+    try std.testing.expectEqualStrings("em", spanText(&il, 2));
+    try std.testing.expect(il.spans[2].style.italic);
+    try std.testing.expectEqualStrings("code", spanText(&il, 4));
+    try std.testing.expect(il.spans[4].style.code);
+
+    parseInline(&il, "just plain prose");
+    try std.testing.expectEqual(@as(usize, 1), il.span_count);
+    try std.testing.expectEqualStrings("just plain prose", spanText(&il, 0));
+    try std.testing.expect(!il.spans[0].style.bold and !il.spans[0].style.code);
+}
+
+test "parseInline: literals survive — snake_case, lone *, unpaired markers, stray backtick" {
+    var il: Inline = .{};
+    parseInline(&il, "open file_name.txt in std_lib");
+    try std.testing.expectEqualStrings("open file_name.txt in std_lib", il.text[0..il.text_len]);
+    try std.testing.expectEqual(@as(usize, 1), il.span_count);
+    parseInline(&il, "Multiply a * b now");
+    try std.testing.expectEqualStrings("Multiply a * b now", il.text[0..il.text_len]);
+    parseInline(&il, "**unclosed bold");
+    try std.testing.expectEqualStrings("**unclosed bold", il.text[0..il.text_len]);
+    parseInline(&il, "a ` stray tick");
+    try std.testing.expectEqualStrings("a ` stray tick", il.text[0..il.text_len]);
+    parseInline(&il, "~~kept");
+    try std.testing.expectEqualStrings("~~kept", il.text[0..il.text_len]);
+}
+
+test "parseInline: strikethrough, bold across inline code, underscores inside code stay literal" {
+    var il: Inline = .{};
+    parseInline(&il, "~~gone~~ stays");
+    try std.testing.expectEqualStrings("gone stays", il.text[0..il.text_len]);
+    try std.testing.expect(il.spans[0].style.strike);
+    try std.testing.expect(!il.spans[1].style.strike);
+    // emphasis rides across a code span; the code keeps its own flag too
+    parseInline(&il, "**bold `code` tail**");
+    try std.testing.expectEqualStrings("bold code tail", il.text[0..il.text_len]);
+    try std.testing.expect(il.spans[0].style.bold and !il.spans[0].style.code);
+    try std.testing.expect(il.spans[1].style.bold and il.spans[1].style.code);
+    try std.testing.expect(il.spans[2].style.bold and !il.spans[2].style.code);
+    // markers inside code are verbatim bytes
+    parseInline(&il, "run `a_b * c_d` now");
+    try std.testing.expectEqualStrings("run a_b * c_d now", il.text[0..il.text_len]);
+}
+
+test "parseInline: links carry their url; images show alt; autolinks are clickable; label emphasis strips" {
+    var il: Inline = .{};
+    parseInline(&il, "see [the docs](https://ziglang.org/doc) for more");
+    try std.testing.expectEqualStrings("see the docs for more", il.text[0..il.text_len]);
+    try std.testing.expectEqual(@as(usize, 3), il.span_count);
+    try std.testing.expect(il.spans[1].style.link);
+    try std.testing.expectEqualStrings("the docs", spanText(&il, 1));
+    try std.testing.expectEqualStrings("https://ziglang.org/doc", il.urlOf(il.spans[1]).?);
+    try std.testing.expect(il.urlOf(il.spans[0]) == null);
+
+    parseInline(&il, "![logo](x.png) shown");
+    try std.testing.expectEqualStrings("logo shown", il.text[0..il.text_len]);
+    try std.testing.expectEqualStrings("x.png", il.urlOf(il.spans[0]).?);
+
+    parseInline(&il, "go to https://ziglang.org/download now.");
+    try std.testing.expectEqualStrings("go to https://ziglang.org/download now.", il.text[0..il.text_len]);
+    try std.testing.expect(il.spans[1].style.link);
+    try std.testing.expectEqualStrings("https://ziglang.org/download", il.urlOf(il.spans[1]).?);
+
+    // a url with underscores must not trigger italics
+    parseInline(&il, "https://x.y/a_b_c end");
+    try std.testing.expectEqualStrings("https://x.y/a_b_c end", il.text[0..il.text_len]);
+
+    // link title tails drop; a bold label strips its markers but keeps the url
+    parseInline(&il, "[**bold label**](https://x.y \"title\")");
+    try std.testing.expectEqualStrings("bold label", il.text[0..il.text_len]);
+    try std.testing.expect(il.spans[0].style.link and il.spans[0].style.bold);
+    try std.testing.expectEqualStrings("https://x.y", il.urlOf(il.spans[0]).?);
+
+    // malformed stays literal
+    parseInline(&il, "[unclosed bracket");
+    try std.testing.expectEqualStrings("[unclosed bracket", il.text[0..il.text_len]);
+}
+
+test "parseInline: math resolves outside code, never inside; <br> becomes a hard break" {
+    var il: Inline = .{};
+    parseInline(&il, "area = $\\pi r^2$");
+    try std.testing.expectEqualStrings("area = \u{03C0} r\u{00B2}", il.text[0..il.text_len]);
+    parseInline(&il, "`$x^2$` literal");
+    try std.testing.expectEqualStrings("$x^2$ literal", il.text[0..il.text_len]);
+    try std.testing.expect(il.spans[0].style.code);
+    parseInline(&il, "line one<br>line two");
+    try std.testing.expectEqualStrings("line one\nline two", il.text[0..il.text_len]);
+}
+
+test "parseInline: hostile input never crashes and always yields bounded output" {
+    var il: Inline = .{};
+    // marker storm
+    parseInline(&il, "*** ** * `` ` ~~ __ _ [ ]( ![ <br");
+    try std.testing.expect(il.text_len <= il.text.len);
+    // a giant spaceless run (the renderWrapped OOB class of input)
+    var big: [3000]u8 = undefined;
+    @memset(&big, 'x');
+    big[0] = '*';
+    big[1] = '*';
+    parseInline(&il, &big);
+    try std.testing.expect(il.text_len <= il.text.len);
+    try std.testing.expect(il.span_count >= 1);
+    // many links overflow the url table gracefully (later links render as text)
+    parseInline(&il, "[a](u1) [b](u2) [c](u3) [d](u4) [e](u5) [f](u6) [g](u7) [h](u8)");
+    try std.testing.expect(il.url_count <= MAX_URLS);
 }
 
 test "a full GFM table row round-trips through inner+split+clean" {

@@ -578,6 +578,9 @@ pub const Store = struct {
     console_pending: bool = false,
     console_pending_cmd: [1024]u8 = undefined,
     console_pending_len: usize = 0,
+    // The You shell's CURRENT DIRECTORY (chat thread resolves + writes; the console UI shows it as the prompt).
+    console_cwd: [400]u8 = undefined,
+    console_cwd_len: usize = 0,
     casts: [MAX_CASTS]CastRow = undefined,
     cast_count: usize = 0,
     cast_tail: [CAST_TAIL]scan.Ev = undefined, // live event tail of the newest active cast
@@ -715,6 +718,22 @@ pub const Store = struct {
         const n = @min(text.len, buf.len - lenp.*);
         @memcpy(buf[lenp.* .. lenp.* + n], text[0..n]);
         lenp.* += n;
+    }
+
+    /// Wipe a console scrollback (the You shell's `clear`/`cls` builtin; ai=Veil kept for symmetry).
+    pub fn consoleClear(s: *Store, ai: bool) void {
+        s.lock();
+        defer s.unlock();
+        if (ai) s.console_ai_len = 0 else s.console_you_len = 0;
+    }
+
+    /// Publish the You shell's current directory (chat thread resolves it; the console UI shows the prompt).
+    pub fn consoleSetCwd(s: *Store, cwd: []const u8) void {
+        s.lock();
+        defer s.unlock();
+        const n = @min(cwd.len, s.console_cwd.len);
+        @memcpy(s.console_cwd[0..n], cwd[0..n]);
+        s.console_cwd_len = n;
     }
 
     /// Chat thread: pop the next chat command, or null.
