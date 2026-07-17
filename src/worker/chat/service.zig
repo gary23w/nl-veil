@@ -186,7 +186,11 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         }
     } else |_| {} // no events.jsonl yet → empty body (a fresh conv)
     res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{next_off}));
-    res.content_type = .EVENTS;
+    // .TEXT, deliberately NOT .EVENTS: this is a BOUNDED poll body, not an SSE stream. httpz omits
+    // Content-Length on an EMPTY .EVENTS response (SSE framing = "body ends at close"), so every quiet-window
+    // poll from a keep-alive client (the web UI, curl, any stock HTTP lib) hung until the 60s idle reaper cut
+    // the socket — measured 5–60s per empty poll. .TEXT frames empty bodies as Content-Length: 0.
+    res.content_type = .TEXT;
     res.body = body;
 }
 
