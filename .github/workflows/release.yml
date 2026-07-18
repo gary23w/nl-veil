@@ -47,9 +47,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: windows-latest, name: windows-x86_64, script: pwsh }
-          - { os: ubuntu-latest,  name: linux-x86_64,   script: sh }
-          - { os: macos-latest,   name: macos-arm64,    script: sh }
+          # Each runner contributes the FULL native bundle for its own OS — the only way to ship veil-desk
+          # (raylib links the platform GUI stack) and neuron (Rust) per platform. `xc: yes` additionally
+          # cross-compiles the standalone SERVER for every target; one runner doing that is enough.
+          - { os: windows-latest, name: windows-x86_64, xc: 'no'  }
+          - { os: ubuntu-latest,  name: linux-x86_64,   xc: 'yes' }
+          - { os: macos-14,       name: macos-arm64,    xc: 'no'  }
+          - { os: macos-13,       name: macos-x86_64,   xc: 'no'  }
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout nl-veil
@@ -79,33 +83,45 @@ jobs:
         working-directory: ../neuron-db/rust/neuron-core
         run: cargo build --release --features "sqlite secure server trust"
 
-      # the runner already installed zig/rust/raylib above, so skip the script's own bootstrap
-      - name: Build bundle (unix)
-        if: matrix.script == 'sh'
+      # ONE script on every runner (bash is present on the windows runner too). The runner already installed
+      # zig/rust/raylib above, so skip the script's own bootstrap.
+      - name: Build bundle
+        shell: bash
         env:
           NO_BOOTSTRAP: '1'
-          NEURON: ${{ github.workspace }}/../neuron-db/rust/neuron-core/target/release/neuron
-        run: sh scripts/build-release.sh
-
-      - name: Build bundle (windows)
-        if: matrix.script == 'pwsh'
-        env:
-          NO_BOOTSTRAP: '1'
-          NEURON: ${{ github.workspace }}\..\neuron-db\rust\neuron-core\target\release\neuron.exe
-        run: pwsh scripts/build-release.ps1
+        run: |
+          EXT=""
+          [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
+          export NEURON="$GITHUB_WORKSPACE/../neuron-db/rust/neuron-core/target/release/neuron$EXT"
+          if [ "${{ matrix.xc }}" = "yes" ]; then
+            sh scripts/build-official.sh
+          else
+            sh scripts/build-official.sh --host-only
+          fi
+          # per-runner name so the uploads can't clobber one another's checksum file
+          [ -f bin/SHA256SUMS.txt ] && mv bin/SHA256SUMS.txt "bin/SHA256SUMS-${{ matrix.name }}.txt"
+          ls -la bin/
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: veil-${{ matrix.name }}
           path: |
-            dist/*.zip
-            dist/*.tar.gz
+            bin/*.zip
+            bin/*.tar.gz
+            bin/server-only/veil-server-v*
+            bin/SHA256SUMS-*.txt
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/release/RELEASE-v1.0.0-alpha.1.md
+          # ALPHA: ships a known default admin password (changeme) and the web UI is not yet at desk parity.
+          # Pre-release keeps it out of "Latest release" until v1.0.0 proper.
+          prerelease: true
           files: |
-            dist/*.zip
-            dist/*.tar.gz
+            bin/*.zip
+            bin/*.tar.gz
+            bin/server-only/veil-server-v*
+            bin/SHA256SUMS-*.txt

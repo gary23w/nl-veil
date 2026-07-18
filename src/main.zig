@@ -110,9 +110,164 @@ fn tuneOllama(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.En
     log.info("persisted Ollama tuning (OLLAMA_NUM_PARALLEL=2, OLLAMA_CONTEXT_LENGTH=8192). Restart Ollama to apply now — casts will run parallel + fast instead of serializing on the CPU.", .{});
 }
 
+/// `--server-only` (alias `--headless`): opt OUT of the one-click default and boot the server alone — no desk.
+/// For headless hosts, service managers, and internal auto-starts that bring up their own UI.
+fn isServerOnly(a: []const u8) bool {
+    return std.mem.eql(u8, a, "--server-only") or std.mem.eql(u8, a, "--headless");
+}
+
+// Win32 bits for the two app-mode lifecycle behaviours below (console detach + own-the-tree shutdown). Direct
+// externs, matching how supervisor.zig / run.zig already reach for kernel32 — no subprocess, no shell.
+const winapp = if (builtin.os.tag == .windows) struct {
+    const HANDLE = *anyopaque;
+    const BOOL = c_int; // Win32 BOOL is a 32-bit int at the ABI; plain c_int lets `0` coerce cleanly
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    /// Number of processes attached to OUR console. 1 = we are the only one (double-click / Explorer gave us a
+    /// fresh console); >=2 = a shell (cmd.exe, powershell.exe) is attached and that console is the DEV'S, not
+    /// ours. 0 = the call failed / no console at all.
+    extern "kernel32" fn GetConsoleProcessList(list: [*]u32, count: u32) callconv(.winapi) u32;
+    extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: u32) callconv(.winapi) u32;
+    extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
+
+    // --- Job object: one kill-on-close job holding this process, so every descendant (desk, workers, neuron,
+    // browser) dies with us even when we are hard-killed and never run a defer.
+    const JobObjectExtendedLimitInformation: c_int = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const IO_COUNTERS = extern struct {
+        ReadOperationCount: u64,
+        WriteOperationCount: u64,
+        OtherOperationCount: u64,
+        ReadTransferCount: u64,
+        WriteTransferCount: u64,
+        OtherTransferCount: u64,
+    };
+    const JOBOBJECT_BASIC_LIMIT_INFORMATION = extern struct {
+        PerProcessUserTimeLimit: i64,
+        PerJobUserTimeLimit: i64,
+        LimitFlags: u32,
+        MinimumWorkingSetSize: usize,
+        MaximumWorkingSetSize: usize,
+        ActiveProcessLimit: u32,
+        Affinity: usize,
+        PriorityClass: u32,
+        SchedulingClass: u32,
+    };
+    const JOBOBJECT_EXTENDED_LIMIT_INFORMATION = extern struct {
+        BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        IoInfo: IO_COUNTERS,
+        ProcessMemoryLimit: usize,
+        JobMemoryLimit: usize,
+        PeakProcessMemoryUsed: usize,
+        PeakJobMemoryUsed: usize,
+    };
+    extern "kernel32" fn CreateJobObjectW(sec: ?*anyopaque, name: ?[*:0]const u16) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetInformationJobObject(job: HANDLE, class: c_int, info: *anyopaque, len: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn AssignProcessToJobObject(job: HANDLE, proc: HANDLE) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentProcess() callconv(.winapi) HANDLE;
+} else struct {};
+
+/// Sleep `ms` from a RAW OS thread (the desk watcher is a std.Thread, NOT an Io-managed task — io.sleep throws
+/// there). Same shape as supervisor.zig's threadSleepMs, for the same reason.
+fn threadSleepMs(io: std.Io, ms: u64) void {
+    if (builtin.os.tag == .windows) {
+        winapp.Sleep(@intCast(ms));
+    } else {
+        io.sleep(.{ .nanoseconds = ms * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
+
+/// Set on the relaunched copy so the detach below can never recurse.
+///
+/// DO NOT REMOVE THIS AS "REDUNDANT" — it is the ONLY thing standing between a double-click and a fork bomb.
+/// CREATE_NO_WINDOW does NOT mean "no console": Windows still gives the child its own console, just an
+/// invisible one, and the child is the sole process on it. MEASURED: a process spawned with create_no_window
+/// reports GetConsoleProcessList() == 1, exactly like a double-click. So the count guard alone would make
+/// every relaunch relaunch again, forever. This marker is what actually terminates the recursion.
+const CONSOLE_DETACH_MARKER = "NL_CONSOLE_DETACHED";
+
+/// THE DOUBLE-CLICK CONSOLE. `veil` is — and must stay — a CONSOLE-subsystem binary: flipping it to
+/// `.subsystem = .Windows` makes cmd.exe and PowerShell stop waiting for it and throws away its stdout even
+/// when redirected, which would gut every CLI verb. FreeConsole()/ShowWindow(SW_HIDE) is equally wrong: run
+/// from a shell, those hide the DEVELOPER'S OWN terminal.
+///
+/// So: relaunch ourselves detached with CREATE_NO_WINDOW and exit the parent — but ONLY when we are the sole
+/// process attached to this console (GetConsoleProcessList() == 1), which is exactly the Explorer/double-click
+/// case. Started from a shell, cmd.exe/powershell.exe is attached too, the count is >= 2, and we do nothing:
+/// the dev keeps their terminal and their output.
+///
+/// Returns true when the relaunch was spawned and the caller must exit immediately. Opt out: NL_NO_CONSOLE_DETACH=1.
+fn detachOwnConsole(gpa: std.mem.Allocator, io: std.Io, environ: *std.process.Environ.Map, sub: []const u8, rest: []const []const u8) bool {
+    if (builtin.os.tag != .windows) return false;
+    // FIRST, and load-bearing: the relaunched copy also sees a console count of 1 (see CONSOLE_DETACH_MARKER).
+    if (environ.get(CONSOLE_DETACH_MARKER)) |v| if (v.len > 0) return false; // already the relaunched copy
+    if (environ.get("NL_NO_CONSOLE_DETACH")) |v| if (v.len > 0 and !std.mem.eql(u8, v, "0")) return false;
+    // THE GUARD. Anything other than "exactly us" means a shell owns this console — leave it alone.
+    var pids: [8]u32 = undefined;
+    if (winapp.GetConsoleProcessList(&pids, pids.len) != 1) return false;
+
+    var exe_buf: [4096]u8 = undefined;
+    const exe_n = std.process.executablePath(io, &exe_buf) catch return false;
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    argv.append(gpa, exe_buf[0..exe_n]) catch return false;
+    if (sub.len > 0) argv.append(gpa, sub) catch return false; // same args, verbatim
+    for (rest) |a| argv.append(gpa, a) catch return false;
+
+    var env2 = environ.clone(gpa) catch return false;
+    defer env2.deinit();
+    env2.put(CONSOLE_DETACH_MARKER, "1") catch return false;
+    _ = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+        .environ_map = &env2,
+    }) catch return false;
+    return true;
+}
+
+/// APP MODE ONLY. Put THIS process in a kill-on-job-close job so every process we spawn from here on (the
+/// desk, swarm workers, neuron, the browser host) is a job member too. When we die — cleanly OR via Task
+/// Manager / a hard kill, where no defer and no watcher ever runs — our handle is the job's last, the job
+/// closes, and Windows terminates the whole remaining tree. That is the only orphan-proof mechanism here;
+/// watchDesk below handles the ordinary "user closed the desk" case. Best-effort: on failure we simply keep
+/// the old behaviour. Never called for --server-only (a service manager owns that tree, not us).
+///
+/// KNOWN TRADEOFF — read before widening this. The `local-host` browser daemon (worker/browser/host.zig) is
+/// deliberately built to OUTLIVE a server restart: it runs from a TEMP copy of the exe specifically so restart
+/// scripts don't have to kill it, keeping a warm browser instead of "a cold Edge for the next call, every
+/// time". It is spawned from tool execution, which descends from us, so in app mode it now joins this job and
+/// dies with us — re-introducing the cold start that trick existed to avoid. It is a warm-cache regression,
+/// not a correctness one (ensure() just respawns a daemon on demand), and it cannot be fixed from this file:
+/// the daemon would need CREATE_BREAKAWAY_FROM_JOB, which std.process.spawn does not expose today. Hence the
+/// escape hatch below — NL_NO_JOB_OBJECT=1 restores the old orphan-prone-but-warm behaviour without a rebuild.
+fn ownProcessTree(environ: *std.process.Environ.Map) void {
+    if (builtin.os.tag != .windows) return;
+    if (environ.get("NL_NO_JOB_OBJECT")) |v| {
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;
+    }
+    // Deliberately NOT closed: the handle must live for the whole process, and its release at exit is the
+    // signal that kills the tree. Non-inheritable by default (null security attrs), so no child can keep the
+    // job alive by holding a copy.
+    const job = winapp.CreateJobObjectW(null, null) orelse return;
+    var info: winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std.mem.zeroes(winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+    info.BasicLimitInformation.LimitFlags = winapp.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (winapp.SetInformationJobObject(job, winapp.JobObjectExtendedLimitInformation, @ptrCast(&info), @sizeOf(winapp.JOBOBJECT_EXTENDED_LIMIT_INFORMATION)) == 0) return;
+    // Nested jobs are fine on Win8+; if we are already in a job that refuses nesting this just fails and we
+    // fall back to the watcher path.
+    if (winapp.AssignProcessToJobObject(job, winapp.GetCurrentProcess()) == 0) return;
+    log.info("process tree: this server + everything it spawns now live in one kill-on-close job (app mode)", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
-    var desktop_mode = false;
+    // ONE-CLICK DEFAULT: a bare `veil` — what a double-click runs — boots the server AND opens the desk, so the
+    // shipped bundle is a single icon that brings the whole app up. `--server-only` (alias `--headless`) keeps
+    // the server-only behaviour for headless boxes, service managers, and every internal auto-start that
+    // launches its own UI (cli.zig ensureServer and restart-veil.ps1 both pass it). CLI verbs are unaffected:
+    // they run and return well before the server (and therefore the desk) is ever started.
+    var desktop_mode = true;
     // A real threaded io instead of the default init.io. httpz runs a pool of ~32 worker threads that
     // correctly BLOCK on a condition variable when there is no work — but the default init.io busy-SPINS
     // those blocking waits on Windows, pinning ~10 CPU cores with the server completely idle (0 swarms, no
@@ -159,8 +314,10 @@ pub fn main(init: std.process.Init) !void {
             }
             cli_sub = try gpa.dupe(u8, sub);
             if (std.mem.eql(u8, sub, "--desk")) desktop_mode = true;
+            if (isServerOnly(sub)) desktop_mode = false;
             while (it.next()) |arg| {
                 if (std.mem.eql(u8, arg, "--desk")) desktop_mode = true;
+                if (isServerOnly(arg)) desktop_mode = false;
                 cli_args.append(gpa, try gpa.dupe(u8, arg)) catch {};
             }
         }
@@ -211,6 +368,13 @@ pub fn main(init: std.process.Init) !void {
         var cctx = cli.Ctx{ .gpa = gpa, .io = io, .data = paths.data, .home = paths.home, .port = cli_port, .environ = init.environ_map };
         return std.process.exit(cli.dispatch(&cctx, cli_sub, cli_args.items));
     }
+
+    // DOUBLE-CLICK CONSOLE (Windows, app mode only). Past this point no CLI verb can be running and every
+    // `return` above has already fired, so the only callers left are the one-click default and an explicit
+    // `--desk`. If we own this console outright we hand the work to a windowless copy of ourselves and leave;
+    // if a shell is attached, detachOwnConsole is a no-op and we carry on in the dev's terminal. Placed here,
+    // before any of the heavy boot below, so the parent exits instantly instead of double-booting the server.
+    if (desktop_mode and detachOwnConsole(gpa, io, init.environ_map, cli_sub, cli_args.items)) return std.process.exit(0);
 
     // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
     tuneOllama(gpa, io, init.environ_map);
@@ -376,7 +540,15 @@ pub fn main(init: std.process.Init) !void {
     // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
     // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
     if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
-    if (desktop_mode) launchDesktop(gpa, io, paths.home, init.environ_map);
+    // APP MODE owns the desk's lifetime. The job goes up FIRST so the desk (and every worker spawned after it)
+    // is born inside it. Then, if we actually spawned a desk, a watcher thread turns "user closed the desk"
+    // into a clean server shutdown — the fix for the orphaned :8787 server with no UI and no way to stop it.
+    // None of this runs under --server-only, and none of it runs if the desk was already up on its own: we
+    // only ever wait on a child WE spawned.
+    if (desktop_mode) {
+        ownProcessTree(init.environ_map);
+        if (launchDesktop(gpa, io, paths.home, init.environ_map)) |child| watchDesk(gpa, io, child, &server);
+    }
     try server.listen();
 }
 
@@ -407,29 +579,74 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
 
 const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
 
-/// "Host the desktop": when desktop mode is requested (`--desktop`), launch the veil-desk dashboard if it
-/// was built (desk/zig-out/bin/veil-desk) so it sits in the tray and lights up on the server. Detached
-/// and best-effort — a headless box either has no binary (built with -Ddesk=false) or no display, and
+/// "Host the desktop": when desktop mode is requested (`--desk`, or the one-click default), launch the
+/// veil-desk dashboard if it was built (desk/zig-out/bin/veil-desk) so it sits in the tray and lights up on
+/// the server. Best-effort — a headless box either has no binary (built with -Ddesk=false) or no display, and
 /// the spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
-fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) void {
+///
+/// Returns the child so the caller can OWN its lifetime (see watchDesk); null means no desk of ours is
+/// running, and the caller must not shut anything down on its account.
+fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) ?std.process.Child {
     if (environ.get("NL_NO_DESKTOP")) |v| {
-        if (v.len > 0 and !std.mem.eql(u8, v, "0")) return;
+        if (v.len > 0 and !std.mem.eql(u8, v, "0")) return null;
     }
     // Two layouts host the desktop: a release BUNDLE puts veil-desk right next to the server, and a
     // dev CHECKOUT builds it under desk/zig-out/bin. Try the bundle path first, then the checkout path.
-    const bundle = std.fmt.allocPrint(gpa, "{s}/{s}", .{ home, DESK_EXE }) catch return;
+    const bundle = std.fmt.allocPrint(gpa, "{s}/{s}", .{ home, DESK_EXE }) catch return null;
     defer gpa.free(bundle);
-    const checkout = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return;
+    const checkout = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return null;
     defer gpa.free(checkout);
     const bin = if (std.Io.Dir.cwd().access(io, bundle, .{})) |_|
         bundle
     else |_| if (std.Io.Dir.cwd().access(io, checkout, .{})) |_|
         checkout
-    else |_|
-        return; // not built in either layout → nothing to host
-    // Spawn and forget — it's an independent same-machine companion, not a child we manage.
-    _ = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return;
+    else |_| {
+        // NOT SILENT. A user who double-clicked the standalone server binary used to get a blank console and
+        // conclude the release was broken. Name the situation instead.
+        log.warn("no {s} next to this binary — this is the SERVER-ONLY build, so there is no desktop UI to open. The server itself is up (see the URL above); for the app, use the full bundle that ships {s} alongside {s}, or pass --server-only to silence this.", .{ DESK_EXE, DESK_EXE, if (builtin.os.tag == .windows) "veil.exe" else "veil" });
+        return null; // not built in either layout → nothing to host
+    };
+    const child = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch |e| {
+        log.warn("veil-desk: found {s} but could not launch it ({t}) — the server is up, open http://127.0.0.1:8787 in a browser instead", .{ bin, e });
+        return null;
+    };
     log.info("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)", .{});
+    return child;
+}
+
+/// Ties the server's life to the desk WE spawned: wait on the child, and when it exits, stop httpz and go
+/// away. Without this, closing the desk left a headless server holding :8787 with no UI and no ordinary way
+/// to stop it. Only ever constructed in app mode, and only for a child we launched ourselves.
+const DeskWatch = struct {
+    io: std.Io,
+    child: std.process.Child,
+    server: *httpz.Server(*App),
+
+    fn run(self: *DeskWatch) void {
+        if (builtin.os.tag == .windows) {
+            // Raw WaitForSingleObject on the child's hProcess rather than Child.wait: this is a plain
+            // std.Thread, not an Io task, and the handle is exactly what we need to block on.
+            if (self.child.id) |h| _ = winapp.WaitForSingleObject(h, winapp.INFINITE) else return;
+        } else {
+            _ = self.child.wait(self.io) catch return;
+        }
+        log.info("veil-desk closed — shutting down (app mode: the desk's window IS the app's lifetime). Use --server-only to run the server without a desk.", .{});
+        self.server.stop(); // unblocks listen() in main, which then unwinds and exits normally
+        // BACKSTOP. If listen() somehow does not unwind, exit anyway — leaving the orphaned server behind is
+        // the exact bug this whole path exists to kill. On Windows the job object then reaps the children.
+        threadSleepMs(self.io, 3000);
+        std.process.exit(0);
+    }
+};
+
+fn watchDesk(gpa: std.mem.Allocator, io: std.Io, child: std.process.Child, server: *httpz.Server(*App)) void {
+    // Heap-allocated and intentionally never freed: it outlives this call and lives until the process exits.
+    const w = gpa.create(DeskWatch) catch return;
+    w.* = .{ .io = io, .child = child, .server = server };
+    if (std.Thread.spawn(.{}, DeskWatch.run, .{w})) |t| t.detach() else |e| {
+        gpa.destroy(w);
+        log.warn("veil-desk: could not start the exit watcher ({t}) — closing the desk will leave the server running; stop it from the tray or Task Manager", .{e});
+    }
 }
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {

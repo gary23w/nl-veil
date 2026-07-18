@@ -5,6 +5,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const log = @import("log.zig");
+const assets = @import("assets.zig");
 
 pub const Color = rl.Color;
 pub const Rect = rl.Rectangle;
@@ -356,9 +357,18 @@ fn ensureMarkTexture() void {
     if (mark_tex_attempted) return;
     log.trace("theme.ensureMarkTexture loading", .{});
     mark_tex_attempted = true;
+    // EMBEDDED FIRST: the mark ships inside the exe (see assets.zig), so a bundle always renders the real
+    // brand mark instead of the vector figure. The disk probes below stay as a belt-and-braces fallback.
+    if (assets.markImage()) |loaded| {
+        var img = loaded;
+        defer rl.unloadImage(img);
+        if (uploadMark(&img)) return;
+    }
     // The desk cwd varies (repo root, zig-out/bin, Explorer double-click), so try the icon relative to each.
     // icon16x16.png is the brand mark used for BOTH the titlebar client icon (drawMark) and the chat veil mark
     // (drawMarkPulse); icon48x48.png is a larger fallback (downscaled) so a partial asset set still renders.
+    // These only matter for a source checkout whose assets/ was edited without a rebuild, or if the embedded
+    // PNG somehow fails to decode.
     const candidates = [_][:0]const u8{
         "assets/icon16x16.png",
         "desk/assets/icon16x16.png",
@@ -373,16 +383,23 @@ fn ensureMarkTexture() void {
         if (rl.loadImage(path)) |loaded| {
             var img = loaded;
             defer rl.unloadImage(img);
-            scrubTransparentRgb(&img);
-            if (rl.loadTextureFromImage(img)) |loaded_tex| {
-                var tex = loaded_tex;
-                rl.genTextureMipmaps(&tex); // the source is high-res; mipmaps keep the ~13-18px mark crisp
-                rl.setTextureFilter(tex, .trilinear);
-                mark_tex = tex;
-                return;
-            } else |_| {}
+            if (uploadMark(&img)) return;
         } else |_| {}
     }
+}
+
+/// Scrub, upload and filter a decoded mark image into `mark_tex`. Shared by the embedded and on-disk paths
+/// so both get identical treatment (the mipmap + trilinear pair is what keeps the ~13-18px mark crisp).
+fn uploadMark(img: *rl.Image) bool {
+    scrubTransparentRgb(img);
+    if (rl.loadTextureFromImage(img.*)) |loaded_tex| {
+        var tex = loaded_tex;
+        rl.genTextureMipmaps(&tex); // the source is high-res; mipmaps keep the ~13-18px mark crisp
+        rl.setTextureFilter(tex, .trilinear);
+        mark_tex = tex;
+        return true;
+    } else |_| {}
+    return false;
 }
 fn theFont() rl.Font {
     return ui_font orelse (rl.getFontDefault() catch unreachable);

@@ -7440,7 +7440,7 @@ fn rawSleep1s() void {
         Sleep(1000);
     } else {
         const ts = std.posix.timespec{ .sec = 1, .nsec = 0 };
-        _ = std.os.linux.nanosleep(&ts, null);
+        _ = std.c.nanosleep(&ts, null); // libc, not os.linux — ports to macOS (see browser/util.sleepMs)
     }
 }
 
@@ -8944,7 +8944,7 @@ pub fn escA(alloc: std.mem.Allocator, s: []const u8) []const u8 {
 
 fn currentPid() u32 {
     if (builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
-    return @intCast(std.os.linux.getpid());
+    return @intCast(std.c.getpid()); // libc, not os.linux — ports to macOS
 }
 
 fn dupeEnv(gpa: std.mem.Allocator, environ: *const std.process.Environ.Map, name: []const u8) ?[]u8 {

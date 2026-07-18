@@ -16,6 +16,7 @@ const tray_mod = @import("tray.zig");
 const catalog = @import("catalog.zig");
 const md = @import("mdutil.zig");
 const log = @import("log.zig");
+const assets = @import("assets.zig");
 
 const Store = store_mod.Store;
 const Tab = store_mod.Tab;
@@ -1106,9 +1107,19 @@ fn uiItalicCandidates() []const [:0]const u8 {
     };
 }
 
-/// Dyslexia mode's UI face: the BUNDLED OpenDyslexic (SIL OFL; desk/assets/fonts, same relative roots the
-/// icon loader probes) first, then system faces on the British Dyslexia Association's recommended list so
-/// the mode still helps when the asset is missing (source checkout without assets, other OSes).
+/// Dyslexia mode's UI face at `size`: the BUNDLED OpenDyslexic (SIL OFL), rasterized from the copy
+/// EMBEDDED in the exe. Falls back to the on-disk copies and then to system faces on the British Dyslexia
+/// Association's recommended list, so the mode still helps if the embed fails to rasterize.
+///
+/// The embed is what makes this correct in a released bundle: the disk candidates below are CWD-relative,
+/// so outside the repo they all missed and "dyslexia mode" quietly rendered in Comic Sans / Verdana.
+fn loadDyslexiaFontAt(bold: bool, size: i32) ?rl.Font {
+    if (assets.dyslexicFont(bold, size, glyph_set[0..])) |f| return f;
+    return loadFontAt(dyslexiaCandidates(bold), size);
+}
+
+/// On-disk / system fallbacks for the dyslexia face — see loadDyslexiaFontAt, which tries the embedded
+/// copy before any of these.
 fn dyslexiaCandidates(bold: bool) []const [:0]const u8 {
     if (bold) return &.{
         "assets/fonts/OpenDyslexic3-Bold.ttf",
@@ -1139,8 +1150,11 @@ var font_bold_applied: bool = false;
 /// On load failure the current font stays (the caller records the attempt so a missing bold file can't
 /// turn into a per-frame retry storm).
 fn applyUiFont(dyslexia: bool, bold: bool) void {
-    const cands = if (dyslexia) dyslexiaCandidates(bold) else if (bold) uiBoldCandidates() else uiCandidates();
-    if (loadFontAt(cands, 48)) |f| {
+    const loaded = if (dyslexia)
+        loadDyslexiaFontAt(bold, 48)
+    else
+        loadFontAt(if (bold) uiBoldCandidates() else uiCandidates(), 48);
+    if (loaded) |f| {
         var fm = f;
         rl.genTextureMipmaps(&fm.texture);
         rl.setTextureFilter(fm.texture, .trilinear);
@@ -1176,7 +1190,7 @@ fn applyChatVariantFonts(dyslexia: bool, bold: bool) void {
     var strong: ?rl.Font = null;
     var em: ?rl.Font = null;
     if (dyslexia) {
-        if (loadFontAt(dyslexiaCandidates(true), 48)) |f| strong = prepFont(f);
+        if (loadDyslexiaFontAt(true, 48)) |f| strong = prepFont(f);
     } else {
         if (loadFontAt(uiBoldCandidates(), 48)) |f| strong = prepFont(f);
         if (loadFontAt(uiItalicCandidates(), 48)) |f| em = prepFont(f);
@@ -1188,6 +1202,10 @@ fn applyChatVariantFonts(dyslexia: bool, bold: bool) void {
 }
 
 fn makeIcon() rl.Image {
+    // EMBEDDED FIRST — the window + taskbar icon must survive in a released bundle. The CWD-relative probes
+    // below only ever hit when launched from the repo, so on their own they left every bundle showing the
+    // procedural bust at the bottom of this function.
+    if (assets.iconImage()) |img| return img;
     const candidates = [_][:0]const u8{
         "assets/icon48x48.png",
         "desk/assets/icon48x48.png",
@@ -6488,6 +6506,24 @@ fn submitSched(store: *Store) void {
     ui.sched_inner = .tasks;
 }
 
+/// A Settings SECTION header: a hairline rule + a small-caps label. Returns the y to start the section's body at.
+/// Grouping the page into sections (connection / appearance / behavior / model) is what keeps it from reading as
+/// one undifferentiated column of controls.
+fn settingSection(x: f32, y: f32, colw: f32, title: [:0]const u8) f32 {
+    t.hline(@intFromFloat(x), @intFromFloat(y), @intFromFloat(colw), t.border);
+    t.text(title, @intFromFloat(x), @intFromFloat(y + 12), 12, t.comment);
+    return y + 34;
+}
+
+/// One Settings toggle row: a FIXED-width state chip + its description. Every toggle passes the SAME `w` (the max
+/// over all chip labels), so the chips are flush left and every description starts at the same x — the per-label
+/// widths this replaces are why the page read as "all over the place". Returns true on click; the caller flips.
+fn settingRow(x: f32, y: f32, w: f32, label: [:0]const u8, on: bool, desc: [:0]const u8) bool {
+    const hit = t.button(.{ .x = x, .y = y, .width = w, .height = 32 }, label, if (on) t.green else t.comment, true);
+    t.text(desc, @intFromFloat(x + w + 14), @intFromFloat(y + 9), 12, t.comment);
+    return hit;
+}
+
 fn drawSettings(store: *Store, body: t.Rect) void {
     // While a dropdown is open, block the form's buttons/toggles from eating a click meant for the dropdown
     // list drawn over them (flushChatDropdown clears this before drawing the list, so the options still work).
@@ -6527,6 +6563,8 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const dys_on = store.settings.dyslexia;
     const scale_now = store.settings.font_scale;
     const bold_now = store.settings.font_bold;
+    const narr_on = store.settings.narrator; // snapshot under THIS lock (these two were read unlocked below)
+    const bh_on = store.settings.browser_headful;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -6543,6 +6581,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     @memcpy(cfab[0..cfan], store.settings.cf_account[0..cfan]);
     store.unlock();
 
+    y = settingSection(x, y, colw, "CONNECTION");
     flabel(x, y, "DATA DIRECTORY (read live)");
     y += 20;
     const dr = t.Rect{ .x = x, .y = y, .width = colw, .height = 32 };
@@ -6603,53 +6642,30 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     y += 42; // clear the 34px field + gap
     if (tok_n > 0) t.text(t.z("connected - a token is set ({d} chars, auto-loaded from the server)", .{tok_n}), @intFromFloat(x), @intFromFloat(y), 12, t.green);
     y += 34;
-    // fixed slot wide enough for both labels so the button doesn't resize when toggled
-    const ntf_w = @max(t.btnW(t.z("notifications: ON", .{}), 32), t.btnW(t.z("notifications: OFF", .{}), 32));
-    const tr = t.Rect{ .x = x, .y = y, .width = ntf_w, .height = 32 };
-    if (t.button(tr, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), if (notify_on) t.green else t.comment, true)) {
-        store.lock();
-        store.settings.notify = !store.settings.notify;
-        store.unlock();
-    }
-    y += 46;
-    // SPEED MODE: the chat builds projects itself; casts become 2-minute research sub-agents. OFF restores
-    // the autonomy posture (the chat may deploy long set-and-forget hiveminds). Persisted with the settings.
-    const spd_w = @max(t.btnW(t.z("speed mode: ON", .{}), 32), t.btnW(t.z("speed mode: OFF", .{}), 32));
-    const spr = t.Rect{ .x = x, .y = y, .width = spd_w, .height = 32 };
-    if (t.button(spr, if (speed_on) t.z("speed mode: ON", .{}) else t.z("speed mode: OFF", .{}), if (speed_on) t.green else t.comment, true)) {
-        store.lock();
-        store.settings.speed_mode = !store.settings.speed_mode;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    t.text(t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}), @intFromFloat(x + spd_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
-
-    // ACCESSIBILITY — dyslexia mode: swaps the UI type for OpenDyslexic (bundled, SIL OFL), whose
-    // heavy-bottomed letterforms many dyslexic readers find easier to track. Applies INSTANTLY (the
-    // render loop hot-swaps the font atlas on the next frame) and persists with the settings.
-    const dys_w = @max(t.btnW(t.z("dyslexia mode: ON", .{}), 32), t.btnW(t.z("dyslexia mode: OFF", .{}), 32));
-    const dyr = t.Rect{ .x = x, .y = y, .width = dys_w, .height = 32 };
-    if (t.button(dyr, if (dys_on) t.z("dyslexia mode: ON", .{}) else t.z("dyslexia mode: OFF", .{}), if (dys_on) t.green else t.comment, true)) {
-        store.lock();
-        store.settings.dyslexia = !store.settings.dyslexia;
-        store.unlock();
-        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-    }
-    t.text(t.z("accessibility: renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}), @intFromFloat(x + dys_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
-
-    // TEXT SIZE — a global text scale (90/100/112/125%), applied at draw time everywhere; the chat's
-    // line heights follow it. Cycles on click, persists with the settings, applies the same frame.
+    // TEXT SIZE label (also feeds the shared chip width below). A global draw-time scale (90/100/112/125%);
+    // the chat's line heights follow it. Cycles on click, persists, applies the same frame.
     const size_name: [:0]const u8 = switch (scale_now) {
         90 => t.z("text size: Small", .{}),
         112 => t.z("text size: Large", .{}),
         125 => t.z("text size: XL", .{}),
         else => t.z("text size: Normal", .{}),
     };
-    const size_w = @max(t.btnW(t.z("text size: Normal", .{}), 32), t.btnW(size_name, 32));
-    const szr = t.Rect{ .x = x, .y = y, .width = size_w, .height = 32 };
-    if (t.button(szr, size_name, if (scale_now != 100) t.green else t.comment, true)) {
+    // ONE chip width for every toggle, so the column is flush and all descriptions align. (Each toggle used to
+    // size itself, which left a ragged left edge and descriptions starting at eight different x positions.)
+    var tog_w: f32 = 0;
+    tog_w = @max(tog_w, t.btnW(t.z("notifications: OFF", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("speed mode: OFF", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("dyslexia mode: OFF", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("text size: Normal", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("text weight: Normal", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("narrator: OFF", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(t.z("browser window: SHOWN", .{}), 32));
+    tog_w = @max(tog_w, t.btnW(size_name, 32));
+    const ROW: f32 = 40;
+
+    // ---- APPEARANCE & ACCESSIBILITY -------------------------------------------------------------------
+    y = settingSection(x, y, colw, "APPEARANCE & ACCESSIBILITY");
+    if (settingRow(x, y, tog_w, size_name, scale_now != 100, t.z("scales every label and message - click to cycle Small / Normal / Large / XL.", .{}))) {
         const next: u8 = switch (scale_now) {
             90 => 100,
             100 => 112,
@@ -6661,28 +6677,27 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
-    t.text(t.z("scales every label and message - click to cycle Small / Normal / Large / XL.", .{}), @intFromFloat(x + size_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
-
-    // TEXT WEIGHT — swaps to the face's Bold file (bundled OpenDyslexic Bold in dyslexia mode; the
-    // system face's bold otherwise). Thicker strokes read easier on some displays and for some eyes.
-    const wt_w = @max(t.btnW(t.z("text weight: Normal", .{}), 32), t.btnW(t.z("text weight: Bold", .{}), 32));
-    const wtr = t.Rect{ .x = x, .y = y, .width = wt_w, .height = 32 };
-    if (t.button(wtr, if (bold_now) t.z("text weight: Bold", .{}) else t.z("text weight: Normal", .{}), if (bold_now) t.green else t.comment, true)) {
+    y += ROW;
+    // Swaps to the face's Bold file (bundled OpenDyslexic Bold in dyslexia mode; the system face's bold otherwise).
+    if (settingRow(x, y, tog_w, if (bold_now) t.z("text weight: Bold", .{}) else t.z("text weight: Normal", .{}), bold_now, t.z("renders the whole app in the typeface's bold cut.", .{}))) {
         store.lock();
         store.settings.font_bold = !store.settings.font_bold;
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
-    t.text(t.z("renders the whole app in the typeface's bold cut.", .{}), @intFromFloat(x + wt_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
-
-    // NARRATOR — the app speaks: replies + alerts read aloud through the OS's own text-to-speech (no
-    // audio code bundled). Voice INPUT rides the OS dictation layer (Win+H) into the normal input box.
-    const narr_on = store.settings.narrator;
-    const nr_w = @max(t.btnW(t.z("narrator: ON", .{}), 32), t.btnW(t.z("narrator: OFF", .{}), 32));
-    const nrr = t.Rect{ .x = x, .y = y, .width = nr_w, .height = 32 };
-    if (t.button(nrr, if (narr_on) t.z("narrator: ON", .{}) else t.z("narrator: OFF", .{}), if (narr_on) t.green else t.comment, true)) {
+    y += ROW;
+    // OpenDyslexic (bundled, SIL OFL) — heavy-bottomed letterforms many dyslexic readers track more easily.
+    // Applies INSTANTLY (the render loop hot-swaps the font atlas next frame) and persists.
+    if (settingRow(x, y, tog_w, if (dys_on) t.z("dyslexia mode: ON", .{}) else t.z("dyslexia mode: OFF", .{}), dys_on, t.z("renders the app in OpenDyslexic, a typeface designed for dyslexic readers.", .{}))) {
+        store.lock();
+        store.settings.dyslexia = !store.settings.dyslexia;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    y += ROW;
+    // The app SPEAKS through the OS's own text-to-speech (no audio code bundled); voice INPUT rides the OS
+    // dictation layer (Win+H) into the normal input box.
+    if (settingRow(x, y, tog_w, if (narr_on) t.z("narrator: ON", .{}) else t.z("narrator: OFF", .{}), narr_on, t.z("reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}))) {
         store.lock();
         store.settings.narrator = !store.settings.narrator;
         const now_on = store.settings.narrator;
@@ -6692,23 +6707,34 @@ fn drawSettings(store: *Store, body: t.Rect) void {
             store.pushNotif("Narrator on", "replies and alerts will be read aloud. press Windows plus H to dictate into the message box", 1);
         }
     }
-    t.text(t.z("accessibility: reads replies and alerts aloud (OS voice). dictate input with Win+H.", .{}), @intFromFloat(x + nr_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
+    y += ROW + 10;
 
-    // BROWSER WINDOW — when the AI drives a web browser ON THIS MACHINE, show the window (headful) instead of
-    // running it hidden (headless). Persisted, and mirrored to the local browser daemon's prefs file so the
-    // next browser session opens in the chosen mode without a restart.
-    const bh_on = store.settings.browser_headful;
-    const bw_w = @max(t.btnW(t.z("browser window: SHOWN", .{}), 32), t.btnW(t.z("browser window: HIDDEN", .{}), 32));
-    const bwr = t.Rect{ .x = x, .y = y, .width = bw_w, .height = 32 };
-    if (t.button(bwr, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), if (bh_on) t.green else t.comment, true)) {
+    // ---- BEHAVIOR -------------------------------------------------------------------------------------
+    y = settingSection(x, y, colw, "BEHAVIOR");
+    if (settingRow(x, y, tog_w, if (notify_on) t.z("notifications: ON", .{}) else t.z("notifications: OFF", .{}), notify_on, t.z("desktop + tray alerts when a run finishes or needs you.", .{}))) {
+        store.lock();
+        store.settings.notify = !store.settings.notify;
+        store.unlock();
+    }
+    y += ROW;
+    // SPEED MODE: the chat builds projects itself; casts become 2-minute research sub-agents. OFF restores the
+    // autonomy posture (the chat may deploy long set-and-forget hiveminds). Persisted with the settings.
+    if (settingRow(x, y, tog_w, if (speed_on) t.z("speed mode: ON", .{}) else t.z("speed mode: OFF", .{}), speed_on, t.z("ON: the chat builds hands-on; swarms are 2-min research strikes.  OFF: long autonomous hiveminds.", .{}))) {
+        store.lock();
+        store.settings.speed_mode = !store.settings.speed_mode;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    y += ROW;
+    // Show the AI's browser window (headful) instead of running it hidden. Persisted, and mirrored to the local
+    // browser daemon's prefs so the next session opens in the chosen mode without a restart.
+    if (settingRow(x, y, tog_w, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), bh_on, t.z("when the AI drives a web browser here, show it on screen instead of running it hidden.", .{}))) {
         store.lock();
         store.settings.browser_headful = !store.settings.browser_headful;
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
-    t.text(t.z("when the AI drives a web browser on this machine, show it on screen instead of running it hidden.", .{}), @intFromFloat(x + bw_w + 14), @intFromFloat(y + 9), 12, t.comment);
-    y += 46;
+    y += ROW + 10;
 
     // ---- chat model provider (the Chat tab's brain; casts use the same provider) ----
     // Seed the custom-URL editable fields from the store once (used only for chat_kind==2).
@@ -6718,11 +6744,9 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         setField(&ui.s_cfacct, cfab[0..cfan]);
         ui.s_seeded = true;
     }
-    t.hline(@intFromFloat(x), @intFromFloat(y), @intFromFloat(colw), t.border);
-    y += 12;
-    t.text(t.z("CHAT MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
-    t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x + 100), @intFromFloat(y), 11, t.comment);
-    y += 22;
+    y = settingSection(x, y, colw, "CHAT MODEL");
+    t.text(t.z("the Chat tab talks through this provider - its swarm casts use it too", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+    y += 20;
 
     // CHAT ENGINE: the server brain (default + recommended) vs the retired local fallback. IMPORTANT COPY
     // LESSON: in client mode the SERVER brain STILL runs every tool on THIS machine (delegation) — the old
