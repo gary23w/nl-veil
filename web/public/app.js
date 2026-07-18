@@ -268,8 +268,13 @@ async function doAuth(mode) {
       authMsg('Account created — now log in.', 'ok');
     } else {
       await api.login(email, pass);
+      // /auth/me answers {authed, email, admin, plan, id, …} — there is no
+      // `user` wrapper. Reading one gave enterApp(undefined) and a login that
+      // failed with "Cannot read properties of undefined" AFTER the cookie was
+      // already set, so the session existed but the app never opened.
       const me = await api.me();
-      return enterApp(me.user);
+      if (!me.authed) return authMsg('Signed in, but the session did not stick.');
+      return enterApp(me);
     }
   } catch (e) {
     authMsg(e.message || 'That did not work.');
@@ -289,6 +294,13 @@ const TABS = [
 ];
 
 function enterApp(user) {
+  // Defensive: every caller has already checked `authed`, but a shape surprise
+  // here used to throw INSIDE the click handler and leave the user staring at a
+  // login form that had, in fact, just logged them in.
+  if (!user || typeof user !== 'object') {
+    renderAuth('The server sent an unexpected sign-in response.', 'err');
+    return;
+  }
   S.me = user;
   S.isAdmin = !!user.admin;
   S.tab = LS.get('veil.tab', 'chat');
