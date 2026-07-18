@@ -25,10 +25,15 @@ jobs:
       # switched to arch-first naming (zig-x86_64-linux-…). This is what broke every main-push check.
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
-      - name: zig build (server)
-        run: zig build
+      # -Dapp=false is the SERVER-ONLY build this step means: since the desktop GUI was merged into the
+      # `veil` binary (-Dapp defaults to true), a bare `zig build` compiles raylib and needs GL/X11 — which
+      # are installed further down, for the desk suite. Server-only never fetches raylib at all, so this
+      # stays the fast badge signal it was written to be.
+      - name: zig build (server only)
+        run: zig build -Dapp=false
       # `zig build test` runs src/tests.zig, which references EVERY test-bearing file; the old
       # `zig test src/worker/run.zig` only collected the tests reachable from run.zig.
+      # (The suite is server-side and never links raylib, so it needs no GUI deps either.)
       - name: zig build test (full server suite)
         run: zig build test
       - name: Linux desktop deps (raylib GL/X11/wayland)
@@ -36,6 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgl1-mesa-dev libx11-dev libxrandr-dev \
             libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev
+      # The DEFAULT build (GUI merged into `veil`) is what ships, so verify it compiles on Linux too —
+      # once the GUI deps above exist. Without this, a break in the default target would hide until a tag.
+      - name: zig build (default — GUI merged into veil)
+        run: zig build
       - name: zig build test (desk suite)
         working-directory: desk
         run: zig build test
