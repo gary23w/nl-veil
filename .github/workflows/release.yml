@@ -63,7 +63,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gary23w/neuron-db
-          path: ../neuron-db
+          # MUST live under $GITHUB_WORKSPACE — actions/checkout rejects a path that escapes it
+          # ("is not under"), which is exactly how the first v1.0.0-alpha.1 run died in 7s.
+          path: neuron-db
 
       - name: Linux desktop deps (raylib GL/X11/wayland)
         if: matrix.os == 'ubuntu-latest'
@@ -80,7 +82,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build the neuron memory engine
-        working-directory: ../neuron-db/rust/neuron-core
+        working-directory: neuron-db/rust/neuron-core
         run: cargo build --release --features "sqlite secure server trust"
 
       # ONE script on every runner (bash is present on the windows runner too). The runner already installed
@@ -92,7 +94,7 @@ jobs:
         run: |
           EXT=""
           [ "$RUNNER_OS" = "Windows" ] && EXT=".exe"
-          export NEURON="$GITHUB_WORKSPACE/../neuron-db/rust/neuron-core/target/release/neuron$EXT"
+          export NEURON="$GITHUB_WORKSPACE/neuron-db/rust/neuron-core/target/release/neuron$EXT"
           if [ "${{ matrix.xc }}" = "yes" ]; then
             sh scripts/build-official.sh
           else
