@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/release-v1.0.0-A8241B">
+  <a href="https://github.com/gary23w/nl-veil/releases/latest"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0--alpha.1-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <img alt="model" src="https://img.shields.io/badge/model-gary--neuron--emergent-6E4A27">
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-31405C"></a>
@@ -18,8 +18,9 @@ building, remembering, **learning from its own mistakes** — while one unified 
 Veil**, integrates the whole hive into a single first-person "I" that speaks for it and steers it.
 
 It runs on **any model** — a free local one through Ollama, or a hosted/BYOK endpoint — and needs no
-cloud account and no database service. **One Zig binary is the whole thing**: the server, the built-in
-`veil` command line, and — optionally — the native desktop. No Python to run it.
+cloud account and no database service. **One Zig binary is the whole thing**: the server, the native
+desktop app, the web UI, the memory engine, and the built-in `veil` command line. Download it, run it,
+and you're in. No Python, no Node, no Docker.
 
 > ⭐ **If the veil is useful to you, [star it on GitHub](https://github.com/gary23w/nl-veil).** It's a
 > solo project — a star genuinely helps it reach the next person who'd get something out of it.
@@ -28,19 +29,36 @@ cloud account and no database service. **One Zig binary is the whole thing**: th
 [the chat brain](#the-chat-brain-runs-in-the-server)), a built-in **`veil` CLI** that retires the old
 Python launcher, **[scheduled tasks](#scheduled-tasks)** that run through chat, a native desktop
 dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that **keeps a playbook** ([it learns](#it-learns)),
-and one-command **prebuilt binaries** for Windows, Linux, and macOS. Browse the annotated source as a
+and **prebuilt one-click binaries** for Windows, Linux, and macOS. Browse the annotated source as a
 case file at **[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
 
 ## Install
 
-**The easy way (v1):** grab the bundle for your OS from the
-[Releases page](https://github.com/gary23w/nl-veil/releases), unzip, and run the launcher — it starts
-the server and the desktop together. No Python, no toolchain, nothing to build. (Details in
-[Release — v1](#release--v1).)
+**Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
+**[latest release](https://github.com/gary23w/nl-veil/releases/latest)**, unzip, and run `veil`:
 
-**Or one line from the network.** The installer fetches and builds the rest — no Python required; you
-only need [Zig 0.16+](https://ziglang.org) on `PATH` for a from-source build (the release bundles ship
-the binaries prebuilt).
+| You're on | Download | Then run |
+|---|---|---|
+| **Windows** | `veil-…-windows-x86_64.zip` | `veil.exe` |
+| **macOS** (Apple Silicon) | `veil-…-macos-arm64.zip` | `./veil` |
+| **macOS** (Intel) | `veil-…-macos-x86_64.zip` | `./veil` |
+| **Linux** | `veil-…-linux-x86_64.zip` | `./veil` |
+
+That single action starts the local server **and** opens the desktop app.
+
+> **Take the `veil-…` bundle for your OS — not "Source code (zip)".** GitHub attaches a source archive
+> to every release automatically: it's the raw repo, building it needs the Zig compiler, and the
+> `install.ps1` inside is a *developer* script. The `veil-server-…` assets are the **headless** server
+> for remote boxes — no desktop app.
+
+> **Alpha builds are unsigned.** Windows shows *"Windows protected your PC"* → **More info → Run
+> anyway**. macOS says the developer can't be verified → **right-click → Open** (or
+> `xattr -dr com.apple.quarantine <folder>`). Signing certificates are planned for v1.0.0 proper.
+
+<details><summary><b>Build from source instead</b> — contributors (needs Zig 0.16+)</summary>
+
+These installers **clone the repo and build it**, so they need [Zig 0.16+](https://ziglang.org) on
+`PATH`. This is the contributor path, *not* the quick start.
 
 **macOS / Linux**
 ```sh
@@ -52,31 +70,39 @@ curl -fsSL https://raw.githubusercontent.com/gary23w/nl-veil/main/install.sh | s
 iwr -useb https://raw.githubusercontent.com/gary23w/nl-veil/main/install.ps1 | iex
 ```
 
-<details><summary>or from source</summary>
-
+or by hand:
 ```sh
 git clone https://github.com/gary23w/nl-veil && cd nl-veil
-zig build run -- --desk
+zig build run
 ```
-The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run —
-each with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing
-binaries to skip the builds.
+The `veil` binary (Zig) and the neuron-db memory engine (Rust) are built for you on first run — each
+with a prompt before it downloads anything. Point `--neuron-bin` / `--bin` at existing binaries to
+skip the builds.
 </details>
 
 ## Start it
 
-`veil` **is** the launcher and the control plane. Run it with no subcommand to boot the server; add a
+`veil` **is** the launcher and the control plane. Run it with no subcommand to start the app; add a
 verb to drive the running server over its API.
 
 ```sh
-veil            # run the server in the foreground (serves http://127.0.0.1:8787)
-veil --desk     # run the server AND host the native desktop, veil-desk
+veil                 # THE ONE-CLICK DEFAULT: starts the server AND opens the desktop app
+veil --server-only   # server alone, no desktop (headless boxes, services, containers)
 ```
+
+Closing the desktop window shuts the whole thing down — server and everything it spawned — so there's
+no stray process left listening. On Windows a double-click opens no console window; run it from a
+terminal and your terminal is left alone.
 
 Point the model endpoint with `NL_LLM_BASE_URL` / `NL_LLM_MODEL` / `NL_LLM_KEY` (it defaults to a
 local Ollama), or pick a model in the web UI / the desktop. On a localhost bind the server mints an
 admin key at `data/.desktop_key`; the CLI and the desktop read it automatically, so same-machine
 commands never prompt for auth. **Any `veil <verb>` auto-starts the server if it isn't already up.**
+
+**Where your stuff lives:** a `data/` folder **next to the `veil` binary** — conversations, memory,
+swarm workdirs, logs, all of it. Nothing is written to a system temp dir and nothing leaves the
+machine. Move the folder and you move the whole install; back it up and you've backed up everything.
+(From a source checkout it resolves to the repo's own `data/`, so dev and release never share state.)
 
 ## The `veil` command line
 
@@ -84,7 +110,7 @@ Every subcommand is a thin client over the running server's `/api/v1/*` — no s
 argv secrets, no Python. The verbs:
 
 ```
-veil                          run the server (foreground; add --desk to host the desktop)
+veil                          start the app: server + desktop (--server-only for headless)
 
 SWARMS
   cast "<goal>" [flags]        deploy a swarm to work a goal
@@ -112,7 +138,6 @@ FLEET
 
 MISC
   doctor                       check server + token health
-  desktop                      launch the veil-desk dashboard
   version | help
 ```
 
@@ -220,16 +245,17 @@ that shows every running hive round-by-round, and a **build console**.
 - **It sits in the tray.** A system-tray icon and native toasts on Windows; it lights up the moment
   the server has something to show.
 
-The prebuilt bundles (see [Releases](#release--v1)) launch the server **and** the desktop together —
-double-click and you're in. From source it's opt-in at the repo root (default `zig build` /
-`zig build run` stay server-only, so headless and CI boxes never touch raylib):
+The desktop is compiled **into** `veil`, so the released binary is the whole app — double-click and
+you're in, server and window together. Same from source:
 
 ```sh
-zig build -Ddesk=true            # build the server AND veil-desk
-zig build run -- --desk          # run the server in desktop-host mode (spawns veil-desk)
+zig build run                 # server + desktop, exactly like the release binary
+zig build -Dapp=false         # server-only build: no GUI compiled in, no raylib/GL to link
 ```
 
-Set `NL_NO_DESKTOP=1` to force-disable the desktop launch even when desktop mode is enabled.
+`-Dapp=false` is what headless hosts and CI boxes want — the GUI is left out of the compilation
+entirely rather than merely unused. To keep the GUI compiled in but not opened for a given run, pass
+`--server-only` at runtime.
 
 ## It learns
 
@@ -398,7 +424,7 @@ second control plane. Today the console operates the local server's fleet.
 install.sh  install.ps1    one-command installers (no Python)
 scripts/                   the release build scripts (build-release.sh / build-release.ps1)
 veil  veil.cmd             the `veil` front-door shim → the compiled binary
-build.zig                  the Zig build (server + CLI; -Ddesk=true also builds veil-desk)
+build.zig                  the Zig build (server + CLI + desktop; -Dapp=false = server-only)
 src/
   main.zig                 entry point: CLI dispatch, then the server + control plane (auth, routes)
   cli.zig                  the `veil` CLI — a thin client over the server's /api/v1/*
@@ -423,34 +449,34 @@ web/public/                the bundled control-plane UI
 bin/neuron[.exe]           the neuron-db memory engine (bundled / built on first run)
 ```
 
-## Release — v1
+## Release
 
-Prebuilt bundles ship on the [Releases page](https://github.com/gary23w/nl-veil/releases) — one
-archive per platform, each containing the `veil` server **and** the `veil-desk` desktop, plus a
-launcher that starts both at once:
+Builds ship on the [Releases page](https://github.com/gary23w/nl-veil/releases/latest), one per
+platform. Unzip and run `veil` — that starts the server **and** opens the desktop app. No Python, no
+toolchain, no first-run build; the memory engine ships inside.
 
-| platform | archive | launch (starts server + desktop) |
-|---|---|---|
-| Windows x86-64 | `veil-v1.0.0-windows-x86_64.zip` | double-click `start.cmd` |
-| Linux x86-64 | `veil-v1.0.0-linux-x86_64.tar.gz` | `./start` |
-| macOS arm64 | `veil-v1.0.0-macos-arm64.tar.gz` | `./start` |
+| asset | what it is |
+|---|---|
+| `veil-…-windows-x86_64.zip` | **the app** — Windows |
+| `veil-…-macos-arm64.zip` / `…-macos-x86_64.zip` | **the app** — Apple Silicon / Intel |
+| `veil-…-linux-x86_64.zip` | **the app** — Linux |
+| `veil-server-…-<os>-<arch>` | **server only**, no desktop — headless hosts, containers, remote boxes |
+| `SHA256SUMS-*.txt` | checksums |
 
-No Python, no toolchain, no first-run build — the memory engine is bundled too. To roll your own
-(or cross-build every target at once), the release scripts wrap the whole thing — and they
-**bootstrap their own toolchain**: a missing Zig, Rust, C compiler, or (on Linux) raylib dev
-library is fetched/installed for you before the build:
+Desktop builds are produced natively per-OS (the GUI links the platform graphics stack and can't be
+cross-compiled); the standalone server cross-compiles to every target from one runner.
+
+To cut your own, the official builder wraps the whole thing and **bootstraps its own toolchain** — a
+missing Zig, Rust, C compiler, or (on Linux) raylib dev library is fetched for you first:
 
 ```sh
-scripts/build-release.sh            # this host's platform → dist/  (installs any missing deps)
-scripts/build-release.sh --all      # also cross-compile the server for win + linux + mac → dist/
-```
-```powershell
-scripts\build-release.ps1           # Windows bundle → dist\
+sh scripts/build-official.sh              # everything for this host, plus cross-built servers → bin/
+sh scripts/build-official.sh --host-only  # skip the cross-compiled server matrix
 ```
 
-Each run produces the platform archive in `dist/` with the two binaries, the launcher, and a README.
-Set `NO_BOOTSTRAP=1` to skip the dependency step (and provide `ZIG=` / `NEURON=` yourself);
-`ASSUME_YES=1` runs it unattended. `veil doctor` prints server + token health.
+It stages into a private prefix, so it never disturbs `zig-out` — you can cut a release while the app
+is running. `NO_BOOTSTRAP=1` skips the dependency step (supply `ZIG=` / `NEURON=` yourself).
+`veil doctor` prints server + token health.
 
 ## License
 
