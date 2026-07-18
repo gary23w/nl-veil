@@ -297,6 +297,10 @@ pub fn main(init: std.process.Init) !void {
         // is localhost (desktop netcli already sends Connection: close; the web UI reconnects), so the extra
         // handshake per request is free.
         .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1 },
+        // Body cap: httpz defaults to 1 MiB, which 413-rejects a chat message carrying an image attachment
+        // (base64 of a normal screenshot easily exceeds 1 MiB) BEFORE the handler runs. Lift it to 16 MiB —
+        // above the desk's 8 MiB raw-image read limit × ~1.4 base64 + JSON/header headroom. Loopback-only.
+        .request = .{ .max_body_size = 16 << 20 },
         // httpz here runs the BLOCKING worker model (thread-per-request); a cast/deploy handler holds its pool
         // thread for the whole synchronous spawn. The 32-thread default starves under a burst of concurrent
         // casts (each also leaving a live worker behind) — new casts then hang + return curl 000. Give admission

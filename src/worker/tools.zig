@@ -1262,10 +1262,21 @@ fn browserOp(ctx: *ToolCtx, action: []const u8, params_json: []const u8) []u8 {
     return browser_mgr.dispatch(ctx.gpa, ctx.io, ctx.environ, key, action, params_json);
 }
 
-/// Dispatch a `pixel_*` tool (Pixel RAG). Gated by NL_BROWSER_DRIVER (ingest renders in the browser) and the
-/// offline flag; pixel_ingest is allowlist-gated like browser_navigate.
+/// Dispatch a `pixel_*` tool (Pixel RAG). pixel_ingest / pixel_capture RENDER a live page, so they stay gated by
+/// NL_BROWSER_DRIVER + the offline flag (pixel_ingest is also allowlist-gated like browser_navigate). pixel_search
+/// is pure LOCAL retrieval over the already-indexed manifest — it renders nothing and touches no network, so it is
+/// UNGATED: it must work with no browser driver and OFFLINE to retrieve an OCR'd image attachment or a prior capture.
 fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
+
+    if (std.mem.eql(u8, name, "pixel_search")) {
+        const A = struct { query: []const u8 = "", k: u32 = 4 };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "pixel_search needs a query");
+        return pixelrag.search(gpa, ctx.io, ctx.run_dir, p.value.query, p.value.k);
+    }
+
     if (!ctx.roam and !browserEnabled(ctx)) return dupe(gpa, "pixel rag disabled — set NL_BROWSER_DRIVER=1 on the server (it renders pages in the browser)");
     if (!ctx.internet) return dupe(gpa, "web disabled: this is an OFFLINE run; pixel rag is unavailable");
 
@@ -1289,13 +1300,6 @@ fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             return dupe(gpa, "pixel_capture: could not parse args JSON");
         defer p.deinit();
         return pixelrag.capture(gpa, ctx.io, ctx.environ, ctx.run_dir, ctx.mem, p.value.doc_id, ctx.browser_daemon);
-    }
-    if (std.mem.eql(u8, name, "pixel_search")) {
-        const A = struct { query: []const u8 = "", k: u32 = 4 };
-        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
-        defer p.deinit();
-        if (std.mem.trim(u8, p.value.query, " \r\n\t").len == 0) return dupe(gpa, "pixel_search needs a query");
-        return pixelrag.search(gpa, ctx.io, ctx.run_dir, p.value.query, p.value.k);
     }
     return std.fmt.allocPrint(gpa, "unknown pixel tool: {s}", .{name}) catch dupe(gpa, "unknown pixel tool");
 }

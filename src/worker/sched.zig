@@ -792,7 +792,7 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     // DONE (bounded by LOOP_MAX_STEPS, so a stuck task ends instead of burning forever). Never afk: an
     // unattended run must terminate on its own. spawnTurn copies every arg into its own blob (conv lives in
     // a stack buffer here) and owns releasing the turn slot on every completion path.
-    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false); // tool_client=false: a scheduled run executes tools server-side (no client attached)
+    chat_engine.spawnTurn(app, uid, conv, trio, text, 1, false, ""); // tool_client=false: a scheduled run executes tools server-side (no client attached); no image attachment
 
     // Bookkeeping AFTER the spawn is committed, under the sched lock with a FRESH re-load: a concurrent
     // update (rename, toggle, prompt edit) between the caller's read and this save must not be clobbered by

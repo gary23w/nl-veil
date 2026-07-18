@@ -244,6 +244,35 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
 }
 
+/// VISION-AS-TEXT fallback for machines with no built-in OCR (Linux, or a box missing it): ask a VISION-CAPABLE
+/// model to transcribe an image to text. The PNG rides as an OpenAI-style image_url data-URL content part; the
+/// assistant's returned text IS the "OCR" — no pixels are persisted, only the text grounds the chat, so it stays
+/// vision-as-text at the conversation layer. Returns an empty-ok=false Reply on ANY failure (non-vision model,
+/// provider error) so the caller degrades to an image-only tile. An Ollama /v1 base_url accepts the same shape
+/// for a LOCAL vision model (llava / qwen-vl / moondream), so the fallback needs no cloud dependency either.
+pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, png_bytes: []const u8, instruction: []const u8, max_tokens: u32) Reply {
+    if (png_bytes.len == 0 or model.len == 0) return err(gpa, "vision: no image or model");
+    const Enc = std.base64.standard.Encoder;
+    const b64 = gpa.alloc(u8, Enc.calcSize(png_bytes.len)) catch return oom(gpa);
+    defer gpa.free(b64);
+    _ = Enc.encode(b64, png_bytes);
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    // OpenAI-compatible multimodal user message: content is an ARRAY of a text part + an image_url data URL.
+    msgs.appendSlice(gpa, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":") catch return oom(gpa);
+    jstr(gpa, &msgs, instruction) catch return oom(gpa);
+    msgs.appendSlice(gpa, "},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,") catch return oom(gpa);
+    msgs.appendSlice(gpa, b64) catch return oom(gpa); // base64 alphabet is JSON-safe — no escaping needed
+    msgs.appendSlice(gpa, "\"}}]}") catch return oom(gpa);
+    const mt = effTokens(base_url, model, max_tokens);
+    const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, msgs.items, mt }) catch return oom(gpa);
+    defer gpa.free(body);
+    var s = completeBody(gpa, io, run_dir, tag, base_url, key, body);
+    defer s.deinit(gpa);
+    if (!s.ok) return err(gpa, s.content);
+    return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
+}
+
 /// The agentic step: `messages_json` is the inside of "messages":[ … ] (caller-built, grows each turn);
 /// `tools_json` is the inside of "tools":[ … ]. Returns the assistant content OR parsed tool_calls.
 pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
