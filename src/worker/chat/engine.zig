@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
+const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
 const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
 const cctx = @import("context.zig");
@@ -426,7 +427,7 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client: bool) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8) void {
     const gpa = app.gpa;
 
     // The trio splits this turn's LLM calls across three models. `coding` is the base/default (the main answer
@@ -618,6 +619,36 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             conv_buf.append(gpa, '}') catch return;
         }
     }
+    // ATTACHED IMAGE (vision-as-text): the desk can attach ONE raster image this turn (image_b64 = STANDARD
+    // base64 of the raw PNG). It has no DOM, so its text comes from OS-native OCR (Windows.Media.Ocr / macOS
+    // Vision — free/offline/private), or, where the OS has none, a vision-model fallback (pixelrag.ingestImage →
+    // llm.visionExtract, using this turn's coding provider). The extracted text rides as its OWN per-turn system
+    // fragment — NEVER folded into user_text, which is the recall query + deferred neuron-db observe + pinned
+    // goal; polluting it would corrupt memory. The full image is indexed as a pixel-RAG doc, so pixel_search can
+    // retrieve it. Sits after the stable prefix (durable memory + tool digest) and before the history window,
+    // where the per-turn recall fragment also lives, so the cache prefix behind it stays intact.
+    if (image_b64.len > 0) attach: {
+        const Dec = std.base64.standard.Decoder;
+        const n = Dec.calcSizeForSlice(image_b64) catch break :attach;
+        const png = gpa.alloc(u8, n) catch break :attach;
+        defer gpa.free(png);
+        Dec.decode(png, image_b64) catch break :attach;
+        // Ingest into `workdir` (not run_root): pixel_search is DELEGATED to the client, which roots at the
+        // conversation workdir — writing the manifest there is what lets a later pixel_search actually find it.
+        const text = pixelrag.ingestImage(gpa, app.io, environ, workdir, ctx.mem, "", png, coding.base_url, coding.key, coding.model);
+        defer gpa.free(text);
+        const trimmed = std.mem.trim(u8, text, " \r\n\t");
+        var note: std.ArrayListUnmanaged(u8) = .empty;
+        defer note.deinit(gpa);
+        if (trimmed.len > 0) {
+            note.appendSlice(gpa, "ATTACHED IMAGE — text extracted from the image the user attached this turn (vision-as-text; treat as grounded context). The full image is also indexed for pixel_search if you need more than the excerpt below. Extracted:\n") catch break :attach;
+            note.appendSlice(gpa, clipBytes(trimmed, 2800)) catch break :attach; // UTF-8-safe clip of the OCR text
+        } else {
+            note.appendSlice(gpa, "ATTACHED IMAGE — the user attached an image this turn, but no text could be extracted from it (OCR unavailable, or the image carries no readable text).") catch break :attach;
+        }
+        appendMsgObj(gpa, &conv_buf, "system", note.items, 3200);
+    }
+
     // BOUNDED HISTORY (chat_context): instead of replaying the entire transcript (which overflowed the model
     // window on long chats and hit an 8 MiB read cliff), project it into a fixed budget — a rolling summary of
     // scrolled-out turns + the pinned goal + the recall fragment + a recency window of the newest turns.
@@ -2029,12 +2060,13 @@ pub const TurnArgs = struct {
     text: []const u8,
     loop: u8,
     tool_client: bool,
+    image_b64: []const u8,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
     const gpa = args.app.gpa;
@@ -2047,14 +2079,14 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
     const p = trio.prompting;
-    // Own every string in ONE allocation: conv + text + all three role triples (9 strings). `total` is the
-    // exact sum of what dupInto copies below — the two MUST stay in lockstep (a short total → OOB blob slices).
-    const total = conv.len + text.len +
+    // Own every string in ONE allocation: conv + text + image_b64 + all three role triples (9 strings). `total`
+    // is the exact sum of what dupInto copies below — the two MUST stay in lockstep (a short total → OOB slices).
+    const total = conv.len + text.len + image_b64.len +
         c.base_url.len + c.key.len + c.model.len +
         t.base_url.len + t.key.len + t.model.len +
         p.base_url.len + p.key.len + p.model.len;
@@ -2062,14 +2094,14 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64);
         endTurn(app.io, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64);
         endTurn(app.io, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
@@ -2077,13 +2109,14 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     var o: usize = 0;
     const cv = dupInto(blob, &o, conv);
     const tx = dupInto(blob, &o, text);
+    const ib = dupInto(blob, &o, image_b64);
     // Re-slice every provider string into the owned blob (the passed-in slices die with the request arena).
     const owned: ModelTrio = .{
         .coding = .{ .base_url = dupInto(blob, &o, c.base_url), .key = dupInto(blob, &o, c.key), .model = dupInto(blob, &o, c.model) },
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
         th.detach();
     } else |_| {

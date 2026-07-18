@@ -132,6 +132,8 @@ const Ui = struct {
     chat: Field = .{},
     // Chat tab
     c_input: Field = .{},
+    c_attach: Attach = .{}, // optional image attachment for the next send (drop/paste → thumbnail chip in the composer)
+    attach_seq: u32 = 0, // monotonic counter for scratch paste-image filenames (Date-free; resets across restarts, fine for a scratch dir)
     c_rename: Field = .{},
     c_renaming: bool = false, // the active conversation's title is being edited in the left pane
     chat_scroll: f32 = 0,
@@ -144,6 +146,7 @@ const Ui = struct {
     llm_scroll: f32 = 0, // Dashboard LLM BREAKDOWN vertical scroll (the model list can exceed its panel)
     tbl_hscroll: [4]TblHScroll = .{ .{}, .{}, .{}, .{} }, // per chat-table horizontal scroll (content-keyed FIFO)
     tbl_hgrab: u64 = 0, // id of the chat table whose h-scrollbar thumb is being dragged (0 = none)
+    msg_thumbs: [8]MsgThumb = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, // path-keyed transcript-image texture cache (FIFO)
     pane_drag: PaneDrag = .none, // which side-panel divider is being dragged (drag-to-resize)
     right_tab: RightTab = .activity, // right pane: Swarm activity | Memory (durable keys/logins/prefs)
     mem_scroll: f32 = 0, // scroll offset for the Memory tab list
@@ -261,6 +264,9 @@ const Ui = struct {
     // Per chat-table horizontal-scroll offset (px), keyed by a content hash so it survives vertical scroll +
     // stream-settle. A tiny FIFO (see tblScrollOff): a new table evicts the oldest.
     const TblHScroll = struct { id: u64 = 0, off: f32 = 0 };
+    // One decoded transcript-image thumbnail texture, keyed by a hash of its source path. A small FIFO (see
+    // msgThumb): a new image evicts + unloads the oldest slot. MAIN/GL THREAD ONLY (renderMsg's draw pass).
+    const MsgThumb = struct { id: u64 = 0, tex: ?rl.Texture2D = null, w: i32 = 0, h: i32 = 0 };
     const Field = struct {
         buf: [4096]u8 = [_]u8{0} ** 4096, // 4K: the chat composer's char budget scales up to ~4000 for large models
         len: usize = 0,
@@ -334,6 +340,26 @@ const Ui = struct {
             const nx = f.nextCp(f.cur);
             std.mem.copyForwards(u8, f.buf[f.cur .. f.len - (nx - f.cur)], f.buf[nx..f.len]);
             f.len -= nx - f.cur;
+        }
+    };
+    // One optional image attachment for the next send. The SOURCE file path (drop target or a scratch PNG we
+    // export a pasted clipboard image to) rides the command ring to the chat thread; `tex` is a small GL
+    // thumbnail (main-thread only) for the composer chip. base64 is done on the chat thread from `path`.
+    const Attach = struct {
+        path: [512]u8 = [_]u8{0} ** 512,
+        path_len: u16 = 0,
+        tex: ?rl.Texture2D = null,
+        w: i32 = 0,
+        h: i32 = 0,
+        fn pathStr(a: *const Attach) []const u8 {
+            return a.path[0..a.path_len];
+        }
+        fn clear(a: *Attach) void {
+            if (a.tex) |tx| rl.unloadTexture(tx);
+            a.tex = null;
+            a.path_len = 0;
+            a.w = 0;
+            a.h = 0;
         }
     };
 };
@@ -701,6 +727,18 @@ pub fn main() !void {
         handleWindowChrome();
         handleKeys(&store);
 
+        // DROP-TO-ATTACH: a file dropped onto the Chat tab becomes the next send's image attachment (v1 = one
+        // image). isFileDropped is per-frame global state, so poll it here (not focus-gated); the FilePathList is
+        // valid only until unloadDroppedFiles, so setAttachFromPath copies the path + builds the thumbnail now.
+        if (ui.tab == .chat and rl.isFileDropped()) {
+            const fl = rl.loadDroppedFiles();
+            defer rl.unloadDroppedFiles(fl);
+            if (fl.count > 0) {
+                const dropped = std.mem.span(fl.paths[0]);
+                _ = setAttachFromPath(dropped);
+            }
+        }
+
         rl.beginDrawing();
         defer rl.endDrawing();
         rl.clearBackground(t.bg);
@@ -731,6 +769,74 @@ fn setField(f: *Ui.Field, s: []const u8) void {
     f.len = n;
     f.cur = n;
     f.sel = null;
+}
+
+/// Whether `path` ends in a supported image extension (case-insensitive). A cheap gate before we ask raylib
+/// to decode a dropped file — the actual decode (isImageValid) is the real filter.
+fn isImageExtPath(path: []const u8) bool {
+    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".bmp", ".gif" };
+    for (exts) |ext| {
+        if (path.len >= ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
+    }
+    return false;
+}
+
+/// Load the image at `path`, shrink it to a ~64px-tall thumbnail texture, and stash it (plus the SOURCE path)
+/// as the pending attachment. Main/GL thread ONLY (texture ops). Any previous attachment texture is unloaded
+/// on success; on failure the existing attachment is left intact. Returns true when an attachment was set.
+fn setAttachFromPath(path: []const u8) bool {
+    if (path.len == 0 or path.len > ui.c_attach.path.len) return false;
+    if (!isImageExtPath(path)) return false;
+    var zbuf: [520]u8 = undefined;
+    const zp = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return false;
+    var img = rl.loadImage(zp) catch return false;
+    if (!rl.isImageValid(img)) {
+        rl.unloadImage(img);
+        return false;
+    }
+    const th: i32 = 64;
+    if (img.height > 0 and img.height != th) {
+        var tw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(img.width)) * (@as(f32, @floatFromInt(th)) / @as(f32, @floatFromInt(img.height)))));
+        if (tw < 1) tw = 1;
+        if (tw > 320) tw = 320; // clamp the chip width for a very wide source
+        rl.imageResize(&img, tw, th);
+    }
+    const tex = rl.loadTextureFromImage(img) catch {
+        rl.unloadImage(img);
+        return false;
+    };
+    rl.unloadImage(img);
+    ui.c_attach.clear(); // unload any prior thumbnail now that the new one is safely created
+    ui.c_attach.tex = tex;
+    ui.c_attach.w = tex.width;
+    ui.c_attach.h = tex.height;
+    const n = @min(path.len, ui.c_attach.path.len);
+    @memcpy(ui.c_attach.path[0..n], path[0..n]);
+    ui.c_attach.path_len = @intCast(n);
+    return true;
+}
+
+/// If the clipboard holds an image, export it to a scratch PNG under <data>/.veil-desk/attach/ and set it as
+/// the pending attachment. Main/GL thread only. Returns true when an image was consumed (caller then skips the
+/// text-paste). An empty/text clipboard yields width 0 → returns false (no allocation to release in that case).
+fn pasteClipboardImage(store: *Store) bool {
+    const img = rl.getClipboardImage();
+    if (img.width <= 0 or img.height <= 0 or @intFromPtr(img.data) == 0) return false;
+    defer rl.unloadImage(img);
+    var ddb: [512]u8 = undefined;
+    store.lock();
+    const dd = store.settings.dataDir();
+    const ddn = @min(dd.len, ddb.len);
+    @memcpy(ddb[0..ddn], dd[0..ddn]);
+    store.unlock();
+    var dirb: [640]u8 = undefined;
+    const dirz = std.fmt.bufPrintZ(&dirb, "{s}/.veil-desk/attach", .{ddb[0..ddn]}) catch return false;
+    _ = rl.makeDirectory(dirz);
+    ui.attach_seq +%= 1;
+    var pathb: [700]u8 = undefined;
+    const pz = std.fmt.bufPrintZ(&pathb, "{s}/paste-{d}.png", .{ dirz, ui.attach_seq }) catch return false;
+    if (!rl.exportImage(img, pz)) return false;
+    return setAttachFromPath(pz);
 }
 
 fn drawLogOverlay() void {
@@ -1323,7 +1429,7 @@ fn handleKeys(store: *Store) void {
             }
         }
     }
-    if (focusedField()) |f| editField(f);
+    if (focusedField()) |f| editField(store, f);
     if (rl.isKeyPressed(.escape)) {
         ui.focus = .none;
         ui.file_menu = false;
@@ -1361,24 +1467,32 @@ fn focusedField() ?*Ui.Field {
     };
 }
 
-fn editField(f: *Ui.Field) void {
+fn editField(store: *Store, f: *Ui.Field) void {
     f.clampCur(); // external writers (setField/seeds) may have moved len under the caret
     const ctrl = rl.isKeyDown(.left_control) or rl.isKeyDown(.right_control);
     const shift = rl.isKeyDown(.left_shift) or rl.isKeyDown(.right_shift);
     // Ctrl+V paste — inserts at the caret (replacing any selection).
     if (ctrl and rl.isKeyPressed(.v)) {
         ui.input_active = true;
-        _ = f.delSel();
-        const clip = rl.getClipboardText();
-        for (clip) |raw_ch| {
-            // multi-line pastes flatten to spaces instead of being silently dropped
-            const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
-            // Accept UTF-8 (any byte >= 128) as well as printable ASCII, so smart quotes, em-dashes, and accents
-            // survive a paste. The renderer folds these to ASCII for display, but the field keeps the real bytes
-            // to send/copy.
-            if (ch >= 32 and ch != 127) {
-                if (ch == ' ' and f.cur > 0 and f.buf[f.cur - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
-                f.insert(ch);
+        // IMAGE PASTE (chat composer only): an image-bearing clipboard becomes the send's attachment. An
+        // image-only clipboard yields empty getClipboardText, so trying the image first never eats a text paste.
+        // We export the raw clipboard image to a scratch PNG, then thumbnail it — carrying a path (not pixels)
+        // to the chat thread. All raylib image/texture ops here are legal: editField runs on the main/GL thread.
+        if (f == &ui.c_input and pasteClipboardImage(store)) {
+            // handled as an attachment — skip the text-paste path this keypress
+        } else {
+            _ = f.delSel();
+            const clip = rl.getClipboardText();
+            for (clip) |raw_ch| {
+                // multi-line pastes flatten to spaces instead of being silently dropped
+                const ch: u8 = if (raw_ch == '\n' or raw_ch == '\t') ' ' else raw_ch;
+                // Accept UTF-8 (any byte >= 128) as well as printable ASCII, so smart quotes, em-dashes, and accents
+                // survive a paste. The renderer folds these to ASCII for display, but the field keeps the real bytes
+                // to send/copy.
+                if (ch >= 32 and ch != 127) {
+                    if (ch == ' ' and f.cur > 0 and f.buf[f.cur - 1] == ' ' and (raw_ch == '\n' or raw_ch == '\t')) continue;
+                    f.insert(ch);
+                }
             }
         }
     }
@@ -2502,6 +2616,7 @@ const MSG_HEADING_H: f32 = 24;
 const MSG_FENCE_H: f32 = 6;
 const MSG_HR_H: f32 = 12;
 const MSG_MAX_LINES = 512;
+const THUMB_H: f32 = 120; // fixed height of an attached-image thumbnail block reserved at the top of a message body
 
 fn inView(v: t.Rect, y: f32, h: f32) bool {
     return y + h >= v.y and y <= v.y + v.height;
@@ -2587,7 +2702,7 @@ fn renderConsole(view: t.Rect, card_top: f32, text_: []const u8, fsz: i32, draw:
 /// (backdrop + copy chip), GFM tables (aligned columns), headings, horizontal rules, bullets, and inline
 /// **bold** / `code` / <br> handled. ONE function measures AND draws (draw flag) so scroll math and pixels
 /// can never disagree. Returns the y after the message.
-fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, fsz: i32, draw: bool, cursor: bool) f32 {
+fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8, fsz: i32, draw: bool, cursor: bool, img: []const u8) f32 {
     var yy = y0;
     // A folded shell result ("[console]\n$ cmd\n…") renders as a styled terminal CARD instead of plain prose.
     // renderConsole is reached HERE in BOTH the height-cache/measure pass and the draw pass (renderMsg is called
@@ -2605,6 +2720,32 @@ fn renderMsg(view: t.Rect, y0: f32, role: store_mod.ChatRole, text_: []const u8,
     }
     yy += MSG_HEAD_H;
     if (is_console) return renderConsole(view, yy, text_, fsz, draw);
+    // ATTACHED IMAGE: a FIXED THUMB_H-tall block reserved at the top of the message body. Its reserved height
+    // depends ONLY on img.len>0 — NOT on whether a texture actually decoded — so the measure pass (draw=false)
+    // and the draw pass advance yy identically and scroll math never drifts. On the DRAW pass only we fetch a
+    // cached texture (msgThumb, main/GL thread) and blit it aspect-scaled into the block; a decode failure draws
+    // a subtle bordered placeholder of the same reserved size.
+    if (img.len > 0) {
+        if (draw and inView(view, yy, THUMB_H)) {
+            const bx = view.x + 8;
+            const maxw = @max(1.0, view.width - 40); // cap thumbnail width to the reading band
+            const th = msgThumb(img);
+            if (th.tex) |tex| {
+                const iw: f32 = @floatFromInt(@max(1, th.w));
+                const ih: f32 = @floatFromInt(@max(1, th.h));
+                var dw = iw * (THUMB_H / ih);
+                if (dw > maxw) dw = maxw;
+                const src = t.Rect{ .x = 0, .y = 0, .width = iw, .height = ih };
+                const dst = t.Rect{ .x = bx, .y = yy, .width = dw, .height = THUMB_H };
+                rl.drawTexturePro(tex, src, dst, .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+            } else {
+                const pw = @min(maxw, THUMB_H * 1.4);
+                t.panelBordered(.{ .x = bx, .y = yy, .width = pw, .height = THUMB_H }, t.withAlpha(t.bg_hl, 120), t.border);
+                t.text(t.z("image", .{}), @intFromFloat(bx + 10), @intFromFloat(yy + THUMB_H / 2 - 6), 11, t.comment);
+            }
+        }
+        yy += THUMB_H + 6; // advance in BOTH passes (parity) — reserved whenever img.len>0
+    }
     const dim = role == .cast_note or role == .thought;
 
     // split into a line array so multi-line constructs (tables, code) can be grouped with lookahead
@@ -2814,6 +2955,50 @@ fn tblScrollOff(id: u64) *f32 {
     while (k > 0) : (k -= 1) ui.tbl_hscroll[k] = ui.tbl_hscroll[k - 1];
     ui.tbl_hscroll[0] = .{ .id = id, .off = 0 };
     return &ui.tbl_hscroll[0].off;
+}
+
+/// Fetch (or decode-and-cache) a THUMB_H-tall texture for the image at `path`, for the transcript thumbnail.
+/// MAIN/GL THREAD ONLY — raylib texture ops must never run off the render thread, and only renderMsg's DRAW
+/// pass calls this. Returns the cached MsgThumb (tex may still be null if the file won't decode → the caller
+/// draws a placeholder). Path-keyed FIFO like tblScrollOff: a miss evicts + unloads the oldest slot.
+fn msgThumb(path: []const u8) *Ui.MsgThumb {
+    const id = std.hash.Wyhash.hash(0, path);
+    for (&ui.msg_thumbs) |*s| {
+        if (s.id == id) return s;
+    }
+    // MISS: shift the FIFO down and unload the texture in the slot we're about to reuse (the LRU-oldest).
+    const last = ui.msg_thumbs.len - 1;
+    if (ui.msg_thumbs[last].tex) |old| rl.unloadTexture(old);
+    var k: usize = last;
+    while (k > 0) : (k -= 1) ui.msg_thumbs[k] = ui.msg_thumbs[k - 1];
+    ui.msg_thumbs[0] = .{ .id = id, .tex = null, .w = 0, .h = 0 };
+    const slot = &ui.msg_thumbs[0];
+    // decode → resize to THUMB_H tall → upload. A failed load leaves tex=null (cached, so we don't re-decode a
+    // bad/missing path every frame); the caller draws the placeholder box.
+    var zbuf: [520]u8 = undefined;
+    if (path.len == 0 or path.len >= zbuf.len) return slot;
+    const zp = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return slot;
+    var img = rl.loadImage(zp) catch return slot;
+    if (!rl.isImageValid(img)) {
+        rl.unloadImage(img);
+        return slot;
+    }
+    const th: i32 = @intFromFloat(THUMB_H);
+    if (img.height > 0 and img.height != th) {
+        var tw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(img.width)) * (THUMB_H / @as(f32, @floatFromInt(img.height)))));
+        if (tw < 1) tw = 1;
+        if (tw > 1024) tw = 1024; // clamp width for a pathologically wide source (drawTexturePro re-caps to the view)
+        rl.imageResize(&img, tw, th);
+    }
+    const tex = rl.loadTextureFromImage(img) catch {
+        rl.unloadImage(img);
+        return slot;
+    };
+    rl.unloadImage(img);
+    slot.tex = tex;
+    slot.w = tex.width;
+    slot.h = tex.height;
+    return slot;
 }
 
 /// Render a GFM table (rows include the |---| separator, which is skipped) as aligned mono columns at their
@@ -3485,7 +3670,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
     // make room because everything below derives from input_h. Clamped so the transcript keeps space.
     ui.input_extra = std.math.clamp(ui.input_extra, 0, @max(0, r.height * 0.5 - 66));
-    const input_h: f32 = 66 + ui.input_extra;
+    // When an image is attached, the composer grows by a chip row so the thumbnail sits ABOVE the text (which is
+    // inset by the same amount) instead of covering it. Folded into input_h, so `view` shrinks + the box grows.
+    const chip_row_h: f32 = if (ui.c_attach.tex != null) 56 else 0;
+    const input_h: f32 = 66 + ui.input_extra + chip_row_h;
     const status_h: f32 = 22;
     const tab_h: f32 = 26;
     // Chat | Metrics | Files inner tabs (Metrics = per-turn perf graphs; Files = this chat's own build dir)
@@ -3551,12 +3739,12 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // by the per-row fp, so `wipe` (below) forces every cached height stale.
         const wipe = ui.mh_cols != cols; // wrap width changed → every cached height is stale
         for (msgs, 0..) |*m, i| {
-            const mfp: u64 = @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (ui.tool_open == i) @as(u64, 1) << 48 else 0);
+            const mfp: u64 = @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (ui.tool_open == i) @as(u64, 1) << 48 else 0) ^ (if (m.img_len > 0) @as(u64, 1) << 47 else 0); // img presence changes the row height (THUMB_H block)
             if (!wipe and i < ui.mh_count and ui.mh_mfp[i] == mfp) continue; // unchanged row — keep its height
             ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and ui.tool_open != i)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
-                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false);
+                renderMsg(view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
             ui.mh_mfp[i] = mfp;
         }
         ui.mh_count = msgs.len;
@@ -3568,7 +3756,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (busy or stream.len > 0) {
         // re-measure the live preview only when it actually grew (it only ever grows within a step)
         if (stream.len != ui.stream_h_len or cols != ui.stream_h_cols) {
-            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false);
+            ui.stream_h = renderMsg(view, 0, .veil, stream, fsz, false, false, "");
             ui.stream_h_len = stream.len;
             ui.stream_h_cols = cols;
         }
@@ -3614,7 +3802,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // The reasoning trace renders collapsed (a dim one-line chip); click to read the full thinking that
             // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
             if (ui.tool_open == i) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
                 if (t.hovering(t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 }) and t.hovering(view)) {
@@ -3634,7 +3822,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             // Tool calls render as a compact chip (raw JSON/result hidden). Click to expand/collapse; the full
             // text is untouched in the message, so the model still receives it and copy still grabs it.
             if (ui.tool_open == i) {
-                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
+                _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
                 // expanded tool text is copyable like any other message
@@ -3651,7 +3839,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         }
         cur_sel_msg = i; // capture THIS message's text-line geometry for selection
         cur_sel_char0 = 0;
-        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false);
+        _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
         // whole-message copy chip on hover (beside the role label)
         const mrect = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 4, .height = yy - y0 };
         if (m.text_len > 0 and t.hovering(mrect) and t.hovering(view)) {
@@ -3668,7 +3856,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.live_len_prev = stream.len;
             ui.live_change_t = rl.getTime();
         }
-        yy = renderMsg(view, yy, .veil, stream, fsz, true, true);
+        yy = renderMsg(view, yy, .veil, stream, fsz, true, true, "");
     }
     if (cast_live) yy = renderCastLive(view, yy, status, true);
     if (msgs.len == 0 and !busy and stream.len == 0) {
@@ -3813,9 +4001,29 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             ui.input_extra = std.math.clamp(ui.input_extra - rl.getMouseDelta().y, 0, @max(0, r.height * 0.5 - 66));
         } else ui.input_dragging = false;
     }
-    const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - 16, 18))); // textArea's 18px line pitch
+    const input_rows: usize = @intFromFloat(@max(3, @divTrunc(input_h - chip_row_h - 16, 18))); // rows in the text region BELOW the chip
     const cf = t.Rect{ .x = r.x, .y = sy, .width = r.width - send_w - t.GAP, .height = input_h };
-    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows);
+    textArea(cf, &ui.c_input, ui.focus == .c_input, if (afk_on) t.z("auto-loop-afk - the veil never stops; type to steer, Stop to end", .{}) else if (loop_on) t.z("auto-loop on - type to steer, or let the veil drive", .{}) else t.z("message the veil - Enter to send", .{}), .c_input, input_rows, chip_row_h);
+    // ATTACHMENT CHIP: the pending image's thumbnail sits at the composer's top-left (above the first text line),
+    // with a ✕ to drop it. drawTexturePro is legal here — drawChatCenter runs on the main/GL thread.
+    if (ui.c_attach.tex) |atex| {
+        const cpad: f32 = 6;
+        const chip_h: f32 = 46;
+        const aw: f32 = @floatFromInt(@max(1, ui.c_attach.w));
+        const ah: f32 = @floatFromInt(@max(1, ui.c_attach.h));
+        const chip_w = aw * (chip_h / ah);
+        const cx = cf.x + cpad;
+        const cy = cf.y + cpad;
+        // opaque backdrop + border so the thumbnail reads over any typed text behind it
+        t.fillRect(@intFromFloat(cx - 2), @intFromFloat(cy - 2), @intFromFloat(chip_w + 4), @intFromFloat(chip_h + 4), t.withAlpha(t.bg, 235));
+        t.panelBordered(.{ .x = cx - 2, .y = cy - 2, .width = chip_w + 4, .height = chip_h + 4 }, t.withAlpha(t.bg, 0), t.border);
+        const asrc = t.Rect{ .x = 0, .y = 0, .width = aw, .height = ah };
+        const adst = t.Rect{ .x = cx, .y = cy, .width = chip_w, .height = chip_h };
+        rl.drawTexturePro(atex, asrc, adst, .{ .x = 0, .y = 0 }, 0, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
+        const xs: f32 = 18;
+        const xr = t.Rect{ .x = cx + chip_w - xs + 4, .y = cy - xs + 4, .width = xs, .height = xs };
+        if (t.buttonSolid(xr, t.z("x", .{}), t.red, true)) ui.c_attach.clear();
+    }
     // MODEL-SCALED CHARACTER BUDGET: a live count in the composer's bottom-right against a limit sensed from the
     // current (coding/input) model — a small 8B model gets ~500, a frontier one ~4000 (inputCharLimit). Soft: it
     // only recolors (dim → orange near the cap → red over); the [4096]u8 buffer is the hard stop. Shown while
@@ -3873,6 +4081,7 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
             if (can_post and (post_click or enter)) {
                 store.pushChatCmd(store_mod.mkChatCmd(.steer_turn, "", ui.c_input.str()));
                 ui.c_input.clear();
+                ui.c_attach.clear(); // a steer carries no image in v1; drop any staged attachment so it can't linger
                 ui.chat_follow = true;
             }
         } else {
@@ -3886,8 +4095,16 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         const enter_key = rl.isKeyPressed(.enter) or rl.isKeyPressed(.kp_enter);
         const enter = enter_key and !shift;
         if (can_send and (clicked or (ui.focus == .c_input and enter))) {
-            store.pushChatCmd(store_mod.mkChatCmd(.send, "", ui.c_input.str()));
+            var cmd = store_mod.mkChatCmd(.send, "", ui.c_input.str());
+            const ap = ui.c_attach.pathStr(); // carry the SOURCE image path (not pixels) to the chat thread
+            if (ap.len > 0) {
+                const an = @min(ap.len, cmd.attach_path.len);
+                @memcpy(cmd.attach_path[0..an], ap[0..an]);
+                cmd.attach_path_len = @intCast(an);
+            }
+            store.pushChatCmd(cmd);
             ui.c_input.clear();
+            ui.c_attach.clear();
             ui.chat_follow = true;
         }
     }
@@ -6042,11 +6259,11 @@ fn drawSchedBuild(store: *Store, r: t.Rect) void {
     y += fh + gap;
 
     flabel(x, y, "PROMPT (the message the veil receives on every run)");
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_prompt, ui.focus == .sc_prompt, "e.g. check the overnight build logs and summarize any failures", .sc_prompt, 4);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_prompt, ui.focus == .sc_prompt, "e.g. check the overnight build logs and summarize any failures", .sc_prompt, 4, 0);
     y += 14 + area_h + gap;
 
     flabel(x, y, "KEY DETAILS / DATA (context every run should carry)");
-    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_details, ui.focus == .sc_details, "paths, hosts, formats, constraints - anything the run needs to know", .sc_details, 4);
+    textArea(.{ .x = x, .y = y + 14, .width = colw, .height = area_h }, &ui.sc_details, ui.focus == .sc_details, "paths, hosts, formats, constraints - anything the run needs to know", .sc_details, 4, 0);
     y += 14 + area_h + gap;
 
     // schedule kind: click-to-cycle (three options — a floating dropdown would be overkill), with the
@@ -7042,15 +7259,18 @@ var field_drag: bool = false;
 /// A multi-row text input. The Field holds ONE logical line (paste flattens newlines); this wraps it across
 /// up to `rows` visible rows and keeps the CARET's row in view. Click to place the caret, drag to select,
 /// arrows/Home/End move it (editField owns the keys; this owns the pixels).
-fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize) void {
+fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, which: Ui.Focus, rows: usize, top_pad: f32) void {
     t.panelBordered(r, t.bg, if (focused) t.blue else t.border);
     if (t.hovering(r) and ui.open_dd == .none) t.wantCursor(.ibeam);
     f.clampCur();
     const inner_x: i32 = @intFromFloat(r.x + 10);
     const line_h: f32 = 18;
+    // Text starts below any reserved top strip (top_pad) — e.g. the composer's image-attachment chip — so a
+    // pending thumbnail never covers what the user is typing. The border/box still spans the full rect.
+    const text_top: f32 = r.y + 8 + top_pad;
     if (f.len == 0 and !focused) {
         if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) ui.focus = which;
-        t.text(placeholder, inner_x, @intFromFloat(r.y + 8), 13, t.comment);
+        t.text(placeholder, inner_x, @intFromFloat(text_top), 13, t.comment);
         return;
     }
     var lines: [96][]const u8 = undefined;
@@ -7068,21 +7288,21 @@ fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, w
     if (t.hovering(r) and rl.isMouseButtonPressed(.left) and ui.open_dd == .none) {
         ui.focus = which;
         const mp = rl.getMousePosition();
-        f.cur = hitField(f, lines[0..nl], first, mp, r.y + 8, line_h, @floatFromInt(inner_x));
+        f.cur = hitField(f, lines[0..nl], first, mp, text_top, line_h, @floatFromInt(inner_x));
         f.sel = f.cur;
         field_drag = true;
     }
     if (focused and field_drag) {
         if (rl.isMouseButtonDown(.left)) {
             const mp = rl.getMousePosition();
-            f.cur = hitField(f, lines[0..nl], first, mp, r.y + 8, line_h, @floatFromInt(inner_x));
+            f.cur = hitField(f, lines[0..nl], first, mp, text_top, line_h, @floatFromInt(inner_x));
             ui.input_active = true;
         } else {
             if (f.selRange() == null) f.sel = null;
             field_drag = false;
         }
     }
-    var yy: f32 = r.y + 8;
+    var yy: f32 = text_top;
     var li = first;
     while (li < nl and li < first + rows) : (li += 1) {
         // selection highlight behind the text
@@ -7103,7 +7323,7 @@ fn textArea(r: t.Rect, f: *Ui.Field, focused: bool, placeholder: [:0]const u8, w
         const cl: []const u8 = if (nl > 0) lines[caret_line] else "";
         const cw = fieldPrefixPx(cl, f.cur -| lineOff(f, cl));
         const shown: f32 = @floatFromInt(caret_line - first);
-        t.fillRect(inner_x + @as(i32, @intFromFloat(cw)) + 1, @intFromFloat(r.y + 8 + shown * line_h), 2, 15, t.blue);
+        t.fillRect(inner_x + @as(i32, @intFromFloat(cw)) + 1, @intFromFloat(text_top + shown * line_h), 2, 15, t.blue);
     }
 }
 

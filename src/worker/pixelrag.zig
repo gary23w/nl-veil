@@ -14,10 +14,17 @@
 const std = @import("std");
 const browser_mgr = @import("browser/manager.zig");
 const browser_host = @import("browser/host.zig");
+const ocr = @import("ocr.zig");
+const llm = @import("llm.zig");
 const osc = @import("oscillation.zig");
 const Mem = osc.Mem;
 
 const log = std.log.scoped(.pixelrag);
+
+/// Instruction for the text-only fallback (used ONLY on a machine with no built-in OS OCR — never on Win/macOS).
+/// Kept pure-transcription to match the user's "vision-as-text, no visual description" choice: it acts as an OCR
+/// stand-in, not an image describer.
+const VISION_PROMPT = "Act as an OCR engine. Transcribe ALL text visible in this image, verbatim and in reading order. Output only the transcribed text — no description of the image, no preamble, no markdown fences. If there is no readable text, output nothing.";
 
 /// neuron-db scope holding the tile corpus. Each stored fact is `<band text>\x1e<doc>\x1f<tile>\x1f<rel img>`.
 pub const PIXEL_SCOPE = "pixelrag";
@@ -153,6 +160,65 @@ pub fn ingest(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Enviro
     if (manifest_add.items.len > 0) appendManifest(gpa, io, run_dir, manifest_add.items);
     log.info("pixel_ingest {s}: {d} tiles, {d} indexed, {d} chars (daemon={})", .{ doc_id, tile_count, indexed, total_chars, use_daemon });
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"doc_id\":\"{s}\",\"tiles\":{d},\"indexed\":{d},\"chars\":{d},\"note\":\"rendered + indexed; retrieve with pixel_search\"}}", .{ doc_id, tile_count, indexed, total_chars }) catch dupe(gpa, "ingested");
+}
+
+/// BROWSER-FREE image ingest: a dropped/pasted raster image has no DOM, so it can't render into tiles. Instead
+/// OCR it (ocr.extractImageText — the OS OCR engine; vision-as-text, no vision model sees pixels) and feed the
+/// extracted text through the SAME indexOne primitive the browser path uses. The neuron-db fact + .pixelrag
+/// manifest line are written exactly as a rendered tile's would be, so pixel_search retrieves the attachment with
+/// ZERO retrieval-side changes. Returns the extracted text (caller frees; "" when OCR yielded nothing / is
+/// unavailable). The tile PNG is always written to disk, so the image is present as an (image-only) tile even
+/// when it carried no readable text.
+/// Ingest a raster image as a pixel-RAG document, browser-free: OCR its text (OS-native → vision-model fallback),
+/// write the tile PNG, and index it via the SAME indexOne primitive a browser tile uses (so pixel_search finds
+/// it with zero retrieval changes). base_url/key/model are the turn's provider, used ONLY for the vision-model
+/// fallback when the OS has no built-in OCR (pass model="" to disable the fallback). Returns the extracted text.
+pub fn ingestImage(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, run_dir: []const u8, mem: Mem, doc_id_in: []const u8, png_bytes: []const u8, base_url: []const u8, key: []const u8, model: []const u8) []u8 {
+    // Stable, filesystem-safe doc id derived from the image bytes ("attach-<8hex>") unless the caller named one —
+    // re-attaching the same image reuses its doc instead of piling duplicates into the index. resolveDocId
+    // sanitizes/validates; a synthetic hash string doubles as its url-derive fallback.
+    var idbuf: [32]u8 = undefined;
+    const h32: u32 = @truncate(std.hash.Wyhash.hash(0, png_bytes));
+    const synth = std.fmt.bufPrint(&idbuf, "attach-{x:0>8}", .{h32}) catch "attach";
+    const chosen = if (std.mem.trim(u8, doc_id_in, " \r\n\t").len > 0) doc_id_in else synth;
+    const doc_id = resolveDocId(gpa, chosen, synth);
+    defer gpa.free(doc_id);
+
+    const dir = std.fmt.allocPrint(gpa, "{s}/.pixelrag/{s}", .{ run_dir, doc_id }) catch return dupe(gpa, "");
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+
+    // Write the tile PNG to its canonical path first (indexOne writes the identical file, but OCR needs it on
+    // disk BEFORE indexing so it can read an ABSOLUTE path — the WinRT shim resolves relative paths against the
+    // server's CWD, not this run dir, so an absolute path is mandatory).
+    const img_abs = std.fmt.allocPrint(gpa, "{s}/tile_0.png", .{dir}) catch return dupe(gpa, "");
+    defer gpa.free(img_abs);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = img_abs, .data = png_bytes }) catch {};
+
+    // OS-NATIVE OCR first (Windows.Media.Ocr / macOS Vision — free, offline, private).
+    var text: []u8 = ocr.extractImageText(gpa, io, env, run_dir, img_abs);
+    // UNIVERSAL FALLBACK: no built-in OCR (Linux, or a box missing the engine) → ask a vision-capable model to
+    // transcribe the image. Only when the OS path produced nothing AND a provider/model is configured. The image
+    // itself is never persisted to the model — only the returned text grounds the chat, so it stays vision-as-text.
+    if (std.mem.trim(u8, text, " \r\n\t").len == 0 and model.len > 0) {
+        gpa.free(text);
+        const r = llm.visionExtract(gpa, io, run_dir, "vision", base_url, key, model, png_bytes, VISION_PROMPT, 1200);
+        text = if (r.ok) r.content else blk: {
+            gpa.free(r.content); // !ok content is an error message — never index it AS the image's text
+            break :blk dupe(gpa, "");
+        };
+    }
+    defer gpa.free(text);
+
+    var manifest_add: std.ArrayListUnmanaged(u8) = .empty;
+    defer manifest_add.deinit(gpa);
+    var indexed: u32 = 0;
+    // Same call shape as ingest()'s tile loop: writes the tile PNG, stores the band-text fact in neuron-db, and
+    // appends the manifest line. On empty text it early-returns after writing the (image-only) tile.
+    _ = indexOne(gpa, io, run_dir, mem, doc_id, 0, png_bytes, text, &manifest_add, &indexed);
+    if (manifest_add.items.len > 0) appendManifest(gpa, io, run_dir, manifest_add.items);
+    log.info("ingestImage {s}: {d} indexed, {d} chars", .{ doc_id, indexed, text.len });
+    return dupe(gpa, text);
 }
 
 fn clip(s: []const u8, n: usize) []const u8 {

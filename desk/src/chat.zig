@@ -702,6 +702,10 @@ pub const Chat = struct {
     parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
+    // Image-attachment path carried from the UI's .send command into cmdSend (consumed + cleared at the top of
+    // cmdSend so a machine-continuation/auto-loop send never inherits a stale attachment). See routeToServerChat.
+    send_attach: [512]u8 = undefined,
+    send_attach_len: u16 = 0,
     tool_iters: u32 = 0, // tool calls this user turn (bounded by MAX_TOOL_ITERS)
     loop_iter: u32 = 0, // auto-loop iterations since the last manual message (bounded by LOOP_MAX_ITERS)
     loop_casts: u32 = 0, // swarms this auto-loop session has fired (bounded by MAX_LOOP_CASTS — runaway guard)
@@ -1360,7 +1364,13 @@ pub const Chat = struct {
         while (self.store.popChatCmd()) |c| {
             switch (c.kind) {
                 .none => {},
-                .send => self.cmdSend(dd, c.textStr()),
+                .send => {
+                    // stash any image-attachment path for cmdSend to consume (kept off the arg list so the many
+                    // other cmdSend callers — auto-loop, tests — stay unchanged and attachment-free)
+                    self.send_attach_len = @min(c.attachStr().len, self.send_attach.len);
+                    @memcpy(self.send_attach[0..self.send_attach_len], c.attachStr()[0..self.send_attach_len]);
+                    self.cmdSend(dd, c.textStr());
+                },
                 .steer_turn => self.cmdSteerTurn(dd, c.textStr()),
                 // Guard a chat switch/new-chat while ANY work is pending (a streaming reply, a running cast, or an
                 // AI console command): switching would repoint conv_active and the settling output would land in —
@@ -1438,7 +1448,7 @@ pub const Chat = struct {
     /// Route one user send to the conv's SERVER-side chat turn. Returns true if the send was handed to the server
     /// (the caller then SKIPS the entire local turn path); false if no conv could be resolved, so the caller falls
     /// back to the local loop. The user message is ALREADY in the transcript (cmdSend appended it before calling).
-    fn routeToServerChat(self: *Chat, dd: []const u8, text: []const u8) bool {
+    fn routeToServerChat(self: *Chat, dd: []const u8, text: []const u8, attach_path: []const u8) bool {
         _ = dd;
         var convb: [96]u8 = undefined;
         const conv = self.convScope(&convb);
@@ -1485,11 +1495,28 @@ pub const Chat = struct {
             break :blk_lm if (self.store.chat_loop_afk) @as(u8, 2) else if (self.store.chat_loop) @as(u8, 1) else @as(u8, 0);
         };
 
+        // IMAGE ATTACHMENT (v1, single image): read the raw PNG the UI captured and base64-encode it (STANDARD
+        // alphabet, no "data:" prefix) into the body's "image_b64" field. File-read + encode happen HERE, on the
+        // chat worker thread (never a raylib texture op). Any failure just omits the attachment — the text still
+        // sends. The encoded buffer lives until after the POST (w.buffered() at chatSend), so free it via defer.
+        var image_b64: []const u8 = "";
+        var image_b64_buf: ?[]u8 = null;
+        defer if (image_b64_buf) |b| self.gpa.free(b);
+        if (attach_path.len > 0) blk_img: {
+            const raw = Io.Dir.cwd().readFileAlloc(self.io, attach_path, self.gpa, .limited(8 << 20)) catch break :blk_img;
+            defer self.gpa.free(raw);
+            if (raw.len == 0) break :blk_img;
+            const enc = std.base64.standard.Encoder;
+            const b64 = self.gpa.alloc(u8, enc.calcSize(raw.len)) catch break :blk_img;
+            image_b64 = enc.encode(b64, raw);
+            image_b64_buf = b64;
+        }
+
         // Heap body: on default-on a long user message would overflow a fixed buffer (which would then wrongly
         // fall back). Size it to the escaped worst case; any alloc/build failure just falls back to local.
         const cap = text.len * 2 + prov.base_url.len + prov.model.len + prov.key.len +
             think.base_url.len + think.model.len + think.key.len +
-            prompt.base_url.len + prompt.model.len + prompt.key.len + 256;
+            prompt.base_url.len + prompt.model.len + prompt.key.len + image_b64.len + 256;
         const body = self.gpa.alloc(u8, cap) catch return false;
         defer self.gpa.free(body);
         var w = Io.Writer.fixed(body);
@@ -1519,6 +1546,12 @@ pub const Chat = struct {
             // THIS machine (via `veil exec-tool`) so the veil acts in the user's environment, not the server's box.
             w.writeAll("\",\"tool_client\":true,\"loop\":") catch break :blk false;
             w.writeByte('0' + loop_mode) catch break :blk false; // 0|1|2 — the desk's live auto-loop tier
+            // Optional single-image attachment. base64's alphabet ([A-Za-z0-9+/=]) needs no JSON escaping.
+            if (image_b64.len > 0) {
+                w.writeAll(",\"image_b64\":\"") catch break :blk false;
+                w.writeAll(image_b64) catch break :blk false;
+                w.writeAll("\"") catch break :blk false;
+            }
             w.writeAll("}") catch break :blk false;
             break :blk true;
         };
@@ -1835,7 +1868,7 @@ pub const Chat = struct {
         }
         // no observe: server frames are already observed into the SERVER's hippocampus; a desk-side subprocess
         // observe per committed frame (dozens per turn) stalled the worker thread that pumps the 30Hz stream.
-        if (rlen > 0) self.appendMsgFull(dd, .thought, rbuf[0..rlen], false);
+        if (rlen > 0) self.appendMsgFull(dd, .thought, rbuf[0..rlen], false, "");
     }
 
     /// Commit the in-flight streamed REPLY as a durable .veil message and clear the live buffer (0 = no-op).
@@ -1849,7 +1882,7 @@ pub const Chat = struct {
             @memcpy(tbuf[0..tlen], self.store.stream_text[0..tlen]);
             self.store.stream_len = 0;
         }
-        if (tlen > 0) self.appendMsgFull(dd, .veil, tbuf[0..tlen], false); // no observe — see scCommitReason
+        if (tlen > 0) self.appendMsgFull(dd, .veil, tbuf[0..tlen], false, ""); // no observe — see scCommitReason
     }
 
     /// Discard any in-flight streamed reply/reasoning preview WITHOUT committing (both buffers).
@@ -1902,7 +1935,7 @@ pub const Chat = struct {
                 // no observe: the desk observing the server veil's replies re-creates the confabulation loop the
                 // server side already fixed (its own replies recalled later as "grounded context") — and each
                 // observe is a subprocess spawn on the streaming worker thread.
-                if (content.len > 0) self.appendMsgFull(dd, .veil, content, false);
+                if (content.len > 0) self.appendMsgFull(dd, .veil, content, false, "");
             }
             return;
         }
@@ -1935,7 +1968,7 @@ pub const Chat = struct {
                 std.fmt.bufPrint(&nb, "[tool:{s}] {s} — {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)], preview[0..@min(preview.len, 220)] }) catch "[tool]"
             else
                 std.fmt.bufPrint(&nb, "[tool:{s}] {s}", .{ tool[0..@min(tool.len, 96)], state[0..@min(state.len, 16)] }) catch "[tool]";
-            self.appendMsgFull(dd, .cast_note, note, false); // no observe — a "[tool:x] start" row is not knowledge
+            self.appendMsgFull(dd, .cast_note, note, false, ""); // no observe — a "[tool:x] start" row is not knowledge
             return;
         }
         if (std.mem.eql(u8, kind, "error")) {
@@ -1945,7 +1978,7 @@ pub const Chat = struct {
             const err = if (scRawField(line, "err")) |raw| scUnescape(raw, &buf) else "";
             var nb: [600]u8 = undefined;
             const note = std.fmt.bufPrint(&nb, "(server error: {s})", .{err[0..@min(err.len, 500)]}) catch "(server error)";
-            self.appendMsgFull(dd, .veil, note, false); // no observe — an error string is not knowledge
+            self.appendMsgFull(dd, .veil, note, false, ""); // no observe — an error string is not knowledge
             return;
         }
         if (std.mem.eql(u8, kind, "status")) {
@@ -1964,7 +1997,7 @@ pub const Chat = struct {
                 const t = scUnescape(raw, &buf);
                 if (t.len > 0) {
                     var nb: [160]u8 = undefined;
-                    self.appendMsgFull(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t, false); // no observe
+                    self.appendMsgFull(dd, .cast_note, std.fmt.bufPrint(&nb, "\u{2219} {s}", .{t}) catch t, false, ""); // no observe
                 }
             }
             // METRICS: the backend's REAL output-token count — preferred over the char/4 proxy for tok/s.
@@ -2980,7 +3013,7 @@ pub const Chat = struct {
         const head = result[0..@min(result.len, 120)];
         self.setDirective(std.fmt.bufPrint(&db, "VERIFICATION FAILED — the read-back did not confirm the claimed outcome (result: {s}). If that result contradicts the goal, the work is NOT done: fix the underlying issue (e.g. actually write the missing file), then verify again. If an ABSENCE was the expected outcome (e.g. verifying a deletion), state that explicitly and prove it differently (list the parent directory).", .{head}) catch
             "VERIFICATION FAILED — the read-back did not confirm the claimed outcome. If that contradicts the goal, fix the underlying issue and verify again; if an absence was the expected outcome, prove it by listing the parent directory.");
-        self.appendMsgFull(dd, .cast_note, "(verification failed — the read-back contradicts the claimed outcome; continuing the fix)", false);
+        self.appendMsgFull(dd, .cast_note, "(verification failed — the read-back contradicts the claimed outcome; continuing the fix)", false, "");
         log.info("verify: the read-back FAILED mechanically — re-arming the verify gate", .{});
     }
 
@@ -3616,6 +3649,15 @@ pub const Chat = struct {
     }
 
     pub fn cmdSend(self: *Chat, dd: []const u8, text: []const u8) void {
+        // Consume any image-attachment path carried by the .send command, ALWAYS (even on the early returns
+        // below), so it can never leak into a later machine-continuation/auto-loop cmdSend that set nothing.
+        var attach_buf: [512]u8 = undefined;
+        const attach_path = blk_at: {
+            const an = @min(self.send_attach_len, attach_buf.len);
+            @memcpy(attach_buf[0..an], self.send_attach[0..an]);
+            self.send_attach_len = 0;
+            break :blk_at attach_buf[0..an];
+        };
         if (text.len == 0) return;
         if (self.turn != .idle or self.consoleAiBusy() or self.sc_active) {
             // Don't silently drop the message — tell the user why. Sending DURING a cast is fine (cast_active
@@ -3678,16 +3720,22 @@ pub const Chat = struct {
         self.reflect_trace_len = 0;
         self.reflect_trace_has_reason = false;
         self.abort_turn.store(false, .monotonic); // a new user message clears any pending Stop from the last turn
-        self.appendMsg(dd, .user, text);
+        // Carry the attachment's SOURCE path onto the user's own bubble so the sent image shows in the transcript
+        // (pure display; the OCR/base64 wire path is unchanged). Empty when this send had no attachment.
+        self.appendMsgFull(dd, .user, text, true, attach_path);
         // SERVER CHAT ROUTING (P0-6, gated on Settings.server_chat; default OFF ⇒ never taken, the LOCAL path
         // below runs exactly as today). When ON, the brain lives in the backend: hand this send to the conv's
         // server turn and let pumpServerChat render the frames. The whole local path (cast fast-path, knowledge
         // directive, startTurn, auto-loop) is SKIPPED. On a resolvable conv this returns; else it falls through.
         if (self.serverChatOn()) {
-            if (self.routeToServerChat(dd, text)) return;
+            if (self.routeToServerChat(dd, text, attach_path)) return;
         }
-        // Past the server route → this message is served LOCALLY (server off, in cooldown, or a fallback). Mark the
-        // conv as NOT server-served so the local auto-loop (maybeLoop) is allowed to drive it.
+        // Past the server route → this message is served LOCALLY (server off, in cooldown, or a fallback). The local
+        // engine has no image-input path in v1, so an attachment is dropped — tell the user rather than silently.
+        if (attach_path.len > 0) {
+            self.store.pushNotif("Image not sent", "attaching an image needs the server brain (enable server chat in Settings); the message was sent without it", 2);
+        }
+        // Mark the conv as NOT server-served so the local auto-loop (maybeLoop) is allowed to drive it.
         self.sc_serving = false;
         // SUB-AGENT DISPATCH: an explicit "cast a swarm to ..." IS the task — deploy it NOW instead of
         // spending a whole model turn deciding to (measured ~10s hosted, up to a minute on a local thinking
@@ -4840,6 +4888,13 @@ pub const Chat = struct {
             const tn = @min(tt.len, m.text.len);
             @memcpy(m.text[0..tn], tt[0..tn]);
             m.text_len = @intCast(tn);
+            // optional "img" field: the source path of an attached image. Absent in old logs → empty (back-compat).
+            if (llm.jsonUnescape(self.gpa, line, "img")) |ip| {
+                defer self.gpa.free(ip);
+                const in = @min(ip.len, m.img.len);
+                @memcpy(m.img[0..in], ip[0..in]);
+                m.img_len = @intCast(in);
+            }
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
         }
@@ -4860,6 +4915,40 @@ pub const Chat = struct {
         // this to attach the live event poller instead of leaving the user staring at a frozen snapshot
         self.mirror_live = std.mem.indexOf(u8, resp.body, "\"live\":true") != null;
         const arr = std.mem.indexOf(u8, resp.body, "\"messages\":[") orelse return false;
+        // PRESERVE ATTACHED IMAGES across the mirror: server messages carry no "img" field, so read the CURRENT
+        // local file first and remember each user message's image path (keyed by its escaped text). During the
+        // rewrite below we re-attach them — else re-mirroring a server conv drops the thumbnail the user attached.
+        var img_keys: [16][]const u8 = undefined; // escaped "t"
+        var img_vals: [16][]const u8 = undefined; // escaped "img" path (into old_data)
+        var img_n: usize = 0;
+        var old_data: ?[]u8 = null;
+        defer if (old_data) |d| self.gpa.free(d);
+        {
+            var pb0: [700]u8 = undefined;
+            if (convPath(dd, id, &pb0)) |p0| {
+                if (Io.Dir.cwd().readFileAlloc(self.io, p0, self.gpa, .limited(4 << 20))) |d| {
+                    old_data = d;
+                    var lines = std.mem.splitScalar(u8, d, '\n');
+                    while (lines.next()) |ln| {
+                        if (img_n >= img_keys.len) break;
+                        const trimmed = std.mem.trim(u8, ln, " \r\t");
+                        if (trimmed.len < 2 or trimmed[0] != '{') continue;
+                        var role0: u8 = 2;
+                        var t0: []const u8 = "";
+                        var im0: []const u8 = "";
+                        var c0: usize = 0;
+                        while (scan.nextJsonPair(trimmed, &c0)) |p| {
+                            if (std.mem.eql(u8, p.key, "r")) role0 = if (p.raw.len > 0 and p.raw[0] == '0') 0 else 2 else if (p.is_str and std.mem.eql(u8, p.key, "t")) t0 = p.raw else if (p.is_str and std.mem.eql(u8, p.key, "img")) im0 = p.raw;
+                        }
+                        if (role0 == 0 and im0.len > 0) {
+                            img_keys[img_n] = t0;
+                            img_vals[img_n] = im0;
+                            img_n += 1;
+                        }
+                    }
+                } else |_| {}
+            }
+        }
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         // title: the sidebar row refreshConvs already resolved (a real name, never the id). When it hasn't been
@@ -4901,7 +4990,21 @@ pub const Chat = struct {
             if (raw.len == 0) continue;
             jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{role}) catch return false;
             jb.appendSlice(self.gpa, raw) catch return false; // still-escaped server JSON, byte-compatible with loadMsgs
-            jb.appendSlice(self.gpa, "\"}\n") catch return false;
+            jb.append(self.gpa, '"') catch return false;
+            // re-attach a preserved image to the matching user message (escaped text match; consume so two
+            // identical texts don't both claim one image)
+            if (role == 0 and img_n > 0) {
+                for (0..img_n) |k| {
+                    if (img_vals[k].len > 0 and std.mem.eql(u8, img_keys[k], raw)) {
+                        jb.appendSlice(self.gpa, ",\"img\":\"") catch return false;
+                        jb.appendSlice(self.gpa, img_vals[k]) catch return false;
+                        jb.append(self.gpa, '"') catch return false;
+                        img_vals[k] = "";
+                        break;
+                    }
+                }
+            }
+            jb.appendSlice(self.gpa, "}\n") catch return false;
         }
         var pb: [700]u8 = undefined;
         const path = convPath(dd, id, &pb) orelse return false;
@@ -4993,12 +5096,14 @@ pub const Chat = struct {
     }
 
     pub fn appendMsg(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8) void {
-        self.appendMsgFull(dd, role, text, true);
+        self.appendMsgFull(dd, role, text, true, "");
     }
 
     /// appendMsg with the hippocampus observe optional — a reflect DRAFT commits without observing (only the
-    /// FINAL text should become a neuron; a superseded draft in recall would poison future prompts).
-    fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool) void {
+    /// FINAL text should become a neuron; a superseded draft in recall would poison future prompts). `img` is the
+    /// SOURCE path of an image attached to this message (user bubble only) — persisted on the line and rendered as
+    /// a thumbnail; "" for the overwhelming majority of appends that carry no image.
+    fn appendMsgFull(self: *Chat, dd: []const u8, role: store_mod.ChatRole, text: []const u8, do_observe: bool, img: []const u8) void {
         // NARRATOR: every committed reply is also an utterance — the audible transcript. Cleaned for
         // speech (markdown stripped, code elided, capped) and queued; the poller speaks it via OS TTS.
         // pushNarr no-ops unless the narrator setting is on, so this line costs nothing otherwise.
@@ -5030,6 +5135,9 @@ pub const Chat = struct {
             tn = @min(text.len, m.text.len);
             @memcpy(m.text[0..tn], text[0..tn]);
             m.text_len = @intCast(tn);
+            const in = @min(img.len, m.img.len);
+            @memcpy(m.img[0..in], img[0..in]);
+            m.img_len = @intCast(in);
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
         }
@@ -5044,14 +5152,14 @@ pub const Chat = struct {
         // FAST PATH: a plain append writes ONE line (O(1)). The full whole-file rewrite — which during a server
         // turn ran per tool/status frame and scaled with history length, on sync-watched storage — is only needed
         // when the ring evicted (rows shifted) or the file doesn't exist yet (fresh conv needs its title header).
-        if (evicted or !self.persistAppendMsg(dd, idb[0..idn], role, text[0..tn]))
+        if (evicted or !self.persistAppendMsg(dd, idb[0..idn], role, text[0..tn], img))
             self.persistConv(dd, idb[0..idn]);
     }
 
     /// Append ONE message line to the conv file. Returns false when the caller must do the full persistConv
     /// instead: the file is missing (a fresh conv needs the {"title"} header line first) or the stat/write failed.
     /// Single-writer (only this chat worker touches the file), so stat→positioned-write needs no lock here.
-    fn persistAppendMsg(self: *Chat, dd: []const u8, conv_id: []const u8, role: store_mod.ChatRole, text: []const u8) bool {
+    fn persistAppendMsg(self: *Chat, dd: []const u8, conv_id: []const u8, role: store_mod.ChatRole, text: []const u8, img: []const u8) bool {
         var pb: [700]u8 = undefined;
         const path = convPath(dd, conv_id, &pb) orelse return false;
         const st = Io.Dir.cwd().statFile(self.io, path, .{}) catch return false;
@@ -5060,7 +5168,13 @@ pub const Chat = struct {
         defer jb.deinit(self.gpa);
         jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{@intFromEnum(role)}) catch return false;
         escJson(&jb, self.gpa, text);
-        jb.appendSlice(self.gpa, "\"}\n") catch return false;
+        jb.appendSlice(self.gpa, "\"") catch return false;
+        if (img.len > 0) { // optional trailing "img" field — a persisted attachment path the transcript re-renders
+            jb.appendSlice(self.gpa, ",\"img\":\"") catch return false;
+            escJson(&jb, self.gpa, img);
+            jb.appendSlice(self.gpa, "\"") catch return false;
+        }
+        jb.appendSlice(self.gpa, "}\n") catch return false;
         const f = Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false }) catch return false;
         defer f.close(self.io);
         f.writePositionalAll(self.io, jb.items, st.size) catch return false;
@@ -5155,7 +5269,13 @@ pub const Chat = struct {
                 const m = &self.store.msgs[i];
                 jb.print(self.gpa, "{{\"r\":{d},\"t\":\"", .{@intFromEnum(m.role)}) catch return;
                 escJson(&jb, self.gpa, m.textStr());
-                jb.appendSlice(self.gpa, "\"}\n") catch return;
+                jb.appendSlice(self.gpa, "\"") catch return;
+                if (m.img_len > 0) { // carry the attachment path through the whole-file rewrite (see persistAppendMsg)
+                    jb.appendSlice(self.gpa, ",\"img\":\"") catch return;
+                    escJson(&jb, self.gpa, m.imgStr());
+                    jb.appendSlice(self.gpa, "\"") catch return;
+                }
+                jb.appendSlice(self.gpa, "}\n") catch return;
             }
         }
         var pb: [700]u8 = undefined;
@@ -5583,7 +5703,7 @@ pub const Chat = struct {
             // retry and a persistent one still surfaces right after it.
             if (!self.stream_retried and !self.abort_turn.load(.monotonic) and self.turn_epoch == self.conv_epoch) {
                 self.stream_retried = true;
-                self.appendMsgFull(dd, .cast_note, "(the model stream died — retrying once)", false);
+                self.appendMsgFull(dd, .cast_note, "(the model stream died — retrying once)", false, "");
                 log.info("stream retry: transient model failure — re-entering the turn once", .{});
                 self.startTurn(dd, kind);
                 if (self.turn == kind) return; // the retry turn is live
@@ -5713,7 +5833,7 @@ pub const Chat = struct {
                     if (looksTruncatedWrite(full) and self.tool_iters < MAX_TOOL_ITERS) {
                         self.tool_iters += 1;
                         self.stream.deinit(self.gpa);
-                        self.appendMsgFull(dd, .cast_note, "(that file was too large and got cut off mid-write — asking it to write in smaller append chunks)", false);
+                        self.appendMsgFull(dd, .cast_note, "(that file was too large and got cut off mid-write — asking it to write in smaller append chunks)", false, "");
                         self.setDirective("Your write_file was TOO LARGE and got cut off mid-content — the reply hit its length limit, so NOTHING was written and the PATH was never the problem. Write this file in CHUNKS across replies: in THIS reply call write_file with ONLY the FIRST part (about the first 120 lines); then in EACH following reply call write_file with the SAME path, \"mode\":\"append\", and the NEXT part — repeat until the file is complete. Keep every chunk small.");
                         self.internal_turn = true;
                         self.setStatus("writing the file in chunks...");
@@ -5747,7 +5867,7 @@ pub const Chat = struct {
                     if (prose.len > 0) {
                         self.appendVeil(dd, "", prose);
                     } else if (reason.len > 0) {
-                        self.appendMsgFull(dd, .thought, reason[0..@min(reason.len, 1200)], false);
+                        self.appendMsgFull(dd, .thought, reason[0..@min(reason.len, 1200)], false, "");
                     }
                 }
                 self.tool_iters += 1;
@@ -5805,7 +5925,7 @@ pub const Chat = struct {
                 // rows) — do NOT clobber last_user with it (that mis-keyed every recall/reinforce/loop
                 // guard to machine boilerplate) and do NOT observe it (identical boilerplate as neurons
                 // poisons the conversation scope's recall).
-                self.appendMsgFull(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)", false);
+                self.appendMsgFull(dd, .cast_note, "(that used a tool-call format I can't run — asking it to retry in the right one)", false, "");
                 self.setDirective("Your last reply attempted a tool call in a format I can't execute (only plain TOOL: lines run). Reissue the SAME call: one short why-sentence, then on its own line: TOOL: <name> {\"arg\":\"value\", ...} — no other syntax, no special tokens.");
                 self.internal_turn = true; // corrective directive, not a real user turn — don't consolidate memory off it
                 self.setStatus("retrying in the right tool format...");
@@ -5835,9 +5955,9 @@ pub const Chat = struct {
                 // history. And this exchange may still owe a consolidation: the re-entry is machine-authored
                 // (internal_turn), which would silently swallow shouldConsolidate — stash the debt.
                 if (self.shouldConsolidate(kind, full)) self.consolidate_pending = true;
-                if (full.len > 0) self.appendMsgFull(dd, .veil, full, false);
+                if (full.len > 0) self.appendMsgFull(dd, .veil, full, false, "");
                 self.stream.deinit(self.gpa);
-                self.appendMsgFull(dd, .cast_note, "continue", false);
+                self.appendMsgFull(dd, .cast_note, "continue", false, "");
                 self.setDirective("Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.");
                 self.internal_turn = true; // machine directive, not a user exchange (last_user keeps the real goal)
                 self.setStatus("following through on the announced action...");
@@ -5961,7 +6081,7 @@ pub const Chat = struct {
             if (fizzled) {
                 self.act_nudges += 1;
                 self.stream.deinit(self.gpa);
-                self.appendMsgFull(dd, .cast_note, "(the reply announced an action but didn't perform it — asking it to act now)", false);
+                self.appendMsgFull(dd, .cast_note, "(the reply announced an action but didn't perform it — asking it to act now)", false, "");
                 self.setDirective("Your last reply PROMISED an action but performed none. Do it NOW, in this reply: one short why-sentence, then the action on its own line (RUN: <command> or TOOL: <name> {\"arg\":...}). Never end a reply with a promise of future action — act, or state plainly what is blocking you.");
                 self.internal_turn = true; // machine directive, not a user exchange (last_user keeps the real goal)
                 self.setStatus("following through on the announced action...");
@@ -6040,9 +6160,9 @@ pub const Chat = struct {
             // this would re-open the exact confabulation loop appendVeil closes (parrot → re-observe → amplify).
             // dedupSentences collapses the "I am … I am … I am …" flail this raw-reasoning path is most prone to.
             var ddb: [8192]u8 = undefined;
-            self.appendMsgFull(dd, .veil, dedupSentences(reason, &ddb), false);
+            self.appendMsgFull(dd, .veil, dedupSentences(reason, &ddb), false, "");
         } else {
-            self.appendMsgFull(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)", false);
+            self.appendMsgFull(dd, .veil, "(the model returned an empty reply — try rephrasing, or switch to a lighter model in Settings)", false, "");
         }
         // LEARNING (neuron-db Hebbian plasticity): a completed answer turn means the query topic + the memory
         // recalled for it proved useful — STRENGTHEN the stored turn for that topic so it out-ranks the
@@ -6104,7 +6224,7 @@ pub const Chat = struct {
             // which suppresses shouldConsolidate for the rest of the arc, so carry the debt to the arc's
             // eventual settle (otherwise durable facts are dropped on every mutating arc).
             if (consolidate) self.consolidate_pending = true;
-            self.appendMsgFull(dd, .cast_note, "(verifying the outcome before calling it done)", false);
+            self.appendMsgFull(dd, .cast_note, "(verifying the outcome before calling it done)", false, "");
             self.setDirective("Before we call this done: VERIFY the outcome OBJECTIVELY. One short sentence, then exactly ONE read-only RUN: or TOOL: line that checks the thing you just changed actually exists and behaves (query the created task/file/service/state — e.g. a scheduled task's LastTaskResult, a file's content, a service's status). When the result arrives: if it proves the work, report done WITH the evidence; if it exposes a failure, FIX it now and verify again. Only if this exchange truly changed nothing, restate your final answer instead.");
             self.internal_turn = true; // machine directive — never consolidated as a user exchange (last_user keeps the real goal)
             self.setStatus("verifying the work...");
@@ -6350,7 +6470,7 @@ pub const Chat = struct {
         }
         const files_full = if (listing.items.len > 0) listing.items else "  (the build workdir is EMPTY — nothing was actually written)\n";
         const files_block = files_full[0..@min(files_full.len, 2000)];
-        self.appendMsgFull(dd, .cast_note, "(before finishing: checking every file the build needs is actually on disk)", false);
+        self.appendMsgFull(dd, .cast_note, "(before finishing: checking every file the build needs is actually on disk)", false, "");
         // The check is scoped to THIS ARC'S GOAL, quoted verbatim: without it the model fills the vacuum
         // from whatever else is in its prompt (a durable-memory fact about a PAST session's build can read
         // as a deliverable list and re-land a whole file tree unprompted).
@@ -6450,7 +6570,7 @@ pub const Chat = struct {
         // Append WITHOUT observing: the loop's own generated message must not be re-observed into the conversation's
         // neuron-db, or its guesses become recallable "grounded context" next turn — a self-reinforcing drift loop.
         // The durable goal (arc_goal) is the loop's anchor; a synthetic driver turn is not durable knowledge.
-        self.appendMsgFull(dd, .user, text, false);
+        self.appendMsgFull(dd, .user, text, false, "");
         self.startTurn(dd, .user);
     }
 
@@ -6675,7 +6795,7 @@ pub const Chat = struct {
         // runaway loop. The hippocampus keeps DURABLE facts — user turns, cast findings, tool/console results —
         // not the veil's own chatter.
         if (reasoning.len == 0) {
-            self.appendMsgFull(dd, .veil, text, false);
+            self.appendMsgFull(dd, .veil, text, false, "");
             return;
         }
         // Reasoning lands as its OWN collapsed .thought message above the answer (.thought is excluded from the
@@ -6700,8 +6820,8 @@ pub const Chat = struct {
             @memcpy(buf[w .. w + 3], "...");
             w += 3;
         }
-        if (w > 0) self.appendMsgFull(dd, .thought, buf[0..w], false);
-        if (text.len > 0) self.appendMsgFull(dd, .veil, text, false); // not observed — see the note above
+        if (w > 0) self.appendMsgFull(dd, .thought, buf[0..w], false, "");
+        if (text.len > 0) self.appendMsgFull(dd, .veil, text, false, ""); // not observed — see the note above
     }
 
     /// STEER: <instruction> — the veil's control door to a LIVE hive. Each STEER line is delivered on the
@@ -6779,7 +6899,7 @@ pub const Chat = struct {
     /// opens if curious). Clears all reflect state.
     fn revealReflect(self: *Chat, dd: []const u8, answer: []const u8) void {
         if (answer.len > 0) {
-            self.appendMsgFull(dd, .veil, answer, false); // not observed into the hippocampus (see appendVeil's note)
+            self.appendMsgFull(dd, .veil, answer, false, ""); // not observed into the hippocampus (see appendVeil's note)
             // Only when some pass contributed REAL thinking — a labels-only trace ("- drafting -" +
             // "- self-check pass 1: ... -" with nothing under them) is noise, not a reasoning locker.
             if (self.reflect_trace_len > 0 and self.reflect_trace_has_reason) {
@@ -11394,10 +11514,10 @@ test "the 64-message eviction pins the conversation's original goal (slot 0 stay
     // a long build arc: the goal, then a flood of tool-result rows well past the ring's capacity —
     // without the pin, row 0 (the assignment itself) would be the FIRST thing evicted and the model would
     // spend the rest of the arc working from tool chatter alone
-    chat.appendMsgFull(dd, .user, "GOAL: build the neuronet app with axum 0.7", false);
+    chat.appendMsgFull(dd, .user, "GOAL: build the neuronet app with axum 0.7", false, "");
     var i: usize = 0;
     while (i < store_mod.MAX_CHAT_MSGS + 20) : (i += 1) {
-        chat.appendMsgFull(dd, .cast_note, "[tool:write_file]\nwrote a file", false);
+        chat.appendMsgFull(dd, .cast_note, "[tool:write_file]\nwrote a file", false, "");
     }
     {
         store.lock();

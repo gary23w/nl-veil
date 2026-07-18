@@ -306,9 +306,14 @@ pub const ChatMsg = struct {
     role: ChatRole = .user,
     text: [12288]u8 = [_]u8{0} ** 12288, // 12K: long LLM answers (reasoning + tables/code) need the headroom
     text_len: u16 = 0,
+    img: [512]u8 = [_]u8{0} ** 512, // SOURCE path of an image attached to this message (user bubble); persisted so it re-renders on load
+    img_len: u16 = 0,
 
     pub fn textStr(m: *const ChatMsg) []const u8 {
         return m.text[0..m.text_len];
+    }
+    pub fn imgStr(m: *const ChatMsg) []const u8 {
+        return m.img[0..m.img_len];
     }
 };
 
@@ -590,12 +595,19 @@ pub const ChatCommand = struct {
     id_len: u8 = 0,
     text: [4096]u8 = [_]u8{0} ** 4096, // message text (up to the large-model input budget) / new title / api key
     text_len: u16 = 0,
+    // Optional image attachment for a .send: the SOURCE file PATH (base64 is too big for this ring's buffers and
+    // textures are GL-thread-only, so the chat thread reads + encodes the file from this path). Empty = none.
+    attach_path: [512]u8 = [_]u8{0} ** 512,
+    attach_path_len: u16 = 0,
 
     pub fn idStr(c: *const ChatCommand) []const u8 {
         return c.id[0..c.id_len];
     }
     pub fn textStr(c: *const ChatCommand) []const u8 {
         return c.text[0..c.text_len];
+    }
+    pub fn attachStr(c: *const ChatCommand) []const u8 {
+        return c.attach_path[0..c.attach_path_len];
     }
 };
 
