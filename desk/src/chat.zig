@@ -391,6 +391,12 @@ const USER_SCOPE = "veil-user"; //      the deepening working MODEL of the user 
 const PLAYBOOK_PROPOSED = PLAYBOOK_SCOPE ++ "-proposed";
 const SKILLS_PROPOSED = SKILLS_SCOPE ++ "-proposed";
 const USER_PROPOSED = USER_SCOPE ++ "-proposed";
+// LEDGER of merge-candidate proposals the human already resolved (kept or dropped). The curator records here on
+// keep/drop and skips any pair already listed, so it never re-derives the SAME near-duplicate merge from the
+// still-present entries every session (the "stuck showing the same candidates" bug). Never recalled into a
+// prompt and never shown in the Memory pane — bookkeeping only.
+const PLAYBOOK_MERGE_DONE = PLAYBOOK_SCOPE ++ "-merge-done";
+const SKILLS_MERGE_DONE = SKILLS_SCOPE ++ "-merge-done";
 
 const JUDGE_EVERY_TURNS: u32 = 10; // cadence trigger: grade the trace every ~N REAL user turns...
 const JUDGE_COOLDOWN_S: i64 = 240; // ...and never more than one pass per 4 minutes (outcome trigger included)
@@ -3432,6 +3438,10 @@ pub const Chat = struct {
     fn acceptProposal(self: *Chat, dd: []const u8, tag: []const u8, text: []const u8) void {
         const t2 = std.mem.trim(u8, text, " \r\n\t");
         if (t2.len < 8) return;
+        // A curator MERGE proposal is NOT a lesson to promote — "keep" here means "I've handled these dupes".
+        // Record it resolved (so the curator won't re-derive the same pair next session) and dismiss it, rather
+        // than storing the "merge candidates in..." meta text as a bogus playbook lesson (the old accept bug).
+        if (std.mem.startsWith(u8, t2, "merge candidates in ")) return self.resolveMergeProposal(dd, tag, t2);
         const cut = std.mem.indexOf(u8, t2, "| evidence:") orelse t2.len;
         const lesson = std.mem.trim(u8, t2[0..cut], " \t");
         if (lesson.len < 8) return;
@@ -3454,8 +3464,24 @@ pub const Chat = struct {
     fn rejectProposal(self: *Chat, dd: []const u8, tag: []const u8, text: []const u8) void {
         const t2 = std.mem.trim(u8, text, " \r\n\t");
         if (t2.len < 8) return;
+        // A dropped MERGE proposal must be remembered as resolved too — else the curator re-derives the same
+        // near-duplicate pair from the still-present entries every session ("stuck showing the same candidates").
+        if (std.mem.startsWith(u8, t2, "merge candidates in ")) return self.resolveMergeProposal(dd, tag, t2);
         self.mind().forget(propQuarantineScope(tag), t2[0..@min(t2.len, 110)]);
         log.info("proposal rejected ({d}b)", .{t2.len});
+        self.refreshProposals(dd);
+    }
+
+    /// A curator merge-candidate proposal was resolved (kept OR dropped): drop it from quarantine AND record a
+    /// stable signature in the scope's -merge-done ledger, so proposeMergeCandidates won't re-derive the same
+    /// pair from the still-present near-duplicate entries on a later session. Nothing in the live playbook is
+    /// deleted — the user asked the nag to stop, not to lose a lesson (they can consolidate manually).
+    fn resolveMergeProposal(self: *Chat, dd: []const u8, tag: []const u8, t2: []const u8) void {
+        var mb: [48]u8 = undefined;
+        const marker = std.fmt.bufPrint(&mb, "merge-done-{x}-", .{mergePropSig(t2)}) catch "merge-done-0-";
+        self.mind().observe(propMergeDoneScope(tag), marker);
+        self.mind().forget(propQuarantineScope(tag), t2[0..@min(t2.len, 110)]);
+        log.info("merge proposal resolved + ledgered ({d}b)", .{t2.len});
         self.refreshProposals(dd);
     }
 
@@ -3518,6 +3544,11 @@ pub const Chat = struct {
             defer self.gpa.free(pd);
             if (std.mem.indexOf(u8, pd, "merge candidates in ") != null) return; // one batch at a time
         }
+        // Ledger of pairs the human already kept/dropped — so a resolved merge is never re-proposed (the
+        // "stuck showing the same candidates" bug). Snapshot once; each candidate is checked against it below.
+        const done_scope = if (std.mem.eql(u8, scope, SKILLS_SCOPE)) SKILLS_MERGE_DONE else PLAYBOOK_MERGE_DONE;
+        const done_dump = self.mind().dump(done_scope);
+        defer if (done_dump) |d| self.gpa.free(d);
         var entries: [64][]const u8 = undefined;
         var n: usize = 0;
         var it = std.mem.splitScalar(u8, dump_out, '\n');
@@ -3538,6 +3569,13 @@ pub const Chat = struct {
                 const prop = std.fmt.bufPrint(&lb, "merge candidates in {s} (same lesson class? author ONE general entry): 1) {s} 2) {s} | evidence: near-duplicate content overlap found by the curator", .{
                     scope, entries[i][0..@min(entries[i].len, 260)], entries[j][0..@min(entries[j].len, 260)],
                 }) catch continue;
+                // Skip a pair the human already decided on. mergePropSig canonicalizes (lowercase alnum only),
+                // so it matches the same proposal AFTER the atomize/observe/export round-trip changed punctuation.
+                if (done_dump) |d2| {
+                    var mb: [48]u8 = undefined;
+                    const mk = std.fmt.bufPrint(&mb, "merge-done-{x}-", .{mergePropSig(prop)}) catch "";
+                    if (mk.len > 0 and std.mem.indexOf(u8, d2, mk) != null) continue;
+                }
                 var ab: [900]u8 = undefined;
                 self.mind().observe(pq, atomizeForObserve(&ab, prop));
                 found += 1;
@@ -9900,6 +9938,46 @@ fn propQuarantineScope(tag: []const u8) []const u8 {
     if (tag.len > 0 and tag[0] == '1') return SKILLS_PROPOSED;
     if (tag.len > 0 and tag[0] == '2') return USER_PROPOSED;
     return PLAYBOOK_PROPOSED;
+}
+
+fn propMergeDoneScope(tag: []const u8) []const u8 {
+    if (tag.len > 0 and tag[0] == '1') return SKILLS_MERGE_DONE;
+    return PLAYBOOK_MERGE_DONE; // user-model proposals are never merge candidates → default to the playbook ledger
+}
+
+/// A stable identity for a merge-candidate proposal, robust to the atomize→observe→export round-trip and the
+/// PropRow text cap. Canonicalizes (lowercase alphanumerics only) the first 400 SOURCE chars: 400 sits inside
+/// the PropRow cap so the stored/rendered copy carries the same span, and because the fact store keeps text
+/// VERBATIM (only the length-preserving atomize pass rewrote punctuation) that span is byte-identical whether the
+/// proposal was just built or read back. The span covers the scope + entry_1 in full + the start of entry_2, so
+/// two near-duplicate proposals that merely share entry_1's prefix don't collide.
+fn mergePropSig(text: []const u8) u64 {
+    const cap = @min(text.len, 400);
+    var canon: [400]u8 = undefined;
+    var cn: usize = 0;
+    for (text[0..cap]) |ch| {
+        const c = std.ascii.toLower(ch);
+        if ((c >= 'a' and c <= 'z') or (c >= '0' and c <= '9')) {
+            canon[cn] = c;
+            cn += 1;
+        }
+    }
+    return std.hash.Wyhash.hash(0, canon[0..cn]);
+}
+
+test "mergePropSig: stable across atomize/whitespace/case + PropRow truncation; distinct pairs differ" {
+    // A realistic code-heavy proposal (backticks/quotes/parens = low alnum density — the powershell case that
+    // exposed the bug). atomizeForObserve swaps ". "/"? " for ", "; the stored copy is verbatim; the resolve
+    // side is truncated to the PropRow cap. The signature must survive ALL of that so a kept/dropped pair is
+    // recognized when the curator rebuilds the same proposal next session.
+    const raw = "merge candidates in veil-playbook (same lesson class? author ONE general entry): 1) fix: `powershell -Command \"@'\"` failed (exit code 1) [+ FullyQualifiedErrorId : TerminatorExpectedAtEndOfString] because a here-string body was passed inline and the closing terminator was not at column 0 of its own line 2) fix: `powershell` here-string terminator @' must sit alone at column 0 or the parser reports a TerminatorExpected error | evidence: near-duplicate content overlap found by the curator";
+    const atomized = "merge candidates in veil-playbook (same lesson class, author ONE general entry): 1) fix: `powershell -Command \"@'\"` failed (exit code 1) [+ FullyQualifiedErrorId : TerminatorExpectedAtEndOfString] because a here-string body was passed inline and the closing terminator was not at column 0 of its own line 2) fix: `powershell` here-string terminator @' must sit alone at column 0 or the parser reports a TerminatorExpected error | evidence: near-duplicate content overlap found by the curator";
+    comptime std.debug.assert(atomized.len > 420); // the assertion below must exercise a REAL PropRow truncation
+    try std.testing.expectEqual(mergePropSig(raw), mergePropSig(atomized));
+    try std.testing.expectEqual(mergePropSig(raw), mergePropSig(atomized[0..420])); // resolve-side PropRow truncation
+    // a genuinely different pair must NOT collide
+    const other = "merge candidates in veil-skills (same lesson class, author ONE general entry): 1) use ripgrep for search across the tree 2) prefer rg over grep for large repos | evidence: overlap";
+    try std.testing.expect(mergePropSig(raw) != mergePropSig(other));
 }
 
 /// Are two stored entries near-duplicates by CONTENT? Substantial-token overlap in BOTH directions —
