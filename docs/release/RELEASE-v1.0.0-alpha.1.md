@@ -51,9 +51,9 @@ Download the bundle for your OS below, unpack it, and run it:
 
 | OS | Run |
 |---|---|
-| **Windows** | double-click `start.cmd` (or `veil.exe`) |
-| **macOS** | `./start` |
-| **Linux** | `./start` |
+| **Windows** | double-click `veil.exe` |
+| **macOS** | `./veil` |
+| **Linux** | `./veil` |
 
 That one action starts the **local server** (`http://127.0.0.1:8787`) **and opens the desktop app**. Nothing else
 to install — the bundle carries the server, the desktop, and the memory engine.
@@ -140,9 +140,9 @@ Keys live in your OS keychain — never in plaintext, never in the repo.
 
 | Asset | Contains |
 |---|---|
-| `veil-v1.0.0-windows-x86_64.zip` | **Full bundle** — server + desktop + memory engine + launcher |
-| `veil-v1.0.0-macos-*.tar.gz` | **Full bundle** for macOS |
-| `veil-v1.0.0-linux-x86_64.tar.gz` | **Full bundle** for Linux |
+| `veil-v1.0.0-windows-x86_64.zip` | **Full bundle** — server + desktop + memory engine |
+| `veil-v1.0.0-macos-arm64.zip` / `-macos-x86_64.zip` | **Full bundle** for macOS (Apple Silicon / Intel) |
+| `veil-v1.0.0-linux-x86_64.zip` | **Full bundle** for Linux |
 | `veil-server-v1.0.0-<os>-<arch>` | **Server only** — headless hosts, containers, remote boxes (no desktop) |
 | `SHA256SUMS.txt` | Checksums for every asset |
 

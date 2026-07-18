@@ -50,6 +50,23 @@
     revealables.forEach((el) => io.observe(el));
   }
 
+  // property receipt: tag the download row for the machine that's reading. Purely additive — every row
+  // stays visible and clickable, so a wrong guess (or no guess at all) costs nobody a download.
+  (() => {
+    const rows = document.getElementById('relList');
+    if (!rows) return;
+    const ua = navigator.userAgent || '';
+    const plat = navigator.platform || '';
+    let os = null;
+    if (/Win/i.test(plat) || /Windows/i.test(ua)) os = 'win';
+    else if (/Mac/i.test(plat) || /Mac OS X/i.test(ua)) os = 'macarm';
+    else if (/Linux/i.test(plat) && !/Android/i.test(ua)) os = 'linux';
+    // Apple Silicon still reports as Intel in the UA, and userAgentData is no better, so Macs guess arm64
+    // (the majority now). Both mac rows sit right there, so a miss is a glance, not a dead end.
+    const row = os && rows.querySelector('.rel-row[data-os="' + os + '"]');
+    if (row) row.classList.add('is-yours');
+  })();
+
   // grease-pencil circles on the flagged rounds
   const CIRCLE_PATH = 'M18,34 C12,16 58,6 96,9 C134,12 152,24 148,38 C144,52 100,58 62,55 C28,52 12,44 22,28 C30,15 70,8 108,12';
   document.querySelectorAll('.tl-entry[data-circle]').forEach((entry) => {

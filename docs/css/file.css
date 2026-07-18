@@ -145,6 +145,27 @@
   letter-spacing:.08em;color:var(--ink-faded);padding-top:4px;
 }
 
+/* the one call to action on the cover: take the file home */
+.cover-get{text-align:center;margin-top:24px}
+.cover-get-link{
+  display:inline-block;
+  font-family:'Stardos Stencil',sans-serif;font-weight:700;font-size:16px;letter-spacing:.14em;
+  color:var(--bond);background:var(--red-ink);text-decoration:none;
+  padding:11px 26px;border:2px solid var(--red-ink);
+  box-shadow:3px 3px 0 rgba(38,33,23,.28);
+  transition:background .18s ease,color .18s ease,transform .18s cubic-bezier(.2,1.3,.35,1),box-shadow .18s ease;
+}
+.cover-get-link:hover,.cover-get-link:focus-visible{
+  background:transparent;color:var(--red-ink);transform:translate(-1px,-2px);box-shadow:5px 6px 0 rgba(38,33,23,.22);
+}
+.cover-get-sub{
+  display:block;margin-top:10px;
+  font-family:'Courier Prime',monospace;font-size:12.5px;letter-spacing:.04em;color:var(--ink-faded);
+}
+@media (min-width:760px){
+  .cover-get-sub{display:inline;margin-top:0;margin-left:12px}
+}
+
 /* GitHub corner link on the cover */
 .cover-repo{
   text-align:center;margin-top:10px;
@@ -254,3 +275,68 @@
   .veil-vapor{transition:none}
 }
 @media (max-width:640px){ .veil-cord{right:10px} .veil-cord .cord-line{height:44px} }
+
+/* ============================================================
+   RELEASED TO BEARER — the property receipt (downloads)
+   Sits between the cover and the board: the one thing on this
+   page a visitor can walk away with.
+   ============================================================ */
+.release{padding-top:64px}
+.receipt{
+  --tilt:.4deg;                        /* .reveal.in reads this; don't hardcode transform */
+  position:relative;max-width:760px;margin:0 auto;background:var(--bond);
+  padding:clamp(22px,4.5vw,44px) clamp(16px,4.5vw,48px);
+  box-shadow:0 3px 8px rgba(50,30,5,.28), 0 14px 34px -10px rgba(50,30,5,.35);
+  transform:rotate(var(--tilt));
+}
+.receipt::after{content:"";position:absolute;inset:0;background-image:var(--grain);opacity:.5;pointer-events:none}
+.receipt-caption{
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:13px;letter-spacing:.1em;
+  text-align:center;border-bottom:2px solid var(--ink);padding-bottom:10px;margin-bottom:6px;
+}
+
+.rel-list{list-style:none;position:relative;z-index:1}
+.rel-row{
+  /* fixed filename + button tracks: `auto` sizes each row to its OWN text, which staggers the
+     columns down the page. A receipt's columns line up. */
+  display:grid;grid-template-columns:minmax(0,1fr) 212px 104px;gap:14px;align-items:baseline;
+  padding:13px 4px;border-bottom:1.5px dotted rgba(74,66,52,.45);
+  font-family:'Special Elite',monospace;font-size:14.5px;
+}
+.rel-os{font-family:'Stardos Stencil',sans-serif;font-weight:700;letter-spacing:.04em;font-size:16px}
+.rel-arch{font-family:'Courier Prime',monospace;font-weight:400;font-size:12px;color:var(--ink-faded);letter-spacing:.06em}
+.rel-file{font-family:'Courier Prime',monospace;font-size:12.5px;color:var(--ink-faded);white-space:nowrap}
+.rel-get{
+  font-family:'Stardos Stencil',sans-serif;font-weight:700;font-size:13px;letter-spacing:.12em;
+  color:var(--bond);background:var(--red-ink);text-decoration:none;
+  padding:7px 15px;border:2px solid var(--red-ink);white-space:nowrap;
+  transition:background .18s ease,color .18s ease,transform .18s cubic-bezier(.2,1.3,.35,1);
+}
+.rel-get:hover,.rel-get:focus-visible{background:transparent;color:var(--red-ink);transform:translateY(-1px)}
+
+/* the row matching the visitor's own machine, tagged by main.js */
+.rel-row.is-yours .rel-os::after{
+  content:"YOUR MACHINE";
+  font-family:'Courier Prime',monospace;font-weight:700;font-size:10px;letter-spacing:.14em;
+  color:var(--red-ink);border:1.5px solid var(--red-ink);padding:2px 6px;margin-left:10px;
+  white-space:nowrap;vertical-align:middle;
+}
+
+.rel-notes{margin-top:18px;position:relative;z-index:1}
+.rel-notes p{font-size:14px;line-height:1.6;margin-top:10px;color:var(--ink-faded)}
+.rel-notes code,.rel-src code{
+  font-family:'Courier Prime',monospace;font-size:12.5px;
+  background:rgba(110,74,39,.12);padding:1px 5px;
+}
+.rel-src{overflow-x:auto}
+.rel-src code{white-space:nowrap}
+
+@media (max-width:640px){
+  /* two rows: OS + button on top, filename beneath. Explicit placement — auto-flow drops the button
+     onto a third row of its own once the filename spans the full width. */
+  .rel-row{grid-template-columns:minmax(0,1fr) auto;row-gap:6px;align-items:center}
+  .rel-os{grid-area:1/1}
+  .rel-get{grid-area:1/2}
+  .rel-file{grid-area:2/1/auto/-1;white-space:normal;word-break:break-all}
+  .rel-row.is-yours .rel-os::after{display:block;margin:4px 0 0;width:max-content}
+}
