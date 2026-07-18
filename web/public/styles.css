@@ -744,6 +744,11 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .key-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
 .key-row:last-child { border-bottom: 0; }
 
+/* Button and its caveat: side by side when there is room, stacked when there is
+   not. A plain flex row let the text run underneath the button at narrow widths. */
+.key-add { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.key-add .muted { flex: 1 1 260px; font-size: calc(var(--fs-micro) * var(--text-scale)); line-height: 1.4; }
+
 .auth-note {
   margin-top: 12px; text-align: center;
   font-size: calc(var(--fs-small) * var(--text-scale)); color: var(--text-muted);
