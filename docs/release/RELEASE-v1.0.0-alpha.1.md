@@ -1,5 +1,30 @@
 # the veil — v1.0.0-alpha.1
 
+## ⬇ Which file do I download?
+
+| You're on | Download |
+|---|---|
+| **Windows** | **`veil-v1.0.0-windows-x86_64.zip`** |
+| **macOS** (Apple Silicon) | **`veil-v1.0.0-macos-arm64.zip`** |
+| **macOS** (Intel) | **`veil-v1.0.0-macos-x86_64.zip`** |
+| **Linux** | **`veil-v1.0.0-linux-x86_64.zip`** |
+
+Unzip it, then run **`veil.exe`** (Windows) or **`./veil`** (macOS/Linux). That single action starts the
+server *and* opens the app.
+
+> **Do NOT download "Source code (zip / tar.gz)"** at the bottom of this page. GitHub attaches those to every
+> release automatically — they're the raw repo, and building from them needs the Zig compiler. Likewise
+> `install.ps1` inside that source archive is a *developer* installer, not the app.
+>
+> The `veil-server-*` files are the **headless** control plane for servers — no desktop app. Most people
+> don't want these.
+
+**Unsigned build:** these binaries aren't code-signed yet, so Windows shows *"Windows protected your PC"*
+(click **More info → Run anyway**) and macOS says the developer can't be verified (**right-click → Open**, or
+`xattr -dr com.apple.quarantine <folder>`). Signing certificates are on the list for v1.0.0 proper.
+
+---
+
 > **This is an alpha.** A real, working build — but with known gaps, stated up front rather than buried:
 >
 > - **Default admin password.** The local admin is `admin@neuron-loops.local` / `changeme`. The server binds
