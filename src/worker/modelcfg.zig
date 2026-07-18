@@ -55,6 +55,44 @@ const parsed: Parsed = blk: {
     break :blk parse();
 };
 
+/// Which catalog provider does this base URL belong to? Matched on HOST, so a base that carries a
+/// different path or a trailing slash than the catalog's still resolves (callers hand-type these).
+/// Used to look a BYOK key up in the vault when a request arrives with a blank key — the browser
+/// never holds a provider key, so the server has to know which one an endpoint wants.
+/// Empty / unknown / placeholder-bearing bases return null rather than guessing.
+pub fn providerForBase(base_url: []const u8) ?[]const u8 {
+    const h = hostOf(base_url);
+    if (h.len == 0) return null;
+    for (providers) |p| {
+        if (p.local or p.base_url.len == 0) continue;
+        if (std.mem.indexOf(u8, p.base_url, "{account}") != null) continue; // Cloudflare: OAuth path, not BYOK
+        const ph = hostOf(p.base_url);
+        if (ph.len != 0 and std.mem.eql(u8, ph, h)) return p.key;
+    }
+    return null;
+}
+
+/// Host component of a URL: scheme stripped, path/query dropped, port KEPT (a different port is a
+/// different endpoint). Lowercased comparison is not needed — hosts here are catalog-authored or
+/// typed, and a case-mismatched host is better left unresolved than silently matched.
+fn hostOf(url: []const u8) []const u8 {
+    var s = std.mem.trim(u8, url, " \r\n\t");
+    if (std.mem.indexOf(u8, s, "://")) |i| s = s[i + 3 ..];
+    if (std.mem.indexOfAny(u8, s, "/?#")) |i| s = s[0..i];
+    return s;
+}
+
+test "providerForBase matches on host, ignoring path and trailing slash" {
+    const t = std.testing;
+    try t.expectEqualStrings("deepseek", providerForBase("https://api.deepseek.com/v1").?);
+    try t.expectEqualStrings("deepseek", providerForBase("https://api.deepseek.com/v1/").?);
+    try t.expectEqualStrings("openai", providerForBase("https://api.openai.com/v1").?);
+    // a local endpoint is never a BYOK provider, and neither is an unknown host
+    try t.expect(providerForBase("http://127.0.0.1:11434/v1") == null);
+    try t.expect(providerForBase("https://example.invalid/v1") == null);
+    try t.expect(providerForBase("") == null);
+}
+
 /// May this provider deploy WITHOUT an api key? (local endpoints, or server-side credential fallback)
 pub fn isKeyless(key: []const u8) bool {
     for (providers) |p| {

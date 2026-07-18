@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const llm = @import("llm.zig");
-const modelcfg = @import("modelcfg.zig");
+const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — shared with the compiled-in desk
 const httpc = @import("httpc.zig");
 const tools = @import("tools.zig");
 const commons = @import("commons.zig");

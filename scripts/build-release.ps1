@@ -1,9 +1,10 @@
 # ============================================================================
 # build-release.ps1 - package a self-contained veil release bundle (Windows).
 #
-# Produces dist\veil-v<ver>-windows-x86_64.zip containing the server (veil.exe),
-# the desktop (veil-desk.exe), the memory engine (bin\neuron.exe), and a
-# start.cmd that runs the server AND the desktop together.
+# Produces dist\veil-v<ver>-windows-x86_64.zip containing the app (veil.exe -
+# ONE binary: the desktop GUI is compiled in and runs in-process alongside its
+# server), the memory engine (bin\neuron.exe), and a start.cmd. There is no
+# separate veil-desk.exe in the bundle any more.
 #
 #   scripts\build-release.ps1
 #
@@ -29,15 +30,15 @@ if ($env:NO_BOOTSTRAP -ne '1') {
   $Zig = if ($env:ZIG) { $env:ZIG } else { 'zig' }
 }
 
-# ---- 1. build server + desktop ----
-Say 'building the server + desktop (zig build -Ddesk=true)'
+# ---- 1. build the app (ONE binary - the desktop GUI is compiled into veil.exe) ----
+# No separate veil-desk build: `zig build` (-Dapp defaults to true) links raylib and the desk sources
+# straight into veil.exe, and a bare `veil` runs the window in-process.
+Say 'building the app (zig build - desktop GUI compiled in)'
 Push-Location $Root
-& $Zig build -Ddesk=true
+& $Zig build
 Pop-Location
 $Server = Join-Path $Root 'zig-out\bin\veil.exe'
-$Desk   = Join-Path $Root 'desk\zig-out\bin\veil-desk.exe'
-if (-not (Test-Path $Server)) { throw "server binary not found at $Server" }
-if (-not (Test-Path $Desk)) { Say '! veil-desk not built - bundling server only' }
+if (-not (Test-Path $Server)) { throw "veil binary not found at $Server" }
 
 # ---- 2. locate or build the neuron memory engine ----
 $Neuron = $null
@@ -62,22 +63,23 @@ $Out  = Join-Path $Dist $Name
 if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
 New-Item -ItemType Directory -Force -Path (Join-Path $Out 'bin') | Out-Null
 Copy-Item $Server (Join-Path $Out 'veil.exe')
-if (Test-Path $Desk) { Copy-Item $Desk (Join-Path $Out 'veil-desk.exe') }
 if ($Neuron) { Copy-Item $Neuron (Join-Path $Out 'bin\neuron.exe') }
 
+# A bare `veil.exe` IS the app now (window + server in one process) - no flag, no second binary to start.
 @"
 @echo off
 cd /d "%~dp0"
-veil.exe --desk %*
+veil.exe %*
 "@ | Set-Content -Encoding ascii (Join-Path $Out 'start.cmd')
 
 @"
 the veil - v$Version ($Os/$Arch)
 
-Run:  double-click start.cmd
-It starts the server on http://127.0.0.1:8787 and opens the desktop dashboard.
+Run:  double-click start.cmd  (or veil.exe directly - same thing)
+It opens the desktop dashboard and runs its server on http://127.0.0.1:8787,
+both inside the one process.
 Configure a model on first run (a local Ollama, or a hosted/BYOK endpoint).
-Server-only:  veil.exe        (no desktop)
+Server-only:  veil.exe --server-only     (no window)
 
 https://github.com/gary23w/nl-veil
 "@ | Set-Content -Encoding ascii (Join-Path $Out 'README.txt')

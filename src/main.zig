@@ -28,9 +28,17 @@ const rate = @import("worker/rate.zig");
 const admin_service = @import("admin/admin_service.zig");
 const billing_seam = @import("plan/billing_seam.zig");
 const keys_api = @import("config/keys_api.zig");
+const local_models = @import("config/local_models.zig");
 const cf_oauth = @import("config/cf_oauth.zig");
 const worker = @import("worker/run.zig");
 const cli = @import("cli.zig");
+const build_options = @import("build_options");
+
+/// Whether the desktop GUI is compiled into this binary (`-Dapp`, default true). False = the server-only
+/// build: no raylib, no GL/X11, and no `desk` module in the graph at all — hence the comptime branch, which
+/// keeps @import("desk") out of the server-only compilation entirely.
+pub const HAS_GUI = build_options.gui;
+const desk = if (HAS_GUI) @import("desk") else struct {};
 
 // .info, explicitly: the default log_level tracks the optimize mode, and the ReleaseFast default (.err)
 // would silently swallow every operational message below — including the one-shot generated-admin-password
@@ -263,11 +271,15 @@ fn ownProcessTree(environ: *std.process.Environ.Map) void {
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     // ONE-CLICK DEFAULT: a bare `veil` — what a double-click runs — boots the server AND opens the desk, so the
-    // shipped bundle is a single icon that brings the whole app up. `--server-only` (alias `--headless`) keeps
+    // shipped binary is a single icon that brings the whole app up. `--server-only` (alias `--headless`) keeps
     // the server-only behaviour for headless boxes, service managers, and every internal auto-start that
     // launches its own UI (cli.zig ensureServer and restart-veil.ps1 both pass it). CLI verbs are unaffected:
     // they run and return well before the server (and therefore the desk) is ever started.
-    var desktop_mode = true;
+    //
+    // In a `-Dapp=false` build there is no GUI to open, so this is pinned false and every `veil` invocation
+    // behaves exactly like --server-only.
+    var desktop_mode = HAS_GUI;
+    var desk_requested = false; // an explicit --desk, so a server-only build can say why it did nothing
     // A real threaded io instead of the default init.io. httpz runs a pool of ~32 worker threads that
     // correctly BLOCK on a condition variable when there is no work — but the default init.io busy-SPINS
     // those blocking waits on Windows, pinning ~10 CPU cores with the server completely idle (0 swarms, no
@@ -313,10 +325,16 @@ pub fn main(init: std.process.Init) !void {
                 return;
             }
             cli_sub = try gpa.dupe(u8, sub);
-            if (std.mem.eql(u8, sub, "--desk")) desktop_mode = true;
+            if (std.mem.eql(u8, sub, "--desk")) {
+                desk_requested = true;
+                desktop_mode = HAS_GUI;
+            }
             if (isServerOnly(sub)) desktop_mode = false;
             while (it.next()) |arg| {
-                if (std.mem.eql(u8, arg, "--desk")) desktop_mode = true;
+                if (std.mem.eql(u8, arg, "--desk")) {
+                    desk_requested = true;
+                    desktop_mode = HAS_GUI;
+                }
                 if (isServerOnly(arg)) desktop_mode = false;
                 cli_args.append(gpa, try gpa.dupe(u8, arg)) catch {};
             }
@@ -498,6 +516,9 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/keys", keys_api.putKey, .{});
     router.get("/api/v1/keys", keys_api.listKeys, .{});
     router.delete("/api/v1/keys/:provider", keys_api.delKey, .{});
+    // Which local models Ollama has ACTUALLY pulled — the catalog lists what is worth running, not
+    // what is installed, and only this machine can answer the difference.
+    router.get("/api/v1/models/local", local_models.list, .{});
     router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
     router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
     router.get("/api/v1/oauth/cloudflare/status", cf_oauth.status, .{});
@@ -540,16 +561,80 @@ pub fn main(init: std.process.Init) !void {
     // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
     // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
     if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
-    // APP MODE owns the desk's lifetime. The job goes up FIRST so the desk (and every worker spawned after it)
-    // is born inside it. Then, if we actually spawned a desk, a watcher thread turns "user closed the desk"
-    // into a clean server shutdown — the fix for the orphaned :8787 server with no UI and no way to stop it.
-    // None of this runs under --server-only, and none of it runs if the desk was already up on its own: we
-    // only ever wait on a child WE spawned.
-    if (desktop_mode) {
-        ownProcessTree(init.environ_map);
-        if (launchDesktop(gpa, io, paths.home, init.environ_map)) |child| watchDesk(gpa, io, child, &server);
+    if (desk_requested and !HAS_GUI)
+        log.warn("--desk ignored: this is the SERVER-ONLY build (-Dapp=false), which has no GUI compiled in. The server itself is up (see the URL above) — open it in a browser, or use the standard build.", .{});
+
+    // ---- SERVER-ONLY: today's behaviour, unchanged. listen() blocks main until the process is stopped. ----
+    if (!desktop_mode or !HAS_GUI) return server.listen();
+
+    // ---- APP MODE: one process, GUI on the main thread, server on a background thread. ----
+    // raylib's window creation and event pump are main-thread-only, and `try server.listen()` blocks forever —
+    // so the two swap places relative to the old shell-out design. The desk is no longer a child process, so
+    // there is nothing to spawn and nothing to wait on: runApp RETURNING (user closed the window) is the
+    // shutdown signal that DeskWatch used to derive from a child exit.
+    //
+    // The job object still goes up FIRST, and still matters: workers, neuron, and the browser host are all
+    // spawned from this process, and a kill-on-job-close job is the only thing that reaps them when we are
+    // hard-killed (Task Manager) and no defer or watcher ever runs.
+    ownProcessTree(init.environ_map);
+    var st = ServerThread{ .server = &server, .port = port };
+    const server_thread = std.Thread.spawn(.{}, ServerThread.run, .{&st}) catch |e| {
+        // No server thread = no backend for the GUI to talk to. Fall back to the blocking listen rather than
+        // opening a window onto nothing.
+        log.err("could not start the HTTP thread ({t}) — running server-only on this thread instead", .{e});
+        return server.listen();
+    };
+    server_thread.detach();
+    // Give httpz a moment to actually bind before the GUI's 1Hz liveness probe starts. The desk handles an
+    // offline server fine (it just renders disconnected and retries), so this is cosmetic — it only avoids a
+    // "server offline" flash on every launch. Bounded and best-effort: never block the window on the backend.
+    awaitServer(gpa, io, port, 3000);
+
+    desk.runApp(paths.data) catch |e| log.err("desktop GUI exited with an error: {t}", .{e});
+
+    // The window IS the app's lifetime (same contract the old DeskWatch enforced across the process boundary).
+    log.info("desktop window closed — shutting down. Use --server-only to run the server without a GUI.", .{});
+    server.stop(); // wake the listen thread so it unwinds instead of holding the port
+    // Then exit outright rather than returning: main's `defer server.deinit()` would race the listen thread
+    // that is still unwinding, and the job object (Windows) reaps the descendants on process exit anyway.
+    threadSleepMs(io, 150);
+    std.process.exit(0);
+}
+
+/// Runs httpz's blocking accept loop OFF the main thread so raylib can own main. Everything it touches
+/// (`server`) lives on main's stack for the life of the process — main never returns normally in app mode, it
+/// exits via std.process.exit once the window closes.
+const ServerThread = struct {
+    server: *httpz.Server(*App),
+    port: u16,
+
+    fn run(self: *ServerThread) void {
+        self.server.listen() catch |e| {
+            // Almost always "port already in use" — another veil is up. Say so loudly: the GUI will come up
+            // regardless and would otherwise just look mysteriously disconnected.
+            log.err("HTTP server failed to listen on port {d}: {t} — the desktop window will open but has NO backend (is another veil already running?)", .{ self.port, e });
+        };
     }
-    try server.listen();
+};
+
+/// Poll the loopback health endpoint until the server answers or `budget_ms` elapses. Best-effort and
+/// deliberately short: a slow bind must delay the window, never prevent it.
+fn awaitServer(gpa: std.mem.Allocator, io: std.Io, port: u16, budget_ms: u64) void {
+    const httpc = @import("worker/httpc.zig");
+    var waited: u64 = 0;
+    while (waited < budget_ms) {
+        switch (httpc.request(io, gpa, .{ .method = "GET", .port = port, .path = "/api/v1/health", .timeout_s = 2, .cap = 4 << 10 })) {
+            .ok => |resp| {
+                const up = resp.status == 200;
+                if (resp.body.len > 0) gpa.free(resp.body);
+                if (up) return;
+            },
+            else => {},
+        }
+        threadSleepMs(io, 50);
+        waited += 50;
+    }
+    log.warn("HTTP server was not answering on port {d} after {d}ms — opening the window anyway; it will connect when the server comes up", .{ port, budget_ms });
 }
 
 const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
@@ -577,77 +662,12 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
     log.info("veil-desk: preloaded an admin API key at <data>/.desktop_key (localhost)", .{});
 }
 
-const DESK_EXE = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
-
-/// "Host the desktop": when desktop mode is requested (`--desk`, or the one-click default), launch the
-/// veil-desk dashboard if it was built (desk/zig-out/bin/veil-desk) so it sits in the tray and lights up on
-/// the server. Best-effort — a headless box either has no binary (built with -Ddesk=false) or no display, and
-/// the spawn simply fails without touching the server. Opt out with NL_NO_DESKTOP=1.
-///
-/// Returns the child so the caller can OWN its lifetime (see watchDesk); null means no desk of ours is
-/// running, and the caller must not shut anything down on its account.
-fn launchDesktop(gpa: std.mem.Allocator, io: std.Io, home: []const u8, environ: *std.process.Environ.Map) ?std.process.Child {
-    if (environ.get("NL_NO_DESKTOP")) |v| {
-        if (v.len > 0 and !std.mem.eql(u8, v, "0")) return null;
-    }
-    // Two layouts host the desktop: a release BUNDLE puts veil-desk right next to the server, and a
-    // dev CHECKOUT builds it under desk/zig-out/bin. Try the bundle path first, then the checkout path.
-    const bundle = std.fmt.allocPrint(gpa, "{s}/{s}", .{ home, DESK_EXE }) catch return null;
-    defer gpa.free(bundle);
-    const checkout = std.fmt.allocPrint(gpa, "{s}/desk/zig-out/bin/{s}", .{ home, DESK_EXE }) catch return null;
-    defer gpa.free(checkout);
-    const bin = if (std.Io.Dir.cwd().access(io, bundle, .{})) |_|
-        bundle
-    else |_| if (std.Io.Dir.cwd().access(io, checkout, .{})) |_|
-        checkout
-    else |_| {
-        // NOT SILENT. A user who double-clicked the standalone server binary used to get a blank console and
-        // conclude the release was broken. Name the situation instead.
-        log.warn("no {s} next to this binary — this is the SERVER-ONLY build, so there is no desktop UI to open. The server itself is up (see the URL above); for the app, use the full bundle that ships {s} alongside {s}, or pass --server-only to silence this.", .{ DESK_EXE, DESK_EXE, if (builtin.os.tag == .windows) "veil.exe" else "veil" });
-        return null; // not built in either layout → nothing to host
-    };
-    const child = std.process.spawn(io, .{ .argv = &.{bin}, .cwd = .{ .path = home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch |e| {
-        log.warn("veil-desk: found {s} but could not launch it ({t}) — the server is up, open http://127.0.0.1:8787 in a browser instead", .{ bin, e });
-        return null;
-    };
-    log.info("veil-desk: launched the desktop dashboard (set NL_NO_DESKTOP=1 to disable)", .{});
-    return child;
-}
-
-/// Ties the server's life to the desk WE spawned: wait on the child, and when it exits, stop httpz and go
-/// away. Without this, closing the desk left a headless server holding :8787 with no UI and no ordinary way
-/// to stop it. Only ever constructed in app mode, and only for a child we launched ourselves.
-const DeskWatch = struct {
-    io: std.Io,
-    child: std.process.Child,
-    server: *httpz.Server(*App),
-
-    fn run(self: *DeskWatch) void {
-        if (builtin.os.tag == .windows) {
-            // Raw WaitForSingleObject on the child's hProcess rather than Child.wait: this is a plain
-            // std.Thread, not an Io task, and the handle is exactly what we need to block on.
-            if (self.child.id) |h| _ = winapp.WaitForSingleObject(h, winapp.INFINITE) else return;
-        } else {
-            _ = self.child.wait(self.io) catch return;
-        }
-        log.info("veil-desk closed — shutting down (app mode: the desk's window IS the app's lifetime). Use --server-only to run the server without a desk.", .{});
-        self.server.stop(); // unblocks listen() in main, which then unwinds and exits normally
-        // BACKSTOP. If listen() somehow does not unwind, exit anyway — leaving the orphaned server behind is
-        // the exact bug this whole path exists to kill. On Windows the job object then reaps the children.
-        threadSleepMs(self.io, 3000);
-        std.process.exit(0);
-    }
-};
-
-fn watchDesk(gpa: std.mem.Allocator, io: std.Io, child: std.process.Child, server: *httpz.Server(*App)) void {
-    // Heap-allocated and intentionally never freed: it outlives this call and lives until the process exits.
-    const w = gpa.create(DeskWatch) catch return;
-    w.* = .{ .io = io, .child = child, .server = server };
-    if (std.Thread.spawn(.{}, DeskWatch.run, .{w})) |t| t.detach() else |e| {
-        gpa.destroy(w);
-        log.warn("veil-desk: could not start the exit watcher ({t}) — closing the desk will leave the server running; stop it from the tray or Task Manager", .{e});
-    }
-}
+// GONE, and deliberately: launchDesktop / DeskWatch / watchDesk. The desk used to be a SEPARATE
+// veil-desk.exe that this process spawned, found by probing two layouts (bundle-adjacent, then
+// desk/zig-out/bin), with a watcher thread blocking on the child handle to turn "user closed the desk" into a
+// server shutdown. The GUI is now compiled in and runs on the main thread, so there is no child to find, no
+// spawn to fail, and no handle to wait on — runApp returning IS the exit signal (see app mode in main).
+// NL_NO_DESKTOP is likewise retired; `--server-only` is the one way to ask for a server without a window.
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .ok = true, .service = "veil", .version = VERSION }, .{});
