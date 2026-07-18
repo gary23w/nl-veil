@@ -1236,10 +1236,20 @@ function renderSettings(host) {
         </div>
         <div id="keyList"><div class="muted">loading…</div></div>
         <div class="field-row" style="margin-top:10px">
-          <div class="field"><label for="kProv">Provider</label><input id="kProv" type="text" placeholder="openai"></div>
-          <div class="field"><label for="kBase">Base URL (optional)</label><input id="kBase" type="text" placeholder="https://…"></div>
+          <div class="field"><label for="kProv">Provider</label>
+            <input id="kProv" type="text" placeholder="openai" autocapitalize="none" spellcheck="false"></div>
+          <div class="field"><label for="kBase">Base URL (optional)</label>
+            <input id="kBase" type="text" placeholder="https://…" autocapitalize="none" spellcheck="false"></div>
         </div>
-        <div class="row"><button class="btn btn-sm" id="kAdd">Add a provider key</button></div>
+        <div class="field">
+          <label for="kKey">API key</label>
+          <input id="kKey" type="password" placeholder="sk-…" autocomplete="off"
+                 autocapitalize="none" spellcheck="false" enterkeyhint="done">
+        </div>
+        <div class="key-add">
+          <button class="btn btn-solid btn-sm" id="kAdd">Add a provider key</button>
+          <span class="muted">sent once to your local server and sealed there — never stored in this browser</span>
+        </div>
       </div>
 
       <div class="section-head"><h2>Account</h2></div>
@@ -1267,6 +1277,7 @@ function renderSettings(host) {
   el('setLoop').addEventListener('change', (e) => { S.settings.loop = parseInt(e.target.value, 10) || 0; saveSettings(); });
   el('setOut').addEventListener('click', async () => { try { await api.logout(); } catch (e) {} onSignedOut(); });
   el('kAdd').addEventListener('click', addProviderKey);
+  el('kKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addProviderKey(); } });
 
   drawRolePanels();
   refreshKeys();
@@ -1457,9 +1468,11 @@ function roleKeyState(roleKey) {
     return '<span class="ok-dot"></span>no key needed — ' + esc(providerLabel(prov));
   }
   const have = (S.keys || []).some((k) => k.provider === prov);
+  // Phrased without an article: "needs a openrouter key" was the alternative, and
+  // an a/an rule keyed on provider names is not worth carrying.
   return have
     ? '<span class="ok-dot"></span>uses your stored <b>' + esc(prov) + '</b> key'
-    : '<span class="bad-dot"></span>needs a <b>' + esc(prov) + '</b> key — add one under Provider keys';
+    : '<span class="bad-dot"></span>no <b>' + esc(prov) + '</b> key stored — add one under Provider keys';
 }
 
 function refreshRoleKeyStates() {
@@ -1502,22 +1515,32 @@ async function refreshKeys() {
   }
 }
 
-/* A provider key is a credential, so it never lands in our own state or in
-   localStorage: the value goes straight from the prompt into the POST body, and
-   the server answers with only a last4 and a fingerprint. */
+/* A provider key is a credential, so it never lands in S, in localStorage, or in
+   any URL: the value goes straight from the field into the POST body and the
+   field is cleared immediately, whether the request succeeded or not. The
+   server answers with only a last4 and a fingerprint — the key itself never
+   comes back. (This used to call prompt(), which browsers block outright in
+   several contexts, so there was no way to enter a key at all.) */
 async function addProviderKey() {
-  const provider = el('kProv').value.trim();
-  if (!provider) return toast('Provider required', 'e.g. openai, anthropic, deepseek', 'err');
-  const key = prompt('Paste the API key for "' + provider + '".\nIt goes to your local server and is sealed there.');
-  if (!key) return;
+  const provEl = el('kProv'), keyEl = el('kKey'), baseEl = el('kBase');
+  const provider = provEl.value.trim();
+  const key = keyEl.value.trim();
+  if (!provider) { provEl.focus(); return toast('Provider required', 'e.g. openai, anthropic, deepseek', 'err'); }
+  if (!key) { keyEl.focus(); return toast('Key required', 'Paste the provider API key.', 'err'); }
+
+  const btn = el('kAdd');
+  btn.disabled = true;
   try {
-    await jpost('/api/v1/keys', { provider: provider, key: key.trim(), base_url: el('kBase').value.trim() });
-    toast('Key stored', provider, 'ok');
-    el('kProv').value = '';
-    el('kBase').value = '';
-    refreshKeys();
+    await jpost('/api/v1/keys', { provider: provider, key: key, base_url: baseEl.value.trim() });
+    toast('Key stored', providerLabel(provider) + ' — sealed server-side.', 'ok');
+    provEl.value = '';
+    baseEl.value = '';
+    refreshKeys();       // repaints the list AND the per-role "uses your stored X key" lines
   } catch (e) {
     toast('Could not store the key', e.message, 'err');
+  } finally {
+    keyEl.value = '';    // cleared on every path — a failed POST must not leave it sitting in the DOM
+    btn.disabled = false;
   }
 }
 
