@@ -22,7 +22,8 @@ const S = {
   online: false,
   fleet: { live: 0, minds: 0, headroom: 0 },
   metrics: null,
-  models: null,         // parsed models.json
+  models: null,         // parsed models.json — the shared catalog
+  keys: [],             // provider keys on file (never the key itself)
   // chat
   convs: [],
   conv: null,           // active conversation id
@@ -1246,24 +1247,134 @@ function setScale(v) {
   document.documentElement.style.setProperty('--text-scale', String(v));
 }
 
+/* ---------------- the model catalog ----------------
+   models.json ships 79 models across 14 providers with context window, tool
+   reliability, cost tier and a prose note. A blank text box asks the user to
+   have memorised a model slug; a grouped picker just shows them what exists.
+   The free-text row stays underneath, because a custom endpoint must remain
+   expressible — the catalog is a shortcut, not a cage. */
+
+function providerLabel(key) {
+  const p = S.models && S.models.providers && S.models.providers.find((x) => x.key === key);
+  return p ? p.label : key;
+}
+
+function providerBase(key) {
+  const p = S.models && S.models.providers && S.models.providers.find((x) => x.key === key);
+  if (!p) return '';
+  // "local" and "cloudflare" are sentinels, not URLs: Ollama is resolved by the
+  // server's own default and Workers AI goes through the OAuth token path.
+  if (!p.base_url || p.base_url === 'local' || p.base_url === 'cloudflare') return '';
+  return p.base_url;
+}
+
+function modelById(id) {
+  return (S.models && S.models.models || []).find((m) => m.id === id) || null;
+}
+
+/** Group the catalog by provider, hosting-local first so an offline user sees
+    what actually runs on their machine before a list of paid endpoints. */
+function catalogOptions(selected) {
+  const models = (S.models && S.models.models) || [];
+  if (!models.length) return '';
+  const byProv = new Map();
+  for (const m of models) {
+    if (!byProv.has(m.provider)) byProv.set(m.provider, []);
+    byProv.get(m.provider).push(m);
+  }
+  const keys = Array.from(byProv.keys()).sort((a, b) => {
+    const la = byProv.get(a)[0].hosting === 'local' ? 0 : 1;
+    const lb = byProv.get(b)[0].hosting === 'local' ? 0 : 1;
+    return la - lb || providerLabel(a).localeCompare(providerLabel(b));
+  });
+  let html = '<option value="">— custom / not listed —</option>';
+  for (const k of keys) {
+    html += `<optgroup label="${esc(providerLabel(k))}">`;
+    for (const m of byProv.get(k)) {
+      const tags = [];
+      if (m.context) tags.push(Math.round(m.context / 1000) + 'k');
+      if (m.tools && m.tools !== 'reliable') tags.push('tools: ' + m.tools);
+      if (m.cost) tags.push(m.cost);
+      html += `<option value="${esc(m.id)}"${m.id === selected ? ' selected' : ''}>`
+            + esc(m.label) + (tags.length ? ' · ' + esc(tags.join(' · ')) : '') + '</option>';
+    }
+    html += '</optgroup>';
+  }
+  return html;
+}
+
 function drawRolePanels() {
   const host = el('rolePanels');
   if (!host) return;
   const roles = S.settings.oneModel ? [ROLES[0]] : ROLES;
-  host.innerHTML = roles.map((r) => `
+  const loaded = !!(S.models && S.models.models && S.models.models.length);
+
+  host.innerHTML = roles.map((r) => {
+    const cur = S.settings[r.key + 'model'] || '';
+    const known = modelById(cur);
+    return `
     <div class="role-panel">
       <div class="role-title">${r.label}<span class="muted"> — ${esc(r.hint)}</span></div>
+      ${loaded ? `
+        <div class="field">
+          <label>Model</label>
+          <select data-pick="${r.key}">${catalogOptions(cur)}</select>
+          <div class="model-note muted" data-note="${r.key}">${known && known.note ? esc(known.note) : ''}</div>
+        </div>` : '<div class="muted" style="margin-bottom:10px">catalog unavailable — enter a model by hand</div>'}
       <div class="field-row">
-        <div class="field"><label>Model</label><input type="text" data-set="${r.key}model" value="${esc(S.settings[r.key + 'model'] || '')}" placeholder="gpt-oss:20b"></div>
-        <div class="field"><label>Base URL</label><input type="text" data-set="${r.key}base_url" value="${esc(S.settings[r.key + 'base_url'] || '')}" placeholder="http://127.0.0.1:11434/v1"></div>
+        <div class="field"><label>Model id</label>
+          <input type="text" data-set="${r.key}model" value="${esc(cur)}" placeholder="gpt-oss:20b"></div>
+        <div class="field"><label>Base URL</label>
+          <input type="text" data-set="${r.key}base_url" value="${esc(S.settings[r.key + 'base_url'] || '')}" placeholder="http://127.0.0.1:11434/v1"></div>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
+
+  $$('[data-pick]', host).forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const role = sel.dataset.pick;
+      const id = sel.value;
+      const m = modelById(id);
+      S.settings[role + 'model'] = id;
+      // Picking from the catalog fills the base URL too, since a model id
+      // pointed at the wrong endpoint is the most common way to get a 404 that
+      // reads like a model problem.
+      if (m) S.settings[role + 'base_url'] = providerBase(m.provider);
+      saveSettings();
+      const idIn = host.querySelector('[data-set="' + role + 'model"]');
+      const baseIn = host.querySelector('[data-set="' + role + 'base_url"]');
+      if (idIn) idIn.value = S.settings[role + 'model'];
+      if (baseIn) baseIn.value = S.settings[role + 'base_url'] || '';
+      const note = host.querySelector('[data-note="' + role + '"]');
+      if (note) note.textContent = m && m.note ? m.note : '';
+      updateCharCount();   // the composer's cap follows the coding model's size
+      if (m && m.provider) needsKeyHint(m.provider);
+    });
+  });
+
   $$('[data-set]', host).forEach((inp) => {
     inp.addEventListener('change', () => {
       S.settings[inp.dataset.set] = inp.value.trim();
       saveSettings();
+      // A hand-typed id may not be in the catalog; drop the select to "custom"
+      // rather than letting it claim a model the user did not choose.
+      if (inp.dataset.set.endsWith('model')) {
+        const role = inp.dataset.set.slice(0, -'model'.length);
+        const sel = host.querySelector('[data-pick="' + role + '"]');
+        if (sel) sel.value = modelById(inp.value.trim()) ? inp.value.trim() : '';
+      }
     });
   });
+}
+
+/** Tell the user up front that a hosted provider needs a key, and where to put
+    it — rather than letting the first turn fail with a 401 from the provider. */
+function needsKeyHint(provider) {
+  const p = S.models && S.models.providers && S.models.providers.find((x) => x.key === provider);
+  if (!p || !p.needs_key) return;
+  const have = (S.keys || []).some((k) => k.provider === provider);
+  if (have) return;
+  toast('This model needs a key', providerLabel(provider) + ' — add it under Provider keys below.', 'err');
 }
 
 async function refreshKeys() {
@@ -1272,6 +1383,7 @@ async function refreshKeys() {
   try {
     const j = await jget('/api/v1/keys');
     const keys = j.keys || [];
+    S.keys = keys;   // needsKeyHint reads this to avoid nagging about a key you already have
     host.innerHTML = keys.length
       ? keys.map((k) => `<div class="key-row">
           <span class="mono grow">${esc(k.provider)}</span>
