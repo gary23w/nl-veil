@@ -59,3 +59,6 @@ dist/
 
 # stray local agent/editor dirs
 .codex/
+
+# release build staging (scripts/build-official.sh) — never committed
+.release-stage/

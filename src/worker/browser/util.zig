@@ -14,12 +14,14 @@ pub fn sleepMs(ms: u64) void {
         Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
     } else {
         // std.Thread.sleep does not exist in this Zig (0.16) — the tree's raw-thread POSIX sleep is a
-        // timespec + std.os.linux.nanosleep (see tools.zig watch / run.zig / mcp/client.zig). Split ms
-        // into whole seconds + remainder so nsec stays under 1e9.
+        // timespec + libc nanosleep (see tools.zig watch / run.zig / mcp/client.zig). Split ms into whole
+        // seconds + remainder so nsec stays under 1e9. std.c, NOT std.os.linux: for a macOS target the
+        // linux binding wants os.linux.timespec while posix.timespec IS c.timespec, so the linux call
+        // fails to compile there — libc's nanosleep is the one that ports across linux + macOS.
         const ts = std.posix.timespec{
             .sec = @intCast(ms / 1000),
             .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
         };
-        _ = std.os.linux.nanosleep(&ts, null);
+        _ = std.c.nanosleep(&ts, null);
     }
 }

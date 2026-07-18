@@ -145,7 +145,9 @@ fn ensureServer(ctx: *Ctx) bool {
     const bundle = std.fmt.bufPrint(eb[350..], "{s}/{s}", .{ ctx.home, VEIL_EXE }) catch return false;
     const bin = if (std.Io.Dir.cwd().access(ctx.io, exe, .{})) |_| exe else |_| bundle;
     out("starting the veil server on :{d}...\n", .{ctx.port});
-    _ = std.process.spawn(ctx.io, .{ .argv = &.{bin}, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    // --server-only: a bare `veil` now also opens the desk (the one-click default), which a CLI verb must never
+    // do — `veil chat` auto-starting the server should not pop a GUI window.
+    _ = std.process.spawn(ctx.io, .{ .argv = &.{ bin, "--server-only" }, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
     var tries: u32 = 0;
     while (tries < 30) : (tries += 1) {
         ctx.io.sleep(.{ .nanoseconds = 500 * std.time.ns_per_ms }, .awake) catch {};

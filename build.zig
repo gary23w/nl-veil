@@ -7,11 +7,26 @@ const builtin = @import("builtin");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // ReleaseFast by DEFAULT: this binary is what every user runs (the `veil` shim builds it with a bare
-    // `zig build`), and the engine's hot paths — BM25 page fitting, salvage scans over long replies,
-    // VCS merges, atlas matching on every fetch — run 5-20x slower in Debug. Developers still get a
-    // debug build explicitly with `zig build -Doptimize=Debug`.
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    // ReleaseFast by DEFAULT — and this time the code actually does it. `standardOptimizeOption` with a
+    // preferred mode only applies that preference when `--release` is passed with NO value, so a bare
+    // `zig build` shipped a DEBUG binary while this comment claimed otherwise, `--release=small` was a
+    // silent no-op (byte-identical to fast), and `-Doptimize=ReleaseSmall` errored "invalid option".
+    // Switching on b.release_mode ourselves fixes all three: bare build = ReleaseFast (the engine's hot
+    // paths — BM25 page fitting, salvage scans, VCS merges, atlas matching — run 5-20x slower in Debug),
+    // `--release=small` reaches ReleaseSmall, and devs keep `zig build -Doptimize=Debug`.
+    // NOTE: `-Doptimize=` is only accepted when no `--release=` flag is present (they are the same knob).
+    const optimize: std.builtin.OptimizeMode = switch (b.release_mode) {
+        .off => b.option(std.builtin.OptimizeMode, "optimize", "Prioritize performance, safety, or binary size") orelse .ReleaseFast,
+        .any, .fast => .ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
+
+    // Debug info / PDB is ~16MB beside a 5.5MB exe — three quarters of the shipped bytes, for symbols no
+    // end user can act on. Strip by default for every release mode; a dev debugging a crash keeps symbols
+    // automatically via -Doptimize=Debug, or forces them back with -Dstrip=false.
+    // (In Zig 0.16 `strip` is a MODULE property, not a Compile field — it goes into createModule below.)
+    const strip = b.option(bool, "strip", "omit debug info / PDB (default: on for release)") orelse (optimize != .Debug);
 
     const httpz = b.dependency("httpz", .{
         .target = target,
@@ -24,8 +39,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
+    // Emit each function/data symbol into its own section so the linker can drop the unreachable ones.
+    // Worth ~2% on its own; free, and it compounds with ReleaseSmall.
+    exe.link_function_sections = true;
+    exe.link_data_sections = true;
+    exe.link_gc_sections = true;
     exe.root_module.addImport("httpz", httpz.module("httpz"));
     exe.root_module.addAnonymousImport("index.html", .{ .root_source_file = b.path("web/public/index.html") });
     exe.root_module.addAnonymousImport("app.js", .{ .root_source_file = b.path("web/public/app.js") });

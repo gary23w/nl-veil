@@ -31,7 +31,9 @@ if ($LASTEXITCODE -ne 0) { Write-Host "DESK BUILD FAILED" -ForegroundColor Red; 
 Pop-Location
 
 Write-Host "starting server on :8787..."
-Start-Process -FilePath "$repo\zig-out\bin\veil.exe" -WorkingDirectory $repo `
+# --server-only: a bare `veil` now opens the desk too (the one-click default), and this script starts the desk
+# itself a few lines below — without the flag we'd end up with two of them.
+Start-Process -FilePath "$repo\zig-out\bin\veil.exe" -ArgumentList "--server-only" -WorkingDirectory $repo `
     -RedirectStandardOutput "$repo\data\server-stdout.log" -RedirectStandardError "$repo\data\server-stderr.log"
 Start-Sleep -Seconds 4
 

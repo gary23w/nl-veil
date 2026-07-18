@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rl = @import("raylib");
 const log = @import("log.zig");
+const assets = @import("assets.zig");
 
 pub const Tray = struct {
     inited: bool = false,
@@ -310,6 +311,19 @@ const WindowsTray = struct {
 
     fn loadIconFromPng(self: *WindowsTray) ?*anyopaque {
         _ = self;
+        // EMBEDDED FIRST: the icon is compiled into the exe, so the tray shows the real brand mark in a
+        // released bundle. It previously probed CWD-relative paths, missed them all outside the repo, and
+        // silently fell back to the generic IDI_APPLICATION icon (see the caller).
+        if (assets.iconImage()) |loaded| {
+            var img = loaded;
+            defer rl.unloadImage(img);
+            if (iconImageToHicon(&img)) |h_icon| {
+                log.info("tray: icon loaded from the embedded asset", .{});
+                return h_icon;
+            }
+            log.warn("tray: failed to convert the embedded icon image", .{});
+        }
+        // Disk probes retained as a last resort (edited assets/ in a source checkout, or a decode failure).
         const candidates = [_][:0]const u8{
             "assets/icon48x48.png",
             "desk/assets/icon48x48.png",
@@ -320,9 +334,7 @@ const WindowsTray = struct {
             if (rl.loadImage(path)) |loaded| {
                 var img = loaded;
                 defer rl.unloadImage(img);
-                img.resize(32, 32);
-                img.setFormat(.uncompressed_r8g8b8a8);
-                if (imageToHicon(img)) |h_icon| {
+                if (iconImageToHicon(&img)) |h_icon| {
                     log.info("tray: icon loaded from {s}", .{path});
                     return h_icon;
                 }
@@ -330,6 +342,14 @@ const WindowsTray = struct {
             } else |_| {}
         }
         return null;
+    }
+
+    /// Normalize a decoded icon image to the 32x32 RGBA the notification area wants, then hand it to
+    /// CreateIconIndirect. Shared by the embedded and on-disk paths so both produce an identical icon.
+    fn iconImageToHicon(img: *rl.Image) ?*anyopaque {
+        img.resize(32, 32);
+        img.setFormat(.uncompressed_r8g8b8a8);
+        return imageToHicon(img.*);
     }
 
     nid: NOTIFYICONDATAW = undefined,

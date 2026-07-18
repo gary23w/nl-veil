@@ -61,7 +61,7 @@ const KillGuard = struct {
                 Sleep(150);
             } else {
                 const ts = std.posix.timespec{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
-                _ = std.os.linux.nanosleep(&ts, null);
+                _ = std.c.nanosleep(&ts, null); // libc, not os.linux — ports to macOS (see browser/util.sleepMs)
             }
             if (g.done.load(.monotonic)) return;
         }
