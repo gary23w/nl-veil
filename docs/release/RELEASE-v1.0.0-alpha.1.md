@@ -1,4 +1,15 @@
-# the veil — v1.0.0
+# the veil — v1.0.0-alpha.1
+
+> **This is an alpha.** A real, working build — but with known gaps, stated up front rather than buried:
+>
+> - **Default admin password.** The local admin is `admin@neuron-loops.local` / `changeme`. The server binds
+>   loopback-only by default, so this is same-machine trust — but if you set `NL_BIND` to expose it,
+>   **set `NL_ADMIN_PASSWORD` first.**
+> - **The web UI lags the desktop app.** It's still the older swarm console — no chat, tasks, or settings
+>   yet. Use the desktop app for those; the web port to full parity is in progress.
+> - **Desktop bundles are built per-OS.** The GUI links the platform graphics stack and can't be
+>   cross-compiled, so each OS bundle is built natively in CI. The standalone server covers all five targets.
+> - Expect rough edges — please file what you hit.
 
 **A local-first AI workspace that actually does the work.** One download, one click: a hive-mind engine,
 a native desktop app, a web UI, a CLI, and a persistent associative memory — all in a single self-contained
