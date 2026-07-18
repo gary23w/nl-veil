@@ -2,31 +2,38 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>nl-veil</title>
-  <meta name="description" content="Deploy autonomous minds and swarms that research, form stances, and build.">
-  <meta name="application-name" content="nl-veil">
-  <meta name="theme-color" content="#1a1b26">
-  <meta name="color-scheme" content="dark">
-  <meta property="og:type" content="website">
-  <meta property="og:site_name" content="nl-veil">
-  <meta property="og:title" content="nl-veil">
-  <meta property="og:description" content="Autonomous minds and swarms that research, reason, and build with closed-loop memory.">
-  <meta property="og:url" content="https://gary23w.github.io/nl-veil/">
-  <meta property="og:image:type" content="image/svg+xml">
-  <meta property="og:image:width" content="1200">
-  <meta property="og:image:height" content="630">
-  <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="nl-veil">
-  <meta name="twitter:description" content="Deploy swarms of autonomous minds.">
-  <link rel="icon" type="image/png" href="icon.png">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+  <!-- viewport-fit=cover so env(safe-area-inset-*) reports real values on notched phones -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>the veil</title>
+  <meta name="description" content="A hive mind you talk to — chat, swarms, and scheduled tasks, running on your own machine.">
+  <meta name="application-name" content="the veil">
+  <!-- both schemes declared: the browser paints the right chrome before app.js runs -->
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f7fb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1a1b26" media="(prefers-color-scheme: dark)">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <!-- Inline data URI, not a file: /icon.png has no route on the server, so a
+       linked icon 404s on every load. Local-first also means no CDN fonts —
+       the stylesheet uses the system stack the desk itself falls back to. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%238a3ffc'/%3E%3Cpath d='M8 10l8 13 8-13' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
+  <script>
+    /* Resolve the theme before first paint so there is no flash of the wrong
+       scheme. Explicit choice wins; otherwise follow the OS. */
+    try {
+      var t = localStorage.getItem('veil.theme');
+      if (!t) t = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', t);
+      var s = localStorage.getItem('veil.textScale');
+      if (s) document.documentElement.style.setProperty('--text-scale', s);
+    } catch (e) {}
+  </script>
 </head>
 <body>
   <div id="app"></div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>
