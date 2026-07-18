@@ -6,7 +6,8 @@
 # Author / publisher: gary23w — https://github.com/gary23w
 #
 # Produces:
-#   • a FULL one-click bundle for THIS host  (veil + veil-desk + neuron + launcher)
+#   • a FULL one-click bundle for THIS host  (ONE veil binary — server + desktop
+#     + web UI + CLI in a single exe — plus neuron and a launcher)
 #   • bin/server-only/ — the server cross-compiled for EVERY supported target
 #   • SHA256SUMS.txt + MANIFEST.txt saying exactly what each artifact contains
 #
@@ -97,17 +98,22 @@ mkdir -p "$STAGE"
 # so a bare `zig build` is already ReleaseFast (it used to silently emit a DEBUG server). Kept explicit so the
 # release build states its own mode instead of inheriting a default someone could change. Release builds also
 # strip by default now — no 16MB PDB rides along beside a 5MB exe.
-say "building server for $OS/$ARCH (ReleaseFast, stripped)"
-( cd "$ROOT" && "$ZIG" build --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" )
+# ONE binary: the desktop GUI is compiled INTO veil (-Dapp, default on), so there is no separate
+# veil-desk to build or ship any more. The trade is that this build now needs the platform graphics
+# stack present — on a headless box the raylib link fails, and it would take the whole release with
+# it. So: try the real thing, and if it does not link, fall back to an explicitly server-only bundle
+# and SAY SO, rather than emitting something that silently has no window.
+say "building the app for $OS/$ARCH (ReleaseFast, stripped, GUI linked in)"
+HAVE_GUI=1
+( cd "$ROOT" && "$ZIG" build --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" ) || HAVE_GUI=0
+if [ "$HAVE_GUI" = 0 ]; then
+  warn "the GUI did not link here (no GL/X11 dev libs?) — retrying server-only"
+  rm -rf "$STAGE/server"
+  ( cd "$ROOT" && "$ZIG" build -Dapp=false --release=fast --cache-dir "$CACHE" --prefix "$STAGE/server" )
+fi
 SERVER="$STAGE/server/bin/veil$EXE"
-[ -f "$SERVER" ] || { say "server binary missing at $SERVER"; exit 1; }
-
-say "building desktop for $OS/$ARCH"
-HAVE_DESK=1
-( cd "$ROOT/desk" && "$ZIG" build --cache-dir "$CACHE/desk" --prefix "$STAGE/desk" ) || HAVE_DESK=0
-DESK="$STAGE/desk/bin/veil-desk$EXE"
-[ -f "$DESK" ] || HAVE_DESK=0
-[ "$HAVE_DESK" = 1 ] || warn "veil-desk not built (no GL/X11 here?) — this bundle will be server-only"
+[ -f "$SERVER" ] || { say "veil binary missing at $SERVER"; exit 1; }
+[ "$HAVE_GUI" = 1 ] || warn "THIS BUNDLE HAS NO DESKTOP — server + web UI only"
 
 # ---- 2. the neuron memory engine ----
 neuron=""
@@ -127,7 +133,6 @@ B="$OUT/$NAME"
 rm -rf "$B"
 mkdir -p "$B/bin"
 cp "$SERVER" "$B/veil$EXE"
-[ "$HAVE_DESK" = 1 ] && cp "$DESK" "$B/veil-desk$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$B/bin/neuron$EXE"
 
 # Launcher. A bare `veil` now boots the server AND opens the desk (the one-click default), so the
@@ -150,7 +155,6 @@ cd /d "%~dp0"
 start "" veil.exe %*
 LAUNCHW
 chmod +x "$B/start" "$B/veil$EXE" 2>/dev/null || true
-[ "$HAVE_DESK" = 1 ] && chmod +x "$B/veil-desk$EXE" 2>/dev/null || true
 [ -n "$neuron" ] && chmod +x "$B/bin/neuron$EXE" 2>/dev/null || true
 
 cat > "$B/README.txt" <<TXT
