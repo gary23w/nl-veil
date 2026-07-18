@@ -25,6 +25,12 @@ jobs:
       # switched to arch-first naming (zig-x86_64-linux-…). This is what broke every main-push check.
       - uses: mlugg/setup-zig@v2
         with: { version: 0.16.0 }
+      # The catalog is authored in models.yaml (embedded at comptime) and mirrored into
+      # web/public/models.json for the browser. The two drifted badly once: the yaml carried the
+      # first-party Kimi provider and four verified ids the web picker could not offer at all. This
+      # fails the build instead of letting that rot silently again.
+      - name: model catalog is in sync
+        run: python scripts/gen-models-json.py --check
       # -Dapp=false is the SERVER-ONLY build this step means: since the desktop GUI was merged into the
       # `veil` binary (-Dapp defaults to true), a bare `zig build` compiles raylib and needs GL/X11 — which
       # are installed further down, for the desk suite. Server-only never fetches raylib at all, so this

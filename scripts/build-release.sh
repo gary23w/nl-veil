@@ -120,8 +120,7 @@ Run:
 
 It starts the server on http://127.0.0.1:8787 and opens the desktop dashboard.
 Configure a model on first run (a local Ollama, or a hosted/BYOK endpoint).
-Server-only:  ./veil        (no desktop)
-Disable desk: NL_NO_DESKTOP=1 ./veil --desk
+Server only (no window):  ./veil --server-only
 
 https://github.com/gary23w/nl-veil
 TXT
