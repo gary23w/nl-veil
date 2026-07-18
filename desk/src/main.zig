@@ -411,7 +411,23 @@ fn pruneDeleting(rows: []const scan.SwarmSummary) void {
     }
 }
 
+/// Entry point for the STANDALONE veil-desk binary (`cd desk && zig build`), kept for development: run the
+/// dashboard on its own against an already-running server. The shipped app does NOT come through here — the
+/// GUI is compiled into `veil` and src/main.zig calls runApp directly (see below).
 pub fn main() !void {
+    return runApp(null);
+}
+
+/// THE GUI. Owns the raylib window and must run on the process's MAIN thread — raylib's window creation and
+/// event pump are main-thread-only on macOS and unreliable off it elsewhere. Returns when the user closes the
+/// window; in-process that return IS the app's shutdown signal (src/main.zig then stops httpz and exits).
+///
+/// `data_dir` pins the server's already-resolved data directory. The standalone binary passes null and falls
+/// back to seedSettings' CWD-relative probe ("data", "../data", ...), which is right for a dev checkout
+/// launched from the repo. In-process there is no such guarantee — `veil` can be started from anywhere — so
+/// the server hands down the absolute path it resolved from its own executable location. Without this the
+/// desk would probe relative to the user's shell CWD and quietly find no <data>/.desktop_key.
+pub fn runApp(data_dir: ?[]const u8) !void {
     const gpa = std.heap.c_allocator;
 
     // carry the real process environ so spawned children (curl, explorer) get a working environment
@@ -420,7 +436,7 @@ pub fn main() !void {
     const io = threaded.io();
 
     var store = Store{};
-    seedSettings(&store, gpa, io);
+    seedSettings(&store, gpa, io, data_dir);
     ui.d_name.len = seedName(&ui.d_name.buf);
 
     var poller = poller_mod.Poller{ .io = io, .gpa = gpa, .store = &store };
@@ -1237,8 +1253,18 @@ fn seedName(buf: []u8) usize {
     return s.len;
 }
 
-fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io) void {
+fn seedSettings(store: *Store, gpa: std.mem.Allocator, io: std.Io, pinned: ?[]const u8) void {
     seedChatDefaults(store);
+    // A caller-pinned data dir (the in-process GUI: the server already resolved it from its own executable
+    // path) wins outright — no probing, because the CWD-relative candidates below are meaningless when
+    // `veil` was launched from an arbitrary directory.
+    if (pinned) |dd| {
+        if (dd.len > 0) {
+            setDataDir(store, dd);
+            loadDesktopKey(store, gpa, io, dd);
+            return;
+        }
+    }
     const candidates = [_][]const u8{ "data", "../data", "../../data", "../nl-veil/data" };
     for (candidates) |c| {
         if (dirExists(io, c)) {

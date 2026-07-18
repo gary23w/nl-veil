@@ -719,6 +719,17 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .set-row .muted { font-size: calc(var(--fs-small) * var(--text-scale)); margin-top: 2px; }
 .w-auto { width: auto; min-height: 0; }
 
+.role-key {
+  display: flex; align-items: center; gap: 7px;
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  color: var(--text-secondary);
+}
+.role-key:empty { display: none; }
+.role-key b { font-family: var(--font-mono); font-weight: 600; }
+.ok-dot, .bad-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+.ok-dot  { background: var(--success); }
+.bad-dot { background: var(--warn); }
+
 .model-note {
   margin-top: 6px;
   font-size: calc(var(--fs-small) * var(--text-scale));

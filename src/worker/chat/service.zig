@@ -22,22 +22,41 @@ const http = @import("../../gateway/http.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
 const llm = @import("../llm.zig");
+const modelcfg = @import("modelcfg");
 
 const App = http.App;
 const requireUser = http.requireUser;
 const badReq = http.badReq;
 const notFound = http.notFound;
 
-/// Resolve ONE role's (base_url, api_key) against Cloudflare OAuth: when the key is blank and the endpoint or
-/// model names Workers AI, swap in the user's auto-refreshed CF token + authoritative account base from the
-/// vault (so the turn runs with no pasted key). Any other provider — or a role left entirely blank — passes
-/// through untouched. Mirrors the single-triple logic postMessage used before the model trio; called per role.
-fn resolveCf(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8) struct { base: []const u8, key: []const u8 } {
+/// Resolve ONE role's (base_url, api_key) when the client sends a BLANK key. Two fallbacks, in order:
+///
+///   1. Cloudflare OAuth — the endpoint or model names Workers AI, so swap in the user's auto-refreshed
+///      token + authoritative account base.
+///   2. The BYOK vault — the base URL matches a catalog provider, so look that provider's sealed key up
+///      for THIS user (deploy/service.zig:189 has always done this for swarms; chat never did).
+///
+/// (2) is what lets a browser run a hosted turn at all. The desk can hold a key in its own settings and
+/// paste it into the request; a web client must not — a key in localStorage is a key in every XSS. So the
+/// browser sends the endpoint and nothing else, and the key stays server-side in the per-user vault.
+/// A non-blank key always wins: an explicitly-supplied key is the caller's stated intent.
+fn resolveRole(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const u8, model: []const u8, api_key: []const u8) struct { base: []const u8, key: []const u8 } {
     if (api_key.len != 0) return .{ .base = base_url, .key = api_key };
+
     const looks_cf = std.mem.indexOf(u8, base_url, "api.cloudflare.com") != null and std.mem.indexOf(u8, base_url, "/ai/") != null;
     if (looks_cf or std.mem.startsWith(u8, model, "@cf/")) {
         if (cf_oauth.resolveToken(app, uid, arena)) |cf| return .{ .base = cf.base_url, .key = cf.key };
     }
+
+    if (modelcfg.providerForBase(base_url)) |prov| {
+        if (app.vault.resolve(uid, prov, arena)) |rk| {
+            // The vault may carry its own base (a custom endpoint stored with the key). Prefer it only
+            // when the caller left the base blank — otherwise the caller's endpoint stands.
+            const base = if (base_url.len == 0 and rk.base_url.len != 0) rk.base_url else base_url;
+            return .{ .base = base, .key = rk.key };
+        }
+    }
+
     return .{ .base = base_url, .key = api_key };
 }
 
@@ -299,15 +318,15 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
     }
 
-    // CLOUDFLARE LOGIN: when a role is sent with an empty key against a Workers AI endpoint (or an @cf/ model),
-    // the user is relying on their Cloudflare OAuth login — resolveCf swaps in the (auto-refreshed) token +
-    // account base from the vault so the turn runs with no pasted key. Any other provider passes through. Each
-    // of the three roles is resolved independently (a user can point, say, prompting at CF and coding at BYOK).
-    const cc = resolveCf(app, u.id, res.arena, b.base_url, b.model, b.api_key);
+    // BLANK-KEY RESOLUTION: a role sent with an empty key is resolved server-side — Cloudflare OAuth for a
+    // Workers AI endpoint, otherwise this user's sealed BYOK vault entry for whichever catalog provider the
+    // base URL belongs to. That is what lets a browser run a hosted turn without ever holding a key. Each of
+    // the three roles resolves independently (a user can point prompting at CF and coding at BYOK).
+    const cc = resolveRole(app, u.id, res.arena, b.base_url, b.model, b.api_key);
     const eff_base = cc.base;
     const eff_key = cc.key;
-    const tc = resolveCf(app, u.id, res.arena, b.think_base_url, b.think_model, b.think_api_key);
-    const pc = resolveCf(app, u.id, res.arena, b.prompt_base_url, b.prompt_model, b.prompt_api_key);
+    const tc = resolveRole(app, u.id, res.arena, b.think_base_url, b.think_model, b.think_api_key);
+    const pc = resolveRole(app, u.id, res.arena, b.prompt_base_url, b.prompt_model, b.prompt_api_key);
     // The base (coding) triple is always populated; thinking/prompting stay empty when the client didn't send
     // them and fall back to coding inside the engine (ModelTrio.pick). The local-admission gate keys on the
     // coding/base backend only (below) — a mixed setup with a local secondary role is a documented limitation.

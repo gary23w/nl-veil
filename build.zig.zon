@@ -10,11 +10,25 @@
         .httpz = .{
             .path = "vendor/httpz",
         },
+        // raylib-zig — the GUI toolkit behind the in-process desk (desk/src/*, linked into `veil` itself so
+        // the release ships ONE binary). Kept in sync with desk/build.zig.zon, which still builds veil-desk
+        // standalone for development.
+        //
+        // LAZY on purpose: `zig build -Dapp=false` (the headless/server-only build) must never so much as
+        // FETCH raylib, let alone link GL/X11. b.lazyDependency below is only reached when the app option is
+        // on, so a GL-free box resolves this package with nothing but vendor/httpz.
+        .raylib_zig = .{
+            .url = "git+https://github.com/raylib-zig/raylib-zig#97be2c7ae646a2f09856604b138c427c0af1b952",
+            .hash = "raylib_zig-6.0.0-KE8REDJ4BQBu7lKwYNt6R4j5ywPeS37zqW6zrtjCcRwH",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
+        "desk",
+        "models.yaml",
         "vendor",
         "web",
         "LICENSE",

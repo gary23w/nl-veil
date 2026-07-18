@@ -2,6 +2,9 @@
 # ============================================================================
 # build-official.sh — the OFFICIAL release builder. Outputs everything to bin/.
 #
+# the veil — https://github.com/gary23w/nl-veil
+# Author / publisher: gary23w — https://github.com/gary23w
+#
 # Produces:
 #   • a FULL one-click bundle for THIS host  (veil + veil-desk + neuron + launcher)
 #   • bin/server-only/ — the server cross-compiled for EVERY supported target
@@ -167,9 +170,11 @@ OTHER WAYS TO RUN
   veil cast "<goal>"     deploy a swarm
   veil list | stop <id>  fleet control
 
-Everything is local: your data lives in ./data, your keys in the OS keychain.
+Everything is local: your data lives in ./data, your keys stay on this machine.
 
-https://github.com/gary23w/nl-veil
+the veil — by gary23w
+  author   https://github.com/gary23w
+  project  https://github.com/gary23w/nl-veil
 TXT
 
 # ---- 3b. SCRUB the bundle before it is sealed ----

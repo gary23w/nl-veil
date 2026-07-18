@@ -22,7 +22,7 @@ test {
     _ = @import("worker/locs/atlas.zig");
     _ = @import("worker/mcp/discovery.zig");
     _ = @import("worker/metrics.zig");
-    _ = @import("worker/modelcfg.zig");
+    _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
     _ = @import("worker/oscillation.zig");
     _ = @import("worker/rate.zig");
     _ = @import("worker/rerank.zig");

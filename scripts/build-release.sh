@@ -2,9 +2,10 @@
 # ============================================================================
 # build-release.sh — package a self-contained veil release bundle.
 #
-# A bundle is the server (`veil`), the desktop (`veil-desk`), the memory engine
-# (`neuron`), and a `start` launcher that runs the server AND the desktop at
-# once. No Python, no toolchain, nothing to build on the user's machine.
+# A bundle is the app (`veil` — ONE binary: the desktop GUI is compiled in and
+# runs in-process alongside its server), the memory engine (`neuron`), and a
+# `start` launcher. No Python, no toolchain, nothing to build on the user's
+# machine, and no separate veil-desk binary any more.
 #
 #   scripts/build-release.sh            build THIS host's full bundle -> dist/
 #   scripts/build-release.sh --all      also cross-compile the SERVER binary for
@@ -60,13 +61,13 @@ if [ "${NO_BOOTSTRAP:-0}" != 1 ]; then
 fi
 ZIG=${ZIG:-zig}
 
-# ---- 1. build server + desktop (one graph: -Ddesk=true also builds veil-desk) ----
-say "building the server + desktop (zig build -Ddesk=true)"
-( cd "$ROOT" && "$ZIG" build -Ddesk=true )
+# ---- 1. build the app (ONE binary — the desktop GUI is compiled into veil) ----
+# There is no separate veil-desk to build or bundle any more: `zig build` (-Dapp defaults to true) links
+# raylib and the desk sources straight into veil, and a bare `veil` runs the window in-process.
+say "building the app (zig build — desktop GUI compiled in)"
+( cd "$ROOT" && "$ZIG" build )
 SERVER="$ROOT/zig-out/bin/veil$EXE"
-DESK="$ROOT/desk/zig-out/bin/veil-desk$EXE"
-[ -f "$SERVER" ] || { say "server binary not found at $SERVER"; exit 1; }
-[ -f "$DESK" ] || say "! veil-desk not built (headless box / no GL) — bundling server only"
+[ -f "$SERVER" ] || { say "veil binary not found at $SERVER"; exit 1; }
 
 # ---- 2. locate or build the neuron memory engine ----
 neuron=""
@@ -89,25 +90,25 @@ OUT="$DIST/$NAME"
 rm -rf "$OUT"
 mkdir -p "$OUT/bin"
 cp "$SERVER" "$OUT/veil$EXE"
-[ -f "$DESK" ] && cp "$DESK" "$OUT/veil-desk$EXE"
 [ -n "$neuron" ] && cp "$neuron" "$OUT/bin/neuron$EXE"
 
-# launcher: run the server in desktop-host mode (it spawns veil-desk sitting beside it)
+# launcher: a bare `veil` IS the app now (window + server in ONE process), so there is no flag to pass and
+# no second binary to start. Kept as a launcher anyway so the bundle has an obvious double-click target and
+# so the cwd is pinned to the bundle dir.
 cat > "$OUT/start" <<'LAUNCH'
 #!/bin/sh
-# start the veil server AND the desktop together.
+# start the veil app — desktop window and its server, one process.
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$DIR"
-exec ./veil --desk "$@"
+exec ./veil "$@"
 LAUNCH
 chmod +x "$OUT/start" "$OUT/veil$EXE" 2>/dev/null || true
-[ -f "$OUT/veil-desk$EXE" ] && chmod +x "$OUT/veil-desk$EXE" 2>/dev/null || true
 [ -f "$OUT/bin/neuron$EXE" ] && chmod +x "$OUT/bin/neuron$EXE" 2>/dev/null || true
 
 cat > "$OUT/start.cmd" <<'LAUNCHW'
 @echo off
 cd /d "%~dp0"
-veil.exe --desk %*
+veil.exe %*
 LAUNCHW
 
 cat > "$OUT/README.txt" <<TXT

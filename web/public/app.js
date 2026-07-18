@@ -23,6 +23,7 @@ const S = {
   fleet: { live: 0, minds: 0, headroom: 0 },
   metrics: null,
   models: null,         // parsed models.json — the shared catalog
+  localModels: null,    // {installed:[…]} from this machine's Ollama, or null if unreachable
   keys: [],             // provider keys on file (never the key itself)
   // chat
   convs: [],
@@ -194,6 +195,18 @@ async function boot() {
 
 async function loadModels() {
   try { S.models = await api.models(); } catch (e) { S.models = null; }
+}
+
+/** Ask the server which local models Ollama actually has. Unreachable is normal
+    (hosted-only users have no Ollama), and then we leave the catalog's local
+    list alone rather than hiding every local option. */
+async function loadLocalModels() {
+  try {
+    const j = await jget('/api/v1/models/local', 8000);
+    S.localModels = j.reachable ? j : null;
+  } catch (e) {
+    S.localModels = null;
+  }
 }
 
 function onSignedOut() {
@@ -513,10 +526,16 @@ function inputCharLimit() {
   return 4000;
 }
 
+/** Callable from any tab: Settings calls this after a model change (the cap
+    follows the model's size), and the composer only exists on the Chat tab.
+    Without the null guard this throws mid-handler and silently kills whatever
+    the caller meant to do next. */
 function updateCharCount() {
-  const n = el('input').value.length;
-  const cap = inputCharLimit();
+  const input = el('input');
   const c = el('charCount');
+  if (!input || !c) return;
+  const n = input.value.length;
+  const cap = inputCharLimit();
   c.textContent = n ? (n + ' / ' + cap) : '';
   c.style.color = n > cap ? 'var(--danger)' : '';
 }
@@ -1239,6 +1258,9 @@ function renderSettings(host) {
 
   drawRolePanels();
   refreshKeys();
+  // Redraw once the machine has answered about its own Ollama, so the local
+  // group reflects what is pulled rather than what is merely catalogued.
+  loadLocalModels().then(() => { if (S.tab === 'settings') drawRolePanels(); });
 }
 
 function getScale() { return parseFloat(LS.get('veil.textScale', '1')) || 1; }
@@ -1273,12 +1295,30 @@ function modelById(id) {
 }
 
 /** Group the catalog by provider, hosting-local first so an offline user sees
-    what actually runs on their machine before a list of paid endpoints. */
+    what actually runs on their machine before a list of paid endpoints.
+
+    Local entries are reconciled against what Ollama has really pulled: the
+    catalog says which local models are worth running, not which are installed,
+    and offering one the machine has never downloaded produces a first-turn
+    stall that reads like an app bug. Anything installed but not in the catalog
+    is offered too — the user's own machine is authoritative about itself. */
 function catalogOptions(selected) {
-  const models = (S.models && S.models.models) || [];
+  const models = ((S.models && S.models.models) || []).slice();
   if (!models.length) return '';
+
+  const installed = S.localModels && S.localModels.installed;
+  if (installed) {
+    const known = new Set(models.map((m) => m.id));
+    for (const id of installed) {
+      if (!known.has(id)) {
+        models.push({ id: id, label: id, provider: 'ollama', hosting: 'local', installed: true });
+      }
+    }
+  }
+
   const byProv = new Map();
   for (const m of models) {
+    if (m.hosting === 'local' && installed && !installed.includes(m.id)) continue; // not pulled here
     if (!byProv.has(m.provider)) byProv.set(m.provider, []);
     byProv.get(m.provider).push(m);
   }
@@ -1327,6 +1367,7 @@ function drawRolePanels() {
         <div class="field"><label>Base URL</label>
           <input type="text" data-set="${r.key}base_url" value="${esc(S.settings[r.key + 'base_url'] || '')}" placeholder="http://127.0.0.1:11434/v1"></div>
       </div>
+      <div class="role-key" data-keystate="${r.key}">${roleKeyState(r.key)}</div>
     </div>`;
   }).join('');
 
@@ -1348,6 +1389,7 @@ function drawRolePanels() {
       const note = host.querySelector('[data-note="' + role + '"]');
       if (note) note.textContent = m && m.note ? m.note : '';
       updateCharCount();   // the composer's cap follows the coding model's size
+      refreshRoleKeyStates();
       if (m && m.provider) needsKeyHint(m.provider);
     });
   });
@@ -1367,13 +1409,60 @@ function drawRolePanels() {
   });
 }
 
-/** Tell the user up front that a hosted provider needs a key, and where to put
-    it — rather than letting the first turn fail with a 401 from the provider. */
+/** Which provider does a role's base URL resolve to? Mirrors the server's own
+    host match (modelcfg.providerForBase) so the UI and the turn agree on which
+    vault entry will be used. */
+function roleProvider(roleKey) {
+  const base = S.settings[roleKey + 'base_url'] || '';
+  const model = S.settings[roleKey + 'model'] || '';
+  const m = modelById(model);
+  if (m) return m.provider;
+  if (!base) return '';
+  const host = hostOf(base);
+  const p = (S.models && S.models.providers || []).find(
+    (x) => x.base_url && x.base_url !== 'local' && x.base_url !== 'cloudflare' && hostOf(x.base_url) === host);
+  return p ? p.key : '';
+}
+
+function hostOf(url) {
+  let s = String(url || '').trim();
+  const i = s.indexOf('://');
+  if (i >= 0) s = s.slice(i + 3);
+  const j = s.search(/[/?#]/);
+  return j >= 0 ? s.slice(0, j) : s;
+}
+
+/** Say, per role, which credential the turn will actually use. The key itself
+    never comes to the browser — the server resolves it from this user's sealed
+    vault when the request carries a blank key — so the honest thing to show is
+    which provider it will look up and whether anything is on file. */
+function roleKeyState(roleKey) {
+  const prov = roleProvider(roleKey);
+  if (!prov) return '';
+  const p = (S.models && S.models.providers || []).find((x) => x.key === prov);
+  if (!p) return '';
+  if (p.base_url === 'local' || !p.needs_key) {
+    return '<span class="ok-dot"></span>no key needed — ' + esc(providerLabel(prov));
+  }
+  const have = (S.keys || []).some((k) => k.provider === prov);
+  return have
+    ? '<span class="ok-dot"></span>uses your stored <b>' + esc(prov) + '</b> key'
+    : '<span class="bad-dot"></span>needs a <b>' + esc(prov) + '</b> key — add one under Provider keys';
+}
+
+function refreshRoleKeyStates() {
+  $$('[data-keystate]').forEach((n) => { n.innerHTML = roleKeyState(n.dataset.keystate); });
+}
+
+/** Tell the user up front that a hosted provider needs a key, and pre-fill the
+    provider field so adding it is one paste rather than a spelling exercise. */
 function needsKeyHint(provider) {
-  const p = S.models && S.models.providers && S.models.providers.find((x) => x.key === provider);
-  if (!p || !p.needs_key) return;
-  const have = (S.keys || []).some((k) => k.provider === provider);
-  if (have) return;
+  const p = (S.models && S.models.providers || []).find((x) => x.key === provider);
+  if (!p) return;
+  const prov = el('kProv');
+  if (prov && !prov.value.trim()) prov.value = provider;   // name the field after the choice
+  if (!p.needs_key) return;
+  if ((S.keys || []).some((k) => k.provider === provider)) return;
   toast('This model needs a key', providerLabel(provider) + ' — add it under Provider keys below.', 'err');
 }
 
@@ -1391,6 +1480,7 @@ async function refreshKeys() {
           <button class="btn btn-sm btn-ghost" data-key-del="${esc(k.provider)}">Remove</button>
         </div>`).join('')
       : '<div class="muted">no provider keys stored</div>';
+    refreshRoleKeyStates();   // the role panels report which of these they use
     $$('[data-key-del]', host).forEach((b) => b.addEventListener('click', async () => {
       try { await jdel('/api/v1/keys/' + encodeURIComponent(b.dataset.keyDel)); refreshKeys(); }
       catch (e) { toast('Could not remove', e.message, 'err'); }

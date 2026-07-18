@@ -81,7 +81,7 @@
       "key": "google",
       "label": "Google Gemini",
       "kind": "openai-compatible",
-      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
       "needs_key": true
     },
     {
@@ -103,6 +103,13 @@
       "label": "TokenGO",
       "kind": "openai-compatible",
       "base_url": "https://api.thorbase.com/v1",
+      "needs_key": true
+    },
+    {
+      "key": "moonshot",
+      "label": "Kimi (Moonshot AI)",
+      "kind": "openai-compatible",
+      "base_url": "https://api.moonshot.ai/v1",
       "needs_key": true
     }
   ],
@@ -155,7 +162,7 @@
       "context": 1000000,
       "tools": "reliable",
       "cost": "high",
-      "note": "Anthropic's most capable widely released model for the hardest reasoning/long-horizon agentic work. Above Opus pricing ($10/$50 per MTok). Thinking always on (omit thinking param); safety classifiers may return stop_reason 'refusal' (enable fallbacks); requires 30-day data retention (no ZDR). Not the default Opus upgrade \u2014 select explicitly."
+      "note": "Anthropic's most capable widely released model for the hardest reasoning/long-horizon agentic work. Above Opus pricing ($10/$50 per MTok). Thinking always on (omit thinking param); safety classifiers may return stop_reason 'refusal' (enable fallbacks); requires 30-day data retention (no ZDR). Not the default Opus upgrade — select explicitly."
     },
     {
       "id": "claude-opus-4-7",
@@ -295,7 +302,7 @@
       "context": 400000,
       "tools": "partial",
       "cost": "low",
-      "note": "Smallest/cheapest GPT-5; aimed at classification, extraction, ranking, coding subagents. Tool calling works but the small tier is less reliable for complex multi-tool swarms \u2014 validate before trusting in a mind. Use max_completion_tokens (NOT max_tokens)."
+      "note": "Smallest/cheapest GPT-5; aimed at classification, extraction, ranking, coding subagents. Tool calling works but the small tier is less reliable for complex multi-tool swarms — validate before trusting in a mind. Use max_completion_tokens (NOT max_tokens)."
     },
     {
       "id": "gpt-4.1-nano",
@@ -305,7 +312,7 @@
       "context": 1000000,
       "tools": "partial",
       "cost": "low",
-      "note": "Cheapest 4.1 tier; fast 1M-context model for light tasks. Function calling supported but the nano tier is weaker for complex multi-tool orchestration \u2014 verify per swarm. Uses max_tokens."
+      "note": "Cheapest 4.1 tier; fast 1M-context model for light tasks. Function calling supported but the nano tier is weaker for complex multi-tool orchestration — verify per swarm. Uses max_tokens."
     },
     {
       "id": "qwen2.5-coder:7b",
@@ -405,7 +412,7 @@
       "context": 32768,
       "tools": "partial",
       "cost": "free",
-      "note": "Tools + thinking modes; agent-oriented. HONEST: tool-calling in thinking mode can be inconsistent across Ollama versions \u2014 verify against your swarm before trusting. ~5.2GB, ~8GB VRAM at Q4."
+      "note": "Tools + thinking modes; agent-oriented. HONEST: tool-calling in thinking mode can be inconsistent across Ollama versions — verify against your swarm before trusting. ~5.2GB, ~8GB VRAM at Q4."
     },
     {
       "id": "llama3.1:8b",
@@ -495,7 +502,7 @@
       "context": 163840,
       "tools": "partial",
       "cost": "med",
-      "note": "DeepSeek V3.2 (sparse-attention MoE) tuned for reasoning + agentic tool use. Together id HF-style 'deepseek-ai/...'. DeepSeek tool-calling is good but historically less rock-solid than Qwen/Kimi in dense swarms \u2014 verify per-mind. Confirm exact casing against Together's live catalog."
+      "note": "DeepSeek V3.2 (sparse-attention MoE) tuned for reasoning + agentic tool use. Together id HF-style 'deepseek-ai/...'. DeepSeek tool-calling is good but historically less rock-solid than Qwen/Kimi in dense swarms — verify per-mind. Confirm exact casing against Together's live catalog."
     },
     {
       "id": "moonshotai/kimi-k2",
@@ -525,7 +532,7 @@
       "context": 163840,
       "tools": "partial",
       "cost": "low",
-      "note": "DeepSeek V3.1 chat via OpenRouter, supports structured tool calling (V3.1 Terminus variant: deepseek/deepseek-v3.1-terminus). Capable + cheap; DeepSeek tool reliability in complex swarms is good-not-perfect \u2014 test per-mind."
+      "note": "DeepSeek V3.1 chat via OpenRouter, supports structured tool calling (V3.1 Terminus variant: deepseek/deepseek-v3.1-terminus). Capable + cheap; DeepSeek tool reliability in complex swarms is good-not-perfect — test per-mind."
     },
     {
       "id": "openrouter/free",
@@ -535,7 +542,7 @@
       "context": 200000,
       "tools": "partial",
       "cost": "free",
-      "note": "OpenRouter's own ROTATING free-tier router: 'openrouter/free' selects a currently-free model at random on every request (their free pool is grant/web3-subsidized and churns, so this never goes stale). $0 tokens \u2014 still needs an OpenRouter key, and free models may require enabling free-model/training consent in OpenRouter privacy settings. Which underlying model you get varies per call, so tool-calling reliability varies \u2014 validate for anything demanding; ideal for cheap/experimental minds."
+      "note": "OpenRouter's own ROTATING free-tier router: 'openrouter/free' selects a currently-free model at random on every request (their free pool is grant/web3-subsidized and churns, so this never goes stale). $0 tokens — still needs an OpenRouter key, and free models may require enabling free-model/training consent in OpenRouter privacy settings. Which underlying model you get varies per call, so tool-calling reliability varies — validate for anything demanding; ideal for cheap/experimental minds."
     },
     {
       "id": "meta-llama/llama-3.3-70b-instruct:free",
@@ -545,7 +552,7 @@
       "context": 131072,
       "tools": "reliable",
       "cost": "free",
-      "note": "Meta Llama 3.3 70B via OpenRouter's free tier ($0). Reliable tool caller for a free model. The ':free' suffix is OpenRouter's free-variant convention; this specific free listing can rotate out over time \u2014 use openrouter/free for a self-maintaining rotator."
+      "note": "Meta Llama 3.3 70B via OpenRouter's free tier ($0). Reliable tool caller for a free model. The ':free' suffix is OpenRouter's free-variant convention; this specific free listing can rotate out over time — use openrouter/free for a self-maintaining rotator."
     },
     {
       "id": "qwen/qwen3-coder:free",
@@ -555,7 +562,7 @@
       "context": 262144,
       "tools": "reliable",
       "cost": "free",
-      "note": "Qwen3 Coder via OpenRouter free tier ($0), strong for code + tool use. ':free' free-variant listing; may rotate out over time \u2014 openrouter/free is the durable rotating option."
+      "note": "Qwen3 Coder via OpenRouter free tier ($0), strong for code + tool use. ':free' free-variant listing; may rotate out over time — openrouter/free is the durable rotating option."
     },
     {
       "id": "openai/gpt-oss-20b:free",
@@ -565,7 +572,7 @@
       "context": 131072,
       "tools": "partial",
       "cost": "free",
-      "note": "OpenAI open-weight GPT-OSS 20B via OpenRouter free tier ($0). Good cheap agentic option; small tier so validate tool reliability in complex swarms. ':free' listing may rotate out \u2014 prefer openrouter/free for a self-maintaining rotator."
+      "note": "OpenAI open-weight GPT-OSS 20B via OpenRouter free tier ($0). Good cheap agentic option; small tier so validate tool reliability in complex swarms. ':free' listing may rotate out — prefer openrouter/free for a self-maintaining rotator."
     },
     {
       "id": "openrouter/auto",
@@ -575,7 +582,7 @@
       "context": 2000000,
       "tools": "reliable",
       "cost": "med",
-      "note": "OpenRouter's meta Auto Router: routes your prompt to whichever of dozens of models gives the best output (variable pricing, billed at the chosen model's rate \u2014 NOT free). The response's returned model id tells you which was used. Good 'just pick something good' default when you don't want to choose."
+      "note": "OpenRouter's meta Auto Router: routes your prompt to whichever of dozens of models gives the best output (variable pricing, billed at the chosen model's rate — NOT free). The response's returned model id tells you which was used. Good 'just pick something good' default when you don't want to choose."
     },
     {
       "id": "accounts/fireworks/models/kimi-k2-instruct-0905",
@@ -645,7 +652,7 @@
       "context": 256000,
       "tools": "partial",
       "cost": "low",
-      "note": "Edge/latency-tier (also 3B and 14B variants: ministral-3-3b-2512 / ministral-3-14b-2512). Supports tools but small models tool-call less reliably in complex swarms \u2014 verify per deployment. Open-weight, runnable locally."
+      "note": "Edge/latency-tier (also 3B and 14B variants: ministral-3-3b-2512 / ministral-3-14b-2512). Supports tools but small models tool-call less reliably in complex swarms — verify per deployment. Open-weight, runnable locally."
     },
     {
       "id": "deepseek-v4-flash",
@@ -675,7 +682,7 @@
       "context": 128000,
       "tools": "reliable",
       "cost": "low",
-      "note": "Legacy alias = non-thinking mode of deepseek-v4-flash. Function calling supported. DEPRECATES 2026-07-24 \u2014 migrate to deepseek-v4-flash. Listed only for back-compat; do not pick for new minds."
+      "note": "Legacy alias = non-thinking mode of deepseek-v4-flash. Function calling supported. DEPRECATES 2026-07-24 — migrate to deepseek-v4-flash. Listed only for back-compat; do not pick for new minds."
     },
     {
       "id": "gemini-3.5-flash",
@@ -695,7 +702,7 @@
       "context": 1000000,
       "tools": "reliable",
       "cost": "high",
-      "note": "Highest-capability Gemini, advanced reasoning + powerful agentic/coding. 1M context, function calling. Preview channel \u2014 id may change; confirm before pinning. Use for hardest multi-step tool reasoning."
+      "note": "Highest-capability Gemini, advanced reasoning + powerful agentic/coding. 1M context, function calling. Preview channel — id may change; confirm before pinning. Use for hardest multi-step tool reasoning."
     },
     {
       "id": "gemini-2.5-flash",
@@ -896,6 +903,84 @@
       "tools": "partial",
       "cost": "low",
       "note": "DeepSeek V3.1 via TokenGO, 164K context. ~$0.19/$0.71 per 1M in/out. Structured tool calling supported; verify per-mind. Slug 'deepseek/deepseek-v3.1'."
+    },
+    {
+      "id": "claude-sonnet-5",
+      "label": "Claude Sonnet 5",
+      "provider": "anthropic",
+      "hosting": "hosted"
+    },
+    {
+      "id": "gpt-oss:20b",
+      "label": "gpt-oss 20B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "hermes3:8b",
+      "label": "Hermes 3 8B",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "openai/gpt-oss-20b",
+      "label": "GPT-OSS 20B",
+      "provider": "huggingface",
+      "hosting": "hosted"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-R1",
+      "label": "DeepSeek R1",
+      "provider": "huggingface",
+      "hosting": "hosted"
+    },
+    {
+      "id": "meta-llama/Llama-3.1-8B-Instruct",
+      "label": "Llama 3.1 8B",
+      "provider": "huggingface",
+      "hosting": "hosted"
+    },
+    {
+      "id": "Qwen/Qwen2.5-72B-Instruct",
+      "label": "Qwen2.5 72B",
+      "provider": "huggingface",
+      "hosting": "hosted"
+    },
+    {
+      "id": "mistralai/Mistral-Small-24B-Instruct-2501",
+      "label": "Mistral Small 24B",
+      "provider": "huggingface",
+      "hosting": "hosted"
+    },
+    {
+      "id": "anthropic/claude-sonnet-4.5",
+      "label": "Claude Sonnet 4.5",
+      "provider": "openrouter",
+      "hosting": "hosted"
+    },
+    {
+      "id": "kimi-k3",
+      "label": "Kimi K3 (flagship, 1M ctx)",
+      "provider": "moonshot",
+      "hosting": "hosted"
+    },
+    {
+      "id": "kimi-k2.7-code",
+      "label": "Kimi K2.7 Code",
+      "provider": "moonshot",
+      "hosting": "hosted"
+    },
+    {
+      "id": "kimi-k2.7-code-highspeed",
+      "label": "Kimi K2.7 Code (highspeed)",
+      "provider": "moonshot",
+      "hosting": "hosted"
+    },
+    {
+      "id": "kimi-k2.6",
+      "label": "Kimi K2.6",
+      "provider": "moonshot",
+      "hosting": "hosted"
     }
   ],
   "defaults": {

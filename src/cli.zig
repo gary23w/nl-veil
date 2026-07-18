@@ -484,21 +484,27 @@ fn cmdSched(ctx: *Ctx, args: []const []const u8) u8 {
     return 1;
 }
 
+/// `veil desktop` — open the app window.
+///
+/// Used to locate and spawn a SEPARATE veil-desk binary (probing desk/zig-out/bin, then the bundle dir). That
+/// binary is no longer part of a release: the GUI is compiled into this executable and a bare `veil` runs it
+/// in-process. So the verb now relaunches THIS executable in app mode, which is the same thing a double-click
+/// does — one binary, one code path. It stays a distinct verb because `veil desktop` reads clearly in scripts
+/// and docs, and because the plain `veil` form is easy to miss.
 fn cmdDesktop(ctx: *Ctx) u8 {
-    var eb: [700]u8 = undefined;
-    const desk_exe = if (builtin.os.tag == .windows) "veil-desk.exe" else "veil-desk";
-    const checkout = std.fmt.bufPrint(&eb, "{s}/desk/zig-out/bin/{s}", .{ ctx.home, desk_exe }) catch return 1;
-    const bundle = std.fmt.bufPrint(eb[350..], "{s}/{s}", .{ ctx.home, desk_exe }) catch return 1;
-    const bin = if (std.Io.Dir.cwd().access(ctx.io, checkout, .{})) |_| checkout else |_| if (std.Io.Dir.cwd().access(ctx.io, bundle, .{})) |_| bundle else |_| {
-        std.debug.print("veil-desk isn't built. Build it: cd desk && zig build --release=fast\n", .{});
+    var eb: [4096]u8 = undefined;
+    const n = std.process.executablePath(ctx.io, &eb) catch {
+        std.debug.print("could not resolve this executable's path — run `veil` on its own to open the app\n", .{});
         return 1;
     };
-    _ = ensureServer(ctx); // the desk lights up against a running server
-    _ = std.process.spawn(ctx.io, .{ .argv = &.{bin}, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
+    // Detached, exactly like the old spawn: the CLI returns immediately and the app owns its own lifetime.
+    // No ensureServer here — app mode brings its own server up in-process (and binds the same port, so an
+    // already-running server would make the new instance's listen fail rather than double-bind).
+    _ = std.process.spawn(ctx.io, .{ .argv = &.{eb[0..n]}, .cwd = .{ .path = ctx.home }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {
         std.debug.print("could not launch the desktop\n", .{});
         return 1;
     };
-    out("launched veil-desk\n", .{});
+    out("launched the veil desktop\n", .{});
     return 0;
 }
 
@@ -507,7 +513,8 @@ fn cmdHelp() u8 {
         \\veil — the local agentic swarm + chat control plane
         \\
         \\USAGE
-        \\  veil                         run the server (foreground daemon; add --desk to host the desktop)
+        \\  veil                         open the app: desktop window + its server, in ONE process
+        \\  veil --server-only           run the server alone (headless hosts, service managers)
         \\  veil <command> [args]        talk to the running server (auto-starts it if needed)
         \\
         \\SWARMS
@@ -534,7 +541,7 @@ fn cmdHelp() u8 {
         \\
         \\MISC
         \\  doctor                       check server + token health
-        \\  desktop                      launch the veil-desk dashboard
+        \\  desktop                      open the app window (same as a bare `veil`, but detached)
         \\  version                      print the server version
         \\
     , .{});
