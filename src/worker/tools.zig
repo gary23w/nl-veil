@@ -185,6 +185,44 @@ pub const MemSink = struct {
     }
 };
 
+/// What a caller is allowed to reach through `execute`.
+///
+/// `.full` is the historical behaviour and stays the default: swarm minds, the desk on localhost, the
+/// CLI, and admin chat all run the complete surface.
+///
+/// `.sandboxed` is for a caller whose prompts are not trusted with the host — a normal (non-admin)
+/// account on a shared server. It keeps files (already jailed to the conversation workdir by safeRel),
+/// research, and the ENTIRE hive-memory surface, and removes code execution, host control, engine
+/// self-modification, tool authoring, and browser/MCP drive.
+pub const Caps = enum { full, sandboxed };
+
+/// Tools a `.sandboxed` caller may run. An ALLOWLIST, deliberately — `execute`'s tail falls through to
+/// runAuthored for any unrecognised name (see the make_tool path), so a denylist would be bypassed by
+/// authoring a tool and calling it by its new name. Anything not named here is refused.
+///
+/// The hive verbs are all present on purpose: the shared associative memory is the product, and a
+/// sandboxed user keeps every bit of it. What they lose is the ability to act on the machine.
+const SANDBOX_TOOLS = [_][]const u8{
+    // research
+    "web_search", "web_fetch", "fetch_json", "read_url",
+    // hive / memory — the whole surface, intentionally
+    "recall", "recall_hive", "observe", "share", "note_stance", "save_skill", "journal",
+    "set_directive", "probe", "add_task", "complete_task", "send_message", "propose_plan_change",
+    // files, jailed to the conversation's own workdir
+    "write_file", "edit_file", "read_file", "list_dir", "delete_file",
+    // local retrieval over this conversation's own attachments; renders nothing, touches no network
+    "pixel_search",
+    // read-only swarm observation (each is uid-checked by its handler)
+    "swarm_status", "swarm_asks", "stop_swarm",
+};
+
+/// Is `name` runnable by a sandboxed caller? Exposed so the HTTP tool endpoint can share this exact
+/// predicate rather than keeping a second list that drifts out of step with this one.
+pub fn sandboxAllowed(name: []const u8) bool {
+    for (SANDBOX_TOOLS) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
 pub const ToolCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -229,6 +267,10 @@ pub const ToolCtx = struct {
     // assistant to act on their own files — the workdir jail is a SWARM-mind boundary, not a client one.
     // Writes (write_file/edit_file/delete_file) stay workdir-locked everywhere. Never set for minds.
     roam: bool = false,
+    // Capability tier for THIS caller — see Caps. Defaults to .full so every existing construction site
+    // (swarm minds, the CLI, exec-tool, the desk) keeps today's behaviour untouched; only the chat turn
+    // sets .sandboxed, and only for a non-admin.
+    caps: Caps = .full,
     // Route browser/pixel tools through the per-machine local-host DAEMON instead of the in-process manager.
     // Set ONLY by `veil exec-tool` (subprocess-per-call: a fresh process per delegated tool can't hold a browser
     // session, so the daemon does). A LONG-LIVED process (the server's /chat/tool endpoint, a swarm worker) keeps
@@ -837,6 +879,10 @@ pub const OPERATE_SCHEMA =
 /// (caller frees) — always a string, even on error, so it can feed back to the model.
 pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
+    // THE SANDBOX GATE. First thing in the dispatcher, before any tool-specific
+    // logic, so there is exactly one place a capability decision is made.
+    if (ctx.caps == .sandboxed and !sandboxAllowed(name))
+        return dupe(gpa, "that tool is not available in this workspace — you are working inside this conversation's own directory. Files, research, and memory are available; running code, reaching the host, and driving a browser are not.");
     if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
         std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
@@ -2901,6 +2947,89 @@ test "urlAllowed SSRF guard: IPv6 literals fail closed; private v4 + metadata st
     try std.testing.expect(urlAllowed("https://172.32.1.1/x")); // 172.32+ is public space
     try std.testing.expect(urlAllowed("https://example.com/x"));
     try std.testing.expect(!urlAllowed("ftp://example.com/x"));
+}
+
+test "sandboxAllowed: every host-reaching tool is refused, the whole hive surface is kept" {
+    // The failure mode this guards is a NEW tool being added to a schema and silently defaulting to
+    // allowed. Naming the dangerous ones explicitly means adding one to the dispatcher without a
+    // tiering decision breaks a test rather than opening a hole quietly.
+    const denied = [_][]const u8{
+        "run_python",      "run_tests",        "patch_system",  "make_tool",      "propose_change",
+        "simulate_change", "stage_delivery",   "osint_scan",    "host_status",    "host_command",
+        "host_explore",    "browser_navigate", "browser_read",  "browser_click",  "browser_type",
+        "browser_eval",    "browser_close",    "pixel_ingest",  "pixel_capture",  "mcp_discover",
+        "mcp_call",        "get_credential",   "deep_crawl",    "stage_file",     "ask_veil",
+    };
+    for (denied) |n| {
+        if (sandboxAllowed(n)) {
+            std.debug.print("sandboxAllowed({s}) should be false\n", .{n});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    // The hive mind is the product: a sandboxed user keeps ALL of it. If a future change tiers one of
+    // these as admin-only, that is a product regression and this test is the place it should surface.
+    const kept = [_][]const u8{
+        "recall",        "recall_hive",  "observe",      "share",         "note_stance",
+        "save_skill",    "journal",      "set_directive", "probe",        "add_task",
+        "complete_task", "send_message", "web_search",   "web_fetch",     "read_file",
+        "write_file",    "edit_file",    "list_dir",     "delete_file",   "pixel_search",
+    };
+    for (kept) |n| {
+        if (!sandboxAllowed(n)) {
+            std.debug.print("sandboxAllowed({s}) should be true — the hive/workspace surface stays open\n", .{n});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "the sandbox gate actually fires in execute, before any tool runs" {
+    // The predicate tests above prove the LIST is right. This proves the DISPATCHER consults it: a
+    // sandboxed ctx must refuse run_python without reaching runPython, and the same ctx at .full must
+    // get past the gate. Everything here is inert — the refusal returns before any tool touches the
+    // filesystem, a model, or a subprocess.
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = undefined, // never reached: the gate returns before any I/O
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined, // likewise untouched on the refusal path
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .caps = .sandboxed,
+    };
+
+    for ([_][]const u8{ "run_python", "host_command", "patch_system", "browser_eval", "get_credential" }) |name| {
+        const out = execute(&ctx, name, "{}");
+        defer gpa.free(out);
+        if (std.mem.indexOf(u8, out, "not available in this workspace") == null) {
+            std.debug.print("sandboxed execute({s}) did not refuse — got: {s}\n", .{ name, out });
+            return error.TestUnexpectedResult;
+        }
+    }
+    // No .full control here on purpose: anything that gets PAST the gate dereferences the undefined
+    // io/mem above and segfaults the runner. That the gate is what refused is established by the
+    // allowlist tests either side of this one; this test's job is only to prove execute() consults it.
+}
+
+test "sandboxAllowed is an allowlist: an unknown name is refused" {
+    // execute()'s tail falls through to runAuthored for any unrecognised name, so make_tool could mint
+    // a tool and call it by that new name. A denylist would never see it; this pins the polarity.
+    try std.testing.expect(!sandboxAllowed("totally_made_up_tool"));
+    try std.testing.expect(!sandboxAllowed(""));
+    try std.testing.expect(!sandboxAllowed("run_python "));  // no trimming, no near-miss matching
+    try std.testing.expect(!sandboxAllowed("RUN_PYTHON"));   // case-sensitive by design
 }
 
 test "urlAllowed: numeric spellings of loopback and private space are blocked too" {

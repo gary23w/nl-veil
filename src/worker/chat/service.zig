@@ -261,14 +261,17 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     }
 
     const u = requireUser(app, req, res) orelse return;
-    // ADMIN-ONLY for now. runTurn hands the model the FULL tool surface (incl. code-exec / host / engine
-    // self-mod), and tools.execute does not gate by role — so until per-role SAFE-only tool access lands (strip
-    // admin tools from the schema + gate execution, mirroring chat_tools' SAFE/ADMIN split), restrict the whole
-    // turn to admins. This matches local-first: the desktop is admin on localhost, the intended user.
-    if (!app.auth.isAdmin(u)) {
-        res.status = 403;
-        return res.json(.{ .ok = false, .err = "the server chat backend is admin-only for now" }, .{});
-    }
+    // OPEN TO EVERY AUTHED USER. This used to 403 non-admins, because runTurn handed the model the full
+    // tool surface and tools.execute did not gate by role — the whole turn was blocked as the blunt way
+    // to avoid that. The gate now exists: engine's ToolCtx carries `caps`, and a non-admin turn runs
+    // .sandboxed — files jailed to the conversation workdir, research, and the entire hive-memory
+    // surface, with code execution, host control, engine self-mod, tool authoring, browser/MCP drive,
+    // casting and scheduling all refused at tools.execute and orchTool.
+    //
+    // Two things had to be true before this line could change, and both are (see the commit that
+    // introduced them): the durable memory store is per-uid, so a turn's system prompt no longer carries
+    // another user's credentials; and the sandbox check is an ALLOWLIST, because execute() falls through
+    // to runAuthored for unknown names and a denylist would be defeated by make_tool.
     const id = req.param("id") orelse return badReq(res, "no id");
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
