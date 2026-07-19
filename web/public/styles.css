@@ -605,7 +605,54 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   color: var(--text-muted);
   margin-bottom: 6px;
 }
+
+/* "what the host machine is doing" — the engine's own status line, or the tool
+   currently executing with its elapsed time. A web user staring at silence
+   cannot tell working from wedged; the desk shows this constantly. */
+.host-activity {
+  display: flex; align-items: center; gap: 7px;
+  min-height: 1.4em;
+  margin-bottom: 7px;
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  color: var(--text-secondary);
+}
+.host-activity:empty { display: none; }
+.host-activity b { font-family: var(--font-mono); font-weight: 600; color: var(--text); }
+.host-activity .ellip { max-width: 42ch; }
+
+/* A ring that spins — no glyph, so it cannot be mistaken for content and it
+   costs nothing to animate (transform only, no layout). */
+.spin {
+  width: 11px; height: 11px; flex: 0 0 auto;
+  border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: veil-spin .8s linear infinite;
+}
+@keyframes veil-spin { to { transform: rotate(360deg); } }
+
+.live-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--role-assistant);
+  animation: veil-pulse 1.6s ease-in-out infinite;
+  vertical-align: middle;
+}
+@keyframes veil-pulse { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+
+/* The typewriter's cursor: a block that blinks in steps, not a fade — a fading
+   caret reads as a rendering artifact rather than a cursor. */
+.caret {
+  display: inline-block;
+  width: .5em; height: 1em;
+  margin-left: 1px;
+  background: var(--accent);
+  vertical-align: text-bottom;
+  animation: veil-caret 1s steps(1) infinite;
+}
+@keyframes veil-caret { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
+
 .tools { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.tools:empty { display: none; }
 .tool-chip {
   display: inline-flex; align-items: baseline; gap: 6px;
   max-width: 100%;
@@ -617,9 +664,17 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .tool-chip b { font-family: var(--font-mono); font-weight: 600; }
 .tool-chip span { color: var(--text-muted); max-width: 40ch; }
+/* State is a colour AND a mark: colour alone fails for anyone who cannot
+   distinguish the two, and these are the difference between "it worked" and
+   "it failed". */
+.tool-chip .tool-mark { font-style: normal; font-size: .9em; flex: 0 0 auto; }
+.tool-chip .tool-mark.spin { width: 9px; height: 9px; border-width: 1.5px; }
+.tool-chip { transition: border-color .25s ease, color .25s ease; }
 .tool-chip.run  { border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .tool-chip.done { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); }
+.tool-chip.done .tool-mark { color: var(--success); }
 .tool-chip.err  { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); color: var(--danger); }
+.tool-chip.err .tool-mark { color: var(--danger); }
 
 /* the desk shimmers while a turn is thinking with nothing to show yet */
 .shimmer-line {
@@ -719,16 +774,35 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .set-row .muted { font-size: calc(var(--fs-small) * var(--text-scale)); margin-top: 2px; }
 .w-auto { width: auto; min-height: 0; }
 
+/* The key row: status dot pinned top-left, then the control. The dot aligns to
+   the FIRST LINE rather than centring on the row, so when the field wraps to its
+   own line on a narrow screen the indicator stays put instead of drifting to the
+   vertical middle of a two-line block. */
 .role-key {
-  display: flex; align-items: center; gap: 7px;
+  display: flex; align-items: flex-start; gap: 8px;
+  flex-wrap: wrap;
   font-size: calc(var(--fs-small) * var(--text-scale));
   color: var(--text-secondary);
+  margin-top: 4px;
 }
 .role-key:empty { display: none; }
 .role-key b { font-family: var(--font-mono); font-weight: 600; }
-.ok-dot, .bad-dot { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 auto; }
+
+.key-what {
+  font-family: var(--font-mono);
+  line-height: calc(var(--field-h) * 0.82);   /* sit on the field's optical centre */
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.ok-dot, .bad-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  flex: 0 0 auto;
+  margin-top: calc(var(--field-h) / 2 - 3.5px);   /* first-line alignment, not row-centre */
+}
 .ok-dot  { background: var(--success); }
 .bad-dot { background: var(--warn); }
+.role-key .linkbtn { line-height: calc(var(--field-h) * 0.82); }
 
 .model-note {
   margin-top: 6px;
@@ -761,9 +835,12 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .linkbtn:hover { color: var(--text); }
 
-/* The key field that unfolds under a role's "no X key stored" line. */
-.inline-key { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
-.inline-key input { flex: 1 1 220px; min-width: 0; }
+/* The key field sits on the role's status row: input first, Save beside it. It
+   takes the remaining width and drops to its own full-width line when the row
+   can no longer hold both — hence flex-wrap on .role-key and a flex-basis here
+   rather than a fixed width. */
+.inline-key { display: flex; gap: 8px; flex: 1 1 240px; min-width: 0; }
+.inline-key input { flex: 1 1 auto; min-width: 0; }
 .inline-key .btn { flex: 0 0 auto; }
 
 .auth-note {

@@ -643,34 +643,169 @@ async function deleteActiveConv() {
   refreshConvs();
 }
 
-function resetStream() { S.stream = { text: '', reasoning: '', tools: [], status: '' }; }
+function resetStream() {
+  S.stream = { text: '', shown: 0, reasoning: '', tools: [], status: '', started: 0 };
+}
 
-/* ---------------- transcript ---------------- */
+/* ---------------- transcript ----------------
+   Rendering is INCREMENTAL. The old version rebuilt every message's markdown on
+   each poll tick, which threw away the reader's text selection, re-ran the
+   highlighter over the whole history, and made a long conversation heavier with
+   every turn. Committed messages are now rendered once and appended; only the
+   live block is touched while a turn runs. */
 
 function drawTranscript() {
   const host = el('transcript');
   if (!host) return;
   if (!S.conv) {
     host.innerHTML = '<div class="empty">pick a conversation, or start a new one</div>';
+    host._rendered = 0;
     return;
   }
   const stick = isPinnedToBottom(host);
 
-  let html = S.msgs.map(renderMsg).join('');
+  // A shorter list than we have drawn means a different conversation (or a
+  // delete) — start over. Otherwise append only what is new.
+  if (typeof host._rendered !== 'number' || S.msgs.length < host._rendered) {
+    host.innerHTML = '';
+    host._rendered = 0;
+  }
+  if (host._rendered === 0 && !S.msgs.length && !S.live) {
+    host.innerHTML = '<div class="empty">say something to begin</div>';
+    return;
+  }
+  if (host._rendered === 0) host.innerHTML = '';
 
-  // The in-flight turn renders as one live block below the committed messages.
-  if (S.live || S.stream.text || S.stream.tools.length || S.stream.status) {
-    html += '<div class="msg assistant live">'
-      + '<div class="msg-role">veil</div>'
-      + (S.stream.status ? '<div class="turn-status">' + esc(S.stream.status) + '</div>' : '')
-      + (S.stream.tools.length ? '<div class="tools">' + S.stream.tools.map(toolChip).join('') + '</div>' : '')
-      + '<div class="msg-body">' + (S.stream.text ? mdRender(S.stream.text) : '<span class="shimmer-line"></span>') + '</div>'
-      + '</div>';
+  for (let i = host._rendered; i < S.msgs.length; i++) {
+    const node = document.createElement('div');
+    node.innerHTML = renderMsg(S.msgs[i]);
+    const msg = node.firstElementChild;
+    if (msg) { host.insertBefore(msg, liveNode(host)); wireCodeCopy(msg); }
+  }
+  host._rendered = S.msgs.length;
+
+  renderLive(host);
+  if (stick) host.scrollTop = host.scrollHeight;
+}
+
+/** The live block always sits last; committed messages insert before it. */
+function liveNode(host) {
+  return host.querySelector('.msg.live');
+}
+
+function renderLive(host) {
+  const want = S.live || S.stream.text || S.stream.tools.length || S.stream.status;
+  let live = liveNode(host);
+  if (!want) {
+    if (live) live.remove();
+    return;
+  }
+  if (!live) {
+    live = document.createElement('div');
+    live.className = 'msg assistant live';
+    live.innerHTML = '<div class="msg-role">veil <span class="live-dot"></span></div>'
+      + '<div class="host-activity"></div>'
+      + '<div class="tools"></div>'
+      + '<div class="msg-body"></div>';
+    host.appendChild(live);
   }
 
-  host.innerHTML = html || '<div class="empty">say something to begin</div>';
-  wireCodeCopy(host);
-  if (stick) host.scrollTop = host.scrollHeight;
+  const act = live.querySelector('.host-activity');
+  const html = hostActivityHtml();
+  if (act.innerHTML !== html) act.innerHTML = html;
+
+  const tools = live.querySelector('.tools');
+  const th = S.stream.tools.map(toolChip).join('');
+  if (tools.innerHTML !== th) tools.innerHTML = th;
+  tools.classList.toggle('hide', !S.stream.tools.length);
+
+  paintTyped(live.querySelector('.msg-body'));
+}
+
+/** What the host machine is doing right now, in the engine's own words: the
+    latest status frame, plus the tool currently executing and how long it has
+    been going. The desk shows this constantly; a web user staring at silence
+    has no idea whether the machine is working or wedged. */
+function hostActivityHtml() {
+  const running = S.stream.tools.filter((t) => t.state !== 'done' && t.state !== 'error');
+  const bits = [];
+  if (running.length) {
+    const t = running[running.length - 1];
+    const secs = t.started ? Math.round((Date.now() - t.started) / 1000) : 0;
+    bits.push('<span class="spin"></span><b>' + esc(t.tool) + '</b>'
+      + (t.preview ? ' <span class="muted ellip">' + esc(t.preview) + '</span>' : '')
+      + (secs > 1 ? ' <span class="muted">' + secs + 's</span>' : ''));
+  } else if (S.stream.status) {
+    bits.push('<span class="spin"></span>' + esc(S.stream.status));
+  } else if (S.live && !S.stream.text) {
+    bits.push('<span class="spin"></span>thinking');
+  }
+  return bits.join('');
+}
+
+/* ---------------- the typewriter ----------------
+   Frames arrive in ~900ms polls, so painting them as they land makes the reply
+   jump in blocks. We keep the received text and reveal it on a rAF loop, which
+   turns bursty transport into steady output. The rate is proportional to the
+   backlog, so it always catches up rather than falling behind a fast model —
+   what it smooths is the arrival pattern, not the model's actual speed. */
+
+let _typeRaf = 0;
+let _typeLastPaint = 0;
+
+function scheduleType() {
+  if (_typeRaf) return;
+  _typeRaf = requestAnimationFrame(typeTick);
+}
+
+function typeTick() {
+  _typeRaf = 0;
+  const host = el('transcript');
+  const live = host && liveNode(host);
+  if (!live) return;
+
+  const total = S.stream.text.length;
+  if (S.stream.shown < total) {
+    // Drain the backlog over roughly a dozen frames (~200ms): fast enough that a
+    // long paste does not crawl, slow enough that a short sentence still types.
+    const backlog = total - S.stream.shown;
+    S.stream.shown = Math.min(total, S.stream.shown + Math.max(2, Math.ceil(backlog / 12)));
+  }
+
+  const now = performance.now();
+  // Markdown + highlighting on every frame is wasted work; the eye cannot tell
+  // 60fps from ~25fps here, and this keeps a long code block from stuttering.
+  if (now - _typeLastPaint > 40 || S.stream.shown >= total) {
+    _typeLastPaint = now;
+    const stick = isPinnedToBottom(host);
+    paintTyped(live.querySelector('.msg-body'));
+    const act = live.querySelector('.host-activity');
+    const html = hostActivityHtml();
+    if (act && act.innerHTML !== html) act.innerHTML = html;
+    if (stick) host.scrollTop = host.scrollHeight;
+  }
+
+  // Keep ticking while there is text to reveal, or while a tool is running (the
+  // elapsed counter and spinner need frames of their own).
+  if (S.stream.shown < total || S.live) scheduleType();
+}
+
+function paintTyped(body) {
+  if (!body) return;
+  if (!S.stream.text) {
+    if (!body.querySelector('.shimmer-line')) body.innerHTML = '<span class="shimmer-line"></span>';
+    return;
+  }
+  const revealed = S.stream.text.slice(0, S.stream.shown);
+  // Render the revealed prefix as markdown so fences, lists and tables form as
+  // they arrive — mdRender tolerates a half-finished fence by design, which is
+  // exactly the streaming case.
+  const html = mdRender(revealed) + (S.stream.shown < S.stream.text.length ? '<span class="caret"></span>' : '');
+  if (body._html !== html) {
+    body._html = html;
+    body.innerHTML = html;
+    wireCodeCopy(body);
+  }
 }
 
 function isPinnedToBottom(host) {
@@ -687,9 +822,18 @@ function renderMsg(m) {
   </div>`;
 }
 
+/** A tool chip carries its own state and elapsed time — the point is that the
+    user can see the host working, not just that something is happening. */
 function toolChip(t) {
   const cls = t.state === 'done' ? 'done' : (t.state === 'error' ? 'err' : 'run');
-  return `<div class="tool-chip ${cls}"><b>${esc(t.tool)}</b>${t.preview ? '<span class="ellip">' + esc(t.preview) + '</span>' : ''}</div>`;
+  const mark = t.state === 'done' ? '✓' : (t.state === 'error' ? '✗' : '');
+  const secs = t.started && t.ended ? Math.round((t.ended - t.started) / 1000) : 0;
+  return '<div class="tool-chip ' + cls + '">'
+    + (mark ? '<i class="tool-mark">' + mark + '</i>' : '<i class="tool-mark spin"></i>')
+    + '<b>' + esc(t.tool) + '</b>'
+    + (t.preview ? '<span class="ellip">' + esc(t.preview) + '</span>' : '')
+    + (secs > 1 ? '<span class="muted">' + secs + 's</span>' : '')
+    + '</div>';
 }
 
 function wireCodeCopy(host) {
@@ -847,7 +991,8 @@ function applyFrame(f) {
   switch (f.kind) {
     case 'token':
       S.stream.text += f.delta || '';
-      return true;
+      scheduleType();           // reveal it smoothly rather than in poll-sized blocks
+      return false;             // the rAF loop paints; a full redraw here would fight it
     case 'reasoning':
       S.stream.reasoning += f.delta || '';
       return false;             // thinking stays out of the transcript
@@ -855,9 +1000,15 @@ function applyFrame(f) {
       S.stream.status = f.text || '';
       return true;
     case 'tool': {
-      const prev = S.stream.tools.find((t) => t.tool === f.tool && t.state !== 'done');
-      if (prev) { prev.state = f.state; prev.preview = f.preview || prev.preview; }
-      else S.stream.tools.push({ tool: f.tool, state: f.state, preview: f.preview || '' });
+      const prev = S.stream.tools.find((t) => t.tool === f.tool && t.state !== 'done' && t.state !== 'error');
+      if (prev) {
+        prev.state = f.state;
+        prev.preview = f.preview || prev.preview;
+        if (f.state === 'done' || f.state === 'error') prev.ended = Date.now();
+      } else {
+        S.stream.tools.push({ tool: f.tool, state: f.state, preview: f.preview || '', started: Date.now(), ended: 0 });
+      }
+      scheduleType();           // keeps the elapsed counter and spinner ticking
       return true;
     }
     case 'message':
@@ -1465,30 +1616,27 @@ function roleKeyState(roleKey) {
   const p = (S.models && S.models.providers || []).find((x) => x.key === prov);
   if (!p) return '';
   if (p.base_url === 'local' || !p.needs_key) {
-    return '<span class="ok-dot"></span>no key needed — ' + esc(providerLabel(prov));
+    return '<span class="ok-dot"></span><span class="key-what">' + esc(providerLabel(prov)) + ' · no key needed</span>';
   }
   const stored = (S.keys || []).find((k) => k.provider === prov);
-  // The key lives WITH the model that needs it. Sending someone to a different
-  // panel to paste a key for a choice they just made here is the whole
-  // complaint: nothing connected the two, so it read as broken rather than
-  // two-step. Add and Remove both happen inline now.
+  // The key lives WITH the model that needs it — sending someone to a different
+  // panel to paste a key for the choice they just made is what read as broken.
+  // The row is deliberately terse: a status dot, the provider, and the control.
+  // The explanatory prose that used to sit here said nothing the field did not.
   if (stored) {
-    return '<span class="ok-dot"></span>using your <b>' + esc(prov) + '</b> key'
-      + (stored.last4 ? ' <span class="muted">••••' + esc(stored.last4) + '</span>' : '')
-      + ' <button class="linkbtn" data-key-remove="' + esc(prov) + '">remove</button>';
+    return '<span class="ok-dot"></span>'
+      + '<span class="key-what">' + esc(prov)
+      + (stored.last4 ? ' <span class="muted">••••' + esc(stored.last4) + '</span>' : '') + '</span>'
+      + '<button class="linkbtn" data-key-remove="' + esc(prov) + '">remove</button>';
   }
   // No disclosure toggle: when the key is missing, the field IS the message.
-  // Hiding it behind an "add one" link is what made this feel broken in the
-  // first place — the user had already chosen a model and had nowhere obvious
-  // to put its key.
-  // Phrased without an article: "needs a openrouter key" was the alternative,
-  // and an a/an rule keyed on provider names is not worth carrying.
-  return '<span class="bad-dot"></span>no <b>' + esc(prov) + '</b> key stored — paste one to use this model'
-    + '<div class="inline-key" data-inlinefor="' + esc(prov) + '">'
+  return '<span class="bad-dot"></span>'
+    + '<span class="key-what">' + esc(prov) + '</span>'
+    + '<span class="inline-key" data-inlinefor="' + esc(prov) + '">'
     + '<input type="password" placeholder="' + esc(prov) + ' API key" autocomplete="off"'
     + ' autocapitalize="none" spellcheck="false" data-inlinekey="' + esc(prov) + '">'
     + '<button class="btn btn-sm btn-solid" data-inlinesave="' + esc(prov) + '">Save</button>'
-    + '</div>';
+    + '</span>';
 }
 
 function refreshRoleKeyStates() {
