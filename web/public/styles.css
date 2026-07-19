@@ -471,7 +471,12 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .chat { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 
 .chat-list {
-  flex: 0 0 260px;
+  /* The basis is set inline by applyRailWidth (see app.js) — going through a
+     custom property here left the computed basis pinned to the fallback. This
+     is only the starting value. */
+  flex-grow: 0;
+  flex-shrink: 0;
+  flex-basis: 260px;
   display: flex; flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--border);
@@ -911,3 +916,34 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 
 .row-actions { display: flex; gap: 6px; white-space: nowrap; }
+
+/* ============================================================ rail grip
+   The draggable divider between the conversation list and the thread. Six
+   pixels wide but with a wider hit area via padding, because a 6px target is a
+   fight on a trackpad. Hidden on phones, where the two panes never coexist. */
+.rail-grip {
+  flex: 0 0 6px;
+  position: relative;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;          /* or the browser pans the page mid-drag */
+}
+.rail-grip::before {
+  content: "";
+  position: absolute; inset: 0 2px;
+  background: var(--border);
+  transition: background .15s ease;
+}
+.rail-grip:hover::before,
+.rail-grip:focus-visible::before,
+.rail-grip.dragging::before { background: var(--accent); }
+/* Widen the GRAB area well past the visible line without moving the layout. */
+.rail-grip::after {
+  content: "";
+  position: absolute; top: 0; bottom: 0; left: -4px; right: -4px;
+}
+.rail-grip.dragging { user-select: none; }
+body:has(.rail-grip.dragging) { cursor: col-resize; user-select: none; }
+
+@media (max-width: 720px) { .rail-grip { display: none; } }
+.chat.rail-collapsed .rail-grip { display: none; }
