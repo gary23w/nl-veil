@@ -31,6 +31,7 @@ const keys_api = @import("config/keys_api.zig");
 const local_models = @import("config/local_models.zig");
 const cf_oauth = @import("config/cf_oauth.zig");
 const server_config = @import("config/server_config.zig");
+const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
 const cli = @import("cli.zig");
 const build_options = @import("build_options");
@@ -635,12 +636,32 @@ pub fn main(init: std.process.Init) !void {
     // merely misleading on a loopback bind and actively wrong now that binding every interface is the
     // default — the whole point is that somebody on another machine can open it.
     if (bind_all) {
-        log.info("neuron-loops {s} on http://localhost:{d}  (and http://<this machine>:{d} from the network)  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, port, paths.home, auth.userCount(), readopted });
+        // Name the addresses somebody can actually type. A placeholder like "http://<this machine>"
+        // is not an address, and the whole point of binding every interface is that a phone in the
+        // next room can open it.
+        var lan_buf: [256]u8 = undefined;
+        const lan = lan_mod.addresses(gpa, io, &lan_buf);
+        if (lan.len > 0) {
+            // One complete URL per address. Joining them with commas and appending the port once
+            // produced "http://a, b, c:8787", where only the last one is actually a link.
+            var urls_buf: [512]u8 = undefined;
+            var un: usize = 0;
+            var addrs = std.mem.splitScalar(u8, lan, ' ');
+            while (addrs.next()) |a| {
+                if (a.len == 0) continue;
+                const line = std.fmt.bufPrint(urls_buf[un..], "\n      http://{s}:{d}", .{ a, port }) catch break;
+                un += line.len;
+            }
+            log.info("neuron-loops {s} on http://localhost:{d}\n" ++
+                "    open from another machine (phone, laptop) at:{s}\n" ++
+                "    home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, urls_buf[0..un], paths.home, auth.userCount(), readopted });
+        } else {
+            log.info("neuron-loops {s} on http://localhost:{d}  (also reachable from this network — check this machine's IP)  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+        }
     } else {
         log.info("neuron-loops {s} on http://127.0.0.1:{d}  (this machine only — NL_BIND=127.0.0.1)  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, paths.home, auth.userCount(), readopted });
     }
-    // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
-    // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
+
     // ALWAYS mint the desktop key. This is how the desk and the `veil` CLI authenticate to their own
     // server on this machine, and it is a file readable only by this OS user — the port being open to
     // the LAN does not make a local file more reachable. Gating it on the bind address meant that
