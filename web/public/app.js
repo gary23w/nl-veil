@@ -1467,28 +1467,93 @@ function roleKeyState(roleKey) {
   if (p.base_url === 'local' || !p.needs_key) {
     return '<span class="ok-dot"></span>no key needed — ' + esc(providerLabel(prov));
   }
-  const have = (S.keys || []).some((k) => k.provider === prov);
-  // Phrased without an article: "needs a openrouter key" was the alternative, and
-  // an a/an rule keyed on provider names is not worth carrying.
-  return have
-    ? '<span class="ok-dot"></span>uses your stored <b>' + esc(prov) + '</b> key'
-    : '<span class="bad-dot"></span>no <b>' + esc(prov) + '</b> key stored — add one under Provider keys';
+  const stored = (S.keys || []).find((k) => k.provider === prov);
+  // The key lives WITH the model that needs it. Sending someone to a different
+  // panel to paste a key for a choice they just made here is the whole
+  // complaint: nothing connected the two, so it read as broken rather than
+  // two-step. Add and Remove both happen inline now.
+  if (stored) {
+    return '<span class="ok-dot"></span>using your <b>' + esc(prov) + '</b> key'
+      + (stored.last4 ? ' <span class="muted">••••' + esc(stored.last4) + '</span>' : '')
+      + ' <button class="linkbtn" data-key-remove="' + esc(prov) + '">remove</button>';
+  }
+  // No disclosure toggle: when the key is missing, the field IS the message.
+  // Hiding it behind an "add one" link is what made this feel broken in the
+  // first place — the user had already chosen a model and had nowhere obvious
+  // to put its key.
+  // Phrased without an article: "needs a openrouter key" was the alternative,
+  // and an a/an rule keyed on provider names is not worth carrying.
+  return '<span class="bad-dot"></span>no <b>' + esc(prov) + '</b> key stored — paste one to use this model'
+    + '<div class="inline-key" data-inlinefor="' + esc(prov) + '">'
+    + '<input type="password" placeholder="' + esc(prov) + ' API key" autocomplete="off"'
+    + ' autocapitalize="none" spellcheck="false" data-inlinekey="' + esc(prov) + '">'
+    + '<button class="btn btn-sm btn-solid" data-inlinesave="' + esc(prov) + '">Save</button>'
+    + '</div>';
 }
 
 function refreshRoleKeyStates() {
   $$('[data-keystate]').forEach((n) => { n.innerHTML = roleKeyState(n.dataset.keystate); });
 }
 
-/** Tell the user up front that a hosted provider needs a key, and pre-fill the
-    provider field so adding it is one paste rather than a spelling exercise. */
+/* DELEGATION, not per-node listeners. These controls live inside markup that is
+   rebuilt with innerHTML from several independent paths (drawRolePanels, the
+   model picker's change handler, refreshKeys resolving), and any repaint after
+   a wiring pass silently orphans every listener attached to the old nodes — the
+   buttons render perfectly and simply do nothing, which is indistinguishable
+   from a styling bug. One document-level listener keyed on data attributes
+   cannot be orphaned, so the render order stops mattering. */
+document.addEventListener('click', (e) => {
+  const t = e.target.closest ? e.target.closest('[data-inlinesave],[data-key-remove]') : null;
+  if (!t) return;
+  if (t.dataset.inlinesave !== undefined) return saveInlineKey(t.dataset.inlinesave);
+  if (t.dataset.keyRemove !== undefined) return removeKey(t.dataset.keyRemove);
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter') return;
+  const f = e.target;
+  if (!f || !f.dataset || f.dataset.inlinekey === undefined) return;
+  e.preventDefault();
+  saveInlineKey(f.dataset.inlinekey);
+});
+
+async function saveInlineKey(provider) {
+  const f = $('[data-inlinekey="' + provider + '"]');
+  if (!f) return;
+  const key = f.value.trim();
+  if (!key) { f.focus(); return toast('Key required', 'Paste the provider API key.', 'err'); }
+  try {
+    // base_url is deliberately omitted: the role panel already carries the
+    // endpoint, and storing a second copy here is how the two drift apart.
+    await jpost('/api/v1/keys', { provider: provider, key: key, base_url: '' });
+    toast('Key stored', providerLabel(provider) + ' — sealed server-side.', 'ok');
+    await refreshKeys();
+  } catch (e) {
+    toast('Could not store the key', e.message, 'err');
+  } finally {
+    f.value = '';   // cleared on every path, success or failure
+  }
+}
+
+/** One removal path for both the inline line and the Provider keys list, so the
+    key list and every role line repaint together and cannot disagree. */
+async function removeKey(provider) {
+  if (!confirm('Remove the stored ' + provider + ' key?')) return;
+  try {
+    await jdel('/api/v1/keys/' + encodeURIComponent(provider));
+    toast('Key removed', providerLabel(provider), 'ok');
+    await refreshKeys();
+  } catch (e) {
+    toast('Could not remove the key', e.message, 'err');
+  }
+}
+
+/** Pre-fill the standalone provider field after a model choice, so adding a key
+    there is one paste rather than a spelling exercise. The inline affordance is
+    the primary path now, so this no longer nags with a toast. */
 function needsKeyHint(provider) {
-  const p = (S.models && S.models.providers || []).find((x) => x.key === provider);
-  if (!p) return;
   const prov = el('kProv');
-  if (prov && !prov.value.trim()) prov.value = provider;   // name the field after the choice
-  if (!p.needs_key) return;
-  if ((S.keys || []).some((k) => k.provider === provider)) return;
-  toast('This model needs a key', providerLabel(provider) + ' — add it under Provider keys below.', 'err');
+  if (prov && !prov.value.trim()) prov.value = provider;
 }
 
 async function refreshKeys() {
@@ -1506,12 +1571,17 @@ async function refreshKeys() {
         </div>`).join('')
       : '<div class="muted">no provider keys stored</div>';
     refreshRoleKeyStates();   // the role panels report which of these they use
-    $$('[data-key-del]', host).forEach((b) => b.addEventListener('click', async () => {
-      try { await jdel('/api/v1/keys/' + encodeURIComponent(b.dataset.keyDel)); refreshKeys(); }
-      catch (e) { toast('Could not remove', e.message, 'err'); }
-    }));
+    $$('[data-key-del]', host).forEach((b) => b.addEventListener('click', () => removeKey(b.dataset.keyDel)));
   } catch (e) {
-    host.innerHTML = '<div class="muted">could not load keys</div>';
+    // Say WHICH failure this is. "could not load keys" on an expired session sent
+    // the last reader hunting for a key bug that did not exist — the list was
+    // empty because the request was unauthorized, and with no list there was no
+    // Remove button, which read as "keys cannot be deleted".
+    S.keys = [];
+    host.innerHTML = e.message === 'unauthorized'
+      ? '<div class="muted">not signed in — reload the page</div>'
+      : '<div class="muted">could not load keys — ' + esc(e.message) + '</div>';
+    refreshRoleKeyStates();
   }
 }
 

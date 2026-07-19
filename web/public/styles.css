@@ -749,6 +749,23 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .key-add { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .key-add .muted { flex: 1 1 260px; font-size: calc(var(--fs-micro) * var(--text-scale)); line-height: 1.4; }
 
+/* A button that reads as a link: used for the inline add/remove on a role's key
+   line, where a full button would shout louder than the status it sits beside. */
+.linkbtn {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  font-size: inherit;
+  padding: 0 2px;
+  min-height: 0;
+}
+.linkbtn:hover { color: var(--text); }
+
+/* The key field that unfolds under a role's "no X key stored" line. */
+.inline-key { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.inline-key input { flex: 1 1 220px; min-width: 0; }
+.inline-key .btn { flex: 0 0 auto; }
+
 .auth-note {
   margin-top: 12px; text-align: center;
   font-size: calc(var(--fs-small) * var(--text-scale)); color: var(--text-muted);
