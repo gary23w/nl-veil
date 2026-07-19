@@ -386,6 +386,49 @@ async function pollHealth() {
 
 /* ============================================================ dashboard */
 
+/** Everything happening for THIS user, in one place. Swarms and scheduled tasks
+    each had their own tab, and a running turn was only visible if you happened
+    to have that conversation open — so "is anything happening right now?" had no
+    answer anywhere. This is that answer, assembled from endpoints that already
+    exist rather than a new one. */
+async function renderActivity() {
+  const host = el('activityBody');
+  if (!host) return;
+  const [swarms, tasks, convs] = await Promise.all([
+    api.swarms().then((j) => j.swarms || []).catch(() => []),
+    api.sched().then((j) => j.tasks || []).catch(() => []),   // 403s for non-admins; empty is the honest answer
+    api.convs().then((j) => j.convs || []).catch(() => []),
+  ]);
+  if (S.tab !== 'dashboard') return;
+
+  const live = swarms.filter((s) => swarmState(s) === 'live');
+  const due = tasks.filter((t) => t.enabled).sort((a, b) => (a.next_due || 0) - (b.next_due || 0));
+  const recent = convs.slice().sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 5);
+
+  const rows = [];
+  for (const s of live) {
+    rows.push({ when: 0, cls: 'live', what: 'swarm', who: s.name || s.id,
+      detail: (s.minds || 0) + ' minds working', go: () => setTab('swarms') });
+  }
+  for (const t of due.slice(0, 3)) {
+    rows.push({ when: t.next_due || 0, cls: '', what: 'task', who: t.name || t.id,
+      detail: t.next_due ? 'next ' + fmtWhen(t.next_due) : taskSchedule(t), go: () => setTab('tasks') });
+  }
+  for (const c of recent) {
+    rows.push({ when: c.updated || 0, cls: '', what: 'chat', who: c.title || c.id,
+      detail: (c.msgs || 0) + ' messages · ' + fmtWhen(c.updated), go: () => { S.conv = c.id; setTab('chat'); } });
+  }
+
+  host.innerHTML = rows.length ? rows.map((r, i) => `
+    <button class="act-row ${r.cls}" data-act-i="${i}">
+      <span class="act-kind">${esc(r.what)}</span>
+      <span class="act-who grow ellip">${esc(r.who)}</span>
+      <span class="act-detail muted ellip">${esc(r.detail)}</span>
+    </button>`).join('')
+    : '<div class="empty">nothing running — start a chat, or deploy a swarm</div>';
+  $$('[data-act-i]', host).forEach((b) => b.addEventListener('click', () => rows[+b.dataset.actI].go()));
+}
+
 async function renderDashboard(host) {
   host.innerHTML = '<div class="scroller"><div class="pad" id="dashBody"><div class="empty">reading the ledger…</div></div></div>';
   let m = null;
@@ -415,6 +458,10 @@ async function renderDashboard(host) {
       ${cards.map((c) => `<div class="stat ${c.cls || ''}"><b>${esc(c.v)}</b><span>${esc(c.l)}</span></div>`).join('')}
     </div>
 
+    <div class="section-head"><h2>Happening now</h2>
+      <button class="btn btn-sm btn-ghost" id="actRefresh">Refresh</button></div>
+    <div class="panel" id="activityBody"><div class="empty">looking…</div></div>
+
     <div class="section-head"><h2>LLM breakdown</h2></div>
     ${models.length ? `<div class="table-wrap"><table class="data">
       <thead><tr><th>model</th><th class="num">calls</th><th class="num">in</th><th class="num">out</th><th class="num">tok/s</th></tr></thead>
@@ -441,6 +488,9 @@ async function renderDashboard(host) {
       </div>
       <div class="bars-axis"><span>14 days ago</span><span>today</span></div>
     </div>`;
+
+  el('actRefresh').addEventListener('click', renderActivity);
+  renderActivity();   // fired after the shell exists, so it can paint into it
 }
 
 /* ============================================================ chat */

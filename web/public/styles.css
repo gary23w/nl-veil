@@ -947,3 +947,40 @@ body:has(.rail-grip.dragging) { cursor: col-resize; user-select: none; }
 
 @media (max-width: 720px) { .rail-grip { display: none; } }
 .chat.rail-collapsed .rail-grip { display: none; }
+
+/* ============================================================ activity feed
+   One list answering "is anything happening right now?", assembled from the
+   swarm / task / conversation endpoints that already exist. Every row is a
+   button that takes you to the thing it names — a feed you cannot act from is
+   just decoration. */
+.act-row {
+  display: flex; align-items: baseline; gap: 12px;
+  width: 100%; text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.act-row:last-child { border-bottom: 0; }
+.act-row:hover { background: var(--surface-hover); }
+.act-kind {
+  flex: 0 0 62px;
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+  letter-spacing: .08em; text-transform: uppercase;
+  color: var(--text-muted);
+}
+.act-who { font-weight: 600; min-width: 0; }
+.act-detail { flex: 0 1 auto; min-width: 0; }
+/* A live row earns the accent — it is the only thing on this page that is
+   changing while you look at it. */
+.act-row.live .act-kind { color: var(--success); }
+.act-row.live .act-who::after {
+  content: ""; display: inline-block;
+  width: 6px; height: 6px; margin-left: 7px; border-radius: 50%;
+  background: var(--success);
+  animation: veil-pulse 1.6s ease-in-out infinite;
+}
+@media (max-width: 720px) {
+  .act-row { flex-wrap: wrap; }
+  .act-detail { flex-basis: 100%; }
+}
