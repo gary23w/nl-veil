@@ -1621,31 +1621,51 @@ async function renderAdmin(host) {
 async function renderServerConfig() {
   const host = el('cfgPanel');
   if (!host) return;
-  let cur = { default_model: '', default_base_url: '' };
+  let cur = {};
+  let keys = [];
   try {
     cur = await jget('/api/v1/admin/config');
+    keys = (await jget('/api/v1/admin/keys')).keys || [];
   } catch (e) {
     host.innerHTML = '<div class="muted">could not read the configuration — ' + esc(e.message) + '</div>';
     return;
   }
   if (!S.models) await loadModels();
+  S.adminKeys = keys;
+  const trio = !!(cur.think_model || cur.prompt_model);
+
+  const rolePanel = (key, label, hint, model, base) => `
+    <div class="role-panel" data-cfgrole="${key}">
+      <div class="role-title">${label}<span class="muted"> — ${esc(hint)}</span></div>
+      <div class="field">
+        <label>Model</label>
+        <select data-cfgpick="${key}">${catalogOptions(model || '')}</select>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Model id</label>
+          <input type="text" data-cfgid="${key}" value="${esc(model || '')}" placeholder="${key === '' ? 'none — users choose their own' : 'blank = use the coding model'}"></div>
+        <div class="field"><label>Base URL</label>
+          <input type="text" data-cfgbase="${key}" value="${esc(base || '')}" placeholder="https://…"></div>
+      </div>
+      <div class="role-key" data-cfgkey="${key}">${adminKeyState(model, base)}</div>
+    </div>`;
 
   host.innerHTML = `
     <div class="muted" style="margin-bottom:10px">
-      Everyone who has not chosen their own model uses this. It applies immediately — no restart — and
-      the API key is never part of it: each account still supplies its own, sealed server-side.
+      Everyone who has not chosen their own model uses this. It applies immediately — no restart.
     </div>
-    <div class="field">
-      <label for="cfgModel">Model</label>
-      <select id="cfgModel">${catalogOptions(cur.default_model)}</select>
+    <div class="set-row">
+      <div><b>One model for everything</b>
+        <div class="muted">Off = publish a coding / thinking / prompting split for every user, the same
+          three roles they can set for themselves.</div></div>
+      <input type="checkbox" id="cfgOne" class="w-auto" ${trio ? '' : 'checked'}>
     </div>
-    <div class="field-row">
-      <div class="field"><label for="cfgId">Model id</label>
-        <input id="cfgId" type="text" value="${esc(cur.default_model || '')}" placeholder="none — users choose their own"></div>
-      <div class="field"><label for="cfgBase">Base URL</label>
-        <input id="cfgBase" type="text" value="${esc(cur.default_base_url || '')}" placeholder="https://…"></div>
+    <div id="cfgRoles">
+      ${rolePanel('', 'Coding', 'the build stream — and the fallback for every unset role', cur.default_model, cur.default_base_url)}
+      ${trio ? rolePanel('think_', 'Thinking', 'planning, reflection, summaries', cur.think_model, cur.think_base_url) : ''}
+      ${trio ? rolePanel('prompt_', 'Prompting', 'drives the auto-loop', cur.prompt_model, cur.prompt_base_url) : ''}
     </div>
-    <div class="row">
+    <div class="row" style="margin-top:12px">
       <button class="btn btn-solid btn-sm" id="cfgSave">Save</button>
       <button class="btn btn-sm btn-ghost" id="cfgClear">Clear</button>
       <span class="muted" id="cfgState">${cur.default_model
@@ -1653,21 +1673,108 @@ async function renderServerConfig() {
         : 'no default — every user must pick a model before they can chat'}</span>
     </div>`;
 
-  el('cfgModel').addEventListener('change', () => {
-    const m = modelById(el('cfgModel').value);
-    el('cfgId').value = el('cfgModel').value;
-    // Fill the endpoint from the catalog too: a right model id against the wrong
-    // base is the most common way to get a 404 that reads like a model problem.
-    if (m) el('cfgBase').value = providerBase(m.provider);
+  el('cfgOne').addEventListener('change', () => {
+    // Collapsing to one model clears the other two: a hidden thinking model that
+    // still applied would be a setting nobody could see.
+    const one = el('cfgOne').checked;
+    saveServerConfig(readCfg(''), one ? null : readCfg('think_'), one ? null : readCfg('prompt_'));
   });
-  el('cfgSave').addEventListener('click', () => saveServerConfig(el('cfgId').value.trim(), el('cfgBase').value.trim()));
-  el('cfgClear').addEventListener('click', () => saveServerConfig('', ''));
+  $$('[data-cfgpick]').forEach((sel) => sel.addEventListener('change', () => {
+    const role = sel.dataset.cfgpick;
+    const m = modelById(sel.value);
+    const idEl = host.querySelector('[data-cfgid="' + role + '"]');
+    const baseEl = host.querySelector('[data-cfgbase="' + role + '"]');
+    idEl.value = sel.value;
+    if (m) baseEl.value = providerBase(m.provider);
+    const line = host.querySelector('[data-cfgkey="' + role + '"]');
+    if (line) { line.innerHTML = adminKeyState(idEl.value, baseEl.value); wireAdminKeys(); }
+  }));
+  el('cfgSave').addEventListener('click', () => {
+    const one = el('cfgOne').checked;
+    saveServerConfig(readCfg(''), one ? null : readCfg('think_'), one ? null : readCfg('prompt_'));
+  });
+  el('cfgClear').addEventListener('click', () => saveServerConfig({ model: '', base: '' }, null, null));
+  wireAdminKeys();
 }
 
-async function saveServerConfig(model, base) {
+function readCfg(role) {
+  const idEl = document.querySelector('[data-cfgid="' + role + '"]');
+  const baseEl = document.querySelector('[data-cfgbase="' + role + '"]');
+  return { model: idEl ? idEl.value.trim() : '', base: baseEl ? baseEl.value.trim() : '' };
+}
+
+/** The SHARED key for whichever provider this role's endpoint belongs to.
+    Without one, a default model is only half an answer — every user still has to
+    bring their own key before they can send a message, which is exactly the
+    setup step a default model exists to remove. */
+function adminKeyState(model, base) {
+  const prov = (base && providerForBaseJs(base)) || (modelById(model) || {}).provider;
+  if (!prov) return '';
+  const p = (S.models && S.models.providers || []).find((x) => x.key === prov);
+  if (!p || !p.needs_key || p.base_url === 'local') {
+    return '<span class="ok-dot"></span><span class="key-what">no key needed</span>';
+  }
+  const have = (S.adminKeys || []).find((k) => k.provider === prov);
+  if (have) {
+    return '<span class="ok-dot"></span><span class="key-what">shared ' + esc(prov) + ' key'
+      + (have.last4 ? ' <span class="muted">••••' + esc(have.last4) + '</span>' : '') + '</span>'
+      + '<button class="linkbtn" data-adminkeydel="' + esc(prov) + '">remove</button>';
+  }
+  return '<span class="bad-dot"></span><span class="key-what">' + esc(prov) + '</span>'
+    + '<span class="inline-key">'
+    + '<input type="password" placeholder="shared ' + esc(prov) + ' key — used by everyone" autocomplete="off"'
+    + ' autocapitalize="none" spellcheck="false" data-adminkey="' + esc(prov) + '">'
+    + '<button class="btn btn-sm btn-solid" data-adminkeysave="' + esc(prov) + '">Save</button>'
+    + '</span>';
+}
+
+/** Catalog lookup by base URL. hostOf + the same host-match modelcfg does on the
+    server, so the UI names the provider whose key the turn will actually resolve. */
+function providerForBaseJs(base) {
+  const host = hostOf(base);
+  if (!host) return null;
+  const p = (S.models && S.models.providers || []).find(
+    (x) => x.base_url && x.base_url !== 'local' && x.base_url !== 'cloudflare' && hostOf(x.base_url) === host);
+  return p ? p.key : null;
+}
+
+function wireAdminKeys() {
+  $$('[data-adminkeysave]').forEach((b) => b.addEventListener('click', () => saveAdminKey(b.dataset.adminkeysave)));
+  $$('[data-adminkey]').forEach((f) => f.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveAdminKey(f.dataset.adminkey); }
+  }));
+  $$('[data-adminkeydel]').forEach((b) => b.addEventListener('click', async () => {
+    const prov = b.dataset.adminkeydel;
+    if (!confirm('Remove the shared ' + prov + ' key?\nUsers without a key of their own will stop being able to chat.')) return;
+    try { await jdel('/api/v1/admin/keys/' + encodeURIComponent(prov)); renderServerConfig(); }
+    catch (e) { toast('Could not remove', e.message, 'err'); }
+  }));
+}
+
+async function saveAdminKey(provider) {
+  const f = document.querySelector('[data-adminkey="' + provider + '"]');
+  if (!f) return;
+  const key = f.value.trim();
+  if (!key) { f.focus(); return toast('Key required', 'Paste the provider API key.', 'err'); }
   try {
-    await jpost('/api/v1/admin/config', { default_model: model, default_base_url: base });
-    toast(model ? 'Default model set' : 'Default cleared', model || 'users now choose their own', 'ok');
+    await jpost('/api/v1/admin/keys', { provider: provider, key: key, base_url: '' });
+    toast('Shared key stored', 'Every user without their own key now uses it.', 'ok');
+    renderServerConfig();
+  } catch (e) {
+    toast('Could not store the key', e.message, 'err');
+  } finally {
+    f.value = '';   // cleared on every path, success or failure
+  }
+}
+
+async function saveServerConfig(coding, thinking, prompting) {
+  try {
+    await jpost('/api/v1/admin/config', {
+      default_model: coding.model, default_base_url: coding.base,
+      think_model: thinking ? thinking.model : '', think_base_url: thinking ? thinking.base : '',
+      prompt_model: prompting ? prompting.model : '', prompt_base_url: prompting ? prompting.base : '',
+    });
+    toast(coding.model ? 'Default model set' : 'Default cleared', coding.model || 'users now choose their own', 'ok');
     // /auth/me carries this to every client, so refresh our own copy rather than
     // displaying a value only this tab believes in.
     try {
@@ -1678,127 +1785,6 @@ async function saveServerConfig(model, base) {
   } catch (e) {
     toast('Could not save', e.message, 'err');
   }
-}
-
-function showNewUserForm() {
-  const f = el('newUserForm');
-  f.classList.remove('hide');
-  f.innerHTML = `<div class="panel task-form">
-    <div class="muted" style="margin-bottom:10px">
-      Registration is closed on most installs, so this is how an account gets made. Hand the password
-      over out of band — it is not shown again.
-    </div>
-    <div class="field-row">
-      <div class="field"><label for="nuEmail">Email</label>
-        <input id="nuEmail" type="email" autocapitalize="none" spellcheck="false"></div>
-      <div class="field"><label for="nuPass">Password (8+ characters)</label>
-        <input id="nuPass" type="password" autocomplete="new-password"></div>
-    </div>
-    <div class="row">
-      <button class="btn btn-solid" id="nuSave">Create account</button>
-      <button class="btn btn-ghost" id="nuCancel">Cancel</button>
-    </div>
-  </div>`;
-  el('nuCancel').addEventListener('click', () => { f.classList.add('hide'); f.innerHTML = ''; });
-  el('nuSave').addEventListener('click', createUser);
-}
-
-async function createUser() {
-  const email = el('nuEmail').value.trim();
-  const pass = el('nuPass').value;
-  if (!email || !pass) return toast('Missing fields', 'Both an email and a password are required.', 'err');
-  try {
-    await api.adminCreate(email, pass);
-    toast('Account created', email, 'ok');
-    el('newUserForm').classList.add('hide');
-    el('newUserForm').innerHTML = '';
-    refreshUsers();
-  } catch (e) {
-    toast('Could not create the account', e.message, 'err');
-  } finally {
-    const p = el('nuPass');
-    if (p) p.value = '';   // the password does not linger in the DOM, on either path
-  }
-}
-
-async function refreshUsers() {
-  const host = el('userList');
-  if (!host) return;
-  let users;
-  try {
-    const j = await api.adminUsers();
-    users = j.users || [];
-  } catch (e) {
-    host.innerHTML = `<div class="empty">could not load users — ${esc(e.message)}</div>`;
-    return;
-  }
-  host.innerHTML = `<div class="table-wrap"><table class="data">
-    <thead><tr><th>account</th><th>plan</th><th class="num">swarms</th><th class="num">minds</th><th>state</th><th></th></tr></thead>
-    <tbody>${users.map((u) => `<tr>
-      <td><button class="linkbtn" data-user-open="${esc(String(u.id))}">${esc(u.email)}</button></td>
-      <td>${esc(u.plan || 'free')}</td>
-      <td class="num">${u.swarms || 0}</td>
-      <td class="num">${u.live_minds || 0}</td>
-      <td>${u.banned ? '<span class="pill">suspended</span>' : '<span class="pill on">active</span>'}</td>
-      <td class="row-actions">
-        <button class="btn btn-sm btn-ghost" data-user-mod="${esc(u.email)}" data-act="${u.banned ? 'unban' : 'ban'}">${u.banned ? 'Restore' : 'Suspend'}</button>
-        <button class="btn btn-sm btn-danger" data-user-mod="${esc(u.email)}" data-act="delete">Delete</button>
-      </td>
-    </tr>`).join('')}</tbody></table></div>`;
-
-  $$('[data-user-open]', host).forEach((b) => b.addEventListener('click', () => showUserActivity(b.dataset.userOpen)));
-  $$('[data-user-mod]', host).forEach((b) => b.addEventListener('click', () => moderate(b.dataset.userMod, b.dataset.act)));
-}
-
-async function moderate(email, action) {
-  const verb = action === 'delete' ? 'Delete' : (action === 'ban' ? 'Suspend' : 'Restore');
-  if (!confirm(verb + ' ' + email + '?' + (action === 'delete' ? '\nThis cannot be undone.' : ''))) return;
-  try {
-    await api.adminModerate(email, action);
-    toast(verb + 'd', email, 'ok');
-    refreshUsers();
-    el('userDetail').innerHTML = '';
-  } catch (e) {
-    toast('Could not ' + verb.toLowerCase(), e.message, 'err');
-  }
-}
-
-async function showUserActivity(uid) {
-  const host = el('userDetail');
-  host.innerHTML = '<div class="empty">reading activity…</div>';
-  let a;
-  try {
-    a = await api.adminActivity(uid);
-  } catch (e) {
-    host.innerHTML = `<div class="empty">could not read activity — ${esc(e.message)}</div>`;
-    return;
-  }
-  const convs = a.convs || [];
-  host.innerHTML = `
-    <div class="section-head"><h2>${esc(a.email)}</h2>
-      <button class="btn btn-sm btn-ghost" id="closeDetail">Close</button></div>
-    <div class="stat-grid">
-      <div class="stat"><b>${a.swarms || 0}</b><span>swarms</span></div>
-      <div class="stat"><b>${a.live_minds || 0}</b><span>live minds</span></div>
-      <div class="stat"><b>${convs.length}</b><span>conversations</span></div>
-      <div class="stat ${a.banned ? 'bad' : 'good'}"><b>${a.banned ? 'suspended' : 'active'}</b><span>state</span></div>
-    </div>
-    <div class="panel set-panel">
-      <div class="muted" style="margin-bottom:8px">
-        Conversation metadata only — ids and sizes. Message content is not readable from here, by design.
-      </div>
-      ${convs.length ? `<div class="table-wrap"><table class="data">
-        <thead><tr><th>conversation</th><th class="num">size</th></tr></thead>
-        <tbody>${convs.map((c) => `<tr><td class="mono">${esc(c.id)}</td><td class="num">${fmtBytes(c.bytes || 0)}</td></tr>`).join('')}</tbody>
-      </table></div>` : '<div class="muted">no conversations</div>'}
-    </div>`;
-  el('closeDetail').addEventListener('click', () => { host.innerHTML = ''; });
-}
-
-function fmtBytes(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / 1048576).toFixed(1) + ' MB';
 }
 
 /* ============================================================ settings */
@@ -1833,11 +1819,11 @@ function renderSettings(host) {
       <div class="panel set-panel">
         ${S.serverDefault && S.serverDefault.model ? `
         <div class="set-row">
-          <div><b>Server default</b>
-            <div class="muted">This server is configured with <span class="mono">${esc(S.serverDefault.model)}</span>.
-              Leave both fields below empty to use it — you do not need to choose a model at all.</div>
+          <div><b>Use the server default</b>
+            <div class="muted">This server is set up with <span class="mono">${esc(S.serverDefault.model)}</span>.
+              Leave this on and you never have to think about models.</div>
           </div>
-          <button class="btn btn-sm btn-ghost" id="useDefault">Use it</button>
+          <input type="checkbox" id="useDefault" class="w-auto" ${usingServerDefault() ? 'checked' : ''}>
         </div>` : ''}
         <div class="set-row">
           <div><b>One model for everything</b><div class="muted">Off = point coding, thinking and prompting at different models.</div></div>
@@ -1906,14 +1892,23 @@ function renderSettings(host) {
   el('setLoop').addEventListener('change', (e) => { S.settings.loop = parseInt(e.target.value, 10) || 0; saveSettings(); });
   el('setOut').addEventListener('click', async () => { try { await api.logout(); } catch (e) {} onSignedOut(); });
   el('kAdd').addEventListener('click', addProviderKey);
-  if (el('useDefault')) el('useDefault').addEventListener('click', () => {
-    // Clearing BOTH is what selects the server default — the server only applies
-    // it when the pair is blank, so half-clearing would silently do nothing.
-    S.settings.model = '';
-    S.settings.base_url = '';
+  if (el('useDefault')) el('useDefault').addEventListener('change', (e) => {
+    // Clearing BOTH fields is what SELECTS the server default — the server only
+    // applies it when the pair is blank, so half-clearing would silently do
+    // nothing and look like the setting was ignored.
+    if (e.target.checked) {
+      S.settings.model = '';
+      S.settings.base_url = '';
+      S.settings.think_model = ''; S.settings.think_base_url = '';
+      S.settings.prompt_model = ''; S.settings.prompt_base_url = '';
+    } else if (S.serverDefault.model) {
+      // Turning it OFF pre-fills with the server's own choice, so "customise"
+      // starts from something that works rather than from empty fields.
+      S.settings.model = S.serverDefault.model;
+      S.settings.base_url = S.serverDefault.base_url || '';
+    }
     saveSettings();
     drawRolePanels();
-    toast('Using the server default', S.serverDefault.model, 'ok');
   });
   el('kKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addProviderKey(); } });
 
@@ -2004,11 +1999,30 @@ function catalogOptions(selected) {
   return html;
 }
 
+/** True when this account has chosen nothing and is riding the server's default.
+    The server decides this the same way — a BLANK model+base pair — so the UI and
+    the turn agree on what "using the default" means. */
+function usingServerDefault() {
+  return !!(S.serverDefault && S.serverDefault.model) && !S.settings.model && !S.settings.base_url;
+}
+
 function drawRolePanels() {
   const host = el('rolePanels');
   if (!host) return;
   const roles = S.settings.oneModel ? [ROLES[0]] : ROLES;
   const loaded = !!(S.models && S.models.models && S.models.models.length);
+  const locked = usingServerDefault();
+  // Disabled rather than hidden: the reader can still see WHAT they are getting,
+  // and the fields explain themselves the moment the switch goes off.
+  host.classList.toggle('locked', locked);
+  if (locked) {
+    host.innerHTML = '<div class="role-panel"><div class="role-title">Coding, thinking and prompting'
+      + '<span class="muted"> — all using the server default</span></div>'
+      + '<div class="muted mono">' + esc(S.serverDefault.model)
+      + (S.serverDefault.base_url ? ' <span class="dim">· ' + esc(hostOf(S.serverDefault.base_url)) + '</span>' : '')
+      + '</div></div>';
+    return;
+  }
 
   host.innerHTML = roles.map((r) => {
     const cur = S.settings[r.key + 'model'] || '';

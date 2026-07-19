@@ -568,6 +568,10 @@ pub fn main(init: std.process.Init) !void {
     // The default model every web user falls back to — set from the UI, live, no restart.
     router.get("/api/v1/admin/config", admin_service.adminGetConfig, .{});
     router.post("/api/v1/admin/config", admin_service.adminSetConfig, .{});
+    // The instance-wide provider key: a default model nobody can afford to call is not a default.
+    router.get("/api/v1/admin/keys", admin_service.adminListKeys, .{});
+    router.post("/api/v1/admin/keys", admin_service.adminPutKey, .{});
+    router.delete("/api/v1/admin/keys/:provider", admin_service.adminDelKey, .{});
     // Moderation needs to see what an account is DOING. Metadata only — see the handler.
     router.get("/api/v1/admin/users/:uid/activity", admin_service.adminUserActivity, .{});
     router.get("/api/v1/admin/swarms", admin_service.adminSwarms, .{});
