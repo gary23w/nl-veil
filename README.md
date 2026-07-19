@@ -390,8 +390,9 @@ gitignored `keys.env` in the run dir.
 
 ## Web control plane
 
-The same binary also serves a small web UI — deploy and watch swarms, steer them live, pick the
-model, manage accounts. It comes up whenever the server runs:
+The same binary serves the **web app**: chat with the veil, watch swarms, run scheduled tasks, browse
+what a turn built, and manage accounts — the desktop's surfaces, in a browser, on any device on your
+network. It comes up whenever the server runs:
 
 ```sh
 zig build && ./zig-out/bin/veil      # serves http://127.0.0.1:8787
@@ -400,6 +401,24 @@ zig build && ./zig-out/bin/veil      # serves http://127.0.0.1:8787
 First-run local login is `admin@neuron-loops.local` / `changeme` — **change it immediately** via
 `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
 refuses the default and prints a generated password once.
+
+### Everyone else is sandboxed
+
+The web app is multi-user, and **a normal account is not trusted with the host**. Its turns run a
+restricted tool surface: the conversation's own workspace, research, and the *entire* hive-memory
+surface — but no code execution, no host commands, no engine self-modification, no tool authoring, no
+browser or MCP drive, and no casting swarms or scheduling runs (both execute outside the sandbox).
+The admin account keeps the full surface. Files were always confined to the conversation's workdir;
+what changed is that the dangerous verbs are now refused inside a turn, not just on the tool endpoint.
+
+| variable | what it does |
+|---|---|
+| `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | one model every web user falls back to, so nobody has to configure anything to start. A user's own choice still wins, and the API key is never part of it — that resolves server-side from their own sealed vault |
+| `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
+| `NL_BROWSER_DRIVER` / `NL_MCP` | give **sandboxed** users the browser / local MCP servers too. Admins already have both; leave these unset unless you mean it — the browser inherits this machine's network position and its profile's cookies |
+
+Provider keys are entered per model in Settings and sealed server-side per account. They are never
+stored in the browser, and the server never sends one back — only a last-four and a fingerprint.
 
 ## The fleet hub — many swarms, one console
 
