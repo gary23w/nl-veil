@@ -4734,7 +4734,7 @@ fn replaceOne(gpa: std.mem.Allocator, src: []const u8, find: []const u8, repl: [
     return out.toOwnedSlice(gpa) catch null;
 }
 
-fn safeRel(p: []const u8) bool {
+pub fn safeRel(p: []const u8) bool {
     if (p.len == 0 or p[0] == '/' or p[0] == '\\' or p[0] == '~') return false;
     // a drive colon ("C:/...") or NTFS ADS colon is NOT workdir-relative — without this a Windows absolute
     // path slipped past as "relative", got joined under the workdir, and read as a confusing "not found"

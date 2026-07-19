@@ -26,6 +26,78 @@ pub fn adminUsers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = try res.arena.dupe(u8, arr.items);
 }
 
+const NewUserReq = struct { email: []const u8, password: []const u8 };
+
+/// POST /api/v1/admin/users — mint an account as the admin.
+///
+/// Registration is closed by default (NL_OPEN_REGISTRATION), which is the right posture for a box on a
+/// LAN — but it left no way to onboard anyone at all. This is that way: the admin creates the account
+/// and hands the password over out of band. It reuses `register`, so the same validation, the same
+/// argon2id hashing, and the same duplicate-email refusal apply; there is no second account-creation
+/// path with its own rules to drift out of step.
+pub fn adminCreateUser(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const body = (try req.json(NewUserReq)) orelse return badReq(res, "bad body");
+    app.auth.register(body.email, body.password) catch |e| return switch (e) {
+        error.EmailTaken => badReq(res, "that email already has an account"),
+        error.BadEmail => badReq(res, "that is not a valid email address"),
+        error.WeakInput => badReq(res, "password must be 8-200 characters"),
+        else => badReq(res, "could not create the account"),
+    };
+    // Logged because account creation is exactly what an operator needs to reconstruct afterwards:
+    // who was let in, by whom, and when.
+    app.audit.record(admin.email, "create_user", body.email);
+    res.status = 201;
+    try res.json(.{ .ok = true, .email = body.email }, .{});
+}
+
+/// GET /api/v1/admin/users/:uid/activity — what one account is actually doing.
+///
+/// METADATA ONLY, deliberately. Swarms, conversation ids with sizes and last-touched times, token
+/// spend — never message content, tool arguments, or file bodies. A conversation's event stream carries
+/// shell output, fetched pages and file contents; a route returning it would be a keylogger over
+/// everything that user's AI touched, and moderation does not require reading someone's mail. If
+/// transcript access is ever genuinely needed it should be its own route, with its own audit action and
+/// a recorded reason — not a field quietly added to this one.
+pub fn adminUserActivity(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const uid_s = req.param("uid") orelse return badReq(res, "no uid");
+    const uid = std.fmt.parseInt(u64, uid_s, 10) catch return badReq(res, "uid must be a number");
+    const target = app.auth.userById(uid) orelse return notFound(res);
+
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(app.gpa);
+    try arr.appendSlice(app.gpa, "{\"ok\":true,\"email\":");
+    try http.jstr(app.gpa, &arr, target.email);
+    const head = try std.fmt.allocPrint(res.arena, ",\"id\":{d},\"banned\":{},\"plan\":\"{s}\",\"live_minds\":{d},\"swarms\":{d},\"convs\":[", .{ uid, target.banned, @tagName(target.plan), app.sup.liveMindsForUser(uid), app.sup.activeSwarmsForUser(uid) });
+    try arr.appendSlice(app.gpa, head);
+
+    const root = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs", .{ app.data, uid });
+    var n: usize = 0;
+    if (std.Io.Dir.cwd().openDir(app.io, root, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(app.io);
+        var it = dir.iterate();
+        while (it.next(app.io) catch null) |ent2| {
+            if (ent2.kind != .directory or n >= 200) continue;
+            const mpath = std.fmt.allocPrint(res.arena, "{s}/{s}/messages.jsonl", .{ root, ent2.name }) catch continue;
+            const st = std.Io.Dir.cwd().statFile(app.io, mpath, .{}) catch continue;
+            if (n > 0) try arr.append(app.gpa, ',');
+            try arr.appendSlice(app.gpa, "{\"id\":");
+            try http.jstr(app.gpa, &arr, ent2.name);
+            const tail = try std.fmt.allocPrint(res.arena, ",\"bytes\":{d}}}", .{st.size});
+            try arr.appendSlice(app.gpa, tail);
+            n += 1;
+        }
+    } else |_| {}
+
+    try arr.appendSlice(app.gpa, "]}");
+    // Reading another account's activity is itself an administrative act, so it is logged as one.
+    app.audit.record(admin.email, "read_activity", target.email);
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, arr.items);
+}
+
 const ModReq = struct { email: []const u8, action: []const u8 };
 pub fn adminModerate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;

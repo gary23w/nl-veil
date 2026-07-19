@@ -135,6 +135,52 @@ pub const Auth = struct {
             try self.users.put(self.gpa, u.email, u);
             if (v.id >= self.next_id) self.next_id = v.id + 1;
         }
+
+        // REHYDRATE SESSIONS. mintSession has always persisted s_{token}, and nothing ever read it
+        // back — the write was dead weight and every restart signed everyone out. On a single-user
+        // desktop that reads as a quirk; on a shared server it is a reboot logging out the building.
+        // Expired rows are dropped rather than loaded, which garbage-collects them at the same time.
+        const sscopes = self.nb.scopes("s_") catch return;
+        defer {
+            for (sscopes) |s| self.gpa.free(s);
+            self.gpa.free(sscopes);
+        }
+        const now = std.Io.Timestamp.now(self.nb.io, .real).toSeconds();
+        for (sscopes) |scope| {
+            if (scope.len <= 2) continue; // the scope key is "s_" ++ token
+            const enc = (self.nb.get(scope) catch continue) orelse continue;
+            defer self.gpa.free(enc);
+            const json = unb64(self.gpa, enc) catch continue;
+            defer self.gpa.free(json);
+            const sp = std.json.parseFromSlice(struct { email: []const u8, created: i64 = 0 }, self.gpa, json, .{ .ignore_unknown_fields = true }) catch continue;
+            defer sp.deinit();
+            if (sessionExpired(sp.value.created, now)) {
+                self.nb.del(scope);
+                continue;
+            }
+            const tok = self.gpa.dupe(u8, scope[2..]) catch continue;
+            const email = self.gpa.dupe(u8, sp.value.email) catch {
+                self.gpa.free(tok);
+                continue;
+            };
+            // The live map is token -> email (SessionVal is only the on-disk shape), so the age check
+            // has to happen HERE, at load, rather than on lookup.
+            self.sessions.put(self.gpa, tok, email) catch {
+                self.gpa.free(tok);
+                self.gpa.free(email);
+            };
+        }
+    }
+
+    /// Sessions are not immortal. The cookie claims a 30-day Max-Age, but that is a client-side hint a
+    /// browser may ignore and a stolen token never respected — the server checked age nowhere, so a
+    /// token stayed valid until the process died. `created` was written from the first commit and read
+    /// by nothing; this is what it was for.
+    const SESSION_TTL_S: i64 = 30 * 24 * 60 * 60;
+
+    fn sessionExpired(created: i64, now: i64) bool {
+        if (created <= 0) return false; // rows written before this existed carry no stamp; keep them
+        return now - created > SESSION_TTL_S;
     }
 
     pub fn register(self: *Auth, email: []const u8, password: []const u8) AuthError!void {

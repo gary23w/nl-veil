@@ -865,3 +865,49 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .msg { margin-bottom: 15px; }
   .tool-chip span { max-width: 22ch; }
 }
+
+/* ============================================================ files pane
+   Slides in under the transcript rather than replacing it: the reader keeps the
+   conversation in view while looking at what it produced. */
+.files-pane {
+  flex: 0 0 auto;
+  max-height: 42vh;
+  display: flex; flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--surface-raised);
+  overflow: hidden;
+}
+.files-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.files-head b { flex: 0 1 auto; min-width: 0; }
+.files-head .muted { flex: 1 1 auto; }
+.files-list { overflow-y: auto; }
+.file-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  width: 100%; text-align: left;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.file-row:hover { background: var(--surface-hover); }
+.files-view { overflow: auto; padding: 12px 14px; }
+
+/* ============================================================ collapsible rail
+   The conversation list is the widest thing competing with the transcript, and
+   on a laptop it is often just in the way. Collapsing is remembered. */
+.rail-toggle { display: none; }
+@media (min-width: 721px) {
+  .rail-toggle { display: grid; flex: 0 0 auto; }
+  .chat.rail-collapsed .chat-list { flex-basis: 0; width: 0; overflow: hidden; border-right: 0; }
+  .chat.rail-collapsed .chat-list > * { display: none; }
+  /* Re-expanding needs a handle, so the topline grows one when the rail is away. */
+  .chat.rail-collapsed .chat-back { display: grid; transform: rotate(180deg); }
+  .chat-list { transition: flex-basis .18s ease; }
+}
+
+.row-actions { display: flex; gap: 6px; white-space: nowrap; }

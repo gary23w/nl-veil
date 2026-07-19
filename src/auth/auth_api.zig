@@ -52,11 +52,11 @@ pub fn me(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (u == null) if (app.keys) |ks| if (http.apiKeyFromReq(req)) |k| if (ks.verify(k)) |uid| {
         u = app.auth.userById(uid);
     };
-    const user = u orelse return res.json(.{ .authed = false, .open_registration = app.open_registration }, .{});
+    const user = u orelse return res.json(.{ .authed = false, .open_registration = app.open_registration, .default_model = app.default_model, .default_base_url = app.default_base_url }, .{});
     const admin = app.auth.isAdmin(user);
     const e = ent.entitlements(user.plan, admin);
     const ns: neurons.Status = if (app.ledger) |l| l.status(user.id, user.plan) else .{ .granted = 0, .used = 0, .balance = 0, .period_start = 0 };
-    try res.json(.{ .authed = true, .email = user.email, .plan = @tagName(user.plan), .id = user.id, .admin = admin, .open_registration = app.open_registration, .workers_ai_available = (app.cf_account_id.len > 0 and app.workers_ai_token.len > 0), .entitlements = .{ .max_swarms = e.max_swarms, .max_minds = e.max_minds, .per_swarm_minds = e.per_swarm_minds, .workers_ai = e.workers_ai, .cloudflare_deploy = e.cloudflare_deploy, .encrypted = e.encrypted }, .neurons = .{ .metered = http.metered(app, user), .granted = ns.granted, .used = ns.used, .balance = ns.balance } }, .{});
+    try res.json(.{ .authed = true, .email = user.email, .plan = @tagName(user.plan), .id = user.id, .admin = admin, .open_registration = app.open_registration, .workers_ai_available = (app.cf_account_id.len > 0 and app.workers_ai_token.len > 0), .entitlements = .{ .max_swarms = e.max_swarms, .max_minds = e.max_minds, .per_swarm_minds = e.per_swarm_minds, .workers_ai = e.workers_ai, .cloudflare_deploy = e.cloudflare_deploy, .encrypted = e.encrypted }, .neurons = .{ .metered = http.metered(app, user), .granted = ns.granted, .used = ns.used, .balance = ns.balance }, .default_model = app.default_model, .default_base_url = app.default_base_url }, .{});
 }
 
 fn keyNameFromBody(req: *httpz.Request) []const u8 {
