@@ -340,7 +340,10 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         // so a delegated observe must not globalize conversation-local project state either.
         .hive_guard = true,
         // Same durable store as the engine ctx — a desk-delegated get_credential resolves identically.
-        .durable_path = std.fmt.allocPrint(res.arena, "{s}/.veil-desk/memories.jsonl", .{app.data}) catch "",
+        // PER-UID, matching engine.memoriesPath: this backs get_credential, so a global path here would
+        // hand any authed caller the owner's stored credentials through the delegated tool surface even
+        // after the turn path was fixed. The two must move together.
+        .durable_path = std.fmt.allocPrint(res.arena, "{s}/u{d}/.veil-desk/memories.jsonl", .{ app.data, uid }) catch "",
         .mem = blk_mem: {
             var m = osc.Mem.init(app.gpa, app.io, app.sup.neuron_bin, db);
             m.trust = true; // trust-weighted assoc ranking, matching the server drive loop's Mem

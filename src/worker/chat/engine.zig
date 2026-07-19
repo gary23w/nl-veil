@@ -540,7 +540,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .hive_guard = true,
         // get_credential's store: the chat veil acts AS the user, so it may fetch a withheld credential
         // value in the turn that needs it (values are masked out of every broadcast prompt).
-        .durable_path = memoriesPath(app, &durable_pb) orelse "",
+        .durable_path = memoriesPath(app, uid, &durable_pb) orelse "",
         .mem = blk_mem: {
             var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
             // TRUST-WEIGHTED RANKING: the trust feature is compiled in; without this flag every assoc runs
@@ -606,7 +606,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
-    injectDurableMemory(app, &conv_buf);
+    injectDurableMemory(app, uid, &conv_buf);
     // TOOL-PERFORMANCE DIGEST: a compact, learned note on which tools are slow or flaky on THIS machine, so the
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
@@ -988,7 +988,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // empty → show a short confirmation instead of committing a blank message.
         {
             var mem_saved: usize = 0;
-            if (processMemoryDirectives(app, answer, &mem_saved)) |stripped| {
+            if (processMemoryDirectives(app, uid, answer, &mem_saved)) |stripped| {
                 if (std.mem.trim(u8, stripped, " \r\n\t").len == 0 and mem_saved > 0) {
                     if (gpa.dupe(u8, "(noted — saved to your memory)")) |note| {
                         gpa.free(stripped);
@@ -3985,22 +3985,54 @@ const CtlResult = enum { none, stop };
 /// Drain the conv's control.jsonl from *cursor (between drive steps): a `stop` op ENDS the turn; a `steer`/`say`
 /// op INJECTS the user's text as a mid-turn user message so the next inference incorporates it — this is the user
 /// "posting to steer" a running turn without stopping it. Advances *cursor past everything read.
-// ---- DURABLE USER MEMORY: the user's cross-conversation facts (keys/logins/preferences) live in
-// {data}/.veil-desk/memories.jsonl — one {"cat","text"} JSON line each. The DESK writes this file; the server
-// shares the same localhost data dir, so reading + appending it keeps ONE durable store (no split-brain). ----
+// ---- DURABLE USER MEMORY: a user's cross-conversation facts (keys/logins/preferences) live in
+// {data}/u{uid}/.veil-desk/memories.jsonl — one {"cat","text"} JSON line each.
+//
+// PER-USER, and it must stay that way. This file is injected verbatim into EVERY turn's system prompt
+// (injectDurableMemory, called unconditionally from runTurn) and it backs get_credential. It used to be
+// {data}/.veil-desk/memories.jsonl — process-global — which was harmless only because the chat backend
+// was admin-only: exactly one person could ever read it. The moment a second account can run a turn, a
+// global store hands every user the owner's environment notes, deploy targets and credentials with no
+// prompt injection required, because it is already in the system prompt before any tool runs.
+//
+// Blanking ctx.durable_path for untrusted callers is NOT a substitute: it closes get_credential but not
+// the injection, which builds this path directly.
+//
+// The desk keeps writing the legacy global file. Migration is deliberately read-only and one-way: see
+// legacyMemoriesPath below.
 const MEM_INJECT_CAP = 96; // newest N durable memories injected (bounded prompt)
 
-fn memoriesPath(app: *App, buf: []u8) ?[]const u8 {
+fn memoriesPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/u{d}/.veil-desk/memories.jsonl", .{ app.data, uid }) catch null;
+}
+
+/// The pre-split global store. Read as a FALLBACK for uid 1 only — the local admin, who is the only
+/// account that could have written it while chat was admin-gated. Never written, never read for anyone
+/// else, so an existing single-user install keeps its memory and no other account inherits it.
+fn legacyMemoriesPath(app: *App, uid: u64, buf: []u8) ?[]const u8 {
+    if (uid != 1) return null;
     return std.fmt.bufPrint(buf, "{s}/.veil-desk/memories.jsonl", .{app.data}) catch null;
+}
+
+/// Read the durable store for a user: their own file, falling back to the legacy global one for uid 1.
+/// Caller owns the returned bytes.
+fn readDurable(app: *App, uid: u64) ?[]u8 {
+    var pb: [700]u8 = undefined;
+    if (memoriesPath(app, uid, &pb)) |path| {
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(256 << 10))) |d| return d else |_| {}
+    }
+    var lb: [700]u8 = undefined;
+    if (legacyMemoriesPath(app, uid, &lb)) |path| {
+        if (std.Io.Dir.cwd().readFileAlloc(app.io, path, app.gpa, .limited(256 << 10))) |d| return d else |_| {}
+    }
+    return null;
 }
 
 /// Inject the user's durable memory as a "YOUR MEMORY" system message right after the recall block. Additive: an
 /// absent/empty store leaves conv_buf unchanged.
-fn injectDurableMemory(app: *App, conv_buf: *std.ArrayListUnmanaged(u8)) void {
+fn injectDurableMemory(app: *App, uid: u64, conv_buf: *std.ArrayListUnmanaged(u8)) void {
     const gpa = app.gpa;
-    var pb: [700]u8 = undefined;
-    const path = memoriesPath(app, &pb) orelse return;
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
+    const data = readDurable(app, uid) orelse return;
     defer gpa.free(data);
     // gather non-empty JSON lines, keep the NEWEST cap (append order = oldest first)
     var slices: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -4055,11 +4087,9 @@ fn injectDurableMemory(app: *App, conv_buf: *std.ArrayListUnmanaged(u8)) void {
 }
 
 /// True if `fact` (trimmed) is already stored — exact text match against the durable store (dedup).
-fn durableMemoryHas(app: *App, fact: []const u8) bool {
+fn durableMemoryHas(app: *App, uid: u64, fact: []const u8) bool {
     const gpa = app.gpa;
-    var pb: [700]u8 = undefined;
-    const path = memoriesPath(app, &pb) orelse return false;
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return false;
+    const data = readDurable(app, uid) orelse return false;
     defer gpa.free(data);
     const M = struct { text: []const u8 = "" };
     var it = std.mem.splitScalar(u8, data, '\n');
@@ -4074,17 +4104,20 @@ fn durableMemoryHas(app: *App, fact: []const u8) bool {
 }
 
 /// Append one durable memory {cat,text} to the shared store (dedup on exact text). Category clamped to one short word.
-fn storeDurableMemory(app: *App, cat_in: []const u8, fact_in: []const u8) void {
+fn storeDurableMemory(app: *App, uid: u64, cat_in: []const u8, fact_in: []const u8) void {
     const gpa = app.gpa;
     const fact = std.mem.trim(u8, fact_in, " \r\n\t");
     if (fact.len < 2) return;
     const fact_clip = fact[0..@min(fact.len, 260)];
-    if (durableMemoryHas(app, fact_clip)) return;
+    if (durableMemoryHas(app, uid, fact_clip)) return;
     var cat = std.mem.trim(u8, cat_in, " \r\n\t[]");
     if (cat.len == 0) cat = "fact";
     if (cat.len > 20) cat = cat[0..20];
     var pb: [700]u8 = undefined;
-    const path = memoriesPath(app, &pb) orelse return;
+    const path = memoriesPath(app, uid, &pb) orelse return;
+    // The per-uid parent may not exist yet on a fresh account, and appendFile's createFile does not
+    // create parents — without this the very first REMEMBER: for a new user is silently dropped.
+    if (std.fs.path.dirname(path)) |d| _ = std.Io.Dir.cwd().createDirPathStatus(app.io, d, .default_dir) catch {};
     var jb: std.ArrayListUnmanaged(u8) = .empty;
     defer jb.deinit(gpa);
     jb.appendSlice(gpa, "{\"cat\":") catch return;
@@ -4099,12 +4132,12 @@ fn storeDurableMemory(app: *App, cat_in: []const u8, fact_in: []const u8) void {
 /// append lock across read AND write: this rewrite must be mutually exclusive with storeDurableMemory's
 /// appendFile, or a concurrent chat's append that lands between this read and this write is clobbered (the
 /// durable-store lost-update race that opens up once two conversations run at once).
-fn forgetDurableMemory(app: *App, match_in: []const u8) void {
+fn forgetDurableMemory(app: *App, uid: u64, match_in: []const u8) void {
     const gpa = app.gpa;
     const match = std.mem.trim(u8, match_in, " \r\n\t");
     if (match.len < 2) return;
     var pb: [700]u8 = undefined;
-    const path = memoriesPath(app, &pb) orelse return;
+    const path = memoriesPath(app, uid, &pb) orelse return;
     http.appendLock(app.io);
     defer http.appendUnlock(app.io);
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
@@ -4149,7 +4182,7 @@ fn parseRemember(body_in: []const u8) struct { cat: []const u8, fact: []const u8
 /// Act on a reply's REMEMBER:/FORGET: lines (store/forget in the shared durable memory) and return the reply with
 /// those lines STRIPPED — the desk's processMemory ported. Returns an owned copy when it changed anything, else
 /// null (caller keeps the original). `saved` receives the number of directives applied.
-fn processMemoryDirectives(app: *App, text: []const u8, saved: *usize) ?[]u8 {
+fn processMemoryDirectives(app: *App, uid: u64, text: []const u8, saved: *usize) ?[]u8 {
     const gpa = app.gpa;
     saved.* = 0;
     if (std.mem.indexOf(u8, text, "REMEMBER:") == null and std.mem.indexOf(u8, text, "FORGET:") == null) return null;
@@ -4162,7 +4195,7 @@ fn processMemoryDirectives(app: *App, text: []const u8, saved: *usize) ?[]u8 {
         if (std.ascii.startsWithIgnoreCase(ln, "REMEMBER:")) {
             const spec = parseRemember(ln["REMEMBER:".len..]);
             if (spec.fact.len >= 2) {
-                storeDurableMemory(app, spec.cat, spec.fact);
+                storeDurableMemory(app, uid, spec.cat, spec.fact);
                 saved.* += 1;
             }
             continue; // strip
@@ -4170,7 +4203,7 @@ fn processMemoryDirectives(app: *App, text: []const u8, saved: *usize) ?[]u8 {
         if (std.ascii.startsWithIgnoreCase(ln, "FORGET:")) {
             const m = std.mem.trim(u8, ln["FORGET:".len..], " \t");
             if (m.len >= 2) {
-                forgetDurableMemory(app, m);
+                forgetDurableMemory(app, uid, m);
                 saved.* += 1;
             }
             continue; // strip
