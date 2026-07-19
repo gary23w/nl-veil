@@ -529,6 +529,9 @@ function renderChat(host) {
 
       <section class="chat-main">
         <div class="chat-topline">
+          <button class="icon-btn rail-restore hide" id="railRestore" title="Show the conversation list" aria-label="Show the conversation list">
+            <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
           <button class="icon-btn chat-back" id="backBtn" aria-label="Back to conversations">
             <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
           </button>
@@ -569,8 +572,9 @@ function renderChat(host) {
   el('delConv').addEventListener('click', deleteActiveConv);
   el('filesBtn').addEventListener('click', toggleFiles);
   el('railToggle').addEventListener('click', toggleRail);
+  el('railRestore').addEventListener('click', toggleRail);
   wireRailGrip();
-  if (LS.get('veil.railCollapsed', '0') === '1') el('chatRoot').classList.add('rail-collapsed');
+  setRailCollapsed(LS.get('veil.railCollapsed', '0') === '1');
   el('sendBtn').addEventListener('click', sendTurn);
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
   el('attachBtn').addEventListener('click', () => el('fileInput').click());
@@ -796,14 +800,21 @@ function wireRailGrip() {
       // Past the floor, preview the collapse rather than sticking at the minimum —
       // the rail should follow the pointer all the way to the edge.
       const shut = want < RAIL_COLLAPSE_AT;
-      root.classList.toggle('rail-collapsed', shut);
-      if (!shut) LS.set('veil.railW', String(applyRailWidth(want)));
+      if (shut) {
+        // Same reason as setRailCollapsed: the inline basis has to go to zero,
+        // because a stylesheet rule cannot override it.
+        root.classList.add('rail-collapsed');
+        list.style.flexBasis = '0px';
+      } else {
+        root.classList.remove('rail-collapsed');
+        LS.set('veil.railW', String(applyRailWidth(want)));
+      }
     };
     const up = (ev) => {
       try { grip.releasePointerCapture(ev.pointerId); } catch (err) {}
       grip.classList.remove('dragging');
       // Persist whichever state the drag ended in, so it survives a reload.
-      LS.set('veil.railCollapsed', root.classList.contains('rail-collapsed') ? '1' : '0');
+      setRailCollapsed(root.classList.contains('rail-collapsed'));
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', up);
@@ -823,12 +834,31 @@ function wireRailGrip() {
   grip.addEventListener('dblclick', toggleRail);
 }
 
-function toggleRail() {
+/** Collapse and restore the rail.
+ *
+ *  The width MUST be driven from here, not from a stylesheet rule. applyRailWidth
+ *  writes an INLINE flex-basis, and inline always beats a stylesheet declaration —
+ *  so `.rail-collapsed .chat-list { flex-basis: 0 }` never applied. The rail hid
+ *  its contents and kept its width, leaving a blank column and no way back. */
+function setRailCollapsed(collapsed) {
   const root = el('chatRoot');
-  const collapsed = root.classList.toggle('rail-collapsed');
+  const list = document.querySelector('.chat-list');
+  if (!root || !list) return;
+  root.classList.toggle('rail-collapsed', collapsed);
+  if (collapsed) {
+    list.style.flexBasis = '0px';
+  } else {
+    applyRailWidth(parseInt(LS.get('veil.railW', '260'), 10) || 260);
+  }
   LS.set('veil.railCollapsed', collapsed ? '1' : '0');
   const b = el('railToggle');
   if (b) b.title = collapsed ? 'Show the list' : 'Collapse the list';
+  const r = el('railRestore');
+  if (r) r.classList.toggle('hide', !collapsed);
+}
+
+function toggleRail() {
+  setRailCollapsed(!el('chatRoot').classList.contains('rail-collapsed'));
 }
 
 async function toggleFiles() {
@@ -1192,6 +1222,12 @@ const CURSOR_PROBE = '18446744073709551615';
 async function baselineCursor() {
   S.cursor = 0;
   if (!S.conv) return;
+  // A brand-new conversation has no directory on the server yet — the client mints
+  // the id and the dir springs into existence on the first postMessage — so probing
+  // it 404s. The 404 was already harmless (the cursor stays 0, which is correct for
+  // an empty log), but it printed a red error in the console on every first message,
+  // which reads like a fault. Nothing to baseline against, so do not ask.
+  if (!S.msgs.length && !S.convs.some((c) => c.id === S.conv)) return;
   try {
     const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/events?from=' + CURSOR_PROBE, null, 8000);
     if (!r.ok) return;
@@ -1785,6 +1821,127 @@ async function saveServerConfig(coding, thinking, prompting) {
   } catch (e) {
     toast('Could not save', e.message, 'err');
   }
+}
+
+function showNewUserForm() {
+  const f = el('newUserForm');
+  f.classList.remove('hide');
+  f.innerHTML = `<div class="panel task-form">
+    <div class="muted" style="margin-bottom:10px">
+      Registration is closed on most installs, so this is how an account gets made. Hand the password
+      over out of band — it is not shown again.
+    </div>
+    <div class="field-row">
+      <div class="field"><label for="nuEmail">Email</label>
+        <input id="nuEmail" type="email" autocapitalize="none" spellcheck="false"></div>
+      <div class="field"><label for="nuPass">Password (8+ characters)</label>
+        <input id="nuPass" type="password" autocomplete="new-password"></div>
+    </div>
+    <div class="row">
+      <button class="btn btn-solid" id="nuSave">Create account</button>
+      <button class="btn btn-ghost" id="nuCancel">Cancel</button>
+    </div>
+  </div>`;
+  el('nuCancel').addEventListener('click', () => { f.classList.add('hide'); f.innerHTML = ''; });
+  el('nuSave').addEventListener('click', createUser);
+}
+
+async function createUser() {
+  const email = el('nuEmail').value.trim();
+  const pass = el('nuPass').value;
+  if (!email || !pass) return toast('Missing fields', 'Both an email and a password are required.', 'err');
+  try {
+    await api.adminCreate(email, pass);
+    toast('Account created', email, 'ok');
+    el('newUserForm').classList.add('hide');
+    el('newUserForm').innerHTML = '';
+    refreshUsers();
+  } catch (e) {
+    toast('Could not create the account', e.message, 'err');
+  } finally {
+    const p = el('nuPass');
+    if (p) p.value = '';   // the password does not linger in the DOM, on either path
+  }
+}
+
+async function refreshUsers() {
+  const host = el('userList');
+  if (!host) return;
+  let users;
+  try {
+    const j = await api.adminUsers();
+    users = j.users || [];
+  } catch (e) {
+    host.innerHTML = `<div class="empty">could not load users — ${esc(e.message)}</div>`;
+    return;
+  }
+  host.innerHTML = `<div class="table-wrap"><table class="data">
+    <thead><tr><th>account</th><th>plan</th><th class="num">swarms</th><th class="num">minds</th><th>state</th><th></th></tr></thead>
+    <tbody>${users.map((u) => `<tr>
+      <td><button class="linkbtn" data-user-open="${esc(String(u.id))}">${esc(u.email)}</button></td>
+      <td>${esc(u.plan || 'free')}</td>
+      <td class="num">${u.swarms || 0}</td>
+      <td class="num">${u.live_minds || 0}</td>
+      <td>${u.banned ? '<span class="pill">suspended</span>' : '<span class="pill on">active</span>'}</td>
+      <td class="row-actions">
+        <button class="btn btn-sm btn-ghost" data-user-mod="${esc(u.email)}" data-act="${u.banned ? 'unban' : 'ban'}">${u.banned ? 'Restore' : 'Suspend'}</button>
+        <button class="btn btn-sm btn-danger" data-user-mod="${esc(u.email)}" data-act="delete">Delete</button>
+      </td>
+    </tr>`).join('')}</tbody></table></div>`;
+
+  $$('[data-user-open]', host).forEach((b) => b.addEventListener('click', () => showUserActivity(b.dataset.userOpen)));
+  $$('[data-user-mod]', host).forEach((b) => b.addEventListener('click', () => moderate(b.dataset.userMod, b.dataset.act)));
+}
+
+async function moderate(email, action) {
+  const verb = action === 'delete' ? 'Delete' : (action === 'ban' ? 'Suspend' : 'Restore');
+  if (!confirm(verb + ' ' + email + '?' + (action === 'delete' ? '\nThis cannot be undone.' : ''))) return;
+  try {
+    await api.adminModerate(email, action);
+    toast(verb + 'd', email, 'ok');
+    refreshUsers();
+    el('userDetail').innerHTML = '';
+  } catch (e) {
+    toast('Could not ' + verb.toLowerCase(), e.message, 'err');
+  }
+}
+
+async function showUserActivity(uid) {
+  const host = el('userDetail');
+  host.innerHTML = '<div class="empty">reading activity…</div>';
+  let a;
+  try {
+    a = await api.adminActivity(uid);
+  } catch (e) {
+    host.innerHTML = `<div class="empty">could not read activity — ${esc(e.message)}</div>`;
+    return;
+  }
+  const convs = a.convs || [];
+  host.innerHTML = `
+    <div class="section-head"><h2>${esc(a.email)}</h2>
+      <button class="btn btn-sm btn-ghost" id="closeDetail">Close</button></div>
+    <div class="stat-grid">
+      <div class="stat"><b>${a.swarms || 0}</b><span>swarms</span></div>
+      <div class="stat"><b>${a.live_minds || 0}</b><span>live minds</span></div>
+      <div class="stat"><b>${convs.length}</b><span>conversations</span></div>
+      <div class="stat ${a.banned ? 'bad' : 'good'}"><b>${a.banned ? 'suspended' : 'active'}</b><span>state</span></div>
+    </div>
+    <div class="panel set-panel">
+      <div class="muted" style="margin-bottom:8px">
+        Conversation metadata only — ids and sizes. Message content is not readable from here, by design.
+      </div>
+      ${convs.length ? `<div class="table-wrap"><table class="data">
+        <thead><tr><th>conversation</th><th class="num">size</th></tr></thead>
+        <tbody>${convs.map((c) => `<tr><td class="mono">${esc(c.id)}</td><td class="num">${fmtBytes(c.bytes || 0)}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<div class="muted">no conversations</div>'}
+    </div>`;
+  el('closeDetail').addEventListener('click', () => { host.innerHTML = ''; });
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
 }
 
 /* ============================================================ settings */

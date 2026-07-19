@@ -916,13 +916,15 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* ============================================================ collapsible rail
    The conversation list is the widest thing competing with the transcript, and
    on a laptop it is often just in the way. Collapsing is remembered. */
-.rail-toggle { display: none; }
+.rail-toggle, .rail-restore { display: none; }
 @media (min-width: 721px) {
   .rail-toggle { display: grid; flex: 0 0 auto; }
   .chat.rail-collapsed .chat-list { flex-basis: 0; width: 0; overflow: hidden; border-right: 0; }
   .chat.rail-collapsed .chat-list > * { display: none; }
-  /* Re-expanding needs a handle, so the topline grows one when the rail is away. */
-  .chat.rail-collapsed .chat-back { display: grid; transform: rotate(180deg); }
+  /* The reopen control lives in the TOPLINE, outside the rail. The collapse
+     button used to be the only one and it sits inside .chat-list-head, which
+     collapsing hides — so there was no way back. */
+  .rail-restore { display: grid; }
   .chat-list { transition: flex-basis .18s ease; }
 }
 
