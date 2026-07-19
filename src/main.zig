@@ -406,15 +406,35 @@ pub fn main(init: std.process.Init) !void {
     api_keys.warm() catch |e| log.warn("api_keys warm: {t}", .{e});
     auth.setAdminEmail(init.environ_map.get("NL_ADMIN_EMAIL"));
     auth.warm() catch |e| log.warn("auth warm: {t}", .{e});
-    const bind_all = if (init.environ_map.get("NL_BIND")) |v| v.len > 0 and !std.mem.eql(u8, v, "127.0.0.1") else false;
+    // BIND 0.0.0.0 BY DEFAULT. The veil is meant to be reachable from the other machines around it —
+    // a phone on the sofa, a laptop in the next room — and a loopback default meant every one of those
+    // people had to discover NL_BIND before the web UI existed for them at all. `NL_BIND=127.0.0.1`
+    // still pins it to this machine.
+    //
+    // This flag used to decide THREE unrelated things. It now decides one — the listen address. The
+    // other two moved to what actually motivates them: the desktop key is minted for the local clients
+    // that need it (gating that on the bind address silently broke the desk and CLI), and the admin
+    // password is randomised when the box is reachable AND nobody chose one.
+    const bind_all = if (init.environ_map.get("NL_BIND")) |v|
+        !(std.mem.eql(u8, v, "127.0.0.1") or std.mem.eql(u8, v, "localhost"))
+    else
+        true;
     var apw_buf: [48]u8 = undefined;
     const admin_pw: ?[]const u8 = init.environ_map.get("NL_ADMIN_PASSWORD") orelse blk: {
         if (!bind_all) break :blk null;
+        // REACHABLE + no password set. The shipped default is "changeme", and this program runs
+        // arbitrary code as the user who started it — so a known password on a box that answers the
+        // whole subnet is a full host compromise by anyone on the same wifi. Generate one instead.
+        // It is written to the data dir as well as logged, because "shown once in a console that
+        // already scrolled" is indistinguishable from being locked out.
         var raw: [24]u8 = undefined;
         io.random(&raw);
         const hx = std.fmt.bytesToHex(raw, .lower);
         @memcpy(apw_buf[0..hx.len], &hx);
-        log.warn("*** NL_ADMIN_PASSWORD unset on a public bind — generated admin password: {s}\n*** SAVE THIS NOW (shown once); set NL_ADMIN_PASSWORD to pin a stable one. ***", .{apw_buf[0..hx.len]});
+        writeAdminPassword(gpa, io, paths.data, apw_buf[0..hx.len]);
+        log.warn("*** no NL_ADMIN_PASSWORD set and this server is reachable on the network.\n" ++
+            "*** Generated admin password: {s}\n" ++
+            "*** Also saved to {s}/admin-password.txt — set NL_ADMIN_PASSWORD to pin your own.", .{ apw_buf[0..hx.len], paths.data });
         break :blk apw_buf[0..hx.len];
     };
     auth.seedDefaultAdmin(admin_pw);
@@ -578,10 +598,21 @@ pub fn main(init: std.process.Init) !void {
     router.delete("/api/v1/admin/swarms/:id", admin_service.adminKill, .{});
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});
 
-    log.info("neuron-loops {s} on http://127.0.0.1:{d}  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+    // Print what it is ACTUALLY reachable at. The banner used to say 127.0.0.1 unconditionally, which was
+    // merely misleading on a loopback bind and actively wrong now that binding every interface is the
+    // default — the whole point is that somebody on another machine can open it.
+    if (bind_all) {
+        log.info("neuron-loops {s} on http://localhost:{d}  (and http://<this machine>:{d} from the network)  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, port, paths.home, auth.userCount(), readopted });
+    } else {
+        log.info("neuron-loops {s} on http://127.0.0.1:{d}  (this machine only — NL_BIND=127.0.0.1)  home={s}  ({d} users, {d} swarms re-adopted)", .{ VERSION, port, paths.home, auth.userCount(), readopted });
+    }
     // On a local bind, mint an admin API key and drop it where the desktop reads it, so veil-desk connects
     // and can deploy WITHOUT the user pasting a key. Localhost-only (never on a public bind).
-    if (!bind_all) preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data);
+    // ALWAYS mint the desktop key. This is how the desk and the `veil` CLI authenticate to their own
+    // server on this machine, and it is a file readable only by this OS user — the port being open to
+    // the LAN does not make a local file more reachable. Gating it on the bind address meant that
+    // turning on network access silently broke every same-machine client.
+    preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data, admin_pw);
     if (desk_requested and !HAS_GUI)
         log.warn("--desk ignored: this is the SERVER-ONLY build (-Dapp=false), which has no GUI compiled in. The server itself is up (see the URL above) — open it in a browser, or use the standard build.", .{});
 
@@ -662,9 +693,29 @@ const DEFAULT_ADMIN_EMAIL = "admin@neuron-loops.local";
 
 /// Ensure a valid admin API key sits at <data>/.desktop_key so the desktop auto-connects. Reuses the
 /// existing key if it still verifies; otherwise logs in as the admin, mints one, and writes it. Best-effort.
-fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8) void {
-    // Written on any localhost bind (harmless, same-user) so the desktop connects whether it's auto-hosted
-    // or the user launches it later — NOT gated on NL_NO_DESKTOP.
+/// Save a generated admin password beside the data it protects. Logged once is not good enough: on a
+/// double-click launch there is no console at all, and the person who needs it is the one who did not
+/// set NL_ADMIN_PASSWORD in the first place.
+fn writeAdminPassword(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, pw: []const u8) void {
+    _ = gpa;
+    var pb: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir}) catch return;
+    var body: [256]u8 = undefined;
+    const text = std.fmt.bufPrint(&body,
+        "admin password: {s}\n\n" ++
+        "Generated because NL_ADMIN_PASSWORD was not set and this server is reachable\n" ++
+        "on the network. Set NL_ADMIN_PASSWORD to choose your own.\n", .{pw}) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
+}
+
+fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8, admin_pw: ?[]const u8) void {
+    // Written unconditionally so the desktop and the CLI connect whether the server was auto-started or
+    // launched later. It is a same-user local file; the port being open to the LAN does not change that.
+    //
+    // `admin_pw` is the password that was ACTUALLY seeded, passed in rather than re-read from the
+    // environment. It used to assume "changeme", which quietly stopped being true the moment an unset
+    // password started being generated: the login below failed, the key was never written, and the desk
+    // and CLI lost their local auth with nothing in the log to say why.
     const path = std.fmt.allocPrint(gpa, "{s}/.desktop_key", .{data}) catch return;
     defer gpa.free(path);
     // reuse an existing valid key
@@ -673,8 +724,11 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
         if (keys.verify(std.mem.trim(u8, old, " \r\n\t")) != null) return;
     } else |_| {}
     const email = environ.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
-    const pw = environ.get("NL_ADMIN_PASSWORD") orelse "changeme";
-    const tok = auth.login(email, pw) catch return;
+    const pw = admin_pw orelse "changeme"; // null = nothing was seeded, so the shipped default stands
+    const tok = auth.login(email, pw) catch |e| {
+        log.warn("veil-desk: could not mint the local API key ({t}) — the desk and `veil <verb>` will ask for auth", .{e});
+        return;
+    };
     defer gpa.free(tok);
     const u = auth.whoami(tok) orelse return;
     const key = keys.create(u.id, "veil-desk") catch return;
