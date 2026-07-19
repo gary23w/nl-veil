@@ -1253,9 +1253,19 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name}) catch dupe(gpa, "unknown tool");
 }
 
-/// True when the web-browser driver is enabled for this process (operator opt-in). Off by default: the driver
-/// launches a real browser and acts on the live web, so it stays dark unless NL_BROWSER_DRIVER is set truthy.
+/// May this caller drive the web browser?
+///
+/// A `.full` caller can, full stop — the admin's own chat turn, the desk, the CLI, swarm minds. Those
+/// callers already hold code execution and host control, for which a headless browser is strictly the
+/// smaller capability. Requiring NL_BROWSER_DRIVER on top of that gated the wrong thing: an ADMIN who
+/// asked the veil to look at a web page got "browser driver disabled" in the same turn where
+/// `run_python` — which can do far more, including driving a browser itself — was available.
+///
+/// The env var still opts a `.sandboxed` caller in, for an operator who deliberately wants web tenants
+/// using the server's browser. Unset, they cannot: the browser inherits the host's network position and
+/// its profile's cookies, which is not something to hand out by default.
 fn browserEnabled(ctx: *ToolCtx) bool {
+    if (ctx.caps == .full) return true;
     const v = ctx.environ.get("NL_BROWSER_DRIVER") orelse return false;
     return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
 }
@@ -1350,9 +1360,12 @@ fn pixelDispatch(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     return std.fmt.allocPrint(gpa, "unknown pixel tool: {s}", .{name}) catch dupe(gpa, "unknown pixel tool");
 }
 
-/// True when MCP discovery/use is enabled (operator opt-in). Off by default: mcp_call spawns local MCP server
-/// processes from the user's app configs.
+/// May this caller use MCP? Same reasoning as browserEnabled: a `.full` caller already holds code
+/// execution, and mcp_call spawning a local server process is a smaller capability than run_python
+/// spawning whatever it likes. The env var remains the opt-in for `.sandboxed` callers, and stays off
+/// by default there — those servers run with the host owner's own credentials.
 fn mcpEnabled(ctx: *ToolCtx) bool {
+    if (ctx.caps == .full) return true;
     const v = ctx.environ.get("NL_MCP") orelse return false;
     return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
 }

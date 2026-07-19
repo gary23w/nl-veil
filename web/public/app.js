@@ -469,6 +469,9 @@ function renderChat(host) {
         <div class="scroller" id="convScroll"><div class="empty">loading…</div></div>
       </aside>
 
+      <div class="rail-grip" id="railGrip" role="separator" aria-orientation="vertical"
+           aria-label="Resize the conversation list" tabindex="0"></div>
+
       <section class="chat-main">
         <div class="chat-topline">
           <button class="icon-btn chat-back" id="backBtn" aria-label="Back to conversations">
@@ -511,6 +514,7 @@ function renderChat(host) {
   el('delConv').addEventListener('click', deleteActiveConv);
   el('filesBtn').addEventListener('click', toggleFiles);
   el('railToggle').addEventListener('click', toggleRail);
+  wireRailGrip();
   if (LS.get('veil.railCollapsed', '0') === '1') el('chatRoot').classList.add('rail-collapsed');
   el('sendBtn').addEventListener('click', sendTurn);
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
@@ -680,6 +684,73 @@ function resetStream() {
    without these routes a web user had nowhere to look: the AI would report
    having built something and there was no way to see it. */
 
+/* DRAG-RESIZE the conversation rail, the way the desk does it. Two things the
+   desk learned the hard way, copied here:
+     - commit the width DURING the drag, not on release, or a repaint mid-drag
+       snaps the pane back to where it started;
+     - use pointer capture, so a fast drag that outruns the cursor keeps
+       delivering events to the grip instead of dropping them on whatever it
+       flew over. */
+const RAIL_MIN = 180, RAIL_MAX = 520;
+
+function applyRailWidth(px) {
+  const w = Math.max(RAIL_MIN, Math.min(RAIL_MAX, Math.round(px)));
+  // Set the basis ON THE ELEMENT rather than driving a custom property from the
+  // root. Going through a var meant the width depended on the cascade resolving
+  // it, and it did not — the variable read back correctly while the computed
+  // flex-basis stayed at the fallback, so the pane never moved. An inline
+  // longhand has no such ambiguity.
+  const list = document.querySelector('.chat-list');
+  if (list) list.style.flexBasis = w + 'px';
+  return w;
+}
+
+function wireRailGrip() {
+  const grip = el('railGrip');
+  const list = document.querySelector('.chat-list');
+  if (!grip || !list) return;
+
+  applyRailWidth(parseInt(LS.get('veil.railW', '260'), 10) || 260);
+
+  grip.addEventListener('pointerdown', (e) => {
+    // Collapsed is its own state; dragging out from zero width would surprise.
+    if (el('chatRoot').classList.contains('rail-collapsed')) return;
+    e.preventDefault();
+    // Capture is an OPTIMISATION, not the mechanism, and it must not be able to
+    // abort the drag: setPointerCapture throws for a pointer id the browser does
+    // not consider active, and an uncaught throw here skipped the listener
+    // registration below — leaving a grip that highlighted on hover and then did
+    // nothing at all.
+    try { grip.setPointerCapture(e.pointerId); } catch (err) {}
+    grip.classList.add('dragging');
+    const startX = e.clientX;
+    const startW = list.getBoundingClientRect().width;
+
+    // Listen on the WINDOW, not the grip: a drag that outruns the pointer leaves
+    // the 6px element, and without capture those moves would land elsewhere.
+    const move = (ev) => LS.set('veil.railW', String(applyRailWidth(startW + (ev.clientX - startX))));
+    const up = (ev) => {
+      try { grip.releasePointerCapture(ev.pointerId); } catch (err) {}
+      grip.classList.remove('dragging');
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', up);
+  });
+
+  // A separator that can only be dragged is unusable without a pointer.
+  grip.addEventListener('keydown', (e) => {
+    const cur = list.getBoundingClientRect().width;
+    if (e.key === 'ArrowLeft') { LS.set('veil.railW', String(applyRailWidth(cur - 24))); e.preventDefault(); }
+    if (e.key === 'ArrowRight') { LS.set('veil.railW', String(applyRailWidth(cur + 24))); e.preventDefault(); }
+  });
+
+  grip.addEventListener('dblclick', toggleRail);
+}
+
 function toggleRail() {
   const root = el('chatRoot');
   const collapsed = root.classList.toggle('rail-collapsed');
@@ -820,7 +891,7 @@ function hostActivityHtml() {
     const t = running[running.length - 1];
     const secs = t.started ? Math.round((Date.now() - t.started) / 1000) : 0;
     bits.push('<span class="spin"></span><b>' + esc(t.tool) + '</b>'
-      + (t.preview ? ' <span class="muted ellip">' + esc(t.preview) + '</span>' : '')
+      + (cleanPreview(t.preview) ? ' <span class="muted ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
       + (secs > 1 ? ' <span class="muted">' + secs + 's</span>' : ''));
   } else if (S.stream.status) {
     bits.push('<span class="spin"></span>' + esc(S.stream.status));
@@ -909,6 +980,30 @@ function renderMsg(m) {
   </div>`;
 }
 
+/** Tool previews arrive as a raw slice of the result, so a web_fetch that landed
+    on an unrendered page shows "<!DOCTYPE html><html lang=..." — technically the
+    truth and useless to read. Strip markup, unescape the handful of entities
+    that survive, collapse whitespace, and fall back to naming the shape when
+    there is no prose left. The full result is still in the transcript; this is
+    a glance, and a glance should be legible. */
+function cleanPreview(s) {
+    let t = String(s || '');
+    if (/^\s*<(!doctype|html|\?xml)/i.test(t)) {
+      // Drop the parts that never contain readable page text before anything else.
+      t = t.replace(/<(script|style|head)[\s\S]*?<\/\1>/gi, ' ');
+    }
+    t = t.replace(/<[^>]*>/g, ' ')
+         .replace(/&(nbsp|amp|lt|gt|quot|#39);/g, (m) => (
+           { '&nbsp;': ' ', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'" }[m] || ' '
+         ))
+         .replace(/\s+/g, ' ')
+         .trim();
+    if (!t) return '';
+    // A JSON body reduces to nothing readable; say what it is rather than showing braces.
+    if (/^[[{]/.test(String(s).trim()) && t.length > 60) return 'JSON · ' + t.slice(0, 40) + '…';
+    return t;
+}
+
 /** A tool chip carries its own state and elapsed time — the point is that the
     user can see the host working, not just that something is happening. */
 function toolChip(t) {
@@ -918,7 +1013,7 @@ function toolChip(t) {
   return '<div class="tool-chip ' + cls + '">'
     + (mark ? '<i class="tool-mark">' + mark + '</i>' : '<i class="tool-mark spin"></i>')
     + '<b>' + esc(t.tool) + '</b>'
-    + (t.preview ? '<span class="ellip">' + esc(t.preview) + '</span>' : '')
+    + (cleanPreview(t.preview) ? '<span class="ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
     + (secs > 1 ? '<span class="muted">' + secs + 's</span>' : '')
     + '</div>';
 }
