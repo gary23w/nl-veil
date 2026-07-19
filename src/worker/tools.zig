@@ -2348,7 +2348,14 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const A = struct { path: []const u8 = ".", root: []const u8 = "workdir" };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
-    const base = if (std.mem.eql(u8, p.value.root, "system")) (patchSystemRoot(ctx) orelse return dupe(gpa, "root=system needs NL_PATCH_SYSTEM_ROOT set")) else ctx.workdir;
+    // root="system" walks the ENGINE'S OWN SOURCE TREE, and CHAT_SCHEMA advertises it to every turn. It is
+    // a patch_system affordance, so it belongs at patch_system's trust level: a caller that may not modify
+    // the engine has no business enumerating it either. Without this the file jail is intact while the
+    // source tree stays readable by anyone who can type a tool call.
+    const want_system = std.mem.eql(u8, p.value.root, "system");
+    if (want_system and !ctx.roam)
+        return dupe(gpa, "root=system is not available to this caller — list paths relative to your workdir instead");
+    const base = if (want_system) (patchSystemRoot(ctx) orelse return dupe(gpa, "root=system needs NL_PATCH_SYSTEM_ROOT set")) else ctx.workdir;
     const rel = if (p.value.path.len == 0 or std.mem.eql(u8, p.value.path, ".")) "" else p.value.path;
     // CLIENT ROAM: listing an absolute/~ directory on the user's own machine is a read (see readFile's twin).
     const roamed: ?[]u8 = if (rel.len > 0 and !safeRel(rel)) roamPath(ctx, rel) else null;
@@ -2807,7 +2814,54 @@ fn urlAllowed(url: []const u8) bool {
         const second = std.fmt.parseInt(u16, rest[0..dot], 10) catch 0;
         if (second >= 16 and second <= 31) return false;
     }
+    // A dotted-quad prefix check misses every OTHER spelling of the same address. curl and urllib both
+    // accept an integer host and octal octets, so http://2130706433/, http://0177.0.0.1/ and http://0/
+    // all reach 127.0.0.1 while matching none of the strings above. Normalize any all-numeric host to
+    // its 32-bit value and re-check the private ranges on the number, not on the text.
+    if (numericHostV4(host)) |ip| {
+        const a: u8 = @truncate(ip >> 24);
+        const b: u8 = @truncate(ip >> 16);
+        if (a == 127 or a == 0 or a == 10) return false; // loopback, "this network", RFC1918 /8
+        if (a == 169 and b == 254) return false; // link-local, incl. cloud metadata
+        if (a == 192 and b == 168) return false; // RFC1918 /16
+        if (a == 172 and b >= 16 and b <= 31) return false; // RFC1918 /12
+    }
     return host.len > 0;
+}
+
+/// A host written entirely as numbers -> its IPv4 value, else null. Accepts the forms an HTTP client will
+/// actually dial: dotted quad, bare integer, and octal/hex octets (a leading 0 means octal, 0x means hex).
+/// Deliberately permissive about WHAT it parses — anything it can read as a number, the SSRF guard should
+/// then judge as a number.
+fn numericHostV4(host: []const u8) ?u32 {
+    if (host.len == 0) return null;
+    var parts: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |p| {
+        if (n == 4 or p.len == 0) return null;
+        parts[n] = p;
+        n += 1;
+    }
+    var vals: [4]u32 = .{ 0, 0, 0, 0 };
+    for (parts[0..n], 0..) |p, i| {
+        const radix: u8 = if (p.len > 2 and p[0] == '0' and (p[1] == 'x' or p[1] == 'X'))
+            16
+        else if (p.len > 1 and p[0] == '0')
+            8
+        else
+            10;
+        const digits = if (radix == 16) p[2..] else p;
+        vals[i] = std.fmt.parseInt(u32, digits, radix) catch return null;
+    }
+    // 1 part = the whole address; 2/3 parts spread the last value over the remaining octets (inet_aton).
+    return switch (n) {
+        1 => vals[0],
+        2 => if (vals[0] > 255 or vals[1] > 0xFFFFFF) null else (vals[0] << 24) | vals[1],
+        3 => if (vals[0] > 255 or vals[1] > 255 or vals[2] > 0xFFFF) null else (vals[0] << 24) | (vals[1] << 16) | vals[2],
+        4 => if (vals[0] > 255 or vals[1] > 255 or vals[2] > 255 or vals[3] > 255) null else (vals[0] << 24) | (vals[1] << 16) | (vals[2] << 8) | vals[3],
+        else => null,
+    };
 }
 
 /// Extract the bare host from an http(s) URL (no scheme, no userinfo, no port, no path). "" on a non-URL.
@@ -2847,6 +2901,32 @@ test "urlAllowed SSRF guard: IPv6 literals fail closed; private v4 + metadata st
     try std.testing.expect(urlAllowed("https://172.32.1.1/x")); // 172.32+ is public space
     try std.testing.expect(urlAllowed("https://example.com/x"));
     try std.testing.expect(!urlAllowed("ftp://example.com/x"));
+}
+
+test "urlAllowed: numeric spellings of loopback and private space are blocked too" {
+    // Same addresses as above, written the ways an HTTP client still dials but a dotted-quad prefix
+    // check never matches. Each of these reached 127.0.0.1 before numericHostV4 existed.
+    try std.testing.expect(!urlAllowed("http://2130706433/")); // 127.0.0.1 as one integer
+    try std.testing.expect(!urlAllowed("http://0177.0.0.1/")); // octal first octet
+    try std.testing.expect(!urlAllowed("http://0x7f.0.0.1/")); // hex first octet
+    try std.testing.expect(!urlAllowed("http://0/")); // 0.0.0.0
+    try std.testing.expect(!urlAllowed("http://127.1/")); // short form
+    try std.testing.expect(!urlAllowed("http://3232235777/")); // 192.168.1.1
+    try std.testing.expect(!urlAllowed("http://2886729729/")); // 172.16.0.1
+    try std.testing.expect(!urlAllowed("http://user@2130706433/x")); // userinfo does not launder it
+    // Public numeric hosts must still pass — the guard judges the value, not the notation.
+    try std.testing.expect(urlAllowed("http://93.184.216.34/")); // example.com
+    try std.testing.expect(urlAllowed("http://1.1.1.1/"));
+}
+
+test "numericHostV4 parses the dial-able notations and rejects names" {
+    try std.testing.expectEqual(@as(?u32, 0x7F000001), numericHostV4("2130706433"));
+    try std.testing.expectEqual(@as(?u32, 0x7F000001), numericHostV4("127.0.0.1"));
+    try std.testing.expectEqual(@as(?u32, 0x7F000001), numericHostV4("127.1"));
+    try std.testing.expectEqual(@as(?u32, 0x7F000001), numericHostV4("0177.0.0.1"));
+    try std.testing.expect(numericHostV4("example.com") == null);
+    try std.testing.expect(numericHostV4("127.0.0.256") == null); // octet out of range
+    try std.testing.expect(numericHostV4("") == null);
 }
 
 test "looksLikeJsShell flags unrendered SPA pages so webFetch falls back to the reader" {
@@ -3769,8 +3849,31 @@ const DEEP_CRAWL_PY =
     \\    if p.scheme not in ("http","https"): return False
     \\    h=(p.netloc or "").lower()
     \\    if not h: return False
+    \\    # netloc KEEPS userinfo and port, so "x@127.0.0.1:8787" defeated every startswith below and the
+    \\    # crawler would happily fetch loopback. Strip both before judging the host, and reject the
+    \\    # numeric spellings (integer / octal / hex) that name the same address without the prefix.
+    \\    if "@" in h: h=h.rsplit("@",1)[1]
+    \\    if h.startswith("["): return False
+    \\    h=h.split(":",1)[0]
+    \\    if not h: return False
     \\    if h.startswith(("localhost","127.","0.0.0.0","169.254.","10.","192.168.")) or h.endswith(".local"):
     \\        return False
+    \\    try:
+    \\        import ipaddress
+    \\        ip=ipaddress.ip_address(int(h,0) if h.isdigit() or h.startswith(("0x","0X")) else h)
+    \\        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved or ip.is_unspecified:
+    \\            return False
+    \\    except ValueError:
+    \\        pass
+    \\    parts=h.split(".")
+    \\    if len(parts)==4 and all(x.lstrip("0") .isdigit() or x=="0" for x in parts if x):
+    \\        try:
+    \\            import ipaddress
+    \\            ip=ipaddress.ip_address(".".join(str(int(x,8) if x.startswith("0") and x!="0" else int(x)) for x in parts))
+    \\            if ip.is_loopback or ip.is_private or ip.is_link_local:
+    \\                return False
+    \\        except (ValueError,OverflowError):
+    \\            return False
     \\    if same_host and h!=seed_host: return False
     \\    return True
     \\def fetch(u,t=16):
