@@ -479,9 +479,20 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   flex-basis: 260px;
   display: flex; flex-direction: column;
   min-height: 0;
+  /* min-width:0, and it is load-bearing. A flex item defaults to min-width:auto,
+     which refuses to render narrower than its CONTENT's min-content width — the
+     "+ New chat" button plus its collapse control put that floor around 300px.
+     The basis was being set to 137px and the pane still drew 300px wide, which
+     read as "the divider stops partway and will not go further". */
+  min-width: 0;
+  overflow: hidden;
   border-right: 1px solid var(--border);
   background: var(--surface-raised);
 }
+/* Same reason, one level down: these are the children that set the floor. */
+.chat-list-head { min-width: 0; }
+.chat-list-head .btn { min-width: 0; overflow: hidden; }
+.conv-row { min-width: 0; }
 .chat-list-head { display: flex; padding: 10px; border-bottom: 1px solid var(--border); }
 
 .conv-row {
@@ -946,7 +957,11 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 body:has(.rail-grip.dragging) { cursor: col-resize; user-select: none; }
 
 @media (max-width: 720px) { .rail-grip { display: none; } }
+/* Hidden when collapsed — EXCEPT mid-drag. Collapsing now happens by dragging
+   past the floor, and a display:none element loses pointer capture, which would
+   end the gesture the instant it snapped shut and strand the pointer. */
 .chat.rail-collapsed .rail-grip { display: none; }
+.chat.rail-collapsed .rail-grip.dragging { display: block; }
 
 /* ============================================================ activity feed
    One list answering "is anything happening right now?", assembled from the

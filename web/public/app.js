@@ -252,7 +252,12 @@ function renderAuth(msg, msgCls) {
     </div>`;
 
   el('authForm').addEventListener('submit', (ev) => { ev.preventDefault(); doAuth('login'); });
-  el('auReg').addEventListener('click', () => doAuth('register'));
+  // The Register button only EXISTS when the instance accepts registrations, so
+  // this has to be conditional. Attaching unconditionally threw during boot on
+  // any closed instance — which is the default — and the throw happened before
+  // focus() ran, so the form rendered but the email field never took focus.
+  const reg = el('auReg');
+  if (reg) reg.addEventListener('click', () => doAuth('register'));
   el('auEmail').focus();
 }
 
@@ -741,7 +746,14 @@ function resetStream() {
      - use pointer capture, so a fast drag that outruns the cursor keeps
        delivering events to the grip instead of dropping them on whatever it
        flew over. */
-const RAIL_MIN = 180, RAIL_MAX = 520;
+/* The floor that actually bit was never this constant — it was flexbox's
+   min-width:auto refusing to draw the pane narrower than its content (see
+   .chat-list in styles.css). With that fixed, 110px is a real floor: narrow
+   enough to be a strip of titles, wide enough to still be a list. Dragging
+   past it collapses rather than refusing, because pulling a divider to the edge
+   means "get this out of my way". */
+const RAIL_MIN = 110, RAIL_MAX = 560;
+const RAIL_COLLAPSE_AT = 76;   // drag narrower than this and it snaps shut
 
 function applyRailWidth(px) {
   const w = Math.max(RAIL_MIN, Math.min(RAIL_MAX, Math.round(px)));
@@ -778,10 +790,20 @@ function wireRailGrip() {
 
     // Listen on the WINDOW, not the grip: a drag that outruns the pointer leaves
     // the 6px element, and without capture those moves would land elsewhere.
-    const move = (ev) => LS.set('veil.railW', String(applyRailWidth(startW + (ev.clientX - startX))));
+    const root = el('chatRoot');
+    const move = (ev) => {
+      const want = startW + (ev.clientX - startX);
+      // Past the floor, preview the collapse rather than sticking at the minimum —
+      // the rail should follow the pointer all the way to the edge.
+      const shut = want < RAIL_COLLAPSE_AT;
+      root.classList.toggle('rail-collapsed', shut);
+      if (!shut) LS.set('veil.railW', String(applyRailWidth(want)));
+    };
     const up = (ev) => {
       try { grip.releasePointerCapture(ev.pointerId); } catch (err) {}
       grip.classList.remove('dragging');
+      // Persist whichever state the drag ended in, so it survives a reload.
+      LS.set('veil.railCollapsed', root.classList.contains('rail-collapsed') ? '1' : '0');
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', up);
       window.removeEventListener('pointercancel', up);
