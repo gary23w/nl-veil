@@ -25,10 +25,21 @@ pub const ServerConfig = struct {
     gpa: std.mem.Allocator,
     data: []const u8,
 
+    // Three roles, mirroring the per-user trio: coding is the fallback for the other two, exactly as
+    // ModelTrio.pick already resolves them. An admin who wants one model for everything simply leaves
+    // thinking and prompting empty — the same shape a user's own settings take.
     model_buf: [MODEL_MAX]u8 = undefined,
     model_len: usize = 0,
     base_buf: [BASE_MAX]u8 = undefined,
     base_len: usize = 0,
+    think_model_buf: [MODEL_MAX]u8 = undefined,
+    think_model_len: usize = 0,
+    think_base_buf: [BASE_MAX]u8 = undefined,
+    think_base_len: usize = 0,
+    prompt_model_buf: [MODEL_MAX]u8 = undefined,
+    prompt_model_len: usize = 0,
+    prompt_base_buf: [BASE_MAX]u8 = undefined,
+    prompt_base_len: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, data: []const u8) ServerConfig {
         return .{ .io = io, .gpa = gpa, .data = data };
@@ -36,32 +47,94 @@ pub const ServerConfig = struct {
 
     /// The configured default, copied into `alloc`. Empty strings mean "no default set" — callers
     /// treat that as "the user must choose", which is the pre-existing behaviour.
-    pub fn defaults(self: *ServerConfig, alloc: std.mem.Allocator) struct { model: []const u8, base_url: []const u8 } {
+    pub const Defaults = struct {
+        model: []const u8 = "",
+        base_url: []const u8 = "",
+        think_model: []const u8 = "",
+        think_base_url: []const u8 = "",
+        prompt_model: []const u8 = "",
+        prompt_base_url: []const u8 = "",
+    };
+
+    pub fn defaults(self: *ServerConfig, alloc: std.mem.Allocator) Defaults {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        const m = alloc.dupe(u8, self.model_buf[0..self.model_len]) catch "";
-        const b = alloc.dupe(u8, self.base_buf[0..self.base_len]) catch "";
-        return .{ .model = m, .base_url = b };
+        return .{
+            .model = alloc.dupe(u8, self.model_buf[0..self.model_len]) catch "",
+            .base_url = alloc.dupe(u8, self.base_buf[0..self.base_len]) catch "",
+            .think_model = alloc.dupe(u8, self.think_model_buf[0..self.think_model_len]) catch "",
+            .think_base_url = alloc.dupe(u8, self.think_base_buf[0..self.think_base_len]) catch "",
+            .prompt_model = alloc.dupe(u8, self.prompt_model_buf[0..self.prompt_model_len]) catch "",
+            .prompt_base_url = alloc.dupe(u8, self.prompt_base_buf[0..self.prompt_base_len]) catch "",
+        };
     }
 
-    /// Set and persist. Over-long input is REJECTED rather than truncated: a silently clipped model id
-    /// would fail later as a confusing 404 from the provider instead of an error here.
+    /// Validate one model/base pair. Rejects rather than truncates: a silently clipped model id would
+    /// fail later as a confusing 404 from the provider instead of an error where it was typed.
+    fn check(model: []const u8, base_url: []const u8) !void {
+        if (model.len > MODEL_MAX or base_url.len > BASE_MAX) return error.TooLong;
+        // This lands in a JSON file and in an HTTP response body, so no quotes or control bytes.
+        for (model) |c| if (c < 0x20 or c == '"' or c == '\\') return error.BadInput;
+        for (base_url) |c| if (c < 0x20 or c == '"' or c == '\\') return error.BadInput;
+    }
+
+    fn put(buf: []u8, len: *usize, v: []const u8) void {
+        @memcpy(buf[0..v.len], v);
+        len.* = v.len;
+    }
+
+    /// Set the coding role only, leaving thinking/prompting untouched.
     pub fn set(self: *ServerConfig, model: []const u8, base_url: []const u8) !void {
-        const m = std.mem.trim(u8, model, " \r\n\t");
-        const b = std.mem.trim(u8, base_url, " \r\n\t");
-        if (m.len > MODEL_MAX or b.len > BASE_MAX) return error.TooLong;
-        // No control characters: this lands in a JSON file and in an HTTP request body.
-        for (m) |c| if (c < 0x20 or c == '"' or c == '\\') return error.BadInput;
-        for (b) |c| if (c < 0x20 or c == '"' or c == '\\') return error.BadInput;
+        const d = self.defaultsRaw();
+        try self.setAll(model, base_url, d.think_model, d.think_base_url, d.prompt_model, d.prompt_base_url);
+    }
+
+    /// Set all three roles at once. Thinking and prompting may be empty — they then fall back to the
+    /// coding model inside ModelTrio.pick, which is exactly how a user's own trio behaves.
+    pub fn setAll(
+        self: *ServerConfig,
+        model: []const u8,
+        base_url: []const u8,
+        think_model: []const u8,
+        think_base_url: []const u8,
+        prompt_model: []const u8,
+        prompt_base_url: []const u8,
+    ) !void {
+        const WS = " \r\n\t";
+        const m = std.mem.trim(u8, model, WS);
+        const b = std.mem.trim(u8, base_url, WS);
+        const tm = std.mem.trim(u8, think_model, WS);
+        const tb = std.mem.trim(u8, think_base_url, WS);
+        const pm = std.mem.trim(u8, prompt_model, WS);
+        const pb2 = std.mem.trim(u8, prompt_base_url, WS);
+        try check(m, b);
+        try check(tm, tb);
+        try check(pm, pb2);
 
         self.mu.lockUncancelable(self.io);
-        @memcpy(self.model_buf[0..m.len], m);
-        self.model_len = m.len;
-        @memcpy(self.base_buf[0..b.len], b);
-        self.base_len = b.len;
+        put(&self.model_buf, &self.model_len, m);
+        put(&self.base_buf, &self.base_len, b);
+        put(&self.think_model_buf, &self.think_model_len, tm);
+        put(&self.think_base_buf, &self.think_base_len, tb);
+        put(&self.prompt_model_buf, &self.prompt_model_len, pm);
+        put(&self.prompt_base_buf, &self.prompt_base_len, pb2);
         self.mu.unlock(self.io);
 
         self.save() catch {}; // a failed write must not fail the request; the value is already live
+    }
+
+    /// Snapshot WITHOUT allocating — used internally where a caller already holds no lock.
+    fn defaultsRaw(self: *ServerConfig) Defaults {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return .{
+            .model = self.model_buf[0..self.model_len],
+            .base_url = self.base_buf[0..self.base_len],
+            .think_model = self.think_model_buf[0..self.think_model_len],
+            .think_base_url = self.think_base_buf[0..self.think_base_len],
+            .prompt_model = self.prompt_model_buf[0..self.prompt_model_len],
+            .prompt_base_url = self.prompt_base_buf[0..self.prompt_base_len],
+        };
     }
 
     fn path(self: *ServerConfig, buf: []u8) ?[]const u8 {
@@ -72,9 +145,14 @@ pub const ServerConfig = struct {
         var pb: [700]u8 = undefined;
         const p = self.path(&pb) orelse return;
         self.mu.lockUncancelable(self.io);
-        var body_buf: [MODEL_MAX + BASE_MAX + 64]u8 = undefined;
-        const body = std.fmt.bufPrint(&body_buf, "{{\"default_model\":\"{s}\",\"default_base_url\":\"{s}\"}}\n", .{
-            self.model_buf[0..self.model_len], self.base_buf[0..self.base_len],
+        var body_buf: [(MODEL_MAX + BASE_MAX) * 3 + 256]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf,
+            "{{\"default_model\":\"{s}\",\"default_base_url\":\"{s}\"," ++
+            "\"think_model\":\"{s}\",\"think_base_url\":\"{s}\"," ++
+            "\"prompt_model\":\"{s}\",\"prompt_base_url\":\"{s}\"}}\n", .{
+            self.model_buf[0..self.model_len],        self.base_buf[0..self.base_len],
+            self.think_model_buf[0..self.think_model_len],  self.think_base_buf[0..self.think_base_len],
+            self.prompt_model_buf[0..self.prompt_model_len], self.prompt_base_buf[0..self.prompt_base_len],
         }) catch {
             self.mu.unlock(self.io);
             return;
@@ -91,10 +169,18 @@ pub const ServerConfig = struct {
         if (self.path(&pb)) |p| {
             if (std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(8 << 10))) |data| {
                 defer self.gpa.free(data);
-                const P = struct { default_model: []const u8 = "", default_base_url: []const u8 = "" };
+                const P = struct {
+                    default_model: []const u8 = "",
+                    default_base_url: []const u8 = "",
+                    think_model: []const u8 = "",
+                    think_base_url: []const u8 = "",
+                    prompt_model: []const u8 = "",
+                    prompt_base_url: []const u8 = "",
+                };
                 if (std.json.parseFromSlice(P, self.gpa, data, .{ .ignore_unknown_fields = true })) |parsed| {
                     defer parsed.deinit();
-                    self.set(parsed.value.default_model, parsed.value.default_base_url) catch {};
+                    const v = parsed.value;
+                    self.setAll(v.default_model, v.default_base_url, v.think_model, v.think_base_url, v.prompt_model, v.prompt_base_url) catch {};
                     return;
                 } else |_| {}
             } else |_| {}

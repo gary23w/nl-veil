@@ -23,6 +23,11 @@ const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg");
+
+/// The reserved uid for INSTANCE-WIDE credentials. Real accounts start at 1 (auth_core.next_id), so 0
+/// can never collide with one, and the shared key reuses the per-user vault's sealing and scoping
+/// wholesale instead of inventing a second secret store.
+pub const SERVER_KEY_UID: u64 = 0;
 const cpaths = @import("paths.zig");
 const tools = @import("../tools.zig");
 
@@ -56,6 +61,18 @@ fn resolveRole(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const 
             // when the caller left the base blank — otherwise the caller's endpoint stands.
             const base = if (base_url.len == 0 and rk.base_url.len != 0) rk.base_url else base_url;
             return .{ .base = base, .key = rk.key };
+        }
+        // SHARED SERVER KEY. uid 0 is a reserved namespace no account can hold (auth_core's next_id
+        // starts at 1), so the admin's instance-wide key lives in the same sealed vault under the same
+        // scheme as everyone else's. It is the LAST resort: a user's own key always wins, so an account
+        // that brings its own billing is never silently switched onto the admin's.
+        //
+        // The trade is deliberate and worth stating: once this is set, every user's turns spend the
+        // admin's credit. That is exactly what a LAN or family install wants — nobody should have to
+        // hold an API key to use the thing — and exactly what a public deployment must think about.
+        if (app.vault.resolve(SERVER_KEY_UID, prov, arena)) |sk| {
+            const base = if (base_url.len == 0 and sk.base_url.len != 0) sk.base_url else base_url;
+            return .{ .base = base, .key = sk.key };
         }
     }
 
@@ -336,19 +353,27 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const use_default = b.model.len == 0 and b.base_url.len == 0 and sd.model.len > 0;
     const c_model = if (use_default) sd.model else b.model;
     const c_base = if (use_default) sd.base_url else b.base_url;
+    // The server's trio applies per role, and only where the client sent nothing. An admin can
+    // therefore publish a full coding/thinking/prompting split for everyone, or just a coding model —
+    // an unset server role falls through to the server's coding model in ModelTrio.pick, exactly as an
+    // unset user role does.
+    const t_model = if (b.think_model.len == 0 and use_default) sd.think_model else b.think_model;
+    const t_base = if (b.think_base_url.len == 0 and use_default) sd.think_base_url else b.think_base_url;
+    const p_model = if (b.prompt_model.len == 0 and use_default) sd.prompt_model else b.prompt_model;
+    const p_base = if (b.prompt_base_url.len == 0 and use_default) sd.prompt_base_url else b.prompt_base_url;
 
     const cc = resolveRole(app, u.id, res.arena, c_base, c_model, b.api_key);
     const eff_base = cc.base;
     const eff_key = cc.key;
-    const tc = resolveRole(app, u.id, res.arena, b.think_base_url, b.think_model, b.think_api_key);
-    const pc = resolveRole(app, u.id, res.arena, b.prompt_base_url, b.prompt_model, b.prompt_api_key);
+    const tc = resolveRole(app, u.id, res.arena, t_base, t_model, b.think_api_key);
+    const pc = resolveRole(app, u.id, res.arena, p_base, p_model, b.prompt_api_key);
     // The base (coding) triple is always populated; thinking/prompting stay empty when the client didn't send
     // them and fall back to coding inside the engine (ModelTrio.pick). The local-admission gate keys on the
     // coding/base backend only (below) — a mixed setup with a local secondary role is a documented limitation.
     const trio: chat_engine.ModelTrio = .{
         .coding = .{ .base_url = eff_base, .key = eff_key, .model = c_model },
-        .thinking = .{ .base_url = tc.base, .key = tc.key, .model = b.think_model },
-        .prompting = .{ .base_url = pc.base, .key = pc.key, .model = b.prompt_model },
+        .thinking = .{ .base_url = tc.base, .key = tc.key, .model = t_model },
+        .prompting = .{ .base_url = pc.base, .key = pc.key, .model = p_model },
     };
 
     // LOCAL-MODEL ADMISSION: a hosted backend fans out up to MAX_ACTIVE_TURNS, but a local model is one process

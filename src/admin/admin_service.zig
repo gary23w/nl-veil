@@ -4,10 +4,12 @@ const std = @import("std");
 const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
+const chat_service = @import("../worker/chat/service.zig");
 const App = http.App;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;
 const notFound = http.notFound;
+const serverErr = http.serverErr;
 
 pub fn adminUsers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     _ = requireAdmin(app, req, res) orelse return;
@@ -26,13 +28,72 @@ pub fn adminUsers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = try res.arena.dupe(u8, arr.items);
 }
 
-const ConfigReq = struct { default_model: []const u8 = "", default_base_url: []const u8 = "" };
+const ConfigReq = struct {
+    default_model: []const u8 = "",
+    default_base_url: []const u8 = "",
+    think_model: []const u8 = "",
+    think_base_url: []const u8 = "",
+    prompt_model: []const u8 = "",
+    prompt_base_url: []const u8 = "",
+};
+
+const ServerKeyReq = struct { provider: []const u8, key: []const u8, base_url: []const u8 = "" };
+
+/// POST /api/v1/admin/keys — the INSTANCE-WIDE provider key.
+///
+/// Without this, setting a default model was only half an answer: every user still had to bring their
+/// own key before they could send a single message, which is precisely the setup step a default model
+/// exists to remove. Stored in the same sealed vault as everyone else's, under the reserved uid 0.
+///
+/// Say the consequence plainly, because it is a billing decision, not a convenience: once set, every
+/// user's turns spend the admin's credit. A user who stores their own key still uses theirs — the
+/// shared key is the last resort in resolveRole, never an override.
+pub fn adminPutKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const body = (try req.json(ServerKeyReq)) orelse return badReq(res, "bad body");
+    app.vault.put(chat_service.SERVER_KEY_UID, body.provider, body.key, body.base_url) catch |e| return badReq(res, switch (e) {
+        error.BadProvider => "invalid provider (use a-z0-9-_ , <=32 chars)",
+        error.BadKey => "invalid key (1..512 chars, no quotes/backslashes/control chars)",
+        error.BadBaseUrl => "invalid base_url",
+        else => "could not store the key",
+    });
+    // The key itself is never echoed, logged, or returned — only that one was set, and for whom.
+    app.audit.record(admin.email, "set_server_key", body.provider);
+    res.status = 201;
+    try res.json(.{ .ok = true, .provider = body.provider }, .{});
+}
+
+/// GET /api/v1/admin/keys — which shared keys exist. Metadata only: provider, last4, fingerprint.
+pub fn adminListKeys(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = requireAdmin(app, req, res) orelse return;
+    const metas = app.vault.list(chat_service.SERVER_KEY_UID, res.arena) catch return serverErr(res, "could not read the vault");
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(app.gpa);
+    try arr.appendSlice(app.gpa, "{\"ok\":true,\"keys\":[");
+    for (metas, 0..) |m, i| {
+        if (i > 0) try arr.append(app.gpa, ',');
+        const item = try std.fmt.allocPrint(res.arena, "{{\"provider\":\"{s}\",\"last4\":\"{s}\"}}", .{ m.provider, m.last4 });
+        try arr.appendSlice(app.gpa, item);
+    }
+    try arr.appendSlice(app.gpa, "]}");
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, arr.items);
+}
+
+/// DELETE /api/v1/admin/keys/:provider — stop paying for everyone.
+pub fn adminDelKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const provider = req.param("provider") orelse return badReq(res, "no provider");
+    app.vault.del(chat_service.SERVER_KEY_UID, provider);
+    app.audit.record(admin.email, "clear_server_key", provider);
+    try res.json(.{ .ok = true, .provider = provider, .deleted = true }, .{});
+}
 
 /// GET /api/v1/admin/config — the settings this server's admin owns.
 pub fn adminGetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     _ = requireAdmin(app, req, res) orelse return;
     const sd = app.cfg.defaults(res.arena);
-    try res.json(.{ .ok = true, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
+    try res.json(sd, .{});
 }
 
 /// POST /api/v1/admin/config — set them, live. No restart: the value is swapped under a mutex and
@@ -41,13 +102,13 @@ pub fn adminGetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
 pub fn adminSetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
     const body = (try req.json(ConfigReq)) orelse return badReq(res, "bad body");
-    app.cfg.set(body.default_model, body.default_base_url) catch |e| return switch (e) {
+    app.cfg.setAll(body.default_model, body.default_base_url, body.think_model, body.think_base_url, body.prompt_model, body.prompt_base_url) catch |e| return switch (e) {
         error.TooLong => badReq(res, "that model id or base URL is too long"),
         error.BadInput => badReq(res, "model id and base URL must not contain quotes or control characters"),
     };
     app.audit.record(admin.email, "set_default_model", body.default_model);
     const sd = app.cfg.defaults(res.arena);
-    try res.json(.{ .ok = true, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
+    try res.json(sd, .{});
 }
 
 const NewUserReq = struct { email: []const u8, password: []const u8 };
