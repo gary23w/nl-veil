@@ -557,6 +557,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .internet = true,
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0,
+        // THE SANDBOX. A non-admin's prompts are not trusted with the host, so their turn runs the
+        // restricted surface: files (already jailed to this conversation's workdir), research, and the
+        // whole hive-memory surface — but no code execution, host control, engine self-modification,
+        // tool authoring, or browser/MCP drive. Derived from the caller here rather than threaded
+        // through runTurn's signature: the uid is already the thing every path in this function keys on,
+        // and one lookup beats changing five signatures to carry a bool alongside it.
+        .caps = if (app.auth.userById(uid)) |cu| (if (app.auth.isAdmin(cu)) .full else .sandboxed) else .sandboxed,
     };
 
     // ---- seed the LLM conversation: system prompt + every persisted message (incl. the user turn just added) ----
@@ -2531,6 +2538,23 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     const base_url = trio.coding.base_url;
     const key = trio.coding.key;
     const model = trio.coding.model;
+
+    // ORCHESTRATION IS A CAPABILITY ESCALATION for a sandboxed caller, and casting is the sharpest edge:
+    // a swarm mind runs its OWN ToolCtx (run.zig) with the full surface and patch_root pointed at the
+    // engine tree, so "sandbox the chat but allow casting" is not a sandbox — it is a redirect. Same for
+    // scheduling, whose runs execute later, outside this turn's context entirely (sched.zig already
+    // refuses to TICK a non-admin's task; this stops one being created in the first place).
+    //
+    // Read-only observation stays: swarm_status / swarm_asks / stop_swarm are each uid-checked by their
+    // own handler, so a sandboxed user can watch and halt their own swarms, just not mint new execution.
+    if (ctx.caps == .sandboxed) {
+        const escalates = std.mem.eql(u8, name, "cast") or std.mem.eql(u8, name, "steer_swarm") or
+            std.mem.eql(u8, name, "answer_swarm") or std.mem.eql(u8, name, "sync_dir") or
+            std.mem.startsWith(u8, name, "schedule_");
+        if (escalates)
+            return ctx.gpa.dupe(u8, "that is not available in this workspace — deploying swarms and scheduling runs are reserved for the server's admin, because they execute outside this conversation's sandbox.") catch null;
+    }
+
     if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, args, tool_client);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);

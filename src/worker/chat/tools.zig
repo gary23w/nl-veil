@@ -72,9 +72,19 @@ const ADMIN_TOOLS = [_][]const u8{
     "mcp_discover",    "mcp_call",
 };
 
+/// Runnable by any authed user on this endpoint. Delegates to the ENGINE'S sandbox predicate so the two
+/// surfaces cannot drift: a tool added to one list and forgotten in the other is exactly how a hole gets
+/// opened quietly. SAFE_TOOLS above is kept as documentation of the original split; the predicate below
+/// is the authority.
+///
+/// Two deliberate differences from that older list, both verified against the implementations:
+///   - deep_crawl is NOT sandbox-safe. It fans out to links it discovers, and its in-Python host filter
+///     is weaker than urlAllowed (it reads p.netloc, which keeps userinfo). web_search/web_fetch cover
+///     research without the fan-out.
+///   - pixel_search IS sandbox-safe. It is local retrieval over the caller's own attachments, renders
+///     nothing and touches no network; it sat in ADMIN_TOOLS beside the browser verbs by association.
 fn toolSafe(name: []const u8) bool {
-    for (SAFE_TOOLS) |a| if (std.mem.eql(u8, a, name)) return true;
-    return false;
+    return tools.sandboxAllowed(name);
 }
 
 fn toolAdminOnly(name: []const u8) bool {
@@ -358,6 +368,10 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0, // route edit_file through the swarm's micro-VCS on a real per-conversation build
         .roam = roam, // admin-on-localhost: this runs on the user's own machine (browser/pixel/mcp authorize on roam)
+        // Defence in depth: the handler already refused anything outside the allowlist before reaching
+        // here, so this should never be the thing that stops a call. It is set anyway because "the
+        // caller was checked upstream" is precisely the assumption that rots when a new route appears.
+        .caps = if (roam) .full else .sandboxed,
     };
     const result = tools.execute(&ctx, tool, args);
     // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid
