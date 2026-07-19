@@ -23,6 +23,8 @@ const cf_oauth = @import("../../config/cf_oauth.zig");
 const chat_engine = @import("engine.zig");
 const llm = @import("../llm.zig");
 const modelcfg = @import("modelcfg");
+const cpaths = @import("paths.zig");
+const tools = @import("../tools.zig");
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -325,7 +327,16 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // Workers AI endpoint, otherwise this user's sealed BYOK vault entry for whichever catalog provider the
     // base URL belongs to. That is what lets a browser run a hosted turn without ever holding a key. Each of
     // the three roles resolves independently (a user can point prompting at CF and coding at BYOK).
-    const cc = resolveRole(app, u.id, res.arena, b.base_url, b.model, b.api_key);
+    // SERVER DEFAULT: fill a blank coding model from the host's configuration before anything else
+    // looks at it. Applied all-or-nothing on the pair — a model from the default paired with a base URL
+    // the user happened to type (or vice versa) is a combination nobody chose, and it fails as a 404
+    // that reads like a broken model. Only the coding role is defaulted; thinking/prompting already
+    // fall back to coding inside ModelTrio.pick.
+    const use_default = b.model.len == 0 and b.base_url.len == 0 and app.default_model.len > 0;
+    const c_model = if (use_default) app.default_model else b.model;
+    const c_base = if (use_default) app.default_base_url else b.base_url;
+
+    const cc = resolveRole(app, u.id, res.arena, c_base, c_model, b.api_key);
     const eff_base = cc.base;
     const eff_key = cc.key;
     const tc = resolveRole(app, u.id, res.arena, b.think_base_url, b.think_model, b.think_api_key);
@@ -334,7 +345,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // them and fall back to coding inside the engine (ModelTrio.pick). The local-admission gate keys on the
     // coding/base backend only (below) — a mixed setup with a local secondary role is a documented limitation.
     const trio: chat_engine.ModelTrio = .{
-        .coding = .{ .base_url = eff_base, .key = eff_key, .model = b.model },
+        .coding = .{ .base_url = eff_base, .key = eff_key, .model = c_model },
         .thinking = .{ .base_url = tc.base, .key = tc.key, .model = b.think_model },
         .prompting = .{ .base_url = pc.base, .key = pc.key, .model = b.prompt_model },
     };
@@ -462,4 +473,93 @@ fn clipUtf8(s: []const u8, max: usize) []const u8 {
     var n = @min(s.len, max);
     while (n > 0 and (s[n - 1] & 0x80) != 0) n -= 1;
     return s[0..n];
+}
+
+// ---- THE CONVERSATION'S FILES -------------------------------------------------------------------------
+// A turn writes real files, and until now a web client had no way to see them: the desk browses the build
+// tree directly off disk, which a browser cannot do. The swarm side has had /files and /file since the
+// beginning; this is the same pair for a conversation. Ownership stays structural — the path is built from
+// the authenticated uid, so a foreign conv id is not expressible rather than being checked and rejected.
+
+const FILE_MAX = 2 << 20; // 2 MiB, matching the swarm route's per-file ceiling
+const FILES_MAX = 400; // a listing is for browsing, not for mirroring a node_modules
+
+/// Absolute "{root}/work" for one of THIS user's conversations, or "" if the id is unsafe.
+fn convWorkDir(app: *App, arena: std.mem.Allocator, uid: u64, conv: []const u8, buf: []u8) []const u8 {
+    const seg = safeSeg(conv);
+    if (seg.len == 0) return "";
+    const base = std.fmt.allocPrint(arena, "{s}/u{d}/_chat", .{ app.data, uid }) catch return "";
+    const root = cpaths.buildRootFromChatBase(buf, base, seg);
+    if (root.len == 0) return "";
+    return std.fmt.allocPrint(arena, "{s}/work", .{root}) catch "";
+}
+
+/// GET /api/v1/chat/convs/:id/files — what this conversation has built. Walks {root}/work recursively and
+/// returns relative paths with sizes. A conversation that has written nothing returns an empty list, not a
+/// 404: "no files yet" is a normal state and the client should render it as one.
+pub fn convFiles(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const id = req.param("id") orelse return badReq(res, "no id");
+    var rb: [1024]u8 = undefined;
+    const work = convWorkDir(app, res.arena, u.id, id, &rb);
+    if (work.len == 0) return notFound(res);
+
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(app.gpa);
+    try arr.appendSlice(app.gpa, "{\"ok\":true,\"files\":[");
+    var n: usize = 0;
+    var bytes: u64 = 0;
+
+    if (std.Io.Dir.cwd().openDir(app.io, work, .{ .iterate = true })) |dir_const| {
+        var dir = dir_const;
+        defer dir.close(app.io);
+        var walker = dir.walk(app.gpa) catch {
+            try arr.appendSlice(app.gpa, "]}");
+            res.content_type = .JSON;
+            res.body = try res.arena.dupe(u8, arr.items);
+            return;
+        };
+        defer walker.deinit();
+        while (walker.next(app.io) catch null) |ent| {
+            if (ent.kind != .file) continue;
+            if (n >= FILES_MAX) break;
+            const st = dir.statFile(app.io, ent.path, .{}) catch continue;
+            if (n > 0) try arr.append(app.gpa, ',');
+            try arr.appendSlice(app.gpa, "{\"path\":");
+            // Normalize to forward slashes: the client uses this string as a query parameter and as a
+            // display path, and a Windows walker hands back backslashes.
+            const norm = try res.arena.dupe(u8, ent.path);
+            for (norm) |*c| if (c.* == '\\') { c.* = '/'; };
+            try http.jstr(app.gpa, &arr, norm);
+            const tail = try std.fmt.allocPrint(res.arena, ",\"size\":{d}}}", .{st.size});
+            try arr.appendSlice(app.gpa, tail);
+            bytes += st.size;
+            n += 1;
+        }
+    } else |_| {}
+
+    const tail = try std.fmt.allocPrint(res.arena, "],\"n\":{d},\"bytes\":{d},\"truncated\":{}}}", .{ n, bytes, n >= FILES_MAX });
+    try arr.appendSlice(app.gpa, tail);
+    res.content_type = .JSON;
+    res.body = try res.arena.dupe(u8, arr.items);
+}
+
+/// GET /api/v1/chat/convs/:id/file?path=rel — one file's bytes, as text.
+pub fn convFile(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const u = requireUser(app, req, res) orelse return;
+    const id = req.param("id") orelse return badReq(res, "no id");
+    const q = try req.query();
+    const rel = q.get("path") orelse return badReq(res, "no path");
+    // The SAME rule the tools use, deliberately: no absolute path, no drive letter, no "..". The swarm
+    // route hand-rolls a weaker literal check; reusing tools.safeRel means one definition of "inside the
+    // workspace" rather than two that can drift apart.
+    if (!tools.safeRel(rel)) return badReq(res, "bad path");
+
+    var rb: [1024]u8 = undefined;
+    const work = convWorkDir(app, res.arena, u.id, id, &rb);
+    if (work.len == 0) return notFound(res);
+    const full = try std.fmt.allocPrint(res.arena, "{s}/{s}", .{ work, rel });
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, full, res.arena, .limited(FILE_MAX)) catch return notFound(res);
+    res.content_type = .TEXT;
+    res.body = data;
 }

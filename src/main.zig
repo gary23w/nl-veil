@@ -454,7 +454,7 @@ pub fn main(init: std.process.Init) !void {
     // client_id. The redirect defaults to this server's loopback callback on the resolved port.
     const cf_oauth_redirect = init.environ_map.get("NL_CF_OAUTH_REDIRECT") orelse
         (std.fmt.allocPrint(gpa, "http://localhost:{d}/api/v1/oauth/cloudflare/callback", .{cli_port}) catch "http://localhost:8787/api/v1/oauth/cloudflare/callback");
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts" };
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .default_model = init.environ_map.get("NL_DEFAULT_MODEL") orelse "", .default_base_url = init.environ_map.get("NL_DEFAULT_BASE_URL") orelse "" };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -537,6 +537,10 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/chat/tool", chat_tools.chatTool, .{});
     router.get("/api/v1/chat/convs", chat_service.listConvs, .{});
     router.get("/api/v1/chat/convs/:id", chat_service.getConv, .{});
+    // What a conversation has BUILT. The desk browses the build tree straight off disk; a browser
+    // cannot, so it needs these two. Same pair the swarm side has always had.
+    router.get("/api/v1/chat/convs/:id/files", chat_service.convFiles, .{});
+    router.get("/api/v1/chat/convs/:id/file", chat_service.convFile, .{});
     router.delete("/api/v1/chat/convs/:id", chat_service.deleteConv, .{});
     router.get("/api/v1/chat/convs/:id/events", chat_service.convEvents, .{});
     router.post("/api/v1/chat/convs/:id/messages", chat_service.postMessage, .{});
@@ -553,6 +557,10 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
     router.post("/api/v1/admin/billing", deploy_service.adminBilling, .{});
     router.post("/api/v1/admin/users/moderate", admin_service.adminModerate, .{});
+    // Registration defaults CLOSED, which is right for a LAN box but left no way to onboard anyone.
+    router.post("/api/v1/admin/users", admin_service.adminCreateUser, .{});
+    // Moderation needs to see what an account is DOING. Metadata only — see the handler.
+    router.get("/api/v1/admin/users/:uid/activity", admin_service.adminUserActivity, .{});
     router.get("/api/v1/admin/swarms", admin_service.adminSwarms, .{});
     router.delete("/api/v1/admin/swarms/:id", admin_service.adminKill, .{});
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});

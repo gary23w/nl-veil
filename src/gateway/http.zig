@@ -30,6 +30,13 @@ pub const App = struct {
     workers_ai_token: []const u8 = "",
     retention_days: u32 = 14,
     production: bool = false,
+    // SERVER-SET DEFAULT MODEL. The host configures one model + endpoint (NL_DEFAULT_MODEL /
+    // NL_DEFAULT_BASE_URL) that web users fall back to, so somebody who knows nothing about models can
+    // just start typing. A user's own choice always wins; this only fills a BLANK. The key is never part
+    // of it — that resolves server-side from the user's vault, so a default can never leak a credential
+    // to a browser.
+    default_model: []const u8 = "",
+    default_base_url: []const u8 = "",
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
     // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all
@@ -48,10 +55,26 @@ pub fn metered(app: *App, u: User) bool {
 }
 
 pub fn requireUser(app: *App, req: *httpz.Request, res: *httpz.Response) ?User {
-    if (sessionToken(req)) |tok| if (app.auth.whoami(tok)) |u| return u;
-    if (app.keys) |ks| if (apiKeyFromReq(req)) |k| if (ks.verify(k)) |uid| if (app.auth.userById(uid)) |u| return u;
+    // BANNED IS CHECKED HERE, on BOTH paths. setBanned drops the user's sessions, which closed the
+    // cookie door — but an API key is verified straight against the key store and userById returns the
+    // record regardless of `banned`, so a banned account holding an nlk_ key kept full access and ban
+    // was not actually a moderation primitive. Login already refuses a banned user (auth_core:172);
+    // this is the same refusal for a request that arrives already holding a credential.
+    if (sessionToken(req)) |tok| if (app.auth.whoami(tok)) |u| {
+        if (u.banned) { forbidden(res, "this account is suspended") catch {}; return null; }
+        return u;
+    };
+    if (app.keys) |ks| if (apiKeyFromReq(req)) |k| if (ks.verify(k)) |uid| if (app.auth.userById(uid)) |u| {
+        if (u.banned) { forbidden(res, "this account is suspended") catch {}; return null; }
+        return u;
+    };
     unauth(res) catch {};
     return null;
+}
+
+fn forbidden(res: *httpz.Response, msg: []const u8) !void {
+    res.status = 403;
+    try res.json(.{ .ok = false, .err = msg }, .{});
 }
 
 pub fn apiKeyFromReq(req: *httpz.Request) ?[]const u8 {

@@ -25,6 +25,7 @@ const S = {
   models: null,         // parsed models.json — the shared catalog
   localModels: null,    // {installed:[…]} from this machine's Ollama, or null if unreachable
   keys: [],             // provider keys on file (never the key itself)
+  serverDefault: { model: '', base_url: '' },  // what the host configured for users who pick nothing
   // chat
   convs: [],
   conv: null,           // active conversation id
@@ -153,6 +154,11 @@ const api = {
   control:  (id, b) => jpost('/api/v1/chat/convs/' + encodeURIComponent(id) + '/control', b),
   sched:    ()      => jget('/api/v1/sched'),
   swarms:   ()      => jget('/api/v1/swarms'),
+  convFiles:(id)    => jget('/api/v1/chat/convs/' + encodeURIComponent(id) + '/files'),
+  adminUsers:  ()   => jget('/api/v1/admin/users'),
+  adminActivity:(uid) => jget('/api/v1/admin/users/' + encodeURIComponent(uid) + '/activity'),
+  adminCreate: (e,p) => jpost('/api/v1/admin/users', { email: e, password: p }),
+  adminModerate:(e,a) => jpost('/api/v1/admin/users/moderate', { email: e, action: a }),
 };
 
 /* ============================================================ theme */
@@ -188,6 +194,7 @@ async function boot() {
   try {
     const me = await api.me();
     S.openReg = !!me.open_registration;
+    S.serverDefault = { model: me.default_model || '', base_url: me.default_base_url || '' };
     if (me.authed) return enterApp(me);
   } catch (e) { /* the server is not up yet */ }
   renderAuth();
@@ -290,6 +297,7 @@ const TABS = [
   { id: 'chat',      label: 'Chat',      icon: 'M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.9-.9L3 21l1.9-4.6A8.4 8.4 0 0 1 4 11.5a8.5 8.5 0 0 1 17 0z' },
   { id: 'tasks',     label: 'Tasks',     icon: 'M12 8v4l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z' },
   { id: 'swarms',    label: 'Swarms',    icon: 'M12 3v4M12 17v4M3 12h4M17 12h4M7.8 7.8l2.8 2.8M13.4 13.4l2.8 2.8M16.2 7.8l-2.8 2.8M10.6 13.4l-2.8 2.8' },
+  { id: 'admin',     label: 'Admin',     adminOnly: true, icon: 'M12 2l7 4v6c0 4.4-3 8.3-7 10-4-1.7-7-5.6-7-10V6l7-4zM9 12l2 2 4-4' },
   { id: 'settings',  label: 'Settings',  icon: 'M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM4.3 14.6l-1.6 1 1.9 3.3 1.8-.7a7 7 0 0 0 1.9 1.1l.3 1.9h3.8l.3-1.9a7 7 0 0 0 1.9-1.1l1.8.7 1.9-3.3-1.6-1a7 7 0 0 0 0-2.2l1.6-1-1.9-3.3-1.8.7a7 7 0 0 0-1.9-1.1L12.4 2H8.6l-.3 1.9a7 7 0 0 0-1.9 1.1l-1.8-.7-1.9 3.3 1.6 1a7 7 0 0 0 0 2.2z' },
 ];
 
@@ -304,7 +312,7 @@ function enterApp(user) {
   S.me = user;
   S.isAdmin = !!user.admin;
   S.tab = LS.get('veil.tab', 'chat');
-  if (!TABS.some((t) => t.id === S.tab)) S.tab = 'chat';
+  if (!visibleTabs().some((t) => t.id === S.tab)) S.tab = 'chat';
 
   el('app').innerHTML = `
     <header class="topbar">
@@ -318,13 +326,13 @@ function enterApp(user) {
     </header>
 
     <nav class="tabbar" role="tablist">
-      ${TABS.map((t) => `<button class="tab" role="tab" data-tab="${t.id}">${t.label}</button>`).join('')}
+      ${visibleTabs().map((t) => `<button class="tab" role="tab" data-tab="${t.id}">${t.label}</button>`).join('')}
     </nav>
 
     <main class="view" id="view"></main>
 
     <nav class="mobilenav">
-      ${TABS.map((t) => `<button data-tab="${t.id}" aria-label="${t.label}">
+      ${visibleTabs().map((t) => `<button data-tab="${t.id}" aria-label="${t.label}">
         <svg viewBox="0 0 24 24"><path d="${t.icon}"/></svg>${t.label}</button>`).join('')}
     </nav>`;
 
@@ -340,6 +348,13 @@ function enterApp(user) {
   setInterval(pollHealth, 8000);
 }
 
+/** Tabs this account may actually use. The Admin tab is not merely hidden — every
+    route behind it is admin-gated server-side, so hiding it is presentation, not
+    the security boundary. */
+function visibleTabs() {
+  return TABS.filter((t) => !t.adminOnly || S.isAdmin);
+}
+
 function setTab(id) {
   S.tab = id;
   LS.set('veil.tab', id);
@@ -352,6 +367,7 @@ function setTab(id) {
   if (id === 'chat')      return renderChat(v);
   if (id === 'tasks')     return renderTasks(v);
   if (id === 'swarms')    return renderSwarms(v);
+  if (id === 'admin')     return renderAdmin(v);
   if (id === 'settings')  return renderSettings(v);
 }
 
@@ -444,7 +460,12 @@ function renderChat(host) {
   host.innerHTML = `
     <div class="chat" id="chatRoot">
       <aside class="chat-list">
-        <div class="chat-list-head"><button class="btn btn-solid btn-sm grow" id="newConv">+ New chat</button></div>
+        <div class="chat-list-head">
+          <button class="btn btn-solid btn-sm grow" id="newConv">+ New chat</button>
+          <button class="icon-btn rail-toggle" id="railToggle" title="Collapse the list" aria-label="Collapse the conversation list">
+            <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
+          </button>
+        </div>
         <div class="scroller" id="convScroll"><div class="empty">loading…</div></div>
       </aside>
 
@@ -454,12 +475,16 @@ function renderChat(host) {
             <svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg>
           </button>
           <div class="grow mono ellip" id="convTitle">—</div>
+          <button class="icon-btn" id="filesBtn" title="Files this conversation built" aria-label="Files">
+            <svg viewBox="0 0 24 24"><path d="M4 6a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/></svg>
+          </button>
           <button class="icon-btn" id="delConv" title="Delete conversation" aria-label="Delete conversation">
             <svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6"/></svg>
           </button>
         </div>
 
         <div class="scroller transcript" id="transcript"><div class="empty">pick a conversation, or start a new one</div></div>
+        <div class="files-pane hide" id="filesPane"></div>
 
         <div class="composer" id="composer">
           <div class="composer-chips hide" id="chips"></div>
@@ -484,6 +509,9 @@ function renderChat(host) {
   el('newConv').addEventListener('click', () => openConv(newConvId(), true));
   el('backBtn').addEventListener('click', () => el('chatRoot').classList.remove('on-thread'));
   el('delConv').addEventListener('click', deleteActiveConv);
+  el('filesBtn').addEventListener('click', toggleFiles);
+  el('railToggle').addEventListener('click', toggleRail);
+  if (LS.get('veil.railCollapsed', '0') === '1') el('chatRoot').classList.add('rail-collapsed');
   el('sendBtn').addEventListener('click', sendTurn);
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
   el('attachBtn').addEventListener('click', () => el('fileInput').click());
@@ -645,6 +673,65 @@ async function deleteActiveConv() {
 
 function resetStream() {
   S.stream = { text: '', shown: 0, reasoning: '', tools: [], status: '', started: 0 };
+}
+
+/* ---------------- what the turn built ----------------
+   The desk browses the build tree straight off disk. A browser cannot, so
+   without these routes a web user had nowhere to look: the AI would report
+   having built something and there was no way to see it. */
+
+function toggleRail() {
+  const root = el('chatRoot');
+  const collapsed = root.classList.toggle('rail-collapsed');
+  LS.set('veil.railCollapsed', collapsed ? '1' : '0');
+  const b = el('railToggle');
+  if (b) b.title = collapsed ? 'Show the list' : 'Collapse the list';
+}
+
+async function toggleFiles() {
+  const pane = el('filesPane');
+  if (!pane) return;
+  if (!pane.classList.contains('hide')) { pane.classList.add('hide'); return; }
+  if (!S.conv) return toast('No conversation', 'Open one first.', 'err');
+  pane.classList.remove('hide');
+  pane.innerHTML = '<div class="files-head"><b>Files</b><span class="muted">reading…</span></div>';
+  try {
+    const j = await api.convFiles(S.conv);
+    const files = j.files || [];
+    pane.innerHTML = '<div class="files-head"><b>Files</b>'
+      + '<span class="muted">'
+      + (files.length ? files.length + ' file' + (files.length === 1 ? '' : 's') + ' · ' + fmtBytes(j.bytes || 0) : 'nothing built yet')
+      + (j.truncated ? ' · first ' + files.length + ' shown' : '')
+      + '</span></div>'
+      + (files.length ? '<div class="files-list">' + files.map((f) =>
+          '<button class="file-row" data-file="' + esc(f.path) + '">'
+          + '<span class="ellip mono">' + esc(f.path) + '</span>'
+          + '<span class="muted">' + fmtBytes(f.size || 0) + '</span></button>').join('') + '</div>'
+        : '');
+    $$('[data-file]', pane).forEach((b) => b.addEventListener('click', () => openConvFile(b.dataset.file)));
+  } catch (e) {
+    pane.innerHTML = '<div class="files-head"><b>Files</b><span class="muted">' + esc(e.message) + '</span></div>';
+  }
+}
+
+async function openConvFile(path) {
+  try {
+    const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/file?path=' + encodeURIComponent(path));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const text = await r.text();
+    const pane = el('filesPane');
+    // Rendered through the SAME markdown/highlight path the transcript uses, as
+    // a fenced block named by the file's extension — one renderer, one look, and
+    // the escaping is already proven there.
+    const ext = (path.split('.').pop() || '').toLowerCase();
+    pane.innerHTML = '<div class="files-head"><b class="ellip mono">' + esc(path) + '</b>'
+      + '<button class="linkbtn" id="filesBack">back</button></div>'
+      + '<div class="files-view msg-body">' + mdRender('```' + ext + '\n' + text + '\n```') + '</div>';
+    wireCodeCopy(pane);
+    el('filesBack').addEventListener('click', () => { pane.classList.add('hide'); toggleFiles(); });
+  } catch (e) {
+    toast('Could not open the file', e.message, 'err');
+  }
 }
 
 /* ---------------- transcript ----------------
@@ -1331,6 +1418,152 @@ async function delSwarm(id) {
   } catch (e) { toast('Could not delete', e.message, 'err'); }
 }
 
+/* ============================================================ admin console
+   Every route behind this tab is admin-gated server-side; hiding the tab is
+   presentation, not the security boundary.
+
+   Deliberately METADATA ONLY. It reports what an account is DOING — swarms,
+   conversation ids and sizes, state — and never what it SAID. A conversation's
+   event stream carries shell output, fetched pages and file contents, so a
+   transcript viewer here would be a keylogger over everything that user's AI
+   touched. Moderation does not require reading someone's mail. */
+
+async function renderAdmin(host) {
+  host.innerHTML = `
+    <div class="scroller"><div class="pad">
+      <div class="section-head">
+        <h2>Users</h2>
+        <button class="btn btn-solid btn-sm" id="newUser">+ New user</button>
+      </div>
+      <div id="newUserForm" class="hide"></div>
+      <div id="userList"><div class="empty">loading…</div></div>
+      <div id="userDetail"></div>
+    </div></div>`;
+  el('newUser').addEventListener('click', showNewUserForm);
+  await refreshUsers();
+}
+
+function showNewUserForm() {
+  const f = el('newUserForm');
+  f.classList.remove('hide');
+  f.innerHTML = `<div class="panel task-form">
+    <div class="muted" style="margin-bottom:10px">
+      Registration is closed on most installs, so this is how an account gets made. Hand the password
+      over out of band — it is not shown again.
+    </div>
+    <div class="field-row">
+      <div class="field"><label for="nuEmail">Email</label>
+        <input id="nuEmail" type="email" autocapitalize="none" spellcheck="false"></div>
+      <div class="field"><label for="nuPass">Password (8+ characters)</label>
+        <input id="nuPass" type="password" autocomplete="new-password"></div>
+    </div>
+    <div class="row">
+      <button class="btn btn-solid" id="nuSave">Create account</button>
+      <button class="btn btn-ghost" id="nuCancel">Cancel</button>
+    </div>
+  </div>`;
+  el('nuCancel').addEventListener('click', () => { f.classList.add('hide'); f.innerHTML = ''; });
+  el('nuSave').addEventListener('click', createUser);
+}
+
+async function createUser() {
+  const email = el('nuEmail').value.trim();
+  const pass = el('nuPass').value;
+  if (!email || !pass) return toast('Missing fields', 'Both an email and a password are required.', 'err');
+  try {
+    await api.adminCreate(email, pass);
+    toast('Account created', email, 'ok');
+    el('newUserForm').classList.add('hide');
+    el('newUserForm').innerHTML = '';
+    refreshUsers();
+  } catch (e) {
+    toast('Could not create the account', e.message, 'err');
+  } finally {
+    const p = el('nuPass');
+    if (p) p.value = '';   // the password does not linger in the DOM, on either path
+  }
+}
+
+async function refreshUsers() {
+  const host = el('userList');
+  if (!host) return;
+  let users;
+  try {
+    const j = await api.adminUsers();
+    users = j.users || [];
+  } catch (e) {
+    host.innerHTML = `<div class="empty">could not load users — ${esc(e.message)}</div>`;
+    return;
+  }
+  host.innerHTML = `<div class="table-wrap"><table class="data">
+    <thead><tr><th>account</th><th>plan</th><th class="num">swarms</th><th class="num">minds</th><th>state</th><th></th></tr></thead>
+    <tbody>${users.map((u) => `<tr>
+      <td><button class="linkbtn" data-user-open="${esc(String(u.id))}">${esc(u.email)}</button></td>
+      <td>${esc(u.plan || 'free')}</td>
+      <td class="num">${u.swarms || 0}</td>
+      <td class="num">${u.live_minds || 0}</td>
+      <td>${u.banned ? '<span class="pill">suspended</span>' : '<span class="pill on">active</span>'}</td>
+      <td class="row-actions">
+        <button class="btn btn-sm btn-ghost" data-user-mod="${esc(u.email)}" data-act="${u.banned ? 'unban' : 'ban'}">${u.banned ? 'Restore' : 'Suspend'}</button>
+        <button class="btn btn-sm btn-danger" data-user-mod="${esc(u.email)}" data-act="delete">Delete</button>
+      </td>
+    </tr>`).join('')}</tbody></table></div>`;
+
+  $$('[data-user-open]', host).forEach((b) => b.addEventListener('click', () => showUserActivity(b.dataset.userOpen)));
+  $$('[data-user-mod]', host).forEach((b) => b.addEventListener('click', () => moderate(b.dataset.userMod, b.dataset.act)));
+}
+
+async function moderate(email, action) {
+  const verb = action === 'delete' ? 'Delete' : (action === 'ban' ? 'Suspend' : 'Restore');
+  if (!confirm(verb + ' ' + email + '?' + (action === 'delete' ? '\nThis cannot be undone.' : ''))) return;
+  try {
+    await api.adminModerate(email, action);
+    toast(verb + 'd', email, 'ok');
+    refreshUsers();
+    el('userDetail').innerHTML = '';
+  } catch (e) {
+    toast('Could not ' + verb.toLowerCase(), e.message, 'err');
+  }
+}
+
+async function showUserActivity(uid) {
+  const host = el('userDetail');
+  host.innerHTML = '<div class="empty">reading activity…</div>';
+  let a;
+  try {
+    a = await api.adminActivity(uid);
+  } catch (e) {
+    host.innerHTML = `<div class="empty">could not read activity — ${esc(e.message)}</div>`;
+    return;
+  }
+  const convs = a.convs || [];
+  host.innerHTML = `
+    <div class="section-head"><h2>${esc(a.email)}</h2>
+      <button class="btn btn-sm btn-ghost" id="closeDetail">Close</button></div>
+    <div class="stat-grid">
+      <div class="stat"><b>${a.swarms || 0}</b><span>swarms</span></div>
+      <div class="stat"><b>${a.live_minds || 0}</b><span>live minds</span></div>
+      <div class="stat"><b>${convs.length}</b><span>conversations</span></div>
+      <div class="stat ${a.banned ? 'bad' : 'good'}"><b>${a.banned ? 'suspended' : 'active'}</b><span>state</span></div>
+    </div>
+    <div class="panel set-panel">
+      <div class="muted" style="margin-bottom:8px">
+        Conversation metadata only — ids and sizes. Message content is not readable from here, by design.
+      </div>
+      ${convs.length ? `<div class="table-wrap"><table class="data">
+        <thead><tr><th>conversation</th><th class="num">size</th></tr></thead>
+        <tbody>${convs.map((c) => `<tr><td class="mono">${esc(c.id)}</td><td class="num">${fmtBytes(c.bytes || 0)}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<div class="muted">no conversations</div>'}
+    </div>`;
+  el('closeDetail').addEventListener('click', () => { host.innerHTML = ''; });
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
 /* ============================================================ settings */
 
 const ROLES = [
@@ -1361,6 +1594,14 @@ function renderSettings(host) {
 
       <div class="section-head"><h2>Models</h2></div>
       <div class="panel set-panel">
+        ${S.serverDefault && S.serverDefault.model ? `
+        <div class="set-row">
+          <div><b>Server default</b>
+            <div class="muted">This server is configured with <span class="mono">${esc(S.serverDefault.model)}</span>.
+              Leave both fields below empty to use it — you do not need to choose a model at all.</div>
+          </div>
+          <button class="btn btn-sm btn-ghost" id="useDefault">Use it</button>
+        </div>` : ''}
         <div class="set-row">
           <div><b>One model for everything</b><div class="muted">Off = point coding, thinking and prompting at different models.</div></div>
           <input type="checkbox" id="setOne" class="w-auto" ${st.oneModel ? 'checked' : ''}>
@@ -1428,6 +1669,15 @@ function renderSettings(host) {
   el('setLoop').addEventListener('change', (e) => { S.settings.loop = parseInt(e.target.value, 10) || 0; saveSettings(); });
   el('setOut').addEventListener('click', async () => { try { await api.logout(); } catch (e) {} onSignedOut(); });
   el('kAdd').addEventListener('click', addProviderKey);
+  if (el('useDefault')) el('useDefault').addEventListener('click', () => {
+    // Clearing BOTH is what selects the server default — the server only applies
+    // it when the pair is blank, so half-clearing would silently do nothing.
+    S.settings.model = '';
+    S.settings.base_url = '';
+    saveSettings();
+    drawRolePanels();
+    toast('Using the server default', S.serverDefault.model, 'ok');
+  });
   el('kKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addProviderKey(); } });
 
   drawRolePanels();
