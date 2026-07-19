@@ -209,6 +209,45 @@ pub const Auth = struct {
         self.users.put(self.gpa, u.email, u) catch return AuthError.WeakInput;
     }
 
+    /// Set the password on an account that ALREADY EXISTS.
+    ///
+    /// There was no such path, and its absence was load-bearing in the wrong direction: seedDefaultAdmin
+    /// calls register, register returns EmailTaken for an existing account, and the caller returns — so
+    /// any password handed to it after the first boot was silently discarded. A caller that then told
+    /// the user "your password is X" was lying, and the account kept whatever it had, up to and
+    /// including the published default. Rotation needs to be expressible for that to be fixable.
+    ///
+    /// Sessions are dropped on success: a password change that leaves existing sessions live has not
+    /// really changed anything for whoever is already holding one.
+    pub fn setPassword(self: *Auth, email: []const u8, password: []const u8) bool {
+        if (password.len < 8 or password.len > 200) return false;
+        self.mu.lockUncancelable(self.nb.io);
+        var u = self.users.get(email) orelse {
+            self.mu.unlock(self.nb.io);
+            return false;
+        };
+        var hbuf: [128]u8 = undefined;
+        const phc = std.crypto.pwhash.argon2.strHash(password, .{
+            .allocator = self.gpa,
+            .params = .{ .t = 2, .m = 19456, .p = 1 },
+            .mode = .argon2id,
+        }, &hbuf, self.nb.io) catch {
+            self.mu.unlock(self.nb.io);
+            return false;
+        };
+        const dup = self.gpa.dupe(u8, phc) catch {
+            self.mu.unlock(self.nb.io);
+            return false;
+        };
+        self.gpa.free(u.pwhash);
+        u.pwhash = dup;
+        self.persistUser(u) catch {};
+        self.users.put(self.gpa, u.email, u) catch {};
+        self.mu.unlock(self.nb.io);
+        self.dropSessions(email);
+        return true;
+    }
+
     pub fn login(self: *Auth, email: []const u8, password: []const u8) AuthError![]u8 {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);

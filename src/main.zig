@@ -420,24 +420,57 @@ pub fn main(init: std.process.Init) !void {
     else
         true;
     var apw_buf: [48]u8 = undefined;
+    var apw_generated = false;
     const admin_pw: ?[]const u8 = init.environ_map.get("NL_ADMIN_PASSWORD") orelse blk: {
         if (!bind_all) break :blk null;
-        // REACHABLE + no password set. The shipped default is "changeme", and this program runs
-        // arbitrary code as the user who started it — so a known password on a box that answers the
-        // whole subnet is a full host compromise by anyone on the same wifi. Generate one instead.
-        // It is written to the data dir as well as logged, because "shown once in a console that
-        // already scrolled" is indistinguishable from being locked out.
+        // REACHABLE + no password chosen. The shipped default is "changeme", published in the README,
+        // and this program runs arbitrary code as the user who started it — so a known password on a
+        // box answering the whole subnet is a full host compromise by anyone on the same wifi.
+        //
+        // REUSE what we generated last time before minting anything. Generating unconditionally meant a
+        // fresh secret every boot while seedDefaultAdmin quietly discarded it (register returns
+        // EmailTaken for an existing account and the caller returns), so from boot 2 the recorded
+        // password was never the real one — and on an upgraded install the real one was still
+        // "changeme" while the file said otherwise. Reassuring and wrong beats loud and right only in
+        // the sense that nobody notices.
+        if (readAdminPassword(io, paths.data, &apw_buf)) |saved| break :blk saved;
         var raw: [24]u8 = undefined;
         io.random(&raw);
         const hx = std.fmt.bytesToHex(raw, .lower);
         @memcpy(apw_buf[0..hx.len], &hx);
-        writeAdminPassword(gpa, io, paths.data, apw_buf[0..hx.len]);
-        log.warn("*** no NL_ADMIN_PASSWORD set and this server is reachable on the network.\n" ++
-            "*** Generated admin password: {s}\n" ++
-            "*** Also saved to {s}/admin-password.txt — set NL_ADMIN_PASSWORD to pin your own.", .{ apw_buf[0..hx.len], paths.data });
+        apw_generated = true;
         break :blk apw_buf[0..hx.len];
     };
     auth.seedDefaultAdmin(admin_pw);
+
+    // MAKE IT TRUE, then record it. seedDefaultAdmin only CREATES; against an existing account it
+    // returns having changed nothing. So prove the password actually works, rotate it if not, and only
+    // then write it down — a file that states a password which was never applied is worse than no file,
+    // because the reader stops looking for the real problem.
+    if (admin_pw) |pw| {
+        if (init.environ_map.get("NL_ADMIN_PASSWORD") == null) {
+            const email = init.environ_map.get("NL_ADMIN_EMAIL") orelse DEFAULT_ADMIN_EMAIL;
+            var in_force = false;
+            if (auth.login(email, pw)) |tok| {
+                gpa.free(tok);
+                in_force = true;
+            } else |_| {
+                // Not in force: either an account that predates this (still on the shipped default) or
+                // a data dir whose recorded password no longer matches. Rotate it.
+                in_force = auth.setPassword(email, pw);
+                if (in_force) apw_generated = true; // changed → the user needs to be told again
+            }
+            if (!in_force) {
+                log.err("could not set an admin password on {s} — it may still be the shipped default. Set NL_ADMIN_PASSWORD.", .{email});
+            } else if (apw_generated) {
+                writeAdminPassword(gpa, io, paths.data, pw);
+                log.warn("*** no NL_ADMIN_PASSWORD set and this server is reachable on the network.\n" ++
+                    "*** Admin password: {s}\n" ++
+                    "*** Saved to {s}/admin-password.txt — set NL_ADMIN_PASSWORD to pin your own.", .{ pw, paths.data });
+            }
+        }
+    }
+
     var sup = Supervisor.init(gpa, io, paths.neuron_bin);
     sup.server_key = crypto.deriveServerKey(gpa, io, init.environ_map, paths.data);
     sup.parent_env = init.environ_map;
@@ -706,6 +739,27 @@ fn writeAdminPassword(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, 
         "Generated because NL_ADMIN_PASSWORD was not set and this server is reachable\n" ++
         "on the network. Set NL_ADMIN_PASSWORD to choose your own.\n", .{pw}) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
+}
+
+/// Read back a password this server generated earlier, so a restart does not mint a new one and
+/// invalidate what the user wrote down. Returns null when the file is absent or does not look like a
+/// password line we wrote.
+fn readAdminPassword(io: std.Io, data_dir: []const u8, out: *[48]u8) ?[]const u8 {
+    var pb: [700]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir}) catch return null;
+    var buf: [512]u8 = undefined;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(buf.len)) catch return null;
+    defer std.heap.page_allocator.free(data);
+    const n = data.len;
+    @memcpy(buf[0..n], data);
+    const tag = "admin password: ";
+    const at = std.mem.indexOf(u8, buf[0..n], tag) orelse return null;
+    var rest = buf[at + tag.len .. n];
+    if (std.mem.indexOfAny(u8, rest, "\r\n")) |e| rest = rest[0..e];
+    const pw = std.mem.trim(u8, rest, " \t");
+    if (pw.len < 8 or pw.len > out.len) return null;
+    @memcpy(out[0..pw.len], pw);
+    return out[0..pw.len];
 }
 
 fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8, admin_pw: ?[]const u8) void {
