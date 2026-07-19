@@ -26,6 +26,30 @@ pub fn adminUsers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.body = try res.arena.dupe(u8, arr.items);
 }
 
+const ConfigReq = struct { default_model: []const u8 = "", default_base_url: []const u8 = "" };
+
+/// GET /api/v1/admin/config — the settings this server's admin owns.
+pub fn adminGetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = requireAdmin(app, req, res) orelse return;
+    const sd = app.cfg.defaults(res.arena);
+    try res.json(.{ .ok = true, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
+}
+
+/// POST /api/v1/admin/config — set them, live. No restart: the value is swapped under a mutex and
+/// every turn after this one reads the new one. Sending an empty model CLEARS the default, which is
+/// the only way to go back to "everyone picks their own" and so is deliberately expressible.
+pub fn adminSetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const body = (try req.json(ConfigReq)) orelse return badReq(res, "bad body");
+    app.cfg.set(body.default_model, body.default_base_url) catch |e| return switch (e) {
+        error.TooLong => badReq(res, "that model id or base URL is too long"),
+        error.BadInput => badReq(res, "model id and base URL must not contain quotes or control characters"),
+    };
+    app.audit.record(admin.email, "set_default_model", body.default_model);
+    const sd = app.cfg.defaults(res.arena);
+    try res.json(.{ .ok = true, .default_model = sd.model, .default_base_url = sd.base_url }, .{});
+}
+
 const NewUserReq = struct { email: []const u8, password: []const u8 };
 
 /// POST /api/v1/admin/users — mint an account as the admin.

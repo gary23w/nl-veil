@@ -332,9 +332,10 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // the user happened to type (or vice versa) is a combination nobody chose, and it fails as a 404
     // that reads like a broken model. Only the coding role is defaulted; thinking/prompting already
     // fall back to coding inside ModelTrio.pick.
-    const use_default = b.model.len == 0 and b.base_url.len == 0 and app.default_model.len > 0;
-    const c_model = if (use_default) app.default_model else b.model;
-    const c_base = if (use_default) app.default_base_url else b.base_url;
+    const sd = app.cfg.defaults(res.arena);
+    const use_default = b.model.len == 0 and b.base_url.len == 0 and sd.model.len > 0;
+    const c_model = if (use_default) sd.model else b.model;
+    const c_base = if (use_default) sd.base_url else b.base_url;
 
     const cc = resolveRole(app, u.id, res.arena, c_base, c_model, b.api_key);
     const eff_base = cc.base;

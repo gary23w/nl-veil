@@ -12,6 +12,7 @@ pub const LoginGuard = @import("../auth/login_guard.zig").LoginGuard;
 pub const KeyVault = @import("../config/key_vault.zig").KeyVault;
 pub const NeuronLedger = @import("../plan/neurons.zig").NeuronLedger;
 pub const ApiKeys = @import("../auth/api_keys.zig").ApiKeys;
+pub const ServerConfig = @import("../config/server_config.zig").ServerConfig;
 
 pub const COOKIE = "nl_sess";
 
@@ -30,13 +31,10 @@ pub const App = struct {
     workers_ai_token: []const u8 = "",
     retention_days: u32 = 14,
     production: bool = false,
-    // SERVER-SET DEFAULT MODEL. The host configures one model + endpoint (NL_DEFAULT_MODEL /
-    // NL_DEFAULT_BASE_URL) that web users fall back to, so somebody who knows nothing about models can
-    // just start typing. A user's own choice always wins; this only fills a BLANK. The key is never part
-    // of it — that resolves server-side from the user's vault, so a default can never leak a credential
-    // to a browser.
-    default_model: []const u8 = "",
-    default_base_url: []const u8 = "",
+    // SERVER-SET DEFAULT MODEL, and anything else the admin owns at runtime. Live, mutex-guarded and
+    // persisted — see config/server_config.zig. It used to be two frozen strings read from the
+    // environment at boot, which meant a restart to change a dropdown's worth of state.
+    cfg: *ServerConfig,
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
     // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all

@@ -404,6 +404,11 @@ refuses the default and prints a generated password once.
 
 ### Everyone else is sandboxed
 
+**Set the default model in the Admin tab.** Pick it from the same catalog the Settings tab uses; it
+applies immediately, with no restart, to everyone who has not chosen their own. The API key is never
+part of it — each account still supplies its own, sealed server-side. Without a default, a brand-new
+account has to configure a model before it can chat at all.
+
 The web app is multi-user, and **a normal account is not trusted with the host**. Its turns run a
 restricted tool surface: the conversation's own workspace, research, and the *entire* hive-memory
 surface — but no code execution, no host commands, no engine self-modification, no tool authoring, no
@@ -413,7 +418,7 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 
 | variable | what it does |
 |---|---|
-| `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | one model every web user falls back to, so nobody has to configure anything to start. A user's own choice still wins, and the API key is never part of it — that resolves server-side from their own sealed vault |
+| `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
 | `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
 | `NL_BROWSER_DRIVER` / `NL_MCP` | give **sandboxed** users the browser / local MCP servers too. Admins already have both; leave these unset unless you mean it — the browser inherits this machine's network position and its profile's cookies |
 

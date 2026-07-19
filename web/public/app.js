@@ -1576,6 +1576,9 @@ async function delSwarm(id) {
 async function renderAdmin(host) {
   host.innerHTML = `
     <div class="scroller"><div class="pad">
+      <div class="section-head"><h2>Default model</h2></div>
+      <div class="panel set-panel" id="cfgPanel"><div class="muted">loading…</div></div>
+
       <div class="section-head">
         <h2>Users</h2>
         <button class="btn btn-solid btn-sm" id="newUser">+ New user</button>
@@ -1585,7 +1588,74 @@ async function renderAdmin(host) {
       <div id="userDetail"></div>
     </div></div>`;
   el('newUser').addEventListener('click', showNewUserForm);
+  renderServerConfig();
   await refreshUsers();
+}
+
+/** The setting that decides whether a brand-new account can do anything at all
+    without configuring something first. A picker over the same catalog the
+    Settings tab uses — an admin should not have to know that
+    "@cf/meta/llama-3.3-70b-instruct-fp8-fast" is spelled exactly that way. */
+async function renderServerConfig() {
+  const host = el('cfgPanel');
+  if (!host) return;
+  let cur = { default_model: '', default_base_url: '' };
+  try {
+    cur = await jget('/api/v1/admin/config');
+  } catch (e) {
+    host.innerHTML = '<div class="muted">could not read the configuration — ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (!S.models) await loadModels();
+
+  host.innerHTML = `
+    <div class="muted" style="margin-bottom:10px">
+      Everyone who has not chosen their own model uses this. It applies immediately — no restart — and
+      the API key is never part of it: each account still supplies its own, sealed server-side.
+    </div>
+    <div class="field">
+      <label for="cfgModel">Model</label>
+      <select id="cfgModel">${catalogOptions(cur.default_model)}</select>
+    </div>
+    <div class="field-row">
+      <div class="field"><label for="cfgId">Model id</label>
+        <input id="cfgId" type="text" value="${esc(cur.default_model || '')}" placeholder="none — users choose their own"></div>
+      <div class="field"><label for="cfgBase">Base URL</label>
+        <input id="cfgBase" type="text" value="${esc(cur.default_base_url || '')}" placeholder="https://…"></div>
+    </div>
+    <div class="row">
+      <button class="btn btn-solid btn-sm" id="cfgSave">Save</button>
+      <button class="btn btn-sm btn-ghost" id="cfgClear">Clear</button>
+      <span class="muted" id="cfgState">${cur.default_model
+        ? 'currently <b>' + esc(cur.default_model) + '</b>'
+        : 'no default — every user must pick a model before they can chat'}</span>
+    </div>`;
+
+  el('cfgModel').addEventListener('change', () => {
+    const m = modelById(el('cfgModel').value);
+    el('cfgId').value = el('cfgModel').value;
+    // Fill the endpoint from the catalog too: a right model id against the wrong
+    // base is the most common way to get a 404 that reads like a model problem.
+    if (m) el('cfgBase').value = providerBase(m.provider);
+  });
+  el('cfgSave').addEventListener('click', () => saveServerConfig(el('cfgId').value.trim(), el('cfgBase').value.trim()));
+  el('cfgClear').addEventListener('click', () => saveServerConfig('', ''));
+}
+
+async function saveServerConfig(model, base) {
+  try {
+    await jpost('/api/v1/admin/config', { default_model: model, default_base_url: base });
+    toast(model ? 'Default model set' : 'Default cleared', model || 'users now choose their own', 'ok');
+    // /auth/me carries this to every client, so refresh our own copy rather than
+    // displaying a value only this tab believes in.
+    try {
+      const me = await api.me();
+      S.serverDefault = { model: me.default_model || '', base_url: me.default_base_url || '' };
+    } catch (e) {}
+    renderServerConfig();
+  } catch (e) {
+    toast('Could not save', e.message, 'err');
+  }
 }
 
 function showNewUserForm() {
