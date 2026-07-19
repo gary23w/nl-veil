@@ -6,6 +6,7 @@ test {
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/server_config.zig");
+    _ = @import("config/lan.zig");
     _ = @import("worker/agi.zig");
     _ = @import("worker/browser/manager.zig");
     _ = @import("worker/bufedit.zig");
