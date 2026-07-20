@@ -905,6 +905,69 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .role-title { font-weight: 650; font-size: calc(var(--fs-ui) * var(--text-scale)); margin-bottom: 8px; }
 .role-title .muted { font-weight: 400; }
 
+/* ---------------- the trio explainer ----------------
+   A native <details>. The summary is focusable and Enter/Space toggles it, so there
+   is no JS here and nothing that can trap focus; :focus-visible is styled explicitly
+   because the default outline is easy to lose against a tonal row.
+
+   The disclosure triangle is drawn with borders rather than typed as a character:
+   list-style:none on a flex summary drops the built-in marker in every engine, and a
+   glyph would depend on a font the user may not have. Every colour is a semantic
+   alias, so light and dark both follow the palette with no theme-specific rule.
+   Layout is single-column and flows, so it survives a phone and a 1.25 text scale. */
+.trio-help { border-top: 1px solid var(--border); padding: 2px 0 6px; }
+.trio-help > summary {
+  display: flex; align-items: center; gap: 7px;
+  padding: 9px 2px;
+  border-radius: var(--radius);
+  cursor: pointer;
+  list-style: none;
+  color: var(--text-secondary);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  font-weight: 600;
+}
+.trio-help > summary::-webkit-details-marker { display: none; }
+.trio-help > summary::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 0; height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 120ms ease;
+}
+.trio-help[open] > summary::before { transform: rotate(90deg); }
+.trio-help > summary:hover { color: var(--text); }
+.trio-help > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.trio-help-body {
+  padding: 2px 2px 6px;
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+.trio-help-body p { margin: 9px 0; }
+.trio-help-body b { color: var(--text); font-weight: 650; }
+.trio-help-body h4 {
+  margin: 16px 0 4px;
+  font-size: calc(var(--fs-ui) * var(--text-scale));
+  font-weight: 650;
+  color: var(--text);
+}
+
+/* The fallback rule. Tonal, not loud — it is the reassurance that you do not have to
+   configure three models, and a warning colour would say the opposite. */
+.trio-note {
+  padding: 9px 11px;
+  background: var(--tonal);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  color: var(--text);
+}
+
+.trio-what { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 9px; }
+.trio-what li { padding-left: 11px; border-left: 2px solid var(--border); }
+
 .key-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
 .key-row:last-child { border-bottom: 0; }
 

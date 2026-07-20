@@ -2467,7 +2467,81 @@ const ROLES = [
 /** Where the money actually goes. MODELLED from request-body sizes after prefix-cache
     hits, not metered per account — so it is phrased as a rule of thumb, which is all
     it needs to be to steer the one decision it informs: go cheap on prompting. */
-const SPEND_HINT = 'Roughly 60% of billable input goes to coding, 20% to thinking, 15% to prompting.';
+const SPEND_HINT = 'Estimated: ~60% of billable input goes to coding, ~20% to thinking, ~15% to prompting. '
+  + 'Modelled from measured prompt sizes, not metered per account.';
+
+/** The long form of the same story, collapsed under the Models panel. Collapsed
+    because the single-model path needs none of it; present because splitting the
+    trio is otherwise a decision made blind — the role names alone do not tell you
+    that "thinking" is mostly transcript compression.
+
+    <details> is natively keyboard-reachable: the summary takes focus in tab order
+    and Enter/Space toggles it. No JS, no focus management, nothing to trap.
+
+    EVERY CLAIM HERE IS CHECKED AGAINST THE ENGINE — the label→role table in
+    chat/trio_routing_test.zig (EXPECTED), the fallback in engine.zig ModelTrio.pick
+    and Provider.isSet, and per-label prompt sizes measured from recorded request
+    bodies. The cache and size figures are measurements. The share-of-spend split is
+    MODELLED from those sizes, not metered, and says so where it appears: a number
+    presented as measured is a promise, and this page is where a wrong one costs
+    someone real money. No third-party model is named and no price is quoted —
+    both go stale, and a stale price in a settings page is just a lie with a
+    timestamp. */
+const TRIO_HELP = `
+<details class="trio-help">
+  <summary>How the three roles split one turn</summary>
+  <div class="trio-help-body">
+
+    <p class="trio-note"><b>A role you leave blank falls back twice: to this server's model for that
+      role if the admin published one, and to your coding model otherwise.</b>
+      The split is opt-in — one model for everything is a fully supported setup, and it
+      behaves exactly as it did before roles existed. But on a server you do not run, a
+      role you left blank may be running on the host's choice rather than yours. A role
+      only counts as set once it has both a model id and a base URL, so a half-filled
+      role falls back too rather than failing.</p>
+
+    <p>In the turn you just watched:</p>
+    <ul class="trio-what">
+      <li><b>Coding</b> — the reply that streamed onto the screen, and every tool call
+        inside it: the file reads, the edits, the commands. This is the agentic step,
+        and it runs once per step of the turn.</li>
+      <li><b>Thinking</b> — the parts you did not see. Before the work: breaking the task
+        into subtasks and writing the acceptance bar the result is checked against.
+        After it: critiquing the committed answer and appending a correction if one is
+        warranted. Throughout: compressing the working transcript when it outgrows the
+        context window, and rewriting the rolling conversation summary. Scheduled runs
+        also close with a one-sentence lesson for the next run.</li>
+      <li><b>Prompting</b> — one line per step of the auto-loop: what is the single next
+        concrete step, or DONE. It also rewrites a web search query before the search is
+        dispatched, and writes the recovery instruction when the loop is confirmed
+        stuck.</li>
+    </ul>
+
+    <h4>Choosing a model for each</h4>
+
+    <p><b>Coding</b> — the strongest model you are willing to run. It does the work and
+      it is the bulk of the spend (an estimated 60% of billable input). It is also where
+      the prompt cache pays: across 140 recorded turns just under half of all input
+      tokens were prefix-cache hits, and essentially all of them were coding calls. A
+      strong model in this slot costs meaningfully less in practice than its sticker
+      rate suggests. Wants a large context window and dependable tool calling.</p>
+
+    <p><b>Thinking</b> — where judgment lives, but the role is not uniform, and this is
+      the part worth reading twice. The planning call is tiny, around a kilobyte, and it
+      is the call that carries the judgment. Compaction and summarisation share this same
+      role and their prompts run thirty to forty times larger — and both are mechanical
+      text compression, which a modest model does about as well. So a premium model here
+      pays premium rates mostly to compress transcripts. If your tasks are long and need
+      real decomposition, that can be a fair trade; if they are short, a competent
+      mid-tier model is usually the better one. Wants sound reasoning and enough context
+      to hold a long transcript.</p>
+
+    <p><b>Prompting</b> — high volume, low judgment: small context, one short line of
+      output, many calls. The cheapest model that reliably follows a one-line instruction
+      without rambling is the right answer. There is no upside to spending here.</p>
+
+  </div>
+</details>`;
 
 function renderSettings(host) {
   const st = S.settings;
@@ -2504,6 +2578,7 @@ function renderSettings(host) {
             ${SPEND_HINT}</div></div>
           <input type="checkbox" id="setOne" class="w-auto" ${st.oneModel ? 'checked' : ''}>
         </div>
+        ${TRIO_HELP}
         <div id="rolePanels"></div>
       </div>
 

@@ -6541,6 +6541,31 @@ fn settingSection(x: f32, y: f32, colw: f32, title: [:0]const u8) f32 {
     return y + 34;
 }
 
+/// A multi-line HELP paragraph for the Settings page: '\n' hard-breaks each sentence onto its own line and the
+/// rest is greedy word-wrapped to `maxw` by the SAME wrapInto the multi-line text fields use — no second wrap
+/// implementation to keep in sync. Drawn in comment grey at size 11 like the one-line hints around it. Returns
+/// the y below the last line.
+///
+/// OVERFLOW SAFETY (why this exists at all): the one-line `t.text` hints elsewhere in this page are unclipped,
+/// so a sentence that outgrows the column just runs off the edge — and it outgrows it at the LARGE text-size
+/// settings long before it does at 1.0. wrapInto measures at size 13 while this draws at 11, so every line it
+/// emits is strictly NARROWER than the width it was fitted to. Any string passed here fits the column at every
+/// text size; the textClip is a belt-and-braces backstop, not the mechanism.
+fn helpPara(s: []const u8, x: f32, y_in: f32, maxw: f32) f32 {
+    // Generous line budget: nothing enforces a minimum window width, so a narrow window at the largest text
+    // size wraps the paragraph far harder than the 720px column suggests. wrapInto TRUNCATES rather than
+    // overruns once `out` is full, so an undersized array would silently swallow the last sentences.
+    var lines: [40][]const u8 = undefined;
+    const n = wrapInto(s, maxw, &lines);
+    const lh: f32 = @round(15.0 * t.uiScale());
+    var y = y_in;
+    for (lines[0..n]) |ln| {
+        t.textClip(ln, @intFromFloat(x), @intFromFloat(y), 11, t.comment, @intFromFloat(maxw));
+        y += lh;
+    }
+    return y;
+}
+
 /// One Settings toggle row: a FIXED-width state chip + its description. Every toggle passes the SAME `w` (the max
 /// over all chip labels), so the chips are flush left and every description starts at the same x — the per-label
 /// widths this replaces are why the page read as "all over the place". Returns true on click; the caller flips.
@@ -6826,9 +6851,31 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     if (!unified) {
         // Why anyone would pay for three: the roles do different jobs at very different volumes. The
         // split below is MODELLED from request-body sizes after prefix-cache hits, not metered — it is
-        // here to steer a choice ("go cheap on prompting"), so it says "about" and means it.
-        t.text(t.z("about 60% of billable input goes to coding, 20% to thinking, 15% to prompting", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
-        y += 18;
+        // here to steer a choice ("go cheap on prompting"), so it says so out loud. A settings page that
+        // states an unmeasured number as fact sends people to tune the wrong role.
+        //
+        // The other two things users get wrong without this paragraph:
+        //   1) they think a BLANK role breaks the turn. It doesn't. Precedence is the user's own role, then the
+        //      HOST's published role for it (service.zig roleDefault), then whatever coding resolved to
+        //      (ModelTrio.pick). So a single-model setup behaves exactly as it did before the trio existed —
+        //      additive, never required. The line says both hops because "blank uses coding" is simply FALSE on
+        //      a host that publishes its own thinking/prompting models, and this page must not teach that.
+        //   2) they read "thinking" as the clever role and put their biggest model on it. But thinking carries
+        //      two unlike jobs: `plan` is a ~1KB prompt that decides the acceptance contract (the judgment),
+        //      while `compact` + `ctxsum` are tens of KB per turn of mechanical compression — and the
+        //      compression is most of what the role COSTS. "Buy a bigger thinking model" is only good advice
+        //      about the planning half, so the copy splits them instead of implying every role wants more.
+        y = helpPara(
+            "estimate, not a measurement: about 60% of billable input goes to coding, 20% to thinking, 15% to prompting.\n" ++
+                "a blank role is fine: it falls back to your host's model for that role if it publishes one, otherwise to coding. the trio is opt-in - one model for everything still works.\n" ++
+                "coding does the work, and it is the one role prompt caching really pays off on: give it your strongest.\n" ++
+                "thinking is two jobs - planning is short and sets the bar for done (worth a good model); compaction is long, mechanical, and most of what thinking costs.\n" ++
+                "prompting is one short line per step, at high volume: the cheapest model that writes a clean sentence.",
+            x,
+            y,
+            colw,
+        );
+        y += 12;
         t.text(t.z("CODING MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
         t.text(t.z("runs the tools, writes the files, streams the reply — your strongest", .{}), @intFromFloat(x + 110), @intFromFloat(y), 11, t.comment);
         y += 20;
