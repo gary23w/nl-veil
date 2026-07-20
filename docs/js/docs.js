@@ -9,7 +9,12 @@
   const GROUPS = [
     { key: '', label: 'CASE SUMMARY', note: 'start here', docs: [
       { p: 'index', c: 'IX-00', t: 'Module index — the contents of the file', s: 'docs-src' },
-      { p: 'main', c: 'MN-01', t: 'Entry point — subsystem init and the event loop', s: 'main.zig' }
+      { p: 'main', c: 'MN-01', t: 'Entry point — CLI dispatch, the route table, server or app mode', s: 'main.zig' }
+    ]},
+    { key: 'guide/', label: 'GUIDE — RUNNING THE THING', note: 'not per-file', docs: [
+      { p: 'guide/architecture', c: 'GD-01', t: 'Architecture — one server, three clients (web, desk, CLI)', s: 'main.zig · build.zig' },
+      { p: 'guide/server', c: 'GD-02', t: 'Running a server — first login, the bind, the default model, accounts', s: 'main.zig · config/' },
+      { p: 'guide/accounts', c: 'GD-03', t: 'Accounts and the sandbox — what a non-admin can and cannot do', s: 'worker/tools.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
       { p: 'admin/admin_service', c: 'AD-01', t: 'Core admin service — API admin operations', s: 'admin_service.zig' }

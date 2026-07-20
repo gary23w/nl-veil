@@ -32,6 +32,59 @@ dashboard ([veil-desk](#the-desktop--veil-desk)), a swarm that **keeps a playboo
 and **prebuilt one-click binaries** for Windows, Linux, and macOS. Browse the annotated source as a
 case file at **[the docs site](https://gary23w.github.io/nl-veil/)** (`docs/`).
 
+## One server, three faces
+
+The mental model, because everything else follows from it: **the server process is the whole system.**
+It holds the accounts, the memory, the model keys, and it is the only thing that executes tools. The
+web app, the desktop window, and the CLI are all just clients of the same `/api/v1` surface — none of
+them holds state the others can't see.
+
+```
+                    ┌──────────────────────────────────────────────┐
+   a browser,  ───►  │  veil  (ONE process, ONE binary)              │
+   any device        │                                              │
+                     │   http :8787   ──►  route table (main.zig)   │
+   the desk    ───►  │                       │                      │
+   window            │                       ▼                      │
+                     │                  /api/v1/*                   │
+   `veil <verb>` ──► │       accounts · memory · sealed keys ·      │
+                     │       swarms · scheduled tasks · TOOLS       │
+                     │                       │                      │
+                     └───────────────────────┼──────────────────────┘
+                                             ▼
+                                   this machine's disk,
+                                   shell, network, models
+```
+
+**(a) The web app.** `web/public/{index.html,app.js,styles.css,models.json}` — no bundler, no build
+step, no framework. `index.html` is a single `<div id="app"></div>`; the entire UI renders from
+`app.js`. The four files are embedded into the binary at compile time (`build.zig:71-74`) and served
+by `staticIndex` / `staticJs` / `staticCss` / `staticModels` (`src/main.zig`, the route table). Tabs:
+**Dashboard, Chat, Tasks, Swarms, Admin** (admins only), **Settings**.
+
+**(b) The desktop window.** `desk/*.zig`, compiled **into the same binary** via `-Dapp` (default true,
+`build.zig:82`). In app mode the GUI runs on the main thread and the HTTP server on a background
+thread (`src/main.zig`, "APP MODE") — one process, no child to spawn, no second executable in the
+bundle.
+raylib is a *lazy* dependency, so `-Dapp=false` never fetches it at all.
+
+**(c) The CLI.** `src/cli.zig` dispatches every verb over HTTP to the running server
+(`src/cli/{chat,hub}.zig` for the two big ones). There is no second control plane and no argv secrets.
+
+### Why that shape matters to you
+
+- **Your phone gets the same app as your desktop**, and nothing is installed on the phone. It's a URL.
+- **The tools run on the host machine, not in the browser.** A browser can't execute a shell command,
+  so the server does it — `web/public/app.js` deliberately omits the `tool_client` flag for exactly
+  this reason (see the comment in `sendTurn`), and the turn's tools run server-side through
+  `POST /api/v1/chat/tool`. When you ask the veil in a browser to write a file, the file lands on the
+  machine running `veil`.
+- **Accounts are isolated on disk.** Each user's data lives under `{data}/u{uid}/…`, and non-admin
+  accounts run a restricted tool surface (`src/worker/chat/tools.zig`, `toolSafe` / `chatTool`). See
+  [everyone else is sandboxed](#everyone-else-is-sandboxed).
+- **One provider key can serve everyone**, or everyone can bring their own. That choice is yours and
+  it has a real cost — see [the shared provider key](#the-shared-provider-key).
+
 ## Install
 
 **Download it and run it — no toolchain, nothing to build.** Grab your platform's bundle from the
@@ -94,15 +147,198 @@ Closing the desktop window shuts the whole thing down — server and everything 
 no stray process left listening. On Windows a double-click opens no console window; run it from a
 terminal and your terminal is left alone.
 
+> **It listens on every network interface by default.** `NL_BIND` is unset → the server binds
+> `0.0.0.0`, which means anyone who can reach this machine on port 8787 can open the login page
+> (`src/main.zig:427-439`). That is the point — a phone on the sofa should be able to open it — but
+> it is worth knowing before you leave it running on a café wifi. `NL_BIND=127.0.0.1` pins it to this
+> machine only. See [the walkthrough](#walkthrough-run-it-add-people-put-it-on-your-network).
+
 Point the model endpoint with `NL_LLM_BASE_URL` / `NL_LLM_MODEL` / `NL_LLM_KEY` (it defaults to a
-local Ollama), or pick a model in the web UI / the desktop. On a localhost bind the server mints an
-admin key at `data/.desktop_key`; the CLI and the desktop read it automatically, so same-machine
-commands never prompt for auth. **Any `veil <verb>` auto-starts the server if it isn't already up.**
+local Ollama), or pick a model in the web UI / the desktop. The server **always** mints an admin key
+at `data/.desktop_key`; the CLI and the desktop read it automatically, so same-machine commands never
+prompt for auth. It is a file readable only by your OS user — opening the port to the LAN does not
+make a local file more reachable. **Any `veil <verb>` auto-starts the server if it isn't already up.**
 
 **Where your stuff lives:** a `data/` folder **next to the `veil` binary** — conversations, memory,
 swarm workdirs, logs, all of it. Nothing is written to a system temp dir and nothing leaves the
 machine. Move the folder and you move the whole install; back it up and you've backed up everything.
 (From a source checkout it resolves to the repo's own `data/`, so dev and release never share state.)
+
+## Walkthrough: run it, add people, put it on your network
+
+Written for someone who is not a developer. **If you only want it on your own machine, stop after
+step 5** — the rest is about letting other people in.
+
+### 1. Download and unblock it
+
+Grab the bundle for your OS from the [latest release](https://github.com/gary23w/nl-veil/releases/latest)
+and unzip it somewhere you'll find again. Builds are unsigned, so:
+
+- **Windows** shows *"Windows protected your PC"* → **More info** → **Run anyway**.
+- **macOS** says the developer can't be verified → **right-click the `veil` file → Open** → **Open**.
+  (Or `xattr -dr com.apple.quarantine <folder>` in Terminal.)
+
+### 2. Run it
+
+Double-click `veil.exe` (Windows) or run `./veil` (macOS/Linux). The desktop window opens and the
+server comes up behind it.
+
+**One rough edge, stated plainly:** on Windows, double-clicking from Explorer relaunches `veil`
+without a console window (`src/main.zig`, `detachOwnConsole`) — which is what you want for an app, but it means
+**the startup banner is invisible**, and the banner is where the network URL and the admin password
+notice get printed. There is no log file to read it out of afterwards, and the desktop window does not
+display the URL either.
+
+So if you care about the banner, **start it from a terminal instead** — when a shell owns the console,
+`veil` leaves it alone and prints normally:
+
+```powershell
+# Windows PowerShell, from the folder you unzipped into
+.\veil.exe
+```
+```sh
+# macOS / Linux
+./veil
+```
+
+### 3. Find the URL
+
+On startup the server prints one complete URL per address this machine answers on
+(`src/main.zig:671-696`, using `src/config/lan.zig`):
+
+```
+neuron-loops 1.0.0 on http://localhost:8787
+    open from another machine (phone, laptop) at:
+      http://192.168.1.42:8787
+```
+
+If you missed the banner, ask the OS for the address instead — `ipconfig` (Windows), `ifconfig` or
+`ip addr` (macOS/Linux) — and use `http://<that-address>:8787`.
+
+The port is **8787** unless you set `NL_PORT` (`src/main.zig:369-373`). It is the one place the port is
+resolved, so the CLI and the server always agree.
+
+### 4. Log in as the admin
+
+The first run creates an admin account. Because the server is reachable on the network by default and
+you did not choose a password, it **generates** one — and writes it to a file, because a banner you
+never saw is not a delivery mechanism:
+
+```
+data/admin-password.txt
+```
+
+That file sits next to the binary, beside the data it protects. The password is **stable across
+restarts** — the server reads it back rather than minting a new one each boot (`src/main.zig`,
+`readAdminPassword` / `writeAdminPassword`).
+
+- Default email: **`admin@neuron-loops.local`** (change it with `NL_ADMIN_EMAIL`).
+- To pin your own password instead of using the generated one, set `NL_ADMIN_PASSWORD` before starting.
+  Do that and no file is written — the password is the one you chose.
+
+> The old shipped default `changeme` still exists as the seed literal, but you will only ever meet it
+> on an explicit `NL_BIND=127.0.0.1` run, where nothing is generated because nothing is exposed.
+> Change it anyway.
+
+### 5. Pick a default model for the instance
+
+Open the web app (or the desktop) and go to **Admin → Default model**. Pick from the same catalog the
+Settings tab uses; it applies immediately, to everyone who hasn't chosen their own, with no restart.
+It persists to `data/server-config.json`.
+
+`NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` **seed** this on a fresh install for unattended setups —
+but once an admin sets it in the UI, the stored value wins, so a stale launch script can't undo it on
+the next restart (`src/config/server_config.zig`).
+
+**Without a default model, a brand-new account cannot chat until it configures one itself.**
+
+---
+
+*Everything below is about other people using it. If it's just you, you're done.*
+
+---
+
+### 6. The shared provider key
+
+**Admin → provider key** (`POST /api/v1/admin/keys`). It is stored sealed in the same vault as
+everyone else's keys, under a reserved uid 0 that no real account can hold
+(`src/worker/chat/service.zig:30`, `:65-76`).
+
+The trade is worth stating outright, because it is a billing decision:
+
+- **Without it**, every new account has to bring its own API key in Settings before it can chat at all.
+- **With it**, nobody needs a key — and **every user's turns spend your credit.** A user's own key
+  always wins if they have one, so setting this never silently switches a paying account onto your
+  bill. But everyone else is on it.
+
+For a family or a LAN of people you know, that's exactly right. For anything wider, think about it
+first, and size `NL_MAX_TURNS` to the rate limit of the key you just handed everyone.
+
+### 7. Create accounts
+
+**Admin → + New user** (`POST /api/v1/admin/users`). Enter an email and a password of **8–200
+characters**, then hand the password over out of band — the server never shows it again. Account
+creation is audited (who was let in, by whom, when).
+
+Self-signup is **off by default**. `NL_OPEN_REGISTRATION=1` opens it, which is the wrong posture for a
+box on a LAN and the right one if you're running something more public.
+
+### 8. Other people connect
+
+They type `http://<your-ip>:8787` into any browser — phone, tablet, laptop, whatever's on the same
+network. Nothing is installed on their device. They get the same web app you do, minus the Admin tab.
+
+### 9. The firewall (this is the step that fails)
+
+**If step 8 does nothing — a spinner, a timeout, "can't reach this page" — it is almost certainly the
+firewall, and the app will not tell you.** There is no firewall detection anywhere in the codebase, so
+a blocked port looks identical to a wrong IP address from inside the browser.
+
+- **Windows.** The first time `veil` binds a port, Windows Defender Firewall pops up *"Allow this app
+  to communicate on these networks."* Tick **Private networks** and allow it. If you dismissed that
+  prompt — or clicked Cancel — Windows silently remembers the block. Fix it in **Windows Security →
+  Firewall & network protection → Allow an app through firewall → Change settings**: find `veil` in
+  the list and tick **Private**. If it isn't listed at all, **Allow another app…** and browse to
+  `veil.exe`.
+- **macOS.** You may get *"Do you want the application to accept incoming network connections?"* —
+  say **Allow**. Otherwise check **System Settings → Network → Firewall → Options**.
+- **Linux.** Usually nothing blocks it, but if you run a firewall you'll need to open the port
+  (`sudo ufw allow 8787/tcp` on ufw-based systems).
+
+Two things to check before you blame the firewall: both machines are on the **same** network (guest
+wifi is often isolated from the main one), and you used the LAN address from the banner, not
+`localhost` — `localhost` on their phone means their phone.
+
+### 10. Locking it back down
+
+```sh
+NL_BIND=127.0.0.1 veil       # this machine only; nothing on the network can reach it
+```
+
+`localhost` works too. Anything else — or leaving it unset — binds every interface.
+
+### Before you put this on a network
+
+Two limits you should know about before you hand out passwords.
+
+**Traffic is plain `http://`.** There is no HTTPS in the server today. Logins, passwords, chat
+contents, and API responses cross your LAN unencrypted, readable by anything else on that network. On
+a home or office network you control, that is a normal trade. On shared or public wifi it is not.
+
+**Tools run on the host machine.** Non-admin accounts are sandboxed: their turns get the conversation's
+own workspace, research, and the full hive-memory surface — but no code execution, no host commands,
+no engine self-modification, no tool authoring, no browser or MCP drive, and no casting swarms or
+scheduling runs. What that means: **a normal user cannot run commands on your machine.** What it does
+*not* mean: their work is still stored on your disk, still spends whatever provider key is in play,
+and the **admin** account keeps the complete surface — so anyone who gets the admin password gets a
+shell on the host, in effect.
+
+**About exposing this to the open internet:** it's a different risk class from a home LAN, and this
+document isn't going to hand you a port-forwarding recipe as if it weren't. Plain-http logins over the
+public internet mean credentials in the clear; unsigned self-signup plus a shared provider key means
+your billing is the attack surface. If you genuinely need remote access, put it behind something that
+terminates TLS and authenticates first (a VPN or a reverse proxy you already trust) rather than
+forwarding 8787 at the router.
 
 ## The `veil` command line
 
@@ -117,10 +353,10 @@ SWARMS
       --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
       --style S  --name N  --continuous  --offline  --follow
   deploy "<goal>" [flags]      alias for `cast --continuous` (a sustained hive)
-  list | ls                    list your swarms
+  list | ls | ps               list your swarms
   stop <id>                    ask a swarm to stop
   rm <id>                      stop and remove a swarm
-  events <id> [--follow]       stream a swarm's event log
+  events <id> [--follow]       stream a swarm's event log  (aliases: logs, watch)
 
 CHAT (the server-side veil brain)
   chat [conv]                  interactive REPL; a line typed mid-turn steers the running turn
@@ -134,10 +370,14 @@ SCHEDULED TASKS (admin-gated)
 FLEET
   hub                          roster: fleet summary + every swarm's state
   hub all "<text>"             broadcast a directive to every swarm
+  hub goal "<text>"            set a new goal on every swarm
   hub stopall                  stop every swarm
 
 MISC
-  doctor                       check server + token health
+  doctor | health              check server + token health
+  desktop | desk               open the app window (like a bare `veil`, but detached)
+  exec-tool <tool> [args]      run one hive tool directly, in this process
+  sync-manifest / sync-read    the file-sync side of a delegated turn
   version | help
 ```
 
@@ -153,7 +393,7 @@ veil cast "add a search box to my landing page" --offline
 
 The agentic chat loop — planning, tool-calling, streaming, steering, and memory — runs **server-side**
 in [`src/worker/chat/engine.zig`](https://gary23w.github.io/nl-veil/#doc=worker/chat/engine). Clients
-(`veil chat`, veil-desk) are thin: they speak three REST calls per conversation.
+(`veil chat`, the desk, the browser) are thin: they speak three REST calls per conversation.
 
 ```
 POST   /api/v1/chat/convs/:id/messages          # send a message → runs one server-side turn
@@ -255,7 +495,8 @@ zig build -Dapp=false         # server-only build: no GUI compiled in, no raylib
 
 `-Dapp=false` is what headless hosts and CI boxes want — the GUI is left out of the compilation
 entirely rather than merely unused. To keep the GUI compiled in but not opened for a given run, pass
-`--server-only` at runtime.
+`--server-only` at runtime. (There is a `zig build desk` step that produces a standalone `veil-desk`
+binary; it is a **development** convenience, not something the release ships or the server spawns.)
 
 ## It learns
 
@@ -395,19 +636,33 @@ what a turn built, and manage accounts — the desktop's surfaces, in a browser,
 network. It comes up whenever the server runs:
 
 ```sh
-zig build && ./zig-out/bin/veil      # serves http://127.0.0.1:8787
+zig build && ./zig-out/bin/veil
 ```
 
-First-run local login is `admin@neuron-loops.local` / `changeme` — **change it immediately** via
-`NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD`. On a public bind (`NL_BIND` ≠ `127.0.0.1`) the server
-refuses the default and prints a generated password once.
+It binds **every interface** unless you say otherwise, and prints the URLs it is reachable at (see
+[step 3](#3-find-the-url)). The admin password for a first run is in `data/admin-password.txt` — the
+full first-login sequence is [step 4](#4-log-in-as-the-admin).
+
+### The shared provider key
+
+A default model nobody can afford to call is not a default. **Admin → provider key** stores one
+instance-wide key (`POST /api/v1/admin/keys`), sealed in the same vault as everyone else's under a
+reserved uid that no account can hold (`SERVER_KEY_UID = 0`, `src/worker/chat/service.zig:30`).
+
+It is the **last** resort in the resolution ladder — an explicitly-supplied key wins, then the user's
+own vaulted key, then this one — so an account that brings its own billing is never silently switched
+onto yours (`src/worker/chat/service.zig`, `resolveRole`).
+
+**The trade is deliberate and worth stating: once this is set, every user's turns spend the admin's
+credit.** That is exactly what a LAN or family install wants — nobody should have to hold an API key
+to use the thing — and exactly what a wider deployment has to think about first. Without it, each new
+account must configure its own key in Settings before it can chat at all.
 
 ### Everyone else is sandboxed
 
 **Set the default model in the Admin tab.** Pick it from the same catalog the Settings tab uses; it
 applies immediately, with no restart, to everyone who has not chosen their own. The API key is never
-part of it — each account still supplies its own, sealed server-side. Without a default, a brand-new
-account has to configure a model before it can chat at all.
+part of it. Without a default, a brand-new account has to configure a model before it can chat at all.
 
 The web app is multi-user, and **a normal account is not trusted with the host**. Its turns run a
 restricted tool surface: the conversation's own workspace, research, and the *entire* hive-memory
@@ -418,6 +673,9 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 
 | variable | what it does |
 |---|---|
+| `NL_BIND` | the listen address. **Unset = every interface**, which is the default and is what makes the phone-in-the-next-room case work. `127.0.0.1` (or `localhost`) pins it to this machine |
+| `NL_PORT` | the port (default 8787). Resolved once and shared by the server bind and the CLI client |
+| `NL_ADMIN_EMAIL` / `NL_ADMIN_PASSWORD` | the admin account. Defaults to `admin@neuron-loops.local` with a password generated on first run and written to `data/admin-password.txt`; set `NL_ADMIN_PASSWORD` to pin your own and no file is written |
 | `NL_MAX_TURNS` | how many chat turns run at once, server-wide (default 64, ceiling 256). Size it to the rate limit of the provider key everyone shares |
 | `NL_MAX_TURNS_PER_USER` | how many of those one account may hold (default: an eighth of capacity). This is what stops one busy user starving everyone else |
 | `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
@@ -458,9 +716,13 @@ src/
   cli/{chat,hub}.zig       the interactive chat REPL and the fleet console
   gateway/http.zig         the HTTP surface: App context, the auth guard, JSON/file helpers
   auth/  config/  admin/   accounts + API keys, the encrypted key vault, the admin API
+    config/lan.zig         which addresses this machine is reachable at (the startup banner's URLs)
+    config/server_config.zig  admin-owned runtime settings → data/server-config.json
   worker/                  the hive and the server-side brain:
-    chat/{engine,service,tools,context,plan}.zig  the chat brain — the agentic turn loop, its REST
-                                                   handlers, tools, context window, and plan board
+    chat/{engine,service,tools,context,plan,sync,toolperf,paths}.zig  the chat brain — the agentic
+                                                   turn loop, its REST handlers, tools, context
+                                                   window, plan board, client file-sync, tool
+                                                   timings, and conversation paths
     sched.zig              scheduled tasks (each run is a server chat conversation)
     control/{supervisor,writer,fanout}.zig  swarm processes, the control bus, event streaming
     deploy/service.zig     the cast/deploy door + swarm files, bundle, archive, lifecycle
@@ -469,10 +731,12 @@ src/
                                                    the Veil, the self-improvement faculties, the
                                                    micro-VCS for concurrent minds
     locs/atlas.zig         the source atlas — points scouts at nl-rag packs
-desk/                      veil-desk, the native desktop dashboard (its own build.zig + raylib)
+desk/                      veil-desk, the native desktop dashboard — compiled INTO `veil` as the
+                           "desk" module (-Dapp, default true), not a separate shipped binary
 docs/                      the annotated-source case file (a static site, home-built md parser)
 examples/embedded/         the device-operator worked example
-web/public/                the bundled control-plane UI
+web/public/                the control-plane UI — index.html, app.js, styles.css, models.json,
+                           embedded into the binary at build time (no bundler, no build step)
 bin/neuron[.exe]           the neuron-db memory engine (bundled / built on first run)
 ```
 
