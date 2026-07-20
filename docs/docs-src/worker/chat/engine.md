@@ -47,7 +47,7 @@ Between drive steps and before each tool the loop drains `control.jsonl`: `{"op"
 
 ## Usage Context
 
-Entered only through `chat_service.postMessage`. ON by default; the kill switch `VEIL_CHAT_BACKEND=0` returns `501`, which a client treats as a signal to fall back to a local engine. Admin-only for now, because the turn hands the model the full tool surface and `tools.execute` does not yet gate by role. Scheduled tasks (`sched.zig`) enter the same `tryBeginTurn` + `spawnTurn` path, so a scheduled run is a real conversation.
+Entered only through `chat_service.postMessage`. ON by default; the kill switch `VEIL_CHAT_BACKEND=0` returns `501`, which a client treats as a signal to fall back to a local engine. Open to every authenticated user. The per-role gating this note used to anticipate has landed: `tools.execute` refuses on `ctx.caps == .sandboxed` as its first statement, before any tool-specific logic, so there is exactly one place a capability decision is made. Non-admins run `.sandboxed`, admins `.full`, and the turn's advertised tool schema is trimmed to match — a sandboxed caller is never offered a tool that could only come back as a refusal. Scheduled tasks (`sched.zig`) enter the same `tryBeginTurn` + `spawnTurn` path, so a scheduled run is a real conversation.
 
 ---
 
