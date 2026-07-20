@@ -628,7 +628,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .host-activity {
   display: flex; align-items: center; gap: 7px;
   min-height: 1.4em;
-  margin-bottom: 7px;
+  margin-top: 7px;
   font-size: calc(var(--fs-small) * var(--text-scale));
   color: var(--text-secondary);
 }
@@ -667,7 +667,8 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 @keyframes veil-caret { 0%,49% { opacity: 1; } 50%,100% { opacity: 0; } }
 
-.tools { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+/* Below the answer now, so the spacing flips from bottom to top. */
+.tools { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .tools:empty { display: none; }
 .tool-chip {
   display: inline-flex; align-items: baseline; gap: 6px;
