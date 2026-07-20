@@ -49,6 +49,141 @@ pub fn tokensSnapshot() TokUsage {
     return .{ .in = tl_tokens_in, .out = tl_tokens_out, .cached = tl_tokens_cached };
 }
 
+// ---- PER-ROLE COST ATTRIBUTION --------------------------------------------------------------------------
+// The model trio routes by call LABEL (chat→coding, loop→prompting, plan/reflect/summary/ctxsum/compact/
+// lesson→thinking), so ONE turn's tokens are spread across up to three different models at three different
+// prices. The thread totals above cannot express that — they are a single number per thread, and the turn
+// recorder that reads them is armed with one model name, so every role's tokens land on that one model's row.
+//
+// These buckets fix it at the only place that knows the truth: the usage fold, where the call's label and the
+// model that actually served it are both already in hand. metrics.zig drains them at the turn's usage
+// choke-point and writes one row per (role, model).
+//
+// Buffered rather than written per call because llm.zig has no data root — it sees run_dir (a disposable build
+// tree), not {data}/u{uid}. The price of that is that a turn killed mid-flight takes its unflushed rows with
+// it; every normal completion path, including provider errors and Stop, reaches the flush.
+pub const RoleMax = 16;
+const LabelMax = 32;
+const ModelMax = 96;
+const BaseMax = 160;
+
+/// One (role, model) bucket for the turn running on this thread. Fixed-width so the whole table lives in
+/// thread-local storage with no allocator on the call path.
+pub const RoleCost = struct {
+    label_b: [LabelMax]u8 = undefined,
+    label_n: usize = 0,
+    model_b: [ModelMax]u8 = undefined,
+    model_n: usize = 0,
+    base_b: [BaseMax]u8 = undefined,
+    base_n: usize = 0,
+    calls: u64 = 0,
+    in: u64 = 0,
+    out: u64 = 0,
+    cached: u64 = 0,
+    /// Summed PROVIDER latency for this bucket — the honest denominator for the role's tokens/sec. (Turn wall
+    /// clock is not: a turn's roles run in sequence inside it, so every role would claim the same seconds.)
+    ms: u64 = 0,
+
+    pub fn label(self: *const RoleCost) []const u8 {
+        return self.label_b[0..self.label_n];
+    }
+    pub fn model(self: *const RoleCost) []const u8 {
+        return self.model_b[0..self.model_n];
+    }
+    pub fn base(self: *const RoleCost) []const u8 {
+        return self.base_b[0..self.base_n];
+    }
+};
+
+threadlocal var role_costs: [RoleMax]RoleCost = undefined; // only [0..role_costs_n) is ever read
+threadlocal var role_costs_n: usize = 0;
+
+/// Buffered flight-recorder lines (whole NDJSON records) for the calls this turn made. ~8KB ≈ 50 calls.
+const CallLogCap = 8 * 1024;
+threadlocal var call_log: [CallLogCap]u8 = undefined;
+threadlocal var call_log_n: usize = 0;
+threadlocal var call_log_dropped: u32 = 0;
+
+/// Fold one completed call into its (role, model) bucket. Called beside meterTL at every usage-fold site.
+fn meterRole(label: []const u8, model: []const u8, base_url: []const u8, in: u64, out: u64, cached: u64, ms: u64) void {
+    for (role_costs[0..role_costs_n]) |*b| {
+        if (std.mem.eql(u8, b.label(), label) and std.mem.eql(u8, b.model(), model)) {
+            b.calls += 1;
+            b.in += in;
+            b.out += out;
+            b.cached += cached;
+            b.ms += ms;
+            return;
+        }
+    }
+    // Out of buckets (pathological label churn): drop the SPLIT, never the tokens. metrics.zig reconciles the
+    // rows it writes against the turn's true delta and books the difference to an "other" row.
+    if (role_costs_n >= RoleMax) return;
+    const b = &role_costs[role_costs_n];
+    b.label_n = @min(label.len, LabelMax);
+    @memcpy(b.label_b[0..b.label_n], label[0..b.label_n]);
+    b.model_n = @min(model.len, ModelMax);
+    @memcpy(b.model_b[0..b.model_n], model[0..b.model_n]);
+    b.base_n = @min(base_url.len, BaseMax);
+    @memcpy(b.base_b[0..b.base_n], base_url[0..b.base_n]);
+    b.calls = 1;
+    b.in = in;
+    b.out = out;
+    b.cached = cached;
+    b.ms = ms;
+    role_costs_n += 1;
+}
+
+/// A config identifier (label / model / base URL) rendered JSON-string-safe into `buf`. These are identifiers,
+/// not prose, so anything needing an escape — a quote or control char fat-fingered into a BYOK model string —
+/// becomes '_' rather than dragging a real JSON escaper onto the call path.
+fn ident(buf: []u8, s: []const u8) []const u8 {
+    const n = @min(s.len, buf.len);
+    for (s[0..n], 0..) |c, i| buf[i] = if (c < 0x20 or c == '"' or c == '\\' or c == 0x7f) '_' else c;
+    return buf[0..n];
+}
+
+/// Buffer one flight-recorder line. `base` is the raw base_url (never the key) — metrics.zig reduces it to a
+/// host for the aggregate, but the operator log keeps what was actually dialed.
+fn logCall(ts: i64, label: []const u8, model: []const u8, base_url: []const u8, ms: u64, in: u64, cached: u64, out: u64) void {
+    var lb: [LabelMax]u8 = undefined;
+    var mb: [ModelMax]u8 = undefined;
+    var bb: [BaseMax]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        call_log[call_log_n..],
+        "{{\"ts\":{d},\"role\":\"{s}\",\"model\":\"{s}\",\"base\":\"{s}\",\"ms\":{d},\"in\":{d},\"cached\":{d},\"out\":{d}}}\n",
+        .{ ts, ident(&lb, label), ident(&mb, model), ident(&bb, base_url), ms, in, cached, out },
+    ) catch {
+        call_log_dropped += 1; // buffer full — the (role, model) totals above are unaffected
+        return;
+    };
+    call_log_n += line.len;
+}
+
+/// The turn's per-(role, model) buckets. Valid until resetAttribution().
+pub fn roleCosts() []const RoleCost {
+    return role_costs[0..role_costs_n];
+}
+
+/// The buffered per-call flight lines, ready to append verbatim to an NDJSON log.
+pub fn callLog() []const u8 {
+    return call_log[0..call_log_n];
+}
+
+/// Flight lines this thread had to drop since the last reset (buffer full). Nonzero means the log undercounts
+/// CALLS — the token totals are still whole.
+pub fn callLogDropped() u32 {
+    return call_log_dropped;
+}
+
+/// Drop everything accumulated for the current turn. Called after a flush AND at turn entry, so a recycled
+/// thread never bills a fresh turn for its predecessor's calls.
+pub fn resetAttribution() void {
+    role_costs_n = 0;
+    call_log_n = 0;
+    call_log_dropped = 0;
+}
+
 pub const Caps = struct {
     probed: bool = false,
     ollama_native: bool = false,
@@ -238,7 +373,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     defer gpa.free(temp_frag);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
-    var s = completeBody(gpa, io, run_dir, tag, base_url, key, body);
+    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
     defer s.deinit(gpa);
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
@@ -267,7 +402,7 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
     const mt = effTokens(base_url, model, max_tokens);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, msgs.items, mt }) catch return oom(gpa);
     defer gpa.free(body);
-    var s = completeBody(gpa, io, run_dir, tag, base_url, key, body);
+    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
     defer s.deinit(gpa);
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
@@ -285,7 +420,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
-    return completeBody(gpa, io, run_dir, tag, base_url, key, body);
+    return completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
 }
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
@@ -298,10 +433,17 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     defer gpa.free(url);
     const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, effectiveCtx(), temp_frag) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
     const r = postUrl(gpa, io, run_dir, tag, url, key, body, true);
+    const t1 = std.Io.Timestamp.now(io, .real);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
     defer gpa.free(r.content);
-    return parseOllamaNative(gpa, base_url, r.content);
+    return parseOllamaNative(gpa, base_url, r.content, .{
+        .tag = tag,
+        .model = model,
+        .ms = @intCast(@max(@divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms), 0)),
+        .ts = t1.toSeconds(),
+    });
 }
 
 /// The num_ctx actually requested: never MORE than the model's probed maximum (asking beyond it is silently
@@ -321,7 +463,18 @@ fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag });
 }
 
-fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8) Step {
+/// What the caller knows about a call that the RESPONSE does not carry: which role asked for it, which model
+/// served it, and how long it took. Only the usage fold needs it, so it rides as one defaulted struct rather
+/// than four more positional parameters (`.{}` in tests, which assert on parsing, not on cost).
+const Attrib = struct {
+    tag: []const u8 = "",
+    model: []const u8 = "",
+    base: []const u8 = "", // only the streamed path needs it; the others already hold base_url locally
+    ms: u64 = 0,
+    ts: i64 = 0,
+};
+
+fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const u8, at: Attrib) Step {
     const Resp = struct {
         message: ?struct {
             content: ?[]const u8 = null,
@@ -346,8 +499,13 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
             _ = tokens_in.fetchAdd(parsed.value.prompt_eval_count orelse 0, .monotonic);
             _ = tokens_out.fetchAdd(ec, .monotonic);
         }
-        meterTL(parsed.value.prompt_eval_count orelse 0, ec, 0);
+        const pin = parsed.value.prompt_eval_count orelse 0;
+        meterTL(pin, ec, 0);
+        // Ollama reports no prompt-cache split, so `cached` is 0 here — a local backend re-prefills anyway.
+        meterRole(at.tag, at.model, base_url, pin, ec, 0, at.ms);
         _ = calls_made.fetchAdd(1, .monotonic);
+        std.log.info("llm[{s}/{s}] {d}ms in={d} out={d}", .{ at.tag, at.model, at.ms, pin, ec });
+        logCall(at.ts, at.tag, at.model, base_url, at.ms, pin, 0, ec);
     }
     if (parsed.value.@"error") |e| return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e}) catch "provider error");
     const msg = parsed.value.message orelse return stepErr(gpa, "no message in Ollama response");
@@ -850,12 +1008,12 @@ fn applyQuirk(gpa: std.mem.Allocator, body: []const u8, q: Quirk) ?[]u8 {
 
 /// On a provider error, try to heal a PARAM constraint: detect it, rewrite + retry ONCE, and learn the quirk
 /// so future requests pre-apply it. Returns the healed Step, or null when the error is not a quirk we can fix.
-fn healParamError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, err_text: []const u8) ?Step {
+fn healParamError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, err_text: []const u8) ?Step {
     const q = detectQuirk(err_text) orelse return null;
     const healed = applyQuirk(gpa, body, q) orelse return null;
     defer gpa.free(healed);
     if (bodyModel(body)) |m| learnQuirk(io, m, q); // remember for every future request to this model
-    return completeBodyH(gpa, io, run_dir, tag, base_url, key, healed, false); // retry once, never re-heal
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, healed, false); // retry once, never re-heal
 }
 
 /// Effective temperature for `model` after any LEARNED quirk (<0 ⇒ omit the field).
@@ -882,18 +1040,21 @@ fn tempFragOwned(gpa: std.mem.Allocator, io: std.Io, model: []const u8, temperat
     return std.fmt.allocPrint(gpa, ",\"temperature\":{s}", .{vs}) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
-fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Step {
-    return completeBodyH(gpa, io, run_dir, tag, base_url, key, body, true);
+/// `model` rides alongside `body` (which already carries it) purely so the usage fold can ATTRIBUTE the call:
+/// re-parsing it back out of the request JSON would be the same string by a longer road.
+fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8) Step {
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, body, true);
 }
 
-fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, heal_ok: bool) Step {
+fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, heal_ok: bool) Step {
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
     const r = post(gpa, io, run_dir, tag, base_url, key, body);
-    const call_ms = @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - t0, std.time.ns_per_ms);
+    const t1 = std.Io.Timestamp.now(io, .real);
+    const call_ms = @divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms);
     if (!r.ok) {
         // HTTP-level error (some providers return the constraint here, not in a JSON error field) — try to heal.
         if (heal_ok) {
-            if (healParamError(gpa, io, run_dir, tag, base_url, key, body, r.content)) |s| {
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, r.content)) |s| {
                 gpa.free(r.content);
                 return s;
             }
@@ -942,18 +1103,22 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
             _ = tokens_cached.fetchAdd(cached, .monotonic);
         }
         meterTL(u.prompt_tokens, u.completion_tokens, cached);
+        meterRole(tag, model, base_url, u.prompt_tokens, u.completion_tokens, cached, @intCast(@max(call_ms, 0)));
         _ = calls_made.fetchAdd(1, .monotonic);
-        // WHERE THE SECONDS GO — one line per completed call: purpose tag, provider latency, and the token
-        // split (cached = the provider-cache share of `in`). This is the flight recorder for "some models
-        // run incredibly slow": provider wall-time per call vs. our own engine gaps between the lines.
-        std.log.info("llm[{s}] {d}ms in={d} (cached {d}) out={d}", .{ tag, call_ms, u.prompt_tokens, cached, u.completion_tokens });
+        // WHERE THE SECONDS GO — one line per completed call: purpose tag, the MODEL that served it (under a
+        // trio the tag alone no longer implies the model), provider latency, and the token split (cached = the
+        // provider-cache share of `in`). This is the flight recorder for "some models run incredibly slow":
+        // provider wall-time per call vs. our own engine gaps between the lines. It goes to stderr for a live
+        // tail AND, via logCall, to a durable per-call log that survives the process.
+        std.log.info("llm[{s}/{s}] {d}ms in={d} (cached {d}) out={d}", .{ tag, model, call_ms, u.prompt_tokens, cached, u.completion_tokens });
+        logCall(t1.toSeconds(), tag, model, base_url, @intCast(@max(call_ms, 0)), u.prompt_tokens, cached, u.completion_tokens);
     } else {
-        std.log.info("llm[{s}] {d}ms (no usage in response)", .{ tag, call_ms });
+        std.log.info("llm[{s}/{s}] {d}ms (no usage in response)", .{ tag, model, call_ms });
     }
     if (parsed.value.@"error") |e| {
         // a JSON error field (HTTP 200 with an {"error":…} body, as Kimi returns) — try to heal the constraint.
         if (heal_ok) {
-            if (healParamError(gpa, io, run_dir, tag, base_url, key, body, e.message)) |s| return s;
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, e.message)) |s| return s;
         }
         return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
     }
@@ -1443,9 +1608,21 @@ fn reconstructSseToolCalls(gpa: std.mem.Allocator, st: *const StreamState) []Too
     return calls.toOwnedSlice(gpa) catch &.{};
 }
 
+/// Close out a streamed call's attribution: stamp `now` and turn the caller's start anchor into a latency.
+fn streamAttrib(io: std.Io, tag: []const u8, model: []const u8, base_url: []const u8, t0_ns: i128) Attrib {
+    const t1 = std.Io.Timestamp.now(io, .real);
+    return .{
+        .tag = tag,
+        .model = model,
+        .base = base_url,
+        .ms = @intCast(@max(@divTrunc(t1.nanoseconds - t0_ns, std.time.ns_per_ms), 0)),
+        .ts = t1.toSeconds(),
+    };
+}
+
 /// Fold a streamed step's token counts into the process meters — the SAME local/hosted split completeBody
 /// and parseOllamaNative use, so streamed chat steps still contribute to REAL cost reporting.
-fn meterStream(st: *const StreamState, local: bool) void {
+fn meterStream(st: *const StreamState, local: bool, at: Attrib) void {
     if (!st.metered) return;
     if (local) {
         _ = tokens_in_free.fetchAdd(st.p_in, .monotonic);
@@ -1456,9 +1633,12 @@ fn meterStream(st: *const StreamState, local: bool) void {
         _ = tokens_cached.fetchAdd(st.p_cached, .monotonic);
     }
     meterTL(st.p_in, st.p_out, st.p_cached);
+    meterRole(at.tag, at.model, at.base, st.p_in, st.p_out, st.p_cached, at.ms);
     _ = calls_made.fetchAdd(1, .monotonic);
-    // the streamed twin of completeBodyH's flight-recorder line (latency reads off the log timestamps here)
-    std.log.info("llm[stream] in={d} (cached {d}) out={d}", .{ st.p_in, st.p_cached, st.p_out });
+    // the streamed twin of completeBodyH's flight-recorder line. Streaming is the CHAT path, so this is the
+    // one that says which model the trio put in front of the user.
+    std.log.info("llm[{s}/{s}] {d}ms stream in={d} (cached {d}) out={d}", .{ at.tag, at.model, at.ms, st.p_in, st.p_cached, st.p_out });
+    logCall(at.ts, at.tag, at.model, at.base, at.ms, st.p_in, st.p_cached, st.p_out);
 }
 
 /// STREAMING agentic step (chat only). Same request as complete() but "stream":true; curl streams the
@@ -1509,6 +1689,9 @@ fn streamAttempt(
 ) ?Step {
     const native = isOllama(base_url);
     const local = isLocal(base_url);
+    // Anchored before the body is built, so the metered latency covers what the CALLER waited for — a streamed
+    // reply has no single response timestamp to subtract from.
+    const call_t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
 
     // ---- URL (native /api/chat, else OpenAI /chat/completions) ----
     const url = blk: {
@@ -1728,7 +1911,7 @@ fn streamAttempt(
                 freeCalls(gpa, calls);
                 return null;
             };
-            meterStream(&st, local);
+            meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
             return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
         }
         freeCalls(gpa, calls); // couldn't reconstruct (native miss, or hosted fragments with no usable name) → complete()
@@ -1742,7 +1925,7 @@ fn streamAttempt(
         gpa.free(c_owned);
         return null;
     };
-    meterStream(&st, local);
+    meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
     return .{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
 }
 
@@ -1871,7 +2054,7 @@ test "parseOllamaNative re-serializes an arguments OBJECT into a JSON-string Too
         \\"tool_calls":[{"function":{"name":"write_file","arguments":{"path":"x.py","content":"print(1)"}}}]},
         \\"done_reason":"stop","eval_count":42,"prompt_eval_count":100}
     ;
-    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw, .{});
     defer step.deinit(gpa);
     try std.testing.expect(step.ok);
     try std.testing.expectEqual(@as(usize, 1), step.calls.len);
@@ -1890,7 +2073,7 @@ test "parseOllamaNative content-only (no tool call) returns text and no calls" {
         \\{"model":"gpt-oss:20b","message":{"role":"assistant","content":"the answer is 391"},
         \\"done_reason":"stop","eval_count":7,"prompt_eval_count":20}
     ;
-    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw, .{});
     defer step.deinit(gpa);
     try std.testing.expect(step.ok);
     try std.testing.expectEqual(@as(usize, 0), step.calls.len);
@@ -1905,7 +2088,7 @@ test "parseOllamaNative flags a length-cut reply as truncated (the committed-par
         \\{"model":"gpt-oss:20b","message":{"role":"assistant","content":"index.html\n```html\n<!DOCTYPE html>\n<style>.page { margin-"},
         \\"done_reason":"length","eval_count":8192,"prompt_eval_count":900}
     ;
-    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw);
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw, .{});
     defer step.deinit(gpa);
     try std.testing.expect(step.ok);
     try std.testing.expect(step.truncated);
@@ -2267,4 +2450,83 @@ test "reconstructSseToolCalls: a fragment with no name is dropped; empty args be
     try std.testing.expectEqual(@as(usize, 1), calls.len);
     try std.testing.expectEqualStrings("run_tests", calls[0].name);
     try std.testing.expectEqualStrings("{}", calls[0].args); // no args fragments → defaulted
+}
+
+// ---- per-role attribution ---------------------------------------------------------------------------------
+
+test "meterRole splits one turn across the trio instead of billing it all to one model" {
+    resetAttribution();
+    defer resetAttribution();
+    // the shape of a real turn: chat on the coding model, reflect on the thinking model, loop on the prompting one
+    meterRole("chat", "kimi-k3", "https://api.moonshot.ai/v1", 30738, 900, 14600, 12000);
+    meterRole("reflect", "deepseek-v4-flash", "https://api.deepseek.com/v1", 5687, 210, 0, 1500);
+    meterRole("loop", "openrouter/free", "https://openrouter.ai/api/v1", 17647, 400, 0, 1800);
+    meterRole("loop", "openrouter/free", "https://openrouter.ai/api/v1", 9000, 240, 0, 1300); // same bucket
+
+    const b = roleCosts();
+    try std.testing.expectEqual(@as(usize, 3), b.len);
+    try std.testing.expectEqualStrings("chat", b[0].label());
+    try std.testing.expectEqualStrings("kimi-k3", b[0].model());
+    try std.testing.expectEqual(@as(u64, 14600), b[0].cached);
+    try std.testing.expectEqualStrings("deepseek-v4-flash", b[1].model());
+    try std.testing.expectEqual(@as(u64, 5687), b[1].in);
+    // the repeated (role, model) folded rather than opening a fourth bucket
+    try std.testing.expectEqual(@as(u64, 2), b[2].calls);
+    try std.testing.expectEqual(@as(u64, 26647), b[2].in);
+    try std.testing.expectEqual(@as(u64, 3100), b[2].ms);
+}
+
+test "the same model under two roles stays two buckets (that IS the per-role question)" {
+    resetAttribution();
+    defer resetAttribution();
+    meterRole("chat", "m", "b", 100, 10, 0, 5);
+    meterRole("compact", "m", "b", 400, 20, 0, 9);
+    const b = roleCosts();
+    try std.testing.expectEqual(@as(usize, 2), b.len);
+    try std.testing.expectEqual(@as(u64, 100), b[0].in);
+    try std.testing.expectEqual(@as(u64, 400), b[1].in);
+}
+
+test "resetAttribution clears buckets and flight log so a recycled thread starts clean" {
+    resetAttribution();
+    meterRole("chat", "m", "b", 1, 1, 0, 1);
+    logCall(1000, "chat", "m", "b", 1, 1, 0, 1);
+    try std.testing.expect(roleCosts().len == 1 and callLog().len > 0);
+    resetAttribution();
+    try std.testing.expectEqual(@as(usize, 0), roleCosts().len);
+    try std.testing.expectEqual(@as(usize, 0), callLog().len);
+    try std.testing.expectEqual(@as(u32, 0), callLogDropped());
+}
+
+test "a flight line names the MODEL, not just the role — the whole point of the line" {
+    resetAttribution();
+    defer resetAttribution();
+    logCall(1784165341, "reflect", "deepseek-v4-flash", "https://api.deepseek.com/v1", 1500, 5687, 0, 210);
+    try std.testing.expectEqualStrings(
+        "{\"ts\":1784165341,\"role\":\"reflect\",\"model\":\"deepseek-v4-flash\",\"base\":\"https://api.deepseek.com/v1\"," ++
+            "\"ms\":1500,\"in\":5687,\"cached\":0,\"out\":210}\n",
+        callLog(),
+    );
+}
+
+test "ident neutralizes anything that would tear the JSON line" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("openrouter/free", ident(&buf, "openrouter/free")); // '/' is JSON-safe
+    try std.testing.expectEqualStrings("a_b_c", ident(&buf, "a\"b\\c")); // a fat-fingered BYOK model string
+    try std.testing.expectEqualStrings("x_y", ident(&buf, "x\ny"));
+    var small: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("abc", ident(&small, "abcdef")); // truncates, never overruns
+}
+
+test "an overlong turn drops flight LINES, never tokens" {
+    resetAttribution();
+    defer resetAttribution();
+    var i: usize = 0;
+    while (i < 500) : (i += 1) {
+        meterRole("chat", "m", "b", 10, 1, 0, 1);
+        logCall(1000, "chat", "m", "b", 1, 10, 0, 1);
+    }
+    try std.testing.expect(callLogDropped() > 0); // the 8KB buffer filled
+    try std.testing.expectEqual(@as(u64, 500), roleCosts()[0].calls); // …and the cost table did not care
+    try std.testing.expectEqual(@as(u64, 5000), roleCosts()[0].in);
 }
