@@ -3841,8 +3841,15 @@ fn runInnerAgentic(
                     break;
                 }
             }
-            const echo_read_class = std.mem.eql(u8, c.name, "read_file") or std.mem.eql(u8, c.name, "list_dir");
-            const echo_limit: u8 = if (echo_read_class) 6 else 3;
+            // Reads used to get a larger allowance (6) than everything else, set when compaction folded the
+            // WHOLE working span and a re-read was often the model's only way back to bytes the engine had
+            // deleted. compactWorking now keeps a verbatim tail (see WORKING_KEEP_TAIL_BYTES), so an IDENTICAL
+            // re-read no longer recovers anything the model cannot already see — and each one costs a full
+            // round trip plus up to TOOL_RESULT_KEEP bytes re-uploaded on every later inference of the turn.
+            // One threshold now. The legitimate case is untouched: the guard keys on the RESULT hash, so a read
+            // returning something different (the read-after-write cycle BUILD DISCIPLINE asks for) resets the
+            // count and never trips this.
+            const echo_limit: u8 = 3;
             const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
             if (echo_blocked) echo_slot.?.count +|= 1;
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning

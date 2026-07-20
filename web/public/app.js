@@ -24,7 +24,10 @@ const S = {
   metrics: null,
   models: null,         // parsed models.json — the shared catalog
   localModels: null,    // {installed:[…]} from this machine's Ollama, or null if unreachable
+  localUp: null,        // tri-state: true/false once probed, null = never asked. See pollHealth.
   keys: [],             // provider keys on file (never the key itself)
+  keysLoaded: false,    // has refreshKeys ever answered? [] means "unknown" until it has
+  convsLoaded: false,   // ditto for S.convs — see drawTranscript's no-conversation branch
   files: [],            // the open conversation's build tree, as last listed
   openTool: -1,         // index of the expanded tool chip, -1 = none
   serverDefault: { model: '', base_url: '' },  // what the host configured for users who pick nothing
@@ -214,6 +217,10 @@ async function loadLocalModels() {
   try {
     const j = await jget('/api/v1/models/local', 8000);
     S.localModels = j.reachable ? j : null;
+    // Same answer the status chip needs, so record it and let the chip's own probe
+    // sit out its throttle rather than asking the identical question again.
+    S.localUp = !!j.reachable;
+    _localProbeAt = Date.now();
   } catch (e) {
     S.localModels = null;
   }
@@ -224,6 +231,18 @@ function onSignedOut() {
   stopHealthPoll();
   S.me = null;
   S.conv = null;
+  // Everything below is per-ACCOUNT, and this tab may well be signed into another
+  // one next. keysLoaded is the flag that licenses missingKeyProvider to make a
+  // statement about keys at all, so leaving it set hands the next user the previous
+  // user's key list as fact — they would be told they are "ready" with no key of
+  // their own on file, and only find out when the turn came back 401. Back to
+  // "unknown", which is what an empty list actually means until refreshKeys answers.
+  S.keys = [];
+  S.keysLoaded = false;
+  S.convs = [];
+  S.convsLoaded = false;   // same reasoning: the next account's history is unknown, not empty
+  S.localUp = null;
+  _probedModel = null;     // the cached backend probe described the PREVIOUS account's model
   renderAuth('Signed out.', 'ok');
 }
 
@@ -388,6 +407,44 @@ function setTab(id) {
   if (id === 'settings')  return renderSettings(v);
 }
 
+/* ---------------- the status chip ----------------
+   "server down" used to be the answer to two different questions, and the fix for
+   each is different: restart the veil server, versus start the model backend it
+   is pointed at. What the client can actually distinguish, honestly:
+
+     - The VEIL server is the thing /api/v1/fleet talks to. If that call fails,
+       the veil server is unreachable, full stop. That case was always correct —
+       it just did not say WHICH server, so the reader could not tell it from a
+       model problem.
+     - A LOCAL model backend can be checked, because /api/v1/models/local asks
+       Ollama on the host and reports `reachable` (local_models.zig). Loopback
+       only and 3s-bounded, so it is a cheap question.
+     - A HOSTED provider cannot be checked from here at all. There is no
+       reachability endpoint for one, and inventing a guess is worse than silence,
+       so for a hosted model the chip says nothing about the backend and the
+       failure mapping in failToast carries that case at send time.
+
+   The local probe is throttled well below the 8s health tick: this is a
+   background reassurance, not something worth a request every eight seconds. */
+
+const LOCAL_PROBE_MS = 60000;
+let _localProbeAt = 0;
+let _probedModel = null;   // which model the cached probe answer describes (see syncSetupState)
+
+async function probeLocalBackend() {
+  if (Date.now() - _localProbeAt < LOCAL_PROBE_MS) return;
+  _localProbeAt = Date.now();
+  try {
+    const j = await jget('/api/v1/models/local', 8000);
+    S.localUp = !!j.reachable;
+    if (j.reachable) S.localModels = j;   // free refresh of the installed list
+  } catch (e) {
+    // The question went unanswered, which is not the same as "the backend is down".
+    // null keeps the chip quiet rather than reporting a failure we did not observe.
+    S.localUp = null;
+  }
+}
+
 async function pollHealth() {
   if (document.hidden) return;   // a backgrounded tab must not poll
   try {
@@ -397,9 +454,32 @@ async function pollHealth() {
   } catch (e) {
     S.online = false;
   }
-  const dot = el('statusDot'), txt = el('statusText');
-  if (dot) dot.className = 'status-dot ' + (S.online ? 'on' : 'off');
-  if (txt) txt.textContent = S.online ? (S.fleet.minds + ' minds') : 'server down';
+  // Computed ONCE and reused below. S.localUp is only ever a statement about a
+  // local backend, so a user who switches from a dead local model to a hosted one
+  // would otherwise keep being told the backend is down — the flag is still false,
+  // and nothing re-probes it because there is no longer anything local to probe.
+  const local = modelIsLocal();
+  if (S.online && local) await probeLocalBackend();
+
+  let cls = 'on', text = S.fleet.minds + ' minds', why = '';
+  if (!S.online) {
+    cls = 'off';
+    text = 'veil server down';
+    why = 'This page cannot reach the veil server itself. Check it is still running.';
+  } else if (!effectiveModel()) {
+    cls = 'warn';
+    text = 'no model picked';
+    why = 'The veil server is up. Choose a model in Settings before sending anything.';
+  } else if (local && S.localUp === false) {
+    cls = 'warn';
+    text = 'model backend down';
+    why = 'The veil server is up, but the local model server it is pointed at is not answering. Start it (ollama serve).';
+  }
+
+  const dot = el('statusDot'), txt = el('statusText'), chip = dot && dot.parentNode;
+  if (dot) dot.className = 'status-dot ' + cls;
+  if (txt) txt.textContent = text;
+  if (chip) chip.title = why;
 }
 
 /* ============================================================ dashboard */
@@ -588,7 +668,15 @@ function renderChat(host) {
   el('railRestore').addEventListener('click', toggleRail);
   wireRailGrip();
   setRailCollapsed(LS.get('veil.railCollapsed', '0') === '1');
-  el('sendBtn').addEventListener('click', sendTurn);
+  // With no model this control is relabelled into a link to Settings (syncSetupState),
+  // so its CLICK has to go there whatever the composer holds. sendTurn cannot carry
+  // that on its own: it returns on empty text BEFORE it ever reaches the model gate,
+  // and a first-run composer is empty — which left the button inert for exactly the
+  // person it was relabelled for. No toast here; the label already says where it goes.
+  el('sendBtn').addEventListener('click', () => {
+    if (!effectiveModel()) return setTab('settings');
+    sendTurn();
+  });
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
   el('attachBtn').addEventListener('click', () => el('fileInput').click());
   el('fileInput').addEventListener('change', (e) => { if (e.target.files[0]) attachImage(e.target.files[0]); });
@@ -623,6 +711,7 @@ function renderChat(host) {
     if (f && f.type.indexOf('image/') === 0) attachImage(f);
   });
 
+  syncSetupState();   // before the list resolves, so the composer never lies on first paint
   refreshConvs();
   if (S.conv) openConv(S.conv, false);
 }
@@ -691,8 +780,14 @@ async function refreshConvs() {
   } catch (e) {
     S.convs = [];
   }
+  // Set on BOTH paths: a failed fetch is still an answer as far as the transcript is concerned, and
+  // leaving it false would hold the blank state forever on an account whose list genuinely errored.
+  S.convsLoaded = true;
   const host = el('convScroll');
   if (!host) return;
+  // The transcript's no-conversation state depends on whether this account has any
+  // history at all, and that is only known once this call lands.
+  if (!S.conv) drawTranscript();
   if (!S.convs.length) {
     host.innerHTML = '<div class="empty">no conversations yet</div>';
     return;
@@ -1057,11 +1152,84 @@ async function openConvFile(path) {
    every turn. Committed messages are now rendered once and appended; only the
    live block is touched while a turn runs. */
 
+/* ---------------- the first-run nudge ----------------
+   A brand-new account lands on the Chat tab with a blank transcript and no
+   sequence: nothing says that a model has to be chosen before anything can run,
+   so the first thing that happens is a failed turn. This is the missing order of
+   operations — and it is a NUDGE, not a tutorial. It is three lines at most, each
+   step drops off as it is satisfied, and the whole thing is gone the moment the
+   conversation has any history. */
+
+/** The provider whose key is missing for the effective model, '' when none is
+    needed — and '' ALSO when we simply have not looked. S.keys is only filled by
+    refreshKeys() on the Settings tab, so on a first login it is an empty array
+    that means "unknown", not "none stored". Reading it as fact would tell a user
+    with a perfectly good key on file to go add the key they already have. */
+function missingKeyProvider() {
+  if (!S.keysLoaded) return '';
+  const m = modelById(effectiveModel());
+  const prov = m ? m.provider : roleProvider('');
+  if (!prov) return '';                       // custom endpoint — unknowable, so unsaid
+  const p = (S.models && S.models.providers || []).find((x) => x.key === prov);
+  if (!p || p.base_url === 'local' || !p.needs_key) return '';
+  return (S.keys || []).some((k) => k.provider === prov) ? '' : prov;
+}
+
+function setupHintHtml() {
+  const model = effectiveModel();
+  const need = missingKeyProvider();
+  const steps = [];
+
+  steps.push(model
+    ? '<li class="done">Model: <span class="mono">' + esc(model) + '</span></li>'
+    : '<li class="now">Pick a model in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+
+  // Only speak about keys when there is something true to say. A local model needs
+  // none, and an unknown endpoint is not ours to guess at.
+  if (need) {
+    steps.push('<li class="now">Add your <span class="mono">' + esc(need)
+      + '</span> key in <button class="linkbtn" data-goto="settings">Settings</button></li>');
+  } else if (model && !S.keysLoaded && !modelIsLocal()) {
+    steps.push('<li>If that model needs a provider key, add it in '
+      + '<button class="linkbtn" data-goto="settings">Settings</button></li>');
+  }
+
+  // "Ready" has to mean every blocking step is done, not just the model — saying it
+  // above an outstanding "add your key" line contradicts the list underneath it.
+  const ready = model && !need;
+  steps.push(ready
+    ? '<li class="now">Ask it something below</li>'
+    : '<li>Then ask it something below</li>');
+
+  return '<div class="empty setup-hint">'
+    + '<b>' + (ready ? 'Ready when you are' : 'One thing first') + '</b>'
+    + '<ol class="setup-steps">' + steps.join('') + '</ol>'
+    + '</div>';
+}
+
+/** Paint an empty-transcript message, but only when it actually changed. The hint
+    holds real buttons, and rebuilding the markup underneath a reader is how a
+    click lands on a node that no longer exists. */
+function paintEmpty(host, html) {
+  if (host._emptyHtml !== html) { host._emptyHtml = html; host.innerHTML = html; }
+}
+
 function drawTranscript() {
   const host = el('transcript');
   if (!host) return;
   if (!S.conv) {
-    host.innerHTML = '<div class="empty">pick a conversation, or start a new one</div>';
+    // No conversation selected. Someone with history wants the list; someone with
+    // none is brand new and wants the order of operations.
+    //
+    // Until refreshConvs answers, S.convs is [] because it is UNKNOWN, not because the account is
+    // empty — same distinction keysLoaded draws for S.keys. Asserting on it painted the first-run
+    // setup nudge at every returning user before flipping to "pick a conversation" one round trip
+    // later. Stay quiet while unknown; refreshConvs calls back here the moment it lands.
+    paintEmpty(host, !S.convsLoaded
+      ? ''
+      : (S.convs.length
+        ? '<div class="empty">pick a conversation, or start a new one</div>'
+        : setupHintHtml()));
     host._rendered = 0;
     return;
   }
@@ -1071,13 +1239,16 @@ function drawTranscript() {
   // delete) — start over. Otherwise append only what is new.
   if (typeof host._rendered !== 'number' || S.msgs.length < host._rendered) {
     host.innerHTML = '';
+    host._emptyHtml = '';
     host._rendered = 0;
   }
+  // An empty conversation gets the same nudge, which by now is usually one line:
+  // an account that already has a model and a key sees only "ask it something".
   if (host._rendered === 0 && !S.msgs.length && !S.live) {
-    host.innerHTML = '<div class="empty">say something to begin</div>';
+    paintEmpty(host, setupHintHtml());
     return;
   }
-  if (host._rendered === 0) host.innerHTML = '';
+  if (host._rendered === 0) { host.innerHTML = ''; host._emptyHtml = ''; }
 
   for (let i = host._rendered; i < S.msgs.length; i++) {
     const node = document.createElement('div');
@@ -1314,6 +1485,103 @@ function wireCodeCopy(host) {
   });
 }
 
+/* ---------------- what a failure means, and what to do about it ----------------
+   A raw transport string tells the reader that something broke, not which thing,
+   and never what to do next. "connect refused" is a five-second fix if you know
+   it means your Ollama is not running, and a dead end if you do not.
+
+   EVERY pattern below was read out of the server before it was written here, and
+   the source is cited. A mapping keyed on a string the server never sends is dead
+   code that looks like a feature, so anything unverified is deliberately absent:
+   there is no "missing API key" case, for instance, because nothing server-side
+   emits one — a blank key is simply sent, and the PROVIDER answers 401, which
+   arrives here inside "provider error: …". That is what the auth pattern matches.
+
+   Order matters: the provider-error sub-cases must be tested before the generic
+   provider-error line, or the generic one swallows them. */
+const FAILURE_FIXES = [
+  // --- FIRST, and anchored. jget/jpost throw exactly this on a 401 (and http.zig:179
+  // sends it as an err body), meaning the VEIL session was rejected. Left to the
+  // loose auth pattern further down it would be read as a provider key problem and
+  // send the reader to Settings to fix a key that was never the issue.
+  { re: /^unauthorized$/i,
+    fix: 'Your session expired. Sign in again — the login form is already on screen.' },
+
+  // --- the veil server itself never answered. Not a server string: this is what
+  // fetch() rejects with, and the wording is per-browser (Chrome / Firefox / Safari).
+  { re: /failed to fetch|networkerror|load failed|aborted/i,
+    fix: 'The veil server did not answer. Check it is still running, then try again.' },
+
+  // --- llm.zig:190-192, the loopback path: a local model backend that is not
+  // listening, is too slow to answer, or dropped the connection mid-reply.
+  { re: /connect refused/i,
+    fix: 'Your local model server is not running. Start it (ollama serve), or pick a hosted model in Settings.' },
+  { re: /local model call timed out/i,
+    fix: 'The local model did not answer in time — it may still be loading. Try again, or pick a smaller model.' },
+  { re: /connection dropped mid-reply/i,
+    fix: 'The local model server died mid-answer. Check it is still up, then try again.' },
+
+  // --- provider error sub-cases (llm.zig:352,958 wrap the provider's OWN message,
+  // so these match the provider's wording, not ours).
+  { re: /api[ _-]?key|unauthorized|authentication|invalid[_ ]api/i,
+    fix: 'The provider rejected the key. Add or replace it in Settings → Provider keys.' },
+  { re: /quota|insufficient|billing|credit/i,
+    fix: 'The provider refused on billing. Check the account behind that key.' },
+  { re: /model.*(not found|does not exist|unknown)|(not found|unknown).*model/i,
+    fix: 'That provider does not have this model. Pick another in Settings — or, for a local model, pull it first.' },
+  { re: /^provider error/i,
+    fix: 'The provider refused the request. The detail below is its own wording.' },
+
+  // --- llm.zig:215. curl only exits non-zero on a TRANSPORT failure; an HTTP error
+  // status comes back as a body and parses as a provider error above.
+  { re: /^curl exit|curl failed to run/i,
+    fix: 'Could not reach the provider. Check your connection and the Base URL in Settings.' },
+
+  // --- llm.zig:339,931 and the no-choices path: something answered, but not in the
+  // shape an OpenAI-compatible API replies with.
+  { re: /^bad (llm|ollama) response|no choices in llm response/i,
+    fix: 'That endpoint answered with something that is not an OpenAI-compatible reply. Check the Base URL in Settings.' },
+
+  // --- service.zig:288 (501, VEIL_CHAT_BACKEND=0) and http.zig:62,66 (403).
+  { re: /chat backend disabled/i,
+    fix: 'The host has turned server-side chat off on this instance. Only they can turn it back on.' },
+  { re: /this account is suspended/i,
+    fix: 'Ask the instance admin to lift the suspension.' },
+
+  // --- engine.zig:604.
+  { re: /server env unavailable/i,
+    fix: 'The server could not read its own environment — it likely needs a restart.' },
+];
+
+/** The remedy for a failure, or '' when we have nothing honest to add.
+    Deliberately silent on the messages that are ALREADY instructions — the 409
+    local-model-busy line (service.zig:414) and both 429 capacity lines
+    (service.zig:360,366) each say what to do, and prefixing them with our own
+    version of the same advice would only make them longer. */
+function explainFailure(detail) {
+  const s = String(detail || '');
+  for (const f of FAILURE_FIXES) if (f.re.test(s)) return f.fix;
+  return '';
+}
+
+/** Report a failure as: what to DO, then what actually came back. The remedy is
+    ADDED to the server's own words, never substituted for them — a reader who
+    knows more than we do still needs the real string, and so does a bug report.
+
+    The toast is 340px wide and gone in five seconds, so the detail is clipped for
+    it and the untouched string goes to console.error. That console line is the one
+    durable copy: the transcript is NOT, because the engine emits {error} and then
+    {done}, and `done` calls resetStream() — which clears S.stream.status a moment
+    after it is set. Anything that leaned on the status line to hold the detail
+    would be describing a message that has already been wiped. */
+function failToast(title, detail) {
+  const raw = String(detail || 'unknown error');
+  const fix = explainFailure(raw);
+  console.error('[veil] ' + title + ': ' + raw);
+  const shown = raw.length > 300 ? raw.slice(0, 300) + '…' : raw;
+  toast(title, fix ? fix + '  ·  ' + shown : shown, 'err');
+}
+
 /* ---------------- sending a turn ---------------- */
 
 function setTurnUi(live) {
@@ -1325,10 +1593,64 @@ function setTurnUi(live) {
   if (st && !live) st.textContent = '';
 }
 
+/** Reflect "can this account run a turn at all?" in the composer, and keep the
+    empty-state nudge agreeing with it.
+ *
+ *  Sending is blocked, but the CONTROL is not disabled, and neither `disabled` nor
+ *  aria-disabled is set. Both would be a lie about a button that does something:
+ *  with no model it stops being Send and becomes "Pick a model in Settings", which
+ *  is a working control that goes there. Marking it unavailable would announce
+ *  "you cannot use this" to a screen reader about the one affordance that fixes
+ *  the problem — and the real `disabled` attribute would also drop it out of the
+ *  tab order, putting it out of keyboard reach entirely. sendTurn is the gate; this
+ *  is the label.
+ *
+ *  Callable from any tab: the composer only exists on Chat, so the null guard is
+ *  what lets Settings call this the moment a model is chosen — which is what makes
+ *  it recover without a reload. */
+function syncSetupState() {
+  // FIRST, and outside the composer guard. A changed model makes any cached local-backend answer a
+  // statement about the OLD one — and the call that changes it comes from SETTINGS, where there is no
+  // composer at all. Behind the guard below, this reset would never run in the one case it is for.
+  //
+  // Gated on the model actually CHANGING. Resetting unconditionally looked equivalent and was not:
+  // renderChat calls this on every Chat-tab render, so bouncing between tabs re-probed the backend on
+  // every following health tick and the 60s throttle never held.
+  const ready = !!effectiveModel();
+  if (effectiveModel() !== _probedModel) {
+    _probedModel = effectiveModel();
+    _localProbeAt = 0;
+  }
+  const send = el('sendBtn');
+  if (send) {
+    send.textContent = ready ? 'Send' : 'Pick a model in Settings';
+    send.classList.toggle('needs-model', !ready);
+    send.title = ready ? '' : 'No model is configured — this opens Settings.';
+  }
+  drawTranscript();   // null-guarded itself; the nudge reads the same facts as the button
+}
+
+/* Same DELEGATION reasoning as the provider-key controls below: the nudge lives
+   inside markup that drawTranscript rebuilds, so a listener bound to those nodes
+   is orphaned by the next repaint and the link silently stops working. */
+document.addEventListener('click', (e) => {
+  const t = e.target.closest ? e.target.closest('[data-goto]') : null;
+  if (t) setTab(t.dataset.goto);
+});
+
 async function sendTurn() {
   const input = el('input');
   const text = input.value.trim();
   if (!text) return;
+  // THE gate, not the button. syncSetupState relabels the send control when there
+  // is no model, but the control is only one of the ways a turn starts — Enter on
+  // a real keyboard is the other, and it does not go through the button at all.
+  // Without a model the POST would carry model:"" and fail as a raw provider error
+  // that reads like the app is broken.
+  if (!effectiveModel()) {
+    toast('No model picked yet', 'Choose one in Settings — nothing can run until then.', 'err');
+    return setTab('settings');
+  }
   if (!S.conv) { S.conv = newConvId(); el('convTitle').textContent = S.conv; }
 
   const body = {
@@ -1371,9 +1693,12 @@ async function sendTurn() {
     refreshConvs();
   } catch (e) {
     setTurnUi(false);
-    if (e.status === 403) toast('Chat is admin-only', 'This account cannot run server chat yet.', 'err');
-    else if (e.status === 409) toast('Busy', e.message, 'err');
-    else toast('Could not send', e.message, 'err');
+    // The 403 here is NOT "chat is admin-only" — that gate is gone (service.zig:292
+    // opened postMessage to every authed user). The only 403 this route can still
+    // produce is a banned account (http.zig:62,66), so the old label sent a
+    // suspended user hunting for an admin setting that does not exist.
+    if (e.status === 409) toast('Busy', e.message, 'err');
+    else failToast(e.status === 403 ? 'Account suspended' : 'Could not send', e.message);
     S.stream.status = 'failed: ' + (e.message || 'unknown');
     drawTranscript();
   }
@@ -1495,7 +1820,10 @@ function applyFrame(f) {
       return false;
     }
     case 'error':
-      toast('Turn error', f.err || '', 'err');
+      // Where a model/key/backend failure actually surfaces most of the time: the
+      // POST returns 202 the moment the turn is spawned, so anything that goes
+      // wrong DURING inference arrives here, not in sendTurn's catch.
+      failToast('Turn error', f.err);
       S.stream.status = f.err || 'error';
       return true;
     case 'done':
@@ -2244,6 +2572,7 @@ function renderSettings(host) {
     }
     saveSettings();
     drawRolePanels();
+    syncSetupState();
   });
   el('kKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addProviderKey(); } });
 
@@ -2341,6 +2670,38 @@ function usingServerDefault() {
   return !!(S.serverDefault && S.serverDefault.model) && !S.settings.model && !S.settings.base_url;
 }
 
+/** The model this account's next turn will ACTUALLY run on, or '' if there is
+    none. Mirrors the server's own resolution (service.zig:381): a blank model is
+    filled from the host's default only when the base URL is blank too, because
+    the default is applied all-or-nothing on the pair. Reading only S.settings.model
+    would call a working setup "unconfigured"; reading only the default would call
+    an unconfigured one working. */
+function effectiveModel() {
+  if (S.settings.model) return S.settings.model;
+  if (!S.settings.base_url && S.serverDefault && S.serverDefault.model) return S.serverDefault.model;
+  return '';
+}
+
+function effectiveBase() {
+  if (S.settings.model || S.settings.base_url) return S.settings.base_url || '';
+  return (S.serverDefault && S.serverDefault.base_url) || '';
+}
+
+/** Does the effective model run on this machine? Two independent tells, because
+    either one alone is wrong:
+      - a loopback base URL (the same four hosts llm.isLocal matches), and
+      - the catalog's own `hosting`, since picking a local model from the picker
+        deliberately leaves the base URL BLANK (providerBase returns '' for the
+        "local" sentinel), so a base-URL test alone would miss every catalog pick.
+    Only used to decide whether the local-backend probe is worth running. */
+function modelIsLocal() {
+  const base = effectiveBase();
+  if (/localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]/.test(base)) return true;
+  if (base) return false;   // an explicit remote endpoint is not local, whatever the catalog says
+  const m = modelById(effectiveModel());
+  return !!(m && m.hosting === 'local');
+}
+
 function drawRolePanels() {
   const host = el('rolePanels');
   if (!host) return;
@@ -2399,6 +2760,7 @@ function drawRolePanels() {
       const note = host.querySelector('[data-note="' + role + '"]');
       if (note) note.textContent = m && m.note ? m.note : '';
       updateCharCount();   // the composer's cap follows the coding model's size
+      syncSetupState();    // and whether it can send at all
       refreshRoleKeyStates();
       if (m && m.provider) needsKeyHint(m.provider);
     });
@@ -2408,6 +2770,10 @@ function drawRolePanels() {
     inp.addEventListener('change', () => {
       S.settings[inp.dataset.set] = inp.value.trim();
       saveSettings();
+      // Typing an id by hand is the other way out of "no model configured", so the
+      // composer has to hear about it too.
+      updateCharCount();
+      syncSetupState();
       // A hand-typed id may not be in the catalog; drop the select to "custom"
       // rather than letting it claim a model the user did not choose.
       if (inp.dataset.set.endsWith('model')) {
@@ -2547,6 +2913,7 @@ async function refreshKeys() {
     const j = await jget('/api/v1/keys');
     const keys = j.keys || [];
     S.keys = keys;   // needsKeyHint reads this to avoid nagging about a key you already have
+    S.keysLoaded = true;   // and missingKeyProvider will only speak once this is true
     host.innerHTML = keys.length
       ? keys.map((k) => `<div class="key-row">
           <span class="mono grow">${esc(k.provider)}</span>

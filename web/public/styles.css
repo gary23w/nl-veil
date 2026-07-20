@@ -200,6 +200,26 @@ button {
 .btn-danger:hover { background: color-mix(in srgb, var(--danger) 26%, transparent); }
 .btn-sm { min-height: 28px; padding: 0 10px; font-size: calc(var(--fs-small) * var(--text-scale)); }
 
+/* Send, when there is no model to send to. It must NOT look like the primary
+   action — it does not send — but it is still a live control that goes to
+   Settings, so it must not look inert either: amber tonal, the same colour the
+   status chip uses for the same class of problem.
+
+   The label is a sentence rather than a word, so on a narrow screen it is allowed
+   to wrap and shrink instead of shoving the textarea off the row. Everything else
+   in .composer-row assumes a button that stays one short word. */
+.btn.needs-model {
+  background: color-mix(in srgb, var(--warn) 15%, transparent);
+  color: var(--warn);
+  font-weight: 600;
+  white-space: normal;
+  line-height: 1.2;
+  max-width: 46%;
+  padding: 0 10px;
+  font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.btn.needs-model:hover { background: color-mix(in srgb, var(--warn) 27%, transparent); }
+
 input[type=text], input[type=email], input[type=password], input[type=number], select, textarea {
   width: 100%;
   min-height: var(--field-h);
@@ -296,6 +316,9 @@ label, .label {
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text-muted); flex: 0 0 auto; }
 .status-dot.on  { background: var(--success); }
 .status-dot.off { background: var(--danger); }
+/* Amber, not red: the veil server IS answering. Something between it and a model
+   is not, which is a different problem with a different fix. */
+.status-dot.warn { background: var(--warn); }
 
 .icon-btn {
   width: 38px; height: 38px;
@@ -346,6 +369,56 @@ label, .label {
   color: var(--text-muted);
   font-size: calc(var(--fs-small) * var(--text-scale));
 }
+
+/* ---------------- the first-run nudge ----------------
+   A short ordered list in the blank transcript. It is deliberately built out of
+   .empty rather than beside it: this is the same "nothing here yet" slot, just
+   with the order of operations in it, and it must read as quiet guidance rather
+   than as an onboarding panel that has taken over the screen.
+
+   The block centres; the text inside does NOT. A numbered list centred line by
+   line is unreadable, so the list gets its own left-aligned column with a width
+   cap that also keeps it comfortable on a phone. */
+.setup-hint { gap: 12px; }
+.setup-hint b {
+  color: var(--text-secondary);
+  font-size: calc(var(--fs-ui) * var(--text-scale));
+}
+.setup-steps {
+  list-style: none;
+  counter-reset: step;
+  display: grid; gap: 7px;
+  text-align: left;
+  max-width: 300px;
+}
+.setup-steps li {
+  display: flex; align-items: baseline; gap: 9px;
+  counter-increment: step;
+  line-height: 1.45;
+}
+/* The marker is a real element rather than a list bullet so a finished step can
+   swap the number for a tick without the row shifting sideways. */
+.setup-steps li::before {
+  content: counter(step);
+  flex: 0 0 auto;
+  width: 18px; height: 18px;
+  display: inline-grid; place-items: center;
+  border-radius: 50%;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+  font-weight: 600;
+  transform: translateY(2px);   /* baseline alignment fights a fixed-height circle */
+}
+.setup-steps li.now::before { background: var(--tonal); color: var(--accent); }
+.setup-steps li.now  { color: var(--text); }
+.setup-steps li.done { color: var(--text-muted); }
+.setup-steps li.done::before {
+  content: '✓';
+  background: color-mix(in srgb, var(--success) 16%, transparent);
+  color: var(--success);
+}
+.setup-steps .mono { color: var(--text-secondary); word-break: break-all; }
 
 /* ============================================================ dashboard */
 .stat-grid {
