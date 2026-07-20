@@ -902,6 +902,10 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .model-note:empty { display: none; }
 
 .role-panel { padding: 12px 0; border-top: 1px solid var(--border); }
+/* The admin default-model panel always renders all three role panels; the "One model
+   for everything" checkbox hides the thinking/prompting pair by toggling this class,
+   so switching modes never destroys typed-in values or round-trips the server. */
+#cfgRoles.one-model .trio-only { display: none; }
 .role-title { font-weight: 650; font-size: calc(var(--fs-ui) * var(--text-scale)); margin-bottom: 8px; }
 .role-title .muted { font-weight: 400; }
 

@@ -2204,10 +2204,12 @@ async function renderServerConfig() {
           three roles they can set for themselves. ${SPEND_HINT}</div></div>
       <input type="checkbox" id="cfgOne" class="w-auto" ${trio ? '' : 'checked'}>
     </div>
-    <div id="cfgRoles">
+    <div id="cfgRoles" class="${trio ? '' : 'one-model'}">
       ${rolePanel('', 'Coding', ROLES[0].hint, cur.default_model, cur.default_base_url)}
-      ${trio ? rolePanel('think_', 'Thinking', ROLES[1].hint, cur.think_model, cur.think_base_url) : ''}
-      ${trio ? rolePanel('prompt_', 'Prompting', ROLES[2].hint, cur.prompt_model, cur.prompt_base_url) : ''}
+      <div class="trio-only">
+        ${rolePanel('think_', 'Thinking', ROLES[1].hint, cur.think_model, cur.think_base_url)}
+        ${rolePanel('prompt_', 'Prompting', ROLES[2].hint, cur.prompt_model, cur.prompt_base_url)}
+      </div>
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn btn-solid btn-sm" id="cfgSave">Save</button>
@@ -2218,10 +2220,17 @@ async function renderServerConfig() {
     </div>`;
 
   el('cfgOne').addEventListener('change', () => {
-    // Collapsing to one model clears the other two: a hidden thinking model that
-    // still applied would be a setting nobody could see.
-    const one = el('cfgOne').checked;
-    saveServerConfig(readCfg(''), one ? null : readCfg('think_'), one ? null : readCfg('prompt_'));
+    // Toggle which role panels are VISIBLE — do NOT persist here. Nothing is saved
+    // until the admin clicks Save (which reads this checkbox's state below).
+    //
+    // The old handler saved on every toggle, and that made the box impossible to turn
+    // OFF: unchecking read the thinking/prompting fields, but those panels only
+    // existed in the DOM when a trio was already saved — so it wrote two BLANK trio
+    // models, the server round-tripped to "no trio", and the box re-rendered checked.
+    // Every click also fired a "Default cleared" toast (they stacked up). Now the
+    // panels are always in the DOM and just hidden, so unchecking reveals empty
+    // thinking/prompting fields to fill in, and Save persists what was typed.
+    el('cfgRoles').classList.toggle('one-model', el('cfgOne').checked);
   });
   $$('[data-cfgpick]').forEach((sel) => sel.addEventListener('change', () => {
     const role = sel.dataset.cfgpick;
