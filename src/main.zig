@@ -684,6 +684,10 @@ pub fn main(init: std.process.Init) !void {
     // the LAN does not make a local file more reachable. Gating it on the bind address meant that
     // turning on network access silently broke every same-machine client.
     preloadDesktopKey(gpa, io, &auth, &api_keys, init.environ_map, paths.data, admin_pw);
+    // Carry a pre-split install's stored credentials into the per-user store, once. uid 1 by
+    // construction: next_id starts at 1 and the admin is the first account seeded, which is the same
+    // assumption engine.zig's legacy read-fallback already makes.
+    migrateLegacyMemories(gpa, io, paths.data, 1);
     if (desk_requested and !HAS_GUI)
         log.warn("--desk ignored: this is the SERVER-ONLY build (-Dapp=false), which has no GUI compiled in. The server itself is up (see the URL above) — open it in a browser, or use the standard build.", .{});
 
@@ -798,6 +802,43 @@ fn readAdminPassword(io: std.Io, data_dir: []const u8, out: *[48]u8) ?[]const u8
     if (pw.len < 8 or pw.len > out.len) return null;
     @memcpy(out[0..pw.len], pw);
     return out[0..pw.len];
+}
+
+/// MIGRATE the pre-split durable memory store into the admin's per-user one.
+///
+/// Splitting {data}/.veil-desk/memories.jsonl per uid was right — it backs get_credential, and one
+/// global file meant every account would read every other account's stored secrets the moment chat
+/// opened up. But the existing file was left where it was, so an upgraded install came up with an
+/// EMPTY store: the injection path had a read-fallback for uid 1, and get_credential — which reads
+/// ctx.durable_path directly — did not. Credentials that were plainly there stopped being findable.
+///
+/// A read-fallback alone would have been a trap rather than a fix. Writes go only to the per-user
+/// path, so the first stored memory would create that file, the fallback would stop being consulted,
+/// and every legacy credential would vanish with nothing to say why. Copying once removes the
+/// ambiguity: afterwards there is one file, and it is the one everything reads and writes.
+///
+/// The original is left in place, deliberately. It costs a few KB and it is the only copy of
+/// credentials the user may have no other record of — this is not the moment to be tidy.
+fn migrateLegacyMemories(gpa: std.mem.Allocator, io: std.Io, data: []const u8, admin_uid: u64) void {
+    var lb: [700]u8 = undefined;
+    var nb2: [700]u8 = undefined;
+    const legacy = std.fmt.bufPrint(&lb, "{s}/.veil-desk/memories.jsonl", .{data}) catch return;
+    const mine = std.fmt.bufPrint(&nb2, "{s}/u{d}/.veil-desk/memories.jsonl", .{ data, admin_uid }) catch return;
+
+    // Already migrated (or the user has their own store) — never overwrite it.
+    if (std.Io.Dir.cwd().statFile(io, mine, .{})) |_| return else |_| {}
+    const body = std.Io.Dir.cwd().readFileAlloc(io, legacy, gpa, .limited(4 << 20)) catch return;
+    defer gpa.free(body);
+    if (body.len == 0) return;
+
+    var db: [700]u8 = undefined;
+    const dir = std.fmt.bufPrint(&db, "{s}/u{d}/.veil-desk", .{ data, admin_uid }) catch return;
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mine, .data = body }) catch |e| {
+        log.warn("could not migrate the durable memory store to u{d} ({t}) — get_credential may find nothing", .{ admin_uid, e });
+        return;
+    };
+    log.info("migrated the durable memory store into u{d}/.veil-desk/ ({d} bytes); the original is kept as a backup", .{ admin_uid, body.len });
 }
 
 fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@import("auth/api_keys.zig").ApiKeys, environ: *std.process.Environ.Map, data: []const u8, admin_pw: ?[]const u8) void {
