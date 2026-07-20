@@ -53,18 +53,27 @@ pub fn run(
     const base_url = ctx.environ.get("NL_LLM_BASE_URL") orelse "http://127.0.0.1:11434/v1";
     const model = ctx.environ.get("NL_LLM_MODEL") orelse "gpt-oss:20b";
     const api_key = ctx.environ.get("NL_LLM_KEY") orelse "";
-    // MODEL TRIO (optional): point the "thinking" (planning + context housekeeping) and "prompting" (the
-    // auto-loop self-prompt-back drive) calls at other models via NL_LLM_THINK_* / NL_LLM_PROMPT_*. Any left
-    // unset stays "" and the server falls back to the base model above — a plain NL_LLM_* setup is unchanged.
+    // MODEL TRIO (optional): route the calls that are not the agentic step at other models via
+    // NL_LLM_THINK_* / NL_LLM_PROMPT_*. thinking = plan/reflect/compact/ctxsum/summary/lesson (planning plus
+    // the mechanical transcript housekeeping); prompting = the one-line drive steps — the auto-loop's next
+    // step, web-search query rewrites, stuck recovery. Any left unset stays "" and the server falls back to
+    // the base model above (ModelTrio.pick) — a plain NL_LLM_* setup is unchanged. `veil help` documents it.
     const think_base = ctx.environ.get("NL_LLM_THINK_BASE_URL") orelse "";
     const think_model = ctx.environ.get("NL_LLM_THINK_MODEL") orelse "";
     const think_key = ctx.environ.get("NL_LLM_THINK_KEY") orelse "";
     const prompt_base = ctx.environ.get("NL_LLM_PROMPT_BASE_URL") orelse "";
     const prompt_model = ctx.environ.get("NL_LLM_PROMPT_MODEL") orelse "";
     const prompt_key = ctx.environ.get("NL_LLM_PROMPT_KEY") orelse "";
-    cli.out("  backend: {s}  ({s})\n", .{ model, base_url });
+    // Name the ROLE each model is carrying, not just the model — otherwise a two-line banner looks like a
+    // list of backends. When no role is set, say so once: the trio is opt-in and invisible until you look.
+    cli.out("  coding: {s}  ({s})\n", .{ model, base_url });
     if (think_model.len > 0) cli.out("  thinking: {s}\n", .{think_model});
     if (prompt_model.len > 0) cli.out("  prompting: {s}\n", .{prompt_model});
+    if (think_model.len == 0 and prompt_model.len == 0)
+        // Deliberately does NOT claim these run on the coding model: this turn is POSTed to a server, and
+        // service.zig fills a blank role from the host's published trio before falling back to coding. The
+        // CLI cannot know which happened without asking, so it names the mechanism instead of a model.
+        cli.out("  thinking + prompting: unset — the server's models for those roles, else coding (set NL_LLM_THINK_* / NL_LLM_PROMPT_* to choose; `veil help`)\n", .{});
 
     var stdin_buf: [4096]u8 = undefined;
     while (true) {

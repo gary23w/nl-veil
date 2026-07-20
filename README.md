@@ -417,6 +417,42 @@ veil chat — conversation cli7f3a1c
 > what are you working on?
 ```
 
+## Three models, one turn — the model trio
+
+A turn is not one kind of work. It streams a reply and calls tools; it decides what *done* means; it
+writes itself a one-line instruction for the next step, over and over. Those want different models, so
+every LLM call the engine makes is labelled and routed to one of three **roles**:
+
+- **coding** — the agentic step: the reply that streams onto your screen and every tool call inside it
+  (`chat`).
+- **thinking** — planning and transcript housekeeping: the task breakdown and the acceptance bar
+  (`plan`), the post-hoc critique (`reflect`), compaction and the rolling summary (`compact`, `ctxsum`),
+  plus `summary` and the scheduled-run `lesson`.
+- **prompting** — the short, frequent calls that write the *next instruction* rather than answer
+  anything: the auto-loop drive step (`loop`), web-search query rewrites (`searchq`), stuck recovery
+  (`stuck`).
+
+**One model for everything is the default and is fully supported.** A role counts as set only when it
+has both a model id and a base URL; anything else is blank, and a blank role falls back to coding
+(`ModelTrio.pick` in `src/worker/chat/engine.zig`). Leave thinking and prompting empty and the engine
+behaves exactly as it did before roles existed. The routing is guarded by a source audit
+(`src/worker/chat/trio_routing_test.zig`) that fails `zig build test` if a label ever reaches the wrong role.
+
+Set it in **Settings → Models** (web), **Settings** (desktop), or **Admin → Default model** to publish a
+trio to everyone who hasn't chosen their own — per role, so an account that picked only a coding model
+still picks up the host's thinking and prompting. For `veil chat` it's environment: `NL_LLM_*` for
+coding, `NL_LLM_THINK_*` and `NL_LLM_PROMPT_*` for the other two.
+
+The one thing worth knowing before you choose: **thinking is not uniformly the expensive-model role.**
+Measured over real request bodies, `plan` averages about **1 KB** per call and carries all of the
+judgment, while `compact` and `ctxsum` are **tens of KB** per turn and are mechanical compression. Both
+run on the thinking model, so that single setting pays for a rare high-stakes call and a bulky low-stakes
+one at the same time. Prompting is the easy call — small outputs, no judgment, high volume — so it is
+the one to make cheap.
+
+Full routing table, the per-call measurements behind that advice, the cost split, and the limitations are
+on the docs page: **[the model trio](https://gary23w.github.io/nl-veil/#doc=guide/models)**.
+
 ## Scheduled tasks
 
 A scheduled task runs **strictly through chat**: when it comes due, the server mints a fresh

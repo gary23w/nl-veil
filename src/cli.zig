@@ -530,6 +530,25 @@ fn cmdHelp() u8 {
         \\CHAT (the server-side veil brain)
         \\  chat [conv]                  interactive chat; steer/stop a running turn inline
         \\
+        \\MODEL TRIO (environment, read by `veil chat`)
+        \\  Every LLM call carries a role, and each role can run on a different model. Set what you want;
+        \\  a role left blank falls back to the SERVER's model for that role if the host published one, and
+        \\  to coding otherwise — a plain NL_LLM_* setup still works, but on someone else's server your
+        \\  unset roles may run on their choice. A role counts as set only with BOTH a model and a base
+        \\  URL; filling one without the other falls back as if you had filled neither.
+        \\  coding     the agentic step — streams the reply you read, carries the tool calls. Long prompts,
+        \\             every turn. This is the one that has to be good.
+        \\             NL_LLM_MODEL  NL_LLM_BASE_URL  NL_LLM_KEY
+        \\  thinking   plan, reflect, compact, ctxsum, summary, lesson. `plan` is short and carries the
+        \\             judgment; compact/ctxsum are long and mechanical. Only the planning half repays a
+        \\             bigger model — the rest is bulk transcript compression.
+        \\             NL_LLM_THINK_MODEL  NL_LLM_THINK_BASE_URL  NL_LLM_THINK_KEY
+        \\  prompting  one line per drive step — the auto-loop's next step, web-search query rewrites, the
+        \\             recovery instruction when a turn is stuck. Short prompts, many calls; small is fine.
+        \\             NL_LLM_PROMPT_MODEL  NL_LLM_PROMPT_BASE_URL  NL_LLM_PROMPT_KEY
+        \\  These affect `veil chat` only. `cast` takes its model on the command line (--model/--base-url/
+        \\  --key — coding only); a task made by `sched add` carries no trio and runs single-model.
+        \\
         \\SCHEDULED TASKS
         \\  sched list                   list scheduled tasks
         \\  sched add --name N --prompt "..." [--kind once|every|daily] [--every MIN] [--at HH:MM]
