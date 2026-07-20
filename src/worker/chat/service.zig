@@ -79,6 +79,15 @@ fn resolveRole(app: *App, uid: u64, arena: std.mem.Allocator, base_url: []const 
     return .{ .base = base_url, .key = api_key };
 }
 
+/// Read the turn limits from the environment. Lives here rather than in the engine so main() has one
+/// place to configure the chat surface, and so the parsing (and its fallbacks) are testable as one unit.
+pub fn configureTurnLimits(environ: *const std.process.Environ.Map) void {
+    const WS = " \r\n\t";
+    const cap = if (environ.get("NL_MAX_TURNS")) |v| (std.fmt.parseInt(usize, std.mem.trim(u8, v, WS), 10) catch 0) else 0;
+    const per = if (environ.get("NL_MAX_TURNS_PER_USER")) |v| (std.fmt.parseInt(usize, std.mem.trim(u8, v, WS), 10) catch 0) else 0;
+    chat_engine.configureTurnLimits(if (cap == 0) 64 else cap, per);
+}
+
 /// Sanitize a conversation id into ONE safe path segment (alnum / - / _ only, no separators, no "..",
 /// bounded). Empty / unsafe → "". Mirrors chat_tools.safeSeg verbatim so a conv addressed here resolves to
 /// the SAME `{data}/u{uid}/_chat/...{seg}` tree the chat build tools + a cast for that conversation use.
@@ -335,9 +344,28 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // on a detached thread, so a second concurrent turn for the same conv would lost-update the durable log. Reject
     // the racing request with 409 (the desk cleanly falls back to its local engine on a non-2xx; a raw API client
     // can retry). Claiming here (not inside spawnTurn) lets us answer 409 before persisting anything.
-    if (!chat_engine.tryBeginTurn(app.io, seg)) {
-        res.status = 409;
-        return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
+    // Three different situations used to share one message ("a turn is already running for this
+    // conversation"), which was actively misleading on a busy server: a user whose OTHER conversation was
+    // running, or who was simply behind ninety other people, was told the wrong thing about the
+    // conversation in front of them. Say which limit was hit, so waiting is understandable.
+    switch (chat_engine.beginTurn(app.io, seg, u.id)) {
+        .ok => {},
+        .conv_busy => {
+            res.status = 409;
+            return res.json(.{ .ok = false, .err = "a turn is already running for this conversation" }, .{});
+        },
+        .user_at_cap => {
+            const lim = chat_engine.turnLimits();
+            res.status = 429;
+            const msg = try std.fmt.allocPrint(res.arena, "you already have {d} turns running — finish or stop one first", .{lim.per_user});
+            return res.json(.{ .ok = false, .err = msg, .retry = true }, .{});
+        },
+        .server_full => {
+            const lim = chat_engine.turnLimits();
+            res.status = 429;
+            const msg = try std.fmt.allocPrint(res.arena, "the server is running its full {d} turns right now — try again in a moment", .{lim.capacity});
+            return res.json(.{ .ok = false, .err = msg, .retry = true }, .{});
+        },
     }
 
     // BLANK-KEY RESOLUTION: a role sent with an empty key is resolved server-side — Cloudflare OAuth for a

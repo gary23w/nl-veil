@@ -418,6 +418,9 @@ what changed is that the dangerous verbs are now refused inside a turn, not just
 
 | variable | what it does |
 |---|---|
+| `NL_MAX_TURNS` | how many chat turns run at once, server-wide (default 64, ceiling 256). Size it to the rate limit of the provider key everyone shares |
+| `NL_MAX_TURNS_PER_USER` | how many of those one account may hold (default: an eighth of capacity). This is what stops one busy user starving everyone else |
+| `NL_KEEPALIVE_REQUESTS` | requests one connection serves before recycling (default 200). Drop to 1 if you hit a stuck-socket worker thread |
 | `NL_DEFAULT_MODEL` / `NL_DEFAULT_BASE_URL` | **seeds** the default model on a fresh install, for unattended provisioning. Afterwards set it in **Admin → Default model** — that persists to `data/server-config.json` and wins over the environment, so a stale launch script cannot undo the admin on the next restart |
 | `NL_OPEN_REGISTRATION` | let people sign themselves up. Off by default; the admin creates accounts from the Admin tab instead |
 | `NL_BROWSER_DRIVER` / `NL_MCP` | give **sandboxed** users the browser / local MCP servers too. Admins already have both; leave these unset unless you mean it — the browser inherits this machine's network position and its profile's cookies |
