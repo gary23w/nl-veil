@@ -442,6 +442,16 @@ pub fn main(init: std.process.Init) !void {
         apw_generated = true;
         break :blk apw_buf[0..hx.len];
     };
+    // How many requests one keep-alive socket serves before recycling. See the timeout block below.
+    const keepalive_requests: u32 = if (init.environ_map.get("NL_KEEPALIVE_REQUESTS")) |v|
+        (std.fmt.parseInt(u32, std.mem.trim(u8, v, " \r\n\t"), 10) catch 200)
+    else
+        200;
+
+    // How many turns this box runs at once, and how many any one account may hold. Defaults suit a
+    // shared server; the right numbers depend on the rate limit of the provider key everyone shares.
+    chat_service.configureTurnLimits(init.environ_map);
+
     auth.seedDefaultAdmin(admin_pw);
 
     // MAKE IT TRUE, then record it. seedDefaultAdmin only CREATES; against an existing account it
@@ -533,12 +543,19 @@ pub fn main(init: std.process.Init) !void {
     // request_count recycles a connection after N requests so no single socket lives unboundedly.
     var server = try httpz.Server(*App).init(io, gpa, .{
         .address = if (bind_all) .all(port) else .localhost(port),
-        // request_count = 1: close the connection after every response (the Connection: close path). This
-        // stops a half-closed keepalive socket from lingering in httpz's blocking worker, where recv()==0 on a
-        // FIN'd peer returns "not done, no error" forever and pins a pool thread at 100% CPU. Every client here
-        // is localhost (desktop netcli already sends Connection: close; the web UI reconnects), so the extra
-        // handshake per request is free.
-        .timeout = .{ .request = 15, .keepalive = 60, .request_count = 1 },
+        // KEEP-ALIVE, and why it is no longer 1. This was pinned to 1 — close after every response — to dodge
+        // a half-closed keepalive socket pinning an httpz blocking-worker thread at 100% CPU, and the
+        // justification was explicit: "every client here is localhost, so the extra handshake per request is
+        // free". That premise died when the server started binding every interface. The web client polls a
+        // running turn about once a second, so a hundred people on wifi is a hundred TCP+handshake cycles a
+        // second, each one a round trip they wait on — the single largest avoidable cost in the whole
+        // request path, and it lands hardest on the phone furthest from the router.
+        //
+        // The original hazard is still real, so it is bounded rather than ignored: request_count caps how
+        // many requests one socket may serve before it is recycled, and keepalive=60 still reaps idle ones.
+        // A stuck socket therefore costs at most one thread for at most a minute, out of 128 — instead of
+        // every client paying a handshake on every poll. Tunable for an operator who hits the old bug.
+        .timeout = .{ .request = 15, .keepalive = 60, .request_count = keepalive_requests },
         // Body cap: httpz defaults to 1 MiB, which 413-rejects a chat message carrying an image attachment
         // (base64 of a normal screenshot easily exceeds 1 MiB) BEFORE the handler runs. Lift it to 16 MiB —
         // above the desk's 8 MiB raw-image read limit × ~1.4 base64 + JSON/header headroom. Loopback-only.

@@ -1264,29 +1264,77 @@ fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, t
 // serializes them: at most one in-flight turn per conv. A distinct conv is unaffected (up to MAX_ACTIVE_TURNS at
 // once — a 17th distinct conv while 16 run is rejected, which is safe, never silent corruption). Bounded fixed
 // storage (conv is safeSeg'd and <= 64 bytes) so no allocation is needed on the hot path.
-const MAX_ACTIVE_TURNS = 16;
+/// The hard table size. 16 was the ceiling for a single-user desktop and the wrong shape for a server
+/// a hundred people share: the 17th concurrent conversation was refused outright, whoever it belonged
+/// to. 256 slots is 20KB of static storage and costs a linear scan per claim — nothing next to a turn.
+const MAX_ACTIVE_TURNS = 256;
+
+/// How many turns this server will actually run at once, and how many ONE account may hold.
+///
+/// Capacity alone does not make a shared server fair. With a single provider key, a user with ten
+/// conversations open would take ten of the slots first-come and everyone else would meet a 409 — so the
+/// per-user share is the part that makes "a hundred people" work rather than "the fastest ten people".
+/// Default: an eighth of capacity, at least one, so at least eight distinct accounts can always be
+/// running something.
+///
+/// Both are set from the environment at startup (NL_MAX_TURNS / NL_MAX_TURNS_PER_USER) rather than
+/// compiled in, because the right number depends on the provider's rate limit for the key everyone is
+/// sharing — which is an operator's fact, not ours.
+var turn_capacity: usize = 64;
+var turn_per_user: usize = 8;
+
+pub fn configureTurnLimits(capacity: usize, per_user: usize) void {
+    turn_capacity = std.math.clamp(capacity, 1, MAX_ACTIVE_TURNS);
+    const derived = @max(@as(usize, 1), turn_capacity / 8);
+    turn_per_user = std.math.clamp(if (per_user == 0) derived else per_user, 1, turn_capacity);
+}
+
+pub fn turnLimits() struct { capacity: usize, per_user: usize } {
+    return .{ .capacity = turn_capacity, .per_user = turn_per_user };
+}
+
+/// Why a claim failed — so the caller can say something true instead of one 409 for three situations.
+pub const TurnDenied = enum {
+    ok,
+    conv_busy, // this conversation already has a turn running
+    user_at_cap, // this account is already using its share
+    server_full, // every slot is taken, by other people
+};
+
 var turn_mtx: std.Io.Mutex = .init;
 var active_convs: [MAX_ACTIVE_TURNS][64]u8 = undefined;
 var active_lens: [MAX_ACTIVE_TURNS]usize = [_]usize{0} ** MAX_ACTIVE_TURNS;
+var active_uids: [MAX_ACTIVE_TURNS]u64 = [_]u64{0} ** MAX_ACTIVE_TURNS;
 
-/// Claim the single in-flight slot for `conv`. Returns false if a turn is already running for it (caller rejects
-/// the concurrent request) or all slots are busy. A caller that gets `true` MUST pair it with endTurn(io, conv).
-pub fn tryBeginTurn(io: std.Io, conv: []const u8) bool {
-    if (conv.len == 0 or conv.len > 64) return false; // unrepresentable (shouldn't happen: safeSeg'd, <=64) — reject
+/// Claim the single in-flight slot for `conv`, on behalf of `uid`. One pass over the table answers all
+/// three questions (is this conv running, how many does this user hold, is there a free slot), so the
+/// lock is held for one scan rather than three.
+pub fn beginTurn(io: std.Io, conv: []const u8, uid: u64) TurnDenied {
+    if (conv.len == 0 or conv.len > 64) return .conv_busy; // unrepresentable — safeSeg should have caught it
     turn_mtx.lockUncancelable(io);
     defer turn_mtx.unlock(io);
     var free_slot: ?usize = null;
-    for (0..MAX_ACTIVE_TURNS) |i| {
+    var mine: usize = 0;
+    for (0..turn_capacity) |i| {
         if (active_lens[i] == 0) {
             if (free_slot == null) free_slot = i;
-        } else if (std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
-            return false; // a turn is already running for this conversation
+            continue;
         }
+        if (std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) return .conv_busy;
+        if (active_uids[i] == uid) mine += 1;
     }
-    const slot = free_slot orelse return false; // all slots busy — reject rather than run unserialized
+    if (mine >= turn_per_user) return .user_at_cap;
+    const slot = free_slot orelse return .server_full;
     @memcpy(active_convs[slot][0..conv.len], conv);
     active_lens[slot] = conv.len;
-    return true;
+    active_uids[slot] = uid;
+    return .ok;
+}
+
+/// Back-compat shim for callers with no uid to hand (the scheduler runs as the task's owner, but its
+/// call site predates this). uid 0 shares one bucket, which is correct for server-initiated work.
+pub fn tryBeginTurn(io: std.Io, conv: []const u8) bool {
+    return beginTurn(io, conv, 0) == .ok;
 }
 
 /// Idempotent network reads whose exact repeat within one turn returns the same bytes — the search-spiral
@@ -1892,6 +1940,7 @@ pub fn endTurn(io: std.Io, conv: []const u8) void {
     for (0..MAX_ACTIVE_TURNS) |i| {
         if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
             active_lens[i] = 0;
+            active_uids[i] = 0; // or the freed slot keeps counting against its owner's share forever
             return;
         }
     }
@@ -4723,4 +4772,68 @@ test "looksCredentialed: credential keys drop the cue; ordinary cues pass" {
     try std.testing.expect(looksCredentialed("{\"cmd\":\"export API_KEY=abc\"}"));
     try std.testing.expect(!looksCredentialed("{\"query\":\"neuron-db worker REST endpoints\"}"));
     try std.testing.expect(!looksCredentialed("{\"path\":\"lib/feed.ts\"}"));
+}
+
+test "turn slots: one user cannot take the whole server" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Reset the shared table — these globals outlive any single test.
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+    configureTurnLimits(8, 2); // 8 slots, 2 per account
+
+    // One account fills its share and is then refused, while five slots stand free.
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "a1", 7));
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "a2", 7));
+    try t.expectEqual(TurnDenied.user_at_cap, beginTurn(io, "a3", 7));
+
+    // A DIFFERENT account still gets in — this is the whole point of the cap.
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "b1", 8));
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "b2", 8));
+
+    // The same conversation twice is refused for its own reason, not the share.
+    try t.expectEqual(TurnDenied.conv_busy, beginTurn(io, "a1", 7));
+
+    // Releasing frees the holder's share again.
+    endTurn(io, "a1");
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "a3", 7));
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+}
+
+test "turn slots: a full server says so, and endTurn clears the owner" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+    configureTurnLimits(2, 2); // deliberately tiny: 2 slots
+
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "c1", 1));
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "c2", 2));
+    // Third caller is a different user, under its own cap — the SERVER is what is full.
+    try t.expectEqual(TurnDenied.server_full, beginTurn(io, "c3", 3));
+
+    // A released slot must not keep counting against the user who held it.
+    endTurn(io, "c1");
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "c3", 3));
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+    configureTurnLimits(64, 8); // restore the defaults for any later test
+}
+
+test "turn limits clamp to something sane rather than trusting the environment" {
+    const t = std.testing;
+    configureTurnLimits(0, 0); // nonsense in
+    try t.expect(turnLimits().capacity >= 1);
+    try t.expect(turnLimits().per_user >= 1);
+    configureTurnLimits(9999, 9999); // above the table
+    try t.expectEqual(@as(usize, MAX_ACTIVE_TURNS), turnLimits().capacity);
+    try t.expect(turnLimits().per_user <= turnLimits().capacity);
+    configureTurnLimits(64, 0); // 0 per-user = derive a share
+    try t.expectEqual(@as(usize, 8), turnLimits().per_user);
 }
