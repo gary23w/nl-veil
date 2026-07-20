@@ -25,6 +25,7 @@ const S = {
   models: null,         // parsed models.json — the shared catalog
   localModels: null,    // {installed:[…]} from this machine's Ollama, or null if unreachable
   keys: [],             // provider keys on file (never the key itself)
+  files: [],            // the open conversation's build tree, as last listed
   serverDefault: { model: '', base_url: '' },  // what the host configured for users who pick nothing
   // chat
   convs: [],
@@ -871,11 +872,14 @@ async function toggleFiles() {
   try {
     const j = await api.convFiles(S.conv);
     const files = j.files || [];
+    S.files = files;
     pane.innerHTML = '<div class="files-head"><b>Files</b>'
-      + '<span class="muted">'
+      + '<span class="muted grow">'
       + (files.length ? files.length + ' file' + (files.length === 1 ? '' : 's') + ' · ' + fmtBytes(j.bytes || 0) : 'nothing built yet')
       + (j.truncated ? ' · first ' + files.length + ' shown' : '')
-      + '</span></div>'
+      + '</span>'
+      + (files.length ? '<button class="linkbtn" id="dlAll">download all</button>' : '')
+      + '</div>'
       + (files.length ? '<div class="files-list">' + files.map((f) =>
           '<div class="file-row">'
           + '<button class="file-open ellip mono" data-file="' + esc(f.path) + '">' + esc(f.path) + '</button>'
@@ -884,6 +888,7 @@ async function toggleFiles() {
           + '</div>').join('') + '</div>'
         : '');
     $$('[data-file]', pane).forEach((b) => b.addEventListener('click', () => openConvFile(b.dataset.file)));
+    if (el('dlAll')) el('dlAll').addEventListener('click', downloadAllFiles);
   } catch (e) {
     pane.innerHTML = '<div class="files-head"><b>Files</b><span class="muted">' + esc(e.message) + '</span></div>';
   }
@@ -893,6 +898,122 @@ async function toggleFiles() {
     download link so the two can never point at different things. */
 function convFileUrl(path) {
   return '/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/file?path=' + encodeURIComponent(path);
+}
+
+/* ---------------- download all ----------------
+   A conversation's files are a tree, and handing someone eight separate
+   downloads is not the same thing as handing them what the AI built. This zips
+   them in the browser: no new server route, and no tar — Explorer and Finder
+   both open a zip by double-clicking, which a .tar is not.
+
+   STORED, not deflated. Zip's method 0 writes bytes verbatim, so there is no
+   compressor to implement or get subtly wrong; these are small text files where
+   compression would save little and cost a dependency the no-build-step rule
+   does not allow. */
+
+const ZIP_MAX_BYTES = 32 << 20; // refuse rather than wedge the tab on a huge tree
+
+let _crcTable = null;
+function crc32(bytes) {
+  if (!_crcTable) {
+    _crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      _crcTable[i] = c >>> 0;
+    }
+  }
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = _crcTable[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/** Build a ZIP from [{path, bytes}] and return a Blob.
+    Entries are stored uncompressed; names are UTF-8 with the language-encoding
+    flag set (bit 11), which is what makes a non-ASCII filename survive. */
+function zipStore(entries) {
+  const enc = new TextEncoder();
+  const chunks = [];
+  const central = [];
+  let offset = 0;
+
+  const u16 = (v) => [v & 0xFF, (v >>> 8) & 0xFF];
+  const u32 = (v) => [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF];
+
+  for (const e of entries) {
+    const name = enc.encode(e.path);
+    const crc = crc32(e.bytes);
+    const n = e.bytes.length;
+    // Local file header. Zero date/time: these files have no meaningful mtime
+    // here (the listing does not carry one), and a fabricated one is worse than
+    // an obviously empty one.
+    const local = [].concat(
+      [0x50, 0x4B, 0x03, 0x04], u16(20), u16(0x0800), u16(0),
+      u16(0), u16(0), u32(crc), u32(n), u32(n), u16(name.length), u16(0)
+    );
+    chunks.push(new Uint8Array(local), name, e.bytes);
+
+    central.push({ name: name, crc: crc, size: n, offset: offset });
+    offset += local.length + name.length + n;
+  }
+
+  const cdStart = offset;
+  for (const c of central) {
+    const hdr = [].concat(
+      [0x50, 0x4B, 0x01, 0x02], u16(20), u16(20), u16(0x0800), u16(0),
+      u16(0), u16(0), u32(c.crc), u32(c.size), u32(c.size),
+      u16(c.name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(c.offset)
+    );
+    chunks.push(new Uint8Array(hdr), c.name);
+    offset += hdr.length + c.name.length;
+  }
+
+  const eocd = [].concat(
+    [0x50, 0x4B, 0x05, 0x06], u16(0), u16(0),
+    u16(central.length), u16(central.length), u32(offset - cdStart), u32(cdStart), u16(0)
+  );
+  chunks.push(new Uint8Array(eocd));
+  return new Blob(chunks, { type: 'application/zip' });
+}
+
+async function downloadAllFiles() {
+  const btn = el('dlAll');
+  const files = S.files || [];
+  if (!files.length) return;
+  const total = files.reduce((a, f) => a + (f.size || 0), 0);
+  if (total > ZIP_MAX_BYTES) {
+    return toast('Too much to zip', fmtBytes(total) + ' — open the files individually instead.', 'err');
+  }
+
+  const label = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'zipping…'; }
+  try {
+    const entries = [];
+    for (let i = 0; i < files.length; i++) {
+      if (btn) btn.textContent = 'zipping ' + (i + 1) + '/' + files.length + '…';
+      const r = await req(convFileUrl(files[i].path), null, 30000);
+      if (!r.ok) throw new Error(files[i].path + ': HTTP ' + r.status);
+      // Bytes, not text: a zip entry is binary and re-encoding through a string
+      // would corrupt anything that is not valid UTF-8.
+      entries.push({ path: files[i].path, bytes: new Uint8Array(await r.arrayBuffer()) });
+    }
+    const blob = zipStore(entries);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (S.conv || 'files') + '.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Revoke on the next tick, not immediately: Safari has not started the
+    // download when click() returns, and revoking first cancels it.
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    toast('Downloaded', files.length + ' files · ' + fmtBytes(blob.size), 'ok');
+  } catch (e) {
+    toast('Could not build the zip', e.message, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = label || 'download all'; }
+  }
 }
 
 async function openConvFile(path) {
