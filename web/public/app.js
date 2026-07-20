@@ -877,9 +877,11 @@ async function toggleFiles() {
       + (j.truncated ? ' · first ' + files.length + ' shown' : '')
       + '</span></div>'
       + (files.length ? '<div class="files-list">' + files.map((f) =>
-          '<button class="file-row" data-file="' + esc(f.path) + '">'
-          + '<span class="ellip mono">' + esc(f.path) + '</span>'
-          + '<span class="muted">' + fmtBytes(f.size || 0) + '</span></button>').join('') + '</div>'
+          '<div class="file-row">'
+          + '<button class="file-open ellip mono" data-file="' + esc(f.path) + '">' + esc(f.path) + '</button>'
+          + '<span class="muted">' + fmtBytes(f.size || 0) + '</span>'
+          + '<a class="linkbtn" download="' + esc(f.path.split('/').pop()) + '" href="' + esc(convFileUrl(f.path)) + '">download</a>'
+          + '</div>').join('') + '</div>'
         : '');
     $$('[data-file]', pane).forEach((b) => b.addEventListener('click', () => openConvFile(b.dataset.file)));
   } catch (e) {
@@ -887,9 +889,15 @@ async function toggleFiles() {
   }
 }
 
+/** The URL for one of this conversation's files. Shared by the viewer and the
+    download link so the two can never point at different things. */
+function convFileUrl(path) {
+  return '/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/file?path=' + encodeURIComponent(path);
+}
+
 async function openConvFile(path) {
   try {
-    const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/file?path=' + encodeURIComponent(path));
+    const r = await req(convFileUrl(path));
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const text = await r.text();
     const pane = el('filesPane');
@@ -898,6 +906,7 @@ async function openConvFile(path) {
     // the escaping is already proven there.
     const ext = (path.split('.').pop() || '').toLowerCase();
     pane.innerHTML = '<div class="files-head"><b class="ellip mono">' + esc(path) + '</b>'
+      + '<a class="linkbtn" download="' + esc(path.split('/').pop()) + '" href="' + esc(convFileUrl(path)) + '">download</a>'
       + '<button class="linkbtn" id="filesBack">back</button></div>'
       + '<div class="files-view msg-body">' + mdRender('```' + ext + '\n' + text + '\n```') + '</div>';
     wireCodeCopy(pane);
