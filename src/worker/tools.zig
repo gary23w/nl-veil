@@ -223,6 +223,35 @@ pub fn sandboxAllowed(name: []const u8) bool {
     return false;
 }
 
+/// The `.sandboxed` projection of a tools-array schema block: the same comma-joined function defs with every
+/// entry the sandbox gate above would refuse dropped. DERIVED from sandboxAllowed rather than a second list of
+/// names — a hand-copied list rots silently the first time SANDBOX_TOOLS changes, and the cost of the drift is
+/// paid in prefill: a tool advertised to a caller who provably cannot execute it is re-sent on EVERY inference
+/// of the turn and invites a whole wasted agentic round-trip.
+///
+/// comptime-only, so both variants are static strings and a turn pays nothing to pick between them. Each entry
+/// must sit on its OWN line (every schema in this file is written that way): the line is the unit kept or
+/// dropped, and its tool name is read from the leading `"name":"…"`. The removal is therefore PER-TOOL, not
+/// per-block — pixel_search survives even though its two PIXEL_SCHEMA neighbours do not.
+pub fn sandboxSchema(comptime block: []const u8) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    comptime var out: []const u8 = "";
+    comptime {
+        var it = std.mem.splitScalar(u8, block, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r,"); // strip the join comma; re-added below
+            if (line.len == 0) continue;
+            const key = "\"name\":\"";
+            const at = std.mem.indexOf(u8, line, key) orelse continue; // nameless line: not a tool def, drop it
+            const rest = line[at + key.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+            if (!sandboxAllowed(rest[0..end])) continue;
+            out = if (out.len == 0) line else out ++ ",\n" ++ line;
+        }
+    }
+    return out;
+}
+
 pub const ToolCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,

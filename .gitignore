@@ -62,3 +62,7 @@ dist/
 
 # release build staging (scripts/build-official.sh) — never committed
 .release-stage/
+
+# runtime server config written next to the CWD when veil is launched from the repo root
+# (the real one lives in data/server-config.json; this copy is an artifact, not source)
+server-config.json

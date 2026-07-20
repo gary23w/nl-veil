@@ -18,17 +18,52 @@ pub fn swarmEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const sw = app.sup.get(id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
     const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{sw.run_dir});
-    const data = std.Io.Dir.cwd().readFileAlloc(app.io, ev_path, res.arena, .limited(4 << 20)) catch "";
     var from: usize = 0;
     const q = try req.query();
     if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
-    const slice = if (from <= data.len) data[from..] else data[0..0];
-    res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{data.len}));
+    // KEEP IN LOCKSTEP WITH ITS TWIN, chat/service.zig convEvents. The web console polls both endpoints with
+    // one piece of code, so any behavioral difference between them is a bug — same byte cursor, same
+    // X-Next-Offset, same size-probe sentinel. Change one, change the other.
+    //
+    // SIZE PROBE (from == max u64): answer the events file's TOTAL length as tiny JSON instead of a body,
+    // so a watcher can baseline at the TAIL without transferring the backlog. An older client never sends
+    // the sentinel; an older server treats it as past-the-end and returns an empty 200, which a new client
+    // detects and falls back from. Probe answers 200 even for a not-yet-written events file (len 0).
+    if (from == std.math.maxInt(u64)) {
+        var size: usize = 0;
+        if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
+            defer f.close(app.io);
+            size = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
+        } else |_| {}
+        return res.json(.{ .ok = true, .len = size }, .{});
+    }
+    // POSITIONAL read from the client's cursor `from` — NOT the whole file. This was readFileAlloc capped at
+    // 4 MiB; a long run appends events.jsonl indefinitely, and once the file crossed the cap EVERY poll read
+    // EMPTY, which reset the cursor to 0 and replayed history at the client. The file only grows, so `from`
+    // stays valid; one poll's payload is bounded and the client catches up across polls. A quiet poll now
+    // allocates and reads nothing.
+    var body: []const u8 = "";
+    var next_off: usize = from;
+    if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
+        defer f.close(app.io);
+        const size: usize = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
+        if (size > from) {
+            // PAGE bound UNDER the client's 1MB response cap — a burst bigger than the client could swallow
+            // wedged its poll forever, since the delta only grows.
+            const want = @min(size - from, 512 << 10);
+            if (res.arena.alloc(u8, want)) |buf| {
+                const n = f.readPositionalAll(app.io, buf, from) catch 0;
+                body = buf[0..n];
+                next_off = from + n;
+            } else |_| {} // OOM → empty this poll; the client re-polls (cursor unchanged)
+        }
+    } else |_| {} // no events.jsonl yet → empty body (a fresh run)
+    res.header("X-Next-Offset", try std.fmt.allocPrint(res.arena, "{d}", .{next_off}));
     // .TEXT, deliberately NOT .EVENTS: bounded poll body. An empty .EVENTS response carries no Content-Length
     // (SSE framing = body ends at close), so a keep-alive client (the web console's poll loop) blocked until
     // the 60s idle reap on every empty poll. swarmStream below is the real SSE endpoint and keeps .EVENTS.
     res.content_type = .TEXT;
-    res.body = slice;
+    res.body = body;
 }
 
 const StreamCtx = struct {

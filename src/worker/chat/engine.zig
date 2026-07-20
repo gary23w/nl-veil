@@ -197,6 +197,31 @@ const ORCH_TOOLS =
 // SCHEMA, so nothing breaks if a tool is ever re-advertised. See tools.CHAT_SCHEMA for the exact keep-set + why.
 const TURN_TOOLS = tools.CHAT_SCHEMA ++ "," ++ ORCH_TOOLS;
 
+/// The browser/pixel/MCP block every chat turn carries — see the accessibility directive where turn_tools is
+/// bound in runInnerAgentic.
+const EXTRA_TOOLS = tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA ++ ",\n" ++ tools.MCP_SCHEMA;
+
+/// This turn's tools array, in the two shapes a caller can have. Both are STATIC strings built at comptime: the
+/// choice is made by the caller's CAPS and by nothing else. It must never vary with message content, or the
+/// provider's prompt-prefix cache misses and the whole prefill is re-billed on every inference (same hazard the
+/// recall-placement note in runTurn describes).
+const TURN_TOOLS_FULL = TURN_TOOLS ++ ",\n" ++ EXTRA_TOOLS;
+
+/// The `.sandboxed` projection. tools.sandboxSchema DERIVES it from the sandbox allowlist, so it drops exactly
+/// what tools.execute's gate refuses before any tool logic runs: all browser_*, pixel_ingest, pixel_capture,
+/// mcp_discover, mcp_call, stage_file, get_credential, run_python, run_tests — ~8 KB of schema that was being
+/// advertised to every non-admin and re-sent on every inference of their turn, inviting calls that could only
+/// come back as a refusal. pixel_search outlives its two PIXEL_SCHEMA neighbours because it is sandbox-safe
+/// (local retrieval over the caller's own attachments); the removal is per-tool, not per-block. ORCH_TOOLS is
+/// deliberately NOT filtered — orchTool dispatches the orchestration verbs BEFORE the sandbox gate, so they do
+/// run for a sandboxed caller and dropping them would remove working capability.
+const TURN_TOOLS_SANDBOXED = blk: {
+    var out: []const u8 = tools.sandboxSchema(tools.CHAT_SCHEMA) ++ "," ++ ORCH_TOOLS;
+    const extra = tools.sandboxSchema(EXTRA_TOOLS);
+    if (extra.len > 0) out = out ++ ",\n" ++ extra; // empty ⇒ no trailing comma into the tools array
+    break :blk out;
+};
+
 /// io-based wall clock — the SAME source the worker stamps its event `t` with (std time under io, never a raw
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.
 fn nowSecs(io: std.Io) i64 {
@@ -278,6 +303,48 @@ test "clipToolResult: small stays verbatim (same ptr); big keeps head+tail aroun
     try std.testing.expect(std.mem.indexOf(u8, c, "bytes elided") != null);
 }
 
+test "turn tools: both caps variants are valid JSON arrays, and the sandboxed one drops exactly the refused set" {
+    const gpa = std.testing.allocator;
+
+    // WHY THIS TEST EXISTS: tools.sandboxSchema filters the schema LINE BY LINE, so it silently depends on every
+    // tool def occupying its own line. That holds today (27 defs, 27 lines) but it is a formatting convention,
+    // not something the compiler enforces — and if a def is ever wrapped across two lines, the continuation has
+    // no `"name":"…"` key, gets dropped, and the sandboxed array becomes malformed JSON. That failure would be
+    // invisible in dev (admins get the unfiltered variant) and would break every non-admin turn in production.
+    // Parsing both variants here turns that into a build failure.
+    inline for (.{ TURN_TOOLS_FULL, TURN_TOOLS_SANDBOXED }) |variant| {
+        const arr = try std.fmt.allocPrint(gpa, "[{s}]", .{variant});
+        defer gpa.free(arr);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        try std.testing.expect(parsed.value.array.items.len > 0);
+    }
+
+    // The gate and the schema must agree: advertising a tool tools.execute would refuse is the waste this
+    // filter removes, and dropping one it would ALLOW is a silent capability regression.
+    const arr = try std.fmt.allocPrint(gpa, "[{s}]", .{TURN_TOOLS_SANDBOXED});
+    defer gpa.free(arr);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |def| {
+        // OpenAI tool shape: {"type":"function","function":{"name":…}} — the name is nested, which is also why
+        // sandboxSchema scans for the `"name":"` key rather than assuming a top-level field.
+        const name = def.object.get("function").?.object.get("name").?.string;
+        // ORCH_TOOLS rides along unfiltered on purpose: orchTool dispatches those verbs BEFORE the sandbox
+        // gate, so they genuinely run for a sandboxed caller (see the note on TURN_TOOLS_SANDBOXED).
+        if (std.mem.indexOf(u8, ORCH_TOOLS, name) != null) continue;
+        try std.testing.expect(tools.sandboxAllowed(name));
+    }
+    // pixel_search is the reason the removal is per-tool rather than per-block — it is sandbox-safe while both
+    // of its PIXEL_SCHEMA neighbours are not.
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"pixel_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"pixel_capture\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"browser_navigate\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"get_credential\"") == null);
+    try std.testing.expect(TURN_TOOLS_SANDBOXED.len < TURN_TOOLS_FULL.len);
+}
+
 test "schedTaskOf: extracts the task id from a run conv, null for ordinary convs" {
     try std.testing.expectEqualStrings("news-0715174857", schedTaskOf("scheduled_news-0715174857_07151753").?);
     try std.testing.expectEqualStrings("daily-report-0301070500", schedTaskOf("scheduled_daily-report-0301070500_03010705").?);
@@ -356,6 +423,27 @@ fn msgTail(items: []const u8, want: usize) []const u8 {
 const TOOL_RESULT_KEEP: usize = 10 * 1024;
 const TOOL_RESULT_HEAD: usize = 7 * 1024;
 const TOOL_RESULT_TAIL: usize = 2 * 1024;
+
+/// How much of the working span survives compaction VERBATIM (see compactWorking). A tail is kept at all
+/// because folding the WHOLE span was itself a token sink: three unowned read_file results are 3x8000 bytes
+/// plus envelopes, so they cross WORKING_COMPACT_BYTES on the very round that issues them, and the model's
+/// freshly-read bytes were summarized away before it could use them. It then re-read them — rationally, since
+/// a ~200-byte memory note is not the file. Observed: 14 re-reads of the same files in one turn.
+///
+/// The size is not a taste call: it must EXCEED one round's growth. msgTail can only anchor on a message it
+/// finds at or after `span.len - keep`, and the only non-tool object in a round is the assistant tool_calls
+/// message that OPENS it — so a keep smaller than a round sees nothing but orphan tool results, refuses, and
+/// the whole mechanism silently no-ops. Measured over 14 rounds of 3x8000 B: 12 KiB and 16 KiB splice ZERO
+/// times, 24-40 KiB splice on every round and hold the working span at ~24 KB with the newest round intact.
+/// 32 KiB takes the middle of that plateau, leaving headroom for a 4-read round.
+const WORKING_KEEP_TAIL_BYTES: usize = 32 * 1024;
+
+/// Above this the span is folded WHOLE (the pre-tail behaviour) when no safe splice point exists — a single
+/// enormous message, or a round so large the keep window lands entirely inside its own tool results. Re-reading
+/// a file is expensive; overflowing the model window is fatal, so the safety valve wins at the extreme. Held at
+/// 2x WORKING_COMPACT_BYTES: below it a spliceless span is simply left alone until the next round gives msgTail
+/// something to anchor on.
+const WORKING_HARD_FOLD_BYTES: usize = 48 * 1024;
 
 /// Clip an oversized tool result to head + elision note + tail (UTF-8-boundary safe). Returns `result`
 /// unchanged (same pointer) when it already fits; otherwise a NEW gpa string (caller frees whichever it holds).
@@ -439,8 +527,20 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8) void {
     const gpa = app.gpa;
+
+    // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
+    // `tool_client` arrives as a plain bool on the request body (chat/service.zig), so it is caller-controlled:
+    // any authed user could send `{"tool_client":true}`. That flag routes tool calls to a client harness via
+    // delegateTool INSTEAD of tools.execute — and the sandbox gate that confines non-admins to their own
+    // workspace lives inside tools.execute. Delegating therefore walked straight around the one enforcement
+    // point, for run_python and host_command included. Gating the whole turn (not just the dispatch branch)
+    // keeps every downstream reader — cast file sync, syncDirTool, awaitConvCast — on the same answer.
+    // Legitimate clients are unaffected: the desk authenticates as admin, and the web UI omits the flag
+    // entirely (see the note in web/public/app.js) because the server executes its tools.
+    const is_admin = if (app.auth.userById(uid)) |cu| app.auth.isAdmin(cu) else false;
+    const tool_client = tool_client_req and is_admin;
 
     // The trio splits this turn's LLM calls across three models. `coding` is the base/default (the main answer
     // stream, metrics attribution, cast/schedule inheritance); `think` drives planning + context housekeeping;
@@ -617,7 +717,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 "TASK MEMORY — lessons, outcomes, and findings from PREVIOUS RUNS of this scheduled task. USE them: prefer sources/approaches that worked, skip recorded pitfalls, keep stated assumptions, and improve on the last run instead of starting from zero:\n"
             else
                 "RELEVANT MEMORY (recalled from this conversation's memory — earlier turns, tool findings). Treat as grounded context:\n") catch return;
-            mem_content.appendSlice(gpa, recalled) catch return;
+            // Clipped like every other memory injection (the durable-memory and lesson blocks below clip at
+            // 700/500, the image OCR at 2800). Recall is unbounded by construction — it grows with the
+            // conversation's own fact count — and this fragment rides in front of the recency window on EVERY
+            // inference of the turn.
+            mem_content.appendSlice(gpa, clipBytes(recalled, 1500)) catch return;
             recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
             http.jstr(gpa, &recall_frag, mem_content.items) catch return;
             recall_frag.append(gpa, '}') catch return;
@@ -3557,30 +3661,17 @@ fn runInnerAgentic(
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
     const base_len = conv_buf.items.len;
 
-    // Offer the browser (+ pixel) and MCP tools whenever a CLIENT (desk/CLI, tool_client) is attached to run
-    // them — that is the "client-side by default" model: the client's own machine can drive a browser and reach
-    // its installed MCP servers, so the chat should always know it has the capability (the client controls
-    // visibility via its browser-window setting). A server-side turn with no client (API/hive) still requires
-    // the operator env flag. Adds ~10 tool defs to a client turn's prefill; that is the price of the capability
-    // being available on demand.
-    const turn_tools: []const u8 = blk: {
-        const envon = struct {
-            fn f(e: ?*const std.process.Environ.Map, name: []const u8) bool {
-                const m = e orelse return false;
-                const v = m.get(name) orelse return false;
-                return v.len > 0 and !std.mem.eql(u8, v, "0") and !std.ascii.eqlIgnoreCase(v, "false");
-            }
-        }.f;
-        // Accessibility directive ("always include every tool"): a chat turn ALWAYS gets the browser/pixel/mcp
-        // schema so a tool can never silently drop out. The old signals are retained (discarded here) only so the
-        // reasoning stays legible; the swarm-mind schema in run.zig keeps its own env/tier gate.
-        const had_signal = tool_client or envon(app.sup.parent_env, "NL_BROWSER_DRIVER") or envon(app.sup.parent_env, "NL_MCP");
-        _ = had_signal;
-        const b = ",\n" ++ tools.BROWSER_SCHEMA ++ ",\n" ++ tools.PIXEL_SCHEMA;
-        const m = ",\n" ++ tools.MCP_SCHEMA;
-        break :blk std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ TURN_TOOLS, b, m }) catch TURN_TOOLS;
-    };
-    defer if (turn_tools.ptr != TURN_TOOLS.ptr) gpa.free(@constCast(turn_tools));
+    // The browser (+ pixel) and MCP tools ride on every chat turn — the "client-side by default" model: a
+    // client's own machine can drive a browser and reach its installed MCP servers, so the chat should always
+    // know it has the capability (the client controls visibility via its browser-window setting). Per the
+    // accessibility directive ("always include every tool") there is no env/tier gate here either, so a tool can
+    // never silently drop out on a machine whose flag was set mid-session; the swarm-mind schema in run.zig keeps
+    // its own gate. ~10 extra tool defs of prefill is the price of the capability being available on demand.
+    //
+    // CAPS is the one thing that does gate, and only because it removes nothing that could have run: a .sandboxed
+    // caller's calls are refused by tools.execute's gate before any tool logic, so advertising those defs buys
+    // prefill and dead round-trips and nothing else. Static per caller — see TURN_TOOLS_SANDBOXED.
+    const turn_tools: []const u8 = if (ctx.caps == .sandboxed) TURN_TOOLS_SANDBOXED else TURN_TOOLS_FULL;
 
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
@@ -3757,9 +3848,12 @@ fn runInnerAgentic(
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
             const t_call = nowMillis(app.io);
             var result = if (echo_blocked)
-                (gpa.dupe(u8, "(loop guard: you have made this EXACT call repeatedly and it returned the IDENTICAL result every time — it will not return anything different. Use the result you already have above, or take a DIFFERENT action: different arguments, a different tool, or write/settle your deliverable now.)") catch @constCast(""))
+                // HONEST REFUSALS: these used to say "the result is above". Compaction may have folded that
+                // span into a progress note, so the engine was telling the model to use data it had deleted —
+                // then blocking it for asking again. Say what to do when the bytes are genuinely gone.
+                (gpa.dupe(u8, "(loop guard: you have made this EXACT call repeatedly and it returned the IDENTICAL result every time — it will not return anything different. If its result is still above, use it; if it was folded into a progress note, recall it or read a NARROWER slice. Either way take a DIFFERENT action now: different arguments, a different tool, or write/settle your deliverable.)") catch @constCast(""))
             else if (repeated)
-                (gpa.dupe(u8, "(you already ran this EXACT call earlier this turn — its full result is above in this conversation. Do NOT re-run it: extract what you need from the earlier result and MOVE ON to the next step, e.g. writing the deliverable file.)") catch @constCast(""))
+                (gpa.dupe(u8, "(you already ran this EXACT call earlier this turn — do NOT re-run it. Its result is above unless compaction folded it into a progress note; if you cannot see it, recall it or read a NARROWER slice instead of repeating this. Then MOVE ON to the next step, e.g. writing the deliverable file.)") catch @constCast(""))
             else if (dedupableTool(c.name) and tools_spent.* >= tool_budget) blk_ob: {
                 // BUDGET CEILING (scheduled runs): the research appetite is unbounded but the wallet is not.
                 // Past the budget, NETWORK research calls are answered with "finalize now" — but LOCAL tools
@@ -4664,9 +4758,12 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     return gpa.dupe(u8, clipBytes(t, cctx.SUMMARY_INJECT_CAP)) catch null;
 }
 
-/// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace it
-/// with a single compressed progress note so the loop can continue bounded. Called at a STEP BOUNDARY (after all of
-/// a step's tool results are appended), so the message sequence stays protocol-valid (no dangling tool_calls).
+/// If this pass's working growth (everything appended after `base_len`) exceeds WORKING_COMPACT_BYTES, replace its
+/// OLDER part with a single compressed progress note — the newest WORKING_KEEP_TAIL_BYTES stay verbatim — so the
+/// loop can continue bounded without deleting the results the model is actively working from. Called at a STEP
+/// BOUNDARY (after all of a step's tool results are appended), so the message sequence stays protocol-valid (no
+/// dangling tool_calls). When no safe splice point exists the span is left alone, or folded whole past
+/// WORKING_HARD_FOLD_BYTES — see the two constants for both cases.
 /// Best-effort: a failed summary leaves the buffer as-is (the MAX_ITERS cap still bounds the pass).
 fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, conv_buf: *std.ArrayListUnmanaged(u8), base_len: usize, ctx: *tools.ToolCtx, tool_obs: *std.ArrayListUnmanaged([]u8)) void {
     if (conv_buf.items.len <= base_len or conv_buf.items.len - base_len <= cctx.WORKING_COMPACT_BYTES) return;
@@ -4681,10 +4778,31 @@ fn compactWorking(app: *App, run_root: []const u8, base_url: []const u8, key: []
         for (tool_obs.items) |note| gpa.free(note);
         tool_obs.clearRetainingCapacity();
     }
-    const note = summarizeWorkingSpan(app, run_root, base_url, key, model, conv_buf.items[base_len..]) orelse return;
+    // TAIL-PRESERVING FOLD: summarize only the span OLDER than the newest WORKING_KEEP_TAIL_BYTES, then put that
+    // tail back verbatim after the note. Folding the whole span deleted the model's own just-read bytes and it
+    // re-read them (see WORKING_KEEP_TAIL_BYTES). msgTail picks the splice point because the splice MUST land on
+    // a message boundary: it anchors only on a user/assistant/system object and explicitly refuses an orphan tool
+    // result — one whose tool_calls announcement is inside the folded span is an immediate provider 400.
+    const span = conv_buf.items[base_len..];
+    const tail = msgTail(span, WORKING_KEEP_TAIL_BYTES);
+    // msgTail returns the whole input when it finds no valid anchor in the keep window — one enormous message,
+    // or a round whose own tool results fill the window (their announcement sits further back). There is no
+    // splice that doesn't tear the sequence then, so keep the span intact and wait for the next round to give
+    // it an anchor; only past WORKING_HARD_FOLD_BYTES do we fall back to folding the span whole.
+    const splice = tail.len < span.len;
+    if (!splice and span.len < WORKING_HARD_FOLD_BYTES) return;
+    const older = if (splice) span[0 .. span.len - tail.len - 1] else span; // -1 drops msgTail's skipped comma
+    if (older.len == 0) return; // nothing older than the tail — nothing to summarize
+    const note = summarizeWorkingSpan(app, run_root, base_url, key, model, older) orelse return;
     defer gpa.free(note);
+    // `tail` points INTO conv_buf: shrinking only retains the bytes, and appending the note writes straight over
+    // them (a grow would reallocate outright). Copy it out — with its joining comma — BEFORE either happens.
+    const kept: ?[]u8 = if (splice) (std.fmt.allocPrint(gpa, ",{s}", .{tail}) catch return) else null;
+    defer if (kept) |k| gpa.free(k);
     conv_buf.shrinkRetainingCapacity(base_len);
     appendMsgObj(gpa, conv_buf, "assistant", note, cctx.SUMMARY_INJECT_CAP);
+    // One shot, so an OOM here drops the tail (the old behaviour) instead of stranding a dangling comma.
+    if (kept) |k| conv_buf.appendSlice(gpa, k) catch {};
 }
 
 test "file ledger: mutation parsing, upsert, args-path extraction, and the woven ground-truth block" {
