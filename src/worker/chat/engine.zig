@@ -315,6 +315,18 @@ fn clipBytes(s: []const u8, max: usize) []const u8 {
     return s[0..n];
 }
 
+/// How much of a tool's result rides along in its event frame.
+///
+/// 200 bytes was enough for a one-line chip and nothing else — the client shows roughly forty
+/// characters of it, so "what did that actually return?" was unanswerable without reading the run
+/// directory off disk, which a browser cannot do. 2KB is enough to see a stack trace, a JSON response,
+/// or the head of a file, and it is still a bound: this lands in events.jsonl once per tool call, and
+/// a long auto-loop makes many calls.
+///
+/// get_credential is exempt above and stays exempt — its result is a secret, and no cap makes logging
+/// one acceptable.
+const TOOL_PREVIEW_BYTES: usize = 2000;
+
 /// Bounded-context sizes for the cheap auxiliary inferences (drive-loop step picker / round-cap summary).
 const LOOP_CTX_BYTES: usize = 14 * 1024;
 const SUMMARY_CTX_BYTES: usize = 18 * 1024;
@@ -3819,7 +3831,7 @@ fn runInnerAgentic(
                 }
             }
             // A fetched credential value must never land in the event stream (events.jsonl outlives the turn).
-            emitToolState(app, conv_dir, c.name, "done", if (std.mem.eql(u8, c.name, "get_credential")) "(credential value withheld from the event log)" else clipBytes(result, 200));
+            emitToolState(app, conv_dir, c.name, "done", if (std.mem.eql(u8, c.name, "get_credential")) "(credential value withheld from the event log)" else clipBytes(result, TOOL_PREVIEW_BYTES));
 
             // HIPPOCAMPUS (observe): a SUCCESSFUL tool finding is durable knowledge. Gate out engine error strings
             // — "(...)" notes and `"ok":false` payloads — and never observe assistant reply content (confab fix).
