@@ -903,7 +903,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .files-head .muted { flex: 1 1 auto; }
 .files-list { overflow-y: auto; }
 .file-row {
-  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  display: flex; align-items: center; gap: 12px;
   width: 100%; text-align: left;
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
@@ -911,6 +911,10 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-size: calc(var(--fs-small) * var(--text-scale));
 }
 .file-row:hover { background: var(--surface-hover); }
+/* The name takes the slack so size and download stay pinned to the right. */
+.file-open { flex: 1 1 auto; min-width: 0; text-align: left; color: var(--text); }
+.file-open:hover { color: var(--accent); }
+.file-row .muted, .file-row .linkbtn { flex: 0 0 auto; }
 .files-view { overflow: auto; padding: 12px 14px; }
 
 /* ============================================================ collapsible rail

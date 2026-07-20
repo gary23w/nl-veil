@@ -197,3 +197,35 @@ test "set rejects over-long and control-bearing input rather than truncating" {
     try std.testing.expectError(error.BadInput, cfg.set("gpt\"quote", ""));
     try std.testing.expectError(error.BadInput, cfg.set("gpt\nnewline", ""));
 }
+
+test "setAll round-trips every role through defaults()" {
+    const t = std.testing;
+    // A real Io: setAll takes the mutex, and locking an undefined Io segfaults —
+    // the validation-only test above passes solely because check() returns first.
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var cfg = ServerConfig{ .io = threaded.io(), .gpa = t.allocator, .data = "." };
+    try cfg.setAll("m", "b", "tm", "tb", "pm", "pb");
+    const d = cfg.defaultsRaw();
+    try t.expectEqualStrings("m", d.model);
+    try t.expectEqualStrings("b", d.base_url);
+    try t.expectEqualStrings("tm", d.think_model);
+    try t.expectEqualStrings("tb", d.think_base_url);
+    try t.expectEqualStrings("pm", d.prompt_model);
+    try t.expectEqualStrings("pb", d.prompt_base_url);
+}
+
+test "clearing is expressible: empty values really do empty the config" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    var cfg = ServerConfig{ .io = threaded.io(), .gpa = t.allocator, .data = "." };
+    try cfg.setAll("m", "b", "tm", "tb", "pm", "pb");
+    try cfg.setAll("", "", "", "", "", "");
+    const d = cfg.defaultsRaw();
+    try t.expectEqual(@as(usize, 0), d.model.len);
+    try t.expectEqual(@as(usize, 0), d.think_model.len);
+    try t.expectEqual(@as(usize, 0), d.prompt_base_url.len);
+}

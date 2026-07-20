@@ -5,6 +5,7 @@ const httpz = @import("httpz");
 const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
 const chat_service = @import("../worker/chat/service.zig");
+const server_config = @import("../config/server_config.zig");
 const App = http.App;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;
@@ -93,7 +94,32 @@ pub fn adminDelKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 pub fn adminGetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     _ = requireAdmin(app, req, res) orelse return;
     const sd = app.cfg.defaults(res.arena);
-    try res.json(sd, .{});
+    try res.json(configJson(sd), .{});
+}
+
+/// The wire shape, named to MATCH ConfigReq. Returning the Defaults struct directly serialized its own
+/// field names (`model`, `base_url`), while the client — and the POST body it had just sent — use
+/// `default_model` / `default_base_url`. The save worked; the read-back looked for keys that were not
+/// there and rendered "no default", so a setting that had persisted correctly appeared to have been
+/// discarded. Request and response now use one vocabulary.
+fn configJson(sd: server_config.ServerConfig.Defaults) struct {
+    ok: bool,
+    default_model: []const u8,
+    default_base_url: []const u8,
+    think_model: []const u8,
+    think_base_url: []const u8,
+    prompt_model: []const u8,
+    prompt_base_url: []const u8,
+} {
+    return .{
+        .ok = true,
+        .default_model = sd.model,
+        .default_base_url = sd.base_url,
+        .think_model = sd.think_model,
+        .think_base_url = sd.think_base_url,
+        .prompt_model = sd.prompt_model,
+        .prompt_base_url = sd.prompt_base_url,
+    };
 }
 
 /// POST /api/v1/admin/config — set them, live. No restart: the value is swapped under a mutex and
@@ -108,7 +134,7 @@ pub fn adminSetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !voi
     };
     app.audit.record(admin.email, "set_default_model", body.default_model);
     const sd = app.cfg.defaults(res.arena);
-    try res.json(sd, .{});
+    try res.json(configJson(sd), .{});
 }
 
 const NewUserReq = struct { email: []const u8, password: []const u8 };
