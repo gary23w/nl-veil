@@ -1006,3 +1006,34 @@ body:has(.rail-grip.dragging) { cursor: col-resize; user-select: none; }
   .act-row { flex-wrap: wrap; }
   .act-detail { flex-basis: 100%; }
 }
+
+/* ============================================================ tool detail
+   A chip is a button now, so it needs the affordances of one. */
+.tool-chip { cursor: pointer; text-align: left; font: inherit; }
+.tool-chip:hover { background: var(--surface-hover); }
+.tool-chip.open { border-color: var(--accent); background: var(--tonal); }
+
+.tool-detail {
+  flex: 1 0 100%;              /* full width inside the wrapping .tools flex row */
+  margin-top: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--code-bg);
+  overflow: hidden;
+}
+.tool-detail-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+}
+.tool-detail-head .muted { flex: 1 1 auto; }
+.tool-detail-body {
+  margin: 0; padding: 9px 11px;
+  max-height: 40vh; overflow: auto;
+  font-family: var(--font-mono);
+  font-size: calc(var(--fs-small) * var(--text-scale));
+  line-height: 1.45;
+  white-space: pre-wrap;       /* tool output is prose as often as it is code */
+  word-break: break-word;
+}

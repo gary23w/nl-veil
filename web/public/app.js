@@ -26,6 +26,7 @@ const S = {
   localModels: null,    // {installed:[…]} from this machine's Ollama, or null if unreachable
   keys: [],             // provider keys on file (never the key itself)
   files: [],            // the open conversation's build tree, as last listed
+  openTool: -1,         // index of the expanded tool chip, -1 = none
   serverDefault: { model: '', base_url: '' },  // what the host configured for users who pick nothing
   // chat
   convs: [],
@@ -736,6 +737,7 @@ async function deleteActiveConv() {
 }
 
 function resetStream() {
+  S.openTool = -1; // indices point into the tools array; a new turn invalidates them
   S.stream = { text: '', shown: 0, reasoning: '', tools: [], status: '', started: 0 };
 }
 
@@ -1109,8 +1111,17 @@ function renderLive(host) {
   if (act.innerHTML !== html) act.innerHTML = html;
 
   const tools = live.querySelector('.tools');
-  const th = S.stream.tools.map(toolChip).join('');
-  if (tools.innerHTML !== th) tools.innerHTML = th;
+  const th = S.stream.tools.map(toolChip).join('') + toolDetail();
+  if (tools.innerHTML !== th) {
+    tools.innerHTML = th;
+    $$('[data-tool-idx]', tools).forEach((b) => b.addEventListener('click', () => {
+      const i = Number(b.dataset.toolIdx);
+      S.openTool = (S.openTool === i) ? -1 : i;   // clicking the open one closes it
+      renderLive(el('transcript'));
+    }));
+    const c = el('toolClose');
+    if (c) c.addEventListener('click', () => { S.openTool = -1; renderLive(el('transcript')); });
+  }
   tools.classList.toggle('hide', !S.stream.tools.length);
 
   paintTyped(live.querySelector('.msg-body'));
@@ -1242,15 +1253,37 @@ function cleanPreview(s) {
 
 /** A tool chip carries its own state and elapsed time — the point is that the
     user can see the host working, not just that something is happening. */
-function toolChip(t) {
+function toolChip(t, idx) {
   const cls = t.state === 'done' ? 'done' : (t.state === 'error' ? 'err' : 'run');
   const mark = t.state === 'done' ? '✓' : (t.state === 'error' ? '✗' : '');
   const secs = t.started && t.ended ? Math.round((t.ended - t.started) / 1000) : 0;
-  return '<div class="tool-chip ' + cls + '">'
+  const open = S.openTool === idx;
+  // A button, not a div: this is clickable, so it should be reachable by keyboard
+  // and announced as an action rather than as decoration.
+  return '<button class="tool-chip ' + cls + (open ? ' open' : '') + '" data-tool-idx="' + idx + '"'
+    + ' aria-expanded="' + (open ? 'true' : 'false') + '" title="Show what this returned">'
     + (mark ? '<i class="tool-mark">' + mark + '</i>' : '<i class="tool-mark spin"></i>')
     + '<b>' + esc(t.tool) + '</b>'
     + (cleanPreview(t.preview) ? '<span class="ellip">' + esc(cleanPreview(t.preview)) + '</span>' : '')
     + (secs > 1 ? '<span class="muted">' + secs + 's</span>' : '')
+    + '</button>';
+}
+
+/** The opened tool's output, under the strip. The event frame carries a bounded
+    slice of the result (TOOL_PREVIEW_BYTES server-side), not the whole thing —
+    so this says "clipped" when it is at the cap rather than implying the tool
+    returned exactly this much. */
+function toolDetail() {
+  const t = S.stream.tools[S.openTool];
+  if (!t) return '';
+  const raw = String(t.preview || '');
+  if (!raw) return '<div class="tool-detail"><span class="muted">this call returned nothing</span></div>';
+  const clipped = raw.length >= 1990; // the server clips at 2000 bytes
+  return '<div class="tool-detail">'
+    + '<div class="tool-detail-head"><b class="mono">' + esc(t.tool) + '</b>'
+    + '<span class="muted">' + esc(t.state || '') + (clipped ? ' · output clipped' : '') + '</span>'
+    + '<button class="linkbtn" id="toolClose">close</button></div>'
+    + '<pre class="tool-detail-body">' + esc(raw) + '</pre>'
     + '</div>';
 }
 
