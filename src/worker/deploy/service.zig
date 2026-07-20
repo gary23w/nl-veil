@@ -162,12 +162,40 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     var eff_key: []const u8 = body.api_key;
     var eff_base: []const u8 = body.base_url;
     var eff_model: []const u8 = body.model;
-    const wants_cf_ai = std.mem.eql(u8, body.provider, "workers-ai") or std.mem.eql(u8, body.provider, "cloudflare");
+
+    // PROVIDER DERIVATION. A cast may name only a model (CLI `veil cast … --model deepseek-v4-flash`) or
+    // nothing at all. Without this it defaulted to "workers-ai" and never resolved the caller's stored key —
+    // so an explicit --model and the server's own published default were both silently ignored, and every
+    // keyless cast dead-ended at "Workers AI needs a Cloudflare login". Resolve in priority order; each rung
+    // is a KNOWN fact, never a guess (providerForModel/providerForBase return null rather than mis-attribute):
+    //   1. explicit provider — respect it
+    //   2. the model's catalog provider — a named model implies its provider
+    //   3. the base_url's catalog provider — a known endpoint implies its provider
+    //   4. the server's published default model, and its provider + base
+    //   5. workers-ai — the keyless server-creds fallback, only when nothing above resolved
+    var eff_provider = body.provider;
+    if (eff_provider.len == 0) {
+        if (modelcfg.providerForModel(body.model)) |pv| {
+            eff_provider = pv;
+        } else if (modelcfg.providerForBase(body.base_url)) |pv| {
+            eff_provider = pv;
+        } else {
+            const sd = app.cfg.defaults(arena); // .model/.base_url are the CODING-role (default) pair
+            if (sd.model.len > 0) if (modelcfg.providerForModel(sd.model)) |pv| {
+                eff_provider = pv;
+                if (eff_model.len == 0) eff_model = sd.model;
+                if (eff_base.len == 0) eff_base = sd.base_url;
+            };
+        }
+        if (eff_provider.len == 0) eff_provider = "workers-ai";
+    }
+
+    const wants_cf_ai = std.mem.eql(u8, eff_provider, "workers-ai") or std.mem.eql(u8, eff_provider, "cloudflare");
     // A client can BYO Cloudflare by sending the fully-resolved account URL + its own token. If it doesn't
     // (base is the "cloudflare" sentinel or still carries the "{account}" placeholder), fall back to this
     // server's own configured Workers AI credentials — so a missing account id never yields a broken URL.
-    const cf_base_ok = std.mem.startsWith(u8, body.base_url, "http") and std.mem.indexOf(u8, body.base_url, "{account}") == null;
-    if (wants_cf_ai and (body.api_key.len == 0 or !cf_base_ok)) {
+    const cf_base_ok = std.mem.startsWith(u8, eff_base, "http") and std.mem.indexOf(u8, eff_base, "{account}") == null;
+    if (wants_cf_ai and (eff_key.len == 0 or !cf_base_ok)) {
         if (!e.workers_ai) return failCap("Workers AI is not enabled for your account");
         // Prefer this user's own Cloudflare login (OAuth) — a per-user token + account, auto-refreshed. Falls
         // back to the server-wide NL_CF_* credentials only when the user hasn't logged in.
@@ -181,15 +209,18 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
             eff_key = app.workers_ai_token;
         }
         if (eff_model.len == 0 or !std.mem.startsWith(u8, eff_model, "@cf/")) eff_model = modelcfg.defaults.cf_model;
-    } else if (eff_key.len == 0 and body.base_url.len == 0) {
-        // Fall back to a stored BYOK key ONLY when the caller gave no explicit endpoint (the deploy-wizard
-        // flow: pick a provider, no base, no key). A custom OpenAI-compatible endpoint always carries its own
-        // base_url — pulling the user's real "openai" vault key/base for it would silently redirect the cast
-        // to OpenAI with the wrong credentials.
-        if (app.vault.resolve(u.id, body.provider, arena)) |rk| {
+    } else if (eff_key.len == 0) {
+        // Resolve a stored BYOK key. Safe when the caller gave NO endpoint (pick-a-provider flow) OR when the
+        // endpoint they gave is one this catalog RECOGNISES — providerForBase only matches a known host, so a
+        // custom/unknown endpoint still resolves to null and is never handed another provider's key. This is
+        // what makes `--base-url https://api.deepseek.com/v1` (no key) work: the base identifies the provider,
+        // and the sealed deepseek key is pulled for it. The old guard required a blank base and so silently
+        // dropped the key whenever a base was supplied.
+        const known_base = eff_base.len == 0 or modelcfg.providerForBase(eff_base) != null;
+        if (known_base) if (app.vault.resolve(u.id, eff_provider, arena)) |rk| {
             eff_key = rk.key;
-            if (rk.base_url.len > 0) eff_base = rk.base_url;
-        }
+            if (eff_base.len == 0 and rk.base_url.len > 0) eff_base = rk.base_url;
+        };
     }
     // A local-provider cast with no explicit base_url must resolve to the local Ollama, NEVER the worker's
     // OpenAI fallback (run.zig defaults an empty base to api.openai.com — and with a server-env OPENAI/ANTHROPIC
@@ -197,7 +228,7 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
     // caller may not.
     if (local_model and eff_base.len == 0) eff_base = "http://127.0.0.1:11434/v1";
 
-    const mani_items = buildManifest(arena, body, workdir, eff_base, eff_model, body.encrypt and e.encrypted) catch return failSrv("out of memory");
+    const mani_items = buildManifest(arena, body, eff_provider, workdir, eff_base, eff_model, body.encrypt and e.encrypted) catch return failSrv("out of memory");
     const mani_path = std.fmt.allocPrint(arena, "{s}/swarm.json", .{run_dir}) catch return failSrv("out of memory");
     std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = mani_path, .data = mani_items }) catch return failSrv("could not write manifest");
 
@@ -209,12 +240,12 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
 }
 
 /// Build the swarm.json manifest bytes into `arena` (freed with the arena).
-fn buildManifest(arena: std.mem.Allocator, body: DeployReq, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool) ![]u8 {
+fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []const u8, workdir: []const u8, eff_base: []const u8, eff_model: []const u8, encrypted: bool) ![]u8 {
     var mani: std.ArrayListUnmanaged(u8) = .empty;
     try mani.appendSlice(arena, "{\"swarm\":");
     try jstr(arena, &mani, body.name);
     try mani.appendSlice(arena, ",\"provider\":");
-    try jstr(arena, &mani, body.provider);
+    try jstr(arena, &mani, eff_provider); // the DERIVED provider, so swarm.json records what actually ran
     try mani.appendSlice(arena, ",\"base_url\":");
     try jstr(arena, &mani, eff_base);
     try mani.appendSlice(arena, ",\"model\":");
@@ -362,7 +393,7 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const name = if (rq.name.len > 0) rq.name else try std.fmt.allocPrint(res.arena, "run-{s}", .{std.fmt.bytesToHex(sfx, .lower)});
     const body = DeployReq{
         .name = name,
-        .provider = if (rq.provider.len > 0) rq.provider else "workers-ai",
+        .provider = rq.provider, // "" is fine — deploySwarm derives it from the model/base/server-default (was forced to "workers-ai" here, which ignored an explicit --model and the server default)
         .model = rq.model,
         .stack = rq.stack,
         .style = rq.style,
@@ -493,7 +524,7 @@ pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq)
     const name = if (rq.name.len > 0) rq.name else (std.fmt.allocPrint(arena, "cast-{s}", .{std.fmt.bytesToHex(sfx, .lower)}) catch return failSrv("out of memory"));
     const body = DeployReq{
         .name = name,
-        .provider = if (rq.provider.len > 0) rq.provider else "workers-ai",
+        .provider = rq.provider, // "" is fine — deploySwarm derives it from the model/base/server-default (was forced to "workers-ai" here, which ignored an explicit --model and the server default)
         .model = rq.model,
         .stack = "general",
         // A cast is a FAST scatter-gather, not an 8-minute build loop. mode="cast" -> the engine's cast path:
