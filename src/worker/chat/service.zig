@@ -36,6 +36,19 @@ const requireUser = http.requireUser;
 const badReq = http.badReq;
 const notFound = http.notFound;
 
+/// One role's (model, base_url) resolved against the host's configured default FOR THAT ROLE.
+///
+/// The default lands only when the client sent NEITHER half. That is not caution about the client — it
+/// is about the pair: a defaulted model welded to a base URL the user happened to type (or the reverse)
+/// is an endpoint nobody chose, and it surfaces as a provider 404 that reads like the model is broken.
+/// A host role left unset stays blank here and falls back to coding in ModelTrio.pick, exactly as an
+/// unset USER role does — one fallback rule, not two.
+const RolePair = struct { model: []const u8, base_url: []const u8 };
+fn roleDefault(model: []const u8, base_url: []const u8, d_model: []const u8, d_base: []const u8) RolePair {
+    if (model.len == 0 and base_url.len == 0 and d_model.len > 0) return .{ .model = d_model, .base_url = d_base };
+    return .{ .model = model, .base_url = base_url };
+}
+
 /// Resolve ONE role's (base_url, api_key) when the client sends a BLANK key. Two fallbacks, in order:
 ///
 ///   1. Cloudflare OAuth — the endpoint or model names Workers AI, so swap in the user's auto-refreshed
@@ -372,23 +385,30 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // Workers AI endpoint, otherwise this user's sealed BYOK vault entry for whichever catalog provider the
     // base URL belongs to. That is what lets a browser run a hosted turn without ever holding a key. Each of
     // the three roles resolves independently (a user can point prompting at CF and coding at BYOK).
-    // SERVER DEFAULT: fill a blank coding model from the host's configuration before anything else
-    // looks at it. Applied all-or-nothing on the pair — a model from the default paired with a base URL
-    // the user happened to type (or vice versa) is a combination nobody chose, and it fails as a 404
-    // that reads like a broken model. Only the coding role is defaulted; thinking/prompting already
-    // fall back to coding inside ModelTrio.pick.
+    // SERVER DEFAULT: fill a blank ROLE from the host's configuration before anything else looks at it.
+    // All-or-nothing within each pair (see roleDefault) — but PER ROLE, which it did not used to be.
+    //
+    // The pair rule was evaluated once for the whole body: unless the client sent no coding model AND no
+    // coding base URL, every server role was discarded, thinking and prompting included. The web UI, the
+    // CLI, and every stored scheduled task all send a coding model, so the host's thinking and prompting
+    // models reached nobody except a desk that had already configured its own trio. The setting existed
+    // and did nothing. Roles are independent everywhere else here — resolveRole resolves each role's key
+    // on its own, ModelTrio.pick falls back per role — so they are independent here too.
+    //
+    // Precedence, most specific first: the user's own role, then the host's role for it, then whatever
+    // coding resolved to. A user who chose only a coding model therefore picks up the host's thinking and
+    // prompting models. That is the same bargain as the shared server key, which already spends the
+    // admin's credit for a user who brought none: what you did not choose, the host chooses for you.
     const sd = app.cfg.defaults(res.arena);
-    const use_default = b.model.len == 0 and b.base_url.len == 0 and sd.model.len > 0;
-    const c_model = if (use_default) sd.model else b.model;
-    const c_base = if (use_default) sd.base_url else b.base_url;
-    // The server's trio applies per role, and only where the client sent nothing. An admin can
-    // therefore publish a full coding/thinking/prompting split for everyone, or just a coding model —
-    // an unset server role falls through to the server's coding model in ModelTrio.pick, exactly as an
-    // unset user role does.
-    const t_model = if (b.think_model.len == 0 and use_default) sd.think_model else b.think_model;
-    const t_base = if (b.think_base_url.len == 0 and use_default) sd.think_base_url else b.think_base_url;
-    const p_model = if (b.prompt_model.len == 0 and use_default) sd.prompt_model else b.prompt_model;
-    const p_base = if (b.prompt_base_url.len == 0 and use_default) sd.prompt_base_url else b.prompt_base_url;
+    const cr = roleDefault(b.model, b.base_url, sd.model, sd.base_url);
+    const tr = roleDefault(b.think_model, b.think_base_url, sd.think_model, sd.think_base_url);
+    const pr = roleDefault(b.prompt_model, b.prompt_base_url, sd.prompt_model, sd.prompt_base_url);
+    const c_model = cr.model;
+    const c_base = cr.base_url;
+    const t_model = tr.model;
+    const t_base = tr.base_url;
+    const p_model = pr.model;
+    const p_base = pr.base_url;
 
     const cc = resolveRole(app, u.id, res.arena, c_base, c_model, b.api_key);
     const eff_base = cc.base;
@@ -616,4 +636,29 @@ pub fn convFile(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, full, res.arena, .limited(FILE_MAX)) catch return notFound(res);
     res.content_type = .TEXT;
     res.body = data;
+}
+
+test "the host default fills each role on its own, and never mixes a pair" {
+    const t = std.testing;
+
+    // The regression this guards: a client that picked its own coding model still gets the host's
+    // thinking and prompting roles. Evaluated per-request instead of per-role, both came back blank.
+    const think = roleDefault("", "", "host-think", "https://think.example/v1");
+    try t.expectEqualStrings("host-think", think.model);
+    try t.expectEqualStrings("https://think.example/v1", think.base_url);
+
+    // A role the client DID fill is never touched, base URL and all.
+    const mine = roleDefault("mine", "http://127.0.0.1:11434/v1", "host-think", "https://think.example/v1");
+    try t.expectEqualStrings("mine", mine.model);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", mine.base_url);
+
+    // Half a pair from the client means the default stays out entirely — a host model on a user's
+    // endpoint is the 404 that reads like a broken model.
+    const half = roleDefault("", "http://127.0.0.1:11434/v1", "host-think", "https://think.example/v1");
+    try t.expectEqualStrings("", half.model);
+    try t.expectEqualStrings("http://127.0.0.1:11434/v1", half.base_url);
+
+    // No host role configured: stays blank, and ModelTrio.pick falls it back to coding.
+    const unset = roleDefault("", "", "", "");
+    try t.expectEqualStrings("", unset.model);
 }

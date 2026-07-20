@@ -2178,7 +2178,8 @@ async function renderServerConfig() {
 
   const rolePanel = (key, label, hint, model, base) => `
     <div class="role-panel" data-cfgrole="${key}">
-      <div class="role-title">${label}<span class="muted"> — ${esc(hint)}</span></div>
+      <div class="role-title">${label}</div>
+      <div class="model-note muted" style="margin:0 0 10px">${esc(hint)}</div>
       <div class="field">
         <label>Model</label>
         <select data-cfgpick="${key}">${catalogOptions(model || '')}</select>
@@ -2194,18 +2195,19 @@ async function renderServerConfig() {
 
   host.innerHTML = `
     <div class="muted" style="margin-bottom:10px">
-      Everyone who has not chosen their own model uses this. It applies immediately — no restart.
+      Every role a user has not chosen for themselves uses this — per role, so someone who picked only a
+      coding model still gets the thinking and prompting models set here. Applies immediately, no restart.
     </div>
     <div class="set-row">
       <div><b>One model for everything</b>
         <div class="muted">Off = publish a coding / thinking / prompting split for every user, the same
-          three roles they can set for themselves.</div></div>
+          three roles they can set for themselves. ${SPEND_HINT}</div></div>
       <input type="checkbox" id="cfgOne" class="w-auto" ${trio ? '' : 'checked'}>
     </div>
     <div id="cfgRoles">
-      ${rolePanel('', 'Coding', 'the build stream — and the fallback for every unset role', cur.default_model, cur.default_base_url)}
-      ${trio ? rolePanel('think_', 'Thinking', 'planning, reflection, summaries', cur.think_model, cur.think_base_url) : ''}
-      ${trio ? rolePanel('prompt_', 'Prompting', 'drives the auto-loop', cur.prompt_model, cur.prompt_base_url) : ''}
+      ${rolePanel('', 'Coding', ROLES[0].hint, cur.default_model, cur.default_base_url)}
+      ${trio ? rolePanel('think_', 'Thinking', ROLES[1].hint, cur.think_model, cur.think_base_url) : ''}
+      ${trio ? rolePanel('prompt_', 'Prompting', ROLES[2].hint, cur.prompt_model, cur.prompt_base_url) : ''}
     </div>
     <div class="row" style="margin-top:12px">
       <button class="btn btn-solid btn-sm" id="cfgSave">Save</button>
@@ -2452,11 +2454,20 @@ function fmtBytes(n) {
 
 /* ============================================================ settings */
 
+/** The three roles, described by WHAT THEY DECIDE rather than by which internal call
+    they serve. The old copy ("planning, reflection, summaries", "housekeeping") was
+    accurate and useless: nobody buys a second model to do housekeeping. A reader has
+    to be able to tell, from one line, why these would be three different models. */
 const ROLES = [
-  { key: '',        label: 'Coding',    hint: 'the build stream — and the fallback for every unset role' },
-  { key: 'think_',  label: 'Thinking',  hint: 'planning, reflection, summaries' },
-  { key: 'prompt_', label: 'Prompting', hint: 'drives the auto-loop' },
+  { key: '',        label: 'Coding',    hint: 'runs the tools, writes the files, streams the reply you read — your strongest model, and the fallback for anything unset' },
+  { key: 'think_',  label: 'Thinking',  hint: 'decides what done means — breaks the task down, writes the bar the work is checked against, picks what survives compaction' },
+  { key: 'prompt_', label: 'Prompting', hint: 'writes the next instruction, once per step, from a short slice of transcript — high volume, small context, so set it cheap' },
 ];
+
+/** Where the money actually goes. MODELLED from request-body sizes after prefix-cache
+    hits, not metered per account — so it is phrased as a rule of thumb, which is all
+    it needs to be to steer the one decision it informs: go cheap on prompting. */
+const SPEND_HINT = 'Roughly 60% of billable input goes to coding, 20% to thinking, 15% to prompting.';
 
 function renderSettings(host) {
   const st = S.settings;
@@ -2489,7 +2500,8 @@ function renderSettings(host) {
           <input type="checkbox" id="useDefault" class="w-auto" ${usingServerDefault() ? 'checked' : ''}>
         </div>` : ''}
         <div class="set-row">
-          <div><b>One model for everything</b><div class="muted">Off = point coding, thinking and prompting at different models.</div></div>
+          <div><b>One model for everything</b><div class="muted">Off = give coding, thinking and prompting their own models.
+            ${SPEND_HINT}</div></div>
           <input type="checkbox" id="setOne" class="w-auto" ${st.oneModel ? 'checked' : ''}>
         </div>
         <div id="rolePanels"></div>
@@ -2670,10 +2682,14 @@ function usingServerDefault() {
   return !!(S.serverDefault && S.serverDefault.model) && !S.settings.model && !S.settings.base_url;
 }
 
-/** The model this account's next turn will ACTUALLY run on, or '' if there is
-    none. Mirrors the server's own resolution (service.zig:381): a blank model is
-    filled from the host's default only when the base URL is blank too, because
-    the default is applied all-or-nothing on the pair. Reading only S.settings.model
+/** The CODING model this account's next turn will ACTUALLY run on, or '' if there
+    is none. Mirrors the server's own resolution (service.zig roleDefault): a blank
+    model is filled from the host's default only when the base URL is blank too,
+    because the default is applied all-or-nothing on the pair. The other two roles
+    resolve the same way but independently, and the host may fill them from its own
+    trio — which this client cannot see, since /auth/me carries only the coding
+    pair. Nothing here depends on that; it is only why this is coding-only.
+    Reading only S.settings.model
     would call a working setup "unconfigured"; reading only the default would call
     an unconfigured one working. */
 function effectiveModel() {
@@ -2712,11 +2728,15 @@ function drawRolePanels() {
   // and the fields explain themselves the moment the switch goes off.
   host.classList.toggle('locked', locked);
   if (locked) {
-    host.innerHTML = '<div class="role-panel"><div class="role-title">Coding, thinking and prompting'
-      + '<span class="muted"> — all using the server default</span></div>'
+    // Names the CODING model only, because that is the only one of the three /auth/me carries. The host
+    // may also publish its own thinking and prompting models, which this account would then be using —
+    // claiming "all three are X" would be a guess, and on a split host a wrong one.
+    host.innerHTML = '<div class="role-panel"><div class="role-title">Every role'
+      + '<span class="muted"> — set by this server</span></div>'
       + '<div class="muted mono">' + esc(S.serverDefault.model)
       + (S.serverDefault.base_url ? ' <span class="dim">· ' + esc(hostOf(S.serverDefault.base_url)) + '</span>' : '')
-      + '</div></div>';
+      + '</div><div class="muted">coding runs here; thinking and prompting use it too unless the server '
+      + 'has its own models for them.</div></div>';
     return;
   }
 
@@ -2725,7 +2745,8 @@ function drawRolePanels() {
     const known = modelById(cur);
     return `
     <div class="role-panel">
-      <div class="role-title">${r.label}<span class="muted"> — ${esc(r.hint)}</span></div>
+      <div class="role-title">${r.label}</div>
+      <div class="model-note muted" style="margin:0 0 10px">${esc(r.hint)}</div>
       ${loaded ? `
         <div class="field">
           <label>Model</label>

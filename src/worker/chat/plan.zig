@@ -2,7 +2,9 @@
 //!
 //! When the veil is given a non-trivial task, its first move is to decompose it into a list of subtasks, each
 //! tagged with a triage ROUTE: "hive" (delegate to a swarm), "research" (learn/RAG first), or "inline" (build it
-//! itself). This module is the pure data layer for that plan: parse the decomposition the model returns, persist
+//! itself) — and, alongside the list, an ACCEPTANCE CONTRACT (Brief: objective / done_when / watch_for) stating
+//! what "done" means before any work starts. This module is the pure data layer for that plan: parse the
+//! decomposition and the contract the model returns, persist
 //! the task list to plan.jsonl, and walk it deterministically. The drive loop (chat_engine) executes one pending
 //! task per step and marks it done — turning the prompt-level "plan then triage" posture into tracked structure
 //! that survives across turns (a follow-up "continue" resumes the pending tasks).
@@ -29,6 +31,9 @@ pub const Task = struct {
     route: []u8, // "hive" | "research" | "inline" (gpa-owned)
     status: []u8, // "pending" | "active" | "done" (gpa-owned)
     swarm_id: []u8, // the swarm cast for this task, or "" (gpa-owned)
+    // The checkable condition that ends THIS subtask, in the planner's own words, or "" (gpa-owned). A model
+    // that omits it leaves "" — the caller falls back to its generic closing line, which is the old behaviour.
+    done_when: []u8 = &.{},
 };
 
 pub fn freeTasks(gpa: std.mem.Allocator, tasks: []Task) void {
@@ -37,8 +42,60 @@ pub fn freeTasks(gpa: std.mem.Allocator, tasks: []Task) void {
         gpa.free(t.route);
         gpa.free(t.status);
         gpa.free(t.swarm_id);
+        gpa.free(t.done_when);
     }
     gpa.free(tasks);
+}
+
+/// How many done_when / watch_for lines one brief may carry. A brief rides in EVERY inference of the turn (it is
+/// injected below the compaction floor), so an over-eager planner must not be able to mint an unbounded preamble.
+pub const MAX_BRIEF_ITEMS: usize = 8;
+
+/// The turn's ACCEPTANCE CONTRACT — what the thinking model decided "done" means before any coding work started.
+/// Separate from the task list because it is turn-level, not per-subtask: the objective the whole plan serves, the
+/// conditions that must hold at the end, and the failure modes the planner already anticipated. Every field is
+/// optional by construction: a planner that returns only {"plan":[…]} yields an EMPTY brief and the turn behaves
+/// exactly as it did before briefs existed.
+pub const Brief = struct {
+    objective: []u8 = &.{}, // one-sentence acceptance statement (gpa-owned)
+    done_when: [][]u8 = &.{}, // checkable end conditions (gpa-owned, each item gpa-owned)
+    watch_for: [][]u8 = &.{}, // known failure modes (gpa-owned, each item gpa-owned)
+
+    /// Nothing worth injecting — the caller skips the whole brief message rather than emitting an empty header.
+    pub fn isEmpty(self: Brief) bool {
+        return self.objective.len == 0 and self.done_when.len == 0 and self.watch_for.len == 0;
+    }
+
+    pub fn deinit(self: *Brief, gpa: std.mem.Allocator) void {
+        gpa.free(self.objective);
+        freeLines(gpa, self.done_when);
+        freeLines(gpa, self.watch_for);
+        self.* = .{};
+    }
+};
+
+fn freeLines(gpa: std.mem.Allocator, lines: [][]u8) void {
+    for (lines) |l| gpa.free(l);
+    gpa.free(lines);
+}
+
+/// Dupe up to MAX_BRIEF_ITEMS non-empty, trimmed lines. Any allocation failure just shortens the list — a brief is
+/// additive context, never a reason to fail the turn.
+fn dupeLines(gpa: std.mem.Allocator, src: []const []const u8) [][]u8 {
+    var list: std.ArrayListUnmanaged([]u8) = .empty;
+    defer list.deinit(gpa);
+    for (src) |raw| {
+        if (list.items.len >= MAX_BRIEF_ITEMS) break;
+        const t = std.mem.trim(u8, raw, " \r\n\t");
+        if (t.len == 0) continue;
+        const d = gpa.dupe(u8, t) catch break;
+        list.append(gpa, d) catch {
+            gpa.free(d);
+            break;
+        };
+    }
+    if (list.items.len == 0) return &.{};
+    return list.toOwnedSlice(gpa) catch &.{};
 }
 
 /// Normalize a model-supplied route to one of the three canonical values (unknown → inline, the safe default:
@@ -50,7 +107,7 @@ pub fn normalizeRoute(r: []const u8) []const u8 {
     return ROUTE_INLINE;
 }
 
-fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: []const u8, swarm_id: []const u8) !Task {
+fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: []const u8, swarm_id: []const u8, done_when: []const u8) !Task {
     const tx = try gpa.dupe(u8, text);
     errdefer gpa.free(tx);
     const rt = try gpa.dupe(u8, normalizeRoute(route));
@@ -58,36 +115,104 @@ fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: [
     const st = try gpa.dupe(u8, status);
     errdefer gpa.free(st);
     const sw = try gpa.dupe(u8, swarm_id);
-    return .{ .text = tx, .route = rt, .status = st, .swarm_id = sw };
+    errdefer gpa.free(sw);
+    const dw = try gpa.dupe(u8, std.mem.trim(u8, done_when, " \r\n\t"));
+    return .{ .text = tx, .route = rt, .status = st, .swarm_id = sw, .done_when = dw };
 }
 
-/// Parse the model's decomposition reply — `{"plan":[{"task":"…","route":"hive|research|inline"}, …]}` — into a
+fn freeTask(gpa: std.mem.Allocator, t: Task) void {
+    gpa.free(t.text);
+    gpa.free(t.route);
+    gpa.free(t.status);
+    gpa.free(t.swarm_id);
+    gpa.free(t.done_when);
+}
+
+/// Parse the model's decomposition reply — `{"plan":[{"task":"…","route":"…","done_when":"…"}, …]}` — into a
 /// fresh pending task list (capped at MAX_TASKS). A `{"plan":[]}` (or unparseable / no tasks) returns an EMPTY
 /// slice, the caller's signal to run a normal single-step turn instead of a board. Never errors: any trouble →
 /// empty (degrade to the normal turn).
+///
+/// TWO-SHOT PARSE. `done_when` is the newer field, and std.json type-errors a KNOWN field of the wrong shape even
+/// under ignore_unknown_fields — a planner that emits `"done_when":["a","b"]` on a row would otherwise take the
+/// WHOLE board down to empty. So a failed strict parse retries with the original two-field row: the plan degrades
+/// to what it always was rather than vanishing.
 pub fn parseDecomposition(gpa: std.mem.Allocator, json: []const u8) []Task {
-    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE };
+    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, done_when: []const u8 = "" };
     const Doc = struct { plan: []const Row = &.{} };
-    const parsed = std.json.parseFromSlice(Doc, gpa, json, .{ .ignore_unknown_fields = true }) catch return &.{};
-    defer parsed.deinit();
-
+    if (std.json.parseFromSlice(Doc, gpa, json, .{ .ignore_unknown_fields = true })) |parsed| {
+        defer parsed.deinit();
+        return collectRows(gpa, parsed.value.plan);
+    } else |_| {}
+    const Legacy = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE };
+    const LegacyDoc = struct { plan: []const Legacy = &.{} };
+    const lp = std.json.parseFromSlice(LegacyDoc, gpa, json, .{ .ignore_unknown_fields = true }) catch return &.{};
+    defer lp.deinit();
     var list: std.ArrayListUnmanaged(Task) = .empty;
     defer list.deinit(gpa);
-    for (parsed.value.plan) |row| {
+    for (lp.value.plan) |row| {
         if (list.items.len >= MAX_TASKS) break;
         const text = std.mem.trim(u8, row.task, " \r\n\t");
         if (text.len == 0) continue;
-        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "") catch break;
+        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", "") catch break;
         list.append(gpa, t) catch {
-            gpa.free(t.text);
-            gpa.free(t.route);
-            gpa.free(t.status);
-            gpa.free(t.swarm_id);
+            freeTask(gpa, t);
             break;
         };
     }
     if (list.items.len == 0) return &.{};
     return list.toOwnedSlice(gpa) catch &.{};
+}
+
+fn collectRows(gpa: std.mem.Allocator, rows: anytype) []Task {
+    var list: std.ArrayListUnmanaged(Task) = .empty;
+    defer list.deinit(gpa);
+    for (rows) |row| {
+        if (list.items.len >= MAX_TASKS) break;
+        const text = std.mem.trim(u8, row.task, " \r\n\t");
+        if (text.len == 0) continue;
+        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", row.done_when) catch break;
+        list.append(gpa, t) catch {
+            freeTask(gpa, t);
+            break;
+        };
+    }
+    if (list.items.len == 0) return &.{};
+    return list.toOwnedSlice(gpa) catch &.{};
+}
+
+/// Parse the turn-level acceptance contract out of the SAME decomposition reply. Deliberately a SEPARATE parse
+/// from parseDecomposition: a malformed brief must not cost the caller its plan, and a malformed plan must not
+/// cost it the brief. Missing fields ⇒ empty, never an error.
+pub fn parseBrief(gpa: std.mem.Allocator, json: []const u8) Brief {
+    const Doc = struct {
+        objective: []const u8 = "",
+        done_when: []const []const u8 = &.{},
+        watch_for: []const []const u8 = &.{},
+    };
+    const parsed = std.json.parseFromSlice(Doc, gpa, json, .{ .ignore_unknown_fields = true }) catch return .{};
+    defer parsed.deinit();
+    const obj = std.mem.trim(u8, parsed.value.objective, " \r\n\t");
+    return .{
+        .objective = gpa.dupe(u8, obj) catch &.{},
+        .done_when = dupeLines(gpa, parsed.value.done_when),
+        .watch_for = dupeLines(gpa, parsed.value.watch_for),
+    };
+}
+
+/// The brief as one JSON object — what the caller persists beside plan.jsonl so a "continue" turn resumes under
+/// the SAME acceptance contract it was planned against. gpa-owned.
+pub fn formatBrief(gpa: std.mem.Allocator, b: Brief) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\"objective\":");
+    try appendJsonString(gpa, &out, b.objective);
+    try out.appendSlice(gpa, ",\"done_when\":");
+    try appendJsonArray(gpa, &out, b.done_when);
+    try out.appendSlice(gpa, ",\"watch_for\":");
+    try appendJsonArray(gpa, &out, b.watch_for);
+    try out.append(gpa, '}');
+    return out.toOwnedSlice(gpa);
 }
 
 /// One plan.jsonl line for `task`: {"task":..,"route":..,"status":..,"swarm_id":..}. gpa-owned (no trailing \n).
@@ -102,6 +227,8 @@ pub fn formatPlanLine(gpa: std.mem.Allocator, task: Task) ![]u8 {
     try appendJsonString(gpa, &l, task.status);
     try l.appendSlice(gpa, ",\"swarm_id\":");
     try appendJsonString(gpa, &l, task.swarm_id);
+    try l.appendSlice(gpa, ",\"done_when\":");
+    try appendJsonString(gpa, &l, task.done_when);
     try l.append(gpa, '}');
     return l.toOwnedSlice(gpa);
 }
@@ -122,7 +249,7 @@ pub fn formatPlan(gpa: std.mem.Allocator, tasks: []const Task) ![]u8 {
 /// Parse a persisted plan.jsonl back into a task list (for resuming across turns). Bad lines are skipped; a fully
 /// unreadable file → empty. Capped at MAX_TASKS.
 pub fn parsePlan(gpa: std.mem.Allocator, bytes: []const u8) []Task {
-    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, status: []const u8 = STATUS_PENDING, swarm_id: []const u8 = "" };
+    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, status: []const u8 = STATUS_PENDING, swarm_id: []const u8 = "", done_when: []const u8 = "" };
     var list: std.ArrayListUnmanaged(Task) = .empty;
     defer list.deinit(gpa);
     var it = std.mem.splitScalar(u8, bytes, '\n');
@@ -133,12 +260,9 @@ pub fn parsePlan(gpa: std.mem.Allocator, bytes: []const u8) []Task {
         const p = std.json.parseFromSlice(Row, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
         if (std.mem.trim(u8, p.value.task, " \r\n\t").len == 0) continue;
-        const t = mkTask(gpa, p.value.task, p.value.route, p.value.status, p.value.swarm_id) catch break;
+        const t = mkTask(gpa, p.value.task, p.value.route, p.value.status, p.value.swarm_id, p.value.done_when) catch break;
         list.append(gpa, t) catch {
-            gpa.free(t.text);
-            gpa.free(t.route);
-            gpa.free(t.status);
-            gpa.free(t.swarm_id);
+            freeTask(gpa, t);
             break;
         };
     }
@@ -198,6 +322,15 @@ fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s:
     try out.append(gpa, '"');
 }
 
+fn appendJsonArray(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), items: []const []u8) !void {
+    try out.append(gpa, '[');
+    for (items, 0..) |s, i| {
+        if (i > 0) try out.append(gpa, ',');
+        try appendJsonString(gpa, out, s);
+    }
+    try out.append(gpa, ']');
+}
+
 // ------------------------------------------------------------------------------------------- tests
 
 test "parseDecomposition: parses tasks + routes; normalizes unknown route to inline; empty plan → empty" {
@@ -254,6 +387,58 @@ test "nextPending / allDone / doneCount walk the board" {
     setStatus(gpa, &tasks[1], STATUS_DONE);
     try std.testing.expectEqual(@as(?usize, null), nextPending(tasks));
     try std.testing.expect(allDone(tasks));
+}
+
+test "brief: parsed from the same reply, round-trips, and is EMPTY (never an error) when omitted" {
+    const gpa = std.testing.allocator;
+    const json =
+        \\{"objective":"the site builds and serves","done_when":["npm run build exits 0","/ returns 200"," "],"watch_for":["missing imports"],"plan":[{"task":"scaffold","route":"inline","done_when":"index.html exists"}]}
+    ;
+    var b = parseBrief(gpa, json);
+    defer b.deinit(gpa);
+    try std.testing.expect(!b.isEmpty());
+    try std.testing.expectEqualStrings("the site builds and serves", b.objective);
+    try std.testing.expectEqual(@as(usize, 2), b.done_when.len); // the blank item is dropped
+    try std.testing.expectEqualStrings("npm run build exits 0", b.done_when[0]);
+    try std.testing.expectEqualStrings("missing imports", b.watch_for[0]);
+
+    const body = try formatBrief(gpa, b);
+    defer gpa.free(body);
+    var back = parseBrief(gpa, body);
+    defer back.deinit(gpa);
+    try std.testing.expectEqualStrings(b.objective, back.objective);
+    try std.testing.expectEqual(b.done_when.len, back.done_when.len);
+    try std.testing.expectEqualStrings(b.done_when[1], back.done_when[1]);
+
+    // the OLD schema (plan only) still parses into a usable plan, and yields an empty brief
+    var none = parseBrief(gpa, "{\"plan\":[{\"task\":\"a\",\"route\":\"inline\"}]}");
+    defer none.deinit(gpa);
+    try std.testing.expect(none.isEmpty());
+    var junk = parseBrief(gpa, "not json");
+    defer junk.deinit(gpa);
+    try std.testing.expect(junk.isEmpty());
+}
+
+test "per-task done_when parses, round-trips, and a wrong-shaped done_when still yields a plan" {
+    const gpa = std.testing.allocator;
+    const tasks = parseDecomposition(gpa, "{\"plan\":[{\"task\":\"a\",\"route\":\"hive\",\"done_when\":\"the files land\"},{\"task\":\"b\",\"route\":\"inline\"}]}");
+    defer freeTasks(gpa, tasks);
+    try std.testing.expectEqual(@as(usize, 2), tasks.len);
+    try std.testing.expectEqualStrings("the files land", tasks[0].done_when);
+    try std.testing.expectEqualStrings("", tasks[1].done_when); // omitted ⇒ empty, not an error
+
+    const body = try formatPlan(gpa, tasks);
+    defer gpa.free(body);
+    const back = parsePlan(gpa, body);
+    defer freeTasks(gpa, back);
+    try std.testing.expectEqualStrings("the files land", back[0].done_when);
+
+    // TWO-SHOT: an array-shaped row done_when type-errors the strict parse; the board must survive it
+    const odd = parseDecomposition(gpa, "{\"plan\":[{\"task\":\"a\",\"route\":\"inline\",\"done_when\":[\"x\",\"y\"]}]}");
+    defer freeTasks(gpa, odd);
+    try std.testing.expectEqual(@as(usize, 1), odd.len);
+    try std.testing.expectEqualStrings("a", odd[0].text);
+    try std.testing.expectEqualStrings("", odd[0].done_when);
 }
 
 test "parseDecomposition caps at MAX_TASKS" {

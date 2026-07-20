@@ -6817,12 +6817,20 @@ fn drawSettings(store: *Store, body: t.Rect) void {
         store.settings.chat_unified = nv;
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
-        store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
+        // A role left blank is sent blank, and the SERVER may fill it from its own published trio before
+        // falling back to coding (service.zig roleDefault) — so "all use the model below" is only true
+        // of a host that publishes nothing. Say what actually decides it rather than overclaiming.
+        store.pushNotif(if (nv) "One model for everything" else "Per-role models", if (nv) "coding, thinking and prompting all use the model below, unless your server publishes its own" else "thinking + prompting start on the coding model; pick a provider below to override either", 1);
     }
     y += 30;
     if (!unified) {
+        // Why anyone would pay for three: the roles do different jobs at very different volumes. The
+        // split below is MODELLED from request-body sizes after prefix-cache hits, not metered — it is
+        // here to steer a choice ("go cheap on prompting"), so it says "about" and means it.
+        t.text(t.z("about 60% of billable input goes to coding, 20% to thinking, 15% to prompting", .{}), @intFromFloat(x), @intFromFloat(y), 11, t.comment);
+        y += 18;
         t.text(t.z("CODING MODEL", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);
-        t.text(t.z("writes the code — the main build/answer stream", .{}), @intFromFloat(x + 110), @intFromFloat(y), 11, t.comment);
+        t.text(t.z("runs the tools, writes the files, streams the reply — your strongest", .{}), @intFromFloat(x + 110), @intFromFloat(y), 11, t.comment);
         y += 20;
     }
 
@@ -6981,8 +6989,8 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     }
     // MODEL TRIO: the thinking + prompting override panels — shown only when the user split the models out.
     if (!unified) {
-        y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "plans + summarizes (housekeeping)", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
-        y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "drives the auto-loop (prompts back)", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
+        y = chatRolePanel(store, x, y, colw, half, ol_n, 1, "THINKING MODEL", "sets the plan, the bar for done, and what survives compaction", .think_provider, .think_byok, .think_model, &ui.s_tkey, .s_tkey, "think");
+        y = chatRolePanel(store, x, y, colw, half, ol_n, 2, "PROMPTING MODEL", "writes the next instruction each step — small context, go cheap", .prompt_provider, .prompt_byok, .prompt_model, &ui.s_pkey, .s_pkey, "prompt");
     }
     y += 8;
     t.text(t.z("veil-desk v0.2.0 - same-machine companion - borderless chrome", .{}), @intFromFloat(x), @intFromFloat(y), 12, t.comment);

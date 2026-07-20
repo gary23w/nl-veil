@@ -77,7 +77,28 @@ const AFK_DRIVE_TMPL = "Keep going toward the goal: \"{s}\". Re-verify the lates
 /// What an AFK loop injects when its next step just REPEATS the last one (afk skips the repeat-guard that ends a
 /// non-afk loop, so instead of churning the same failing step it steps back, re-grounds, and researches the blocker
 /// — the light server-side form of the desk's stuck->research escalation, using the model's own recall/search tools.
+/// This is now the FALLBACK, not the plan: prompting writes the real instruction from the transcript tail (see
+/// stuckStep). A static nudge fires exactly when the loop is CONFIRMED stuck, which is the one moment a generic
+/// "try something different" is worth least and the one moment the tail contains the actual blocker.
 const AFK_STUCK_TMPL = "You just repeated the previous step — that is not making progress. STOP repeating it: re-read the goal, and try a DIFFERENT approach. If you're blocked, first recall_hive / web_search the ACTUAL error or unknown, then act on what you learn. Goal: \"{s}\".";
+/// STUCK-RECOVERY WRITER (prompting). Reads the same bounded transcript tail the drive picker rides and names the
+/// concrete way around the blocker it can see, instead of the template's abstract encouragement.
+const STUCK_SYSTEM =
+    "You are reading the tail of an autonomous work loop that has just REPEATED the same step instead of making " ++
+    "progress. Find the ACTUAL blocker in what you can see — the command that failed, the error text, the file " ++
+    "that is missing, the assumption that did not hold — and write the single next instruction that gets around " ++
+    "it. Name the concrete thing: the exact error string to look up, the file to read, the different approach to " ++
+    "take. Do not restate the goal, do not encourage, do not call tools, do not explain your reasoning.";
+const STUCK_QUESTION =
+    "Write that next instruction: 2-4 sentences, addressed to the worker as a command. If the blocker is a " ++
+    "specific error or unknown, say to look THAT up by name first. Reply with ONLY the instruction.";
+/// SEARCH-QUERY FORMULATION (prompting). The swarm's scoutQuery text, kept deliberately close — it is the same
+/// job. Terms, not a sentence: a search engine matches documents, not questions.
+const SEARCH_QUERY_PROMPT =
+    "You convert an intent and a draft query into ONE focused web-search query. Output ONLY the query: at most 10 " ++
+    "words, no quotes, no punctuation, no preamble — just the search terms a person would actually type. Keep the " ++
+    "proper nouns, versions, error strings and identifiers that pin the search down; drop question words and " ++
+    "filler. If the draft query is already the best search, output it unchanged.";
 /// TERMINAL BUILD-VERIFY (desk fireTerminalVerify): an armed loop must not accept a bare DONE right after writing
 /// files — a model can ANNOUNCE a build it didn't finish. One completeness check (run the tests / write any missing
 /// file) is injected before the loop ends; it fires at most once per turn and only when files were actually written.
@@ -94,25 +115,56 @@ const LOOP_QUESTION =
     "What is the single next concrete step toward the goal? Reply with ONLY that next instruction, or reply " ++
     "exactly DONE if the goal is fully achieved.";
 
-/// REFLECT (desk REFLECT_PASSES): one self-critique/improve pass on a substantial first answer before it's
-/// committed — the model reviews its own reply against the question and returns the final (improved-or-unchanged)
-/// text. Gated to the FIRST drive step only (one reflect per turn) and to answers >= REFLECT_MIN bytes, so a
-/// terse reply or a multi-step build's intermediate narration doesn't spend an extra full completion.
+/// POST-ANSWER CRITIQUE (was REFLECT): the THINKING model reviews the answer the user has ALREADY been given and
+/// may APPEND a short correction as its own separate message. It can never rewrite what was said.
+///
+/// The predecessor re-generated the answer and SWAPPED it, which froze the chat ~8s and replaced text the user had
+/// watched type out — so it was gated on the answer not having streamed. streamOnDelta sets that flag on the first
+/// delta, so on any healthy streaming backend the gate could only open when the stream had FAILED: the trio's one
+/// evaluative faculty was alive exclusively on the error path. Append-only removes the reason for the gate rather
+/// than the gate's protection — the committed answer is never touched, so there is nothing left to preserve.
+/// Still gated to the FIRST answer of a turn (drive == 0), to unplanned turns, and to answers >= REFLECT_MIN
+/// bytes, so a terse reply or a build's intermediate narration never pays for it.
 /// PLAN-BOARD: how many subtasks one turn works before pausing (the plan persists, so "continue" resumes the
 /// rest). Bounds a big plan's turn length — each subtask is a full agentic pass, so this * MAX_ITERS is the ceiling.
 const PLAN_STEPS_PER_TURN: usize = 8;
+/// The decomposition prompt. It asks for TWO things: the routed subtask list, and the turn's ACCEPTANCE CONTRACT
+/// (objective / done_when / watch_for). The contract is the load-bearing half — it is the only channel the
+/// THINKING model has into the CODING model's own prompt in the turn where it thinks (see the TURN BRIEF note at
+/// the injection site), and it turns each subtask from a bucket of prose into something checkable. Every added
+/// field is OPTIONAL on the wire: a model that answers with the old {"plan":[…]} shape still yields a working
+/// board (plan.parseDecomposition / plan.parseBrief both degrade to empty rather than failing).
 const PLAN_PROMPT =
     "Decompose the user's request into an ordered list of concrete subtasks, and for EACH pick the best ROUTE: " ++
     "\"hive\" (delegate to a swarm of AI minds — a big or parallelizable build/research chunk), \"research\" (you " ++
-    "need to learn or look something up first), or \"inline\" (a small, direct step you just do yourself). Reply " ++
-    "with ONLY compact JSON: {\"plan\":[{\"task\":\"…\",\"route\":\"hive|research|inline\"}, …]}. If the request " ++
-    "is a simple question, a greeting, or a single trivial step that needs no plan, reply exactly {\"plan\":[]}.";
+    "need to learn or look something up first), or \"inline\" (a small, direct step you just do yourself). Also " ++
+    "state what DONE means before any work starts: one-sentence \"objective\", a \"done_when\" list of conditions " ++
+    "that can each be CHECKED (a command that must exit clean, a file that must exist, an output that must " ++
+    "appear — not \"it works well\"), and a \"watch_for\" list of failure modes you expect on THIS task. Give each " ++
+    "subtask its own short \"done_when\" too. Reply with ONLY compact JSON: {\"objective\":\"…\",\"done_when\":" ++
+    "[\"…\"],\"watch_for\":[\"…\"],\"plan\":[{\"task\":\"…\",\"route\":\"hive|research|inline\",\"done_when\":\"…\"}" ++
+    ", …]}. If the request is a simple question, a greeting, or a single trivial step that needs no plan, reply " ++
+    "exactly {\"plan\":[]}.";
 
 const REFLECT_MIN: usize = 240;
-const REFLECT_PROMPT =
-    "Critically review the answer you just gave for correctness, completeness, and clarity against the user's " ++
-    "request. If it can be materially improved, reply with ONLY the improved answer. If it is already good, reply " ++
-    "with it unchanged. Do not add commentary about the review itself.";
+/// The reply that means "nothing worth saying", and the shortest note that is worth appending. ABSTAIN IS THE
+/// DESIGNED COMMON CASE: an always-on footer is noise the user learns to skip past, and it bills output tokens on
+/// every substantial turn for the privilege. Anything shorter than CRITIQUE_MIN is the abstain token, a variant of
+/// it, or too vague to act on — all of which are silence.
+const CRITIQUE_ABSTAIN = "OK";
+const CRITIQUE_MIN: usize = 40;
+/// The longest note that is still a CORRECTION and not a rewrite of the answer. Past this the model has started
+/// re-answering, and appending a second full answer under the first is the swap failure wearing a new hat.
+const CRITIQUE_MAX: usize = 600;
+const CRITIQUE_PROMPT =
+    "The answer above has ALREADY been sent to the user and CANNOT be changed — you are not rewriting it. Look for " ++
+    "exactly one class of thing: a MATERIAL problem that would mislead them or make them act wrongly — a factual " ++
+    "or logical error, a claim that contradicts what the tools actually returned, or a missing caveat that changes " ++
+    "the conclusion. Style, tone, polish, and \"it could go deeper\" are NOT material. Most answers have no such " ++
+    "problem, so OK is the normal and expected reply: answer with exactly OK unless you can name something " ++
+    "specific that is wrong. If there IS such a problem, reply with 1-3 sentences addressed to the user stating " ++
+    "the correction directly and nothing else — do not restate or summarize the answer, and do not mention that a " ++
+    "review happened.";
 
 /// Serializes edit_file's micro-VCS commits (vcs.zig) across concurrent chat turns IN THIS gateway process —
 /// the exact role chat_tools.chat_vcs_mtx plays for /api/v1/chat/tool. A live hive cast building in the same
@@ -667,6 +719,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .directives_set = &counters[3],
         .tools_made = &counters[4],
         .internet = true,
+        // RECALL_HIVE SECOND STAGE. tools.zig gates the reranker on gw_model.len > 0, and a chat turn never set
+        // these — so recall_hive returned raw first-stage hits (and could never ABSTAIN) for every chat that has
+        // ever run, while only a swarm mind got the reranked read. Point them at the THINKING model: judging
+        // whether a recalled fact is relevant to the query is exactly the role's job, and it keeps the judgement
+        // off the coding model's stream. An unset thinking role resolves back to coding via trio.pick, so this is
+        // never empty when the turn has a provider at all.
+        .gw_base = think.base_url,
+        .gw_key = think.key,
+        .gw_model = think.model,
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0,
         // THE SANDBOX. A non-admin's prompts are not trusted with the host, so their turn runs the
@@ -833,15 +894,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var tool_perf: toolperf.Acc = .{};
     defer toolperf.merge(app.io, gpa, app.data, &tool_perf);
 
-    // The assembled, bounded PREFIX (system + recall + summary + goal + recency window). Everything appended past
-    // this by the drive loop (settled answers, synthetic drive steps, per-pass tool notes) is compacted against it
-    // between drive steps so a multi-step turn stays bounded ACROSS steps, not only within one pass.
-    const assembled_len = conv_buf.items.len;
-
     // ---- PLAN-BOARD: the veil's first move on a non-trivial task is to decompose it into routed subtasks. Try a
     // fresh decomposition of THIS message; if it yields a plan, that's the new board (persist + show it). If not
     // (a question / "continue" / trivial step), resume an existing unfinished plan if one is on disk; else run a
     // normal free-form turn. When a plan is active the drive loop below walks it deterministically. ----
+    // THE TURN BRIEF: the acceptance contract the planning pass wrote, carried for the whole turn (see the
+    // injection below the plan block for why it lives here and not in the drive loop). Empty when this turn
+    // doesn't plan, or when the planner answered in the old plan-only shape.
+    var brief: cplan.Brief = .{};
+    defer brief.deinit(gpa);
     var plan: []cplan.Task = blk: {
         // RESUME-PREFERRED: if an UNFINISHED plan is on disk, keep working IT — never silently clobber in-progress
         // work (with its completed-subtask state) by decomposing the new message into a fresh board. This is also
@@ -849,6 +910,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         const resumed = resumePlan(app, conv_dir);
         if (resumed.len > 0 and !cplan.allDone(resumed)) {
             emitPlanMessage(app, conv_dir, resumed);
+            brief = resumeBrief(app, conv_dir); // resume under the contract this board was planned against
             break :blk resumed;
         }
         cplan.freeTasks(gpa, resumed);
@@ -859,9 +921,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
         // so no in-progress work is lost.
         if (shouldPlan(user_text)) {
-            const fresh = planTask(app, run_root, think.base_url, think.key, think.model, user_text);
+            const fresh = planTask(app, run_root, think.base_url, think.key, think.model, user_text, &brief);
             if (fresh.len > 0) {
                 persistPlan(app, conv_dir, fresh);
+                persistBrief(app, conv_dir, brief);
                 emitPlanMessage(app, conv_dir, fresh);
                 break :blk fresh;
             }
@@ -874,11 +937,91 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // (has_plan=false) after the await, so the gather step can run through the normal drive machinery.
     var has_plan = plan.len > 0;
 
+    // ---- TURN BRIEF, injected HERE and nowhere else ----
+    // This is the ONLY channel the thinking model has into the coding model's prompt in the turn where it thinks:
+    // emitPlanMessage writes messages.jsonl and emits a UI frame, but never touches conv_buf, so the plan board
+    // itself does not reach this turn's inference at all (only the NEXT turn's history replay sees it).
+    //
+    // The PLACEMENT is the whole point. compactWorking only rewrites conv_buf.items[assembled_len..] — everything
+    // inside the assembled prefix is untouchable — so a brief appended BEFORE the freeze below survives every
+    // compaction for the entire turn, including a 100k-step afk run that folds its working context dozens of
+    // times. Move this into the drive loop and it becomes just another compactable note: the acceptance contract
+    // would be summarized away exactly when a long turn most needs it. It is not tidiable back into the loop.
+    //
+    // CACHE SAFETY: it goes in the MESSAGE BODY, after SYSTEM_PROMPT and after the tools array — never into
+    // SYSTEM_PROMPT or turn_tools, whose content must not vary per turn (see TURN_TOOLS_FULL above for why a
+    // content-varying prefix re-bills the whole prefill).
+    if (!brief.isEmpty()) {
+        var bt: std.ArrayListUnmanaged(u8) = .empty;
+        defer bt.deinit(gpa);
+        renderBrief(gpa, brief, &bt);
+        if (bt.items.len > 0) {
+            // Scratch-build then append in ONE shot, like the ground-truth block above: an OOM mid-append must
+            // not strand a partial JSON object in conv_buf.
+            var frag: std.ArrayListUnmanaged(u8) = .empty;
+            defer frag.deinit(gpa);
+            _ = blk_br: {
+                frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch break :blk_br false;
+                http.jstr(gpa, &frag, clipBytes(std.mem.trim(u8, bt.items, " \n"), BRIEF_MAX_BYTES)) catch break :blk_br false;
+                frag.append(gpa, '}') catch break :blk_br false;
+                conv_buf.appendSlice(gpa, frag.items) catch break :blk_br false;
+                break :blk_br true;
+            };
+        }
+    }
+
+    // What this turn is FOR, in one line, for search-query formulation: the planner's objective when there is one
+    // (it is already the distilled statement of intent), else the user's own words. Turn-stable.
+    const search_intent: []const u8 = if (brief.objective.len > 0) brief.objective else user_text;
+
+    // The assembled, bounded PREFIX (system + recall + summary + goal + recency window + the turn brief).
+    // Everything appended past this by the drive loop (settled answers, synthetic drive steps, per-pass tool
+    // notes) is compacted against it between drive steps so a multi-step turn stays bounded ACROSS steps, not
+    // only within one pass. compactWorking (the sole reader) is the reason the brief is appended above this line.
+    const assembled_len = conv_buf.items.len;
+
+    // TERMINAL VERIFY, contract-aware: the generic paragraph plus THIS turn's done_when list, so the one
+    // completeness check an armed loop gets before accepting DONE names the specific conditions that must hold
+    // instead of asking for verification in the abstract. Built once (turn-stable); falls back to the bare
+    // paragraph when the planner gave no contract, which is every unplanned turn.
+    var verify_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer verify_buf.deinit(gpa);
+    const verify_prompt: []const u8 = blk_vp: {
+        if (brief.done_when.len == 0) break :blk_vp TERMINAL_VERIFY_PROMPT;
+        verify_buf.appendSlice(gpa, TERMINAL_VERIFY_PROMPT) catch break :blk_vp TERMINAL_VERIFY_PROMPT;
+        verify_buf.appendSlice(gpa, "\nThis turn is not done until EVERY one of these holds — check each one and name any that does not:\n") catch break :blk_vp TERMINAL_VERIFY_PROMPT;
+        for (brief.done_when) |c| {
+            if (verify_buf.items.len > BRIEF_MAX_BYTES) break;
+            verify_buf.appendSlice(gpa, "- ") catch break;
+            verify_buf.appendSlice(gpa, clipBytes(c, 300)) catch break;
+            verify_buf.append(gpa, '\n') catch break;
+        }
+        break :blk_vp verify_buf.items;
+    };
+
     // ---- AUTO-LOOP DRIVE: settle one answer, then either take the next PLAN subtask (deterministic) or infer the
     // next free-form step, and drive again until the plan/goal is done, a repeat, or the step cap. ----
     // `prev_drive` seeds the repeat guard with the user's own request so a driver that merely echoes it stops.
     var prev_drive: []u8 = gpa.dupe(u8, user_text) catch &[_]u8{};
     defer if (prev_drive.len > 0) gpa.free(prev_drive);
+
+    // POST-ANSWER CRITIQUE source: the turn's first substantial answer, HELD (not critiqued) here and reviewed
+    // once at the completion site below. Captured rather than reviewed inline so the drive loop's pacing is
+    // untouched, and CLEARED at the top of every drive step — so it is still non-empty at the completion site
+    // only when the turn actually ended on that first answer. A turn that drove on has superseded it, and a
+    // critique of superseded narration is noise about work the user already watched get redone.
+    var critique_src: []u8 = &[_]u8{};
+    defer if (critique_src.len > 0) gpa.free(critique_src);
+
+    // WEB-SEARCH QUERY LEDGER (turn scope): the literal query TEXT of every search this turn. call_ledger below
+    // dedups EXACT repeats by hash; this exists because the observed failure was the OTHER one — a model that
+    // varies the wording slightly and searches the same thing over and over (107 web calls in one live run). The
+    // reformulator is required to move off this list, which is only possible if the engine kept the words.
+    var search_log: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (search_log.items) |q| gpa.free(q);
+        search_log.deinit(gpa);
+    }
 
     // AUTO-LOOP MODE (desk chat_loop / chat_loop_afk, now server-driven). A plan drives its own subtask budget; a
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
@@ -922,6 +1065,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var foreign_warned = false;
     var drive: usize = 0;
     outer: while (drive < max_steps) : (drive += 1) {
+        // Reaching a SECOND drive step means the answer captured last step was not the turn's answer — drop it
+        // (see the capture site). This clear is what makes "still held at the completion site" mean "the turn
+        // ended on that answer" without threading a flag through every break path.
+        if (critique_src.len > 0) {
+            gpa.free(critique_src);
+            critique_src = &[_]u8{};
+        }
         // CONTROL (between drive steps): a `stop` op ends the turn; a `steer`/`say` op injects the user's text as a
         // mid-turn user message (posting to steer a running turn) so the next inference picks it up.
         switch (drainChatControl(app, conv_dir, &steer_cursor, &conv_buf)) {
@@ -1011,7 +1161,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -1128,17 +1278,24 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             }
         }
 
-        // REFLECT: on the FIRST substantial answer of the turn, run one self-critique/improve pass before commit.
-        // Skipped when a plan drives the turn (the plan already structures the work) AND — critically — when the
-        // answer already STREAMED to the user (inner.streamed): re-generating a streamed answer non-streamed froze
-        // the chat ~8s and then swapped the text the user just watched type out. Reflect only runs when nothing
-        // streamed (a non-streaming backend), where there's no live answer to preserve.
-        if (!has_plan and !inner.streamed and drive == 0 and answer.len >= REFLECT_MIN) {
-            if (reflectAnswer(app, run_root, think.base_url, think.key, think.model, user_text, answer)) |improved| {
-                gpa.free(answer);
-                answer = improved;
-                emitKV(app, conv_dir, "status", "text", "reflected");
-            }
+        // POST-ANSWER CRITIQUE, capture half: hold the FIRST substantial answer of an unplanned turn for the
+        // append-only review at the completion site. Nothing runs here — the critique used to, and re-generating
+        // the answer at this point is precisely what swapped text the user had already read. The old
+        // `!inner.streamed` gate that suppressed that (and, since streaming works, suppressed the critique
+        // entirely) is gone: an APPEND has nothing to swap, so streaming is no longer a reason to stay silent.
+        //
+        // `inner.tools_ran` is part of the gate and it is the difference between this being free and being a
+        // tax on every message. Without it the capture fires ahead of the no-tools fast path at the bottom of
+        // this block — the plain-Q&A path — so an ordinary question with a >=REFLECT_MIN answer bought a whole
+        // extra completion AND made the user wait for it before {done}. That is the same "the chat froze"
+        // complaint that neutered the old reflect, just moved to the end of the turn. Critique the turns that
+        // DID work: a tool-using turn is where a wrong claim is both likelier and more expensive, and its user
+        // is already waiting on tool round-trips, so one more is not what they notice.
+        if (!has_plan and drive == 0 and inner.tools_ran and answer.len >= REFLECT_MIN) {
+            if (gpa.dupe(u8, answer)) |d| {
+                if (critique_src.len > 0) gpa.free(critique_src);
+                critique_src = d;
+            } else |_| {}
         }
         defer gpa.free(answer);
         appendMsg(app, conv_dir, "assistant", answer, "veil", nowSecs(app.io));
@@ -1229,13 +1386,17 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // bare DONE right after building — one completeness check first), re-ground (afk anchors to the goal), and
         // stuck-recovery (afk re-grounds + researches on a repeat instead of churning).
         var next_step: []const u8 = trimmed;
+        // Holds a WRITTEN stuck-recovery instruction for this iteration (see stuckStep); empty means the static
+        // template. Freed at the end of the iteration, which is past every use of next_step below.
+        var stuck_written: []u8 = &[_]u8{};
+        defer if (stuck_written.len > 0) gpa.free(stuck_written);
         if (is_done) {
             // files_written counts only SERVER-executed writes; delegated client-mode writes register in the
             // ledger (parsed from their result strings). Without the ledger arm, a desk-client build accepted
             // a bare DONE with no verification nudge at all — the counter sat at 0 the whole turn.
             if (armed and (ctx.files_written.* > 0 or file_ledger.mutations > 0) and !verified_done) {
                 verified_done = true; // TERMINAL BUILD-VERIFY (once): confirm the build before letting DONE stand
-                next_step = TERMINAL_VERIFY_PROMPT;
+                next_step = verify_prompt; // the brief's done_when list when this turn has one, else the bare paragraph
             } else if (armed) {
                 // ARMED (on or afk): never accept DONE while this conversation's cast hive is still working —
                 // await it (cheap, stop-checked), then gather its results instead of settling over them.
@@ -1264,7 +1425,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             }
         } else if (is_repeat) {
             if (afk) {
-                next_step = afk_stuck_msg; // afk: don't churn the same step — re-ground + research the blocker
+                // afk: don't churn the same step — re-ground + research the blocker. PROMPTING writes the actual
+                // instruction from the transcript tail, which at this exact moment holds the failing command and
+                // its error; AFK_STUCK_TMPL is what a failed/implausible write degrades to, not the first choice.
+                stuck_written = stuckStep(app, run_root, prompt, user_text, trimmed, conv_buf.items) orelse &[_]u8{};
+                next_step = if (stuck_written.len > 0) stuck_written else afk_stuck_msg;
             } else if (armed) {
                 // ARMED repeat while the hive runs = "the hive is working" narrated twice — that's a wait, not
                 // a stall. Await + gather; a genuine no-progress repeat (no hive) still ends the loop.
@@ -1326,6 +1491,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // drainChatControl persists each pending steer as a durable user message, so the NEXT turn replays it.
     salvageSteers(app, conv_dir, &steer_cursor);
     if (has_plan) emitPlanClosing(app, conv_dir, plan);
+    // POST-ANSWER CRITIQUE, review half. It runs HERE, in the same deferred phase as the rolling-summary refresh
+    // below and for the same reason: the answer was delivered and read long before this point, so the cost lands
+    // where the user is not waiting on a blank chat. It can only ADD a message — the answer above is already
+    // durable in messages.jsonl and already on screen, and nothing here can reach back and edit it.
+    //
+    // Why not a background thread, which would also spare the {done} frame: appendMsg is an UNLOCKED
+    // read-modify-write of messages.jsonl (see the turn-thread note above), so a critique still writing after the
+    // turn ended would race the NEXT turn's appends — and the desk disarms on {done}, so a message emitted after
+    // it is a message nobody renders. Deferring inside the turn is the version that is actually safe.
+    if (critique_src.len > 0) {
+        if (critiqueAnswer(app, run_root, think.base_url, think.key, think.model, user_text, critique_src)) |note| {
+            defer gpa.free(note);
+            appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
+            emitAssistant(app, conv_dir, note);
+        }
+    }
     // SCHEDULED-RUN LEARNING: at normal completion, fold this run's outcome + one distilled lesson into the
     // TASK's memory so the next run starts smarter — the recursive-improvement loop for recurring tasks.
     if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, run_root, think.base_url, think.key, think.model, &conv_buf);
@@ -2305,10 +2486,10 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
 const InnerResult = struct {
     outcome: enum { settled, hard_error, stopped },
     content: []u8,
-    // Did this settled answer TYPE OUT to the user live (streamOnDelta fired)? If so, reflect MUST NOT run — you
-    // cannot silently re-generate + swap an answer the user already watched stream (it froze the chat ~8s then
-    // replaced the text). Reflect only makes sense when nothing streamed (a non-streaming backend fallback).
-    streamed: bool = false,
+    // (There used to be a `streamed` flag here, read by exactly one caller: the reflect gate, to refuse to
+    // re-generate an answer the user had already watched type out. The critique that replaced reflect only ever
+    // APPENDS, so whether the answer streamed no longer changes what may be done with it, and the flag had no
+    // second reader. sctx.streamed still exists inside the pass, where it gates the non-streaming reasoning emit.)
     // Did ANY tool execute during this pass? A pure-prose answer with no tools on the first step is DONE — there's
     // no agentic work in flight to continue, so the drive loop's LOOP_QUESTION "are you done?" completion is pure
     // wasted latency (it delayed {done}/usage + the turn-lock release by a full round-trip on every simple Q&A).
@@ -2480,8 +2661,9 @@ fn shouldPlan(user_text: []const u8) bool {
 }
 
 /// DECOMPOSITION inference: ask the model to break the request into routed subtasks. Returns owned tasks (empty =
-/// no plan needed → a normal single-step turn). No tools; deterministic (low temp). Any failure → empty.
-fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8) []cplan.Task {
+/// no plan needed → a normal single-step turn) and fills `out_brief` with the turn's acceptance contract (empty
+/// when the model omitted it). No tools; deterministic (low temp). Any failure → empty tasks + empty brief.
+fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, out_brief: *cplan.Brief) []cplan.Task {
     const gpa = app.gpa;
     const empty: []cplan.Task = &.{};
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
@@ -2497,10 +2679,70 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     uc.appendSlice(gpa, PLAN_PROMPT) catch return empty;
     http.jstr(gpa, &msgs, uc.items) catch return empty;
     msgs.append(gpa, '}') catch return empty;
-    var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1024, 0.3);
+    // The contract costs OUTPUT tokens the old 1024 budget did not allow for — and this pass is sequential ahead
+    // of time-to-first-token, so on a slow host the contract is paid in seconds of latency, not just tokens. The
+    // cap is a ceiling, not a target (the model stops at the closing brace); it is raised only so a long plan
+    // can't get truncated mid-JSON, which extractJsonObject would hand to the parser as an unbalanced object and
+    // the whole board would come back empty.
+    var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1536, 0.3);
     defer step.deinit(gpa);
     if (!step.ok) return empty;
-    return cplan.parseDecomposition(gpa, extractJsonObject(step.content));
+    const obj = extractJsonObject(step.content);
+    const tasks = cplan.parseDecomposition(gpa, obj);
+    // Only adopt a brief that came with a REAL board: a brief without tasks has no turn to govern, and the caller
+    // would otherwise inject an acceptance contract for a plan it decided not to run.
+    if (tasks.len > 0) out_brief.* = cplan.parseBrief(gpa, obj);
+    return tasks;
+}
+
+/// The brief lives beside plan.jsonl so a "continue" turn resumes under the SAME acceptance contract the work was
+/// planned against — the plan board survives across turns, and a contract that didn't would leave the resumed half
+/// of the job judged by nothing.
+fn resumeBrief(app: *App, conv_dir: []const u8) cplan.Brief {
+    const gpa = app.gpa;
+    const path = std.fmt.allocPrint(gpa, "{s}/brief.json", .{conv_dir}) catch return .{};
+    defer gpa.free(path);
+    const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(64 << 10)) catch return .{};
+    defer gpa.free(data);
+    return cplan.parseBrief(gpa, data);
+}
+
+fn persistBrief(app: *App, conv_dir: []const u8, brief: cplan.Brief) void {
+    const gpa = app.gpa;
+    const body = cplan.formatBrief(gpa, brief) catch return;
+    defer gpa.free(body);
+    const path = std.fmt.allocPrint(gpa, "{s}/brief.json", .{conv_dir}) catch return;
+    defer gpa.free(path);
+    std.Io.Dir.cwd().writeFile(app.io, .{ .sub_path = path, .data = body }) catch {};
+}
+
+/// Render the brief as the TURN BRIEF system message. Bounded: MAX_BRIEF_ITEMS lines per list on the parse side,
+/// BRIEF_MAX_BYTES here — it rides in every inference of the turn, so it must be small and it must be capped by
+/// the engine rather than by the planner's restraint.
+const BRIEF_MAX_BYTES: usize = 1200;
+fn renderBrief(gpa: std.mem.Allocator, brief: cplan.Brief, out: *std.ArrayListUnmanaged(u8)) void {
+    out.appendSlice(gpa, "TURN BRIEF — the acceptance contract for this turn, written by the planning pass before any work started. It is the definition of DONE for everything below: do not declare the task complete while any condition is unmet, and say which one is unmet if you stop short.\n") catch return;
+    if (brief.objective.len > 0) {
+        out.appendSlice(gpa, "OBJECTIVE: ") catch return;
+        out.appendSlice(gpa, clipBytes(brief.objective, 400)) catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    if (brief.done_when.len > 0) {
+        out.appendSlice(gpa, "DONE WHEN (each must be checkable, and checked):\n") catch return;
+        for (brief.done_when) |c| {
+            out.appendSlice(gpa, "- ") catch return;
+            out.appendSlice(gpa, clipBytes(c, 300)) catch return;
+            out.append(gpa, '\n') catch return;
+        }
+    }
+    if (brief.watch_for.len > 0) {
+        out.appendSlice(gpa, "WATCH FOR (failure modes anticipated for this task):\n") catch return;
+        for (brief.watch_for) |c| {
+            out.appendSlice(gpa, "- ") catch return;
+            out.appendSlice(gpa, clipBytes(c, 300)) catch return;
+            out.append(gpa, '\n') catch return;
+        }
+    }
 }
 
 /// Read the persisted plan.jsonl back into a task list (for resuming a plan across turns). Empty if absent.
@@ -2540,7 +2782,10 @@ fn emitPlanMessage(app: *App, conv_dir: []const u8, plan: []const cplan.Task) vo
     emitAssistant(app, conv_dir, m.items);
 }
 
-/// The instruction injected as the working turn for one subtask — the subtask text + a route-specific nudge.
+/// The instruction injected as the working turn for one subtask — the subtask text + a route-specific nudge +
+/// the subtask's own acceptance condition. The closing line is where the planner's done_when lands: "briefly say
+/// what you did" invites narration, a named condition invites a check. Falls back to the generic line whenever the
+/// planner gave the subtask no condition (an old-schema plan, or a resumed plan.jsonl written before briefs).
 fn subtaskInstruction(gpa: std.mem.Allocator, task: cplan.Task, idx: usize, total: usize) ?[]u8 {
     const hint = if (std.mem.eql(u8, task.route, cplan.ROUTE_HIVE))
         "This subtask suits a HIVE — `cast` a swarm for it and steer it; don't build it all yourself."
@@ -2548,7 +2793,13 @@ fn subtaskInstruction(gpa: std.mem.Allocator, task: cplan.Task, idx: usize, tota
         "You may be missing knowledge here — research it first (web_search / read_url / recall_hive) before acting."
     else
         "Do this directly with your own tools (write_file / edit_file / run_python).";
-    return std.fmt.allocPrint(gpa, "Work this subtask now — step {d} of {d} in your plan: {s}\nSuggested route ({s}): {s}\nWhen it's done, briefly say what you did.", .{ idx + 1, total, task.text, task.route, hint }) catch null;
+    const generic = "When it's done, briefly say what you did.";
+    var cb: [420]u8 = undefined;
+    const closing: []const u8 = if (task.done_when.len > 0)
+        (std.fmt.bufPrint(&cb, "DONE WHEN: {s} — verify that, then briefly say how you met it (or why you couldn't).", .{clipBytes(task.done_when, 300)}) catch generic)
+    else
+        generic;
+    return std.fmt.allocPrint(gpa, "Work this subtask now — step {d} of {d} in your plan: {s}\nSuggested route ({s}): {s}\n{s}", .{ idx + 1, total, task.text, task.route, hint, closing }) catch null;
 }
 
 /// A plan subtask was mid-flight when the turn aborted (Stop / hard error / empty answer). Mark it DONE + persist
@@ -3642,6 +3893,10 @@ fn runInnerAgentic(
     // this turn, and the once-per-turn latch for its conflict note.
     foreign_mem: []const u8,
     foreign_warned: *bool,
+    // SEARCH-QUERY FORMULATION inputs (turn-scoped, owned by runTurn): what this turn is FOR (the planner's
+    // objective when there is one, else the user's own words), and the queries already searched this turn.
+    intent: []const u8,
+    search_log: *std.ArrayListUnmanaged([]u8),
 ) InnerResult {
     const gpa = app.gpa;
     // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING
@@ -3754,7 +4009,7 @@ fn runInnerAgentic(
         }
 
         if (step.calls.len == 0) // no tool calls — this settled answer is the turn's reply for this drive step.
-            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .streamed = sctx.streamed, .tools_ran = any_tool };
+            return .{ .outcome = .settled, .content = gpa.dupe(u8, step.content) catch empty, .tools_ran = any_tool };
 
         any_tool = true; // this iteration is running tools — the turn did agentic work, so the drive loop may continue
 
@@ -3852,6 +4107,38 @@ fn runInnerAgentic(
             const echo_limit: u8 = 3;
             const echo_blocked = echo_slot != null and echo_slot.?.count >= echo_limit;
             if (echo_blocked) echo_slot.?.count +|= 1;
+            // QUERY FORMULATION (prompting): chat used to hand web_search the model's query verbatim — the swarm
+            // has had a formulation step for a while (run.zig scoutQuery) and the chat side had none at all.
+            // Gated on the call actually being about to EXECUTE (the three guard conditions below are the ones
+            // the result chain checks), because reformulating a query for a call that is about to be refused
+            // spends a completion to produce nothing. `run_args` is what runs; `c.args` above already went into
+            // conv_buf verbatim, which is deliberate — the cue-threading observe wants the model's own words —
+            // so a rewrite has to SAY so in the result, further down.
+            var new_query: []u8 = &[_]u8{};
+            var spliced_args: []u8 = &[_]u8{};
+            defer if (new_query.len > 0) gpa.free(new_query);
+            defer if (spliced_args.len > 0) gpa.free(spliced_args);
+            var run_args: []const u8 = c.args;
+            if (std.mem.eql(u8, c.name, "web_search") and !echo_blocked and !repeated and tools_spent.* < tool_budget) {
+                if (searchQuerySpan(c.args)) |span| {
+                    const raw_q = c.args[span.start..span.end];
+                    var used_q: []const u8 = raw_q;
+                    if (formulateSearch(app, run_root, trio.pick(.prompting), intent, raw_q, search_log.items)) |rw| {
+                        if (std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ c.args[0..span.start], rw, c.args[span.end..] })) |sp| {
+                            spliced_args = sp;
+                            run_args = sp;
+                            new_query = rw;
+                            used_q = rw;
+                        } else |_| gpa.free(rw); // the splice failed — run the model's own query, say nothing
+                    }
+                    // Ledger the query that ACTUALLY runs, so the next formulation this turn has to move off it.
+                    if (search_log.items.len < SEARCH_LOG_MAX) {
+                        if (gpa.dupe(u8, used_q)) |q| {
+                            search_log.append(gpa, q) catch gpa.free(q);
+                        } else |_| {}
+                    }
+                }
+            }
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
             const t_call = nowMillis(app.io);
             var result = if (echo_blocked)
@@ -3887,10 +4174,20 @@ fn runInnerAgentic(
                 // its Discourse key and built around the failure). Everything else executes as a mind tool: in
                 // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
                 // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
-                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, c.name, c.args, tool_client) orelse
-                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, c.args, steer_cursor.*) else tools.execute(ctx, c.name, c.args));
+                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, c.name, run_args, tool_client) orelse
+                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, run_args, steer_cursor.*) else tools.execute(ctx, c.name, run_args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
+            // A reformulated search must SAY so in its own result. The transcript records the query the model
+            // asked for, so without this it would read results for a search it never made and have no way to
+            // tell. Appended, never prefixed: the observe gate below drops any result starting with '(' — a
+            // leading note would silently cost the finding its place in memory.
+            if (new_query.len > 0 and result.len > 0) {
+                if (std.fmt.allocPrint(gpa, "{s}\n(engine: this searched \"{s}\" — a focused rewrite of the query you gave, aimed at the same intent.)", .{ result, new_query })) |noted| {
+                    gpa.free(result);
+                    result = noted;
+                } else |_| {}
+            }
             // TOOL-PERFORMANCE LEARNING: record only genuinely-executed calls (dedup/budget guards never ran the
             // tool, so counting them would smear its stats). `ok` mirrors the observe gate — a real result, not
             // an engine error string or an `"ok":false` payload.
@@ -4100,10 +4397,144 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     return gpa.dupe(u8, t) catch null;
 }
 
-/// One REFLECT pass: hand the model its own answer + the original question and ask for the final (improved-or-
-/// unchanged) text. Fresh minimal context (system + user + assistant + critique), no tools. Returns a gpa-owned
-/// improved answer, or null to keep the original (a failed / empty / too-short reply means "leave it alone").
-fn reflectAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8) ?[]u8 {
+/// How many distinct queries the turn's search ledger remembers. It exists to be SHOWN to the reformulator, so it
+/// is bounded by what is useful in a ~40-token prompt, not by memory.
+const SEARCH_LOG_MAX: usize = 16;
+
+/// Byte span of the `"query"` VALUE inside a web_search arguments object, or null when it is absent or not a plain
+/// unescaped string. Escaped queries are declined rather than handled: the caller SPLICES raw bytes back into the
+/// arguments JSON, and getting that wrong would corrupt a tool call to save one search.
+///
+/// Whitespace-tolerant, unlike argsPath's fixed `"path":"` probe. That probe only feeds ledger bookkeeping, so a
+/// pretty-printed arguments object costs it one entry; here a missed match silently switches the whole
+/// reformulation off, and which of the two spellings arrives is the provider's choice, not ours.
+fn searchQuerySpan(args: []const u8) ?struct { start: usize, end: usize } {
+    var i = std.mem.indexOf(u8, args, "\"query\"") orelse return null;
+    i += "\"query\"".len;
+    while (i < args.len and std.ascii.isWhitespace(args[i])) i += 1;
+    if (i >= args.len or args[i] != ':') return null;
+    i += 1;
+    while (i < args.len and std.ascii.isWhitespace(args[i])) i += 1;
+    if (i >= args.len or args[i] != '"') return null;
+    const start = i + 1;
+    const end = std.mem.indexOfScalarPos(u8, args, start, '"') orelse return null;
+    if (end == start) return null;
+    if (std.mem.indexOfScalar(u8, args[start..end], '\\') != null) return null;
+    return .{ .start = start, .end = end };
+}
+
+test "searchQuerySpan: extracts a plain query, declines escaped or missing ones" {
+    const a = "{\"query\":\"zig 0.16 release notes\",\"limit\":5}";
+    const sp = searchQuerySpan(a).?;
+    try std.testing.expectEqualStrings("zig 0.16 release notes", a[sp.start..sp.end]);
+    // the splice must be able to rebuild the object around the span
+    try std.testing.expectEqualStrings("{\"query\":\"", a[0..sp.start]);
+    try std.testing.expectEqualStrings("\",\"limit\":5}", a[sp.end..]);
+    // pretty-printed arguments are the same call — a provider that spaces its JSON must not disable the rewrite
+    const b = "{ \"query\" : \"zig release\", \"source\": \"web\" }";
+    const spb = searchQuerySpan(b).?;
+    try std.testing.expectEqualStrings("zig release", b[spb.start..spb.end]);
+    try std.testing.expect(searchQuerySpan("{\"query\":\"say \\\"hi\\\"\"}") == null);
+    try std.testing.expect(searchQuerySpan("{\"query\":\"\"}") == null);
+    try std.testing.expect(searchQuerySpan("{\"url\":\"x\"}") == null);
+    try std.testing.expect(searchQuerySpan("{\"query\":5}") == null);
+}
+
+/// Turn the model's raw web_search query into ONE focused search string under the PROMPTING role. Returns a
+/// gpa-owned query, or null to run the model's own query untouched — a failed or implausible reformulation must
+/// never cost the search itself.
+///
+/// Ported from the swarm's scoutQuery, with the inputs a chat turn actually has. There is no knowledge-gap string
+/// here; there IS the turn's intent and the list of queries already run this turn, and that list is the
+/// load-bearing half. The repeat ledger blocks only an EXACT re-issue, so a model in a research spiral escapes it
+/// by re-phrasing — one live run burned 107 web calls doing exactly that. Showing the reformulator what has
+/// already been tried is what makes the next query land somewhere new instead of one synonym away.
+fn formulateSearch(app: *App, run_root: []const u8, p: Provider, intent: []const u8, raw_query: []const u8, tried: []const []u8) ?[]u8 {
+    const gpa = app.gpa;
+    if (raw_query.len == 0) return null;
+    var ask: std.ArrayListUnmanaged(u8) = .empty;
+    defer ask.deinit(gpa);
+    ask.appendSlice(gpa, "What the user wants: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(intent, 600)) catch return null;
+    ask.appendSlice(gpa, "\nThe query as drafted: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(raw_query, 300)) catch return null;
+    if (tried.len > 0) {
+        ask.appendSlice(gpa, "\nAlready searched this turn — do NOT repeat or merely re-word any of these. If the " ++
+            "draft is close to one of them, attack a DIFFERENT angle instead: the exact error string, a version, a " ++
+            "file or API name, a primary source:") catch return null;
+        for (tried) |q| {
+            ask.appendSlice(gpa, "\n- ") catch return null;
+            ask.appendSlice(gpa, clipBytes(q, 160)) catch return null;
+        }
+    }
+    ask.appendSlice(gpa, "\nOutput ONE web-search query:") catch return null;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, SEARCH_QUERY_PROMPT) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, ask.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "searchq", p.base_url, p.key, p.model, msgs.items, "", 48, 0.3);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    var q = std.mem.trim(u8, step.content, " \r\n\t\"'`*");
+    if (std.mem.indexOfScalar(u8, q, '\n')) |nl| q = std.mem.trim(u8, q[0..nl], " \r\t\"'`*");
+    // Sanity, mirroring scoutQuery: outside this band the reply is a refusal, a preamble, or a paragraph, none of
+    // which belong in a search box. Characters that would need escaping are REJECTED rather than escaped — the
+    // caller splices raw bytes into the arguments JSON, so a query carrying a quote or a backslash is not usable.
+    if (q.len < 4 or q.len > 160) return null;
+    if (std.mem.indexOfAny(u8, q, "\"\\\n\r\t") != null) return null;
+    if (std.mem.eql(u8, q, raw_query)) return null; // unchanged — skip the splice and the "searched as" note
+    return gpa.dupe(u8, q) catch null;
+}
+
+/// The afk stuck-recovery step, WRITTEN rather than templated. Rides the same bounded transcript tail as the drive
+/// picker (LOOP_CTX_BYTES) under the PROMPTING role, and returns a gpa-owned instruction — or null, in which case
+/// the caller falls back to AFK_STUCK_TMPL.
+///
+/// The tail is the whole point. This fires only once the loop is CONFIRMED stuck, and at that moment the last few
+/// messages contain the thing the static template can only gesture at: the command that failed, its error, the
+/// file that was not there. A generic "try a DIFFERENT approach" spends a drive step asking the model to rediscover
+/// what is already on screen.
+fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, repeated_step: []const u8, conv_items: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, STUCK_SYSTEM) catch return null;
+    msgs.appendSlice(gpa, "},") catch return null;
+    msgs.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return null;
+    var ask: std.ArrayListUnmanaged(u8) = .empty;
+    defer ask.deinit(gpa);
+    ask.appendSlice(gpa, "The goal: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(goal, 400)) catch return null;
+    ask.appendSlice(gpa, "\nThe step that just repeated: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(repeated_step, 400)) catch return null;
+    ask.append(gpa, '\n') catch return null;
+    ask.appendSlice(gpa, STUCK_QUESTION) catch return null;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, ask.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    var step = llm.complete(gpa, app.io, run_root, "stuck", p.base_url, p.key, p.model, msgs.items, "", 256, 0.6);
+    defer step.deinit(gpa);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t`*\"'");
+    if (t.len < 24 or t.len > 900) return null; // too vague to act on, or a plan rather than a step
+    if (cctx.looksLikeToolMarkup(t)) return null; // it must write an INSTRUCTION, not emit a tool call
+    if (nearlySame(t, repeated_step)) return null; // it just re-issued the step that is already stuck
+    return gpa.dupe(u8, t) catch null;
+}
+
+/// One POST-ANSWER CRITIQUE pass: hand thinking the committed answer + the original question and ask ONLY for a
+/// material correction. Fresh minimal context (system + user + assistant + critique), no tools. Returns a
+/// gpa-owned short note for the caller to APPEND as its own message, or null to say nothing at all.
+///
+/// Null is the designed outcome, not the failure case — see CRITIQUE_ABSTAIN. The three rejections below are all
+/// the same guard from different angles: this call must never reproduce the answer, because appending a
+/// restatement is the swap-the-text failure in a costume. A borderline note being dropped is fine; silence is the
+/// default. A rewrite getting through is not.
+fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -4114,14 +4545,37 @@ fn reflectAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     msgs.appendSlice(gpa, "},{\"role\":\"assistant\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, answer) catch return null;
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
-    http.jstr(gpa, &msgs, REFLECT_PROMPT) catch return null;
+    http.jstr(gpa, &msgs, CRITIQUE_PROMPT) catch return null;
     msgs.append(gpa, '}') catch return null;
-    var step = llm.complete(gpa, app.io, run_root, "reflect", base_url, key, model, msgs.items, "", 4096, 0.5);
+    // A small output cap is part of the contract, not a saving: a correction that needs more room than this is a
+    // rewrite, and it also bounds the abstain path, which is most calls.
+    var step = llm.complete(gpa, app.io, run_root, "reflect", base_url, key, model, msgs.items, "", 320, 0.3);
     defer step.deinit(gpa);
     if (!step.ok) return null;
-    const t = std.mem.trim(u8, step.content, " \r\n\t");
-    if (t.len < REFLECT_MIN) return null; // too short to be a genuine improved answer → keep the original
+    const t = std.mem.trim(u8, step.content, " \r\n\t`*\"'");
+    if (t.len < CRITIQUE_MIN or t.len > CRITIQUE_MAX) return null;
+    if (std.ascii.startsWithIgnoreCase(t, CRITIQUE_ABSTAIN)) return null;
+    if (restatesAnswer(answer, t)) return null;
     return gpa.dupe(u8, t) catch null;
+}
+
+/// Does `note` quote a chunk of `answer` back at the user? A 48-byte window from the answer's middle appearing
+/// verbatim inside a short note means the critique is restating, not correcting. Deliberately one-sided and
+/// cheap — it only ever costs a note that was probably not worth appending anyway.
+fn restatesAnswer(answer: []const u8, note: []const u8) bool {
+    if (answer.len < 96 or note.len < 48) return false;
+    const mid = answer.len / 2;
+    return std.mem.indexOf(u8, note, answer[mid - 24 .. mid + 24]) != null;
+}
+
+test "critique guards: abstain, over-length, and restatement are all silence" {
+    const answer = "a" ** 60 ++ "the middle chunk that must not be quoted back verbatim" ++ "b" ** 60;
+    try std.testing.expect(restatesAnswer(answer, "You should know: the middle chunk that must not be quoted back verbatim, roughly."));
+    try std.testing.expect(!restatesAnswer(answer, "Correction: the version number above is wrong; the current release is 0.16."));
+    try std.testing.expect(!restatesAnswer("short", "short")); // too small to judge — never a restatement
+    try std.testing.expect(std.ascii.startsWithIgnoreCase("ok", CRITIQUE_ABSTAIN));
+    try std.testing.expect(std.ascii.startsWithIgnoreCase("OK.", CRITIQUE_ABSTAIN));
+    try std.testing.expect(!std.ascii.startsWithIgnoreCase("Correction: the port is 8077, not 8088.", CRITIQUE_ABSTAIN));
 }
 
 /// Current byte length of control.jsonl (0 if absent/unreadable) — the cursor past which a later stop op counts.

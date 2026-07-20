@@ -14,8 +14,10 @@ test {
     _ = @import("worker/chat/engine.zig");
     _ = @import("worker/chat/paths.zig");
     _ = @import("worker/chat/plan.zig");
+    _ = @import("worker/chat/service.zig");
     _ = @import("worker/chat/sync.zig");
     _ = @import("worker/chat/toolperf.zig");
+    _ = @import("worker/chat/trio_routing_test.zig"); // label->role routing guard (reads engine.zig as source)
     _ = @import("worker/control/supervisor.zig");
     _ = @import("worker/crawl.zig");
     _ = @import("worker/httpc.zig");
