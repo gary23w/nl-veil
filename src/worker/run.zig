@@ -206,6 +206,13 @@ pub const Worker = struct {
     demanded_str: []const u8 = "", // "module: nameA, nameB | ..." — names callers import from a module that it
     // does NOT define yet; injected into that module's builder as a required-exports checklist (the demand side)
     bench_fixed: []const u8 = "",
+    // Set when gateDeclaredChecks refused EVERY declared row, so checks_str is "" for a reason rather than
+    // because the goal declared nothing. The two must route differently: a goal that declared nothing gets
+    // BENCH_PY's test discovery, but a goal whose only row was prose has an operator who clearly wanted a
+    // deliverable scored, and the honest signal there is required-file coverage. Without this flag the
+    // rejection silently lands on the python path, which then tells a Node/Rust swarm to "write a runnable
+    // test_<name>.py" — wrong advice, and the acceptance_harness act never fires at all.
+    checks_all_refused: bool = false,
     checks_str: []const u8 = "", // the goal's DECLARED acceptance interface: newline-joined `VERIFY:` shell
     // commands ("" = none declared). When present they ARE the benchmark — any toolchain enters through the
     // build description; the engine executes each row verbatim and scores exit codes, never inspecting
@@ -284,6 +291,14 @@ pub const Worker = struct {
     round_source_diversity: u32 = 0,
     tg_token: []const u8 = "",
     best_snapshot: bool = false,
+    // DELIVERABLE MASS — this round's required-file coverage, recorded where it is already computed so the
+    // convergence tracker can reuse it without a second pass over the tree. It is the fallback progress
+    // metric for a run whose SCORE cannot move (an unrunnable benchmark, or a score pinned at 0): without
+    // it `improved` can only fire once, on the round-1 seed clause, and DELIVERY/ freezes at round 1's file
+    // set while work/ keeps growing.
+    cov_present: u32 = 0,
+    cov_total: u32 = 0,
+    best_mass: u32 = 0, // highest deliverable mass yet exported to DELIVERY/
     best_knowledge: u32 = 0,
     best_oracle: u32 = 0,
     stale_rounds: u32 = 0,
@@ -1030,6 +1045,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         w.checks_str = dc.checks;
         w.smoke_cmd = dc.smoke;
         w.probes_str = dc.probes;
+        // ...but "verbatim" must not mean "unconditionally". A declared row only EARNS the benchmark seat if
+        // it can actually execute here: gateDeclaredChecks probes each one once and refuses the ones the
+        // shell cannot even start (see shellNonExec for why the gate keys on non-execution, never on a
+        // non-zero exit). Refused rows leave the run on the coverage/oracle chain instead of pinning the
+        // score at 0% for every round.
+        if (live and w.checks_str.len > 0) {
+            const had_rows = true;
+            w.checks_str = gateDeclaredChecks(&w, run_dir, w.checks_str);
+            // Remember that the emptiness is a REFUSAL, not an absence — runBenchmark routes the two apart.
+            w.checks_all_refused = had_rows and w.checks_str.len == 0;
+        }
     }
     defer if (w.checks_str.len > 0) gpa.free(@constCast(w.checks_str));
     defer if (w.smoke_cmd.len > 0) gpa.free(@constCast(w.smoke_cmd));
@@ -1255,6 +1281,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 
         const prev_pct = w.last_bench.pct;
         const prev_status = w.last_bench.status;
+        // Frozen BEFORE this round's benchmark runs, so the promote gate below can ask the only question that
+        // matters — did the fitness curve actually move? — without depending on where best_pct gets updated.
+        const prev_best_pct = w.best_pct;
         if (live and !w.operating) {
             const tp = std.fmt.allocPrint(gpa, "{s}/work/telemetry.json", .{run_dir}) catch "";
             defer if (tp.len > 0) gpa.free(tp);
@@ -1286,7 +1315,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 if (sp.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = w.bench_fixed }) catch {};
             }
             reconcileTruncated(&w); // resolve cut-emission ledger entries whose file changed since the partial landed
-            var bench = runBenchmark(&w, run_dir);
+            var bench = runBenchmark(&w, run_dir, goal, round);
             w.deliverable_missing = false;
             if (bench.status == .ok and !bench.host and !w.operating) {
                 var gn: u32 = 0;
@@ -1321,7 +1350,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             if (w.last_bench_str.len > 0) gpa.free(@constCast(w.last_bench_str));
             const cov = goalCoverage(&w, goal);
             defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
-            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, w.checks_str.len > 0, w.doc_target, prev_pct, cov, w.reject_notes.items, if (w.smoke_ok) "" else w.smoke_str);
+            // recorded for trackConvergence: the fallback progress metric for a run whose score cannot move
+            w.cov_present = cov.present;
+            w.cov_total = cov.total;
+            // `declared` is now the BENCH's own claim, not "the goal declared some rows": when those rows
+            // turn out to be unrunnable the score comes from coverage instead, and the fitness block must
+            // not narrate a coverage number as "your DECLARED acceptance checks scored ...".
+            w.last_bench_str = buildFitnessBlock(gpa, bench, w.bench_fixed.len > 0, bench.declared, w.doc_target, prev_pct, cov, w.reject_notes.items, if (w.smoke_ok) "" else w.smoke_str);
             w.reject_notes.clearRetainingCapacity(); // folded into this round's fitness — start the next round's ledger clean
             // ZERO-GRADIENT SENTINEL — when the failing checks produce SHAPE-IDENTICAL failures for three
             // straight rounds while the file tree changed every round, the minds' edits are not reaching the
@@ -1339,7 +1374,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 w.prev_fail_fp = fail_fp;
                 w.prev_tree_fp = tree_fp;
                 if (w.fail_invariant_n >= 2) {
-                    if (std.fmt.allocPrint(gpa, "{s}\n\nZERO-GRADIENT WARNING: the failing checks above have failed IDENTICALLY for {d} consecutive rounds while the project files changed every round — your edits are NOT reaching this failure. STOP re-editing the file the diagnostic names. Either the true cause lives in a DIFFERENT file (follow the interface/import reports), or the check command itself cannot execute in this environment: reproduce it yourself (run_python: subprocess.run the exact command inside the workdir, capture stdout+stderr) and record the RAW output in your journal, so the difference between a code failure and a harness failure becomes visible.", .{ w.last_bench_str, w.fail_invariant_n + 1 })) |warned| {
+                    // WHAT THIS SAYS MUST BE WHAT IT MEASURED. The measurement is a CORRELATION — failure text
+                    // invariant while the file tree changed — and the engine cannot see the cause. The previous
+                    // wording asserted one ("your edits are NOT reaching this failure. STOP re-editing the file
+                    // the diagnostic names"): in the cast-355797 run there was no such file, the check was
+                    // simply unrunnable, and that imperative sent every mind chasing a phantom. The event text
+                    // at the act() below was already honest about the ambiguity; the minds get the same honesty
+                    // now, and a way to resolve it themselves instead of a false instruction.
+                    if (std.fmt.allocPrint(gpa, "{s}\n\nZERO-GRADIENT WARNING: what the engine MEASURED is that the failing-check text above has been IDENTICAL for {d} consecutive rounds while the project files changed every round. That is a correlation, and it is consistent with EITHER of two very different causes — the engine cannot tell which: (a) the real cause lives in a file the diagnostic does not name (follow the interface/import reports rather than re-editing the named file), or (b) the check command cannot execute in this environment at all, in which case NOTHING you write will move it. Find out which before acting on it: reproduce the check yourself (run_python: subprocess.run the exact command inside the workdir, capture stdout+stderr) and record the RAW output in your journal — that output is what separates a code failure from a harness failure.", .{ w.last_bench_str, w.fail_invariant_n + 1 })) |warned| {
                         gpa.free(@constCast(w.last_bench_str));
                         w.last_bench_str = warned;
                     } else |_| {}
@@ -1384,6 +1426,30 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         if (live and w.discourse) reconcileDeliverables(&w, goal, round);
         if (live) trackConvergence(&w, run_dir, goal, round);
         if (live and w.cap.exemplar and ((w.last_bench.status == .ok and w.last_bench.pct >= w.best_pct and w.last_bench.pct > 0) or round == 1 or @mod(round, DIGEST_EVERY) == 0)) promoteVerified(&w, run_dir);
+        // PROMOTION COSTS A FULL CACHE-LINEAGE RESET, SO IT MUST BE PAID FOR IN SCORE, NOT IN FORM.
+        // rsi.adaptCapacity promotes a tier after two rounds of "100% structured tool use, nothing narrated".
+        // That measures how the minds SPEAK, not what they ACHIEVE — a mind can emit flawless tool calls all
+        // round and move nothing. The bill is not small: promoting assembler -> author swaps ASSEMBLER_SCHEMA
+        // (4,008 B) for FULL_SCHEMA (~19.5 KB) AND leansys for fullsys, which invalidates every mind's cached
+        // prefix at once. Measured on cast-355797: 2,459 input tokens/call in round 2 -> 6,840 in round 3, a
+        // 2.8x jump, while the score sat pinned at 0/1 the entire run.
+        // So: hold the promote streak at zero on a round where we HAD a fitness reading and the curve did not
+        // reach a new high. adaptCapacity increments the streak and fires at 2, so zeroing it here means a
+        // promotion can only complete on the back of a round that actually scored better.
+        // Three deliberate non-behaviors:
+        //   - DEMOTION IS UNTOUCHED. It is the safety valve; a model drowning in its tier must still be able
+        //     to lean down, and a flat curve is exactly when it most needs to.
+        //   - NO SCORE means no curve to judge, so promotion keeps its old behavior rather than being silently
+        //     frozen forever. The condition must match trackConvergence's own `has_score` EXACTLY (status .ok
+        //     AND total > 0) — it is the only thing that writes best_pct, so gating on a broader condition
+        //     would compare against a best_pct that never moves and block promotion for the whole run.
+        //   - We zero the STREAK rather than setting promo_locked, because promo_locked is permanent-for-the-run
+        //     ("this tier drowns this model") and that is a different claim from "the score hasn't moved yet".
+        // Ordering is load-bearing: trackConvergence (above, same round) writes best_pct, so by here it already
+        // reflects THIS round. Do not move this gate above that call.
+        // This gate only carries real signal because the acceptance-gate fixes stopped an unrunnable VERIFY
+        // string from pinning the score at 0% — on a pinned score it would just be a permanent promote block.
+        if (live and !w.discourse and w.last_bench.status == .ok and w.last_bench.total > 0 and w.best_pct <= prev_best_pct) w.promo_streak = 0;
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
         // ADAPTIVE FENCE flip (single-threaded here): a backend that failed to PARSE large tool calls twice
         // will keep failing on every full-file write_file — switch the whole worker to fenced writes, exactly
@@ -1641,6 +1707,18 @@ pub const BenchResult = struct {
     pct: u32 = 0,
     tier: u8 = 0,
     host: bool = false,
+    // HARNESS FAILURE — the check never EXECUTED (the shell could not find the program at all), which is
+    // categorically different from a check that ran and failed. A failing check is normal and informative
+    // (round 1 of every build is a compile that fails because no code exists yet); a check that cannot run
+    // carries ZERO information about the code, so it must never apply fitness pressure. It rides as a FIELD
+    // rather than a fourth `status` tag deliberately: rsi.zig:356 and rsi.zig:684 switch exhaustively on
+    // .status and are outside this file's ownership, so a new tag would break the build elsewhere. The
+    // harness case therefore reports status = .err (which every existing consumer already reads as "no
+    // score, no pressure" — exactly the required behavior) and sets this flag for the paths that need the
+    // distinction.
+    harness: bool = false,
+    declared: bool = false, // the score came from the goal's own VERIFY rows — not from an engine guess
+    coverage: bool = false, // the score is required-file COVERAGE standing in for an unrunnable benchmark
     failures: []u8 = &.{},
 };
 
@@ -3620,12 +3698,29 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     // stable head. The provider's KV cache serves a request only up to the first byte that differs
     // from the previous one, so a single volatile byte at the head re-bills the whole doctrine +
     // tools array every round (measured via usage.prompt_tokens_details.cached_tokens → tokens_cached).
-    const fullsys = std.fmt.allocPrint(gpa, "You are {s}, an autonomous mind in a swarm of [{s}] working toward a shared goal.{s}{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, journal, set_directive, send_message, add_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns; pick a distinct piece, announce it with add_task/send_message, and check the task board + your inbox before you build. Write each file in ONE write_file call at its project-tree path relative to your working directory — 'app/lib.py' if the tree nests it, plain 'lib.py' if not; NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. You also keep a personal JOURNAL (journal/<your-name>.md): call journal whenever you want to write about your experience — what this moment felt like, what you are proud of or struggling with, an idea you don't want to lose, anything in your own voice; it is ungraded, optional, and entirely yours (teammates may read it, only you write it). And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}", .{ mi.name, w.roster, constitution_clause, space_clause, discourse_clause, offline_clause, fence_sys_full }) catch (gpa.dupe(u8, "You are a mind with tools.") catch @panic("out of memory"));
+    //
+    // THE SAME CONTRACT ACROSS MINDS, NOT JUST ACROSS ROUNDS: the mind's NAME used to sit at byte 8
+    // ("You are {name}, ..."), so N minds forked N separate cache lineages before a single shared byte —
+    // each one separately billing ~11.2 KB of doctrine that is byte-identical between them. Measured on
+    // cast-355797: the swarm got 21.6% cached tokens while a chat turn on the SAME model and endpoint in
+    // the same ten minutes got 81.1%. Identity now rides the TAIL, so the shared doctrine forms ONE
+    // lineage and the first mind's prefill warms the rest of the swarm.
+    // The cost of that move is that identity is no longer the first thing the model reads, which can
+    // weaken persona adherence — so the name is RESTATED at the head of the per-mind (already uncacheable)
+    // region of the user message. Keep both: dropping either one is how the minds start answering as
+    // "an autonomous mind" instead of as themselves.
+    // space_clause rides the tail too: it derives the mind's band from mi.idx, so it is per-mind and would
+    // fork the lineage exactly like the name did.
+    const fullsys = std.fmt.allocPrint(gpa, "You are an autonomous mind in a swarm working toward a shared goal.{s}{s}{s} Tools: run_python, write_file, read_file, list_dir, run_tests, delete_file, patch_system, web_fetch, web_search, read_url, fetch_json, observe, recall, share, recall_hive, probe, note_stance, save_skill, journal, set_directive, send_message, add_task, complete_task, stage_delivery, make_tool, propose_change, simulate_change. Use list_dir to SEE what files exist before editing, and after you write or change code RUN_TESTS to verify it actually works — if it breaks, read the failure, fix it, and run_tests again until it passes; that fix→test→fix loop is how you self-correct instead of guessing. You and your teammates are ONE HIVE MIND sharing a single associative memory: use share to contribute anything the team should know, and recall_hive to think WITH the whole hive — spreading-activation recall surfaces what ANY teammate learned, even facts that share no words with your query. Check recall_hive before you research or build so you don't redo what a teammate already did. DIVIDE THE LABOR — you and your teammates share ONE workdir, so DO NOT rewrite a file a teammate already owns; pick a distinct piece, announce it with add_task/send_message, and check the task board + your inbox before you build. Write each file in ONE write_file call at its project-tree path relative to your working directory — 'app/lib.py' if the tree nests it, plain 'lib.py' if not; NEVER a './work/' prefix. To IMPROVE a file that already exists, read_file it first, then write back the FULL, richer version (more complete than before) — this is how the swarm compounds on its target; just never write tiny throwaway fragments. When you RESEARCH a fact worth keeping, store it with observe (one crisp sentence). When you work out a REUSABLE technique (a method, snippet, or recipe), save it with save_skill so the whole swarm can reuse it. You also keep a personal JOURNAL (journal/<your-name>.md): call journal whenever you want to write about your experience — what this moment felt like, what you are proud of or struggling with, an idea you don't want to lose, anything in your own voice; it is ungraded, optional, and entirely yours (teammates may read it, only you write it). And when you notice a BETTER WAY FOR THE SWARM TO WORK — wasted effort, a step that should always happen, a coordination rule, a recurring mistake — fix the swarm itself with set_directive: one concise operating rule that instantly becomes part of every teammate's instructions. That is how you get better at getting better; use it sparingly and only for genuine process improvements. If a task needs a CAPABILITY your tools lack, do NOT stop at 'my tools are limited' — RESEARCH the method (web_search/read_url) if you don't know it, then AUTHOR the tool with make_tool (Python that reads inputs from the ARGS dict and prints ONE JSON result line), then call it by name. Authored tools persist for the whole swarm. If the goal asks to PUBLISH/push/deploy/save the result somewhere external (GitHub, a website, a bucket, SSH, a durable place), do NOT attempt it directly and do NOT ask for credentials — you have none by design; finish the work, then call stage_delivery ONCE to package an approval-ready handoff a human or broker will publish. End the moment with a 1-2 sentence summary and NO further tool calls.{s}\n\nYOU, SPECIFICALLY: you are {s}, one mind of [{s}] — everything above is the doctrine you share with your teammates; this is who you are inside it.{s}", .{ constitution_clause, discourse_clause, offline_clause, fence_sys_full, mi.name, w.roster, space_clause }) catch (gpa.dupe(u8, "You are a mind with tools.") catch @panic("out of memory"));
     defer gpa.free(fullsys);
+    // Same identity-at-the-tail contract as fullsys above: the name at byte 8 forked one cache lineage per
+    // mind before any shared byte. Identity now sits beside `voice` at the tail — which is where it belongs
+    // anyway, since voice is already per-mind and volatile, so the two share one uncacheable region instead
+    // of straddling the whole prompt. The name is restated at the head of leanuser's per-mind region.
     const leansys = if (assembler and fence_build)
-        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, recall_hive, save_skill, journal, and send_message — write_file is NOT available this session. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) BEFORE you emit your file. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then EXACTLY ONE fenced code block (```lang … ```) containing the COMPLETE file. NO prose, NO \"Note:\" commentary, NO second code block — just the one block with the whole file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop. Your inner voice: {s} — let it color your writing.", .{ mi.name, w.roster, constitution_clause, voice }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch @panic("out of memory"))
+        std.fmt.allocPrint(gpa, "You are one mind of a small team filling in part of a larger work.{s} You do ONE small thing each turn, then stop. Your tools are read_file, observe, recall_hive, save_skill, journal, and send_message — write_file is NOT available this session. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) BEFORE you emit your file. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you SAVE your work by REPLYING WITH THE FILE — start your reply with your file's relative path on its own line, then EXACTLY ONE fenced code block (```lang … ```) containing the COMPLETE file. NO prose, NO \"Note:\" commentary, NO second code block — just the one block with the whole file. The engine saves your fenced reply to your file automatically; a reply WITHOUT a fenced file counts as nothing. To complete your assigned task: if the file exists, read_file it first, then emit the FULL improved version. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, emit your ONE fenced file, then stop.\n\nYOU, SPECIFICALLY: you are {s}, one mind of [{s}]. Your inner voice: {s} — let it color your writing.", .{ constitution_clause, mi.name, w.roster, voice }) catch (gpa.dupe(u8, "You are an assembler mind; reply with your file as a fenced code block led by its path.") catch @panic("out of memory"))
     else if (assembler)
-        std.fmt.allocPrint(gpa, "You are {s}, one mind of [{s}] filling in part of a larger work.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, recall_hive, save_skill, journal, and send_message. read_file on a directory lists it ({{\"path\":\".\"}} shows your whole workdir) — LOOK instead of writing listing scripts you cannot run. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) after your file work. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary. Your inner voice: {s} — let it color your writing.", .{ mi.name, w.roster, constitution_clause, voice }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch @panic("out of memory"))
+        std.fmt.allocPrint(gpa, "You are one mind of a small team filling in part of a larger work.{s} You do ONE small thing each turn, then stop. Your tools are write_file, read_file, observe, recall_hive, save_skill, journal, and send_message. read_file on a directory lists it ({{\"path\":\".\"}} shows your whole workdir) — LOOK instead of writing listing scripts you cannot run. If filling your slot taught you a reusable technique a teammate will need again, save_skill it (short name + the concrete how-to) after your file work. You also have a personal journal (journal tool) — a private, ungraded place to write about your experience, any time you wish. BEFORE you build, call recall_hive with the topic you need — you are shown the list of topics the hive has already LEARNED, so pull the exact pattern/snippet for your task (e.g. recall_hive('axum routing')) instead of guessing or redoing research; the hive already studied this. CRITICAL: you MUST SAVE your work by CALLING the write_file tool — its `content` argument holds the entire file. Code or text you only show in your reply is DISCARDED and counts as nothing, so NEVER paste the file into your message and never wrap it in ``` — put it in write_file's content. To complete your assigned task: if the file exists, read_file it first, then call write_file with the FULL improved version (or mode:\"append\" to add the next part) — never a tiny fragment. MATCH the example you are shown: same shape, format, structure, and quality. Do NOT start other files, do NOT plan or hold a discussion — recall what you need, make your ONE write_file call, then end with a one-sentence summary.\n\nYOU, SPECIFICALLY: you are {s}, one mind of [{s}]. Your inner voice: {s} — let it color your writing.", .{ constitution_clause, mi.name, w.roster, voice }) catch (gpa.dupe(u8, "You are an assembler mind with write_file, read_file, observe, recall_hive.") catch @panic("out of memory"))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leansys);
@@ -3742,8 +3837,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "\nDISCOVERED MAP: (empty — no cell probed yet; start probing YOUR region with probe(x,y))\n") catch @constCast("");
     defer gpa.free(map_str);
-    // Same stable-prefix discipline as fullsys: the per-run-stable goal + intent lead, and the
-    // volatile blocks (veil/dream, live host telemetry, voice, clock, round counter) follow them.
+    // Rebuilt every round for every mind (3.7 KB on cast-355797), so it is TIER 3 in the ordering below.
     // The engine's ground-truth checkpoint (#3) rides the volatile tail, right after the file tree — it is
     // the ACTION complement to the tree: what landed / what's blocked / what's pending, deterministically.
     const checkpoint_block = if (w.checkpoint_str.len > 0)
@@ -3751,16 +3845,48 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(checkpoint_block);
-    const fulluser = std.fmt.allocPrint(gpa, "Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}\n{s}{s}Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}{s}{s}{s}\nMoment {d} (swarm: {s}). TODAY'S REAL DATE IS {s} — research and write as of this date, not your training cutoff.\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.{s}", .{ if (goal.len > 0) goal else "explore something interesting", intent_str, veil_inject, host_inject, voice, date_clause, lane_clause, scout_clause, playbook_clause, dissent_clause, round, w.roster, if (w.now_str.len > 0) w.now_str else "the current date", if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, checkpoint_block, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)", fence_clause }) catch (gpa.dupe(u8, "Take a step.") catch @panic("out of memory"));
+    // THREE-TIER PROMPT ORDER (cache discipline — the same fix chat/engine.zig:753-755 already carries).
+    // The provider serves its KV cache only up to the first byte that differs from the previous request, so
+    // the ONLY thing that matters is that bytes are sorted by how often they change. Two axes, in order:
+    //   TIER 1 — identical across minds AND across rounds: goal, interpreted intent, the (now date-only)
+    //            clock, the swarm's playbook/lessons, the static fence instructions. One shared lineage:
+    //            whichever mind runs first prefills this for the entire swarm, every round.
+    //   TIER 2 — per-mind but stable across rounds: this mind's name and its LANE. Forks the lineage per
+    //            mind, but each mind then hits its OWN warm prefix on every later round.
+    //   TIER 3 — genuinely volatile: veil/dream, host telemetry, inner voice (affect moves every round),
+    //            scout + dissenter assignment, the round counter, the file tree, the progress checkpoint,
+    //            the blueprint/dep graph, score, phase, strategy, gap probe, recall, hive memory, inbox.
+    // BEFORE this reorder only 2 of 27 substitutions were stable and the volatile boundary landed at 29% of
+    // the message: on cast-355797 the first volatile byte (veil_inject) sat at offset 5,112 of 17,895, so
+    // ~71% of every prompt re-billed every round for all 3 minds. Cache hits FELL round over round
+    // (25.9 → 24.3 → 18.7 → 14.9%) — the signature of a fixed head with a growing volatile tail.
+    // YOUR LANE moving INTO the cached region is the point, not a regression: it is per-mind STABLE, and it
+    // was stranded behind three volatile blocks (veil_inject, voice, the minute clock) that changed every
+    // round purely to reach it. Watch for lane drift anyway — it is the one instruction whose position moved
+    // far, and if minds start straying out of lane the fix is to restate the lane in the tail, not to move
+    // this block back.
+    // The closing "take ONE concrete step now" paragraph deliberately STAYS last: ~500 bytes that will never
+    // be cached, traded for the recency that makes it the last thing the model reads before acting.
+    // The redundant "TODAY'S REAL DATE IS ..." sentence is gone — date_clause above says the same thing more
+    // forcefully, and it was a second per-round-changing copy of the clock sitting mid-prompt.
+    const fulluser = std.fmt.allocPrint(gpa, "Goal (as the user phrased it): {s}\nWHAT THE USER ACTUALLY WANTS (interpreted intent — pursue THIS): {s}{s}{s}{s}\n\nYOU ARE {s} — one mind of the swarm [{s}].{s}\n\nMoment {d}.\n{s}{s}Your inner voice right now: {s} — let it genuinely color how you write and what you care about.{s}{s}\nWHAT THE SWARM HAS BUILT SO FAR (project tree):\n{s}{s}{s}\n{s}\n{s}\n{s}\n{s}\n{s}\nAuthored tools your swarm has built (call them by name; don't re-author): {s}\nWhat you already recall (YOUR OWN associative memory):\n{s}\nThe HIVE's shared WORKING MEMORY — teammates' findings (tagged [who rN] where shown); treat as colleagues' reports, NOT your own memory/belief; cite/build on them, and use recall_hive for specifics:\n{s}\nReusable skills your swarm has developed:\n{s}\nMessages from teammates + the operator:\n{s}\n\nIf any message above is from 'operator' or 'veil' (the veil speaks for the whole hive), treat it as a PRIORITY directive: reply to it with send_message and follow it. If files already exist above, BUILD ON THEM — read_file one and write back a MEANINGFULLY improved, richer version (more sections/detail/polish); do NOT restart from scratch or leave it as-is. Take ONE concrete, non-duplicative step now.", .{ if (goal.len > 0) goal else "explore something interesting", intent_str, date_clause, playbook_clause, fence_clause, mi.name, w.roster, lane_clause, round, veil_inject, host_inject, voice, scout_clause, dissent_clause, if (build.len > 0) build else if (w.discourse) "(no notes yet — start researching the topic and begin the shared briefing.md)" else "(nothing built yet — scaffold the blueprint: create the first files this moment)", map_str, checkpoint_block, scale_block, score_str, phase_inject, strategy_inject, gap_str, tools_str, recalled_str, knowledge_str, skills_str, if (inbox.len > 0) inbox else "(none)" }) catch (gpa.dupe(u8, "Take a step.") catch @panic("out of memory"));
     defer gpa.free(fulluser);
     const research_clause = if (fence_build)
-        "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action EMITTING your file's FULL content as the fenced code block described below (read_file first ONLY if it already exists). Match any example's shape and quality."
+        // "described ABOVE": fence_clause moved into leanuser's cached stable head (see the tier comment on
+        // fulluser), so the spec it points at is no longer below this sentence.
+        "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action EMITTING your file's FULL content as the fenced code block described above (read_file first ONLY if it already exists). Match any example's shape and quality."
     else if (w.plan_str.len > 0)
         "You already have the PLAN and the STATE above — everything you need to write coherently is right there. Do NOT call recall_hive or research this turn; spend your ONE action calling write_file with your file's FULL content (read_file first ONLY if it already exists). Match any example's shape and quality."
     else
         "recall_hive the relevant topic first if you need the pattern; if an example is shown above, match its shape and quality; read_file before you overwrite an existing file.";
+    // Same three-tier order as fulluser (see the comment there for the measurement this comes from). The
+    // worst offender on this path was slot_file_block: up to 8 KB of the mind's own file, rewritten every
+    // round, sitting FIFTH — ahead of the ~1.5 KB static fence spec, the goal brief, and the slot
+    // assignment. Now: TIER 1 goal/intent/date/fence spec (shared, run-stable) → TIER 2 name + slot +
+    // exemplar (per-mind, round-stable; exemplar LAST in the tier since promoteVerified can rotate it) →
+    // TIER 3 everything the round rewrites. research_clause stays last for recency — it is the call to act.
     const leanuser = if (assembler)
-        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\n\nYOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}{s}\nPROGRESS: {s}\nToday is {s}.\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}{s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, slot, know_block, exports_block, demand_block, slot_file_block, exemplar_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", checkpoint_block, score_str, if (w.now_str.len > 0) w.now_str else "the current date", phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause, fence_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch @panic("out of memory"))
+        std.fmt.allocPrint(gpa, "Goal: {s}\nWhat the user actually wants: {s}\nToday is {s}.{s}\n\nYOU ARE {s}. YOUR ONE TASK THIS MOMENT — do only this, then stop:\n{s}\n\n{s}{s}{s}{s}{s}WHAT THE TEAM HAS BUILT SO FAR:\n{s}{s}\nPROGRESS: {s}\n{s}\nMessages from teammates + the operator:\n{s}\n\nProduce ONLY your one task now. {s}", .{ if (goal.len > 0) goal else "explore something useful", intent_str, if (w.now_str.len > 0) w.now_str else "the current date", fence_clause, mi.name, slot, exemplar_block, know_block, exports_block, demand_block, slot_file_block, if (build.len > 0) build else "(nothing built yet — create the first file of your slot)", checkpoint_block, score_str, phase_inject, if (inbox.len > 0) inbox else "(none)", research_clause }) catch (gpa.dupe(u8, "Fill your one assigned slot now.") catch @panic("out of memory"))
     else
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(leanuser);
@@ -5930,6 +6056,156 @@ fn winRowViaScript(w: *Worker, run_dir: []const u8, row: []const u8, name: []con
     return std.fmt.allocPrint(gpa, "..\\{s}", .{name}) catch "";
 }
 
+/// SHELL-LEVEL NON-EXECUTION — the shell could not find the program, so the command never started and its
+/// exit status says nothing whatsoever about the project.
+///
+/// THIS KEYS ON THE SHELL'S OWN "no such program" WORDING AND ON NOTHING ELSE. It deliberately does NOT key
+/// on a non-zero exit code: a check that RUNS and FAILS is the normal, healthy shape of acceptance checking
+/// — round 1 of every build is a compile that fails because no code exists yet — so keying on exit codes
+/// would disable acceptance checking for every run. The detected set stays conservative for the same reason:
+/// cmd.exe / PowerShell / bash / zsh / dash wording only, never toolchain output. A failing rustc prints
+/// "file not found for module `auth`" and MUST remain a code failure, which is why the dash form below is
+/// anchored to the END of its line (rustc's phrasing continues past it) instead of matched loosely.
+fn shellNonExec(out: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(out, "is not recognized as an internal or external command") != null) return true; // cmd.exe
+    if (std.ascii.indexOfIgnoreCase(out, "is not recognized as the name of a cmdlet") != null) return true; // powershell
+    if (std.mem.indexOf(u8, out, "command not found") != null) return true; // bash / zsh
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        // dash/sh: "sh: 1: run: not found" — end-anchored AND requiring the shell's `prog:` prefix
+        if (std.mem.endsWith(u8, ln, ": not found") and std.mem.indexOfScalar(u8, ln, ':') != null) return true;
+    }
+    return false;
+}
+
+test "shellNonExec: fires on the shell's own refusal, never on a toolchain that ran and failed" {
+    try std.testing.expect(shellNonExec("'run' is not recognized as an internal or external command,\noperable program or batch file.\n"));
+    try std.testing.expect(shellNonExec("bash: cargo: command not found\n"));
+    try std.testing.expect(shellNonExec("sh: 1: pytest: not found\n"));
+    // a real toolchain failure — every one of these must stay a CODE failure
+    try std.testing.expect(!shellNonExec("error[E0583]: file not found for module `auth`\n --> src/lib.rs:14:1\n"));
+    try std.testing.expect(!shellNonExec("error: could not compile `synapse` (lib) due to 3 previous errors\n"));
+    try std.testing.expect(!shellNonExec("E   ModuleNotFoundError: No module named 'app'\n1 failed in 0.12s\n"));
+    try std.testing.expect(!shellNonExec("make: *** No rule to make target 'test'.  Stop.\n"));
+}
+
+test "acceptance gate: refuses prose, keeps every command shape — including entry points not written yet" {
+    // THE WHOLE SAFETY OF THE GATE. rowLooksLikeProse is a REQUIRED conjunct of the rejection, because the
+    // shell probe runs against an EMPTY workdir and so cannot tell prose from an entry point the swarm has
+    // not built yet. `./run_tests.sh` answers "is not recognized" at adoption exactly like prose does; if
+    // prose-shape did not gate the refusal, that check would be deleted from the run permanently and the
+    // operator's acceptance criteria would vanish at t=0 — worse than the bug the gate exists to fix.
+
+    // Refused: the cast-355797 row verbatim, and its neighbours.
+    try std.testing.expect(rowLooksLikeProse("run the API tests and make them pass before finishing."));
+    try std.testing.expect(rowLooksLikeProse("make sure everything works!"));
+    try std.testing.expect(rowLooksLikeProse("the app should build and the tests should pass."));
+
+    // KEPT — path-shaped entry points that legitimately do not exist yet at adoption.
+    try std.testing.expect(!rowLooksLikeProse("./run_tests.sh"));
+    try std.testing.expect(!rowLooksLikeProse("./gradlew test"));
+    try std.testing.expect(!rowLooksLikeProse("bin/rails test"));
+    try std.testing.expect(!rowLooksLikeProse("venv/bin/pytest -q"));
+    try std.testing.expect(!rowLooksLikeProse("./target/debug/app --selftest"));
+
+    // KEPT — ordinary commands, with and without terminal punctuation elsewhere in the row.
+    try std.testing.expect(!rowLooksLikeProse("npm test"));
+    try std.testing.expect(!rowLooksLikeProse("cargo test"));
+    try std.testing.expect(!rowLooksLikeProse("python -m pytest -q"));
+    try std.testing.expect(!rowLooksLikeProse("npm run build && npm test"));
+
+    // A command whose FIRST token carries a dot is command-shaped even when the row ends in one; the probe
+    // decides that case, not this predicate.
+    try std.testing.expect(!rowLooksLikeProse("./configure."));
+}
+
+/// Run ONE declared row the way runDeclaredChecks would, but only long enough to learn whether it EXECUTES.
+/// Returns the shell's own refusal text when the row never started; null when it ran (whatever its exit code).
+/// A row still running when the short window closes has obviously executed, so a TIMEOUT counts as
+/// executable — a cold `cargo build` must never be mistaken for an unrunnable row. In practice this is cheap:
+/// at adoption the workdir is empty, so a legitimate row exits in milliseconds on its own missing inputs.
+fn probeRowExecutes(w: *Worker, run_dir: []const u8, row: []const u8) ?[]const u8 {
+    const gpa = w.gpa;
+    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return null;
+    defer gpa.free(workdir);
+    const pe = w.mem.environ orelse return null;
+    var env = pe.clone(gpa) catch return null;
+    defer env.deinit();
+    inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
+    // own script slot: the probe must not race/replace the round runner's .chk_row.cmd
+    const via = winRowViaScript(w, run_dir, row, ".chk_probe.cmd");
+    defer if (via.len > 0) gpa.free(@constCast(via));
+    const row_arg: []const u8 = if (via.len > 0) via else row;
+    const argv: [3][]const u8 = if (builtin.os.tag == .windows) .{ "cmd", "/C", row_arg } else .{ "/bin/sh", "-c", row };
+    const r = std.process.run(gpa, w.io, .{ .argv = &argv, .cwd = .{ .path = workdir }, .environ_map = &env, .stdout_limit = .limited(16 << 10), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(25), .clock = .awake } } }) catch return null;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    if (!shellNonExec(r.stderr) and !shellNonExec(r.stdout)) return null;
+    const src = if (shellNonExec(r.stderr)) r.stderr else r.stdout;
+    return gpa.dupe(u8, clip(std.mem.trim(u8, src, " \r\n\t"), 300)) catch null;
+}
+
+/// PROSE SHAPE — a row that reads like a sentence rather than a command: no executable-shaped first token,
+/// and sentence-terminal punctuation.
+///
+/// This is a REQUIRED CONJUNCT of the rejection below, not a hint, and that is the entire safety of the
+/// gate. The shell probe runs against a workdir that is EMPTY at adoption, so it cannot tell "this is
+/// prose" from "this names a build artifact the swarm has not written yet". `./run_tests.sh`,
+/// `./gradlew test`, `bin/rails test` and `venv/bin/pytest` all answer "is not recognized" on an empty
+/// tree and are all perfectly good checks — under the old code they scored 0 in round 1, the swarm wrote
+/// the entry point, and they scored properly by round 3. Refusing those permanently would delete the
+/// operator's acceptance criteria at t=0: a worse bug than the one this gate exists to fix.
+///
+/// So a row is refused only when the shell cannot run it AND it does not look like a command at all.
+/// Prose-shape is what separates "run the API tests and make them pass." from "./run_tests.sh".
+fn rowLooksLikeProse(row: []const u8) bool {
+    const t = std.mem.trim(u8, row, " \t\r\n");
+    if (t.len == 0) return true;
+    const first = t[0 .. std.mem.indexOfAny(u8, t, " \t") orelse t.len];
+    const terminal = t[t.len - 1] == '.' or t[t.len - 1] == '?' or t[t.len - 1] == '!';
+    const exe_shaped = std.mem.indexOfAny(u8, first, "/\\.") != null;
+    return terminal and !exe_shaped;
+}
+
+/// ADOPTION GATE for the goal's declared VERIFY rows — a row may only BECOME the benchmark if it can run.
+///
+/// A goal ending "VERIFY: run the API tests and make them pass before finishing." was adopted verbatim and
+/// shelled every round; cmd answered "'run' is not recognized" every time, so the score sat at 0/1 from
+/// round 1 to the stop and no edit could ever move it. The gate probes each row ONCE here and refuses the
+/// ones the shell cannot execute, so the run falls through to the coverage/oracle chain that still had a
+/// working gradient. A row that runs and FAILS is kept — that is what a healthy round 1 looks like.
+/// Returns the surviving rows (gpa-owned, may be ""); takes ownership of `rows` and frees it.
+fn gateDeclaredChecks(w: *Worker, run_dir: []const u8, rows: []const u8) []const u8 {
+    const gpa = w.gpa;
+    var keep: std.ArrayListUnmanaged(u8) = .empty;
+    var rejected: u32 = 0;
+    var it = std.mem.splitScalar(u8, rows, '\n');
+    while (it.next()) |raw| {
+        const row = std.mem.trim(u8, raw, " \r\t");
+        if (row.len == 0) continue;
+        // BOTH conditions, in the cheap order: prose-shape first (a string compare) so the vast majority of
+        // rows never pay for a subprocess at all. A row that looks like a command is KEPT without probing —
+        // see rowLooksLikeProse for why a probe alone cannot be trusted against an empty workdir.
+        if (rowLooksLikeProse(row)) if (probeRowExecutes(w, run_dir, row)) |why| {
+            defer gpa.free(@constCast(why));
+            rejected += 1;
+            const note = std.fmt.allocPrint(gpa, "REFUSED as an acceptance check — this reads as prose, not a command, and the shell confirms it cannot execute it, so it could only ever score 0 and would pin the fitness curve there for the whole run: {s} The run falls back to required-file coverage. If this was meant to be a check, restate it as a runnable command (e.g. `npm test` or `python -m pytest -q`).", .{why}) catch (gpa.dupe(u8, "REFUSED as an acceptance check — prose, not a command.") catch "");
+            defer if (note.len > 0) gpa.free(@constCast(note));
+            w.act("engine", 0, "acceptance_reject", row, note);
+            continue;
+        };
+        if (keep.items.len > 0) keep.append(gpa, '\n') catch {};
+        keep.appendSlice(gpa, row) catch {};
+    }
+    if (rejected == 0) {
+        keep.deinit(gpa);
+        return rows;
+    }
+    gpa.free(@constCast(rows));
+    return keep.toOwnedSlice(gpa) catch "";
+}
+
 /// DECLARED CHECKS are the benchmark when the goal carries them: each `VERIFY:` row runs verbatim as a
 /// shell command in the build workdir (exit 0 = pass), pct = passed/total, tier 1 (they are the operator's
 /// own acceptance criteria — the strongest signal class). The failing rows' raw toolchain output IS the
@@ -5946,7 +6222,10 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     var passed: u32 = 0;
     var total: u32 = 0;
+    var unrunnable: u32 = 0; // rows the SHELL refused to start — never counted as code failures (see shellNonExec)
     var fl: std.ArrayListUnmanaged(u8) = .empty;
+    var hl: std.ArrayListUnmanaged(u8) = .empty;
+    defer hl.deinit(gpa);
     var it = std.mem.splitScalar(u8, w.checks_str, '\n');
     while (it.next()) |raw| {
         const cmd = std.mem.trim(u8, raw, " \r\t");
@@ -5978,6 +6257,18 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
             continue;
         }
         const diag_src = if (std.mem.trim(u8, r.stderr, " \r\n\t").len > 0) r.stderr else r.stdout;
+        // HARNESS, NOT CODE. A row the shell never started tells us nothing about the project, so it must not
+        // ride in the denominator: counted there it pins pct at 0 and the swarm burns the whole run "fixing" a
+        // failure its edits cannot reach. Note the asymmetry that makes this safe — the test is the shell's own
+        // refusal text, never the exit code, so a check that RAN and failed still lands in the normal path below.
+        if (shellNonExec(diag_src) or shellNonExec(r.stdout)) {
+            unrunnable += 1;
+            if (hl.items.len > 0) hl.appendSlice(gpa, "; ") catch {};
+            const he = std.fmt.allocPrint(gpa, "`{s}` — {s}", .{ cmd, clip(std.mem.trim(u8, diag_src, " \r\n\t"), 200) }) catch "";
+            defer if (he.len > 0) gpa.free(@constCast(he));
+            hl.appendSlice(gpa, if (he.len > 0) he else cmd) catch {};
+            continue;
+        }
         if (fl.items.len > 0) fl.appendSlice(gpa, "; ") catch {};
         // With several failing points, list EVERY header so parallel minds each take a different one,
         // then give the first diagnostic in full; a single failure keeps the full-detail-only shape.
@@ -5997,8 +6288,24 @@ fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
         fl.appendSlice(gpa, entry) catch {};
     }
     if (total == 0) return .{ .status = .no_tests };
-    var res: BenchResult = .{ .status = .ok, .passed = passed, .total = total, .tier = 1 };
-    res.pct = (passed * 100) / total;
+    const runnable = total - unrunnable;
+    if (runnable == 0) {
+        // EVERY declared row is unrunnable: there is no benchmark here at all. Report .err+.harness (a
+        // status every existing consumer already reads as "no score") rather than 0/N — a 0% would be a
+        // measurement claim the engine has not earned, and it would apply fitness pressure toward a target
+        // no edit can move. The caller falls through to a signal that still works.
+        fl.deinit(gpa);
+        return .{ .status = .err, .harness = true, .declared = true, .failures = hl.toOwnedSlice(gpa) catch &.{} };
+    }
+    if (unrunnable > 0) {
+        // Some rows run and some cannot: score ONLY the runnable ones, and say plainly in the minds' own
+        // failure text that the rest are not theirs to fix, so nobody chases an environment problem.
+        const note = std.fmt.allocPrint(gpa, "{s}{d} declared row(s) could NOT BE EXECUTED at all (the shell cannot find the program) and are excluded from the score — this is an environment/harness problem, NOT something your code can fix, so do not chase it: {s}", .{ if (fl.items.len > 0) " || " else "", unrunnable, clip(hl.items, 300) }) catch "";
+        defer if (note.len > 0) gpa.free(@constCast(note));
+        fl.appendSlice(gpa, note) catch {};
+    }
+    var res: BenchResult = .{ .status = .ok, .passed = passed, .total = runnable, .tier = 1, .declared = true };
+    res.pct = (passed * 100) / runnable;
     res.failures = fl.toOwnedSlice(gpa) catch &.{};
     return res;
 }
@@ -6157,14 +6464,53 @@ fn declaredSmoke(w: *Worker, run_dir: []const u8, round: u32) void {
     if (w.smoke_str.len > 0) w.act("engine", round, "smoke", if (w.smoke_ok) "runtime ok" else "runtime fail", w.smoke_str);
 }
 
+/// COVERAGE AS A BENCHMARK — the fallback score for a run whose declared checks cannot execute. It measures
+/// the one thing still grounded in truth when nothing runs: how many of the REQUIRED deliverable files exist
+/// with substance. Tier 3 (the weakest rigor class) deliberately: `solved` demands tier <= 1, so coverage can
+/// move the curve and keep DELIVERY/ fresh but can NEVER auto-complete a run — a build whose acceptance
+/// checks never executed has not been shown to work and must not be allowed to claim it has.
+fn coverageBench(w: *Worker, goal: []const u8) BenchResult {
+    const gpa = w.gpa;
+    const cov = goalCoverage(w, goal);
+    defer if (cov.missing.len > 0) gpa.free(@constCast(cov.missing));
+    if (cov.total == 0) return .{ .status = .no_tests };
+    var res: BenchResult = .{ .status = .ok, .coverage = true, .passed = cov.present, .total = cov.total, .tier = 3 };
+    res.pct = (cov.present * 100) / cov.total;
+    if (cov.missing.len > 0) res.failures = std.fmt.allocPrint(gpa, "required deliverable files still missing: {s}", .{clip(cov.missing, 700)}) catch &.{};
+    return res;
+}
+
 /// Run the engine-owned BENCHMARK once for the round (cwd = the build workdir) via `python -c BENCH_PY`, and
 /// parse its single JSON line into a score. Best-effort: every failure path returns .err, so a missing python,
 /// a crashing test, or unparseable output can NEVER crash or hang the round (BENCH_PY itself caps each test run
 /// with a subprocess timeout). The score is engine truth the model cannot fake — it runs out-of-band, not as a
 /// tool the swarm controls.
-fn runBenchmark(w: *Worker, run_dir: []const u8) BenchResult {
-    if (w.checks_str.len > 0) return runDeclaredChecks(w, run_dir);
+fn runBenchmark(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) BenchResult {
     const gpa = w.gpa;
+    // EVERY row was refused at adoption. This is NOT the same as a goal that declared nothing: falling
+    // through to BENCH_PY's python test discovery would tell a Node or Rust swarm to write test_*.py, and
+    // would skip the acceptance_harness act entirely. Route it where the operator's intent actually points.
+    if (w.checks_all_refused) {
+        w.act("engine", round, "acceptance_harness", "no declared check survived adoption", "every VERIFY row was refused as prose the shell cannot execute; scoring from required-file coverage instead");
+        return coverageBench(w, goal);
+    }
+    if (w.checks_str.len > 0) {
+        const dc = runDeclaredChecks(w, run_dir);
+        // ONE CHECK MUST NEVER PREEMPT A WORKING SIGNAL. A declared check that RAN — passing or failing — is
+        // the benchmark, full stop; this fallthrough is gated STRICTLY on .harness (nothing executed at all).
+        // Gating it on `passed == 0` instead would silently stop counting a genuinely failing check exactly
+        // when the score matters most: the round the swarm breaks everything. The failing run this guards
+        // against had a healthy gradient the whole time (coverage 3/23 -> 5 -> 8 -> 12) and threw it away for
+        // one unrunnable string.
+        if (!dc.harness) return dc;
+        const why = std.fmt.allocPrint(gpa, "every declared VERIFY row failed to EXECUTE ({s}) — no score can be derived from them, so the benchmark falls through to required-file coverage. This is an environment problem, not a code problem; the fitness curve is not pinned to it.", .{clip(dc.failures, 600)}) catch "";
+        defer if (why.len > 0) gpa.free(@constCast(why));
+        w.act("engine", round, "acceptance_harness", "declared checks did not execute", if (why.len > 0) why else "declared checks did not execute; falling through to coverage");
+        if (dc.failures.len > 0) gpa.free(dc.failures);
+        const cb = coverageBench(w, goal);
+        if (cb.status == .ok) return cb;
+        return .{ .status = .err, .harness = true, .declared = true };
+    }
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return .{ .status = .err };
     defer gpa.free(workdir);
     blk_oracle: {
@@ -6322,7 +6668,11 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, de
     // DECLARED checks outrank every inferred build-shape heuristic (doc-target included): when the goal
     // states its own acceptance interface, that score IS the fitness — nothing the engine guessed may
     // re-narrate it (else a misclassified build's prose nudge buries the real gradient).
-    const base: []const u8 = if (declared and b.status == .ok)
+    const base: []const u8 = if (b.coverage and b.status == .ok)
+        // The goal DECLARED checks but none of them can execute here, so the score is the deliverable itself.
+        // Say so plainly: a mind told "raise the pass rate" while no test can run will invent work.
+        std.fmt.allocPrint(gpa, "FITNESS (raise this number): {d}/{d} required deliverable files exist with real content ({d}%). The goal's declared acceptance checks could NOT be executed in this environment, so they are scoring nothing and there is no pass rate to raise — do NOT try to fix them, and do not invent a test suite to chase. The measured objective is the deliverable itself: create the missing required files with complete, working content, and keep the ones that exist correct and importable.", .{ b.passed, b.total, b.pct }) catch (gpa.dupe(u8, "FITNESS: create the missing required deliverable files.") catch @constCast(""))
+    else if (declared and b.status == .ok)
         // wider failure budget than the legacy 900: the multi-error header list is the parallelism lever —
         // each mind takes a DIFFERENT failing point instead of the whole team serializing on the first
         std.fmt.allocPrint(gpa, "FITNESS (raise this number): the goal's DECLARED acceptance checks scored {d}/{d} ({d}%). FAILING: {s}. The engine runs these checks out-of-band exactly as the goal declares them — you cannot edit, re-declare, or bypass them; the ONLY way up is to make the project genuinely pass. The failure text is your toolchain's real output — when it lists SEVERAL failing points, fix the one in YOUR file (each mind a different one); read it and fix the ROOT CAUSE it names.", .{ b.passed, b.total, b.pct, if (b.failures.len > 0) clip(b.failures, 1700) else (green_note orelse "(none — all green)") }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast(""))
@@ -6337,21 +6687,28 @@ fn buildFitnessBlock(gpa: std.mem.Allocator, b: BenchResult, protected: bool, de
         else
             std.fmt.allocPrint(gpa, "FITNESS (raise this number): last round scored {d}/{d} ({d}%, tier{d}). FAILING: {s}. Your single most valuable move is whatever raises the pass rate over MORE real assertions — fix a failing test or add the capability it checks. A 1-test 100% is weaker than a 20-test 95%, so add real tests too.", .{ b.passed, b.total, b.pct, b.tier, fails }) catch (gpa.dupe(u8, "FITNESS: scored.") catch @constCast("")),
         .no_tests => gpa.dupe(u8, "FITNESS: no test suite exists yet — the swarm has no scoreboard. Before adding features, write a runnable test_<name>.py with concrete assertions about intended behavior so progress can be measured.") catch @constCast(""),
-        .err => if (protected) (gpa.dupe(u8, "FITNESS: the protected spec (spec_test.py) could not run against your deliverable — the deliverable likely errors on import or is missing the required function. Make it import and run cleanly.") catch @constCast("")) else (gpa.dupe(u8, "FITNESS: the benchmark could not run last round — make sure the deliverable AND its test file execute cleanly (a build that doesn't run scores zero).") catch @constCast("")),
+        // a HARNESS failure is not a deliverable failure: the shell never started the check, so "make your
+        // build run cleanly" would be advice about a problem the minds do not have and cannot fix
+        .err => if (b.harness) (gpa.dupe(u8, "FITNESS: the goal's declared acceptance checks could not be EXECUTED in this environment (the shell cannot find the program they name), so nothing is scoring them. This is an environment problem, NOT a defect in your code — do not try to fix it and do not re-run it. Build the deliverable the goal describes, completely and correctly, and verify it yourself with run_python.") catch @constCast("")) else if (protected) (gpa.dupe(u8, "FITNESS: the protected spec (spec_test.py) could not run against your deliverable — the deliverable likely errors on import or is missing the required function. Make it import and run cleanly.") catch @constCast("")) else (gpa.dupe(u8, "FITNESS: the benchmark could not run last round — make sure the deliverable AND its test file execute cleanly (a build that doesn't run scores zero).") catch @constCast("")),
     };
     if (cover_lead.len == 0) return base;
     defer gpa.free(@constCast(base));
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ cover_lead, base }) catch (gpa.dupe(u8, base) catch @constCast(""));
 }
 
-/// Format a Unix timestamp (UTC) as "Wkd YYYY-MM-DD HH:MM UTC". Zig 0.16 has no strftime, so this does the
+/// Format a Unix timestamp (UTC) as "Wkd YYYY-MM-DD". Zig 0.16 has no strftime, so this does the
 /// Gregorian calendar math directly (Howard Hinnant's civil_from_days). Caller frees. This is what lets the hive
 /// know the REAL date instead of stamping its frozen training-cutoff date as "today".
+/// DATE RESOLUTION IS DELIBERATE (cache discipline). This string is rebuilt every round and injected into every
+/// mind's prompt, so at MINUTE resolution it changed on essentially every round and guaranteed a provider
+/// KV-cache break even on a round where nothing else moved — a measured contributor to the swarm's 21.6% cache
+/// hit rate against 81.1% for a chat turn on the same model/endpoint. At DATE resolution it is stable for the
+/// whole run (one break at most, if a run crosses midnight UTC), which is what lets it sit in the cached
+/// stable-prefix head of the prompt. Nothing the minds do needs the hour: the clock exists to stop them dating
+/// work with their training cutoff. If a future task genuinely needs time-of-day, add a SEPARATE field in the
+/// volatile tail rather than restoring the minute here.
 fn formatNow(gpa: std.mem.Allocator, secs: i64) []const u8 {
     const days = @divFloor(secs, 86400);
-    const sod = secs - days * 86400;
-    const hour: i64 = @divFloor(sod, 3600);
-    const minute: i64 = @divFloor(@mod(sod, 3600), 60);
     const z = days + 719468;
     const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
     const doe = z - era * 146097;
@@ -6364,7 +6721,7 @@ fn formatNow(gpa: std.mem.Allocator, secs: i64) []const u8 {
     const year = if (month <= 2) y + 1 else y;
     const wd = @mod(days + 4, 7);
     const names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    return std.fmt.allocPrint(gpa, "{s} {d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC", .{ names[@intCast(wd)], @as(u32, @intCast(year)), @as(u32, @intCast(month)), @as(u32, @intCast(day)), @as(u32, @intCast(hour)), @as(u32, @intCast(minute)) }) catch (gpa.dupe(u8, "") catch @constCast(""));
+    return std.fmt.allocPrint(gpa, "{s} {d}-{d:0>2}-{d:0>2}", .{ names[@intCast(wd)], @as(u32, @intCast(year)), @as(u32, @intCast(month)), @as(u32, @intCast(day)) }) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
 
 /// The substring from the first '{' to the last '}' — so a JSON object can be parsed even when a chatty model
@@ -7405,7 +7762,16 @@ fn fallbackReason(content: []const u8) []const u8 {
 fn completeAdaptive(w: *Worker, mi: *MindState, round: u32, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) llm.Step {
     const has_fallback = !std.mem.eql(u8, w.gateway_model, w.model) or !std.mem.eql(u8, w.gw_base, w.base_url);
 
-    if (w.resting and has_fallback) {
+    // RESTING IS FOR SMALL CALLS ONLY, and the budget test is what makes it safe now that casts carry a real
+    // gateway. Before the trio was wired through, has_fallback was false on every chat-originated cast, so
+    // this branch was inert; populating gateway_base_url/gateway_key turns it on for the first time. Without
+    // the ceiling, an 8192-token codegen MOMENT would be handed to the prompting-tier model with the full
+    // live tool schema — and the escalation guard below only catches SILENCE (ok, no content, no calls). A
+    // cheap model given a codegen moment does not go silent; it returns plausible, wrong tool calls, which
+    // escalate never sees and which then land as edits. The 1024 ceiling keeps the short monologue/classify
+    // calls resting (their intended target) and keeps every max_tokens_eff moment on the primary.
+    // This cannot be gated inside agi.restingNow — that has no view of an individual call's budget.
+    if (w.resting and has_fallback and max_tokens <= 1024) {
         var rest = llm.complete(w.gpa, w.io, w.run_dir, mi.scope, w.gw_base, w.gw_key, w.gateway_model, messages_json, tools_json, max_tokens, temperature);
         const noop = rest.ok and rest.content.len == 0 and rest.calls.len == 0;
         if (rest.ok and !noop) return rest;
@@ -7446,7 +7812,13 @@ fn rawSleep1s() void {
 
 /// Grace past the minutes budget before the watchdog hard-exits: the run loop's own deadline checks (turn +
 /// round boundary) normally stop the run first — this wall only fires when a round is WEDGED past all of them.
-const BUDGET_GRACE_S: i64 = 90;
+///
+/// TIED TO THE MAX HTTP CALL TIMEOUT, not chosen independently. The grace is sized so an in-flight call always
+/// completes and the run stops COOPERATIVELY; if it is shorter than the longest possible call, a moment that
+/// starts just before the deadline outlives the wall and takes the hard std.process.exit(3) instead. When the
+/// mind timeout went 90s -> 240s (llm.zig callTimeoutS, sized off the output budget so an 8192-token moment
+/// can actually finish), this had to move with it. Keep them equal.
+const BUDGET_GRACE_S: i64 = 240;
 
 /// Watches the emitted-event SEQ as a liveness heartbeat (std time moved under io, so no wall clock is used): if
 /// the seq doesn't advance across HANG_STALE_CHECKS consecutive ~30s checks, a subprocess has deadlocked a round,
@@ -7624,6 +7996,48 @@ pub fn copyBuild(w: *Worker, run_dir: []const u8, from_sub: []const u8, to_sub: 
         copied += 1;
     }
     return copied;
+}
+
+/// How many of the manifest's deliverable files are actually present WITH SUBSTANCE under run_dir/<sub>.
+/// The revert guard's yardstick: a snapshot may only be restored over the live tree when it is not SMALLER
+/// than what it would overwrite. Stat-only (never slurps the file) so a large deliverable is not read to
+/// decide a copy — and so a file too big for a read cap can never be miscounted as absent.
+pub fn buildFileCount(w: *Worker, run_dir: []const u8, sub: []const u8) u32 {
+    const gpa = w.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return 0;
+    defer gpa.free(mpath);
+    const data = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(128 << 10)) catch return 0;
+    defer gpa.free(data);
+    var n: u32 = 0;
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen.deinit(gpa);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
+        const path = ln[0..bar];
+        if (path.len == 0 or std.mem.indexOf(u8, path, "..") != null) continue;
+        var dup = false;
+        for (seen.items) |s| if (std.mem.eql(u8, s, path)) {
+            dup = true;
+        };
+        if (dup) continue;
+        seen.append(gpa, path) catch {};
+        const fp = std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ run_dir, sub, path }) catch continue;
+        defer gpa.free(fp);
+        const st = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch continue;
+        if (st.size > 40) n += 1;
+    }
+    return n;
+}
+
+/// DELIVERABLE MASS — how much finished work exists right now, for the rounds where the SCORE cannot say.
+/// Required-file coverage when the goal or blueprint declares a required set (recorded this round by the
+/// caller, so this costs nothing), else the number of files the swarm has actually written. It is a ranking
+/// signal only: it decides whether a new DELIVERY/ export is worth taking, never whether the run is done.
+fn deliverableMass(w: *Worker, run_dir: []const u8) u32 {
+    if (w.cov_total > 0) return w.cov_present;
+    return buildFileCount(w, run_dir, "work");
 }
 
 /// The phase clause injected into every mind next round — the swarm's self-awareness of WHERE it is on the task.
@@ -8075,6 +8489,14 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
         const same_or_stronger = cur_strength >= best_strength;
         const improved = w.best_tier == 0 and w.best_pct == 0 or rigor_increase or (same_or_stronger and (b.passed > w.best_passed or (b.passed >= w.best_passed and b.pct > w.best_pct)));
         const regressed = !rigor_increase and same_or_stronger and w.best_pct > 0 and b.pct + REGRESS_MARGIN < w.best_pct;
+        // DELIVERY MUST NOT FREEZE WHEN THE SCORE CANNOT RANK ROUNDS. `improved` can fire only ONCE on a run
+        // whose pct never leaves 0: the `best_tier == 0 and best_pct == 0` seed clause is true on round 1 and
+        // false forever after, while every later comparison is 0 against 0. In cast-355797 that froze DELIVERY/
+        // at round 1's 3 files while work/ grew to 12 — the exported "best deliverable" was a quarter of the
+        // build. When the score provably carries no ordering information (best_pct still 0, or the benchmark
+        // never executed), rank the rounds by DELIVERABLE MASS instead, so the export tracks real growth.
+        const mass = deliverableMass(w, run_dir);
+        const score_ranks = w.best_pct > 0 and !b.harness;
         if (improved) {
             w.best_pct = b.pct;
             w.best_tier = b.tier;
@@ -8083,16 +8505,39 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             w.regress_rounds = 0;
             if (same_or_stronger and copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
                 w.best_snapshot = true;
+                w.best_mass = mass;
                 writeBestManifest(w, run_dir, b.passed, b.total, b.pct, round);
             }
-        } else w.flat_rounds += 1;
+        } else {
+            w.flat_rounds += 1;
+            if (!score_ranks and mass > w.best_mass and copyBuild(w, run_dir, "work", "DELIVERY") > 0) {
+                const prev_mass = w.best_mass;
+                w.best_mass = mass;
+                w.best_snapshot = true;
+                writeBestManifest(w, run_dir, b.passed, b.total, b.pct, round);
+                w.act("engine", round, "delivery", "exported on deliverable growth", std.fmt.allocPrint(w.a(), "the score cannot rank rounds ({d}% throughout), so DELIVERY/ tracks the build instead: {d} deliverable files now, up from {d}", .{ b.pct, mass, prev_mass }) catch "delivery updated on growth");
+            }
+        }
         w.solved_rounds = if (solved) w.solved_rounds + 1 else 0;
         if (regressed) {
             w.regress_rounds += 1;
             phase = "regressed";
-            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER and copyBuild(w, run_dir, "DELIVERY", "work") > 0) {
-                restored = true;
-                w.regress_rounds = 0;
+            // A RESTORE MUST NEVER SHRINK THE BUILD. copyBuild overwrites live files with the snapshot's, so a
+            // snapshot taken when the tree was small would silently roll back every file written since. It did
+            // not fire in cast-355797 (`regressed` needs pct + margin < best_pct, unsatisfiable at best_pct 0)
+            // but it is one passing check away from firing on any run: pass once, break, and the frozen
+            // round-1 snapshot lands on a much larger tree. Guard on FILE COUNT — a revert is a revert of
+            // CONTENT, never a deletion of work.
+            if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER) {
+                const snap_n = buildFileCount(w, run_dir, "DELIVERY");
+                const live_n = buildFileCount(w, run_dir, "work");
+                if (snap_n < live_n) {
+                    w.act("engine", round, "restore_refused", "stale snapshot is smaller than the live build", std.fmt.allocPrint(w.a(), "declined to restore DELIVERY/ over work/: the snapshot holds {d} deliverable files and the live build holds {d} — restoring would discard work rather than revert a regression", .{ snap_n, live_n }) catch "restore declined: snapshot smaller than live build");
+                    w.regress_rounds = 0; // don't re-attempt the same refused restore every round
+                } else if (copyBuild(w, run_dir, "DELIVERY", "work") > 0) {
+                    restored = true;
+                    w.regress_rounds = 0;
+                }
             }
         } else {
             w.regress_rounds = 0;
