@@ -72,6 +72,20 @@ pub fn providerForBase(base_url: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Which catalog provider owns this MODEL id? Matched against each provider's declared model list, so a
+/// cast that names only a model ("deepseek-v4-flash") can resolve its provider — and therefore its stored
+/// BYOK key — without the caller having to name it. Returns null for a model no provider claims (a hand-typed
+/// or brand-new id): the caller must NOT guess a provider for it, since guessing wrong sends one provider's
+/// key to another's endpoint. Local providers are skipped — a local model needs no key and no derivation.
+pub fn providerForModel(model_id: []const u8) ?[]const u8 {
+    if (model_id.len == 0) return null;
+    for (providers) |p| {
+        if (p.local) continue;
+        for (p.models) |m| if (std.mem.eql(u8, m.id, model_id)) return p.key;
+    }
+    return null;
+}
+
 /// Host component of a URL: scheme stripped, path/query dropped, port KEPT (a different port is a
 /// different endpoint). Lowercased comparison is not needed — hosts here are catalog-authored or
 /// typed, and a case-mismatched host is better left unresolved than silently matched.
@@ -91,6 +105,15 @@ test "providerForBase matches on host, ignoring path and trailing slash" {
     try t.expect(providerForBase("http://127.0.0.1:11434/v1") == null);
     try t.expect(providerForBase("https://example.invalid/v1") == null);
     try t.expect(providerForBase("") == null);
+}
+
+test "providerForModel resolves a bare model id to its BYOK provider; unknown/empty stay null" {
+    const t = std.testing;
+    try t.expectEqualStrings("deepseek", providerForModel("deepseek-v4-flash").?);
+    try t.expectEqualStrings("openai", providerForModel("gpt-5").?);
+    // an id no provider claims must NOT be guessed — a wrong guess ships one provider's key to another
+    try t.expect(providerForModel("some-model-nobody-ships") == null);
+    try t.expect(providerForModel("") == null);
 }
 
 /// May this provider deploy WITHOUT an api key? (local endpoints, or server-side credential fallback)
