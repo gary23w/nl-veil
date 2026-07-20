@@ -230,7 +230,7 @@ const SYSTEM_PROMPT =
 /// tools.execute — the swarm minds themselves never get these (a mind can't spawn sibling swarms). Comptime
 /// concatenation (both are comptime `\\` strings), joined by a comma into the "tools":[ … ] array body.
 const ORCH_TOOLS =
-    \\{"type":"function","function":{"name":"cast","description":"Deploy a SWARM (a hive of AI minds) to work on a goal in parallel, in THIS conversation's build dir so its files co-exist with yours. Use for a big or parallelizable build/research task you want a team to carry out while you guide them. Returns a swarm id; watch it with swarm_status, guide it with steer_swarm, end it with stop_swarm.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"what the swarm should accomplish"},"minds":{"type":"integer","description":"how many minds (default 3)"},"minutes":{"type":"integer","description":"time budget (0 = server default)"},"mode":{"type":"string","enum":["cast","continuous"],"description":"cast = fast one-shot strike; continuous = sustained hive"},"files":{"type":"string","description":"declared deliverable files, comma/newline separated — adopted verbatim as the blueprint"}},"required":["goal"]}}},
+    \\{"type":"function","function":{"name":"cast","description":"Deploy a SWARM (a hive of AI minds) to work on a goal in parallel, in THIS conversation's build dir so its files co-exist with yours. Use for a big or parallelizable build/research task you want a team to carry out while you guide them. Returns a swarm id; watch it with swarm_status, guide it with steer_swarm, end it with stop_swarm.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"what the swarm should accomplish. LIVE CONTRACT: the engine parses VERIFY:/SMOKE:/PROBE: out of this text and SHELLS the rest of that line every round as the hive's acceptance score (VERIFY: build/tests, SMOKE: boot the deliverable, PROBE: health-check). The body must be a RUNNABLE command — 'VERIFY: npm test', not 'VERIFY: make the tests pass'. Never write these tokens as prose emphasis; omit them and the hive scores on goal coverage instead."},"minds":{"type":"integer","description":"how many minds (default 3)"},"minutes":{"type":"integer","description":"time budget (0 = server default)"},"mode":{"type":"string","enum":["cast","continuous"],"description":"cast = fast one-shot strike; continuous = sustained hive"},"files":{"type":"string","description":"declared deliverable files, comma/newline separated — adopted verbatim as the blueprint"}},"required":["goal"]}}},
     \\{"type":"function","function":{"name":"steer_swarm","description":"Send LIVE guidance to a RUNNING swarm — a priority directive every mind reads at its next round (course-correct, add a constraint, unblock a mind). Or pass `goal` to retarget the whole hive.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id from cast/swarm_status"},"text":{"type":"string","description":"the guidance/directive for the minds"},"goal":{"type":"string","description":"optional: a new goal to retarget the hive"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"stop_swarm","description":"Stop a running swarm (cooperative; takes effect at its next round). Its files + findings are kept.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
     \\{"type":"function","function":{"name":"swarm_status","description":"Check a swarm's state: whether it is running or finished, how many minds, and whether it has produced a result yet.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the swarm id"}},"required":["id"]}}},
@@ -2950,10 +2950,8 @@ fn awaitConvCast(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ct
 }
 
 fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, trio: ModelTrio, name: []const u8, args: []const u8, tool_client: bool) ?[]u8 {
-    // cast inherits the CODING/base model (a hive builds like the main turn); schedule_task persists the full trio.
-    const base_url = trio.coding.base_url;
-    const key = trio.coding.key;
-    const model = trio.coding.model;
+    // cast inherits the CODING/base model as its PRIMARY (a hive builds like the main turn) and the PROMPTING
+    // model as its gateway (see castTool); schedule_task persists the full trio.
 
     // ORCHESTRATION IS A CAPABILITY ESCALATION for a sandboxed caller, and casting is the sharpest edge:
     // a swarm mind runs its OWN ToolCtx (run.zig) with the full surface and patch_root pointed at the
@@ -2971,7 +2969,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
             return ctx.gpa.dupe(u8, "that is not available in this workspace — deploying swarms and scheduling runs are reserved for the server's admin, because they execute outside this conversation's sandbox.") catch null;
     }
 
-    if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, base_url, key, model, args, tool_client);
+    if (std.mem.eql(u8, name, "cast")) return castTool(app, uid, conv, conv_dir, ctrl_cursor, trio, args, tool_client);
     if (std.mem.eql(u8, name, "steer_swarm")) return steerTool(app, uid, args);
     if (std.mem.eql(u8, name, "stop_swarm")) return stopTool(app, uid, args);
     if (std.mem.eql(u8, name, "swarm_status")) return statusTool(app, uid, conv_dir, ctrl_cursor, args);
@@ -3195,8 +3193,27 @@ fn scheduleDeleteTool(app: *App, uid: u64, args: []const u8) []u8 {
 /// cast — deploy a swarm into THIS conversation's build dir, using the chat turn's own model/creds so the hive
 /// runs on the same backend the user is chatting with. Reuses deploy_service.castSwarm (the exact server cast
 /// pipeline the HTTP /cast route uses). gpa-owned result.
-fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, base_url: []const u8, key: []const u8, model: []const u8, args: []const u8, tool_client: bool) []u8 {
+///
+/// THE TRIO REACHES THE HIVE HERE. A cast used to flatten the trio to `coding` for every one of the worker's
+/// labels, so a 16-token BUILD-or-DISCOURSE classifier and a 5-token health ping billed the expensive coding
+/// model. The worker already HAS the split — its mechanical calls (classify/digest/screen/gap/rerank/retro/
+/// growth/mode/preflight) ride gw_base+gw_key+gateway_model — it was just never handed a gateway. The chat
+/// turn's `prompting` role IS that gateway: same intent (cheap, high-volume, non-reasoning), same shape.
+///
+/// Sent as a WHOLE TRIPLE, never model-only: run.zig:749-750 backfills a blank gw_base with the primary
+/// base_url, so a lone gateway_model posts the prompting model's NAME to the CODING provider's endpoint —
+/// which 404s exactly on the cross-provider trios this feature exists to serve. `pick` resolves an unset
+/// prompting role back to coding; that self-equal gateway is precisely what run.zig's has_fallback /
+/// restingNow test for, so a single-model client stays on the old no-gateway path bit for bit.
+fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cursor: usize, trio: ModelTrio, args: []const u8, tool_client: bool) []u8 {
     const gpa = app.gpa;
+    const base_url = trio.coding.base_url;
+    const key = trio.coding.key;
+    const model = trio.coding.model;
+    const gw = trio.pick(.prompting);
+    // "Distinct" by the SAME test run.zig:7406 / agi.zig:447 use to decide a fallback exists (model OR endpoint
+    // differs) — so what the manifest declares and what the worker acts on can never disagree.
+    const gw_distinct = !std.mem.eql(u8, gw.model, model) or !std.mem.eql(u8, gw.base_url, base_url);
     const A = struct { goal: []const u8 = "", minds: u32 = 3, minutes: u32 = 0, mode: []const u8 = "cast", files: []const u8 = "" };
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "cast: could not parse args JSON");
     defer p.deinit();
@@ -3233,6 +3250,16 @@ fn castTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, ctrl_cu
         .model = model,
         .api_key = key,
         .base_url = base_url,
+        // Only when the prompting role is GENUINELY distinct. An unset role resolves back to coding, and sending
+        // that self-equal triple would still be functionally inert (run.zig's has_fallback compares model+base
+        // and would see no difference) — but run.zig:751 emits a "gateway" act event on `gateway_model.len > 0`
+        // alone, so a self-equal gateway would announce a split that isn't there on every single-model cast.
+        .gateway_model = if (gw_distinct) gw.model else "",
+        .gateway_base_url = if (gw_distinct) gw.base_url else "",
+        // The gateway needs its OWN key: a cross-provider gateway authenticates against a different endpoint,
+        // and leaving it blank makes run.zig:750 substitute the literal "gateway-local" (right for a keyless
+        // local sidecar, a 401 for a hosted second provider).
+        .gateway_key = if (gw_distinct) gw.key else "",
         .style = "auto",
         .mode = a.mode,
         .dir = conv, // build in this conversation's dir so the cast + chat co-edit one tree

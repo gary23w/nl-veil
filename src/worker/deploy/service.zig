@@ -333,7 +333,12 @@ const RunReq = struct {
     name: []const u8 = "",
     api_key: []const u8 = "",
     base_url: []const u8 = "",
+    // The gateway is a FULL provider triple, never just a model name: run.zig:749-750 falls gw_base back to
+    // the primary base_url when it is blank, so a model-only gateway sends the gateway model's NAME to the
+    // PRIMARY provider's endpoint — silently broken for any cross-provider pair. Carry all three or none.
     gateway_model: []const u8 = "",
+    gateway_base_url: []const u8 = "",
+    gateway_key: []const u8 = "",
 };
 
 pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -367,6 +372,8 @@ pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .base_url = rq.base_url,
         .minutes = rq.minutes,
         .gateway_model = rq.gateway_model,
+        .gateway_base_url = rq.gateway_base_url,
+        .gateway_key = rq.gateway_key,
         .minds = minds,
     };
     const sp = switch (deploySwarm(app, res.arena, u, body, "")) {
@@ -404,7 +411,13 @@ pub const CastReq = struct {
     model: []const u8 = "",
     api_key: []const u8 = "",
     base_url: []const u8 = "",
+    // GATEWAY = the cheap/secondary provider the worker routes its MECHANICAL calls through (classify, digest,
+    // screen, gap, rerank, retro — see run.zig's gw_base/gw_key/gateway_model call sites). All three fields or
+    // none: a model-only gateway inherits the PRIMARY endpoint (run.zig:749-750) and posts the gateway model's
+    // name to the wrong provider. This is where the chat turn's `prompting` role lands on a cast.
     gateway_model: []const u8 = "",
+    gateway_base_url: []const u8 = "",
+    gateway_key: []const u8 = "",
     style: []const u8 = "auto",
     name: []const u8 = "",
     mode: []const u8 = "", // "" / "cast" = fast one-shot strike; "continuous" = a sustained long-term hivemind
@@ -510,6 +523,8 @@ pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq)
             break :blk_min @max(base, wfloor);
         },
         .gateway_model = rq.gateway_model,
+        .gateway_base_url = rq.gateway_base_url,
+        .gateway_key = rq.gateway_key,
         // DeployReq defaults already carry the cast dials: autonomy=full, internet+gap_assess on,
         // breakout/psyche off — the same posture the deploy wizard gives a research/build cast.
         // The cast MARK (both quick and continuous) makes the worker terminate at completed/graduated

@@ -295,19 +295,55 @@ fn effTokens(base_url: []const u8, model: []const u8, max_tokens: u32) u32 {
     return if (isLocal(base_url) and isThinking(model)) @max(max_tokens, LOCAL_MIN_TOKENS) else max_tokens;
 }
 
+/// WALL-CLOCK CAP for ONE call, DERIVED FROM THE OUTPUT BUDGET instead of being one constant for every caller.
+///
+/// WHY (hard-won, cast-355797): the cap was a flat 90s hosted while a mind moment's max_tokens is 8192. At any
+/// realistic hosted decode rate a call permitted 8192 output tokens CANNOT finish inside its own timeout — the
+/// deadline was structurally unsatisfiable, so the LARGEST, most valuable generations were precisely the ones
+/// guaranteed to die. Measured in that run: ~a quarter of all mind-moments died on --max-time, one of them
+/// carrying the QA lane's entire deliverable (it then failed salvage as "too short (<80 chars)"). A small call
+/// that hangs is a hung provider; a big call that takes minutes is a model doing its job. One constant cannot
+/// tell those apart, so it punished the second to catch the first.
+///
+/// The output budget is a LIVE SIGNAL already present at every call site, so nothing has to declare "I am a
+/// mind": a 5-token preflight ping keeps exactly today's 90s, an 8192-token moment gets room to emit its tokens.
+/// Only hosted calls asking for more than ~1800 output tokens change at all.
+const TIMEOUT_BASE_S: u32 = 45; // connect + provider queue + prefill on a large prompt, before a token is decoded
+const TIMEOUT_TOKENS_PER_S: u32 = 40; // deliberately PESSIMISTIC sustained decode rate — a faster provider just finishes early
+const TIMEOUT_FLOOR_HOSTED_S: u32 = 90; // the old constant, kept as a FLOOR: no call that fits today gets a shorter deadline
+const TIMEOUT_FLOOR_LOCAL_S: u32 = 240;
+/// Hard ceiling on any single call. Sized to stay clear of run.zig's hang watchdog (HANG_CHECK_S *
+/// HANG_STALE_CHECKS = 300s of no emitted event ⇒ "a subprocess deadlocked a round" + hard exit): one slow
+/// call must never be able to masquerade as a wedged run. It also equals TIMEOUT_FLOOR_LOCAL_S, so the LOCAL
+/// path is provably unchanged by this whole mechanism (floor == ceiling ⇒ always 240, exactly as before).
+const TIMEOUT_CEIL_S: u32 = 240;
+
+/// How long a STREAMED transfer may average under 1 byte/s before curl aborts it (curl --speed-time, as a
+/// literal because it only ever reaches an argv). Deliberately equal to the OLD hosted total cap: a stalled
+/// stream dies no later than it did before the cap was raised. Full rationale at the argv in streamAttempt.
+const STREAM_IDLE_ABORT_S = "90";
+
+fn callTimeoutS(local: bool, budget_tokens: u32) u32 {
+    const floor: u32 = if (local) TIMEOUT_FLOOR_LOCAL_S else TIMEOUT_FLOOR_HOSTED_S;
+    const derived: u32 = TIMEOUT_BASE_S +| (budget_tokens / TIMEOUT_TOKENS_PER_S);
+    return @min(TIMEOUT_CEIL_S, @max(floor, derived));
+}
+
 /// POST a fully-formed request body to {base_url}/chat/completions. Returns the raw response JSON (caller
 /// frees) or an error message (ok=false). The key rides in a curl config file, never on the argv. `tag`
 /// makes the scratch request/config files per-caller so concurrent minds don't clobber each other.
-fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8) Reply {
+/// `budget_tokens` is the max_tokens/num_predict THIS body asked for — it sizes the deadline (see callTimeoutS).
+/// 0 means "unknown/tiny" and yields the historical floor.
+fn post(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, body: []const u8, budget_tokens: u32) Reply {
     const url = std.fmt.allocPrint(gpa, "{s}/chat/completions", .{trimSlash(base_url)}) catch return oom(gpa);
     defer gpa.free(url);
     // HOSTED-provider pacing: honor any active per-host 429 cooldown + the optional RPM cap before sending.
     // Local backends never rate-limit, so they skip it (and keep their long, retry-free timeout).
     if (!isLocal(base_url)) rate.acquire(io, base_url);
-    return postUrl(gpa, io, run_dir, tag, url, key, body, isLocal(base_url));
+    return postUrl(gpa, io, run_dir, tag, url, key, body, isLocal(base_url), budget_tokens);
 }
 
-fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, url: []const u8, key: []const u8, body: []const u8, local: bool) Reply {
+fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, url: []const u8, key: []const u8, body: []const u8, local: bool, budget_tokens: u32) Reply {
     // Loopback plain-http (a local Ollama): in-process socket. No curl child, none of the scratch files
     // below — the key and body never touch disk or an argv on this path. Mirrors curl semantics: any HTTP
     // status with a body is returned ok=true (callers parse {"error":...} out of the JSON).
@@ -318,7 +354,7 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
             .path = if (t.path.len > 0) t.path else "/",
             .bearer = key,
             .body = body,
-            .timeout_s = if (local) 240 else 90,
+            .timeout_s = callTimeoutS(local, budget_tokens),
             .cap = 8 << 20,
         })) {
             .ok => |resp| return .{ .content = resp.body, .ok = true },
@@ -340,7 +376,17 @@ fn postUrl(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const
     defer gpa.free(data_at);
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
-    av.appendSlice(gpa, &.{ "curl", "-sS", "--max-time", if (local) "240" else "90" }) catch return oom(gpa);
+    var tt_buf: [16]u8 = undefined;
+    const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{callTimeoutS(local, budget_tokens)}) catch "90";
+    // --connect-timeout bounds the DEAD-HOST case on its own: a provider that never completes a TCP/TLS
+    // handshake now fails in 20s instead of riding the (now budget-sized) total cap to the wall. This is the
+    // only fast-fail available here — see below for why the idle detector cannot live on this path.
+    av.appendSlice(gpa, &.{ "curl", "-sS", "--connect-timeout", "20", "--max-time", tt }) catch return oom(gpa);
+    // NO --speed-limit/--speed-time HERE, deliberately. This request is NON-streaming: the provider sends zero
+    // body bytes for the entire generation and then the whole reply at once. An idle detector cannot tell that
+    // apart from a stalled socket, so arming it here would kill exactly the long, healthy generations this
+    // change exists to save — it would reintroduce the 90s wall under a different name. Idle detection is only
+    // meaningful where bytes flow continuously, i.e. the streamed path (streamAttempt), where it IS armed.
     if (!local) av.appendSlice(gpa, &.{ "--retry", "1", "--retry-delay", "1", "--retry-connrefused", "--retry-all-errors", "--retry-max-time", "3" }) catch return oom(gpa);
     av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, url }) catch return oom(gpa);
     const run = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(8 << 20) }) catch return err(gpa, "curl failed to run");
@@ -373,7 +419,7 @@ pub fn chatTemp(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     defer gpa.free(temp_frag);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, msgs.items, temp_frag, mt }) catch return oom(gpa);
     defer gpa.free(body);
-    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
+    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
@@ -402,7 +448,7 @@ pub fn visionExtract(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, ta
     const mt = effTokens(base_url, model, max_tokens);
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"max_tokens\":{d}}}", .{ model, msgs.items, mt }) catch return oom(gpa);
     defer gpa.free(body);
-    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
+    var s = completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
     defer s.deinit(gpa);
     if (!s.ok) return err(gpa, s.content);
     return .{ .content = gpa.dupe(u8, s.content) catch return oom(gpa), .ok = true };
@@ -420,7 +466,7 @@ pub fn complete(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []
     else
         std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}]{s},\"max_tokens\":{d}}}", .{ model, messages_json, temp_frag, mt }) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
-    return completeBody(gpa, io, run_dir, tag, base_url, key, model, body);
+    return completeBody(gpa, io, run_dir, tag, base_url, key, model, body, mt);
 }
 
 fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, messages_json: []const u8, tools_json: []const u8, max_tokens: u32, temperature: f32) Step {
@@ -434,7 +480,7 @@ fn completeOllamaNative(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8,
     const body = ollamaNativeBody(gpa, model, messages_json, tools_json, np, effectiveCtx(), temp_frag) catch return stepErr(gpa, "oom");
     defer gpa.free(body);
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
-    const r = postUrl(gpa, io, run_dir, tag, url, key, body, true);
+    const r = postUrl(gpa, io, run_dir, tag, url, key, body, true, np);
     const t1 = std.Io.Timestamp.now(io, .real);
     if (!r.ok) return .{ .content = r.content, .reasoning = gpa.dupe(u8, "") catch @constCast(""), .calls = &.{}, .ok = false };
     defer gpa.free(r.content);
@@ -611,7 +657,7 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
         sbody.appendSlice(gpa, "{\"model\":") catch return;
         jstr(gpa, &sbody, model) catch return;
         sbody.appendSlice(gpa, "}") catch return;
-        const sr = postUrl(gpa, io, run_dir, "probe-show", show_url, key, sbody.items, true);
+        const sr = postUrl(gpa, io, run_dir, "probe-show", show_url, key, sbody.items, true, 0); // metadata read, generates nothing
         if (sr.ok) parseShowCaps(sr.content);
         gpa.free(sr.content);
     }
@@ -658,7 +704,7 @@ pub fn probeCapabilities(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8
         msg.appendSlice(gpa, "}") catch return;
         const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":64}}}}", .{ model, msg.items }) catch return;
         defer gpa.free(body);
-        const r = postUrl(gpa, io, run_dir, "probe", chat_url, key, body, true);
+        const r = postUrl(gpa, io, run_dir, "probe", chat_url, key, body, true, 64); // matches num_predict above
         if (r.ok) {
             defer gpa.free(r.content);
             if (responseHasReasoning(r.content)) caps.reasoning = true;
@@ -777,7 +823,7 @@ fn probeHostedToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, 
     // room for a hosted reasoning model to think before the call (hidden reasoning eats the budget).
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"temperature\":0,\"max_tokens\":2048}}", .{ model, msg.items, tool_def }) catch return true;
     defer gpa.free(body);
-    const r = post(gpa, io, run_dir, "probe-native", base_url, key, body);
+    const r = post(gpa, io, run_dir, "probe-native", base_url, key, body, 2048); // matches max_tokens above
     defer gpa.free(r.content);
     if (!r.ok) return true; // transport flake ≠ text-emission evidence
     return hostedToolCallVerdict(r.content);
@@ -848,7 +894,7 @@ fn probeLargeToolCall(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, h
     // the same model alternates between a structured call and the text-emission failure).
     const body = std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"options\":{{\"num_predict\":2048,\"temperature\":0}}}}", .{ model, msg.items, tool_def }) catch return true;
     defer gpa.free(body);
-    const r = postUrl(gpa, io, run_dir, "probe-write", chat_url, key, body, true);
+    const r = postUrl(gpa, io, run_dir, "probe-write", chat_url, key, body, true, 2048); // matches num_predict above
     defer gpa.free(r.content);
     if (!r.ok) return true; // network flake ≠ parser wall
     return largeToolCallVerdict(r.content);
@@ -1008,12 +1054,14 @@ fn applyQuirk(gpa: std.mem.Allocator, body: []const u8, q: Quirk) ?[]u8 {
 
 /// On a provider error, try to heal a PARAM constraint: detect it, rewrite + retry ONCE, and learn the quirk
 /// so future requests pre-apply it. Returns the healed Step, or null when the error is not a quirk we can fix.
-fn healParamError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, err_text: []const u8) ?Step {
+fn healParamError(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, budget_tokens: u32, err_text: []const u8) ?Step {
     const q = detectQuirk(err_text) orelse return null;
     const healed = applyQuirk(gpa, body, q) orelse return null;
     defer gpa.free(healed);
     if (bodyModel(body)) |m| learnQuirk(io, m, q); // remember for every future request to this model
-    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, healed, false); // retry once, never re-heal
+    // The healed body asks for the SAME output budget (a quirk rewrite touches params, not max_tokens), so the
+    // retry keeps the original deadline — a heal must not silently shrink a large moment's timeout.
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, healed, budget_tokens, false); // retry once, never re-heal
 }
 
 /// Effective temperature for `model` after any LEARNED quirk (<0 ⇒ omit the field).
@@ -1042,19 +1090,19 @@ fn tempFragOwned(gpa: std.mem.Allocator, io: std.Io, model: []const u8, temperat
 
 /// `model` rides alongside `body` (which already carries it) purely so the usage fold can ATTRIBUTE the call:
 /// re-parsing it back out of the request JSON would be the same string by a longer road.
-fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8) Step {
-    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, body, true);
+fn completeBody(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, budget_tokens: u32) Step {
+    return completeBodyH(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, true);
 }
 
-fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, heal_ok: bool) Step {
+fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: []const u8, base_url: []const u8, key: []const u8, model: []const u8, body: []const u8, budget_tokens: u32, heal_ok: bool) Step {
     const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
-    const r = post(gpa, io, run_dir, tag, base_url, key, body);
+    const r = post(gpa, io, run_dir, tag, base_url, key, body, budget_tokens);
     const t1 = std.Io.Timestamp.now(io, .real);
     const call_ms = @divTrunc(t1.nanoseconds - t0, std.time.ns_per_ms);
     if (!r.ok) {
         // HTTP-level error (some providers return the constraint here, not in a JSON error field) — try to heal.
         if (heal_ok) {
-            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, r.content)) |s| {
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, r.content)) |s| {
                 gpa.free(r.content);
                 return s;
             }
@@ -1118,7 +1166,7 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     if (parsed.value.@"error") |e| {
         // a JSON error field (HTTP 200 with an {"error":…} body, as Kimi returns) — try to heal the constraint.
         if (heal_ok) {
-            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, e.message)) |s| return s;
+            if (healParamError(gpa, io, run_dir, tag, base_url, key, model, body, budget_tokens, e.message)) |s| return s;
         }
         return stepErr(gpa, std.fmt.allocPrint(gpa, "provider error: {s}", .{e.message}) catch "provider error");
     }
@@ -1709,16 +1757,23 @@ fn streamAttempt(
     const temp_frag = tempFragOwned(gpa, io, model, temperature); // learned-quirk aware (streamed path)
     defer gpa.free(temp_frag);
 
+    // The output budget this request actually asks for — hoisted out of the body builder because it also sizes
+    // the deadline (callTimeoutS): the streamed path must not be capped shorter than the tokens it requested.
+    const budget_tokens: u32 = if (native)
+        (if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens)
+    else
+        effTokens(base_url, model, max_tokens);
+
     const body = blk: {
         if (native) {
-            const np: u32 = if (isThinking(model)) @max(max_tokens, NATIVE_THINK_TOKENS) else max_tokens;
+            const np: u32 = budget_tokens;
             const ctxw = effectiveCtx();
             break :blk (if (tools_json.len > 0)
                 std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })
             else
                 std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })) catch return null;
         }
-        const mt = effTokens(base_url, model, max_tokens);
+        const mt = budget_tokens;
         break :blk (if (tools_json.len > 0)
             std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"stream_options\":{{\"include_usage\":true}}{s},\"max_tokens\":{d}}}", .{ model, messages_json, tools_json, temp_frag, mt })
         else
@@ -1750,13 +1805,38 @@ fn streamAttempt(
     // reaches the wire. Local backends never rate-limit. (A fallback to complete() re-paces at its own post().)
     if (!local) rate.acquire(io, base_url);
 
-    const stream_max_s: u32 = if (local) 240 else 90; // parity with post()/postUrl's --max-time
+    const stream_max_s: u32 = callTimeoutS(local, budget_tokens); // parity with post()/postUrl's --max-time
     var tt_buf: [16]u8 = undefined;
     const tt = std.fmt.bufPrint(&tt_buf, "{d}", .{stream_max_s}) catch "240";
 
-    var sink = std.Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch return null;
+    // argv is assembled BEFORE the sink is created: every failure path here is a bare `return null`, and a
+    // half-built argv must not strand an open file handle.
     // -w appends STREAM_STAT + the HTTP code after the transfer so the tail loop sees curl exit.
-    const argv: []const []const u8 = &.{ "curl", "-sS", "-N", "--connect-timeout", "20", "--max-time", tt, "-K", cfgpath, "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url };
+    //
+    // IDLE-BASED FAILURE DETECTION (--speed-limit/--speed-time) — the half that makes the raised --max-time
+    // above SAFE. --max-time is TOTAL wall clock: it cannot distinguish "the provider is decoding a large file
+    // for me" from "this socket died and nothing is coming". Raising the total cap alone would just make every
+    // genuinely hung provider hold a slot LONGER. So: abort if the transfer averages under 1 byte/s for
+    // STREAM_IDLE_ABORT_S. On an SSE/NDJSON stream a healthy generation emits deltas continuously, so any
+    // silence that long is a stall, while a slow-but-progressing generation keeps resetting the window and
+    // survives to the full budget-sized cap. The window is the OLD 90s total cap on purpose: a stalled stream
+    // now fails no later than it did before this change, and only progress buys the extra time.
+    // It is set generously rather than tightly because the first SSE byte lands only after PREFILL, which on a
+    // large prompt is itself tens of seconds of legitimate zero-byte silence.
+    // This detector exists ONLY here — see postUrl for why a non-streaming POST cannot use it.
+    //
+    // HOSTED ONLY. A LOCAL backend's first token can be minutes away through no fault of the connection: a cold
+    // Ollama loading a 20B model off disk emits nothing until the weights are resident. That silence is work,
+    // not a stall, and the local path already has a bounded 240s cap — so the detector would only ever produce
+    // false kills there.
+    var av: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer av.deinit(gpa);
+    av.appendSlice(gpa, &.{ "curl", "-sS", "-N", "--connect-timeout", "20", "--max-time", tt }) catch return null;
+    if (!local) av.appendSlice(gpa, &.{ "--speed-limit", "1", "--speed-time", STREAM_IDLE_ABORT_S }) catch return null;
+    av.appendSlice(gpa, &.{ "-K", cfgpath, "--data-binary", data_at, "-w", STREAM_STAT ++ "%{http_code}", url }) catch return null;
+    const argv: []const []const u8 = av.items;
+
+    var sink = std.Io.Dir.cwd().createFile(io, outpath, .{ .truncate = true }) catch return null;
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
