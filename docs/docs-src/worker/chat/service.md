@@ -28,7 +28,7 @@ The read handlers degrade gracefully: a missing convs root → empty list, a mis
 `postMessage` is the write door into `chat/engine.zig`. Notable behaviour:
 
 - **Kill switch first.** `VEIL_CHAT_BACKEND=0` returns `501` before auth or parsing, so a disabled backend degrades cleanly to a client's local fallback rather than erroring.
-- **Admin-only for now.** The turn hands the model the full tool surface (code-exec / host / engine self-mod) and `tools.execute` does not gate by role, so the whole turn is restricted to admins until per-role SAFE-only tool access lands. This matches local-first: the desktop is admin on localhost.
+- **Open to every authenticated user, gated per role.** `postMessage` is not admin-restricted. The dangerous half of the tool surface (code-exec / host / engine self-mod) is withheld by capability instead: a non-admin turn runs `.sandboxed`, and `tools.execute` refuses anything outside the sandbox allowlist before the tool runs, confining that user to their own `u{uid}` workspace. Admins run `.full`. Tool DELEGATION (`tool_client` on the body) is admin-only as well — delegating hands tools to a client harness instead of `tools.execute`, which would otherwise route around that gate.
 - **Body.** `{text, base_url, model, api_key, loop}` — `loop` selects the auto-loop tier (`0` off, `1` on, `2` afk); garbage degrades to `0` (never the most-expensive tier).
 - **One turn per conversation.** `tryBeginTurn` claims the per-conv slot; a racing request gets `409`. On success the handler fires the turn on a background thread and returns `202` at once with an `events_url`, so the client streams frames live via `/events` instead of blocking on the whole (possibly multi-step) turn.
 

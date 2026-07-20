@@ -24,7 +24,7 @@
 
 ## Usage Context
 
-Called by `chat/engine.zig` during a turn and by the desktop over the shared tool endpoint. The SAFE/ADMIN split is the intended seam for per-role tool gating; until that lands the chat turn is admin-only (see `chat/service.zig`).
+Called by `chat/engine.zig` during a turn and by the desktop over the shared tool endpoint. The SAFE/ADMIN split is the seam for per-role tool gating, and that gating is live: `sandboxAllowed` is the single predicate, checked at the top of `execute`, and the SAME predicate derives the trimmed schema a sandboxed caller is offered — so the advertised set and the enforced set cannot drift apart.
 
 ---
 

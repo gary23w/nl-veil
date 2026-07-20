@@ -44,11 +44,13 @@ The server also serves the bundled web control-plane UI at `/`, `/app.js`, `/sty
 
 ## Usage Context
 
-Sits at the ingress boundary. Every handler takes `*App` and the `httpz` request/response, guards with `requireUser` (and `isAdmin` where a route is admin-only, e.g. chat turns and scheduled tasks), then reads/writes under the caller's own `u{uid}` prefix — ownership is structural, not a per-request check against a registry.
+Sits at the ingress boundary. Every handler takes `*App` and the `httpz` request/response, guards with `requireUser` (and `isAdmin` where a route is admin-only — scheduled tasks and the admin console; chat turns are open to every authed user and gated by capability inside the turn instead), then reads/writes under the caller's own `u{uid}` prefix — ownership is structural, not a per-request check against a registry.
 
 ## Notable Implementation Details
 
-The server runs `httpz`'s blocking worker model with a large thread pool and `Connection: close` per response (localhost clients reconnect), so one slow synchronous spawn can't wedge admission. On a localhost bind the server mints an admin API key and drops it at `{data}/.desktop_key`, which veil-desk and the `veil` CLI read to authenticate with zero prompting.
+The server runs `httpz`'s blocking worker model with a large thread pool, so one slow synchronous spawn can't wedge admission. Keep-alive is ON — connections are reused for up to `NL_KEEPALIVE_REQUESTS` (default 200) with a 60s idle reap and a 15s request timeout — because the web client polls, and a fresh TCP handshake per poll is a cost a LAN of browsers pays continuously.
+
+The server ALWAYS mints an admin API key and drops it at `{data}/.desktop_key`, which the desk and the `veil` CLI read to authenticate with zero prompting. This used to be conditional on a localhost bind; gating it meant that turning on network access silently broke every same-machine client, so the condition was removed.
 
 ---
 
