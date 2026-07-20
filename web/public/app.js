@@ -36,6 +36,7 @@ const S = {
   stream: { text: '', reasoning: '', tools: [], status: '' },
   cursor: 0,            // events.jsonl byte offset
   poll: null,
+  healthPoll: null,     // the 8s status-chip timer; one per session, never two
   settings: null,       // filled by loadSettings() at boot
 };
 
@@ -220,6 +221,7 @@ async function loadLocalModels() {
 
 function onSignedOut() {
   stopPoll();
+  stopHealthPoll();
   S.me = null;
   S.conv = null;
   renderAuth('Signed out.', 'ok');
@@ -351,8 +353,16 @@ function enterApp(user) {
   $$('[data-tab]').forEach((b) => b.addEventListener('click', () => setTab(b.dataset.tab)));
 
   setTab(S.tab);
+  // The immediate call is per-entry: enterApp just rewrote the DOM, so the fresh
+  // status chip needs filling. The TIMER is per-session — signing out and back in
+  // used to register a second one on top of the first (nothing ever cleared it),
+  // so every logout cycle doubled the health traffic for the rest of the tab's life.
   pollHealth();
-  setInterval(pollHealth, 8000);
+  if (!S.healthPoll) S.healthPoll = setInterval(pollHealth, 8000);
+}
+
+function stopHealthPoll() {
+  if (S.healthPoll) { clearInterval(S.healthPoll); S.healthPoll = null; }
 }
 
 /** Tabs this account may actually use. The Admin tab is not merely hidden — every
@@ -379,6 +389,7 @@ function setTab(id) {
 }
 
 async function pollHealth() {
+  if (document.hidden) return;   // a backgrounded tab must not poll
   try {
     const f = await api.fleet();
     S.online = true;

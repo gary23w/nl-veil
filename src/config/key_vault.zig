@@ -97,15 +97,99 @@ pub const KeyMeta = struct {
     created: i64,
 };
 
+/// A remembered answer for one (uid, provider). `used` is the emptiness flag, NOT uid: uid 0 is the real
+/// shared-server-key namespace (chat/service.zig:30), so it can't double as a sentinel.
+const CachedResolve = struct {
+    used: bool = false,
+    uid: u64 = 0,
+    provider: []const u8 = "",
+    found: bool = false, // false = "this scope is definitively empty", cached just like a hit
+    key: []const u8 = "",
+    base_url: []const u8 = "",
+    at: i64 = 0,
+};
+
+/// resolve() reads through Neuron, and Neuron.get FORKS neuron.exe (worker/neuron/client.zig:16) — a
+/// process spawn, taken while this vault's global mutex is held. A chat turn resolves once per model role
+/// (coding/thinking/prompting), and each role can miss the user's own vault and fall through to the shared
+/// server key, so one turn paid for up to six spawns serialized behind one lock. Hence a small TTL cache.
+///
+/// The TTL is deliberately short, and it is NOT what protects a rotated key: every in-process mutation
+/// (put/putOAuth/del — the only writers of a kv_ scope) drops the affected entry immediately, so a rotation
+/// through the API or the admin routes takes effect on the next resolve. The TTL only bounds staleness
+/// against a writer we cannot observe — someone running the neuron CLI against the same db while the server
+/// is up. It also bounds how long unsealed key material sits resident in process memory.
+const RESOLVE_TTL_S: i64 = 20;
+const RESOLVE_SLOTS = 16;
+
 pub const KeyVault = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     nb: Neuron,
     server_key: [32]u8,
     mu: std.Io.Mutex = .init,
+    cache: [RESOLVE_SLOTS]CachedResolve = @splat(.{}),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, nb: Neuron, server_key: [32]u8) KeyVault {
         return .{ .gpa = gpa, .io = io, .nb = nb, .server_key = server_key };
+    }
+
+    // --- resolve cache. Every one of these runs with `mu` already held by the calling method. ---
+
+    fn cacheFree(self: *KeyVault, e: *CachedResolve) void {
+        if (!e.used) return;
+        self.gpa.free(e.provider);
+        self.gpa.free(e.key);
+        self.gpa.free(e.base_url);
+        e.* = .{};
+    }
+
+    fn cacheFind(self: *KeyVault, uid: u64, provider: []const u8) ?*CachedResolve {
+        for (&self.cache) |*e| {
+            if (e.used and e.uid == uid and std.mem.eql(u8, e.provider, provider)) return e;
+        }
+        return null;
+    }
+
+    /// Forget any remembered answer for (uid, provider). Sweeps ALL slots rather than stopping at the first
+    /// match: a single missed duplicate is a rotated key that keeps getting served, so this errs on paranoid.
+    fn cacheDrop(self: *KeyVault, uid: u64, provider: []const u8) void {
+        for (&self.cache) |*e| {
+            if (e.used and e.uid == uid and std.mem.eql(u8, e.provider, provider)) self.cacheFree(e);
+        }
+    }
+
+    /// Remember `r` (null = definitively absent) for (uid, provider). Dropping first is what keeps the
+    /// no-duplicates invariant cacheDrop relies on. On an allocation failure the entry is simply not
+    /// cached — a slow resolve is always preferable to a wrong one.
+    fn cacheStore(self: *KeyVault, uid: u64, provider: []const u8, r: ?Resolved, now: i64) void {
+        self.cacheDrop(uid, provider);
+        // Take a free slot, else evict the oldest. The live working set is a handful of (uid, provider)
+        // pairs, so a linear scan beats any index here.
+        var slot: *CachedResolve = &self.cache[0];
+        var oldest: i64 = std.math.maxInt(i64);
+        for (&self.cache) |*e| {
+            if (!e.used) {
+                slot = e;
+                break;
+            }
+            if (e.at < oldest) {
+                oldest = e.at;
+                slot = e;
+            }
+        }
+        self.cacheFree(slot);
+        const p = self.gpa.dupe(u8, provider) catch return;
+        const k = self.gpa.dupe(u8, if (r) |v| v.key else "") catch {
+            self.gpa.free(p);
+            return;
+        };
+        const b = self.gpa.dupe(u8, if (r) |v| v.base_url else "") catch {
+            self.gpa.free(p);
+            self.gpa.free(k);
+            return;
+        };
+        slot.* = .{ .used = true, .uid = uid, .provider = p, .found = r != null, .key = k, .base_url = b, .at = now };
     }
 
     fn validProvider(p: []const u8) bool {
@@ -127,6 +211,10 @@ pub const KeyVault = struct {
         if (base_url.len > 512 or !cleanValue(base_url)) return error.BadBaseUrl;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        // Invalidate on EVERY exit, not just the happy one: nb.put forgets the scope before it stores the new
+        // value, so even a failed write can have already changed what's on disk. Defers unwind LIFO, so this
+        // runs before the unlock — i.e. still under the lock, as the cache requires.
+        defer self.cacheDrop(uid, provider);
         const json = try std.fmt.allocPrint(self.gpa, "{{\"key\":\"{s}\",\"base_url\":\"{s}\",\"created\":{d}}}", .{ key, base_url, std.Io.Timestamp.now(self.io, .real).toSeconds() });
         defer self.gpa.free(json);
         const sealed = seal(self.gpa, self.io, self.server_key, json) catch return error.SealFailed;
@@ -146,6 +234,7 @@ pub const KeyVault = struct {
         if (base_url.len > 512 or !cleanValue(base_url)) return error.BadBaseUrl;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        defer self.cacheDrop(uid, provider); // OAuth refresh rotates the access token — see put()
         const json = try std.fmt.allocPrint(self.gpa, "{{\"key\":\"{s}\",\"base_url\":\"{s}\",\"created\":{d},\"refresh_token\":\"{s}\",\"expires_at\":{d},\"account_id\":\"{s}\"}}", .{ access, base_url, std.Io.Timestamp.now(self.io, .real).toSeconds(), refresh, expires_at, account_id });
         defer self.gpa.free(json);
         const sealed = seal(self.gpa, self.io, self.server_key, json) catch return error.SealFailed;
@@ -178,21 +267,47 @@ pub const KeyVault = struct {
 
     pub const Resolved = struct { key: []const u8, base_url: []const u8 };
 
+    /// The hot read: chat resolves this once per model role per turn. Served from the TTL cache above when
+    /// fresh, so the usual turn pays for one neuron.exe spawn instead of one per role. Returned strings are
+    /// always `alloc`-owned copies — the cache keeps its own, so a caller's arena can die whenever it likes.
     pub fn resolve(self: *KeyVault, uid: u64, provider: []const u8, alloc: std.mem.Allocator) ?Resolved {
         if (!validProvider(provider)) return null;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        const now = std.Io.Timestamp.now(self.io, .real).toSeconds();
+        if (self.cacheFind(uid, provider)) |e| {
+            if (now - e.at < RESOLVE_TTL_S) {
+                if (!e.found) return null;
+                return .{
+                    .key = alloc.dupe(u8, e.key) catch return null,
+                    .base_url = alloc.dupe(u8, e.base_url) catch "",
+                };
+            }
+            self.cacheFree(e);
+        }
         var sb: [80]u8 = undefined;
-        const sealed = (self.nb.get(scopeKey(uid, provider, &sb)) catch return null) orelse return null;
-        defer self.gpa.free(sealed);
-        const pt = open(self.gpa, self.server_key, std.mem.trim(u8, sealed, " \r\n\t")) orelse return null;
-        defer self.gpa.free(pt);
-        const parsed = std.json.parseFromSlice(StoredKey, self.gpa, pt, .{ .ignore_unknown_fields = true }) catch return null;
-        defer parsed.deinit();
-        return .{
-            .key = alloc.dupe(u8, parsed.value.key) catch return null,
-            .base_url = alloc.dupe(u8, parsed.value.base_url) catch "",
+        // A neuron.exe FAILURE is deliberately not cached. It means "we don't know", and remembering it as
+        // "no key" would silently downgrade every turn for the rest of the TTL. Only definitive answers —
+        // a stored key, or an empty scope — get remembered. An empty one is worth caching precisely because
+        // it's the common case: chat/service.zig:59 misses here for every user who hasn't brought a key.
+        const sealed = (self.nb.get(scopeKey(uid, provider, &sb)) catch return null) orelse {
+            self.cacheStore(uid, provider, null, now);
+            return null;
         };
+        defer self.gpa.free(sealed);
+        var out: ?Resolved = null;
+        unseal: {
+            const pt = open(self.gpa, self.server_key, std.mem.trim(u8, sealed, " \r\n\t")) orelse break :unseal;
+            defer self.gpa.free(pt);
+            const parsed = std.json.parseFromSlice(StoredKey, self.gpa, pt, .{ .ignore_unknown_fields = true }) catch break :unseal;
+            defer parsed.deinit();
+            out = .{
+                .key = alloc.dupe(u8, parsed.value.key) catch return null,
+                .base_url = alloc.dupe(u8, parsed.value.base_url) catch "",
+            };
+        }
+        self.cacheStore(uid, provider, out, now);
+        return out;
     }
 
     pub fn has(self: *KeyVault, uid: u64, provider: []const u8) bool {
@@ -209,6 +324,7 @@ pub const KeyVault = struct {
         if (!validProvider(provider)) return;
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
+        defer self.cacheDrop(uid, provider); // a revoked key must stop being served immediately, not in TTL seconds
         var sb: [80]u8 = undefined;
         self.nb.del(scopeKey(uid, provider, &sb));
     }

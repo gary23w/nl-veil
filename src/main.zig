@@ -56,6 +56,23 @@ const ASSET_JS = @embedFile("app.js");
 const ASSET_CSS = @embedFile("styles.css");
 const ASSET_MODELS = @embedFile("models.json");
 
+/// One embedded static asset plus everything prepareStatics derives from it at boot: a gzip of the body and
+/// the entity tags naming each representation. Written once before the server listens, read by every
+/// request thread after — which is the whole reason it needs no lock.
+const StaticAsset = struct {
+    body: []const u8,
+    /// null = gzip failed or did not pay; serve identity and never mention the encoding.
+    gz: ?[]const u8 = null,
+    /// Empty = tag generation failed. serveStatic must then skip conditional GET entirely (see there).
+    etag: []const u8 = "",
+    etag_gz: []const u8 = "",
+};
+
+var static_html: StaticAsset = .{ .body = ASSET_HTML };
+var static_js: StaticAsset = .{ .body = ASSET_JS };
+var static_css: StaticAsset = .{ .body = ASSET_CSS };
+var static_models: StaticAsset = .{ .body = ASSET_MODELS };
+
 const Paths = struct { home: []const u8, data: []const u8, neuron_bin: []const u8 };
 
 fn resolvePaths(gpa: std.mem.Allocator, io: std.Io) !Paths {
@@ -571,6 +588,8 @@ pub fn main(init: std.process.Init) !void {
         server.stop();
         server.deinit();
     }
+    // Before any route can be hit: gzip the embedded assets and mint their ETags once. See prepareStatics.
+    prepareStatics(gpa);
     var router = try server.router(.{});
     router.get("/", staticIndex, .{});
     router.get("/app.js", staticJs, .{});
@@ -898,22 +917,114 @@ fn fleet(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
     }, .{});
 }
 
-fn staticIndex(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+/// Compress the embedded assets ONCE, at boot, and mint their entity tags. Per-request compression would
+/// redo byte-identical work forever: the bodies are @embedFile'd, so the input provably cannot change while
+/// this process runs. Costs ~60 KiB of resident memory and a few ms of startup to take the cold-load
+/// payload from ~222 KB to ~63 KB. Nothing here is freed on purpose — it lives as long as the process does.
+///
+/// Must be called before the router is wired. Best-effort throughout: an asset that fails to compress or to
+/// get a tag simply falls back to the old behaviour (full body, no conditional GET), never to a broken one.
+fn prepareStatics(gpa: std.mem.Allocator) void {
+    var saved: usize = 0;
+    for ([_]*StaticAsset{ &static_html, &static_js, &static_css, &static_models }) |a| {
+        // The tag folds a hash of the ACTUAL BYTES in beside VERSION rather than using VERSION alone. Both
+        // halves earn their place: VERSION keeps tags from two releases visibly distinct, and the content
+        // hash means a dev rebuild that edits app.js without bumping VERSION still invalidates every
+        // client's copy. VERSION alone would hand back a 304 for a body that had changed.
+        const h = std.hash.Wyhash.hash(0, a.body);
+        const tag = std.fmt.allocPrint(gpa, "\"{s}-{x}\"", .{ VERSION, h }) catch continue;
+        // A DIFFERENT tag for the gzip. An entity tag names a representation, not a URL, so the two
+        // encodings of one file must not share one — a shared cache keyed on the tag would otherwise be
+        // free to answer an identity request out of a gzipped entry.
+        const tag_gz = std.fmt.allocPrint(gpa, "\"{s}-{x}-gz\"", .{ VERSION, h }) catch continue;
+        a.etag = tag;
+        a.etag_gz = tag_gz;
+        if (gzipAlloc(gpa, a.body)) |gz| {
+            // Only keep the compressed copy if it actually won. models.json is small enough that gzip's
+            // header and footer could in principle outweigh what it saves; shipping it then would cost the
+            // client a decompress for nothing.
+            if (gz.len < a.body.len) {
+                a.gz = gz;
+                saved += a.body.len - gz.len;
+            } else gpa.free(gz);
+        } else |e| log.warn("static assets: gzip failed ({t}) — serving this one uncompressed", .{e});
+    }
+    if (saved > 0) log.info("static assets: gzipped at boot, {d} KB off every cold load", .{saved / 1024});
+}
+
+/// gzip `src` at level 9 into a fresh allocation. Boot-time only — level 9 is the slowest setting and the
+/// right one exactly once per process.
+fn gzipAlloc(gpa: std.mem.Allocator, src: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    // Both of these are heap, not stack, and deliberately: the match window is 64 KiB and Compress itself
+    // is ~224 KiB of lookup and token tables. That is most of a Windows thread's default 1 MiB stack.
+    const window = try gpa.alloc(u8, flate.max_window_len);
+    defer gpa.free(window);
+    const c = try gpa.create(flate.Compress);
+    defer gpa.destroy(c);
+
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, src.len / 2 + 64);
+    errdefer out.deinit();
+    // init writes the gzip header straight to `out`, so `out` must outlive `c` — it does, both are locals
+    // and c is finished below before either goes away.
+    c.* = try flate.Compress.init(&out.writer, window, .gzip, .level_9);
+    try c.writer.writeAll(src);
+    try c.finish(); // emits the final block + CRC32/length footer; the stream is invalid without it
+    return try out.toOwnedSlice();
+}
+
+/// Serve one embedded asset with conditional GET and, where the client allows it, gzip.
+///
+/// The ETag is safe here for a reason worth stating plainly: these bodies are @embedFile'd, fixed at COMPILE
+/// time. There is no file on disk for anyone to edit out from under a running server, so a body can only
+/// change by way of a new binary — and a new binary hashes differently. A tag minted at boot therefore
+/// cannot go stale for as long as it is in use. That fact is what makes the whole approach sound; without
+/// it, serving 304s off a tag nobody re-derives per request would be a bug waiting on a deploy.
+fn serveStatic(req: *httpz.Request, res: *httpz.Response, a: *const StaticAsset) void {
+    // Vary on EVERY response, including the identity body and the 304. Without it an intermediary keys its
+    // cache on the URL alone and is entitled to hand a gzipped entry to a client that never asked for one
+    // and cannot decode it — a blank page with no clue as to why, and not reproducible from the server.
+    res.header("Vary", "Accept-Encoding");
+    res.header("Cache-Control", "no-cache, must-revalidate");
+
+    const ae = req.header("accept-encoding") orelse req.header("Accept-Encoding") orelse "";
+    const use_gz = a.gz != null and std.mem.indexOf(u8, ae, "gzip") != null;
+    const tag = if (use_gz) a.etag_gz else a.etag;
+
+    // Guarded on tag.len, and not as a formality: an empty tag would make the indexOf below match ANY
+    // If-None-Match (indexOf of "" is 0), so a failed allocation in prepareStatics would turn into a
+    // permanent 304 and a blank app. No tag means no conditional GET at all.
+    if (tag.len > 0) {
+        res.header("ETag", tag);
+        // If-None-Match is a comma-separated list whose members may carry a W/ prefix. A substring test
+        // handles both shapes and cannot collide here — every tag carries a 64-bit content hash.
+        if (req.header("if-none-match") orelse req.header("If-None-Match")) |inm| {
+            if (std.mem.indexOf(u8, inm, tag) != null) {
+                res.status = 304;
+                res.body = ""; // a 304 carries no body, and notably no Content-Encoding either
+                return;
+            }
+        }
+    }
+    if (use_gz) {
+        res.header("Content-Encoding", "gzip");
+        res.body = a.gz.?;
+    } else res.body = a.body;
+}
+
+fn staticIndex(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .HTML;
-    res.header("Cache-Control", "no-cache, must-revalidate");
-    res.body = ASSET_HTML;
+    serveStatic(req, res, &static_html);
 }
-fn staticJs(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+fn staticJs(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .JS;
-    res.header("Cache-Control", "no-cache, must-revalidate");
-    res.body = ASSET_JS;
+    serveStatic(req, res, &static_js);
 }
-fn staticCss(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+fn staticCss(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .CSS;
-    res.header("Cache-Control", "no-cache, must-revalidate");
-    res.body = ASSET_CSS;
+    serveStatic(req, res, &static_css);
 }
-fn staticModels(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+fn staticModels(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .JSON;
-    res.body = ASSET_MODELS;
+    serveStatic(req, res, &static_models);
 }
