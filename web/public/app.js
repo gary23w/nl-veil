@@ -1093,10 +1093,14 @@ function renderLive(host) {
   if (!live) {
     live = document.createElement('div');
     live.className = 'msg assistant live';
+    // Status and tools sit BELOW the answer, not above it. Above, they scroll out
+    // of view the moment a reply runs long — the reader is pinned to the bottom
+    // watching text arrive, and the one thing they want to know ("is it still
+    // working, and on what?") had drifted off the top of the screen.
     live.innerHTML = '<div class="msg-role">veil <span class="live-dot"></span></div>'
-      + '<div class="host-activity"></div>'
+      + '<div class="msg-body"></div>'
       + '<div class="tools"></div>'
-      + '<div class="msg-body"></div>';
+      + '<div class="host-activity"></div>';
     host.appendChild(live);
   }
 
@@ -2893,7 +2897,19 @@ function mdRender(src) {
       out.push('<blockquote>' + parts.join('<br>') + '</blockquote>');
       continue;
     }
-    if (!tl) { closeLists(); i++; continue; } // blank line closes any open list and ends the paragraph
+    if (!tl) {
+      // A blank line ends a PARAGRAPH, but between two list items it does not end
+      // the LIST — that is a "loose" list, and it is what a model writes when the
+      // items are more than a few words. Closing on the blank line started a fresh
+      // <ol> per item, so "1. 2. 3." rendered as "1. 1. 1.". Only close when what
+      // follows is genuinely not another item.
+      var k = i + 1;
+      while (k < lines.length && !lines[k].trim()) k++;
+      const continues = k < lines.length && stack.length > 0 && mdIsItem(lines[k].trim());
+      if (!continues) closeLists();
+      i++;
+      continue;
+    }
 
     // list item: bullet, task or ordered, with indent-based nesting
     if (mdIsItem(tl)) {
