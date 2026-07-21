@@ -45,7 +45,7 @@ pub const App = struct {
     // a pointer so a reload is an atomic swap: a turn that captured the old pointer keeps reading a valid
     // registry rather than one being mutated underfoot. Built by admin_service.buildRegistry — the one place
     // that knows the recipe dir and the built-in-name predicate the loader needs.
-    // recipes: *recipes.Registry,
+    recipes: *recipes.Registry,
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
     // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all

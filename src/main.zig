@@ -33,6 +33,7 @@ const cf_oauth = @import("config/cf_oauth.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
+const tools = @import("worker/tools.zig");
 const deps = @import("worker/deps.zig");
 const cli = @import("cli.zig");
 const build_options = @import("build_options");
@@ -543,28 +544,18 @@ pub fn main(init: std.process.Init) !void {
     // sets it from the web UI and it persists, so a stale launch script cannot undo them on restart.
     var server_cfg = server_config.ServerConfig.init(gpa, io, paths.data);
 
-    // pub const Registry = struct {
-    //     arena: std.heap.ArenaAllocator,
-    //     recipes: []Recipe = &.{},
+    // Recipes are immutable once loaded. The admin API writes them to {data}/tools; a service restart picks up
+    // the new registry, keeping every in-flight turn's borrowed recipe pointers stable.
+    const recipe_dir = try std.fmt.allocPrint(gpa, "{s}/tools", .{paths.data});
+    defer gpa.free(recipe_dir);
+    const recipe_registry = try gpa.create(recipes.Registry);
+    recipe_registry.* = recipes.loadDir(gpa, io, recipe_dir, &tools.isBuiltinTool);
+    defer {
+        recipe_registry.deinit();
+        gpa.destroy(recipe_registry);
+    }
 
-    //     pub fn deinit(self: *Registry) void {
-    //         self.arena.deinit();
-    //     }
-
-    //     pub fn count(self: *const Registry) usize {
-    //         return self.recipes.len;
-    //     }
-
-    //     /// The recipe named `name`, or null. Pointer is arena-stable for the Registry's lifetime.
-    //     pub fn get(self: *const Registry, name: []const u8) ?*const Recipe {
-    //         for (self.recipes) |*r| {
-    //             if (std.mem.eql(u8, r.name, name)) return r;
-    //         }
-    //         return null;
-    //     }
-    // };
-
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -678,6 +669,8 @@ pub fn main(init: std.process.Init) !void {
     router.delete("/api/v1/swarms/:id", deploy_service.swarmDelete, .{});
     router.post("/api/v1/billing/checkout", billing_seam.billingCheckout, .{});
     router.get("/api/v1/admin/users", admin_service.adminUsers, .{});
+    router.get("/api/v1/admin/recipes", admin_service.adminRecipes, .{});
+    router.post("/api/v1/admin/users/:uid/recipes/:name", admin_service.adminSetRecipeGrant, .{});
     router.post("/api/v1/admin/billing", deploy_service.adminBilling, .{});
     router.post("/api/v1/admin/users/moderate", admin_service.adminModerate, .{});
     // Registration defaults CLOSED, which is right for a LAN box but left no way to onboard anyone.

@@ -6,11 +6,6 @@ const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
 const chat_service = @import("../worker/chat/service.zig");
 const server_config = @import("../config/server_config.zig");
-const recipes = @import("../worker/recipes.zig");
-// The tool module owns the two authoritative name predicates a recipe is validated against: isBuiltinTool (a
-// recipe may never shadow a built-in — I1) and sandboxAllowed (a step tool refused for non-admin grantees —
-// I4/I7). We consult those SAME predicates rather than keeping a second list that would drift out of step.
-const tools = @import("../worker/tools.zig");
 const App = http.App;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;
@@ -32,6 +27,29 @@ pub fn adminUsers(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     try arr.appendSlice(app.gpa, "]}");
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, arr.items);
+}
+
+/// GET /api/v1/admin/recipes — the immutable registry currently available to chat turns.
+pub fn adminRecipes(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = requireAdmin(app, req, res) orelse return;
+    try res.json(.{ .recipes = app.recipes.recipes }, .{});
+}
+
+const RecipeGrantReq = struct { granted: bool };
+
+/// POST /api/v1/admin/users/:uid/recipes/:name — grant/revoke one already-loaded recipe.
+/// The name must resolve in the registry; stale grants therefore cannot turn an arbitrary string into a tool.
+pub fn adminSetRecipeGrant(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const admin = requireAdmin(app, req, res) orelse return;
+    const uid_s = req.param("uid") orelse return badReq(res, "no uid");
+    const uid = std.fmt.parseInt(u64, uid_s, 10) catch return badReq(res, "uid must be a number");
+    const name = req.param("name") orelse return badReq(res, "no recipe name");
+    _ = app.recipes.get(name) orelse return notFound(res);
+    const target = app.auth.userById(uid) orelse return notFound(res);
+    const body = (try req.json(RecipeGrantReq)) orelse return badReq(res, "bad body");
+    _ = app.auth.setToolGrant(target.email, name, body.granted);
+    app.audit.record(admin.email, if (body.granted) "grant_recipe" else "revoke_recipe", name);
+    try res.json(.{ .ok = true, .uid = uid, .name = name, .granted = body.granted }, .{});
 }
 
 const ConfigReq = struct {
@@ -207,6 +225,11 @@ pub fn adminUserActivity(app: *App, req: *httpz.Request, res: *httpz.Response) !
         }
     } else |_| {}
 
+    try arr.appendSlice(app.gpa, "],\"tool_grants\":[");
+    for (target.tool_grants, 0..) |grant, i| {
+        if (i > 0) try arr.append(app.gpa, ',');
+        try http.jstr(app.gpa, &arr, grant);
+    }
     try arr.appendSlice(app.gpa, "]}");
     // Reading another account's activity is itself an administrative act, so it is logged as one.
     app.audit.record(admin.email, "read_activity", target.email);

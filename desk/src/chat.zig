@@ -115,6 +115,8 @@ const SYSTEM_REST =
     "Then STOP. I run it and reply with a [tool:<name>] message containing the result; read that and either " ++
     "run another TOOL (with its own why-sentence) or give your final answer. Never put MORE than one TOOL " ++
     "line in a reply, and never put anything after the TOOL line.\n" ++
+    "Administrator-granted recipe tools can also be called by their exact name with their declared JSON inputs; " ++
+    "the server accepts only recipes granted to this account.\n" ++
     "Available tools:\n" ++
     "- list_swarms {}  — the swarms currently running (id, name, model, state).\n" ++
     "- stop_swarm {}  — ask the current (or {\"id\":\"<id>\"}) cast to stop COOPERATIVELY (takes effect at its next turn).\n" ++

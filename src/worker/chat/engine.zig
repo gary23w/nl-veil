@@ -285,22 +285,22 @@ const TURN_TOOLS_SANDBOXED = blk: {
 ///
 /// REQUIRES `app.recipes: ?*recipes.Registry` — the loaded recipe registry, owned/reloaded by the admin route
 /// (a file this agent does not own). Null-safe: absent ⇒ no grants. See the run-report for the exact contract.
-// fn resolveGrants(app: *App, uid: u64, is_admin: bool, gpa: std.mem.Allocator) []const *const recipes.Recipe {
-//     const reg = app.recipes orelse return &.{};
-//     if (reg.count() == 0) return &.{};
-//     var list: std.ArrayListUnmanaged(*const recipes.Recipe) = .empty;
-//     if (is_admin) {
-//         for (reg.recipes) |*r| list.append(gpa, r) catch {};
-//     } else {
-//         // Snapshot the user once and match the registry against tool_grants. hasToolGrant walks the snapshot's
-//         // grant slice (a free fn — no lock), matching how every other field is read off a userById snapshot.
-//         const u = app.auth.userById(uid) orelse return &.{};
-//         for (reg.recipes) |*r| {
-//             if (http.Auth.hasToolGrant(u, r.name)) list.append(gpa, r) catch {};
-//         }
-//     }
-//     return list.toOwnedSlice(gpa) catch &.{};
-// }
+fn resolveGrants(app: *App, uid: u64, is_admin: bool, gpa: std.mem.Allocator) []const *const recipes.Recipe {
+    const reg = app.recipes;
+    if (reg.count() == 0) return &.{};
+    var list: std.ArrayListUnmanaged(*const recipes.Recipe) = .empty;
+    if (is_admin) {
+        for (reg.recipes) |*r| list.append(gpa, r) catch {};
+    } else {
+        // Snapshot the user once and match the registry against tool_grants. hasToolGrant walks the snapshot's
+        // grant slice (a free fn — no lock), matching how every other field is read off a userById snapshot.
+        const u = app.auth.userById(uid) orelse return &.{};
+        for (reg.recipes) |*r| {
+            if (http.Auth.hasToolGrant(u, r.name)) list.append(gpa, r) catch {};
+        }
+    }
+    return list.toOwnedSlice(gpa) catch &.{};
+}
 
 /// This turn's tools array with the granted recipes' schemas appended (I6/schema advertising). Built ONCE per
 /// turn: the base is the caller's static TURN_TOOLS variant (chosen by CAPS and nothing else), then each
@@ -807,9 +807,8 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // caller ⇒ the registry ∩ their tool_grants. Empty (feature inert) until the admin route wires app.recipes.
     // execute()/runRecipe read ctx.grants to route a granted name through the recipe dispatch as DATA.
 
-    // TODO: learn what claude was doing....
-    // ctx.grants = resolveGrants(app, uid, is_admin, gpa);
-    // defer gpa.free(ctx.grants);
+    ctx.grants = resolveGrants(app, uid, is_admin, gpa);
+    defer gpa.free(ctx.grants);
 
     // The tools array this turn advertises: the caller's static CAPS variant plus each granted recipe's schema,
     // built ONCE (byte-identical across the turn's inferences → prefix-cache safe) and threaded into

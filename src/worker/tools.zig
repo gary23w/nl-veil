@@ -1616,7 +1616,9 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 
 /// True if `n` is a built-in tool name. execute() checks built-ins FIRST and make_tool rejects these names, so
 /// an authored tool can never shadow/hijack a built-in (e.g. run_python, write_file, make_tool).
-fn isBuiltinTool(n: []const u8) bool {
+/// Whether a name is reserved by the built-in dispatcher. Kept public so the recipe loader and
+/// authoring routes share this exact collision guard rather than carrying a stale second list.
+pub fn isBuiltinTool(n: []const u8) bool {
     const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "browser_navigate", "browser_read", "browser_click", "browser_type", "browser_eval", "browser_close", "pixel_ingest", "pixel_capture", "pixel_search", "mcp_discover", "mcp_call" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     return false;
