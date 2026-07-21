@@ -6,6 +6,11 @@ const http = @import("../gateway/http.zig");
 const ent = @import("../plan/entitlements.zig");
 const chat_service = @import("../worker/chat/service.zig");
 const server_config = @import("../config/server_config.zig");
+const recipes = @import("../worker/recipes.zig");
+// The tool module owns the two authoritative name predicates a recipe is validated against: isBuiltinTool (a
+// recipe may never shadow a built-in — I1) and sandboxAllowed (a step tool refused for non-admin grantees —
+// I4/I7). We consult those SAME predicates rather than keeping a second list that would drift out of step.
+const tools = @import("../worker/tools.zig");
 const App = http.App;
 const requireAdmin = http.requireAdmin;
 const badReq = http.badReq;

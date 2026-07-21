@@ -17,6 +17,7 @@ const browser_host = @import("browser/host.zig");
 const mcp_discovery = @import("mcp/discovery.zig");
 const pixelrag = @import("pixelrag.zig");
 const deps = @import("deps.zig");
+const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
 /// params)` helper that POSTs to the loopback broker so an INVENTED tool can compose the browser primitives
@@ -323,6 +324,18 @@ pub const ToolCtx = struct {
     // by the CHAT surfaces (the veil acting as the user). Empty everywhere else: a swarm mind structurally
     // cannot fetch user credentials, matching the no-creds-in-hive egress design.
     durable_path: []const u8 = "",
+    // GRANTED RECIPES (I3): the per-turn resolved list of recipe tools THIS caller may run — for a sandboxed
+    // caller the registry ∩ the user's tool_grants, for an admin the whole registry (resolved ONCE per turn in
+    // engine.zig, so it is turn-stable and advertising these schemas doesn't vary with message content →
+    // prefix-cache safe). A recipe is DATA: grantedRecipe() only routes a granted name through runRecipe as a
+    // data recipe — it NEVER widens sandboxAllowed, and every step re-hits the top gate under THESE caps (I4),
+    // so a granted recipe can never do more than the caller could by hand. Defaulted empty so every non-chat
+    // construction site (swarm minds, CLI, exec-tool, desk) is untouched: no grants ⇒ the feature is inert.
+    grants: []const *const recipes.Recipe = &.{},
+    // Recipe recursion depth. A recipe step may not name another recipe (refused at run time, I5), so this is
+    // 0 or 1 in practice; it is a belt-and-braces backstop against any future path that could re-enter
+    // runRecipe, guaranteeing one level only regardless of how the step was reached.
+    recipe_depth: u8 = 0,
 };
 
 fn lockFiles(ctx: *ToolCtx) void {
@@ -912,14 +925,31 @@ pub const OPERATE_SCHEMA =
     \\{"type":"function","function":{"name":"set_directive","description":"IMPROVE HOW YOUR SWARM OPERATES. Write one concise imperative process rule into the swarm's shared, self-authored operating PLAYBOOK — injected into every mind's instructions from now on (e.g. 'confirm a target is hostile before any destructive action', 'remove the persistence before killing the process'). This is how the swarm improves its own operating method over time. Don't repeat a directive already in the playbook.","parameters":{"type":"object","properties":{"directive":{"type":"string","description":"one concise imperative process rule for the swarm to follow"}},"required":["directive"]}}}
 ;
 
+/// The sandbox gate's refusal, shared so runRecipe can DETECT it verbatim (a step that hit the gate) and
+/// surface WHY to the model, rather than string-matching a copy that could drift out of step.
+const SANDBOX_REFUSAL = "that tool is not available in this workspace — you are working inside this conversation's own directory. Files, research, and memory are available; running code, reaching the host, and driving a browser are not.";
+
+/// The granted recipe named `name`, or null. Scans ctx.grants — the per-turn resolved allowlist of recipes
+/// THIS caller may run (I2). A name is treated as a recipe ONLY when it is in grants, so a sandboxed caller
+/// can never run a recipe they were not granted, and this never widens sandboxAllowed: it only decides HOW a
+/// permitted name runs (as a data recipe), never WHETHER the gate refuses a name.
+fn grantedRecipe(ctx: *ToolCtx, name: []const u8) ?*const recipes.Recipe {
+    for (ctx.grants) |r| if (std.mem.eql(u8, r.name, name)) return r;
+    return null;
+}
+
 /// Run one tool. `args_json` is the raw arguments string from the tool_call. Returns a gpa-owned result
 /// (caller frees) — always a string, even on error, so it can feed back to the model.
 pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
-    // THE SANDBOX GATE. First thing in the dispatcher, before any tool-specific
-    // logic, so there is exactly one place a capability decision is made.
-    if (ctx.caps == .sandboxed and !sandboxAllowed(name))
-        return dupe(gpa, "that tool is not available in this workspace — you are working inside this conversation's own directory. Files, research, and memory are available; running code, reaching the host, and driving a browser are not.");
+    // THE SANDBOX GATE. First thing in the dispatcher, before any tool-specific logic, so there is exactly one
+    // place a capability decision is made. A sandboxed caller passes a name iff it is on the built-in sandbox
+    // allowlist OR it is a recipe THIS caller was granted (I2). grantedRecipe does NOT widen sandboxAllowed —
+    // sandboxAllowed() is unchanged; a granted name is merely allowed to reach the recipe DISPATCH below, whose
+    // steps each re-hit THIS gate under these same caps (I4). So a grant controls HOW a tool runs (a data
+    // recipe through the gate), never WHETHER the gate refuses a name — the whole safety property of the feature.
+    if (ctx.caps == .sandboxed and !sandboxAllowed(name) and grantedRecipe(ctx, name) == null)
+        return dupe(gpa, SANDBOX_REFUSAL);
     if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
         std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
@@ -1283,11 +1313,113 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         ctx.tools_made.* += 1;
         return std.fmt.allocPrint(gpa, "tool '{s}' registered — every mind can call it by name from next moment (and you can call it now)", .{nm}) catch dupe(gpa, "registered");
     }
+    // RECIPE DISPATCH (I1). A granted recipe is DATA — a sequence of steps over tools the caller is already
+    // allowed to run. It is matched HERE, AFTER every built-in check above (a recipe name can never collide
+    // with a built-in — recipes.loadDir refuses such a name at load) and BEFORE the runAuthored fallthrough
+    // below, and it RETURNS. So a recipe name can NEVER fall through to authoredBody/runAuthored and execute
+    // host Python: built-ins return first, this branch returns next, and for an admin ctx.grants is the whole
+    // registry (so every registry recipe is caught here), while a sandboxed caller's ungranted recipe was
+    // already refused by the gate above. This ordering is the make_tool-authored-name collision guard (I1):
+    // a recipe can neither shadow nor be shadowed by an authored body.
+    if (grantedRecipe(ctx, name)) |rec| return runRecipe(ctx, rec, args_json);
     if (authoredBody(ctx, name)) |body| {
         defer gpa.free(body);
         return runAuthored(ctx, name, body, args_json);
     }
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name}) catch dupe(gpa, "unknown tool");
+}
+
+/// Run a granted recipe (I4/I5/I6): DATA, never host code. Each step is dispatched by RECURSIVELY calling
+/// execute() with the step's substituted args, so every step re-hits the ONE sandbox gate under THIS caller's
+/// OWN caps — an admin-authored `run_python` step is refused the instant a sandboxed grantee runs it, and that
+/// refusal is SURFACED (naming the step) rather than swallowed, so the model sees WHY. Returns the `output`
+/// step's result (or the last step's). gpa-owned result (caller frees), always a string, even on error.
+fn runRecipe(ctx: *ToolCtx, rec: *const recipes.Recipe, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+
+    // DEPTH BACKSTOP (I5). A recipe step naming another recipe is refused below, so a recipe never re-enters
+    // this function by design; this guards the entry regardless, keeping one level only even if that check is
+    // ever bypassed on some future path (unbounded recursion can't happen).
+    if (ctx.recipe_depth > 0)
+        return dupe(gpa, "recipe error: a recipe step may not run another recipe (no recipe-calls-recipe)");
+    ctx.recipe_depth += 1;
+    defer ctx.recipe_depth -= 1;
+
+    // Belt-and-braces step cap (loadDir already enforces MAX_STEPS at load; this backstops a Recipe reaching
+    // here by any other route).
+    if (rec.steps.len > recipes.MAX_STEPS)
+        return dupe(gpa, "recipe error: too many steps");
+
+    // Scratch arena for the call's PARAM bindings — the coerced-to-string input values live here for the whole
+    // step loop and are dropped in one shot. {{paramName}} → the call's arg; only the recipe's DECLARED params
+    // are read (unknown args ignored), a missing arg binds empty (substitute tolerates it). A non-string arg is
+    // compact-stringified so {{count}} → "5"; substitute JSON-escapes each value on splice (I6), so a hostile
+    // value can never break a step's args JSON or inject a new arg.
+    var scratch = std.heap.ArenaAllocator.init(gpa);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+    var params_kv: std.ArrayListUnmanaged(recipes.Binding) = .empty;
+    {
+        const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
+        if (std.json.parseFromSlice(std.json.Value, gpa, aj, .{ .ignore_unknown_fields = true })) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                for (rec.params) |param| {
+                    const v = parsed.value.object.get(param.name) orelse continue;
+                    const val: []const u8 = switch (v) {
+                        .string => |s| sa.dupe(u8, s) catch continue,
+                        else => std.json.Stringify.valueAlloc(sa, v, .{}) catch continue,
+                    };
+                    // param.name points into the registry arena (stable for the turn) — borrow it, don't dupe.
+                    params_kv.append(sa, .{ .name = param.name, .value = val }) catch {};
+                }
+            }
+        } else |_| {}
+    }
+
+    // Prior step results: {{stepId}} → that step's result string. Each result is gpa-owned (execute returns
+    // gpa-owned); we hold them here and free them all at the end. The binding NAME is the step id (registry
+    // arena, stable). The output copy is taken BEFORE these frees run, so the return value is independent.
+    var results_kv: std.ArrayListUnmanaged(recipes.Binding) = .empty;
+    defer {
+        for (results_kv.items) |b| gpa.free(b.value);
+        results_kv.deinit(gpa);
+    }
+
+    for (rec.steps) |step| {
+        // I5: a step tool that is itself a granted recipe is REFUSED at run time — no recipe-calls-recipe. This
+        // fires BEFORE execute(), so the recursion never re-enters runRecipe through the recipe dispatch branch.
+        if (grantedRecipe(ctx, step.tool) != null)
+            return std.fmt.allocPrint(gpa, "recipe error: step '{s}' calls recipe '{s}' — a recipe step may not run another recipe (no recipe-calls-recipe)", .{ step.id, step.tool }) catch dupe(gpa, "recipe error: no recipe-calls-recipe");
+
+        const step_args = recipes.substitute(gpa, step.args_json, params_kv.items, results_kv.items);
+        defer gpa.free(step_args);
+
+        // THE SAFETY PROPERTY (I4): dispatch the step RECURSIVELY through the SAME top gate under THIS caller's
+        // OWN caps — exactly as if the model had called step.tool directly. A step the caller isn't allowed to
+        // run hits the gate's refusal here; nothing about being inside a recipe grants extra capability.
+        const res = execute(ctx, step.tool, step_args);
+
+        // The gate refused this step (e.g. a sandboxed grantee reached an admin-authored run_python step): STOP
+        // and surface WHY, naming the step, instead of splicing the refusal string into a later step's args.
+        if (std.mem.eql(u8, res, SANDBOX_REFUSAL)) {
+            gpa.free(res);
+            return std.fmt.allocPrint(gpa, "recipe stopped at step '{s}': tool '{s}' is not available in this workspace (refused for this user — a recipe can never grant a tool the caller lacks). {s}", .{ step.id, step.tool, SANDBOX_REFUSAL }) catch dupe(gpa, SANDBOX_REFUSAL);
+        }
+
+        // Transfer ownership of the gpa-owned result into the results list (freed in the defer above).
+        results_kv.append(gpa, .{ .name = step.id, .value = res }) catch {
+            gpa.free(res); // couldn't record it — don't leak it
+        };
+    }
+
+    // Return the `output` step's result (authored output, else the last step). Copy it out before the deferred
+    // frees reclaim the stored results.
+    const out_id = rec.outputStepId();
+    for (results_kv.items) |b| {
+        if (std.mem.eql(u8, b.name, out_id)) return dupe(gpa, b.value);
+    }
+    return dupe(gpa, "(recipe produced no output)");
 }
 
 /// May this caller drive the web browser?

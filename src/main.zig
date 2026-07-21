@@ -37,6 +37,8 @@ const deps = @import("worker/deps.zig");
 const cli = @import("cli.zig");
 const build_options = @import("build_options");
 
+const recipes = @import("worker/recipes.zig");
+
 /// Whether the desktop GUI is compiled into this binary (`-Dapp`, default true). False = the server-only
 /// build: no raylib, no GL/X11, and no `desk` module in the graph at all — hence the comptime branch, which
 /// keeps @import("desk") out of the server-only compilation entirely.
@@ -540,7 +542,27 @@ pub fn main(init: std.process.Init) !void {
     // Admin-owned runtime settings. The env vars seed it on a fresh install; after that the admin
     // sets it from the web UI and it persists, so a stale launch script cannot undo them on restart.
     var server_cfg = server_config.ServerConfig.init(gpa, io, paths.data);
-    server_cfg.load(init.environ_map);
+
+    // pub const Registry = struct {
+    //     arena: std.heap.ArenaAllocator,
+    //     recipes: []Recipe = &.{},
+
+    //     pub fn deinit(self: *Registry) void {
+    //         self.arena.deinit();
+    //     }
+
+    //     pub fn count(self: *const Registry) usize {
+    //         return self.recipes.len;
+    //     }
+
+    //     /// The recipe named `name`, or null. Pointer is arena-stable for the Registry's lifetime.
+    //     pub fn get(self: *const Registry, name: []const u8) ?*const Recipe {
+    //         for (self.recipes) |*r| {
+    //             if (std.mem.eql(u8, r.name, name)) return r;
+    //         }
+    //         return null;
+    //     }
+    // };
 
     var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
@@ -800,8 +822,7 @@ fn writeAdminPassword(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, 
     var pb: [700]u8 = undefined;
     const path = std.fmt.bufPrint(&pb, "{s}/admin-password.txt", .{data_dir}) catch return;
     var body: [256]u8 = undefined;
-    const text = std.fmt.bufPrint(&body,
-        "admin password: {s}\n\n" ++
+    const text = std.fmt.bufPrint(&body, "admin password: {s}\n\n" ++
         "Generated because NL_ADMIN_PASSWORD was not set and this server is reachable\n" ++
         "on the network. Set NL_ADMIN_PASSWORD to choose your own.\n", .{pw}) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text }) catch {};
