@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const session = @import("session.zig");
+const launch = @import("launch.zig");
 const Session = session.Session;
 
 const log = std.log.scoped(.browser);
@@ -565,21 +566,21 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
 
     if (std.mem.eql(u8, action, "navigate")) {
         const url = pStr(p, "url") orelse return errJson(gpa, "need url");
-        return navigate(gpa, io, env, key, url) catch |e| errJson(gpa, @errorName(e));
+        return navigate(gpa, io, env, key, url) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "read")) {
-        return read(gpa, io, env, key) catch |e| errJson(gpa, @errorName(e));
+        return read(gpa, io, env, key) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "pagetext")) {
         const max: usize = if (pInt(p, "max")) |m| @intCast(@max(0, m)) else 4000;
-        return pageText(gpa, io, env, key, max) catch |e| errJson(gpa, @errorName(e));
+        return pageText(gpa, io, env, key, max) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "click")) {
         const ref = pInt(p, "ref") orelse return errJson(gpa, "need ref");
-        return click(gpa, io, env, key, @intCast(@max(0, ref))) catch |e| errJson(gpa, @errorName(e));
+        return click(gpa, io, env, key, @intCast(@max(0, ref))) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "type")) {
         const ref = pInt(p, "ref") orelse return errJson(gpa, "need ref");
-        return typeText(gpa, io, env, key, @intCast(@max(0, ref)), pStr(p, "text") orelse "", pBool(p, "submit")) catch |e| errJson(gpa, @errorName(e));
+        return typeText(gpa, io, env, key, @intCast(@max(0, ref)), pStr(p, "text") orelse "", pBool(p, "submit")) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "eval")) {
         const js = pStr(p, "js") orelse return errJson(gpa, "need js");
-        return eval(gpa, io, env, key, js) catch |e| errJson(gpa, @errorName(e));
+        return eval(gpa, io, env, key, js) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "close")) {
         return closeKey(gpa, io, key);
     } else if (std.mem.eql(u8, action, "rendertiles")) {
@@ -599,7 +600,7 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
 /// band text so a CLIENT-side pixel_ingest (running in a short-lived exec-tool subprocess) can get tiles from
 /// the persistent daemon browser and do the indexing itself. gpa-owned JSON.
 fn renderTilesJson(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, url: []const u8, tile_h: i64, max_tiles: u32) []u8 {
-    const tiles = renderTiles(gpa, io, env, key, url, tile_h, max_tiles) catch |e| return errJson(gpa, @errorName(e));
+    const tiles = renderTiles(gpa, io, env, key, url, tile_h, max_tiles) catch |e| return errJson(gpa, launch.errText(e));
     defer freeTiles(gpa, tiles);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);
@@ -624,7 +625,7 @@ fn renderTilesJson(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.E
 /// no navigation — and return the live URL + each tile as base64 PNG + band text, so a client-side capture
 /// (short-lived exec-tool subprocess) snapshots the persistent daemon browser's real state. gpa-owned JSON.
 fn renderTilesCurrentJson(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, tile_h: i64, max_tiles: u32) []u8 {
-    const snap = renderTilesCurrent(gpa, io, env, key, tile_h, max_tiles) catch |e| return errJson(gpa, @errorName(e));
+    const snap = renderTilesCurrent(gpa, io, env, key, tile_h, max_tiles) catch |e| return errJson(gpa, launch.errText(e));
     defer freeSnapshot(gpa, snap);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(gpa);

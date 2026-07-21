@@ -13,8 +13,10 @@ const log = std.log.scoped(.browser);
 
 pub const Error = error{ NoBrowserFound, PortFileTimeout, BadPortFile };
 
-/// Known Chromium-family install paths, most-preferred first. Edge is present on every modern Windows install;
-/// Chrome is the common alternative. NL_BROWSER_BIN overrides this list entirely.
+/// Known Chromium-family install paths, most-preferred first (Edge-first: it ships on every modern Windows
+/// install; Chrome is the common alternative). A caller preference (NL_BROWSER / server_config) only REORDERS
+/// which family is tried first when it is actually installed — the whole list stays the fallback. NL_BROWSER_BIN
+/// (a full exe path) overrides the list entirely.
 const win_candidates = [_][]const u8{
     "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe",
     "C:/Program Files/Microsoft/Edge/Application/msedge.exe",
@@ -30,20 +32,99 @@ const posix_candidates = [_][]const u8{
     "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
 };
 
+/// The three Chromium-family browsers we discover. This is a family PREFERENCE (choose among installed
+/// browsers), never an arbitrary path — that remains the NL_BROWSER_BIN operator escape.
+pub const Family = enum { chrome, edge, chromium };
+
+/// Which family a candidate path belongs to. Order matters: "chromium" must be tested before "chrome" (the
+/// former does not contain the substring "chrome", but keeping it first documents the intent and is robust to
+/// any future path spelling). msedge.exe → edge; google-chrome/chrome.exe → chrome; chromium* → chromium.
+fn familyOf(path: []const u8) Family {
+    if (std.ascii.indexOfIgnoreCase(path, "chromium") != null) return .chromium;
+    if (std.ascii.indexOfIgnoreCase(path, "chrome") != null) return .chrome;
+    if (std.ascii.indexOfIgnoreCase(path, "edge") != null) return .edge;
+    return .chrome; // unreachable for our static lists; a harmless default that only affects ordering
+}
+
+fn parseFamily(s: []const u8) ?Family {
+    if (std.ascii.eqlIgnoreCase(s, "chrome")) return .chrome;
+    if (std.ascii.eqlIgnoreCase(s, "edge")) return .edge;
+    if (std.ascii.eqlIgnoreCase(s, "chromium")) return .chromium;
+    return null; // "" or anything unrecognized ⇒ no preference ⇒ keep the Edge-first default order
+}
+
+// Admin browser-family preference, PUBLISHED by server_config whenever its `browser` field changes (config →
+// launcher push). discover() reads it as the fallback for NL_BROWSER because discover() is reached
+// (session.Session.open) with only an env map and no ServerConfig handle, and exactly one server config is live
+// per process. A tiny enum-name string an admin writes rarely; the release/acquire length pairs the buffer
+// write with the read so an in-flight discover() never observes a torn slice (single-writer — server_config
+// serializes its own writes under its config mutex before calling here).
+var g_pref_buf: [16]u8 = undefined;
+var g_pref_len = std.atomic.Value(usize).init(0);
+
+/// Publish the admin's browser-family preference: "" | "chrome" | "edge" | "chromium". Blank (or anything that
+/// does not fit the buffer) clears it back to the Edge-first default order. Called from server_config.
+pub fn setPreferredBrowser(name: []const u8) void {
+    const n = if (name.len <= g_pref_buf.len) name.len else 0;
+    @memcpy(g_pref_buf[0..n], name[0..n]);
+    g_pref_len.store(n, .release);
+}
+
+fn configuredFamily() ?Family {
+    return parseFamily(g_pref_buf[0..g_pref_len.load(.acquire)]);
+}
+
+/// The family discover() should try FIRST: NL_BROWSER env wins (a per-process operator override), else the
+/// admin's server_config `browser` field, else null → keep the historical Edge-first order.
+fn preferredFamily(env: *const std.process.Environ.Map) ?Family {
+    if (env.get("NL_BROWSER")) |v| {
+        if (parseFamily(std.mem.trim(u8, v, " \r\n\t"))) |f| return f;
+    }
+    return configuredFamily();
+}
+
 fn exists(io: std.Io, path: []const u8) bool {
     if (std.Io.Dir.cwd().access(io, path, .{})) |_| return true else |_| return false;
 }
 
-/// Resolve the browser executable. Order: NL_BROWSER_BIN env override → known install paths → (Windows) the
-/// App Paths registry entry for msedge.exe via `reg query`. Returns a gpa-owned path; caller frees.
+/// Resolve the browser executable. Order: NL_BROWSER_BIN env override → known install paths (a preferred
+/// family, if chosen and installed, tried first) → (Windows) the App Paths registry entry for msedge.exe via
+/// `reg query`. Returns a gpa-owned path; caller frees.
 pub fn discover(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) Error![]u8 {
     if (env.get("NL_BROWSER_BIN")) |p| {
         if (p.len > 0 and exists(io, p)) return gpa.dupe(u8, p) catch return error.NoBrowserFound;
     }
     const candidates = if (builtin.os.tag == .windows) &win_candidates else &posix_candidates;
-    for (candidates) |c| if (exists(io, c)) return gpa.dupe(u8, c) catch return error.NoBrowserFound;
+    const pref = preferredFamily(env);
+    // Preference pass: try the chosen family's known paths first, but ONLY when actually installed — an
+    // uninstalled preference must never shadow a browser that is present.
+    if (pref) |want| {
+        for (candidates) |c| if (familyOf(c) == want and exists(io, c)) return gpa.dupe(u8, c) catch return error.NoBrowserFound;
+    }
+    // Fallback pass: the historical Edge-first order. Skip the preferred family — the pass above already
+    // proved none of its paths exist — so this covers "preferred not installed" and "no preference set".
+    for (candidates) |c| {
+        if (pref != null and familyOf(c) == pref.?) continue;
+        if (exists(io, c)) return gpa.dupe(u8, c) catch return error.NoBrowserFound;
+    }
     if (builtin.os.tag == .windows) if (regAppPath(gpa, io)) |p| return p;
     return error.NoBrowserFound;
+}
+
+/// Remediation for error.NoBrowserFound. The browser is DISCOVERED, never installed, so a missing one is a
+/// human fix the app can only NAME — surface THIS to the model instead of the bare error name. Static (no
+/// allocation) and free of quotes/backslashes/control bytes, so it embeds directly in a JSON string value.
+pub fn notFoundHint() []const u8 {
+    return "no Chromium-family browser found — install Microsoft Edge or Google Chrome, or set NL_BROWSER_BIN to a browser executable";
+}
+
+/// Map a browser error to a model-facing message: NoBrowserFound becomes the actionable remediation above;
+/// every other error keeps its name. A surfacing call site renders `errText(e)` in place of `@errorName(e)`.
+pub fn errText(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NoBrowserFound => notFoundHint(),
+        else => @errorName(e),
+    };
 }
 
 /// Windows-only fallback: read the default value of the msedge.exe App Paths key with `reg query` and return
@@ -183,4 +264,42 @@ pub fn readEndpoint(gpa: std.mem.Allocator, io: std.Io, user_data_dir: []const u
         return .{ .port = port, .ws_path = gpa.dupe(u8, std.mem.trim(u8, ws, " \t")) catch return error.BadPortFile };
     }
     return error.PortFileTimeout;
+}
+
+test "familyOf classifies every known candidate path" {
+    const t = std.testing;
+    // Windows install paths.
+    try t.expectEqual(Family.edge, familyOf("C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"));
+    try t.expectEqual(Family.chrome, familyOf("C:/Program Files/Google/Chrome/Application/chrome.exe"));
+    // POSIX install paths — chromium must NOT be misread as chrome.
+    try t.expectEqual(Family.chrome, familyOf("/usr/bin/google-chrome"));
+    try t.expectEqual(Family.chromium, familyOf("/usr/bin/chromium"));
+    try t.expectEqual(Family.chromium, familyOf("/usr/bin/chromium-browser"));
+    try t.expectEqual(Family.edge, familyOf("/usr/bin/microsoft-edge"));
+}
+
+test "parseFamily accepts the known names case-insensitively and rejects everything else" {
+    const t = std.testing;
+    try t.expectEqual(Family.chrome, parseFamily("Chrome").?);
+    try t.expectEqual(Family.edge, parseFamily("EDGE").?);
+    try t.expectEqual(Family.chromium, parseFamily("chromium").?);
+    try t.expect(parseFamily("") == null);
+    try t.expect(parseFamily("firefox") == null); // an unknown family ⇒ no preference ⇒ default order
+}
+
+test "preferredFamily: NL_BROWSER env overrides the published server_config preference" {
+    const t = std.testing;
+    // Published admin preference = chrome; an env override to edge must win.
+    setPreferredBrowser("chrome");
+    defer setPreferredBrowser(""); // don't leak the global into other tests
+    try t.expectEqual(Family.chrome, configuredFamily().?);
+
+    var env = std.process.Environ.Map.init(t.allocator);
+    defer env.deinit();
+    try env.put("NL_BROWSER", "edge");
+    try t.expectEqual(Family.edge, preferredFamily(&env).?);
+
+    // A garbage env value falls through to the published config preference rather than clearing it.
+    try env.put("NL_BROWSER", "netscape");
+    try t.expectEqual(Family.chrome, preferredFamily(&env).?);
 }

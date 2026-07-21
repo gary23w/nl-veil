@@ -18,6 +18,7 @@ const llm = @import("llm.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (this dir's modelcfg.zig) — shared with the compiled-in desk
 const httpc = @import("httpc.zig");
 const tools = @import("tools.zig");
+const depprobe = @import("deps.zig"); // aliased: `deps` is already a local name for project-dependency strings all over this file
 const commons = @import("commons.zig");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
@@ -225,6 +226,7 @@ pub const Worker = struct {
     corpus_facts: u32 = 0,
     internet: bool = true,
     want_net: bool = true,
+    curl_missing_warned: bool = false, // one-shot: emitted the "curl not installed" remediation once so netProbe doesn't spam it every round
     seen_spans: [48]u64 = [_]u64{0} ** 48, // ring of normalized evidence-span hashes — scout ingest dedup (RSI)
     seen_spans_n: u32 = 0,
     scout_ledger: [24]ScoutNote = [_]ScoutNote{.{}} ** 24, // admitted notes awaiting the round-end application check
@@ -3156,7 +3158,20 @@ fn netProbe(w: *Worker, round: u32, url: []const u8) void {
         if (allow.len > 0 and !tools.egressAllowed(allow, url)) return;
     }
     const argv = [_][]const u8{ "curl", "-sS", "-I", "--max-time", "4", "--connect-timeout", "3", url };
-    const r = std.process.run(w.gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch {
+    const r = std.process.run(w.gpa, w.io, .{ .argv = &argv, .stdout_limit = .limited(8 << 10), .stderr_limit = .limited(2 << 10) }) catch |e| {
+        // A MISSING curl is NOT a network signal — the box just has no curl. Flipping to "uplink lost" here
+        // would strand the swarm on lexical recall forever even on a perfectly connected machine. Surface
+        // the remediation ONCE (all remote HTTP runs through curl, so this names the real blocker) and leave
+        // w.internet untouched. Only a curl that RAN and failed (non-zero/timeout below) is a real degrade.
+        if (depprobe.isSpawnMissing(e)) {
+            if (!w.curl_missing_warned) {
+                w.curl_missing_warned = true;
+                const h = depprobe.hint(w.gpa, "curl");
+                defer w.gpa.free(h);
+                w.act("engine", round, "connectivity", "curl-missing", h);
+            }
+            return;
+        }
         if (w.internet) netFlip(w, round, false);
         return;
     };
