@@ -15,9 +15,13 @@
 //! that could dangle when the value changes underneath a request, and no allocation on the read path.
 
 const std = @import("std");
+// The browser launcher keeps a process-global copy of the family preference because discover() is reached
+// with only an env map (see launch.zig) — this config PUBLISHES to it whenever `browser` changes.
+const launch = @import("../worker/browser/launch.zig");
 
 pub const MODEL_MAX = 160; // longest catalog id today is ~55 bytes (@cf/... slugs); generous
 pub const BASE_MAX = 256;
+pub const BROWSER_MAX = 16; // "chromium" is the longest family name; this is a NAME preference, never a path
 
 pub const ServerConfig = struct {
     mu: std.Io.Mutex = .init,
@@ -41,6 +45,13 @@ pub const ServerConfig = struct {
     prompt_base_buf: [BASE_MAX]u8 = undefined,
     prompt_base_len: usize = 0,
 
+    // Browser-family preference for headless-browser discovery — "" | "chrome" | "edge" | "chromium". This is
+    // ORTHOGONAL to the model trio, so it round-trips on its own axis: setAll() never touches it and
+    // setBrowser() never touches the models. A NAME preference, never a path (an arbitrary executable stays the
+    // NL_BROWSER_BIN operator escape). Every change is published to launch.discover() via setPreferredBrowser().
+    browser_buf: [BROWSER_MAX]u8 = undefined,
+    browser_len: usize = 0,
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, data: []const u8) ServerConfig {
         return .{ .io = io, .gpa = gpa, .data = data };
     }
@@ -54,6 +65,7 @@ pub const ServerConfig = struct {
         think_base_url: []const u8 = "",
         prompt_model: []const u8 = "",
         prompt_base_url: []const u8 = "",
+        browser: []const u8 = "", // "" | "chrome" | "edge" | "chromium"; blank = Edge-first default order
     };
 
     pub fn defaults(self: *ServerConfig, alloc: std.mem.Allocator) Defaults {
@@ -66,6 +78,7 @@ pub const ServerConfig = struct {
             .think_base_url = alloc.dupe(u8, self.think_base_buf[0..self.think_base_len]) catch "",
             .prompt_model = alloc.dupe(u8, self.prompt_model_buf[0..self.prompt_model_len]) catch "",
             .prompt_base_url = alloc.dupe(u8, self.prompt_base_buf[0..self.prompt_base_len]) catch "",
+            .browser = alloc.dupe(u8, self.browser_buf[0..self.browser_len]) catch "",
         };
     }
 
@@ -134,7 +147,38 @@ pub const ServerConfig = struct {
             .think_base_url = self.think_base_buf[0..self.think_base_len],
             .prompt_model = self.prompt_model_buf[0..self.prompt_model_len],
             .prompt_base_url = self.prompt_base_buf[0..self.prompt_base_len],
+            .browser = self.browser_buf[0..self.browser_len],
         };
+    }
+
+    /// Normalize a browser-family preference to the known set, or "" for anything else. Unknown/garbage values
+    /// collapse to "" so a fat-fingered admin entry degrades to the Edge-first default order instead of
+    /// persisting junk — launch.discover() would ignore an unknown value anyway.
+    fn normBrowser(name: []const u8) []const u8 {
+        const t = std.mem.trim(u8, name, " \r\n\t");
+        if (std.ascii.eqlIgnoreCase(t, "chrome")) return "chrome";
+        if (std.ascii.eqlIgnoreCase(t, "edge")) return "edge";
+        if (std.ascii.eqlIgnoreCase(t, "chromium")) return "chromium";
+        return "";
+    }
+
+    /// Write the browser preference into the buffer and PUBLISH it to the launcher, WITHOUT saving. Shared by
+    /// load() (which saves once via setAll afterwards) and setBrowser() (which saves itself).
+    fn applyBrowser(self: *ServerConfig, name: []const u8) void {
+        const v = normBrowser(name);
+        self.mu.lockUncancelable(self.io);
+        put(&self.browser_buf, &self.browser_len, v);
+        self.mu.unlock(self.io);
+        // discover() has no ServerConfig handle (it's reached from Session.open with just env), so the launcher
+        // keeps a process-global copy this pushes on every change.
+        launch.setPreferredBrowser(v);
+    }
+
+    /// Set the server-wide browser-family preference ("" | "chrome" | "edge" | "chromium"). Admin-settable and
+    /// orthogonal to the model trio, so it leaves every model/base value untouched. Blank = Edge-first default.
+    pub fn setBrowser(self: *ServerConfig, name: []const u8) void {
+        self.applyBrowser(name);
+        self.save() catch {}; // a failed persist must not fail the request; the value is already live
     }
 
     fn path(self: *ServerConfig, buf: []u8) ?[]const u8 {
@@ -145,14 +189,16 @@ pub const ServerConfig = struct {
         var pb: [700]u8 = undefined;
         const p = self.path(&pb) orelse return;
         self.mu.lockUncancelable(self.io);
-        var body_buf: [(MODEL_MAX + BASE_MAX) * 3 + 256]u8 = undefined;
+        var body_buf: [(MODEL_MAX + BASE_MAX) * 3 + BROWSER_MAX + 256]u8 = undefined;
         const body = std.fmt.bufPrint(&body_buf,
             "{{\"default_model\":\"{s}\",\"default_base_url\":\"{s}\"," ++
             "\"think_model\":\"{s}\",\"think_base_url\":\"{s}\"," ++
-            "\"prompt_model\":\"{s}\",\"prompt_base_url\":\"{s}\"}}\n", .{
+            "\"prompt_model\":\"{s}\",\"prompt_base_url\":\"{s}\"," ++
+            "\"browser\":\"{s}\"}}\n", .{
             self.model_buf[0..self.model_len],        self.base_buf[0..self.base_len],
             self.think_model_buf[0..self.think_model_len],  self.think_base_buf[0..self.think_base_len],
             self.prompt_model_buf[0..self.prompt_model_len], self.prompt_base_buf[0..self.prompt_base_len],
+            self.browser_buf[0..self.browser_len],
         }) catch {
             self.mu.unlock(self.io);
             return;
@@ -176,10 +222,12 @@ pub const ServerConfig = struct {
                     think_base_url: []const u8 = "",
                     prompt_model: []const u8 = "",
                     prompt_base_url: []const u8 = "",
+                    browser: []const u8 = "",
                 };
                 if (std.json.parseFromSlice(P, self.gpa, data, .{ .ignore_unknown_fields = true })) |parsed| {
                     defer parsed.deinit();
                     const v = parsed.value;
+                    self.applyBrowser(v.browser); // populate + publish before setAll's save() captures the full config
                     self.setAll(v.default_model, v.default_base_url, v.think_model, v.think_base_url, v.prompt_model, v.prompt_base_url) catch {};
                     return;
                 } else |_| {}
@@ -215,6 +263,22 @@ test "setAll round-trips every role through defaults()" {
     try t.expectEqualStrings("tb", d.think_base_url);
     try t.expectEqualStrings("pm", d.prompt_model);
     try t.expectEqualStrings("pb", d.prompt_base_url);
+}
+
+test "browser preference normalizes and round-trips independently of the model trio" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    var cfg = ServerConfig{ .io = threaded.io(), .gpa = t.allocator, .data = "." };
+    try cfg.setAll("m", "b", "tm", "tb", "pm", "pb");
+    cfg.setBrowser("  Chrome ");                  // trimmed + lowercased to the canonical family name
+    try t.expectEqualStrings("chrome", cfg.defaultsRaw().browser);
+    // re-setting the model trio must NOT clear the orthogonal browser preference
+    try cfg.setAll("m2", "b2", "", "", "", "");
+    try t.expectEqualStrings("chrome", cfg.defaultsRaw().browser);
+    // an unknown family degrades to "" (default order) rather than persisting junk
+    cfg.setBrowser("firefox");
+    try t.expectEqual(@as(usize, 0), cfg.defaultsRaw().browser.len);
 }
 
 test "clearing is expressible: empty values really do empty the config" {

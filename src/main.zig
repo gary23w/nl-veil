@@ -33,6 +33,7 @@ const cf_oauth = @import("config/cf_oauth.zig");
 const server_config = @import("config/server_config.zig");
 const lan_mod = @import("config/lan.zig");
 const worker = @import("worker/run.zig");
+const deps = @import("worker/deps.zig");
 const cli = @import("cli.zig");
 const build_options = @import("build_options");
 
@@ -596,6 +597,10 @@ pub fn main(init: std.process.Init) !void {
     router.get("/styles.css", staticCss, .{});
     router.get("/models.json", staticModels, .{});
     router.get("/api/v1/health", health, .{});
+    // What binaries this HOST is missing (python/node/npm/curl/git/browser) and how to fix each — read by
+    // the desk + the AI BEFORE a tool spawn, so a missing dep is named up front instead of decoded from a
+    // flat "X failed to run" afterward. Authed like /models/local; see healthDeps.
+    router.get("/api/v1/health/deps", healthDeps, .{});
     router.get("/api/v1/fleet", fleet, .{});
     router.post("/api/v1/auth/register", auth_api.register, .{});
     router.post("/api/v1/auth/login", auth_api.login, .{});
@@ -898,6 +903,55 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .ok = true, .service = "veil", .version = VERSION }, .{});
+}
+
+/// GET /api/v1/health/deps → {ok:true, deps:[{name,present,version,hint}, …]} — one row per binary the
+/// toolbelt spawns (python, node, npm, curl, git, browser). The desk and the AI read this to know what the
+/// environment is MISSING and exactly how to fix it, instead of decoding a flat "X failed to run" only after
+/// a tool has already dead-ended. The array is nested under `deps` (not returned bare) so the reply carries
+/// the same `ok` envelope every other GET here does — health/, fleet, models/local all wrap.
+///
+/// AUTHED (requireUser), matching /models/local, which is the closest precedent: both inspect what THIS host
+/// can actually do. Dep presence is not a secret, but the version strings are operational detail (a version
+/// can name an exploitable build), so it stays behind a login rather than sitting pre-login like plain
+/// /health. It is deliberately NOT admin-only: every authenticated user's tools spawn these binaries, so any
+/// of them legitimately needs to know why one is absent — and a tool only ever runs for an authenticated
+/// user anyway, so the gate never impedes the actual use case.
+///
+/// SIDE-EFFECT-FREE: probeAll resolves binaries on PATH + best-effort reads `--version`. It NEVER installs,
+/// downloads, or mutates anything. Behind a 15s TTL cache (below) so the ~12 short-lived probe subprocesses
+/// run at most once per 15s regardless of poll rate — dependency presence changes only on an install/remove,
+/// so the cache is effectively always fresh, and it also caps the process churn an authed tight-loop could
+/// otherwise cause. The env comes from the supervisor's captured parent environ (same source chat/tools.zig
+/// probes). Cache strings live in g_deps_arena, reset whole on each refresh; every access is under g_deps_mu.
+var g_deps_mu: std.Io.Mutex = .init;
+var g_deps_arena: ?std.heap.ArenaAllocator = null;
+var g_deps_json: []const u8 = "";
+var g_deps_at: i64 = 0;
+const DEPS_TTL_S: i64 = 15;
+
+fn healthDeps(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    const environ = app.sup.parent_env orelse return http.serverErr(res, "server env unavailable");
+    const now = std.Io.Timestamp.now(app.io, .real).toSeconds();
+
+    g_deps_mu.lockUncancelable(app.io);
+    defer g_deps_mu.unlock(app.io);
+    if (g_deps_json.len == 0 or now - g_deps_at >= DEPS_TTL_S) {
+        // Stale or first call: reset the cache arena (frees the previous body + all its Dep strings in one
+        // shot), re-probe into it, and render. On OOM leave the cache empty and 500 rather than serve junk.
+        if (g_deps_arena) |*a| _ = a.reset(.free_all) else g_deps_arena = std.heap.ArenaAllocator.init(app.gpa);
+        const ca = g_deps_arena.?.allocator();
+        const probed = deps.probeAll(ca, app.io, environ);
+        g_deps_json = std.json.Stringify.valueAlloc(ca, .{ .ok = true, .deps = probed }, .{}) catch {
+            g_deps_json = "";
+            return http.serverErr(res, "could not render dependency status");
+        };
+        g_deps_at = now;
+    }
+    // Copy out under the lock so a concurrent refresh can never reset the arena from under this response.
+    res.content_type = .JSON;
+    res.body = res.arena.dupe(u8, g_deps_json) catch return http.serverErr(res, "oom");
 }
 
 const INSTANCE_MIND_CAP = 25;

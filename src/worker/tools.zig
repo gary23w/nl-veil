@@ -16,6 +16,7 @@ const browser_broker = @import("browser/broker.zig");
 const browser_host = @import("browser/host.zig");
 const mcp_discovery = @import("mcp/discovery.zig");
 const pixelrag = @import("pixelrag.zig");
+const deps = @import("deps.zig");
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
 /// params)` helper that POSTs to the loopback broker so an INVENTED tool can compose the browser primitives
@@ -76,11 +77,13 @@ const KillGuard = struct {
 /// it by handle if it runs longer than `deadline_ms` — so a WAF-held curl self-heals (the tool returns whatever
 /// arrived) instead of wedging the swarm. The watchdog holds a COPY of the handle (captured before spawn) so it never
 /// races the main thread's wait(); TerminateProcess on an already-closed handle is harmless.
-fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
+/// Returns the SPAWN error if the child could not be started (so a caller can tell a MISSING curl from a
+/// curl that ran and returned nothing — see deps.isSpawnMissing), else null on a successful spawn+wait.
+fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) ?anyerror {
     // create_no_window: on Windows a bare spawn of a console app (curl.exe) from a windowless parent pops a
     // console that flashes on the user's desktop for each fetch. std.process.run already defaults this true;
     // std.process.spawn defaults it FALSE, so set it explicitly here (no-op off Windows).
-    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch return;
+    var child = std.process.spawn(io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore, .create_no_window = true }) catch |e| return e;
     var done = std.atomic.Value(bool).init(false);
     const th: ?std.Thread = if (child.id != null)
         (std.Thread.spawn(.{}, KillGuard.watch, .{KillGuard{ .id = child.id.?, .deadline_ms = deadline_ms, .done = &done }}) catch null)
@@ -89,6 +92,7 @@ fn spawnGuarded(io: std.Io, argv: []const []const u8, deadline_ms: u32) void {
     _ = child.wait(io) catch {};
     done.store(true, .monotonic);
     if (th) |t| t.join();
+    return null;
 }
 
 /// Fetch a URL via curl into a per-mind temp file, guarded by spawnGuarded (so a WAF hang is killed, not fatal), then
@@ -147,7 +151,11 @@ pub fn fetchCached(io: std.Io, gpa: std.mem.Allocator, run_dir: []const u8, mind
     if (egress_allow.len > 0) av.appendSlice(gpa, &.{ "--max-redirs", "0" }) catch {};
     if (json) av.appendSlice(gpa, &.{ "-H", "Accept: application/json" }) catch {};
     av.append(gpa, url) catch {};
-    spawnGuarded(io, av.items, deadline_ms);
+    // A MISSING curl must not read back as a silent empty body — all remote HTTP routes through curl, so
+    // surface the actionable dep hint. A curl that spawned and got blocked/timed out keeps the "" path.
+    if (spawnGuarded(io, av.items, deadline_ms)) |e| {
+        if (deps.isSpawnMissing(e)) return deps.hint(gpa, "curl");
+    }
     const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
     std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     // Persist a substantial body for reuse (>=600 bytes filters most error/empty pages; a cached WAF page
@@ -1463,7 +1471,11 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", PYRUN, script_name };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch return dupe(gpa, "python failed to run");
+    // A SPAWN error (python missing / unstartable) is not the same as a script that ran and crashed: the
+    // latter returns a RunResult with a non-zero exit and NEVER reaches this catch. So only the genuine
+    // "the interpreter itself is missing" case swaps the flat string for the actionable dep hint.
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "python failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const exit = if (r.term == .exited) r.term.exited else @as(u8, 255);
@@ -1560,7 +1572,10 @@ fn runAuthored(ctx: *ToolCtx, name: []const u8, body: []const u8, args_json: []c
     const aj = if (std.mem.trim(u8, args_json, " \r\n\t").len == 0) "{}" else args_json;
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", PYRUN, script_name, aj };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch return dupe(gpa, "tool failed to run");
+    // spawn-missing (python absent) → the dep hint; a script that ran and failed exits non-zero and is
+    // handled below, never here.
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(64 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "tool failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const exit = if (r.term == .exited) r.term.exited else @as(u8, 255);
@@ -2466,7 +2481,8 @@ fn listDir(ctx: *ToolCtx, args_json: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", LIST_DIR_PY, full };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "list_dir failed to run");
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(64 << 10), .stderr_limit = .limited(8 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "list_dir failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     if (std.mem.trim(u8, r.stdout, " \r\n\t").len == 0) return dupe(gpa, if (r.stderr.len > 0) clip(r.stderr, 400) else "(empty or not found)");
@@ -2502,7 +2518,8 @@ fn runTests(ctx: *ToolCtx, args_json: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", RUN_TESTS_PY };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(16 << 10) }) catch return dupe(gpa, "run_tests failed to run");
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .cwd = .{ .path = ctx.workdir }, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(16 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "run_tests failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const out = if (std.mem.trim(u8, r.stdout, " \r\n\t").len > 0) r.stdout else r.stderr;
@@ -2871,7 +2888,8 @@ fn patchSystemPatch(ctx: *ToolCtx, root: []const u8, patch: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH" }) |k| env.put(k, "") catch {};
     const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", PATCH_SYSTEM_PATCH_PY, root, patch };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(32 << 10) }) catch return dupe(gpa, "patch_system patch runner failed");
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(128 << 10), .stderr_limit = .limited(32 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "patch_system patch runner failed");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     if (r.term == .exited and r.term.exited == 0 and std.mem.trim(u8, r.stdout, " \r\n\t").len > 0)
@@ -3205,7 +3223,10 @@ fn curlBrowserTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []con
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "-o", tmp, "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "-H", "Accept-Language: en-US,en;q=0.9", url }) catch return dupe(gpa, "");
-    spawnGuarded(io, av.items, deadline_ms);
+    // Missing curl → the dep hint, not a silent empty page.
+    if (spawnGuarded(io, av.items, deadline_ms)) |e| {
+        if (deps.isSpawnMissing(e)) return deps.hint(gpa, "curl");
+    }
     const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
     std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
     return raw;
@@ -3356,7 +3377,11 @@ pub fn fetchSearchText(io: std.Io, gpa: std.mem.Allocator, run_dir: []const u8, 
         defer av.deinit(gpa);
         av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "12", "--connect-timeout", "6", "-o", tmp, "-A", "Mozilla/5.0 (X11; Linux x86_64)" }) catch continue;
         av.append(gpa, url) catch continue;
-        spawnGuarded(io, av.items, 14000);
+        // curl missing → every engine below would fail identically; surface the dep hint once rather than
+        // looping to a silent "". A curl that ran but got blocked falls through to the next engine.
+        if (spawnGuarded(io, av.items, 14000)) |e| {
+            if (deps.isSpawnMissing(e)) return deps.hint(gpa, "curl");
+        }
         const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(512 << 10)) catch (gpa.dupe(u8, "") catch @constCast(""));
         defer gpa.free(raw);
         std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
@@ -3394,7 +3419,14 @@ fn curlForm(io: std.Io, gpa: std.mem.Allocator, url: []const u8, fields: []const
         av.append(gpa, kv) catch {};
     }
     av.append(gpa, url) catch {};
-    const proc = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(256 << 10) }) catch return empty;
+    const proc = std.process.run(gpa, io, .{ .argv = av.items, .stdout_limit = .limited(256 << 10) }) catch |e| {
+        // missing curl → the actionable hint; any other spawn/IO failure keeps the silent empty body.
+        if (deps.isSpawnMissing(e)) {
+            gpa.free(empty);
+            return deps.hint(gpa, "curl");
+        }
+        return empty;
+    };
     gpa.free(proc.stderr);
     if (proc.term != .exited or proc.term.exited != 0) {
         gpa.free(proc.stdout);
@@ -3645,7 +3677,8 @@ fn osintScan(ctx: *ToolCtx, args_json: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", OSINT_SCAN_PY, p.value.url };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(32 << 10) }) catch return dupe(gpa, "osint_scan failed to run");
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(32 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "osint_scan failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const out = std.mem.trim(u8, r.stdout, " \r\n\t");
@@ -3680,7 +3713,8 @@ fn deepCrawl(ctx: *ToolCtx, args_json: []const u8) []u8 {
     inline for (.{ "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NL_BROKER_AUTH", "NL_LLM_KEY" }) |k| env.put(k, "") catch {};
     const py = if (builtin.os.tag == .windows) "python" else "python3";
     const argv = [_][]const u8{ py, "-c", DEEP_CRAWL_PY, p.value.url, ds, ps, same };
-    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(512 << 10), .stderr_limit = .limited(48 << 10) }) catch return dupe(gpa, "deep_crawl failed to run");
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(512 << 10), .stderr_limit = .limited(48 << 10) }) catch |e|
+        return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "deep_crawl failed to run");
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
     const out = std.mem.trim(u8, r.stdout, " \r\n\t");
@@ -3783,7 +3817,10 @@ pub fn searchWeb(io: std.Io, gpa: std.mem.Allocator, environ: *const std.process
         const ls = std.fmt.bufPrint(&lbuf, "{d}", .{limit}) catch "5";
         const py = if (@import("builtin").os.tag == .windows) "python" else "python3";
         const argv = [_][]const u8{ py, "-c", SEARCH_PY, source, query, ls, workdir };
-        const r = std.process.run(gpa, io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch return dupe(gpa, "");
+        // This returns immediately (not enriched), so a missing python can safely surface the dep hint
+        // instead of a silent empty result. A python that ran and produced nothing keeps returning "".
+        const r = std.process.run(gpa, io, .{ .argv = &argv, .environ_map = &env, .stdout_limit = .limited(256 << 10), .stderr_limit = .limited(8 << 10) }) catch |e|
+            return if (deps.isSpawnMissing(e)) deps.hint(gpa, "python") else dupe(gpa, "");
         defer gpa.free(r.stderr);
         links = r.stdout;
     }
