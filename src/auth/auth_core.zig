@@ -14,9 +14,14 @@ pub const User = struct {
     plan: Plan,
     created: i64,
     banned: bool = false,
+    // Recipe tools this user may run. DATA, not capability: a name here only lets runRecipe dispatch that
+    // recipe's steps under the user's OWN caps — it never widens the sandbox gate. Owned exactly like email/
+    // pwhash on a loaded/mutated User (each name duped, the backing slice duped); freed via freeGrants. The
+    // shared empty-slice default is the "no grants" sentinel and is safe to free (a no-op on len 0).
+    tool_grants: []const []const u8 = &.{},
 };
 
-pub const UserInfo = struct { id: u64, email: []const u8, plan: Plan, created: i64, banned: bool = false };
+pub const UserInfo = struct { id: u64, email: []const u8, plan: Plan, created: i64, banned: bool = false, tool_grants: []const []const u8 = &.{} };
 
 const SessionVal = struct { email: []const u8, created: i64 };
 
@@ -99,8 +104,68 @@ pub const Auth = struct {
         return std.mem.indexOfScalar(u8, email[at..], '.') != null;
     }
 
+    fn grantsContain(grants: []const []const u8, name: []const u8) bool {
+        for (grants) |g| if (std.mem.eql(u8, g, name)) return true;
+        return false;
+    }
+
+    /// Serialize the grant list as a JSON string array — `["a","b"]`. Recipe names are [a-z0-9_], so the
+    /// escape never fires today, but we escape `"` and `\` anyway: a name is spliced into the record JSON
+    /// as a value, and a value that could smuggle a quote must not be able to break the record or inject a
+    /// sibling field. Caller frees the result.
+    fn grantsJson(gpa: std.mem.Allocator, grants: []const []const u8) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(gpa);
+        try buf.append(gpa, '[');
+        for (grants, 0..) |g, i| {
+            if (i != 0) try buf.append(gpa, ',');
+            try buf.append(gpa, '"');
+            for (g) |c| {
+                if (c == '"' or c == '\\') try buf.append(gpa, '\\');
+                try buf.append(gpa, c);
+            }
+            try buf.append(gpa, '"');
+        }
+        try buf.append(gpa, ']');
+        return buf.toOwnedSlice(gpa);
+    }
+
+    /// The full on-disk record for a User (base64-wrapped by the caller). Kept as its own fn so the persist
+    /// format has ONE definition — the round-trip test emits through this exact path rather than a replica.
+    /// Caller frees the result.
+    fn recordJson(gpa: std.mem.Allocator, u: User) ![]u8 {
+        const garr = try grantsJson(gpa, u.tool_grants);
+        defer gpa.free(garr);
+        return std.fmt.allocPrint(gpa, "{{\"id\":{d},\"email\":\"{s}\",\"pwhash\":\"{s}\",\"plan\":\"{s}\",\"created\":{d},\"banned\":{},\"tool_grants\":{s}}}", .{ u.id, u.email, u.pwhash, @tagName(u.plan), u.created, u.banned, garr });
+    }
+
+    /// Deep-copy a parsed grant list into gpa-owned memory: each name duped AND the backing slice duped, so
+    /// a loaded User's grants are owned exactly like its email/pwhash and free uniformly (see freeGrants).
+    /// An empty source returns the shared empty-slice sentinel — no allocation, a no-op to free.
+    fn dupGrants(gpa: std.mem.Allocator, src: []const []const u8) ![]const []const u8 {
+        if (src.len == 0) return &.{};
+        const out = try gpa.alloc([]const u8, src.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |g| gpa.free(g);
+            gpa.free(out);
+        }
+        for (src) |g| {
+            out[n] = try gpa.dupe(u8, g);
+            n += 1;
+        }
+        return out;
+    }
+
+    /// Free a grant list owned by dupGrants/setToolGrant: every name, then the backing slice. Safe on the
+    /// empty-slice sentinel — the loop runs zero times and free() is a no-op on a zero-length slice.
+    fn freeGrants(gpa: std.mem.Allocator, grants: []const []const u8) void {
+        for (grants) |g| gpa.free(g);
+        gpa.free(grants);
+    }
+
     fn persistUser(self: *Auth, u: User) !void {
-        const json = try std.fmt.allocPrint(self.gpa, "{{\"id\":{d},\"email\":\"{s}\",\"pwhash\":\"{s}\",\"plan\":\"{s}\",\"created\":{d},\"banned\":{}}}", .{ u.id, u.email, u.pwhash, @tagName(u.plan), u.created, u.banned });
+        const json = try recordJson(self.gpa, u);
         defer self.gpa.free(json);
         const enc = try b64(self.gpa, json);
         defer self.gpa.free(enc);
@@ -121,7 +186,7 @@ pub const Auth = struct {
             defer self.gpa.free(enc);
             const json = unb64(self.gpa, enc) catch continue;
             defer self.gpa.free(json);
-            const parsed = std.json.parseFromSlice(struct { id: u64, email: []const u8, pwhash: []const u8, plan: []const u8, created: i64, banned: bool = false }, self.gpa, json, .{ .ignore_unknown_fields = true }) catch continue;
+            const parsed = std.json.parseFromSlice(struct { id: u64, email: []const u8, pwhash: []const u8, plan: []const u8, created: i64, banned: bool = false, tool_grants: []const []const u8 = &.{} }, self.gpa, json, .{ .ignore_unknown_fields = true }) catch continue;
             defer parsed.deinit();
             const v = parsed.value;
             const u = User{
@@ -131,6 +196,8 @@ pub const Auth = struct {
                 .plan = if (std.mem.eql(u8, v.plan, "max")) .max else if (std.mem.eql(u8, v.plan, "pro")) .pro else .free,
                 .created = v.created,
                 .banned = v.banned,
+                // dup out of the parse arena before its deinit; owned like email/pwhash from here on.
+                .tool_grants = try dupGrants(self.gpa, v.tool_grants),
             };
             try self.users.put(self.gpa, u.email, u);
             if (v.id >= self.next_id) self.next_id = v.id + 1;
@@ -360,6 +427,65 @@ pub const Auth = struct {
         return true;
     }
 
+    /// Does this user hold a grant for recipe tool `name`? The turn-start resolve (engine.zig) intersects
+    /// the recipe registry with each sandboxed caller's grants through this; a free fn (no lock) so it can
+    /// be asked about a User already read out under the caller's own snapshot.
+    pub fn hasToolGrant(u: User, name: []const u8) bool {
+        return grantsContain(u.tool_grants, name);
+    }
+
+    /// Grant (`on`) or revoke a recipe-tool name for a user, persisting the change. Returns whether anything
+    /// actually changed: granting an already-granted name or revoking an absent one is an idempotent no-op
+    /// that returns false (so a caller can tell "flipped" from "was already so"). Mirrors setBanned's shape.
+    ///
+    /// The grant list is rebuilt immutably on each change — a fresh backing slice is allocated, the old one
+    /// freed — so a concurrent reader that snapshotted the User (hasToolGrant above) keeps walking the slice
+    /// it already holds rather than one being mutated underfoot. Names are duped on add and freed on remove,
+    /// keeping the same whole-User ownership every other field follows.
+    pub fn setToolGrant(self: *Auth, email: []const u8, name: []const u8, on: bool) bool {
+        self.mu.lockUncancelable(self.nb.io);
+        defer self.mu.unlock(self.nb.io);
+        const u = self.users.getPtr(email) orelse return false;
+        if (on) {
+            if (grantsContain(u.tool_grants, name)) return false; // already granted → no change
+            const nw = self.gpa.alloc([]const u8, u.tool_grants.len + 1) catch return false;
+            for (u.tool_grants, 0..) |g, i| nw[i] = g; // carry the existing names by reference
+            nw[u.tool_grants.len] = self.gpa.dupe(u8, name) catch {
+                self.gpa.free(nw);
+                return false;
+            };
+            self.gpa.free(u.tool_grants); // free ONLY the old backing slice; its names moved into nw
+            u.tool_grants = nw;
+        } else {
+            var idx: ?usize = null;
+            for (u.tool_grants, 0..) |g, i| if (std.mem.eql(u8, g, name)) {
+                idx = i;
+                break;
+            };
+            const j = idx orelse return false; // not granted → no change
+            if (u.tool_grants.len == 1) {
+                self.gpa.free(u.tool_grants[0]);
+                self.gpa.free(u.tool_grants);
+                u.tool_grants = &.{};
+            } else {
+                // Alloc the smaller slice FIRST; only once it exists do we free the removed name and the old
+                // backing, so an OOM here leaves the grant list intact rather than half-torn.
+                const nw = self.gpa.alloc([]const u8, u.tool_grants.len - 1) catch return false;
+                var k: usize = 0;
+                for (u.tool_grants, 0..) |g, i| {
+                    if (i == j) continue;
+                    nw[k] = g;
+                    k += 1;
+                }
+                self.gpa.free(u.tool_grants[j]); // the removed name
+                self.gpa.free(u.tool_grants); // the old backing slice
+                u.tool_grants = nw;
+            }
+        }
+        self.persistUser(u.*) catch {};
+        return true;
+    }
+
     pub fn deleteUser(self: *Auth, email: []const u8) bool {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);
@@ -369,6 +495,7 @@ pub const Auth = struct {
             self.nb.del(userScope(kv.value.email, &sbuf));
             self.gpa.free(kv.value.email);
             self.gpa.free(kv.value.pwhash);
+            freeGrants(self.gpa, kv.value.tool_grants);
             return true;
         }
         return false;
@@ -379,7 +506,75 @@ pub const Auth = struct {
         defer self.mu.unlock(self.nb.io);
         var list: std.ArrayListUnmanaged(UserInfo) = .empty;
         var it = self.users.valueIterator();
-        while (it.next()) |u| try list.append(gpa, .{ .id = u.id, .email = u.email, .plan = u.plan, .created = u.created, .banned = u.banned });
+        while (it.next()) |u| try list.append(gpa, .{ .id = u.id, .email = u.email, .plan = u.plan, .created = u.created, .banned = u.banned, .tool_grants = u.tool_grants });
         return list.toOwnedSlice(gpa);
     }
 };
+
+// Grant persistence is the load-bearing half of the recipe-tool feature: the run gate trusts what warm()
+// loaded, so a grant that does not survive a restart silently un-grants a user. These two tests pin (1) the
+// serialize↔load record contract the persist/reload cycle rides on, and (2) the in-memory grant bookkeeping
+// setToolGrant maintains — both without a live neuron.exe, so they always run rather than skip.
+
+test "tool_grants record contract: a granted list serializes and re-loads; an empty list stays empty" {
+    const gpa = std.testing.allocator;
+
+    // GRANT → PERSIST: recordJson is the exact bytes persistUser stores. Re-parsing them through the shape
+    // warm() loads with (ignore_unknown_fields lets this subset stand in for the whole record) is the
+    // "reload" step — the two grants must come back.
+    const granted = User{ .id = 7, .email = "u@x.co", .pwhash = "argon2id$stub", .plan = .free, .created = 0, .tool_grants = &.{ "research_brief", "cite_check" } };
+    const j1 = try Auth.recordJson(gpa, granted);
+    defer gpa.free(j1);
+    const Loaded = struct { tool_grants: []const []const u8 = &.{} };
+    {
+        const parsed = try std.json.parseFromSlice(Loaded, gpa, j1, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.tool_grants.len);
+        try std.testing.expect(Auth.grantsContain(parsed.value.tool_grants, "research_brief"));
+        try std.testing.expect(Auth.grantsContain(parsed.value.tool_grants, "cite_check"));
+    }
+
+    // REVOKE-to-none → PERSIST: an empty grant list serializes to `[]` and re-loads as no grants.
+    const revoked = User{ .id = 7, .email = "u@x.co", .pwhash = "argon2id$stub", .plan = .free, .created = 0 };
+    const j2 = try Auth.recordJson(gpa, revoked);
+    defer gpa.free(j2);
+    try std.testing.expect(std.mem.indexOf(u8, j2, "\"tool_grants\":[]") != null);
+    const parsed = try std.json.parseFromSlice(Loaded, gpa, j2, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.tool_grants.len);
+}
+
+test "setToolGrant: grant, idempotent grant, revoke, idempotent revoke; unknown user is false" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    // A neuron handle whose binary cannot be spawned: persistUser's store fails and is swallowed (catch {}),
+    // so this exercises the in-memory grant bookkeeping alone. The mutex still needs a real io to lock on.
+    const nb = Neuron.init(gpa, io, "__nl_no_such_neuron_bin__", "__nl_no_such_db__");
+    var auth = Auth.init(gpa, nb);
+    defer {
+        // The one seeded user's owned fields: its (mutated) grant list and duped pwhash. email + the map key
+        // are static literals, not heap. Then tear down the maps themselves so testing.allocator sees no leak.
+        if (auth.users.getPtr("u@x.co")) |uu| {
+            Auth.freeGrants(gpa, uu.tool_grants);
+            gpa.free(uu.pwhash);
+        }
+        auth.users.deinit(gpa);
+        auth.sessions.deinit(gpa);
+    }
+    // Seed directly, sidestepping register's argon2 + subprocess. pwhash is duped so the User is shaped like
+    // a real one for the persist attempt; freed in the defer above.
+    try auth.users.put(gpa, "u@x.co", .{ .id = 1, .email = "u@x.co", .pwhash = try gpa.dupe(u8, "stub"), .plan = .free, .created = 0 });
+
+    try std.testing.expect(!Auth.hasToolGrant(auth.users.get("u@x.co").?, "research_brief"));
+    try std.testing.expect(auth.setToolGrant("u@x.co", "research_brief", true)); // granted → changed
+    try std.testing.expect(Auth.hasToolGrant(auth.users.get("u@x.co").?, "research_brief"));
+    try std.testing.expect(!auth.setToolGrant("u@x.co", "research_brief", true)); // already granted → no change
+    try std.testing.expect(auth.setToolGrant("u@x.co", "cite_check", true)); // a second, distinct grant
+    try std.testing.expect(auth.setToolGrant("u@x.co", "research_brief", false)); // revoked → changed
+    try std.testing.expect(!Auth.hasToolGrant(auth.users.get("u@x.co").?, "research_brief"));
+    try std.testing.expect(Auth.hasToolGrant(auth.users.get("u@x.co").?, "cite_check")); // the other grant survives the revoke
+    try std.testing.expect(!auth.setToolGrant("u@x.co", "research_brief", false)); // already absent → no change
+    try std.testing.expect(!auth.setToolGrant("nobody@x.co", "research_brief", true)); // unknown user → false
+}

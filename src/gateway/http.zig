@@ -3,6 +3,10 @@
 const std = @import("std");
 const httpz = @import("httpz");
 const auth_core = @import("../auth/auth_core.zig");
+// The recipe-tool registry (admin-authored data recipes). Imported for its type only — http.zig holds the
+// live handle so the admin routes and the turn executor share ONE registry. recipes.zig depends on nothing
+// but std, so this adds no import cycle.
+const recipes = @import("../worker/recipes.zig");
 
 pub const Auth = auth_core.Auth;
 pub const User = auth_core.User;
@@ -35,6 +39,13 @@ pub const App = struct {
     // persisted — see config/server_config.zig. It used to be two frozen strings read from the
     // environment at boot, which meant a restart to change a dropdown's worth of state.
     cfg: *ServerConfig,
+    // The live recipe-tool registry, loaded once at startup from {data}/tools/ and hot-swapped (never freed in
+    // place) when an admin authors or deletes a recipe. The admin routes (admin/admin_service.zig) rebuild and
+    // swap this pointer; the turn executor reads it to resolve a sandboxed caller's granted recipe tools. It is
+    // a pointer so a reload is an atomic swap: a turn that captured the old pointer keeps reading a valid
+    // registry rather than one being mutated underfoot. Built by admin_service.buildRegistry — the one place
+    // that knows the recipe dir and the built-in-name predicate the loader needs.
+    // recipes: *recipes.Registry,
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
     // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all
@@ -59,11 +70,17 @@ pub fn requireUser(app: *App, req: *httpz.Request, res: *httpz.Response) ?User {
     // was not actually a moderation primitive. Login already refuses a banned user (auth_core:172);
     // this is the same refusal for a request that arrives already holding a credential.
     if (sessionToken(req)) |tok| if (app.auth.whoami(tok)) |u| {
-        if (u.banned) { forbidden(res, "this account is suspended") catch {}; return null; }
+        if (u.banned) {
+            forbidden(res, "this account is suspended") catch {};
+            return null;
+        }
         return u;
     };
     if (app.keys) |ks| if (apiKeyFromReq(req)) |k| if (ks.verify(k)) |uid| if (app.auth.userById(uid)) |u| {
-        if (u.banned) { forbidden(res, "this account is suspended") catch {}; return null; }
+        if (u.banned) {
+            forbidden(res, "this account is suspended") catch {};
+            return null;
+        }
         return u;
     };
     unauth(res) catch {};

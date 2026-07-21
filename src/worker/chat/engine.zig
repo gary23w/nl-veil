@@ -18,6 +18,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
+const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
 const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
@@ -273,6 +274,68 @@ const TURN_TOOLS_SANDBOXED = blk: {
     if (extra.len > 0) out = out ++ ",\n" ++ extra; // empty ⇒ no trailing comma into the tools array
     break :blk out;
 };
+
+/// Resolve THIS turn's granted recipe set (I3): for an admin (.full) the whole registry; for a sandboxed
+/// caller the registry ∩ the user's tool_grants. Called ONCE per turn (turn-stable), so the granted tools'
+/// advertised schemas do not vary with message content — same prefix-cache discipline the two static
+/// TURN_TOOLS variants follow. Returns a gpa-owned slice of pointers INTO the registry arena (caller frees the
+/// slice with gpa.free; the Recipes themselves are owned by the registry and outlive the turn per the
+/// resolve-at-turn-boundary contract in recipes.zig). Empty — the feature wholly INERT, no behaviour change —
+/// when no registry is wired onto App yet, the registry is empty, or the caller holds no grants.
+///
+/// REQUIRES `app.recipes: ?*recipes.Registry` — the loaded recipe registry, owned/reloaded by the admin route
+/// (a file this agent does not own). Null-safe: absent ⇒ no grants. See the run-report for the exact contract.
+// fn resolveGrants(app: *App, uid: u64, is_admin: bool, gpa: std.mem.Allocator) []const *const recipes.Recipe {
+//     const reg = app.recipes orelse return &.{};
+//     if (reg.count() == 0) return &.{};
+//     var list: std.ArrayListUnmanaged(*const recipes.Recipe) = .empty;
+//     if (is_admin) {
+//         for (reg.recipes) |*r| list.append(gpa, r) catch {};
+//     } else {
+//         // Snapshot the user once and match the registry against tool_grants. hasToolGrant walks the snapshot's
+//         // grant slice (a free fn — no lock), matching how every other field is read off a userById snapshot.
+//         const u = app.auth.userById(uid) orelse return &.{};
+//         for (reg.recipes) |*r| {
+//             if (http.Auth.hasToolGrant(u, r.name)) list.append(gpa, r) catch {};
+//         }
+//     }
+//     return list.toOwnedSlice(gpa) catch &.{};
+// }
+
+/// This turn's tools array with the granted recipes' schemas appended (I6/schema advertising). Built ONCE per
+/// turn: the base is the caller's static TURN_TOOLS variant (chosen by CAPS and nothing else), then each
+/// granted recipe's function def is appended — turn-stable and byte-identical across every inference of the
+/// turn (grants don't vary with message content), so it never re-bills the prompt-prefix cache. Returns the
+/// static base verbatim (borrowed, do not free) when there are no grants; otherwise a gpa-owned buffer the
+/// caller frees. `owned` receives the allocation to free, or stays null for the borrowed-base path.
+fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, owned: *?[]u8) []const u8 {
+    const base: []const u8 = if (ctx.caps == .sandboxed) TURN_TOOLS_SANDBOXED else TURN_TOOLS_FULL;
+    if (ctx.grants.len == 0) return base; // common case: no grants ⇒ the exact static string, zero allocation
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    b.appendSlice(gpa, base) catch {
+        b.deinit(gpa);
+        return base;
+    };
+    for (ctx.grants) |r| {
+        const sch = recipes.schemaFor(gpa, r.*);
+        defer gpa.free(sch);
+        if (sch.len == 0) continue; // schemaFor degrades to "" only on OOM — skip, never emit a torn def
+        b.appendSlice(gpa, ",\n") catch {
+            b.deinit(gpa);
+            return base;
+        };
+        b.appendSlice(gpa, sch) catch {
+            b.deinit(gpa);
+            return base;
+        };
+    }
+    const out = b.toOwnedSlice(gpa) catch {
+        b.deinit(gpa);
+        return base;
+    };
+    owned.* = out;
+    return out;
+}
 
 /// io-based wall clock — the SAME source the worker stamps its event `t` with (std time under io, never a raw
 /// clock primitive). Seconds are fine: the P0-4 reader only maxes `ts` for a conv's `updated`, so ties are OK.
@@ -739,6 +802,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .caps = if (app.auth.userById(uid)) |cu| (if (app.auth.isAdmin(cu)) .full else .sandboxed) else .sandboxed,
     };
 
+    // GRANTED RECIPES (I3): resolve this caller's recipe allowlist ONCE, right where caps was decided — the
+    // same turn-stable, per-user discipline the tool schema follows. Admin ⇒ the whole registry; a sandboxed
+    // caller ⇒ the registry ∩ their tool_grants. Empty (feature inert) until the admin route wires app.recipes.
+    // execute()/runRecipe read ctx.grants to route a granted name through the recipe dispatch as DATA.
+
+    // TODO: learn what claude was doing....
+    // ctx.grants = resolveGrants(app, uid, is_admin, gpa);
+    // defer gpa.free(ctx.grants);
+
+    // The tools array this turn advertises: the caller's static CAPS variant plus each granted recipe's schema,
+    // built ONCE (byte-identical across the turn's inferences → prefix-cache safe) and threaded into
+    // runInnerAgentic so every drive pass sends the SAME bytes.
+    var turn_tools_owned: ?[]u8 = null;
+    defer if (turn_tools_owned) |t| gpa.free(t);
+    const turn_tools = buildTurnTools(gpa, &ctx, &turn_tools_owned);
+
     // ---- seed the LLM conversation: system prompt + every persisted message (incl. the user turn just added) ----
     // `conv_buf` is the INSIDE of "messages":[ … ]; it grows in the loop with the assistant tool_call turns and
     // tool-result turns so the model always sees full context. First object has no leading comma; rest do.
@@ -1161,7 +1240,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -3924,6 +4003,9 @@ fn runInnerAgentic(
     // objective when there is one, else the user's own words), and the queries already searched this turn.
     intent: []const u8,
     search_log: *std.ArrayListUnmanaged([]u8),
+    // This turn's advertised tools array — the caller's static CAPS variant plus any granted recipe schemas,
+    // built ONCE per turn in runTurn (turn-stable, byte-identical across drive passes → prefix-cache safe).
+    turn_tools: []const u8,
 ) InnerResult {
     const gpa = app.gpa;
     // Bind the coding/base triple to the names this body already uses (the main agentic stream is the CODING
@@ -3952,8 +4034,9 @@ fn runInnerAgentic(
     //
     // CAPS is the one thing that does gate, and only because it removes nothing that could have run: a .sandboxed
     // caller's calls are refused by tools.execute's gate before any tool logic, so advertising those defs buys
-    // prefill and dead round-trips and nothing else. Static per caller — see TURN_TOOLS_SANDBOXED.
-    const turn_tools: []const u8 = if (ctx.caps == .sandboxed) TURN_TOOLS_SANDBOXED else TURN_TOOLS_FULL;
+    // prefill and dead round-trips and nothing else. Static per caller — see TURN_TOOLS_SANDBOXED. `turn_tools`
+    // is that caller-static variant (plus any granted recipe schemas) resolved ONCE in runTurn and passed in, so
+    // every drive pass advertises the SAME bytes (grants are turn-stable; see buildTurnTools).
 
     var iter: usize = 0;
     while (iter < MAX_ITERS) : (iter += 1) {
