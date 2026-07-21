@@ -83,19 +83,19 @@ providers:
   # Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (in the URL) and a
   # token; blank sends the "cloudflare" sentinel so a server configured with NL_CF_ACCOUNT_ID +
   # NL_WORKERS_AI_TOKEN uses its own included credentials (that server-side fallback is why keyless=true).
-  - key: workers-ai
-    label: Cloudflare Workers AI
-    base: https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1
-    needs_key: true
-    needs_account: true
-    keyless: true
-    models:
-      - id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-        label: Llama 3.3 70B (fast)
-      - id: "@cf/meta/llama-3.1-8b-instruct"
-        label: Llama 3.1 8B
-      - id: "@cf/qwen/qwen2.5-coder-32b-instruct"
-        label: Qwen2.5 Coder 32B
+  # - key: workers-ai
+  #   label: Cloudflare Workers AI
+  #   base: https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1
+  #   needs_key: true
+  #   needs_account: true
+  #   keyless: true
+  #   models:
+  #     - id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+  #       label: Llama 3.3 70B (fast)
+  #     - id: "@cf/meta/llama-3.1-8b-instruct"
+  #       label: Llama 3.1 8B
+  #     - id: "@cf/qwen/qwen2.5-coder-32b-instruct"
+  #       label: Qwen2.5 Coder 32B
 
   - key: groq
     label: Groq

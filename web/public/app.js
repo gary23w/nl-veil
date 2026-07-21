@@ -165,6 +165,8 @@ const api = {
   adminActivity:(uid) => jget('/api/v1/admin/users/' + encodeURIComponent(uid) + '/activity'),
   adminCreate: (e,p) => jpost('/api/v1/admin/users', { email: e, password: p }),
   adminModerate:(e,a) => jpost('/api/v1/admin/users/moderate', { email: e, action: a }),
+  adminRecipes: () => jget('/api/v1/admin/recipes'),
+  adminRecipeGrant: (uid, name, granted) => jpost('/api/v1/admin/users/' + encodeURIComponent(uid) + '/recipes/' + encodeURIComponent(name), { granted }),
 };
 
 /* ============================================================ theme */
@@ -2153,7 +2155,21 @@ async function renderAdmin(host) {
     </div></div>`;
   el('newUser').addEventListener('click', showNewUserForm);
   renderServerConfig();
+  renderRecipeTools();
   await refreshUsers();
+}
+
+async function renderRecipeTools() {
+  const userList = el('userList');
+  if (!userList) return;
+  try {
+    const recipes = (await api.adminRecipes()).recipes || [];
+    if (!recipes.length) return;
+    const summary = '<div class="panel set-panel" id="recipeTools"><b>Recipe tools</b><div class="muted">'
+      + recipes.map((r) => esc(r.name) + (r.description ? ' — ' + esc(r.description) : '')).join('<br>')
+      + '</div></div>';
+    userList.insertAdjacentHTML('beforebegin', summary);
+  } catch (e) {}
 }
 
 /** The setting that decides whether a brand-new account can do anything at all
@@ -2434,6 +2450,15 @@ async function showUserActivity(uid) {
     return;
   }
   const convs = a.convs || [];
+  let recipeRows = '';
+  try {
+    const recipes = (await api.adminRecipes()).recipes || [];
+    recipeRows = recipes.map((r) => {
+      const granted = (a.tool_grants || []).includes(r.name);
+      return '<div class="set-row"><div><b>' + esc(r.name) + '</b><div class="muted">' + esc(r.description || '') + '</div></div>'
+        + '<button class="btn btn-sm ' + (granted ? 'btn-ghost' : 'btn-solid') + '" data-recipe-name="' + esc(r.name) + '" data-recipe-granted="' + (!granted) + '">' + (granted ? 'Revoke' : 'Grant') + '</button></div>';
+    }).join('');
+  } catch (e) {}
   host.innerHTML = `
     <div class="section-head"><h2>${esc(a.email)}</h2>
       <button class="btn btn-sm btn-ghost" id="closeDetail">Close</button></div>
@@ -2443,6 +2468,7 @@ async function showUserActivity(uid) {
       <div class="stat"><b>${convs.length}</b><span>conversations</span></div>
       <div class="stat ${a.banned ? 'bad' : 'good'}"><b>${a.banned ? 'suspended' : 'active'}</b><span>state</span></div>
     </div>
+    ${recipeRows ? `<div class="panel set-panel"><div style="margin-bottom:8px"><b>Recipe access</b></div>${recipeRows}</div>` : ''}
     <div class="panel set-panel">
       <div class="muted" style="margin-bottom:8px">
         Conversation metadata only — ids and sizes. Message content is not readable from here, by design.
@@ -2453,6 +2479,12 @@ async function showUserActivity(uid) {
       </table></div>` : '<div class="muted">no conversations</div>'}
     </div>`;
   el('closeDetail').addEventListener('click', () => { host.innerHTML = ''; });
+  $$('[data-recipe-name]', host).forEach((b) => b.addEventListener('click', async () => {
+    try {
+      await api.adminRecipeGrant(uid, b.dataset.recipeName, b.dataset.recipeGranted === 'true');
+      await showUserActivity(uid);
+    } catch (e) { toast('Could not change recipe access', e.message, 'err'); }
+  }));
 }
 
 function fmtBytes(n) {

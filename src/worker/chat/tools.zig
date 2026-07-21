@@ -19,6 +19,7 @@ const std = @import("std");
 const httpz = @import("httpz");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
+const recipes = @import("../recipes.zig");
 const osc = @import("../oscillation.zig");
 const sup_mod = @import("../control/supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
 const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
@@ -92,6 +93,21 @@ fn toolAdminOnly(name: []const u8) bool {
     return false;
 }
 
+/// The desk's one-shot tool endpoint must use the same per-user recipe resolution as a server-driven turn.
+/// The returned pointers belong to the immutable app registry; only this small pointer slice belongs to the
+/// request arena. A recipe remains data and each of its steps still re-enters tools.execute under these caps.
+fn resolveRecipeGrants(app: *App, u: http.User, arena: std.mem.Allocator) []const *const recipes.Recipe {
+    var list: std.ArrayListUnmanaged(*const recipes.Recipe) = .empty;
+    if (app.auth.isAdmin(u)) {
+        for (app.recipes.recipes) |*r| list.append(arena, r) catch {};
+    } else {
+        for (app.recipes.recipes) |*r| {
+            if (http.Auth.hasToolGrant(u, r.name)) list.append(arena, r) catch {};
+        }
+    }
+    return list.toOwnedSlice(arena) catch &.{};
+}
+
 /// Sanitize a conversation id into a single safe path segment for the build workdir (no separators, no "..",
 /// bounded length). Empty / unsafe → "" so the caller falls back to the shared workdir.
 fn safeSeg(id: []const u8) []const u8 {
@@ -131,8 +147,12 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // admin-only — the desktop is admin on localhost, so it gets the complete swarm surface.
     const safe = toolSafe(tool);
     const admin_only = toolAdminOnly(tool);
-    if (!safe and !admin_only) return badReq(res, "unknown or disallowed tool");
     const is_admin = app.auth.isAdmin(u);
+    const granted_recipe = if (app.recipes.get(tool) != null)
+        (is_admin or http.Auth.hasToolGrant(u, tool))
+    else
+        false;
+    if (!safe and !admin_only and !granted_recipe) return badReq(res, "unknown or disallowed tool");
     if (admin_only and !is_admin) {
         res.status = 403;
         try res.json(.{ .ok = false, .err = "this tool is admin-only on the chat surface (code-exec / host / engine / egress)" }, .{});
@@ -141,7 +161,7 @@ pub fn chatTool(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // The desktop is admin on localhost — this endpoint runs the tool on the USER'S OWN machine, so an admin
     // caller gets the roam privilege (the same one `veil exec-tool` grants): absolute-path reads and, crucially,
     // the browser/pixel/mcp tools authorize on roam instead of a server env flag. This is the local-chat path.
-    return runMindTool(app, u.id, tool, body.args, safeSeg(body.dir), is_admin, res);
+    return runMindTool(app, u, tool, body.args, safeSeg(body.dir), is_admin, res);
 }
 
 // ----- orchestration -------------------------------------------------------------------------
@@ -295,7 +315,8 @@ fn findings(app: *App, uid: u64, id: []const u8, res: *httpz.Response) !void {
 
 // ----- mind tools ----------------------------------------------------------------------------
 
-fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []const u8, roam: bool, res: *httpz.Response) !void {
+fn runMindTool(app: *App, u: http.User, tool: []const u8, args: []const u8, conv: []const u8, roam: bool, res: *httpz.Response) !void {
+    const uid = u.id;
     const environ = app.sup.parent_env orelse return serverErr(res, "server env unavailable");
     // Per-user scratch + memory DB so observe/share/recall_hive on the chat surface never cross accounts
     // (the endpoint is multi-tenant on the productized server). Isolation is by the per-uid DB FILE — NOT by
@@ -372,6 +393,7 @@ fn runMindTool(app: *App, uid: u64, tool: []const u8, args: []const u8, conv: []
         // here, so this should never be the thing that stops a call. It is set anyway because "the
         // caller was checked upstream" is precisely the assumption that rots when a new route appears.
         .caps = if (roam) .full else .sandboxed,
+        .grants = resolveRecipeGrants(app, u, res.arena),
     };
     const result = tools.execute(&ctx, tool, args);
     // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid

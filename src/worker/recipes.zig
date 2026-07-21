@@ -48,8 +48,8 @@ pub const Recipe = struct {
     name: []const u8,
     description: []const u8,
     owner_uid: u64,
-    params: []Param,
-    steps: []Step,
+    params: []const Param,
+    steps: []const Step,
     /// Step id whose result is the tool's return. "" ⇒ default to the last step — resolve via outputStepId().
     output: []const u8,
 
