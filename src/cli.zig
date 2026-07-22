@@ -692,6 +692,10 @@ fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u
         out("no facts distilled — the file has little clean prose (a code file, a table dump, or already-structured data). Nothing was stored.\n", .{});
         return 1;
     }
+    if (st.stored == 0 and st.facts > 0) {
+        out("distilled {d} facts but stored 0 — the neuron store could not be written. Check the neuron binary at {s} (or pass --db to a writable hive).\n", .{ st.facts, neuron_bin });
+        return 1;
+    }
     out("absorbed {s}: {d} facts distilled, {d} stored into '{s}' ({s}).\nrecall them:  veil chat  →  \"what does {s} say about <topic>?\"  (or recall_hive)\n", .{ label, st.facts, st.stored, scope, db, label });
     return 0;
 }
