@@ -13,7 +13,7 @@
 const std = @import("std");
 const oscillation = @import("oscillation.zig");
 
-pub const Stats = struct { facts: u32 = 0, stored: u32 = 0, bytes_in: usize = 0 };
+pub const Stats = struct { facts: u32 = 0, stored: u32 = 0, evicted: u64 = 0, bytes_in: usize = 0 };
 
 /// A short, filesystem-safe provenance label from a path's basename (drops the extension). "doc" fallback.
 pub fn labelFromPath(path: []const u8, buf: []u8) []const u8 {
@@ -200,7 +200,12 @@ pub fn ingestText(mem: oscillation.Mem, io: std.Io, gpa: std.mem.Allocator, near
     defer gpa.free(pack);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = pack, .data = body }) catch return st;
     defer std.Io.Dir.cwd().deleteFile(io, pack) catch {};
-    st.stored = mem.import(pack, scope, cap);
+    // importStats, not import: "stored" counts writes, "evicted" counts what the scope's max_facts cap
+    // front-drained during the load. A capped scope can report thousands stored and keep only the tail —
+    // the caller's ack must be able to say so instead of claiming the document is fully recallable.
+    const imp = mem.importStats(pack, scope, cap);
+    st.stored = imp.stored;
+    st.evicted = imp.evicted;
     return st;
 }
 

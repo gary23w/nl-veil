@@ -2755,6 +2755,11 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (st.stored == 0 and st.facts > 0)
         return std.fmt.allocPrint(gpa, "distilled {d} facts from {s} but the memory store rejected them (0 stored) — the neuron-db write failed. Nothing was learned; retry or check the store.", .{ st.facts, label }) catch dupe(gpa, "distilled facts but stored 0 — neuron write failed");
     ctx.observed.* += st.stored;
+    // Eviction is the difference between "written" and "retained": a capped scope front-drains its oldest
+    // facts DURING a big load, so "N stored" alone once acked a book whose first 85% was already gone
+    // (and whose recall then quietly answered from the tail). Never claim full recallability over a drain.
+    if (st.evicted > 0)
+        return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} written into the '{s}' hive — BUT the scope hit its fact cap and evicted {d} oldest fact(s) during the load. Only the LAST part of the document (and whatever else survived) is recallable; earlier content is GONE from memory. Do not summarize from recall alone — re-read the source file for anything before the retained tail.", .{ label, st.facts, st.stored, scope, st.evicted }) catch dupe(gpa, "absorbed with evictions — earlier content was dropped");
     return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into the '{s}' hive. Recall them any time with recall_hive — no re-read, no internet needed.", .{ label, st.facts, st.stored, scope }) catch dupe(gpa, "absorbed");
 }
 

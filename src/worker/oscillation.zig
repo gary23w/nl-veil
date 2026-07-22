@@ -316,13 +316,23 @@ pub const Mem = struct {
         if (self.wmtx) |m| m.unlock(self.io);
     }
 
+    /// Per-scope fact ceiling passed as `--max` on EVERY neuron invocation. The CLI's own default is
+    /// 500, which silently FRONT-DRAINS a scope past the cap: one absorbed book (~3k facts) evicted
+    /// the pre-existing knowledge hive and then ~85% of itself, keeping only the tail — recall then
+    /// "worked" against a scope that had quietly lost the answer. 20k holds several books plus the
+    /// hive while keeping the per-spawn O(scope) blob parse tolerable (the CLI re-loads the scope
+    /// each spawn; raise further only once the linked neuron-ffi handle cache is wired in).
+    pub const MAX_FACTS: u32 = 20_000;
+
     fn run(self: Mem, args: []const []const u8) ?[]u8 {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.gpa);
         var dbbuf: [768]u8 = undefined;
         const d = drift();
         const dbp = if (d == 0) self.db else (std.fmt.bufPrint(&dbbuf, "{s}.{x}.q", .{ self.db, d }) catch "/x/nonexistent.q");
-        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp }) catch return null;
+        var maxbuf: [12]u8 = undefined;
+        const maxs = std.fmt.bufPrint(&maxbuf, "{d}", .{MAX_FACTS}) catch "20000";
+        argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return null;
         argv.appendSlice(self.gpa, args) catch return null;
         const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch return null;
         self.gpa.free(r.stderr);
@@ -375,14 +385,11 @@ pub const Mem = struct {
         if (!kept) return 0;
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = pack, .data = body.items }) catch return 0;
         defer std.Io.Dir.cwd().deleteFile(self.io, pack) catch {};
-        const out = self.run(&.{ "import", pack, "--scope", scope }) orelse return 0;
+        // --json is load-bearing: the non-json import summary ("imported N fact(s)…") prints to STDERR,
+        // which run() discards — parsing it from stdout always yielded 0, under-reporting every batch.
+        const out = self.run(&.{ "--json", "import", pack, "--scope", scope }) orelse return 0;
         defer self.gpa.free(out);
-        const key = "imported ";
-        const i = std.mem.indexOf(u8, out, key) orelse return 0;
-        const rest = out[i + key.len ..];
-        var j: usize = 0;
-        while (j < rest.len and rest[j] >= '0' and rest[j] <= '9') j += 1;
-        return std.fmt.parseInt(u32, rest[0..j], 10) catch 0;
+        return jsonUint(out, "\"stored\":");
     }
 
     pub fn replace(self: Mem, scope: []const u8, fact: []const u8) void {
@@ -398,23 +405,28 @@ pub const Mem = struct {
         return out;
     }
 
+    pub const ImportStats = struct { stored: u32 = 0, evicted: u64 = 0 };
+
     /// Bulk-load a fact pack (.facts/.jsonl) into `scope` via the neuron CLI `import`. Returns the stored count
     /// (0 on any failure — missing/garbage pack is a safe no-op). `--json` is mandatory (the count prints to
     /// stdout only under --json) and must come FIRST (the CLI strips a leading --json before dispatch). --dedup
     /// makes re-deploy idempotent; --flush caps the load.
     pub fn import(self: Mem, pack_path: []const u8, scope: []const u8, cap: u32) u32 {
+        return self.importStats(pack_path, scope, cap).stored;
+    }
+
+    /// import(), but ALSO carries the CLI's `"evicted"` count — facts the scope's max_facts cap front-drained
+    /// DURING the load. "stored" alone is what writes succeeded, not what survived: the absorbed-book failure
+    /// was an ack of "3,152 stored" over a scope that had just evicted 2,652 of them. Callers that report
+    /// success to a model/user must read `evicted` and say so.
+    pub fn importStats(self: Mem, pack_path: []const u8, scope: []const u8, cap: u32) ImportStats {
         self.lockW();
         defer self.unlockW();
         var capbuf: [16]u8 = undefined;
         const caps = std.fmt.bufPrint(&capbuf, "{d}", .{cap}) catch "400";
-        const out = self.run(&.{ "--json", "import", pack_path, "--scope", scope, "--dedup", "--flush", caps }) orelse return 0;
+        const out = self.run(&.{ "--json", "import", pack_path, "--scope", scope, "--dedup", "--flush", caps }) orelse return .{};
         defer self.gpa.free(out);
-        const key = "\"stored\":";
-        const i = std.mem.indexOf(u8, out, key) orelse return 0;
-        const rest = out[i + key.len ..];
-        var j: usize = 0;
-        while (j < rest.len and rest[j] >= '0' and rest[j] <= '9') j += 1;
-        return std.fmt.parseInt(u32, rest[0..j], 10) catch 0;
+        return .{ .stored = jsonUint(out, "\"stored\":"), .evicted = jsonUint64(out, "\"evicted\":") };
     }
 
     /// The native COVERAGE signal: `recall --json` returns {"fact":..,"coverage":0.NN} — the fraction of the
@@ -633,14 +645,23 @@ pub const Mem = struct {
     pub fn factCount(self: Mem, scope: []const u8) u32 {
         const out = self.run(&.{ "--json", "stats", scope }) orelse return 0;
         defer self.gpa.free(out);
-        const key = "\"facts\":";
-        const i = std.mem.indexOf(u8, out, key) orelse return 0;
-        const rest = out[i + key.len ..];
-        var j: usize = 0;
-        while (j < rest.len and rest[j] >= '0' and rest[j] <= '9') j += 1;
-        return std.fmt.parseInt(u32, rest[0..j], 10) catch 0;
+        return jsonUint(out, "\"facts\":");
     }
 };
+
+/// The digit run right after `key` (a `"name":` JSON key) parsed as an integer; 0 when absent/garbled.
+/// The flat-scan shape every Mem parser here uses — the CLI's --json output is single-line and unnested.
+fn jsonUint(out: []const u8, key: []const u8) u32 {
+    const v = jsonUint64(out, key);
+    return if (v > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(v);
+}
+fn jsonUint64(out: []const u8, key: []const u8) u64 {
+    const i = std.mem.indexOf(u8, out, key) orelse return 0;
+    const rest = out[i + key.len ..];
+    var j: usize = 0;
+    while (j < rest.len and rest[j] >= '0' and rest[j] <= '9') j += 1;
+    return std.fmt.parseInt(u64, rest[0..j], 10) catch 0;
+}
 
 /// Normalize one fact for the LINE-ORIENTED store: CR/LF/TAB fold to spaces, runs collapse, ends trim,
 /// clipped to `buf` at a codepoint boundary. Sentence atomization inside the core is DESIGN (prose weaves
