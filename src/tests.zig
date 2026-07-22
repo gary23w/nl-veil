@@ -9,6 +9,7 @@ test {
     _ = @import("config/server_config.zig");
     _ = @import("config/lan.zig");
     _ = @import("worker/agi.zig");
+    _ = @import("worker/hashline.zig"); // hash-anchored atomic line edits (tag dialect of edit_file)
     _ = @import("worker/browser/manager.zig");
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/chat/context.zig");
@@ -29,12 +30,14 @@ test {
     _ = @import("worker/metrics.zig");
     _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
     _ = @import("worker/oscillation.zig");
+    _ = @import("worker/ragmirror.zig"); // local knowledge-pack mirror: url→disk resolve + atlas extension
     _ = @import("worker/rate.zig");
     _ = @import("worker/recipes.zig"); // parse/substitute/validate — the granted-recipe trust boundary
     _ = @import("worker/rerank.zig");
     _ = @import("worker/rsi.zig");
     _ = @import("worker/run.zig");
     _ = @import("worker/sched.zig");
+    _ = @import("worker/toolchain.zig"); // dependency bootstrap + manifest-derived acceptance rows
     _ = @import("worker/tools.zig");
     _ = @import("worker/vcs.zig");
 }

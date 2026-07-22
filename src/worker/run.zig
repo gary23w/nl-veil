@@ -29,6 +29,8 @@ const agi = @import("agi.zig");
 const crawl = @import("crawl.zig");
 const writer = @import("writer.zig");
 const locs = @import("locs/atlas.zig");
+const ragmirror = @import("ragmirror.zig");
+const toolchain = @import("toolchain.zig");
 const cctx = @import("chat/context.zig");
 
 const log = std.log.scoped(.worker);
@@ -48,6 +50,8 @@ const Manifest = struct {
     corpus: []const u8 = "",
     corpus_cap: u32 = 400,
     gap_assess: bool = true,
+    /// engine-run installs of the deliverable's own dependency manifests (npm/pip/cargo/go) — see toolchain.zig
+    bootstrap: bool = true,
     internet: bool = true,
     space: []const u8 = "",
     autonomous: bool = false,
@@ -214,6 +218,8 @@ pub const Worker = struct {
     // rejection silently lands on the python path, which then tells a Node/Rust swarm to "write a runnable
     // test_<name>.py" — wrong advice, and the acceptance_harness act never fires at all.
     checks_all_refused: bool = false,
+    bootstrap_deps: bool = true, // run the deliverable's own dependency installs (manifest `bootstrap` flag)
+    deps_fp: u64 = 0, // content fingerprint of the workdir's dependency manifests at the last bootstrap
     checks_str: []const u8 = "", // the goal's DECLARED acceptance interface: newline-joined `VERIFY:` shell
     // commands ("" = none declared). When present they ARE the benchmark — any toolchain enters through the
     // build description; the engine executes each row verbatim and scores exit codes, never inspecting
@@ -502,10 +508,14 @@ fn factRelevant(sent: []const u8, goal: []const u8) bool {
 /// goal barely matched, top up with a stride sample across the file for a diverse floor. Pure additive; skipped
 /// under an egress allowlist.
 fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
-    if (!w.internet or egress_allow.len > 0) return;
+    if (egress_allow.len > 0) return; // a gated run keeps exactly its declared surface — no side-channel seeding
+    // offline is fine WITH a local mirror (that's the built-in-knowledge case); without one there's nothing to pull
+    if (!w.internet and !ragmirror.active()) return;
     const gpa = w.gpa;
-    var top: [2]*const locs.Loc = undefined;
-    const n = locs.match(goal, top[0..]);
+    // disk reads are free — widen the domain net when a mirror serves them locally
+    const want: u32 = if (ragmirror.active()) 4 else 2;
+    var top: [4]*const locs.Loc = undefined;
+    const n = locs.match(goal, top[0..want]);
     if (n == 0) return;
     var seeded: u32 = 0;
     var domains: u32 = 0;
@@ -549,7 +559,7 @@ fn prefetchPacks(w: *Worker, goal: []const u8, egress_allow: []const u8) void {
             }
         }
         if (here > 0) domains += 1;
-        if (domains >= 2) break;
+        if (domains >= want) break;
     }
     if (seeded > 0) {
         const note = std.fmt.allocPrint(gpa, "prefetched {d} goal-relevant nl-rag pack fact(s) across {d} domain(s) into the hive — scouts start grounded on the RIGHT canonical docs, not a blind web-scrape", .{ seeded, domains }) catch "";
@@ -624,6 +634,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         .autonomous = m.autonomous,
         .internet = m.internet,
         .want_net = m.internet,
+        .bootstrap_deps = m.bootstrap,
         .fence_writes = llm.fenceWrites(base_url, model),
     };
     w.mem.trust = true;
@@ -1067,7 +1078,16 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         defer if (acc.len > 0) gpa.free(acc);
         w.act("engine", 0, "acceptance", "goal DECLARES its own acceptance interface (VERIFY/SMOKE/PROBE) — adopted verbatim; engine-run, language-blind", acc);
     }
-    if (live and w.internet) {
+    // LOCAL KNOWLEDGE MIRROR: adopt a local copy of the pack corpus when one exists (NL_RAG_DIR /
+    // <data>/_rag / vendor/nl-rag). Pack urls then serve from disk through the shared fetch layer, and the
+    // source atlas extends at runtime to every curated domain in the corpus manifest — goal routing is no
+    // longer limited to the compiled table, and the knowledge floor below works fully OFFLINE.
+    if (ragmirror.initAt(gpa, io, environ, std.fs.path.dirname(run_dir) orelse ".")) {
+        const rnote = std.fmt.allocPrint(gpa, "local knowledge mirror active at {s} — pack pages + distilled facts serve from disk ({d} atlas extension domains); pack research works offline", .{ ragmirror.root(), locs.extension().len }) catch "";
+        defer if (rnote.len > 0) gpa.free(rnote);
+        w.act("engine", 0, "rag", rnote, "");
+    }
+    if (live and (w.internet or ragmirror.active())) {
         const srcs = locs.sourcesBlock(gpa, goal, 3);
         if (srcs.len > 0) {
             defer gpa.free(@constCast(srcs));
@@ -1317,6 +1337,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 if (sp.len > 0) std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sp, .data = w.bench_fixed }) catch {};
             }
             reconcileTruncated(&w); // resolve cut-emission ledger entries whose file changed since the partial landed
+            if (live and !w.discourse) maybeToolchain(&w, run_dir, round, environ);
             var bench = runBenchmark(&w, run_dir, goal, round);
             w.deliverable_missing = false;
             if (bench.status == .ok and !bench.host and !w.operating) {
@@ -3425,7 +3446,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var had_reject = false; // this mind's work was refused this round (edit/salvage reject) — a NEGATIVE affect signal
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch @panic("out of memory"));
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
@@ -6227,6 +6248,38 @@ fn gateDeclaredChecks(w: *Worker, run_dir: []const u8, rows: []const u8) []const
 /// failure feedback — no per-format extractor; the minds interpret their own toolchain. Runs out-of-band
 /// and engine-owned, so the swarm cannot edit or fake it — and completely language-blind: any stack enters
 /// via the goal, and keep-or-revert (trackConvergence/rewardFloor) fires unchanged for all of them.
+/// PROJECT-TOOLCHAIN FLOOR (pre-benchmark, each round): (1) when the deliverable's dependency manifests
+/// CHANGED, run the installs the project itself declares — the top cause of "the code was right and the
+/// tests still failed" was a bare host no one ever npm-installed on; (2) when the operator declared no
+/// acceptance rows, adopt tier-1 rows from the project's OWN manifest (npm scripts / Cargo.toml / go.mod /
+/// build.zig) so a non-Python deliverable gets a real completion gate instead of coverage-only limbo.
+/// Both derive from the deliverable's files — never a goal taxonomy (the general-floor rule). Re-checked
+/// every round because manifests usually APPEAR mid-run as minds write them.
+fn maybeToolchain(w: *Worker, run_dir: []const u8, round: u32, environ: *const std.process.Environ.Map) void {
+    const gpa = w.gpa;
+    const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return;
+    defer gpa.free(workdir);
+    const egress = environ.get("NL_EGRESS_ALLOWLIST") orelse "";
+    if (w.bootstrap_deps and w.internet and egress.len == 0) {
+        const fp = toolchain.manifestFingerprint(w.io, gpa, workdir);
+        if (fp != 0 and fp != w.deps_fp) {
+            w.deps_fp = fp; // set BEFORE running: a failing install must not re-run every round (the note tells minds why)
+            const note = toolchain.bootstrap(gpa, w.io, environ, workdir);
+            if (note.len > 0) {
+                defer gpa.free(@constCast(note));
+                w.act("engine", round, "deps", note, "");
+            }
+        }
+    }
+    if (w.checks_str.len == 0 and !w.checks_all_refused) {
+        const rows = toolchain.deriveChecks(gpa, w.io, workdir);
+        if (rows.len > 0) {
+            w.checks_str = rows; // freed by run()'s checks_str defer
+            w.act("engine", round, "acceptance", "no operator-declared checks — adopted tier-1 rows from the project's OWN manifest (engine-run; a missing toolchain is excluded from the denominator, never a code failure)", rows);
+        }
+    }
+}
+
 fn runDeclaredChecks(w: *Worker, run_dir: []const u8) BenchResult {
     const gpa = w.gpa;
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_dir}) catch return .{ .status = .err };

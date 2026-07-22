@@ -420,6 +420,14 @@ pub fn main(init: std.process.Init) !void {
     // Make local Ollama parallel + right-sized on launch (crucial for cast/chat steering; see tuneOllama).
     tuneOllama(gpa, io, init.environ_map);
 
+    // LOCAL KNOWLEDGE MIRROR (server process): chat/cast tools route through the same fetch layer as swarm
+    // workers, so adopting a local pack corpus here makes desk research serve from disk too. Workers detect
+    // it independently (their own process); placed after the CLI early-returns so a thin verb never pays
+    // the manifest parse.
+    if (@import("worker/ragmirror.zig").initAt(gpa, io, init.environ_map, paths.data)) {
+        log.info("knowledge mirror: {s} (+{d} atlas domains)", .{ @import("worker/ragmirror.zig").root(), @import("worker/locs/atlas.zig").extension().len });
+    }
+
     const auth_db = try std.fmt.allocPrint(gpa, "{s}/auth.sqlite", .{paths.data});
     const nb = Neuron.init(gpa, io, paths.neuron_bin, auth_db);
     var auth = Auth.init(gpa, nb);

@@ -57,7 +57,7 @@ pub fn isCommand(sub: []const u8) bool {
         "rm",        "delete",        "events", "logs",    "watch",     "chat",
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
-        "sync-read", "sync-manifest",
+        "sync-read", "sync-manifest", "rag",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -89,6 +89,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "exec-tool")) return exec_tool.cmd(ctx, args);
     if (std.mem.eql(u8, sub, "sync-manifest")) return exec_tool.cmdSyncManifest(ctx, args);
     if (std.mem.eql(u8, sub, "sync-read")) return exec_tool.cmdSyncRead(ctx, args);
+    if (std.mem.eql(u8, sub, "rag")) return cmdRag(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -558,6 +559,13 @@ fn cmdHelp() u8 {
         \\FLEET
         \\  hub                          fleet console across many veils (see `veil hub help`)
         \\
+        \\KNOWLEDGE (local pack corpus — built-in RAG)
+        \\  rag status                   is a local knowledge mirror active? (NL_RAG_DIR / <data>/_rag / vendor/nl-rag)
+        \\  rag sync --from <clone>      copy a corpus checkout into this app's data dir for offline built-in RAG
+        \\      --tier atlas|facts|full  manifest only | +INDEX+distilled facts (default) | +every pack page
+        \\      --dest <dir>             sync somewhere else (e.g. vendor/nl-rag inside a source tree, pre-build)
+        \\      --include-auto           also copy machine-grown packs (off-topic risk; off by default)
+        \\
         \\MISC
         \\  doctor                       check server + token health
         \\  desktop                      open the app window (same as a bare `veil`, but detached)
@@ -565,6 +573,65 @@ fn cmdHelp() u8 {
         \\
     , .{});
     return 0;
+}
+
+/// `veil rag …` — the local knowledge-corpus mirror: report what a worker would adopt, or sync a corpus
+/// checkout into place. Pure-local (no server round-trip): the mirror is a filesystem contract shared by
+/// every process on this data dir.
+fn cmdRag(ctx: *Ctx, args: []const []const u8) u8 {
+    const ragmirror = @import("worker/ragmirror.zig");
+    var sub: []const u8 = "status";
+    var from: []const u8 = "";
+    var dest: []const u8 = "";
+    var tier_s: []const u8 = "facts";
+    var include_auto = false;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--from") and i + 1 < args.len) {
+            i += 1;
+            from = args[i];
+        } else if (std.mem.eql(u8, a, "--dest") and i + 1 < args.len) {
+            i += 1;
+            dest = args[i];
+        } else if (std.mem.eql(u8, a, "--tier") and i + 1 < args.len) {
+            i += 1;
+            tier_s = args[i];
+        } else if (std.mem.eql(u8, a, "--include-auto")) {
+            include_auto = true;
+        } else if (a.len > 0 and a[0] != '-') {
+            sub = a;
+        }
+    }
+    if (std.mem.eql(u8, sub, "sync")) {
+        if (from.len == 0) {
+            out("rag sync needs --from <path to a corpus checkout> (git clone https://github.com/gary23w/nl-rag)\n", .{});
+            return 1;
+        }
+        const tier: ragmirror.SyncTier = if (std.mem.eql(u8, tier_s, "atlas")) .atlas else if (std.mem.eql(u8, tier_s, "full")) .full else .facts;
+        const dflt = std.fmt.allocPrint(ctx.gpa, "{s}/_rag", .{ctx.data}) catch return 1;
+        defer ctx.gpa.free(dflt);
+        const d = if (dest.len > 0) dest else dflt;
+        out("syncing corpus ({s} tier{s}): {s} -> {s} ...\n", .{ tier_s, if (include_auto) ", incl. machine-grown" else "", from, d });
+        const st = ragmirror.syncFrom(ctx.gpa, ctx.io, from, d, tier, include_auto) catch |e| {
+            out("sync failed: {t}\n", .{e});
+            return 1;
+        };
+        out("synced {d} domains, {d} files, {d:.1} MB", .{ st.domains, st.files, @as(f64, @floatFromInt(st.bytes)) / (1024.0 * 1024.0) });
+        if (st.missing > 0) out(" ({d} listed domains had no pack files at the source)", .{st.missing});
+        out("\nworkers + server adopt it automatically (checked before every pack fetch): {s}\n", .{d});
+        return 0;
+    }
+    if (std.mem.eql(u8, sub, "status")) {
+        if (ragmirror.initAt(ctx.gpa, ctx.io, ctx.environ, ctx.data)) {
+            out("knowledge mirror: {s}\natlas extension: +{d} domains beyond the compiled table\n", .{ ragmirror.root(), @import("worker/locs/atlas.zig").extension().len });
+        } else {
+            out("no local knowledge mirror.\nchecked: NL_RAG_DIR, {s}/_rag, vendor/nl-rag\nget one:  git clone https://github.com/gary23w/nl-rag && veil rag sync --from nl-rag\n", .{ctx.data});
+        }
+        return 0;
+    }
+    out("usage: veil rag [status] | veil rag sync --from <dir> [--tier atlas|facts|full] [--dest <dir>] [--include-auto]\n", .{});
+    return 1;
 }
 
 // cmdChat + cmdHub are substantial enough to live in their own files (kept here as thin entry points).
