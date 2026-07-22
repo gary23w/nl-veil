@@ -186,6 +186,10 @@ const SYSTEM_PROMPT =
     "code in your working directory, and observe / recall / recall_hive for memory. Use a tool when it genuinely " ++
     "helps; call tools one or more times, then when you have what you need reply to the user directly in plain " ++
     "prose. Keep answers concrete and grounded in what the tools actually returned.\n" ++
+    "STORED DOCUMENTS. absorb files a document into its own memory scope; recall_hive answers TARGETED questions " ++
+    "about it. For WHOLE-document work (summarize, outline, review), recall fragments are NOT the document -- " ++
+    "page it in order with read_doc and work from those pages; if read_doc has nothing, fall back to read_file " ++
+    "on the source.\n" ++
     "HOW YOU WORK A TASK. Your FIRST move on any non-trivial request is to BREAK IT DOWN into a concrete list of " ++
     "smaller subtasks -- however many it takes, a handful or dozens -- and show the user that plan. Then work the " ++
     "list, and for EACH subtask decide the best route: (a) DELEGATE TO A HIVE -- if a team building or " ++
@@ -2005,10 +2009,11 @@ fn containsCredentialKey(lower: []const u8) bool {
 /// Would storing this tool's RESULT just re-mint memory output as new facts? recall/recall_hive RETURN
 /// memory — observing their echoes copies other scopes' facts into this one (observed live: a Discourse
 /// task's memory carrying an unrelated FPS-game description via one recall echo — the bleed class that
-/// relevance gates can't stop once the fact is laundered into the local scope). observe/skill acks are
-/// bookkeeping, not findings.
+/// relevance gates can't stop once the fact is laundered into the local scope). read_doc PAGES stored
+/// documents — observing its output would re-mint an entire book back into memory, page by page.
+/// observe/skill acks are bookkeeping, not findings.
 fn memoryEchoTool(name: []const u8) bool {
-    const t = [_][]const u8{ "recall", "recall_hive", "observe", "skill" };
+    const t = [_][]const u8{ "recall", "recall_hive", "read_doc", "observe", "skill" };
     for (t) |n| {
         if (std.mem.eql(u8, name, n)) return true;
     }
@@ -2368,8 +2373,9 @@ fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLed
         // The conversation's own partition abstained — thread OUTWARD across the shared KNOWLEDGE hive
         // (where every conversation's observes and swarm deposits land). That scope is CROSS-TASK by
         // construction, so what comes back must clear the relevance bar, and it never rides inside the
-        // step text: it returns as the engine's own provenance-framed note.
-        const hive = ctx.mem.assoc(tools.KNOWLEDGE_SCOPE, step_text, osc.Mem.SATURATE_HOPS, 4);
+        // step text: it returns as the engine's own provenance-framed note. ACROSS: absorbed documents
+        // live in their own knowledge__doc-* sub-scopes now — still one spawn, the CLI fans in-process.
+        const hive = ctx.mem.assocAcross(tools.KNOWLEDGE_SCOPE, step_text, osc.Mem.SATURATE_HOPS, 4);
         defer if (hive.len > 0) gpa.free(hive);
         if (hive.len > 0) {
             scrubUtf8(hive);
