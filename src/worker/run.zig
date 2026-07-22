@@ -261,6 +261,7 @@ pub const Worker = struct {
     discourse: bool = false,
     operating: bool = false,
     app_attach: bool = false, // opt-in generic-app LEARN mode (NL_APP_ATTACH): read-only attach to an arbitrary app
+    idle_skip: bool = false, // opt-in (NL_IDLE_SKIP): a provably-idle non-lead assembler mind skips its LLM moment
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -709,6 +710,12 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             w.app_attach = true;
             w.act("engine", 0, "mode", "app-attach", "generic app-attach LEARN mode (read-only): map the attached app with host_explore; actuating verbs, code execution, and bus/oracle writes are DISABLED. The learned surface persists in the lineage hive — a second attach with the same lineage starts already knowing the app.");
         }
+    }
+    // IDLE-SKIP (opt-in, NL_IDLE_SKIP): let a provably-idle non-lead assembler mind skip its LLM moment instead
+    // of burning a full call to re-narrate. Default-off so existing runs are a byte-for-byte no-op; see doMoment.
+    if (environ.get("NL_IDLE_SKIP")) |v| {
+        w.idle_skip = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (w.idle_skip) w.act("engine", 0, "mode", "idle-skip", "idle-skip armed: a non-lead assembler mind with no unbuilt/incomplete file, no inbox, and a non-failing benchmark skips its moment this round (re-armed every round from live build state; the lead always runs, so a build can never stall).");
     }
     if (live) {
         const c = llm.capsSnapshot();
@@ -3430,6 +3437,49 @@ fn runMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: boo
 /// One mind-moment. Live: the agentic tool loop — the model recalls, then calls tools (run_python /
 /// write_file / web_fetch / observe / …), feeding each result back, until it returns a final summary. Mock:
 /// a canned reflection. Always observes a fact so the mind grows. All returned strings are gpa-owned.
+/// True when any file this mind owns (space-separated `my_files`) is in the `incomplete` list — a built file
+/// markIncomplete re-flagged as a stub/uncompilable that still owes a CONTINUE pass. slotIsBuilt reads such a
+/// file as BUILT, so the frontier check alone misses it; this is what keeps its owner running (idle-skip rule 7).
+fn anyMineIncomplete(my_files: []const u8, incomplete: []const u8) bool {
+    if (my_files.len == 0 or incomplete.len == 0) return false;
+    var it = std.mem.tokenizeScalar(u8, my_files, ' ');
+    while (it.next()) |f| if (inSpaceList(incomplete, f)) return true;
+    return false;
+}
+
+/// The IDLE-SKIP predicate (pure, native, no LLM, no goal text): TRUE ⇒ this assembler mind provably has zero
+/// work this round and its moment may be skipped. Every input is live build state. Any single false forces the
+/// full moment — biased hard toward RUNNING. The caller additionally gates this on the assembler regime + the
+/// NL_IDLE_SKIP opt-in, so a wrongly-permissive result here still cannot fire outside that regime.
+fn mindProvablyIdle(round: u32, idx: u32, team: u32, is_scout: bool, inbox_len: usize, frontier_has_unbuilt: bool, lane_len: usize, my_files: []const u8, incomplete: []const u8, bench_ok: bool, bench_pct: u32) bool {
+    if (round <= 1) return false; // round 1 seeds every mind (the manifest is empty anyway)
+    if (@as(i64, @intCast(idx)) == roleIndices(team).lead) return false; // the lead never skips — the liveness anchor
+    if (is_scout) return false; // a scout's work is open-ended research, not a file slot
+    if (inbox_len > 0) return false; // a teammate / the lead / the veil directed work at this mind
+    if (frontier_has_unbuilt) return false; // this mind owns a concrete unbuilt required file
+    if (lane_len > 0) return false; // the orchestrator pinned a specific fix at this mind
+    if (anyMineIncomplete(my_files, incomplete)) return false; // owns a built-but-incomplete file still owed work
+    if (bench_ok and bench_pct < 100) return false; // the benchmark RAN and is FAILING ⇒ repair pressure — keep working
+    return true;
+}
+
+test "mindProvablyIdle: only a surplus non-lead mind on a passing build with no mail skips; every work signal forces a run" {
+    const t = std.testing;
+    // a rank-2 builder on a 4-mind team, past round 1, no unbuilt frontier / no incomplete / empty inbox / no
+    // lane, and the benchmark passing (or absent) ⇒ idle-eligible
+    try t.expect(mindProvablyIdle(3, 2, 4, false, 0, false, 0, "", "", true, 100));
+    try t.expect(mindProvablyIdle(3, 2, 4, false, 0, false, 0, "src/a.py", "", false, 0)); // no runnable benchmark ⇒ ok
+    // every single work signal forces a run
+    try t.expect(!mindProvablyIdle(1, 2, 4, false, 0, false, 0, "", "", true, 100)); // round 1
+    try t.expect(!mindProvablyIdle(3, 0, 4, false, 0, false, 0, "", "", true, 100)); // the lead (idx 0)
+    try t.expect(!mindProvablyIdle(3, 1, 4, true, 0, false, 0, "", "", true, 100)); // scout
+    try t.expect(!mindProvablyIdle(3, 2, 4, false, 1, false, 0, "", "", true, 100)); // inbox non-empty
+    try t.expect(!mindProvablyIdle(3, 2, 4, false, 0, true, 0, "", "", true, 100)); // unbuilt frontier file
+    try t.expect(!mindProvablyIdle(3, 2, 4, false, 0, false, 5, "", "", true, 100)); // lane override
+    try t.expect(!mindProvablyIdle(3, 2, 4, false, 0, false, 0, "src/a.py", "src/a.py", true, 100)); // owns an incomplete file
+    try t.expect(!mindProvablyIdle(3, 2, 4, false, 0, false, 0, "", "", true, 80)); // benchmark FAILING ⇒ repair pressure
+}
+
 fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool, environ: *const std.process.Environ.Map) Moment {
     const gpa = w.gpa;
     const t0 = w.nowSecs();
@@ -3545,6 +3595,31 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     const assembler_slot = if (w.quick and w.blueprint.len == 0) quickTargetFromGoal(gpa, goal) else if (lane_slot.len > 0) lane_slot else frontier_slot;
     defer if (w.quick and w.blueprint.len == 0 and assembler_slot.len > 0) gpa.free(@constCast(assembler_slot)); // the goal-derived quick slot is gpa-owned
     ctx.slot_path = assembler_slot;
+    // IDLE-SKIP (opt-in, NL_IDLE_SKIP) — in the structured-frontier assembler regime, a non-lead/non-scout mind
+    // past round 1 that provably has NO work this round (no unbuilt frontier file, no incomplete file it owns,
+    // empty inbox, no orchestrator lane override) AND is not under benchmark-failure pressure skips its LLM
+    // moment instead of paying a full call to re-narrate idleness. FAIL-SAFE, four ways: (1) the lead always
+    // runs, so >=1 mind builds while any file is open; (2) assignSlot hands every unbuilt/incomplete file to a
+    // mind, so an open file's owner is never idle; (3) the predicate is recomputed from live build state EVERY
+    // round, so a skip is at most a one-round deferral (a landed dep, a regression into incomplete, a benchmark
+    // drop, or a new message re-arms the mind next round); (4) while the benchmark is failing the whole surplus
+    // workforce keeps running. A skipped mind writes nothing, so no state it owns can be stranded. Every input
+    // is already computed above (inbox 3506, frontier 3536, lane 3539, my_files 3523). Default-off ⇒ no-op.
+    if (w.idle_skip and w.cap.one_slot and w.blueprint.len > 0 and !w.quick and !w.discourse and !w.operating and mi.team >= 3 and
+        mindProvablyIdle(round, mi.idx, mi.team, mi.scout, inbox.len, frontier_has_unbuilt, lane_slot.len, my_files, w.incomplete_str, w.last_bench.status == .ok, w.last_bench.pct))
+    {
+        return .{
+            .monologue = std.fmt.allocPrint(gpa, "[idle] round {d}: {s} has no assigned work — frontier built, no incomplete file it owns, empty inbox, benchmark not failing. Moment skipped to save compute (re-checked next round).", .{ round, mi.name }) catch (gpa.dupe(u8, "[idle] moment skipped") catch @constCast("")),
+            .fact = gpa.dupe(u8, "") catch @constCast(""),
+            .stance = std.fmt.allocPrint(gpa, "idle (round {d})", .{round}) catch (gpa.dupe(u8, "idle") catch @constCast("")),
+            .facts = mi.facts, // carried, not zeroed — the mind's knowledge is unchanged, not lost
+            .recalled = recalled_n,
+            .trace = gpa.dupe(u8, "[\"idle-skip\"]") catch @constCast(""),
+            .files = 0,
+            .dt = w.nowSecs() - t0,
+            .llm_ok = false,
+        };
+    }
     const dg_block = if (w.depgraph_str.len > 0)
         std.fmt.allocPrint(gpa, "\nIMPORT GRAPH (who imports what — when you change a file, update the files that import it so they stay consistent):\n{s}", .{clip(w.depgraph_str, 1400)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
