@@ -274,17 +274,53 @@ pub const MAX_CASTS = 6;
 pub const CAST_TAIL = 40;
 pub const STREAM_CAP = 16384; // in-flight reply buffer — UI-side snapshot buffers MUST use this same constant
 pub const MAX_OLLAMA_MODELS = 48;
-pub const METRIC_RING = 60; // per-turn performance samples for the chat Metrics tab
+pub const METRIC_RING = 120; // performance samples for the chat Metrics tab. 120, not 60: the server path now
+//                              records one sample per LLM CALL (a trio turn is several), so a 60-slot ring held
+//                              only a handful of turns and a per-model breakdown had almost nothing to average.
+pub const MAX_METRIC_MODELS = 8; // distinct models the ring can attribute samples to (a trio, plus headroom for
+//                                  a mid-session model change and the same id served by two providers)
+pub const METRIC_MODEL_NONE: u8 = 0xFF; // TurnMetric.model sentinel — this sample carries NO model identity
+pub const METRIC_KIND_SERVER: u8 = 0xFF; // MetricModel.prov_kind sentinel — the SERVER resolved the provider,
+//                                          not this client, so no local kind/byok pair describes it
+pub const METRIC_MODEL_NAME_MAX = 96; // MetricModel.name capacity. Named so internMetricModel's LOOKUP key and
+//                                       its STORED key are cut to the same length — see internMetricModel.
 
-/// One completed chat turn's performance sample — the raw material for the Metrics tab's live graphs.
+/// One model the metric ring attributes samples to. INTERNED rather than embedded in every sample: a u8 index
+/// costs 1 byte in each of the METRIC_RING slots, where a 96-byte name inline would cost ~11KB inside the
+/// fixed-size, always-resident Store — for what is at most a handful of distinct models. Keyed by (name,
+/// provider) so the same model id served locally and server-side stays two honest rows instead of one blended
+/// average.
+pub const MetricModel = struct {
+    name: [METRIC_MODEL_NAME_MAX]u8 = [_]u8{0} ** METRIC_MODEL_NAME_MAX,
+    name_len: u8 = 0,
+    prov_kind: u8 = 0, // 0 local (Ollama) / 1 BYOK catalog / 2 custom URL / METRIC_KIND_SERVER
+    prov_byok: u8 = 0, // catalog.providers index when prov_kind == 1
+    pub fn nameStr(m: *const MetricModel) []const u8 {
+        return m.name[0..m.name_len];
+    }
+};
+
+/// One completed LLM call's performance sample — the raw material for the Metrics tab's live graphs.
 pub const TurnMetric = struct {
-    first_byte_ms: u32 = 0, // latency to the first streamed token
-    total_ms: u32 = 0, // wall-clock for the whole turn
+    first_byte_ms: u32 = 0, // ms to the first token — MEANINGLESS unless `streamed`; see below
+    total_ms: u32 = 0, // wall-clock for the whole call
     out_chars: u32 = 0, // characters produced (a ~4x proxy for output tokens)
     tok_per_s: f32 = 0, // approx output tokens/sec (out_chars/4 over the generation window)
     tools: u16 = 0, // tool calls fired on this turn
-    kind: u8 = 0, // Turn tag (0 user / 1 collect / 2 tool_follow / 3 reflect / 4 loop_infer)
+    // Turn tag = @intFromEnum(chat.Turn), which has NO explicit tag values: 0 idle / 1 user / 2 collect /
+    // 3 tool_follow / 4 reflect / 5 loop_infer / 6 consolidate. (The old comment here started at "0 user" and
+    // was off by one against that enum — anything decoding it named the wrong turn kind.)
+    kind: u8 = 0,
+    model: u8 = METRIC_MODEL_NONE, // index into Store.metric_models, or METRIC_MODEL_NONE when unattributed
+    role: u8 = 0, // the trio role this call was routed to: 0 coding / 1 thinking / 2 prompting
     ok: bool = true, // completed vs errored
+    // Did this call actually STREAM? Only then is first_byte_ms a real time-to-first-byte. Exactly one call per
+    // server-side inference (the "chat" call, via completeStream) streams; the others go through blocking
+    // llm.complete and report fb_ms == ms — total call time wearing a first-byte label. Consumers MUST NOT mix
+    // the two: a non-streamed sample still counts toward calls / tok-s / success / call-time, and is EXCLUDED
+    // from the first-byte average and the first-byte chart. DEFAULTS FALSE, which is also how a frame from an
+    // older server (no "streamed" field) must be read — we cannot vouch for that number, so we don't publish it.
+    streamed: bool = false,
 };
 
 /// One locally-installed Ollama model name (from GET /api/tags), for the Settings model dropdown.
@@ -727,9 +763,13 @@ pub const Store = struct {
     cast_tail_count: usize = 0,
     plan: [MAX_PLAN]PlanRow = undefined, // the ACTIVE conv's plan-board checklist (chat watchPlan writes, UI reads)
     plan_count: usize = 0,
-    // per-turn chat performance ring (chat worker appends, Metrics tab reads)
+    // per-call chat performance ring (chat worker appends, Metrics tab reads)
     turn_metrics: [METRIC_RING]TurnMetric = undefined,
-    turn_metric_count: usize = 0, // total turns recorded (may exceed the ring; @min with METRIC_RING to iterate)
+    turn_metric_count: usize = 0, // total samples recorded (may exceed the ring; @min with METRIC_RING to iterate)
+    // Interned model identities the ring's samples point at (TurnMetric.model). Append-only for the process's
+    // life — the table is tiny and a retired model's block simply stops gaining samples and ages out of the ring.
+    metric_models: [MAX_METRIC_MODELS]MetricModel = [_]MetricModel{.{}} ** MAX_METRIC_MODELS,
+    metric_model_count: usize = 0,
 
     // --- LLM usage metrics (poller writes from GET /api/v1/metrics/llm; Dashboard reads) ---
     llm_models: [MAX_LLM_MODELS]LlmModelRow = undefined,
@@ -833,13 +873,48 @@ pub const Store = struct {
         s.chat_cmd_head = (s.chat_cmd_head + 1) % CHAT_CMD_RING;
     }
 
-    /// Record one completed turn's performance sample (chat worker → Metrics tab).
-    pub fn pushMetric(s: *Store, m: TurnMetric) void {
-        log.trace("store.pushMetric kind={d} ok={} first_byte_ms={d} total_ms={d} tools={d}", .{ m.kind, m.ok, m.first_byte_ms, m.total_ms, m.tools });
+    /// Record one completed LLM call's performance sample (chat worker → Metrics tab), interning `model` together
+    /// with the provider identity that served it so the Metrics tab can break the ring down PER MODEL. An empty
+    /// `model` records an UNATTRIBUTED sample — the tab shows those in their own bucket rather than crediting
+    /// them to a model that may not have produced them.
+    pub fn pushMetric(s: *Store, m0: TurnMetric, model: []const u8, prov_kind: u8, prov_byok: u8) void {
+        log.trace("store.pushMetric kind={d} role={d} ok={} first_byte_ms={d} total_ms={d} tools={d} model={s}", .{ m0.kind, m0.role, m0.ok, m0.first_byte_ms, m0.total_ms, m0.tools, model });
         s.lock();
         defer s.unlock();
+        var m = m0;
+        m.model = s.internMetricModel(model, prov_kind, prov_byok);
         s.turn_metrics[s.turn_metric_count % METRIC_RING] = m;
         s.turn_metric_count += 1;
+    }
+
+    /// Intern one (model name, provider) pair into the metric model table, returning its index. CALLER MUST HOLD
+    /// THE LOCK (pushMetric does). Returns METRIC_MODEL_NONE for an empty name or a full table — an unattributed
+    /// sample is honest; silently folding a 9th model's numbers into another model's block is not.
+    ///
+    /// LOOKUP AND STORE USE THE SAME KEY. The row can only hold the first `MetricModel.name` bytes of a name, so
+    /// the search compares against the TRUNCATED key too. Comparing the stored (truncated) row against the
+    /// caller's FULL name — the previous behavior — meant an over-long name never matched the row it had just
+    /// written: every call appended another row until the table filled, after which every sample for that model
+    /// went unattributed. pushMetric is pub and promises no length precondition, so this must hold for any input.
+    /// The cost of truncating the key is that two names agreeing in their first 96 bytes share one row; that is a
+    /// far better failure than a model losing its identity outright.
+    fn internMetricModel(s: *Store, name: []const u8, prov_kind: u8, prov_byok: u8) u8 {
+        if (name.len == 0) return METRIC_MODEL_NONE;
+        const key = name[0..@min(name.len, METRIC_MODEL_NAME_MAX)];
+        var i: usize = 0;
+        while (i < s.metric_model_count) : (i += 1) {
+            const e = &s.metric_models[i];
+            if (e.prov_kind == prov_kind and e.prov_byok == prov_byok and std.mem.eql(u8, e.nameStr(), key)) return @intCast(i);
+        }
+        if (s.metric_model_count >= MAX_METRIC_MODELS) return METRIC_MODEL_NONE;
+        const idx = s.metric_model_count;
+        const e = &s.metric_models[idx];
+        @memcpy(e.name[0..key.len], key);
+        e.name_len = @intCast(key.len);
+        e.prov_kind = prov_kind;
+        e.prov_byok = prov_byok;
+        s.metric_model_count += 1;
+        return @intCast(idx);
     }
 
     /// Append `text` to a console scrollback (ai=Veil console, else You). Keeps the newest ~half on overflow.
@@ -972,4 +1047,69 @@ pub fn mkChatCmd(kind: ChatCmdKind, id: []const u8, text: []const u8) ChatComman
     @memcpy(c.text[0..tl], text[0..tl]);
     c.text_len = @intCast(tl);
     return c;
+}
+
+test "pushMetric interns per (model, provider) and leaves a nameless sample unattributed" {
+    const s = std.testing.allocator.create(Store) catch unreachable; // Store is far too big for a test stack frame
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    s.pushMetric(.{ .tok_per_s = 10, .role = 0 }, "gpt-oss:20b", 0, 0);
+    s.pushMetric(.{ .tok_per_s = 20, .role = 1 }, "llama3.1:8b", 0, 0);
+    s.pushMetric(.{ .tok_per_s = 30, .role = 0 }, "gpt-oss:20b", 0, 0); // same pair → same index
+    s.pushMetric(.{ .tok_per_s = 40, .role = 2 }, "gpt-oss:20b", 1, 3); // same NAME, other provider → new row
+    s.pushMetric(.{ .tok_per_s = 50 }, "", 0, 0); // no identity → unattributed, never credited to a model
+    try std.testing.expectEqual(@as(usize, 3), s.metric_model_count);
+    try std.testing.expectEqual(@as(u8, 0), s.turn_metrics[0].model);
+    try std.testing.expectEqual(@as(u8, 1), s.turn_metrics[1].model);
+    try std.testing.expectEqual(@as(u8, 0), s.turn_metrics[2].model);
+    try std.testing.expectEqual(@as(u8, 2), s.turn_metrics[3].model);
+    try std.testing.expectEqual(METRIC_MODEL_NONE, s.turn_metrics[4].model);
+    try std.testing.expectEqualStrings("gpt-oss:20b", s.metric_models[0].nameStr());
+    try std.testing.expectEqual(@as(u8, 1), s.metric_models[2].prov_kind);
+    try std.testing.expectEqual(@as(u8, 3), s.metric_models[2].prov_byok);
+    try std.testing.expectEqual(@as(usize, 5), s.turn_metric_count);
+}
+
+test "the metric model table never folds an overflow model into another model's block" {
+    const s = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    var nb: [8]u8 = undefined;
+    for (0..MAX_METRIC_MODELS + 2) |i| {
+        const nm = std.fmt.bufPrint(&nb, "m{d}", .{i}) catch unreachable;
+        s.pushMetric(.{}, nm, 0, 0);
+    }
+    try std.testing.expectEqual(@as(usize, MAX_METRIC_MODELS), s.metric_model_count);
+    try std.testing.expectEqual(METRIC_MODEL_NONE, s.turn_metrics[MAX_METRIC_MODELS].model);
+    try std.testing.expectEqual(METRIC_MODEL_NONE, s.turn_metrics[MAX_METRIC_MODELS + 1].model);
+}
+
+test "a name longer than the row still matches ITSELF (lookup and store use the same truncated key)" {
+    const s = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    // pushMetric is pub and states no length precondition. Before the fix this name was STORED truncated but
+    // LOOKED UP in full, so it never matched its own row: each call appended another until the table filled and
+    // every later sample fell out unattributed.
+    var long: [METRIC_MODEL_NAME_MAX + 40]u8 = undefined;
+    @memset(&long, 'x');
+    for (0..12) |_| s.pushMetric(.{}, long[0..], 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), s.metric_model_count);
+    try std.testing.expectEqual(@as(usize, 12), s.turn_metric_count);
+    for (0..12) |i| try std.testing.expectEqual(@as(u8, 0), s.turn_metrics[i].model);
+    try std.testing.expectEqual(@as(u8, METRIC_MODEL_NAME_MAX), s.metric_models[0].name_len);
+    // and a genuinely different long name is still its own row
+    long[0] = 'y';
+    s.pushMetric(.{}, long[0..], 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), s.metric_model_count);
+}
+
+test "TurnMetric.streamed defaults FALSE so an older server's sample is never read as a real first-byte" {
+    const s = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    s.pushMetric(.{ .first_byte_ms = 900, .total_ms = 900 }, "m", 0, 0); // no `streamed` given → not streamed
+    try std.testing.expectEqual(false, s.turn_metrics[0].streamed);
+    s.pushMetric(.{ .first_byte_ms = 120, .total_ms = 900, .streamed = true }, "m", 0, 0);
+    try std.testing.expectEqual(true, s.turn_metrics[1].streamed);
 }

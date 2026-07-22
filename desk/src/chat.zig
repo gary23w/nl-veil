@@ -701,6 +701,14 @@ pub const Chat = struct {
     first_byte_logged: bool = false, // one timing line per turn
     turn_start_ms: i64 = 0, // wall-clock (ms) this turn's model call started — for the Metrics tab
     turn_fb_ms: u32 = 0, // ms to the first streamed token this turn (0 until seen)
+    // WHICH MODEL ran this turn — stamped by startTurn beside turn_start_ms, read by recordMetric. It has to live
+    // HERE: recordMetric fires from pumpStream, where the resolved provider is long gone (startTurn's `prov` points
+    // into ITS stack buffers, which die when it returns), so without this copy every local sample was anonymous.
+    turn_model: [96]u8 = undefined,
+    turn_model_len: u8 = 0,
+    turn_model_kind: u8 = 0, // provider kind that served it: 0 local / 1 BYOK catalog / 2 custom URL
+    turn_model_byok: u8 = 0, // catalog.providers index when turn_model_kind == 1
+    turn_role_idx: u8 = 0, // the trio role this turn was routed to: 0 coding / 1 thinking / 2 prompting
     parallel_tip: bool = false, // shown the OLLAMA_NUM_PARALLEL tip once
     last_user: [1600]u8 = undefined, // the message that started the current .user turn (for cast recovery)
     last_user_len: usize = 0,
@@ -930,6 +938,13 @@ pub const Chat = struct {
     sc_chars: usize = 0, //      content chars streamed this turn (the ~4x token proxy, matching recordMetric)
     sc_tools: u32 = 0, //        tool calls this turn
     sc_tokens_out: u32 = 0, //   the backend's REAL output-token count from the {usage} frame (preferred over the proxy)
+    sc_err: bool = false, //     an {"kind":"error"} frame landed in THIS turn — the turn FAILED. Without this the
+    //                           whole-turn sample was hardcoded ok:true and the panel's success rate was pinned at
+    //                           100% forever (and barRow's red-bar branch was dead code).
+    sc_llm_frames: u32 = 0, //   per-call {"kind":"llm"} frames consumed this turn. When the server emits them the
+    //                           per-call samples ARE the record (one per model, which is the point of the trio
+    //                           breakdown) and the coarse whole-turn sample is skipped so the ring never mixes
+    //                           per-call and per-turn rows. Zero ⇒ older server: fall back to the turn sample.
     // ADAPTIVE /events poll: pumpServerChat is called every ~34ms tick while sc_active, and each call opens a FRESH
     // localhost TCP socket (Connection: close) for a full round-trip. Through the ~1.6s TTFT dead-window and the
     // inter-token lulls that is tens of empty 0-byte polls per turn — a sustained ~30 connect+close/sec piling up
@@ -1138,14 +1153,24 @@ pub const Chat = struct {
             .tok_per_s = tok_s,
             .tools = @intCast(@min(self.tool_iters, std.math.maxInt(u16))),
             .kind = @intFromEnum(kind),
+            .role = self.turn_role_idx,
             .ok = ok,
-        });
+            // The LOCAL path always streams (llm.start + pumpStream), and turn_fb_ms is stamped from
+            // stream.saw_any — a genuine first delta. Zero means nothing ever streamed (the call died before its
+            // first token), and then first_byte_ms is not a first-byte time at all, so don't claim one.
+            .streamed = self.turn_fb_ms > 0,
+        }, self.turn_model[0..self.turn_model_len], self.turn_model_kind, self.turn_model_byok);
     }
 
     /// Record one completed SERVER turn's performance into the Metrics ring — the server-path twin of recordMetric,
     /// sourced from the backend's own event stream (accumulated in renderScFrame). Keeps the Metrics tab live now
     /// that the brain is server-side (the local settle path that calls recordMetric never runs for a served conv).
+    ///
+    /// This is the COARSE fallback: it covers a whole turn that may have used all three trio models, so it can name
+    /// no model at all and its sample lands unattributed. When the server emits per-call {"kind":"llm"} frames,
+    /// recordLlmFrame has already recorded one honest per-model sample per call and this whole-turn row is skipped.
     fn recordServerMetric(self: *Chat) void {
+        const had_calls = self.sc_llm_frames > 0;
         const raw_total = self.nowMs() - self.sc_turn_start_ms;
         const total_ms: u32 = if (self.sc_turn_start_ms == 0 or raw_total <= 0 or raw_total > std.math.maxInt(u32)) 0 else @intCast(raw_total);
         const gen_ms = if (total_ms > self.sc_fb_ms) total_ms - self.sc_fb_ms else total_ms;
@@ -1153,7 +1178,9 @@ pub const Chat = struct {
         // usage frame carried none.
         const toks: f32 = if (self.sc_tokens_out > 0) @floatFromInt(self.sc_tokens_out) else @as(f32, @floatFromInt(self.sc_chars)) / 4.0;
         const tok_s: f32 = if (gen_ms > 0) toks / (@as(f32, @floatFromInt(gen_ms)) / 1000.0) else 0;
-        if (self.sc_turn_start_ms == 0) return; // an aborted/unstamped server turn is unmeasurable — skip, never crash
+        const unmeasurable = self.sc_turn_start_ms == 0; // aborted/unstamped server turn — skip, never crash
+        self.sc_turn_start_ms = 0; // consumed — the next send re-stamps (guards a stray duplicate {done})
+        if (unmeasurable or had_calls) return;
         self.store.pushMetric(.{
             .first_byte_ms = self.sc_fb_ms,
             .total_ms = total_ms,
@@ -1161,9 +1188,53 @@ pub const Chat = struct {
             .tok_per_s = tok_s,
             .tools = @intCast(@min(self.sc_tools, std.math.maxInt(u16))),
             .kind = @intFromEnum(Turn.user), // a server turn maps to the user-turn kind in the Metrics view
-            .ok = true,
-        });
-        self.sc_turn_start_ms = 0; // consumed — the next send re-stamps (guards a stray duplicate {done})
+            .ok = !self.sc_err, // a turn whose stream carried an {error} frame FAILED — see sc_err
+            // sc_fb_ms is stamped by renderScFrame off the FIRST streamed frame of the turn, so it is a real
+            // first-byte time whenever it is non-zero. A turn that produced no frame at all has none to report.
+            .streamed = self.sc_fb_ms > 0,
+        }, "", 0, 0); // no model identity: the desk never learns which model(s) a coarse server turn used
+    }
+
+    /// Record ONE completed server-side LLM call from its {"kind":"llm"} frame — the per-model, per-role sample
+    /// that makes the Metrics tab's trio breakdown real. Fields (server contract): model, role, label, ms, fb_ms,
+    /// streamed, in, out, ok, ts. Failures are recorded too (ok:false) so the success rate means something.
+    ///
+    /// `streamed` QUALIFIES `fb_ms`. Exactly one call per inference (the "chat" call, via completeStream) actually
+    /// streams; the other nine go through blocking llm.complete and report fb_ms == ms — total call time wearing a
+    /// first-byte label. Averaging those together would make every model look like it took seconds to first byte,
+    /// so the flag rides the sample and the Metrics tab excludes non-streamed rows from the first-byte figures
+    /// (they still count toward calls / tok-s / success / call time). A frame with NO `streamed` field came from
+    /// an older server and is read as FALSE — we cannot vouch for that number, so we don't publish it.
+    fn recordLlmFrame(self: *Chat, line: []const u8) void {
+        var mb: [96]u8 = undefined;
+        const raw_model = scRawField(line, "model") orelse return;
+        const model = scUnescape(raw_model, &mb);
+        if (model.len == 0) return;
+        const role_s = scRawField(line, "role") orelse "";
+        const role: u8 = if (std.mem.eql(u8, role_s, "thinking")) 1 else if (std.mem.eql(u8, role_s, "prompting")) 2 else 0;
+        const ms_i = jInt(line, "ms") orelse 0;
+        const fb_i = jInt(line, "fb_ms") orelse 0;
+        const out_i = jInt(line, "out") orelse 0;
+        const total_ms: u32 = if (ms_i > 0 and ms_i <= std.math.maxInt(u32)) @intCast(ms_i) else 0;
+        const fb_ms: u32 = if (fb_i > 0 and fb_i <= std.math.maxInt(u32)) @intCast(fb_i) else 0;
+        const out_tok: u32 = if (out_i > 0 and out_i <= std.math.maxInt(u32)) @intCast(out_i) else 0;
+        // tok/s over the GENERATION window (total minus first-byte), exactly as recordMetric measures it.
+        const gen_ms = if (total_ms > fb_ms) total_ms - fb_ms else total_ms;
+        const tok_s: f32 = if (gen_ms > 0 and out_tok > 0) @as(f32, @floatFromInt(out_tok)) / (@as(f32, @floatFromInt(gen_ms)) / 1000.0) else 0;
+        self.sc_llm_frames +|= 1;
+        self.store.pushMetric(.{
+            .first_byte_ms = fb_ms,
+            .total_ms = total_ms,
+            // out_chars is the char/4 token PROXY everywhere else; this frame carries real tokens, so re-express
+            // them in the field's own unit rather than storing two different meanings in one column.
+            .out_chars = out_tok *| 4,
+            .tok_per_s = tok_s,
+            .tools = 0, // an LLM call is not a tool call; tool counts belong to the whole-turn sample
+            .kind = @intFromEnum(Turn.user),
+            .role = role,
+            .ok = jBool(line, "ok") orelse true,
+            .streamed = jBool(line, "streamed") orelse false, // absent ⇒ older server ⇒ NOT a real first-byte
+        }, model, store_mod.METRIC_KIND_SERVER, 0);
     }
 
     /// The chat's hippocampus client (neuron-db). All ops no-op when the binary/db is unavailable.
@@ -1598,6 +1669,8 @@ pub const Chat = struct {
             self.sc_chars = 0;
             self.sc_tools = 0;
             self.sc_tokens_out = 0;
+            self.sc_err = false;
+            self.sc_llm_frames = 0;
             // Commit to the server for this turn. The SERVER now owns the loop (we passed loop_mode in the body), so
             // the desk's LOCAL auto-loop must NOT also drive turns — but do NOT clear the toggle (that would discard
             // the user's auto-loop/afk intent): sc_serving standing down the local maybeLoop keeps the desk from
@@ -1974,6 +2047,8 @@ pub const Chat = struct {
             return;
         }
         if (std.mem.eql(u8, kind, "error")) {
+            self.sc_err = true; // METRICS: this turn FAILED. The whole-turn sample used to be hardcoded ok:true,
+            //                     which pinned the Metrics panel's success rate at 100% no matter what happened.
             self.scCommitReason(dd);
             self.scCommitText(dd);
             var buf: [512]u8 = undefined;
@@ -2006,6 +2081,12 @@ pub const Chat = struct {
             if (jInt(line, "tokens_out")) |n| {
                 if (n > 0) self.sc_tokens_out = @intCast(@min(n, @as(i64, std.math.maxInt(u32))));
             }
+            return;
+        }
+        if (std.mem.eql(u8, kind, "llm")) {
+            // ONE completed server-side LLM call — the per-model/per-role sample the Metrics tab's trio breakdown
+            // is built from. Purely a metrics frame: nothing is drawn into the transcript for it.
+            self.recordLlmFrame(line);
             return;
         }
         if (std.mem.eql(u8, kind, "done")) {
@@ -3909,6 +3990,8 @@ pub const Chat = struct {
         self.sc_chars = 0;
         self.sc_tools = 0;
         self.sc_tokens_out = 0;
+        self.sc_err = false;
+        self.sc_llm_frames = 0;
         self.sc_serving = true; // the SERVER drives this conv — the local loop stands down
         self.setServerActive(true);
         self.setBusy(true);
@@ -4720,84 +4803,179 @@ pub const Chat = struct {
 
     // ------------------------------------------------------------------------------ conversations on disk
 
+    /// Staging capacity for one refresh: 4x the sidebar's display cap. The list is truncated to MAX_CONVS only
+    /// AFTER everything is staged and sorted — capping during the scan (the old behavior) discarded chats by
+    /// DIRECTORY ORDER, so past MAX_CONVS the newest ones were thrown away before the sort could ever see them.
+    const CONV_STAGE = store_mod.MAX_CONVS * 4;
+
+    /// One refresh's working set: the CONV_STAGE most recently active conversations seen so far (unordered), plus
+    /// a cached index of the oldest of them — the EVICTION FLOOR.
+    ///
+    /// WHY THE FLOOR IS CACHED, AND WHY NO TITLE IS READ HERE: refreshConvs runs on the chat worker every ~5s —
+    /// the same thread that pumps the live stream — over a directory under OneDrive, where stat and small reads
+    /// are both slow, and the scan is unbounded in the number of stored conversations. So per-entry cost is the
+    /// whole game. One stat decides whether an entry can reach the sidebar at all; `admits` then rejects it in
+    /// O(1) against the floor, and only an entry that actually displaces something pays the O(CONV_STAGE)
+    /// refloor. The 4KB title read is deferred to the survivors — see fillConvTitle.
+    const ConvStage = struct {
+        rows: [CONV_STAGE]store_mod.ConvRow = undefined,
+        /// Per row: must its TITLE still be read off disk? A local row leaves the scan with only an id and an
+        /// mtime; a server row arrives with its title already in hand.
+        needs_title: [CONV_STAGE]bool = undefined,
+        n: usize = 0,
+        /// Index of the min-mtime staged row. Only meaningful once `n == rows.len` — nothing is evicted before.
+        oldest: usize = 0,
+
+        /// Could a conversation last active at `mtime_s` still make the cut? O(1) — this is the gate that keeps a
+        /// scan over thousands of files cheap.
+        fn admits(s: *const ConvStage, mtime_s: i64) bool {
+            return s.n < s.rows.len or mtime_s > s.rows[s.oldest].mtime_s;
+        }
+
+        /// Stage a row, evicting the oldest once full. Callers MUST have cleared `admits` first.
+        fn put(s: *ConvStage, row: store_mod.ConvRow, needs_title: bool) void {
+            var slot = s.oldest;
+            if (s.n < s.rows.len) {
+                slot = s.n;
+                s.n += 1;
+            }
+            s.rows[slot] = row;
+            s.needs_title[slot] = needs_title;
+            if (s.n == s.rows.len) s.refloor();
+        }
+
+        /// Adopt a NEWER last-active time for an already-staged row (the server-merge clock donation). Raising
+        /// the row that WAS the floor moves the floor, and a stale — too high — floor silently rejects rows that
+        /// belong in the list, so recompute it.
+        fn touch(s: *ConvStage, i: usize, mtime_s: i64) void {
+            if (mtime_s <= s.rows[i].mtime_s) return;
+            s.rows[i].mtime_s = mtime_s;
+            if (s.n == s.rows.len and i == s.oldest) s.refloor();
+        }
+
+        fn refloor(s: *ConvStage) void {
+            var worst: usize = 0;
+            for (s.rows[0..s.n], 0..) |*r, i| {
+                if (r.mtime_s < s.rows[worst].mtime_s) worst = i;
+            }
+            s.oldest = worst;
+        }
+    };
+
+    /// Sidebar order: most recently active first. std.mem.sort is UNSTABLE, so two conversations sharing a second
+    /// (a fresh conv and its first mirror) would swap places between refreshes and make the sidebar jitter — and
+    /// cmdDeleteConv selects convs[0] as "the newest remaining", so a coin-flip there selects a coin-flip chat.
+    /// The id breaks the tie and makes the order total.
+    fn convNewerFirst(_: void, a: store_mod.ConvRow, b: store_mod.ConvRow) bool {
+        if (a.mtime_s != b.mtime_s) return a.mtime_s > b.mtime_s;
+        return std.mem.lessThan(u8, a.idStr(), b.idStr());
+    }
+
+    /// convNewerFirst over INDICES into `rows`. The order has to be decided BEFORE any title is read (that is the
+    /// point of deferring the reads), so the sort must carry the per-row "needs a title read" bookkeeping along
+    /// with the rows; sorting a permutation keeps the two in step without threading a second array through
+    /// std.mem.sort. Totality still comes from convNewerFirst's id tiebreaker.
+    fn convOrderNewerFirst(rows: []const store_mod.ConvRow, a: u16, b: u16) bool {
+        return convNewerFirst({}, rows[a], rows[b]);
+    }
+
+    /// Fill `row.title` from the head of its conv file — the EXPENSIVE half of a refresh, and the reason
+    /// selection happens on stat alone: this is a 4KB read per conversation on a OneDrive-backed tree, on the
+    /// worker thread that also pumps the live stream. Called only for rows that survived selection AND made the
+    /// sidebar's cap, so a refresh does at most MAX_CONVS of them however many chats are stored.
+    ///
+    /// Display title: the first line's {"title":"..."} when it is a real name, else the first message's text,
+    /// else left empty for the render's "New chat" fallback. NEVER the raw conv id — a chat must always show a
+    /// human name (the id is a storage key). Some mirrors wrote the id straight into the title line
+    /// (mirrorServerConv's old id fallback), so a title that EQUALS the id counts as "no title".
+    ///
+    /// Read a bounded PREFIX (readSinkHead), never readFileAlloc(.limited): a conv file grows past a few KB as
+    /// messages accrue, and a size-limited whole-file read then ERRORS — which is exactly why every conversation
+    /// lost its name once it got long enough (title read failed → fell back to the id).
+    ///
+    /// The path is rebuilt from the row's id rather than kept from the dirent. Ids are capped at ConvRow.id's 64
+    /// bytes — the server's own safeSeg ceiling — and a file whose stem exceeds that already cannot be opened or
+    /// deleted from the sidebar (loadMsgs and cmdDeleteConv both rebuild the path the same way), so it loses
+    /// nothing that worked.
+    fn fillConvTitle(self: *Chat, cdir: []const u8, row: *store_mod.ConvRow) void {
+        var fpb: [800]u8 = undefined;
+        const fp = std.fmt.bufPrint(&fpb, "{s}/{s}.jsonl", .{ cdir, row.idStr() }) catch return;
+        var headbuf: [4096]u8 = undefined;
+        const head = self.readSinkHead(fp, &headbuf);
+        const nl = std.mem.indexOfScalar(u8, head, '\n') orelse head.len;
+        var titled = false;
+        if (llm.jsonUnescape(self.gpa, head[0..nl], "title")) |t| {
+            defer self.gpa.free(t);
+            const tt = std.mem.trim(u8, t, " \r\n\t");
+            if (tt.len > 0 and !std.mem.eql(u8, tt, row.idStr())) {
+                const tn = @min(tt.len, row.title.len);
+                @memcpy(row.title[0..tn], tt[0..tn]);
+                row.title_len = @intCast(tn);
+                titled = true;
+            }
+        }
+        // no usable title → name the chat after its first message so the sidebar shows what it is ABOUT
+        if (!titled and nl + 1 < head.len) {
+            var lit = std.mem.splitScalar(u8, head[nl + 1 ..], '\n');
+            while (lit.next()) |line| {
+                if (line.len < 4) continue;
+                if (llm.jsonUnescape(self.gpa, line, "t")) |mt| {
+                    defer self.gpa.free(mt);
+                    const mm = std.mem.trim(u8, mt, " \r\n\t");
+                    if (mm.len > 0) {
+                        const tn = @min(mm.len, row.title.len);
+                        @memcpy(row.title[0..tn], mm[0..tn]);
+                        row.title_len = @intCast(tn);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     fn refreshConvs(self: *Chat, dd: []const u8, force: bool) void {
         _ = force;
-        var rows: [store_mod.MAX_CONVS]store_mod.ConvRow = undefined;
-        var n: usize = 0;
+        var stage: ConvStage = .{};
         var pb: [700]u8 = undefined;
         const cdir = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats", .{dd}) catch return;
         var dir = Io.Dir.cwd().openDir(self.io, cdir, .{ .iterate = true }) catch return;
         defer dir.close(self.io);
         var it = dir.iterate();
-        while (n < rows.len) {
+        while (true) {
             const e = (it.next(self.io) catch break) orelse break;
             if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".jsonl")) continue;
             const stem = e.name[0 .. e.name.len - 6];
             // scheduled-task runs stay OUT of the primary Chats list (user direction) — they're reachable via
             // the sidebar's Scheduled inner tab and the Scheduled top tab, where they belong.
             if (std.mem.startsWith(u8, stem, "scheduled_")) continue;
-            var row: store_mod.ConvRow = .{};
+            var fpb: [760]u8 = undefined;
+            const fp = std.fmt.bufPrint(&fpb, "{s}/{s}", .{ cdir, e.name }) catch continue;
+            // STAT ONLY — the timestamp alone decides whether this chat can reach the sidebar, and one stat is
+            // far cheaper than the 4KB head read a title costs. Select now, read titles later, for survivors.
+            var mtime_s: i64 = 0;
+            if (Io.Dir.cwd().statFile(self.io, fp, .{})) |st| {
+                mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
+            } else |_| {}
+            if (!stage.admits(mtime_s)) continue;
+            var row: store_mod.ConvRow = .{ .mtime_s = mtime_s };
             const idn = @min(stem.len, row.id.len);
             @memcpy(row.id[0..idn], stem[0..idn]);
             row.id_len = @intCast(idn);
-            var fpb: [760]u8 = undefined;
-            const fp = std.fmt.bufPrint(&fpb, "{s}/{s}", .{ cdir, e.name }) catch continue;
-            if (Io.Dir.cwd().statFile(self.io, fp, .{})) |st| {
-                row.mtime_s = @intCast(@divTrunc(st.mtime.nanoseconds, std.time.ns_per_s));
-            } else |_| {}
-            // Display title: the first line's {"title":"..."} when it is a real name, else the first message's
-            // text, else left empty for the render's "New chat" fallback. NEVER the raw conv id — a chat must
-            // always show a human name (the id is a storage key). Some mirrors wrote the id straight into the
-            // title line (mirrorServerConv's old id fallback), so a title that EQUALS the id counts as "no title".
-            // Read a bounded PREFIX (readSinkHead), never readFileAlloc(.limited): a conv file grows past a few
-            // KB as messages accrue, and a size-limited whole-file read then ERRORS — which is exactly why every
-            // conversation lost its name once it got long enough (title read failed → fell back to the id).
-            var headbuf: [4096]u8 = undefined;
-            {
-                const head = self.readSinkHead(fp, &headbuf);
-                const nl = std.mem.indexOfScalar(u8, head, '\n') orelse head.len;
-                var titled = false;
-                if (llm.jsonUnescape(self.gpa, head[0..nl], "title")) |t| {
-                    defer self.gpa.free(t);
-                    const tt = std.mem.trim(u8, t, " \r\n\t");
-                    if (tt.len > 0 and !std.mem.eql(u8, tt, stem)) {
-                        const tn = @min(tt.len, row.title.len);
-                        @memcpy(row.title[0..tn], tt[0..tn]);
-                        row.title_len = @intCast(tn);
-                        titled = true;
-                    }
-                }
-                // no usable title → name the chat after its first message so the sidebar shows what it is ABOUT
-                if (!titled and nl + 1 < head.len) {
-                    var lit = std.mem.splitScalar(u8, head[nl + 1 ..], '\n');
-                    while (lit.next()) |line| {
-                        if (line.len < 4) continue;
-                        if (llm.jsonUnescape(self.gpa, line, "t")) |mt| {
-                            defer self.gpa.free(mt);
-                            const mm = std.mem.trim(u8, mt, " \r\n\t");
-                            if (mm.len > 0) {
-                                const tn = @min(mm.len, row.title.len);
-                                @memcpy(row.title[0..tn], mm[0..tn]);
-                                row.title_len = @intCast(tn);
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            rows[n] = row;
-            n += 1;
+            stage.put(row, true); // title still owed — fillConvTitle pays for it only if this row survives
         }
         // SERVER MERGE: conversations born in the backend (a scheduled task's scheduled_* runs) have no
         // local file yet — fold the server's list in so they reach the sidebar. A local row wins on id
         // collision (its mirror may carry a user-edited title); server unreachable/denied → local list only.
+        // The loop is UNCONDITIONAL now: it used to be gated on "is there a free staging slot", which was false
+        // ON ENTRY the moment the local scan filled the (then MAX_CONVS-sized) buffer — so past 32 local chats
+        // the whole merge was skipped and every server-born conversation silently vanished from the sidebar.
+        // Staging admission (which can EVICT to make room) is what bounds it instead.
         if (self.runner().chatConvs(self.io, self.gpa)) |resp| {
             defer if (resp.body.len > 0) self.gpa.free(resp.body);
             if (resp.status == 200) {
                 if (std.mem.indexOf(u8, resp.body, "\"convs\":[")) |arr| {
                     var cur = arr + "\"convs\":[".len;
-                    const n_local = n; // only local rows participate in the dup check — server rows can't self-collide
-                    while (n < rows.len) {
+                    while (true) {
                         const obj = scan.nextJsonObj(resp.body, &cur) orelse break;
                         var row: store_mod.ConvRow = .{};
                         var pc: usize = 0;
@@ -4820,29 +4998,56 @@ pub const Chat = struct {
                         if (row.id_len == 0) continue;
                         // scheduled runs are listed under Scheduled, never merged into the Chats list
                         if (std.mem.startsWith(u8, row.idStr(), "scheduled_")) continue;
-                        var dup = false;
-                        for (rows[0..n_local]) |*r| {
+                        // Dup check runs over EVERY staged row, not just the local prefix: eviction above can
+                        // drop a local row, and a server row landing in its slot would otherwise let the same id
+                        // stage twice. Server rows can't self-collide, so widening the scan costs nothing.
+                        var dup: ?usize = null;
+                        for (stage.rows[0..stage.n], 0..) |*r, ri| {
                             if (std.mem.eql(u8, r.idStr(), row.idStr())) {
-                                dup = true;
+                                dup = ri;
                                 break;
                             }
                         }
-                        if (dup) continue;
-                        rows[n] = row;
-                        n += 1;
+                        if (dup) |di| {
+                            // ONE CLOCK for the sort key, taking the MORE RECENT of the two. The server's
+                            // `updated` is its last-message time; the local row's is the conv FILE's mtime, which
+                            // a mirrorServerConv rewrite can bump past the last real message — but which also
+                            // moves for LOCAL activity the server never saw. Preferring the server unconditionally
+                            // froze the sort key of every server-known conversation at the last SERVER-side
+                            // message whenever turns ran on the local engine against a reachable server: with
+                            // Server chat off, or after routeToServerChat fell back to local on a non-2xx and
+                            // armed sc_cooldown_until. This block is NOT gated on Settings.server_chat while the
+                            // send path IS, so that combination is ordinary, not exotic. max() keeps "last active"
+                            // meaning last active on EITHER side. The local TITLE still wins (it may be
+                            // user-edited), so the row keeps needing its head read.
+                            stage.touch(di, row.mtime_s);
+                            continue;
+                        }
+                        if (!stage.admits(row.mtime_s)) continue;
+                        stage.put(row, false); // the server sent the title with the row — nothing to read
                     }
                 }
             }
         }
-        std.mem.sort(store_mod.ConvRow, rows[0..n], {}, struct {
-            fn lt(_: void, a: store_mod.ConvRow, b: store_mod.ConvRow) bool {
-                return a.mtime_s > b.mtime_s;
-            }
-        }.lt);
+        // ORDER FIRST, CAP SECOND, READ TITLES LAST. The cap belongs after the sort, so the sidebar keeps the
+        // MAX_CONVS most recently active conversations rather than the first MAX_CONVS the directory happened to
+        // list (cmdDeleteConv treats convs[0] as "the newest remaining conversation" and selects it, so a wrong
+        // order also selects the wrong chat after a delete) — and the title reads belong after the cap, so their
+        // count is bounded by what the sidebar can SHOW, not by how many conversations are stored on disk.
+        comptime std.debug.assert(CONV_STAGE <= std.math.maxInt(u16)); // the permutation is u16-indexed
+        var order: [CONV_STAGE]u16 = undefined;
+        for (0..stage.n) |i| order[i] = @intCast(i);
+        std.mem.sort(u16, order[0..stage.n], @as([]const store_mod.ConvRow, stage.rows[0..stage.n]), convOrderNewerFirst);
+        const keep = @min(stage.n, store_mod.MAX_CONVS);
+        var out: [store_mod.MAX_CONVS]store_mod.ConvRow = undefined;
+        for (order[0..keep], 0..) |si, oi| {
+            out[oi] = stage.rows[si];
+            if (stage.needs_title[si]) self.fillConvTitle(cdir, &out[oi]);
+        }
         self.store.lock();
         defer self.store.unlock();
-        @memcpy(self.store.convs[0..n], rows[0..n]);
-        self.store.conv_count = n;
+        @memcpy(self.store.convs[0..keep], out[0..keep]);
+        self.store.conv_count = keep;
     }
 
     fn convPath(dd: []const u8, id: []const u8, buf: []u8) ?[]const u8 {
@@ -5358,6 +5563,30 @@ pub const Chat = struct {
         return .{ .base_url = base_buf[0..bn], .key = key_buf[0..kn], .model = model_buf[0..mn] };
     }
 
+    /// The PROVIDER IDENTITY (kind + catalog index) a trio role resolves to — resolveProviderFor's fallback rules
+    /// minus the buffers. resolveProviderFor returns only base/key/model, and the Metrics tab needs to name the
+    /// provider that served each model; asking for it separately keeps that function's signature (and its six
+    /// call sites) untouched.
+    fn providerIdentFor(self: *Chat, role: Role) struct { kind: u8, byok: u8 } {
+        self.store.lock();
+        defer self.store.unlock();
+        const s = &self.store.settings;
+        var kind = s.chat_kind;
+        var byok = s.chat_byok;
+        if (!s.chat_unified) {
+            const rc: ?*const store_mod.RoleCfg = switch (role) {
+                .coding => null,
+                .thinking => if (s.chat_think.set) &s.chat_think else null,
+                .prompting => if (s.chat_prompt.set) &s.chat_prompt else null,
+            };
+            if (rc) |r| {
+                kind = r.kind;
+                byok = r.byok;
+            }
+        }
+        return .{ .kind = kind, .byok = byok };
+    }
+
     /// "Sunday 2026-07-05 14:03 UTC" — the model gets a real clock every turn (it has no other one).
     fn dateLine(self: *Chat, buf: []u8) []const u8 {
         const now = self.nowS();
@@ -5606,6 +5835,19 @@ pub const Chat = struct {
         self.draft_latched = false; // each turn re-earns its drafting presentation
         self.turn_start_ms = self.nowMs();
         self.turn_fb_ms = 0;
+        // METRICS: stamp WHICH model and role this turn actually ran on, beside the start time. It must be COPIED
+        // here — prov.model points into `mb`, a stack buffer that dies when startTurn returns, and recordMetric
+        // runs later from pumpStream where the resolved provider is out of scope entirely. Stamped only AFTER
+        // llm.start succeeded, so a failed start can't leave a stamp with no sample behind it.
+        {
+            const pid = self.providerIdentFor(turn_role);
+            const mn = @min(prov.model.len, self.turn_model.len);
+            @memcpy(self.turn_model[0..mn], prov.model[0..mn]);
+            self.turn_model_len = @intCast(mn);
+            self.turn_model_kind = pid.kind;
+            self.turn_model_byok = pid.byok;
+            self.turn_role_idx = @intFromEnum(turn_role);
+        }
         self.setBusy(true);
         self.setStatus("thinking...");
         log.info("chat turn start: kind={t} tier={s} prompt={d}b model_msgs history", .{ kind, tier.label(), msgs.items.len });
@@ -11297,11 +11539,35 @@ fn jInt(line: []const u8, key: []const u8) ?i64 {
     var v: i64 = 0;
     var any = false;
     while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {
-        v = v * 10 + (line[i] - '0');
+        // A corrupt or truncated line can carry more digits than an i64 holds, and the desk builds
+        // ReleaseSafe — so a plain `v * 10 + d` would TRAP and take the whole process down over one
+        // bad byte in an event stream we do not control. Refusing the value degrades to "field
+        // absent", which every caller already handles.
+        v = std.math.mul(i64, v, 10) catch return null;
+        v = std.math.add(i64, v, @as(i64, line[i] - '0')) catch return null;
         any = true;
     }
     if (!any) return null;
     return if (neg) -v else v;
+}
+
+/// jInt's boolean twin: the bare `true`/`false` value of "key" in a flat JSON line, or null when the key is
+/// absent (or carries something else). Used for the {"kind":"llm"} frame's "ok", where "missing" and "false"
+/// must NOT collapse into the same answer — a missing ok means the server didn't say, not that the call failed.
+fn jBool(line: []const u8, key: []const u8) ?bool {
+    var kbuf: [40]u8 = undefined;
+    if (key.len + 3 > kbuf.len) return null;
+    kbuf[0] = '"';
+    @memcpy(kbuf[1 .. 1 + key.len], key);
+    kbuf[1 + key.len] = '"';
+    kbuf[2 + key.len] = ':';
+    const needle = kbuf[0 .. 3 + key.len];
+    const at = std.mem.indexOf(u8, line, needle) orelse return null;
+    var i = at + needle.len;
+    while (i < line.len and line[i] == ' ') i += 1;
+    if (std.mem.startsWith(u8, line[i..], "true")) return true;
+    if (std.mem.startsWith(u8, line[i..], "false")) return false;
+    return null;
 }
 
 var jstr_buf: [64]u8 = undefined;
@@ -12479,6 +12745,208 @@ test "jsonStrInto unescapes; extractToolResult picks the right field" {
     // list_swarms has no string field -> raw body handed back
     const raw = "{\"ok\":true,\"tool\":\"list_swarms\",\"swarms\":[]}";
     try std.testing.expectEqualStrings(raw, extractToolResult(raw, &out));
+}
+
+test "jBool reads a bare true/false and reports MISSING as null, not false" {
+    const frame = "{\"kind\":\"llm\",\"model\":\"gpt-oss:20b\",\"ok\":false,\"streamed\":true,\"ms\":120}";
+    try std.testing.expectEqual(@as(?bool, false), jBool(frame, "ok"));
+    try std.testing.expectEqual(@as(?bool, true), jBool(frame, "streamed"));
+    try std.testing.expectEqual(@as(?bool, null), jBool(frame, "missing"));
+    try std.testing.expectEqual(@as(?bool, null), jBool(frame, "ms")); // a number is not a bool
+    try std.testing.expectEqual(@as(?bool, true), jBool("{\"ok\": true}", "ok")); // tolerate a space after the colon
+}
+
+test "recordLlmFrame records ONE per-model sample per server LLM call, failures included" {
+    const store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    const chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = undefined, .gpa = std.testing.allocator, .store = store };
+
+    chat.recordLlmFrame("{\"kind\":\"llm\",\"model\":\"gpt-oss:20b\",\"role\":\"coding\",\"label\":\"answer\",\"ms\":2000,\"fb_ms\":1000,\"streamed\":true,\"in\":900,\"out\":250,\"ok\":true,\"ts\":1}");
+    // A BLOCKING call: the server reports fb_ms == ms because it never saw a first byte, and says so.
+    chat.recordLlmFrame("{\"kind\":\"llm\",\"model\":\"claude-x\",\"role\":\"thinking\",\"label\":\"plan\",\"ms\":500,\"fb_ms\":500,\"streamed\":false,\"in\":10,\"out\":20,\"ok\":true,\"ts\":2}");
+    // An OLDER server: no "streamed" field at all. Unknown must read as NOT streamed — we can't vouch for fb_ms.
+    chat.recordLlmFrame("{\"kind\":\"llm\",\"model\":\"claude-x\",\"role\":\"prompting\",\"label\":\"drive\",\"ms\":300,\"fb_ms\":50,\"in\":5,\"out\":0,\"ok\":false,\"ts\":3}");
+    chat.recordLlmFrame("{\"kind\":\"llm\",\"role\":\"coding\",\"ms\":10}"); // no model → not a sample at all
+
+    try std.testing.expectEqual(@as(usize, 3), store.turn_metric_count);
+    try std.testing.expectEqual(@as(u32, 3), chat.sc_llm_frames);
+    try std.testing.expectEqual(@as(usize, 2), store.metric_model_count); // two DISTINCT models, three calls
+    // trio roles ride the sample, so the UI can say which role(s) each model served
+    try std.testing.expectEqual(@as(u8, 0), store.turn_metrics[0].role);
+    try std.testing.expectEqual(@as(u8, 1), store.turn_metrics[1].role);
+    try std.testing.expectEqual(@as(u8, 2), store.turn_metrics[2].role);
+    // the two claude-x calls intern to ONE model row
+    try std.testing.expectEqual(store.turn_metrics[1].model, store.turn_metrics[2].model);
+    try std.testing.expect(store.turn_metrics[0].model != store.turn_metrics[1].model);
+    try std.testing.expectEqualStrings("gpt-oss:20b", store.metric_models[0].nameStr());
+    try std.testing.expectEqual(store_mod.METRIC_KIND_SERVER, store.metric_models[0].prov_kind);
+    // a FAILED call is still recorded — that is the only way the success rate can ever read below 100%
+    try std.testing.expectEqual(false, store.turn_metrics[2].ok);
+    try std.testing.expectEqual(true, store.turn_metrics[0].ok);
+    // timings verbatim; tok/s over the GENERATION window (2000-1000 = 1000ms for 250 tokens = 250/s)
+    try std.testing.expectEqual(@as(u32, 1000), store.turn_metrics[0].first_byte_ms);
+    try std.testing.expectEqual(@as(u32, 2000), store.turn_metrics[0].total_ms);
+    try std.testing.expectApproxEqAbs(@as(f32, 250.0), store.turn_metrics[0].tok_per_s, 0.01);
+    // `streamed` QUALIFIES fb_ms, and only the streaming call may claim one. The blocking call's fb_ms is
+    // recorded verbatim (throwing data away is worse) but flagged, and the Metrics tab drops it from the
+    // first-byte average and chart on that flag alone.
+    try std.testing.expectEqual(true, store.turn_metrics[0].streamed);
+    try std.testing.expectEqual(false, store.turn_metrics[1].streamed); // said false
+    try std.testing.expectEqual(false, store.turn_metrics[2].streamed); // said NOTHING — same conclusion
+}
+
+test "a server turn that errored is recorded as a FAILURE, and per-call samples suppress the coarse turn row" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    const chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = threaded.io(), .gpa = std.testing.allocator, .store = store }; // recordServerMetric reads the clock
+
+    // Old server (no {llm} frames): the coarse whole-turn sample is the record — and it must carry the failure.
+    chat.sc_turn_start_ms = 1;
+    chat.sc_fb_ms = 5;
+    chat.sc_err = true;
+    chat.recordServerMetric();
+    try std.testing.expectEqual(@as(usize, 1), store.turn_metric_count);
+    try std.testing.expectEqual(false, store.turn_metrics[0].ok); // was hardcoded true — success rate pinned 100%
+    try std.testing.expectEqual(store_mod.METRIC_MODEL_NONE, store.turn_metrics[0].model); // honestly unattributed
+    try std.testing.expectEqual(@as(i64, 0), chat.sc_turn_start_ms); // consumed either way
+
+    // New server: per-call samples already landed, so the coarse row is skipped (no mixing per-call with per-turn).
+    chat.sc_turn_start_ms = 1;
+    chat.sc_err = false;
+    chat.sc_llm_frames = 3;
+    chat.recordServerMetric();
+    try std.testing.expectEqual(@as(usize, 1), store.turn_metric_count);
+    try std.testing.expectEqual(@as(i64, 0), chat.sc_turn_start_ms);
+}
+
+test "providerIdentFor follows the trio fallback: an unset role inherits the coding provider" {
+    const store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    store.settings.chat_kind = 1;
+    store.settings.chat_byok = 4;
+    store.settings.chat_unified = false;
+    store.settings.chat_think = .{ .set = true, .kind = 0, .byok = 0 };
+    // prompting deliberately left unset
+
+    const chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = undefined, .gpa = std.testing.allocator, .store = store };
+    try std.testing.expectEqual(@as(u8, 1), chat.providerIdentFor(.coding).kind);
+    try std.testing.expectEqual(@as(u8, 4), chat.providerIdentFor(.coding).byok);
+    try std.testing.expectEqual(@as(u8, 0), chat.providerIdentFor(.thinking).kind); // its own local provider
+    try std.testing.expectEqual(@as(u8, 1), chat.providerIdentFor(.prompting).kind); // inherits coding
+    try std.testing.expectEqual(@as(u8, 4), chat.providerIdentFor(.prompting).byok);
+    // unified mode ignores the per-role config entirely
+    store.settings.chat_unified = true;
+    try std.testing.expectEqual(@as(u8, 1), chat.providerIdentFor(.thinking).kind);
+}
+
+test "conversation ordering: newest first, ties broken by id, cap applied AFTER the sort" {
+    const mk = struct {
+        fn row(id: []const u8, mtime: i64) store_mod.ConvRow {
+            var r: store_mod.ConvRow = .{ .mtime_s = mtime };
+            @memcpy(r.id[0..id.len], id);
+            r.id_len = @intCast(id.len);
+            return r;
+        }
+    }.row;
+    // "old" rows land FIRST, exactly as a directory scan that discovers them first would stage them
+    var rows = [_]store_mod.ConvRow{
+        mk("aaa", 100), mk("bbb", 100), // tie: id decides, so the order can't flip between refreshes
+        mk("ccc", 900), mk("ddd", 50),
+    };
+    std.mem.sort(store_mod.ConvRow, rows[0..], {}, Chat.convNewerFirst);
+    try std.testing.expectEqualStrings("ccc", rows[0].idStr());
+    try std.testing.expectEqualStrings("aaa", rows[1].idStr());
+    try std.testing.expectEqualStrings("bbb", rows[2].idStr());
+    try std.testing.expectEqualStrings("ddd", rows[3].idStr());
+    // truncating AFTER the sort keeps the NEWEST — truncating during the scan would have kept aaa/bbb and
+    // thrown ccc (the newest chat of all) away before the sort ever saw it
+    try std.testing.expectEqualStrings("ccc", rows[0..2][0].idStr());
+}
+
+fn tstConvRow(id: []const u8, mtime: i64) store_mod.ConvRow {
+    var r: store_mod.ConvRow = .{ .mtime_s = mtime };
+    @memcpy(r.id[0..id.len], id);
+    r.id_len = @intCast(id.len);
+    return r;
+}
+
+/// Does the staging set hold this id? (Test helper — the stage is unordered, so membership is a scan.)
+fn tstStaged(s: *const Chat.ConvStage, id: []const u8) bool {
+    for (s.rows[0..s.n]) |*r| {
+        if (std.mem.eql(u8, r.idStr(), id)) return true;
+    }
+    return false;
+}
+
+test "the conv stage keeps the newest, rejects an older candidate in O(1), and never over-reads" {
+    const s = std.testing.allocator.create(Chat.ConvStage) catch unreachable; // 128 rows — too big for a test frame
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    // fill: mtimes 1000, 1001, ... one per slot
+    var nb: [16]u8 = undefined;
+    for (0..Chat.CONV_STAGE) |i| {
+        const id = std.fmt.bufPrint(&nb, "f{d}", .{i}) catch unreachable;
+        try std.testing.expect(s.admits(1000 + @as(i64, @intCast(i))));
+        s.put(tstConvRow(id, 1000 + @as(i64, @intCast(i))), true);
+    }
+    try std.testing.expectEqual(@as(usize, Chat.CONV_STAGE), s.n);
+    try std.testing.expectEqual(@as(i64, 1000), s.rows[s.oldest].mtime_s); // floor = the oldest staged row
+    // An older chat is rejected without the caller ever touching its title — that O(1) rejection is the whole
+    // point: the scan is unbounded in stored conversations and runs on the stream-pumping worker thread.
+    try std.testing.expect(!s.admits(999));
+    try std.testing.expect(!s.admits(1000)); // a tie does not displace
+    // A newer one evicts exactly the oldest, and the floor moves up with it.
+    try std.testing.expect(s.admits(5000));
+    s.put(tstConvRow("new", 5000), true);
+    try std.testing.expectEqual(@as(usize, Chat.CONV_STAGE), s.n);
+    try std.testing.expect(tstStaged(s, "new"));
+    try std.testing.expect(!tstStaged(s, "f0")); // the 1000 row is the one that went
+    try std.testing.expectEqual(@as(i64, 1001), s.rows[s.oldest].mtime_s);
+}
+
+test "the server clock donation takes the MORE RECENT of the two clocks, and moves the eviction floor" {
+    const s = std.testing.allocator.create(Chat.ConvStage) catch unreachable;
+    defer std.testing.allocator.destroy(s);
+    s.* = .{};
+    s.put(tstConvRow("local-newer", 900), true);
+    s.put(tstConvRow("server-newer", 100), true);
+    // The server's `updated` is OLDER than the local file mtime — local activity the server never saw (turns run
+    // on the LOCAL engine while the server is merely reachable: Server chat off, or routeToServerChat fell back
+    // after a non-2xx). Preferring the server here froze the sort key and the chat stopped rising in the rail.
+    s.touch(0, 400);
+    try std.testing.expectEqual(@as(i64, 900), s.rows[0].mtime_s);
+    // and where the server IS ahead, its clock is adopted
+    s.touch(1, 700);
+    try std.testing.expectEqual(@as(i64, 700), s.rows[1].mtime_s);
+    // a donation of 0 (server sent no `updated`) never clobbers a real timestamp
+    s.touch(1, 0);
+    try std.testing.expectEqual(@as(i64, 700), s.rows[1].mtime_s);
+
+    // FLOOR: raising the row that WAS the floor must re-find it, or a stale (too high) floor rejects rows that
+    // belong in the list.
+    const f = std.testing.allocator.create(Chat.ConvStage) catch unreachable;
+    defer std.testing.allocator.destroy(f);
+    f.* = .{};
+    var nb: [16]u8 = undefined;
+    for (0..Chat.CONV_STAGE) |i| {
+        const id = std.fmt.bufPrint(&nb, "f{d}", .{i}) catch unreachable;
+        f.put(tstConvRow(id, 1000 + @as(i64, @intCast(i))), true);
+    }
+    const floor_i = f.oldest;
+    f.touch(floor_i, 9_000); // the floor row jumps to the top
+    try std.testing.expectEqual(@as(i64, 1001), f.rows[f.oldest].mtime_s); // floor re-found, not left at 1000
+    try std.testing.expect(f.admits(1002)); // a stale floor of 1000 would have wrongly rejected this
 }
 
 test "hasRealId distinguishes real ids from placeholders" {

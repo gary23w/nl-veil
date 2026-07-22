@@ -114,27 +114,54 @@ fn safeSeg(id: []const u8) []const u8 {
     return t;
 }
 
+/// One row of the conversation list, held until the whole directory has been scanned so the wire order can be
+/// chosen instead of inherited. `id` and `title` are arena-owned/arena-backed for the life of the request:
+/// `id` is a copy (the readdir entry's name buffer is reused on the next iteration) and `title` points into
+/// the arena-allocated messages.jsonl read, or at `id` when the conversation has no messages yet.
+const ConvRow = struct {
+    id: []const u8,
+    title: []const u8,
+    updated: i64,
+    msgs: usize,
+};
+
+/// NEWEST FIRST, with a total order — the sidebar's sort predicate.
+///
+/// std.mem.sort is UNSTABLE, so equal keys may be permuted arbitrarily and differently on each call. Ties are
+/// not hypothetical here: every conversation whose messages.jsonl is missing or carries no `ts` has
+/// `updated == 0`, and a fresh install can easily have several. Without the id tiebreaker two such rows swap
+/// places between one poll and the next and the sidebar flickers. Comparing the id segment (unique — it is
+/// the directory name) makes the order a function of the data alone.
+fn convNewerFirst(_: void, a: ConvRow, b: ConvRow) bool {
+    if (a.updated != b.updated) return a.updated > b.updated;
+    return std.mem.lessThan(u8, a.id, b.id);
+}
+
 /// GET /api/v1/chat/convs — list this user's conversations. Scans `{data}/u{uid}/_chat/convs/*/`, deriving
 /// {id,title,updated,msgs} from each conv's messages.jsonl (title = first message's content preview; updated
 /// = latest `ts` seen; msgs = non-empty line count), all defaulting gracefully. Missing convs root → [].
+///
+/// Rows are COLLECTED and then sorted newest-first before serializing. Writing them straight into the output
+/// buffer inside the readdir loop shipped raw filesystem order, which on any real store is name collation:
+/// ids group by prefix (c*, scheduled_*, web-*) and time does not enter into it, so the conversation the user
+/// just spoke in could render third from the top with the six oldest sitting in the middle.
 pub fn listConvs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const root = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs", .{ app.data, u.id });
 
-    var arr: std.ArrayListUnmanaged(u8) = .empty;
-    defer arr.deinit(app.gpa);
-    try arr.appendSlice(app.gpa, "{\"ok\":true,\"convs\":[");
+    var rows: std.ArrayListUnmanaged(ConvRow) = .empty; // res.arena-backed; freed with the request
 
     // No convs dir yet → return an empty list, never crash.
     if (std.Io.Dir.cwd().openDir(app.io, root, .{ .iterate = true })) |dir_const| {
         var dir = dir_const;
         defer dir.close(app.io);
         var it = dir.iterate();
-        var n: usize = 0;
         while (it.next(app.io) catch null) |ent| {
             if (ent.kind != .directory) continue;
-            const seg = safeSeg(ent.name);
-            if (seg.len == 0) continue; // stray/unsafe dir name — skip it, don't surface it
+            const seg_borrowed = safeSeg(ent.name);
+            if (seg_borrowed.len == 0) continue; // stray/unsafe dir name — skip it, don't surface it
+            // The iterator reuses its name buffer, so the id must be copied before the next next().
+            const seg = res.arena.dupe(u8, seg_borrowed) catch continue;
 
             // messages.jsonl is the conv's metadata source; absent (dir created but not yet written) → defaults.
             const mpath = std.fmt.allocPrint(res.arena, "{s}/{s}/messages.jsonl", .{ root, seg }) catch continue;
@@ -158,17 +185,24 @@ pub fn listConvs(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
             }
             if (title.len == 0) title = seg; // no messages yet → the id is the fallback title
 
-            if (n > 0) try arr.append(app.gpa, ',');
-            try arr.appendSlice(app.gpa, "{\"id\":");
-            try http.jstr(app.gpa, &arr, seg);
-            try arr.appendSlice(app.gpa, ",\"title\":");
-            try http.jstr(app.gpa, &arr, title);
-            const tail = try std.fmt.allocPrint(res.arena, ",\"updated\":{d},\"msgs\":{d}}}", .{ updated, msgs });
-            try arr.appendSlice(app.gpa, tail);
-            n += 1;
+            rows.append(res.arena, .{ .id = seg, .title = title, .updated = updated, .msgs = msgs }) catch continue;
         }
     } else |_| {}
 
+    std.mem.sort(ConvRow, rows.items, {}, convNewerFirst);
+
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    defer arr.deinit(app.gpa);
+    try arr.appendSlice(app.gpa, "{\"ok\":true,\"convs\":[");
+    for (rows.items, 0..) |r, i| {
+        if (i > 0) try arr.append(app.gpa, ',');
+        try arr.appendSlice(app.gpa, "{\"id\":");
+        try http.jstr(app.gpa, &arr, r.id);
+        try arr.appendSlice(app.gpa, ",\"title\":");
+        try http.jstr(app.gpa, &arr, r.title);
+        const tail = try std.fmt.allocPrint(res.arena, ",\"updated\":{d},\"msgs\":{d}}}", .{ r.updated, r.msgs });
+        try arr.appendSlice(app.gpa, tail);
+    }
     try arr.appendSlice(app.gpa, "]}");
     res.content_type = .JSON;
     res.body = try res.arena.dupe(u8, arr.items);
@@ -481,6 +515,32 @@ pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 /// server turn reads it between drive steps + before each tool: `{"op":"stop"}` ends the turn; `{"op":"steer",
 /// "text":".."}` folds the user's mid-turn guidance in as a user message (posting to steer a running turn).
 /// Structural ownership: the path is under the caller's own uid prefix.
+///
+/// The response carries `live` — whether THIS op will actually be read — because writing the op is NOT the same
+/// as it being acted on. runTurn snapshots the control cursor to EOF at turn entry, so an op appended while no
+/// turn is running is behind every future turn's cursor: it is never drained, never folded in, and never
+/// deleted. A steer posted into that window used to answer {"ok":true} and then silently swallow the user's text
+/// forever. The op semantics are unchanged (the append still happens, and a stop written just before a turn
+/// starts is still harmlessly inert) — the caller is simply told whether anything can consume it, so a client
+/// that meant "say this to the running turn" can fall back to sending it as a normal message.
+///
+/// `live` IS NOT isTurnLive, and the difference is the whole point. "A turn is running" is not the question the
+/// client is asking: a turn that entered runTurn AFTER this line landed snapshots its cursor past it and will
+/// never read it, while isTurnLive still — correctly — says true. Answering with isTurnLive therefore hands the
+/// client a `true` for an op nobody will ever read, which is exactly the silent loss this field exists to close,
+/// just moved into a smaller window. chat_engine.turnWillConsume compares the live turn's PUBLISHED starting
+/// cursor against the offset this line landed at, so the answer is about this op rather than about the server.
+///
+/// SO IT CAN DISAGREE WITH getConv's `live`, which is still plain isTurnLive, and that is correct rather than a
+/// drift: they answer different questions. getConv's asks "should I keep polling this conversation" — about the
+/// server. This one asks "will these words be read" — about one line of one file. They differ only inside the
+/// window between an op landing and a turn snapshotting its cursor, where the true answers genuinely differ.
+///
+/// WHAT THIS DOES NOT PROMISE. The offset is measured before the append, so a second writer's line landing in
+/// between makes the real offset larger than the one compared — that direction only UNDER-reports (a `false`
+/// for an op that would in fact be read), never the reverse. And an explicit `stop` ends its turn without the
+/// closing salvage drain, so a steer racing a stop can still be read and discarded. `live:true` means "a running
+/// turn is reading from a point at or before this line", not "the model will certainly see these words".
 pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
     const id = req.param("id") orelse return badReq(res, "no id");
@@ -505,9 +565,22 @@ pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try http.jstr(app.gpa, &line, b.text);
     }
     try line.appendSlice(app.gpa, "}\n");
+
+    // Where this line will land. Taken BEFORE the append (http.appendFile does not report the offset it wrote
+    // at) and therefore a LOWER BOUND on the real one: a concurrent writer's line can only push ours further
+    // out, which can only make a reading turn's cursor compare more favourably, never less. Absent file → 0,
+    // which is also the cursor a turn snapshots from an absent file, so a first op is not spuriously orphaned.
+    const at: usize = if (std.Io.Dir.cwd().statFile(app.io, path, .{})) |st|
+        (std.math.cast(usize, st.size) orelse 0)
+    else |_|
+        0;
+
     http.appendFile(app.io, app.gpa, path, line.items) catch {};
 
-    try res.json(.{ .ok = true }, .{});
+    // Asked AFTER the append, and about THIS op rather than about the server: a turn that snapshots its cursor
+    // while we are writing lands at or past `at` and is reported honestly, in whichever direction is true. See
+    // the header for the two gaps that remain.
+    try res.json(.{ .ok = true, .live = chat_engine.turnWillConsume(app.io, seg, at) }, .{});
 }
 
 // ----- tiny JSON field readers (flat, escape-naive — enough for the list preview) ------------
@@ -636,6 +709,64 @@ pub fn convFile(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, full, res.arena, .limited(FILE_MAX)) catch return notFound(res);
     res.content_type = .TEXT;
     res.body = data;
+}
+
+test "conv list sorts newest-first, and equal `updated` is broken deterministically by id" {
+    const t = std.testing;
+
+    // The live symptom this guards: readdir hands the convs back in NAME collation, which groups by id prefix
+    // (c*, scheduled_*, web-*) and knows nothing about time — so the conversation the user just spoke in
+    // rendered third from the top with the six oldest ones sitting in the middle.
+    var rows = [_]ConvRow{
+        .{ .id = "c-old", .title = "older chat", .updated = 100, .msgs = 4 },
+        .{ .id = "scheduled_x_0101", .title = "a task run", .updated = 300, .msgs = 2 },
+        .{ .id = "c-newest", .title = "just spoke here", .updated = 900, .msgs = 9 },
+        .{ .id = "web-mid", .title = "browser chat", .updated = 500, .msgs = 7 },
+    };
+    std.mem.sort(ConvRow, &rows, {}, convNewerFirst);
+    try t.expectEqualStrings("c-newest", rows[0].id);
+    try t.expectEqualStrings("web-mid", rows[1].id);
+    try t.expectEqualStrings("scheduled_x_0101", rows[2].id);
+    try t.expectEqualStrings("c-old", rows[3].id);
+
+    // THE TIE CASE. Every conv with no messages (or none carrying a `ts`) has updated == 0, and std.mem.sort is
+    // UNSTABLE — without the id tiebreaker those rows may be permuted differently on each call and the sidebar
+    // flickers between polls. Sorting two DIFFERENT input orders of the same tied set must give one answer.
+    var a = [_]ConvRow{
+        .{ .id = "zed", .title = "z", .updated = 0, .msgs = 0 },
+        .{ .id = "alpha", .title = "a", .updated = 0, .msgs = 0 },
+        .{ .id = "mid", .title = "m", .updated = 0, .msgs = 0 },
+        .{ .id = "beta", .title = "b", .updated = 0, .msgs = 0 },
+    };
+    var b = [_]ConvRow{
+        .{ .id = "beta", .title = "b", .updated = 0, .msgs = 0 },
+        .{ .id = "mid", .title = "m", .updated = 0, .msgs = 0 },
+        .{ .id = "alpha", .title = "a", .updated = 0, .msgs = 0 },
+        .{ .id = "zed", .title = "z", .updated = 0, .msgs = 0 },
+    };
+    std.mem.sort(ConvRow, &a, {}, convNewerFirst);
+    std.mem.sort(ConvRow, &b, {}, convNewerFirst);
+    for (a, b) |ra, rb| try t.expectEqualStrings(ra.id, rb.id);
+    try t.expectEqualStrings("alpha", a[0].id); // ascending id within a tie
+    try t.expectEqualStrings("zed", a[3].id);
+
+    // A tie between a dated and an undated conv must still put the dated one first: the tiebreaker only ever
+    // applies WITHIN an equal `updated`, never across one.
+    var mixed = [_]ConvRow{
+        .{ .id = "aaa-untouched", .title = "never spoken in", .updated = 0, .msgs = 0 },
+        .{ .id = "zzz-live", .title = "spoken in", .updated = 1, .msgs = 1 },
+    };
+    std.mem.sort(ConvRow, &mixed, {}, convNewerFirst);
+    try t.expectEqualStrings("zzz-live", mixed[0].id);
+
+    // The comparator must be a STRICT weak order — a `>=` here would make std.mem.sort's invariants undefined.
+    const same = ConvRow{ .id = "same", .title = "s", .updated = 7, .msgs = 1 };
+    try t.expect(!convNewerFirst({}, same, same));
+
+    // Degenerate input is still handled (the empty-store path returns an empty list, never crashes).
+    var none: [0]ConvRow = .{};
+    std.mem.sort(ConvRow, &none, {}, convNewerFirst);
+    try t.expectEqual(@as(usize, 0), none.len);
 }
 
 test "the host default fills each role on its own, and never mixes a pair" {

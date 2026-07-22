@@ -32,7 +32,10 @@ const S = {
   openTool: -1,         // index of the expanded tool chip, -1 = none
   serverDefault: { model: '', base_url: '' },  // what the host configured for users who pick nothing
   // chat
-  convs: [],
+  convs: [],            // the CHAT list: scheduled runs filtered out, newest first
+  allConvs: [],         // every conversation the server returned, untouched. Scheduled-task
+                        // runs live only here, and the Tasks tab reads them back out (taskRuns)
+                        // — filtering the rail must not amount to deleting the only route to them.
   conv: null,           // active conversation id
   msgs: [],             // [{role,content,kind,ts}]
   live: false,          // a turn is running for the active conv
@@ -91,6 +94,86 @@ function fmtWhen(ts) {
   }
   if ((now - d) / 86400000 < 7) return d.toLocaleDateString([], { weekday: 'short' });
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+/** The heading a conversation belongs under in the rail. Deliberately the SAME
+    three tiers fmtWhen draws above (today / inside the last week / older) so a
+    row's own stamp can never contradict the heading it sits beneath; "Yesterday"
+    is only that tier's first day named, because "Wed" directly under "This week"
+    tells a reader nothing they could not already see. */
+function convGroup(ts) {
+  if (!ts) return 'Earlier';
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) return 'Today';
+  const y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  if (d.toDateString() === y.toDateString()) return 'Yesterday';
+  if ((now - d) / 86400000 < 7) return 'This week';
+  return 'Earlier';
+}
+
+/** Newest first. ONE comparator for every conversation list in this client — the
+    dashboard's "recent" strip and the chat rail used to sort independently (the
+    rail did not sort at all), so the two views disagreed about what was newest.
+    std.mem.sort is unstable on the server side and Array#sort is only stable per
+    spec for the same input order, so ties break on id: a deterministic order
+    matters more than which id wins it. */
+function convByRecent(a, b) {
+  return (b.updated || 0) - (a.updated || 0) || String(a.id || '').localeCompare(String(b.id || ''));
+}
+
+/** Scheduled-task runs are conversations on disk, but they are not CHATS. The
+    desk excludes them from its Chats list on both the local and the server-merged
+    path (chat.zig:4738, 4822) and surfaces them under Scheduled instead; without
+    the same rule here the same account saw a different list in each UI — a dozen
+    `scheduled_*` rows nobody started by hand. The ENDPOINT stays complete (other
+    callers legitimately want every conversation); the membership rule is the
+    client's, exactly as it is on the desk. */
+function chatConvs(list) {
+  return (list || []).filter((c) => String(c.id || '').indexOf('scheduled_') !== 0);
+}
+
+/** …and the other half of that rule: the id of the TASK a run conversation belongs
+    to, '' if it is not a run at all. Filtering the rail only stays honest if the
+    runs remain reachable somewhere, and this is what routes them to the task card
+    that produced them.
+
+    A transliteration of paths.zig:schedParts, deliberately — "scheduled_{tid}_{stamp}"
+    split at the LAST underscore, stamp all digits and >= 4 of them, so a task id
+    may contain underscores and a hand-named conversation like "scheduled_notes"
+    is not mistaken for a run. Loosen it here and the server and the client would
+    disagree about which task a transcript came from. */
+/** How many bytes of a task id survive into a run's conversation id (sched.zig convIdFor:
+    64 - "scheduled_" - "_MMDDHHMM"). A segment of exactly this length was clipped. */
+const SCHED_TID_CLIP = 45;
+
+function schedTaskOf(id) {
+  const s = String(id || '');
+  const pre = 'scheduled_';
+  if (s.indexOf(pre) !== 0) return '';
+  const rest = s.slice(pre.length);
+  const us = rest.lastIndexOf('_');
+  if (us <= 0) return '';                       // no stamp, or an empty task id
+  const stamp = rest.slice(us + 1);
+  if (stamp.length < 4 || !/^[0-9]+$/.test(stamp)) return '';
+  return rest.slice(0, us);
+}
+
+/** Every run conversation of task `tid`, newest first. Reads the UNFILTERED list —
+    S.convs cannot answer this by construction. */
+function taskRuns(tid) {
+  if (!tid) return [];
+  // The server CLIPS the task id when it mints a run's conversation id — sched.zig convIdFor keeps
+  // only 64 - "scheduled_" - "_MMDDHHMM" = 45 bytes of it — so a task named longer than that never
+  // round-trips through schedTaskOf and an exact match silently returns nothing. Since task ids run
+  // to 59 bytes, that is not a corner case. A clipped segment is exactly SCHED_TID_CLIP long and is
+  // a prefix of the real id, which is the most we can honestly match on; requiring the exact clip
+  // length keeps a short task id from prefix-matching a longer one's runs.
+  return (S.allConvs || []).filter((c) => {
+    const seg = schedTaskOf(c.id);
+    if (!seg) return false;
+    return seg === tid || (seg.length === SCHED_TID_CLIP && tid.indexOf(seg) === 0);
+  }).sort(convByRecent);
 }
 
 function toast(title, body, cls) {
@@ -242,6 +325,7 @@ function onSignedOut() {
   S.keys = [];
   S.keysLoaded = false;
   S.convs = [];
+  S.allConvs = [];         // including the scheduled runs — same account boundary, same reset
   S.convsLoaded = false;   // same reasoning: the next account's history is unknown, not empty
   S.localUp = null;
   _probedModel = null;     // the cached backend probe described the PREVIOUS account's model
@@ -497,13 +581,13 @@ async function renderActivity() {
   const [swarms, tasks, convs] = await Promise.all([
     api.swarms().then((j) => j.swarms || []).catch(() => []),
     api.sched().then((j) => j.tasks || []).catch(() => []),   // 403s for non-admins; empty is the honest answer
-    api.convs().then((j) => j.convs || []).catch(() => []),
+    api.convs().then((j) => chatConvs(j.convs)).catch(() => []),   // scheduled runs are rows in the Tasks list above, not chats
   ]);
   if (S.tab !== 'dashboard') return;
 
   const live = swarms.filter((s) => swarmState(s) === 'live');
   const due = tasks.filter((t) => t.enabled).sort((a, b) => (a.next_due || 0) - (b.next_due || 0));
-  const recent = convs.slice().sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 5);
+  const recent = convs.slice().sort(convByRecent).slice(0, 5);
 
   const rows = [];
   for (const s of live) {
@@ -654,6 +738,13 @@ function renderChat(host) {
             </button>
             <input type="file" id="fileInput" accept="image/*" class="hide">
             <button class="btn btn-solid" id="sendBtn">Send</button>
+            <!-- Steering, as a REAL control. Enter cannot be the only way in: on touch
+                 Enter inserts a newline (see the keydown handler), so a keyboard-only
+                 affordance would leave every phone with no way to redirect a running
+                 turn at all. Visible exactly while a turn is live, beside Stop —
+                 the two things you can do to a turn in flight, in one place. -->
+            <button class="btn btn-steer hide" id="steerBtn"
+                    title="Send this to the running turn — it folds in as your next instruction">Post</button>
             <button class="btn btn-danger hide" id="stopBtn">Stop</button>
           </div>
           <div class="composer-foot">
@@ -688,6 +779,7 @@ function renderChat(host) {
     if (!effectiveModel()) return setTab('settings');
     sendTurn();
   });
+  el('steerBtn').addEventListener('click', () => steerTurn());
   el('stopBtn').addEventListener('click', () => sendControl('stop'));
   el('attachBtn').addEventListener('click', () => el('fileInput').click());
   el('fileInput').addEventListener('change', (e) => { if (e.target.files[0]) attachImage(e.target.files[0]); });
@@ -699,7 +791,12 @@ function renderChat(host) {
     // on-screen return key becomes send-and-lose-your-draft.
     if (e.key === 'Enter' && !e.shiftKey && matchMedia('(pointer: fine)').matches) {
       e.preventDefault();
-      sendTurn();
+      // MID-TURN, Enter steers instead of starting a turn. Posting to /messages
+      // while a turn runs can only 409 (service.zig refuses a second turn for the
+      // same conversation), so the old routing spent the user's line on a request
+      // that was guaranteed to fail — which is what "I can't steer the chat" was.
+      if (S.live) steerTurn();
+      else sendTurn();
     }
   });
   input.addEventListener('paste', (e) => {
@@ -787,8 +884,21 @@ function clearAttach() {
 async function refreshConvs() {
   try {
     const j = await api.convs();
-    S.convs = j.convs || [];
+    // Two rules, both the desk's, both applied HERE rather than asked of the server —
+    // /convs is meant to be the complete list, and other callers depend on that.
+    //   - membership: scheduled-task runs are not chats (chatConvs);
+    //   - order: newest first, deterministically (convByRecent).
+    // The list arrived in the server's own order, which the rail then rendered
+    // verbatim — so the sidebar and the dashboard's "recent" strip could disagree
+    // about which conversation was the newest one.
+    //
+    // The unfiltered list is KEPT, not discarded: filtering is a rule about what
+    // the rail shows, and it must not become a rule about what the client knows.
+    // The Tasks tab reads the scheduled runs back out of it (taskRuns).
+    S.allConvs = j.convs || [];
+    S.convs = chatConvs(S.allConvs).sort(convByRecent);
   } catch (e) {
+    S.allConvs = [];
     S.convs = [];
   }
   // Set on BOTH paths: a failed fetch is still an answer as far as the transcript is concerned, and
@@ -803,11 +913,22 @@ async function refreshConvs() {
     host.innerHTML = '<div class="empty">no conversations yet</div>';
     return;
   }
-  host.innerHTML = S.convs.map((c) => `
+  // Date tiers. The list is already sorted newest-first, so a heading is emitted
+  // wherever the tier CHANGES — no grouping pass, no second sort, and the order
+  // inside a tier stays exactly the order above.
+  let tier = '';
+  host.innerHTML = S.convs.map((c) => {
+    const g = convGroup(c.updated);
+    const head = g === tier ? '' : `<div class="conv-group">${esc(g)}</div>`;
+    tier = g;
+    return head + `
     <button class="conv-row ${c.id === S.conv ? 'active' : ''}" data-conv="${esc(c.id)}">
       <div class="conv-title ellip">${esc(c.title || c.id)}</div>
       <div class="conv-meta"><span>${esc(fmtWhen(c.updated))}</span><span>${c.msgs || 0} msgs</span></div>
-    </button>`).join('');
+    </button>`;
+  }).join('');
+  // Still every row: the headings are siblings of the buttons, not wrappers, so
+  // this selector reaches the same set it always did.
   $$('[data-conv]', host).forEach((b) => b.addEventListener('click', () => openConv(b.dataset.conv, true)));
 }
 
@@ -1647,10 +1768,15 @@ function failToast(title, detail) {
 
 function setTurnUi(live) {
   S.live = live;
-  const send = el('sendBtn'), stop = el('stopBtn'), st = el('turnStatus');
+  const send = el('sendBtn'), steer = el('steerBtn'), stop = el('stopBtn'), st = el('turnStatus');
   if (!send) return;
   send.classList.toggle('hide', live);
+  // Send is replaced by the two things a running turn accepts: Post (steer it) and
+  // Stop (end it). The composer is never left with no action on it.
+  if (steer) steer.classList.toggle('hide', !live);
   stop.classList.toggle('hide', !live);
+  const input = el('input');
+  if (input) input.placeholder = live ? 'Steer the running turn…' : 'Ask the veil…';
   if (st && !live) st.textContent = '';
 }
 
@@ -1699,9 +1825,19 @@ document.addEventListener('click', (e) => {
   if (t) setTab(t.dataset.goto);
 });
 
-async function sendTurn() {
+/** Start a turn.
+ *
+ *  `opts.text`  — send THIS line instead of the composer's. Used by the steer
+ *                 fallback, which is re-sending a line the composer no longer
+ *                 holds; taking it from the input there would send whatever the
+ *                 user has typed since and lose the original.
+ *  `opts.noSteer` — do not convert a 409 into a steer. Set by the steer path, so
+ *                 the two recoveries can never bounce a line back and forth.
+ */
+async function sendTurn(opts) {
   const input = el('input');
-  const text = input.value.trim();
+  const given = opts && opts.text ? String(opts.text).trim() : '';
+  const text = given || input.value.trim();
   if (!text) return;
   // THE gate, not the button. syncSetupState relabels the send control when there
   // is no model, but the control is only one of the ways a turn starts — Enter on
@@ -1741,31 +1877,221 @@ async function sendTurn() {
   // Sending is an explicit act: resume following even if they had scrolled up to read
   // history. Without this the reply would stream in off-screen, below the fold.
   resumeFollowing(el('transcript'));
-  input.value = '';
-  autoGrow(input);
-  updateCharCount();
+  // Only when the line CAME from the composer. A re-send carries its own text and
+  // must leave whatever the user has typed since exactly where it is.
+  if (!given) {
+    input.value = '';
+    autoGrow(input);
+    updateCharCount();
+  }
   clearAttach();
+  // What the client currently knows about a turn. The next three lines throw it
+  // away on the ASSUMPTION that this POST starts a fresh turn — but the POST can
+  // come back 409 "already running", and then the assumption was wrong and the
+  // reply that IS on screen was just erased. Snapshot before, rewind after: see
+  // rewindStream.
+  const snap = { stream: S.stream, openTool: S.openTool, cursor: S.cursor, rebased: 0 };
   resetStream();
   setTurnUi(true);
   drawTranscript();
 
   await baselineCursor();
+  snap.rebased = S.cursor;   // where baselineCursor left it; rewinding is only safe from here
 
   try {
     await api.send(S.conv, body);
     startPoll();
     refreshConvs();
   } catch (e) {
+    // 409 is its own thing and must NOT fall through to setTurnUi(false) — see onSendBusy.
+    if (e.status === 409) return onSendBusy(e, text, opts, snap);
     setTurnUi(false);
     // The 403 here is NOT "chat is admin-only" — that gate is gone (service.zig:292
     // opened postMessage to every authed user). The only 403 this route can still
     // produce is a banned account (http.zig:62,66), so the old label sent a
     // suspended user hunting for an admin setting that does not exist.
-    if (e.status === 409) toast('Busy', e.message, 'err');
-    else failToast(e.status === 403 ? 'Account suspended' : 'Could not send', e.message);
+    failToast(e.status === 403 ? 'Account suspended' : 'Could not send', e.message);
     S.stream.status = 'failed: ' + (e.message || 'unknown');
     drawTranscript();
   }
+}
+
+/** THE bug that made the web client unsteerable.
+ *
+ *  A 409 means something is already running, and for the common case
+ *  (service.zig:366-368) that something is THIS conversation's turn. The old
+ *  handler answered it with setTurnUi(false) — the client then believed no turn
+ *  was live while the server ran one, so every later attempt routed back into
+ *  sendTurn, 409'd again, and no steer path was ever reachable. One Enter during
+ *  a turn was enough to strand the conversation for its whole duration.
+ *
+ *  So: keep the live UI up, resume the poll, and hand the line to the running
+ *  turn instead of throwing it away. The ONE 409 that does not mean "this
+ *  conversation is busy" is the local-model budget (service.zig:431-435), where a
+ *  DIFFERENT chat holds the machine's only local slot and this conversation is
+ *  genuinely idle — steering there would write to a control file nobody reads. */
+async function onSendBusy(e, text, opts, snap) {
+  const msg = String(e.message || '');
+  const otherChat = /local model busy/i.test(msg);
+
+  if (!otherChat) {
+    // The turn we just erased is the turn the server says is running. Put its
+    // partial reply, its tool chips and its read position back BEFORE anything
+    // repaints, or steering reads as "the answer restarted mid-sentence".
+    rewindStream(snap);
+    setTurnUi(true);          // the server just said the turn IS running; believe it
+    if (!S.poll) startPoll();  // and go back to watching it
+    if (!(opts && opts.noSteer)) {
+      // Reuse the echo already in the transcript: the same words, delivered the
+      // way a running turn accepts them. postSteer re-checks liveness itself, so
+      // a stale 409 cannot strand the text here either.
+      if (await postSteer(text, { echoed: true })) return;
+    }
+  } else {
+    setTurnUi(false);
+  }
+  // Undeliverable: take the optimistic echo back out and give the words to the
+  // person who typed them, rather than leaving a message in the transcript that
+  // the model never saw.
+  dropEcho(text);
+  restoreDraft(text);
+  toast('Busy', msg, 'err');
+  drawTranscript();
+}
+
+/** Undo sendTurn's speculative resetStream()+baselineCursor() after the POST turned
+    out to be a 409 against a turn that is STILL RUNNING.
+ *
+ *  Stream and cursor are rewound TOGETHER, and that is what makes it safe: the
+ *  snapshot's cursor is the byte offset the snapshot's stream already accounts
+ *  for, so the next poll re-reads exactly the frames that were dropped — no gap,
+ *  no double-application.
+ *
+ *  The one case it declines: if something polled while the POST was in flight it
+ *  has already applied frames past `rebased` into the CURRENT stream, and those
+ *  frames include `message` ones that append to S.msgs. Replaying those would
+ *  duplicate messages, so the newer state wins and the old partial stays lost —
+ *  strictly better than the alternative, and it is the rare path. */
+function rewindStream(snap) {
+  if (!snap) return;
+  if (S.cursor !== snap.rebased) return;
+  S.stream = snap.stream;
+  S.openTool = snap.openTool;
+  S.cursor = snap.cursor;
+  if (S.stream.text) scheduleType();   // the reveal loop stopped when the text vanished
+}
+
+/** Remove the optimistic echo of `text` — only if it is still the last message,
+    so a frame that arrived in between is never eaten. drawTranscript rebuilds
+    from scratch whenever S.msgs shrinks below what it drew, so the node goes too. */
+function dropEcho(text) {
+  const last = S.msgs[S.msgs.length - 1];
+  if (last && last.role === 'user' && last.content === text) S.msgs.pop();
+}
+
+/** Give an undelivered line back to the composer, without clobbering a newer draft. */
+function restoreDraft(text) {
+  const input = el('input');
+  if (!input || input.value.trim()) return;
+  input.value = text;
+  autoGrow(input);
+  updateCharCount();
+}
+
+/** Is a turn still running for the open conversation? Only asked when the
+    /control answer did not say. null = could not find out. */
+async function convIsLive() {
+  if (!S.conv) return false;
+  try {
+    const j = await api.conv(S.conv);
+    return !!j.live;
+  } catch (e) {
+    return null;
+  }
+}
+
+/* ---------------- steering a live turn ----------------
+   The engine drains control.jsonl between drive steps and folds a `steer` op in
+   as a mid-turn user message (engine.zig:1160-1168, 5044-5053). The whole server
+   half of this already worked; there was simply no way to reach it from here. */
+
+/** Post the composer's line to the RUNNING turn. Falls back to an ordinary turn
+    whenever there turns out to be nothing running to steer. */
+async function steerTurn() {
+  const input = el('input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  if (!S.conv || !S.live) return sendTurn();   // nothing in flight — this is just a message
+  const conv = S.conv;
+
+  // An image cannot ride a control op (the route takes op + text only), so say so
+  // rather than dropping it. The attachment stays put for the next real turn.
+  if (_attach) toast('Image not sent', 'A steer carries text only — the image stays attached for your next message.', '');
+
+  // THE ECHO, and it is not cosmetic: the engine persists a folded steer to
+  // messages.jsonl (engine.zig:5051) but emits no `message` frame for it, and
+  // applyFrame calls resetStream() on every assistant frame and on done — so
+  // without this the user's line would be invisible until the conversation was
+  // reloaded, which reads exactly like the steer was ignored.
+  S.msgs.push({ role: 'user', content: text, ts: Math.floor(Date.now() / 1000) });
+  input.value = '';
+  autoGrow(input);
+  updateCharCount();
+  resumeFollowing(el('transcript'));   // posting is an explicit act; follow the answer again
+  drawTranscript();
+
+  // postSteer returns false for exactly one thing: the control POST itself failed
+  // (server restarted mid-turn, session expired, connection dropped). Nothing was
+  // delivered — so the same recovery onSendBusy already performs for the same
+  // failure has to happen here too. Without it the composer stays empty and the
+  // transcript keeps drawing a line the model was never given, which is precisely
+  // the silent text-loss this whole path exists to remove.
+  if (await postSteer(text, { echoed: true })) return;
+  if (S.conv !== conv) return;   // they moved on; do not paste this into another chat
+  dropEcho(text);
+  restoreDraft(text);
+  drawTranscript();
+}
+
+/** Deliver `text` to a running turn. Returns true when the words are on their way
+    to the model — by steer OR by the ordinary-message fallback. */
+async function postSteer(text, opts) {
+  const conv = S.conv;
+  let live = null;                    // tri-state: true / false / unknown
+  try {
+    const j = await api.control(conv, { op: 'steer', text: text });
+    if (j && typeof j.live === 'boolean') live = j.live;
+  } catch (e) {
+    failToast('Could not steer', e.message);
+    return false;
+  }
+  if (S.conv !== conv) return true;   // they switched conversations while we waited
+
+  // The silent-loss window: a steer appended AFTER the turn ended sits in
+  // control.jsonl, and the next turn snapshots its cursor past it — the words are
+  // on disk, read by nobody, with no error anywhere. The server's `live` flag
+  // closes it; an older server omits the field, so ask outright instead of hoping.
+  if (live === null) live = await convIsLive();
+
+  if (live === false) {
+    if (opts && opts.echoed) dropEcho(text);
+    setTurnUi(false);
+    stopPoll();
+    // Same words, ordinary route. noSteer so a 409 here cannot send us back.
+    await sendTurn({ text: text, noSteer: true });
+    return true;
+  }
+
+  setTurnUi(true);
+  if (!S.poll) startPoll();
+  if (live === null) {
+    // Neither the control answer nor the conversation could tell us. The steer is
+    // written; say plainly that we could not confirm it will be read.
+    toast('Posted', 'Could not confirm the turn is still running — re-send if nothing changes.', '');
+  }
+  drawTranscript();
+  return true;
 }
 
 async function sendControl(op, text) {
@@ -1794,7 +2120,11 @@ async function baselineCursor() {
   // it 404s. The 404 was already harmless (the cursor stays 0, which is correct for
   // an empty log), but it printed a red error in the console on every first message,
   // which reads like a fault. Nothing to baseline against, so do not ask.
-  if (!S.msgs.length && !S.convs.some((c) => c.id === S.conv)) return;
+  // allConvs, not convs: the question is "does the SERVER have this conversation",
+  // and a scheduled run opened from a task card is a conversation the server has
+  // and the rail's filter hides. Asking the filtered list would call a real
+  // transcript brand-new and skip its baseline.
+  if (!S.msgs.length && !S.allConvs.some((c) => c.id === S.conv)) return;
   try {
     const r = await req('/api/v1/chat/convs/' + encodeURIComponent(S.conv) + '/events?from=' + CURSOR_PROBE, null, 8000);
     if (!r.ok) return;
@@ -1938,6 +2268,11 @@ async function refreshTasks() {
   const host = el('taskList');
   if (!host) return;
   let tasks;
+  // Each card lists the task's own run TRANSCRIPTS, and those are conversations —
+  // they arrive on /convs, which this tab would otherwise never call. refreshConvs
+  // swallows its own errors and no-ops on the rail when the chat DOM is absent, so
+  // it is safe to run from here; both requests go out together.
+  const convsDone = refreshConvs();
   try {
     const j = await api.sched();
     tasks = j.tasks || [];
@@ -1951,8 +2286,19 @@ async function refreshTasks() {
     host.innerHTML = '<div class="empty">no scheduled tasks yet</div>';
     return;
   }
+  await convsDone;   // the run lists are drawn from it; draw once, with them
   host.innerHTML = tasks.map(taskCard).join('');
   $$('[data-task-run]', host).forEach((b) => b.addEventListener('click', () => runTask(b.dataset.taskRun)));
+  // Runs panel. The toggle finds its list through the CARD rather than by id, so a
+  // task id with a quote or a bracket in it cannot break the selector.
+  $$('[data-task-runs]', host).forEach((b) => b.addEventListener('click', () => {
+    const card = b.closest('.task-card');
+    const panel = card && card.querySelector('.task-runs');
+    if (!panel) return;
+    const hidden = panel.classList.toggle('hide');
+    b.textContent = (hidden ? 'Runs' : 'Hide runs') + ' (' + (b.dataset.runCount || '0') + ')';
+  }));
+  $$('[data-run-conv]', host).forEach((b) => b.addEventListener('click', () => openRunConv(b.dataset.runConv)));
   $$('[data-task-del]', host).forEach((b) => b.addEventListener('click', () => delTask(b.dataset.taskDel)));
   $$('[data-task-edit]', host).forEach((b) => {
     b.addEventListener('click', () => showTaskForm(tasks.find((t) => t.id === b.dataset.taskEdit)));
@@ -1968,8 +2314,28 @@ function taskSchedule(t) {
   return t.at ? 'once, ' + new Date(t.at * 1000).toLocaleString() : 'once';
 }
 
+/** Open a scheduled run's transcript in the Chat tab.
+ *
+ *  Deliberately the same two lines the dashboard's recent strip uses: set the
+ *  conversation, switch tab, and let renderChat do the single openConv. Calling
+ *  openConv here as well would race it — two GETs, two cursor baselines, two
+ *  polls for one click. */
+function openRunConv(id) {
+  if (!id) return;
+  S.conv = id;
+  setTab('chat');
+  // Phone layout is one column: without this the tab opens on the conversation
+  // RAIL, which does not list this run — it would look like nothing happened.
+  const root = el('chatRoot');
+  if (root) root.classList.add('on-thread');
+}
+
 function taskCard(t) {
   const bad = (t.fail_streak || 0) > 0;
+  // What the task actually PRODUCED. The runs are conversations the chat rail
+  // filters out by design, and this card is the only place they surface — without
+  // it a web user can see that a task ran 40 times and never read one word of it.
+  const runs = taskRuns(t.id);
   return `<div class="task-card panel">
     <div class="task-head">
       <div class="grow">
@@ -1988,11 +2354,19 @@ function taskCard(t) {
     </div>
     <div class="task-actions">
       <button class="btn btn-sm" data-task-run="${esc(t.id)}">Run now</button>
+      ${runs.length ? `<button class="btn btn-sm btn-ghost" data-task-runs="${esc(t.id)}" data-run-count="${runs.length}">Runs (${runs.length})</button>` : ''}
       <button class="btn btn-sm btn-ghost" data-task-edit="${esc(t.id)}">Edit</button>
       <button class="btn btn-sm btn-ghost" data-task-toggle="${esc(t.id)}" data-enabled="${t.enabled}">${t.enabled ? 'Pause' : 'Resume'}</button>
       <span class="grow"></span>
       <button class="btn btn-sm btn-danger" data-task-del="${esc(t.id)}">Delete</button>
     </div>
+    ${runs.length ? `<div class="task-runs hide">
+      ${runs.map((c) => `<button class="run-row" data-run-conv="${esc(c.id)}">
+        <span class="run-when">${esc(fmtWhen(c.updated))}</span>
+        <span class="run-title grow ellip">${esc(c.title || c.id)}</span>
+        <span class="run-msgs muted">${c.msgs || 0} msgs</span>
+      </button>`).join('')}
+    </div>` : ''}
   </div>`;
 }
 

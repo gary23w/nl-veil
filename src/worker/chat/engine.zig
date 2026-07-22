@@ -647,6 +647,136 @@ fn emitKV(app: *App, conv_dir: []const u8, kind: []const u8, field: []const u8, 
     emitEvent(app, conv_dir, ev.items);
 }
 
+// ---- PER-CALL MODEL ATTRIBUTION ON THE EVENT STREAM ---------------------------------------------------------
+// One `{"kind":"llm",...}` frame per COMPLETED LLM call of a turn, carrying the model that ACTUALLY served it.
+// Under the trio a single turn is served by up to three different models at three different prices, and until
+// now the event stream said nothing about which — a client watching a turn could not tell whether the slow part
+// was the coder, the planner, or the driver, and a per-turn `usage` frame cannot express it either.
+//
+// The frame is emitted BESIDE llm.zig's own per-call meter and reads the SAME numbers: `in`/`out` are the delta
+// of llm.tokensSnapshot() (the thread-local total llm.zig folds each call's usage into, which is also what
+// metrics.zig bills), so the stream and the Dashboard cannot drift apart. Failures are emitted too (`ok:false`,
+// and a failed call has no usage so its token counts are honestly 0) — otherwise a success rate read off the
+// stream would be 100% by construction.
+//
+// `streamed` SAYS WHETHER `fb_ms` IS A REAL FIRST-BYTE TIME. Exactly one of the ten labeled calls in a turn goes
+// through llm.completeStream ("chat"); the other nine — plan, loop, lesson, summary, searchq, stuck, reflect,
+// ctxsum, compact — are blocking llm.complete, where the engine sees the whole body arrive at once and has NO
+// first byte to time. Their fb_ms is the total call time wearing a first-byte label, so a panel that averaged
+// fb_ms across the trio showed the thinking/prompting models one to two orders of magnitude "slower to first
+// byte" than the coder purely as a measurement artifact. Consumers must NOT mix the two: a non-streamed sample
+// still counts toward turns / tok-s / success / turn-time and is EXCLUDED from any first-byte average or chart.
+// A frame with NO `streamed` field came from an older server and MUST be read as false — the safe reading,
+// because it means we cannot vouch for the number either way.
+//
+// Consumers ignore unknown kinds: the web app's applyFrame falls through to `default: return false`, the desk's
+// renderScFrame falls through to "any other kind: not rendered", and the CLI's renderConvFrames only matches
+// token/tool/status. Verified before adding the kind — see the task report.
+
+/// The conv_dir whose events.jsonl the turn on THIS thread writes to. Thread-local for the same reason
+/// metrics.zig's turn context is: a turn runs start-to-finish on one thread, and the labeled LLM calls are
+/// scattered across ten helpers, six of which never receive conv_dir. Armed at runTurn entry, cleared on exit.
+threadlocal var llm_frame_dir: [1024]u8 = undefined;
+threadlocal var llm_frame_dir_len: usize = 0;
+
+fn armLlmFrames(conv_dir: []const u8) void {
+    // A TRUNCATED path is worse than none — it would name a different directory. Refuse instead.
+    if (conv_dir.len == 0 or conv_dir.len > llm_frame_dir.len) {
+        llm_frame_dir_len = 0;
+        return;
+    }
+    @memcpy(llm_frame_dir[0..conv_dir.len], conv_dir);
+    llm_frame_dir_len = conv_dir.len;
+}
+
+fn disarmLlmFrames() void {
+    llm_frame_dir_len = 0;
+}
+
+/// One LLM call, measured from the engine's side of the transport: wall time, this thread's token delta, and
+/// (streaming only) the moment the first delta landed. Taken before the call, closed out after it.
+const CallMeter = struct {
+    t0_ms: i64,
+    tok0: llm.TokUsage,
+    /// Wall-clock ms of the first streamed delta, or 0 when nothing streamed. Only the streaming chat call can
+    /// set this; llm.completeStream falls back to a non-streaming complete() on any trouble, in which case it
+    /// stays 0 exactly as it does for a call that was never streaming to begin with.
+    ///
+    /// This is ALSO the sole source of the frame's `streamed` flag (see meterEnd): non-zero here means a delta
+    /// was genuinely observed, which is the only condition under which the emitted fb_ms is a real first-byte.
+    fb_ms: i64 = 0,
+};
+
+fn meterBegin(io: std.Io) CallMeter {
+    return .{ .t0_ms = nowMillis(io), .tok0 = llm.tokensSnapshot() };
+}
+
+/// Close a measured call out onto the event stream. `model` must be the model the call actually ran on (the
+/// role's resolved Provider.model), never the turn's configured default — that is the whole point of the frame.
+///
+/// `streamed` IS DERIVED FROM THE METER, not passed in per call site, and that is deliberate: it must report
+/// what the transport actually did, and only `m.fb_ms` knows. It is an absolute wall-clock stamp written by
+/// streamOnDelta, so it is non-zero if and only if at least one delta was observed. The nine blocking sites
+/// never touch it (false by construction — the safe default a forgotten new call site also gets), and the one
+/// streaming site is true only when deltas really landed: llm.completeStream silently falls back to a blocking
+/// complete() on any streaming trouble, and a hardcoded `true` at that site would then be a lie.
+fn meterEnd(app: *App, m: CallMeter, label: []const u8, role: Role, model: []const u8, ok: bool) void {
+    const r = meterReport(m, nowMillis(app.io));
+    const t1 = llm.tokensSnapshot();
+    emitLlmFrame(
+        app,
+        label,
+        role,
+        model,
+        r.ms,
+        r.fb_ms,
+        r.streamed,
+        if (t1.in >= m.tok0.in) t1.in - m.tok0.in else 0,
+        if (t1.out >= m.tok0.out) t1.out - m.tok0.out else 0,
+        ok,
+        nowSecs(app.io),
+    );
+}
+
+/// The three timing numbers a closed-out call reports, and the whole of the fb_ms/streamed relationship. Pure
+/// (clock passed in) so that relationship is testable without a server, an App, or a real inference.
+fn meterReport(m: CallMeter, now_ms: i64) struct { ms: u64, fb_ms: u64, streamed: bool } {
+    const ms: u64 = @intCast(@max(now_ms - m.t0_ms, 0));
+    const streamed = m.fb_ms > 0;
+    // A non-streamed call has no first byte the engine can observe before its last one — the whole body arrives
+    // in a single blocking return — so its fb_ms is its ms. The VALUE IS KEPT (rather than zeroed) and the
+    // `streamed:false` flag carries the meaning: zeroing would be indistinguishable from an absent field after
+    // any parse-with-default, would read as an instant response to a consumer that ignores the flag, and would
+    // change what already-shipped readers compute — this field feeds a `total - fb` generation window that is
+    // then divided into. Adding the flag is purely additive; rewriting the number would not be.
+    return .{ .ms = ms, .fb_ms = if (streamed) @intCast(@max(m.fb_ms - m.t0_ms, 0)) else ms, .streamed = streamed };
+}
+
+fn emitLlmFrame(app: *App, label: []const u8, role: Role, model: []const u8, ms: u64, fb_ms: u64, streamed: bool, tin: u64, tout: u64, ok: bool, ts: i64) void {
+    if (llm_frame_dir_len == 0) return; // no turn armed on this thread — nowhere to write
+    const gpa = app.gpa;
+    var ev: std.ArrayListUnmanaged(u8) = .empty;
+    defer ev.deinit(gpa);
+    renderLlmFrame(gpa, &ev, label, role, model, ms, fb_ms, streamed, tin, tout, ok, ts) catch return;
+    emitEvent(app, llm_frame_dir[0..llm_frame_dir_len], ev.items);
+}
+
+/// Render the shared `llm` frame into `out`. Split from the emit so its exact wire shape is testable without a
+/// server, an App, or a turn. `model` is BYOK-supplied text and is JSON-escaped; role/label are engine-owned.
+/// `streamed` sits next to `fb_ms` on the wire because it is the qualifier ON fb_ms — read either alone and you
+/// read a number whose meaning you don't know.
+fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), label: []const u8, role: Role, model: []const u8, ms: u64, fb_ms: u64, streamed: bool, tin: u64, tout: u64, ok: bool, ts: i64) !void {
+    try out.appendSlice(gpa, "{\"kind\":\"llm\",\"model\":");
+    try http.jstr(gpa, out, model);
+    try out.appendSlice(gpa, ",\"role\":");
+    try http.jstr(gpa, out, @tagName(role));
+    try out.appendSlice(gpa, ",\"label\":");
+    try http.jstr(gpa, out, label);
+    var b: [240]u8 = undefined;
+    const tail = try std.fmt.bufPrint(&b, ",\"ms\":{d},\"fb_ms\":{d},\"streamed\":{s},\"in\":{d},\"out\":{d},\"ok\":{s},\"ts\":{d}}}", .{ ms, fb_ms, if (streamed) "true" else "false", tin, tout, if (ok) "true" else "false", ts });
+    try out.appendSlice(gpa, tail);
+}
+
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
 pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8) void {
@@ -685,6 +815,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     defer gpa.free(conv_dir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, conv_dir, .default_dir) catch {};
 
+    // Arm this thread's per-call `llm` frame target. Same thread-local trick as metrics.beginTurn above, and for
+    // the same reason: the ten labeled call sites live in helpers that mostly never see conv_dir. Disarmed on
+    // every exit path so a recycled thread can never append a stray frame to a finished conversation.
+    armLlmFrames(conv_dir);
+    defer disarmLlmFrames();
+
     // ---- HIPPOCAMPUS scope: this conversation's own durable neuron-db partition (user turns + tool findings).
     // SCHEDULED RUNS get a TASK-scoped partition instead: every run of "scheduled_{taskid}_{stamp}" shares
     // "sched:{taskid}", so the recall at run start surfaces previous runs' lessons/answers and everything this
@@ -708,6 +844,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
     // ---- COOPERATIVE-STOP cursor: only control.jsonl ops written AFTER this byte offset count for THIS turn ----
     const ctrl_cursor = controlLen(app, conv_dir);
+    // PUBLISH it, immediately and before any other work: /control answers "will this op be read?" by comparing
+    // the offset its line landed at against this number. Until it is published that endpoint reports "no", which
+    // is the truth — a cursor snapshotted later than an op is a cursor that skips it.
+    publishCtrlCursor(app.io, conv, ctrl_cursor);
 
     // CLIENT-MODE: truncate the delegated-tool-results channel so this turn's scanToolChannel scan starts clean
     // (results are keyed by call id, but resetting keeps the file from growing across a long conversation).
@@ -1457,8 +1597,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         lq.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch break :outer;
         http.jstr(gpa, &lq, LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
+        const loop_cm = meterBegin(app.io);
         var next = llm.complete(gpa, app.io, run_root, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);
         defer next.deinit(gpa);
+        meterEnd(app, loop_cm, "loop", .prompting, prompt.model, next.ok);
 
         const trimmed = std.mem.trim(u8, next.content, " \r\n\t`*\"'");
         // A failed/empty drive inference always ends the turn (even afk — we can't determine a next step, and a
@@ -1628,8 +1770,10 @@ fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, t
     const saved = conv_buf.items.len;
     defer conv_buf.shrinkRetainingCapacity(saved); // the lesson question never rides into durable context
     conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
+    const lesson_cm = meterBegin(app.io);
     var next = llm.complete(gpa, app.io, run_root, "lesson", base_url, key, model, conv_buf.items, "", 256, 0.3);
     defer next.deinit(gpa);
+    meterEnd(app, lesson_cm, "lesson", .thinking, model, next.ok);
     if (!next.ok) return;
     scrubUtf8(next.content);
     const lesson = std.mem.trim(u8, next.content, " \r\n\t\"");
@@ -1689,6 +1833,10 @@ var turn_mtx: std.Io.Mutex = .init;
 var active_convs: [MAX_ACTIVE_TURNS][64]u8 = undefined;
 var active_lens: [MAX_ACTIVE_TURNS]usize = [_]usize{0} ** MAX_ACTIVE_TURNS;
 var active_uids: [MAX_ACTIVE_TURNS]u64 = [_]u64{0} ** MAX_ACTIVE_TURNS;
+/// The control.jsonl byte offset each live turn started reading from, or null while a turn holds a slot but has
+/// not snapshotted its cursor yet. Published under the SAME mutex as the slot itself so a reader can compare
+/// "where the turn began reading" against "where my op landed" without a torn view. See turnWillConsume.
+var active_ctrl: [MAX_ACTIVE_TURNS]?usize = [_]?usize{null} ** MAX_ACTIVE_TURNS;
 
 /// Claim the single in-flight slot for `conv`, on behalf of `uid`. One pass over the table answers all
 /// three questions (is this conv running, how many does this user hold, is there a free slot), so the
@@ -1712,7 +1860,52 @@ pub fn beginTurn(io: std.Io, conv: []const u8, uid: u64) TurnDenied {
     @memcpy(active_convs[slot][0..conv.len], conv);
     active_lens[slot] = conv.len;
     active_uids[slot] = uid;
+    active_ctrl[slot] = null; // claimed, but this turn has not decided where it starts reading control.jsonl yet
     return .ok;
+}
+
+/// Publish the control.jsonl offset this turn will start reading from. Called by runTurn the instant it takes
+/// that snapshot, so /control can answer truthfully instead of guessing (see turnWillConsume). A turn with no
+/// slot (or a conv too long to be one) simply publishes nothing — the reader then reports "will not consume",
+/// which is the safe answer.
+pub fn publishCtrlCursor(io: std.Io, conv: []const u8, cursor: usize) void {
+    if (conv.len == 0 or conv.len > 64) return;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
+            active_ctrl[i] = cursor;
+            return;
+        }
+    }
+}
+
+/// Will the turn running for `conv` actually READ a control op that landed at byte offset `at`?
+///
+/// isTurnLive answers a different question — "is something running" — and a client steering a turn cannot use
+/// it, because a turn that started AFTER the op landed snapshots its cursor past the op and skips it forever
+/// while still reporting live. The three answers here, and why each is sound:
+///
+///   * no slot for this conv                → false. Nothing is reading; the op waits for a turn that will
+///                                            snapshot past it.
+///   * slot held, cursor NOT yet published  → false. The snapshot has not happened, so it will happen after
+///                                            `at` was already on disk, so it will land past the op.
+///   * cursor published as C                → C <= at. drainChatControl reads from C forward, so an op at or
+///                                            after C is inside every tail it reads.
+///
+/// The one-directional guarantee is deliberate: a caller passing an `at` measured BEFORE its own append can only
+/// UNDER-report (another writer's line may have landed in between, pushing the real offset higher — still >= C),
+/// never claim an op will be read when it will not. Remaining honest gap: an explicit `stop` ends its turn
+/// WITHOUT the closing salvage drain, so a steer racing a stop can still be consumed-as-read and discarded.
+pub fn turnWillConsume(io: std.Io, conv: []const u8, at: usize) bool {
+    if (conv.len == 0 or conv.len > 64) return false;
+    turn_mtx.lockUncancelable(io);
+    defer turn_mtx.unlock(io);
+    for (0..MAX_ACTIVE_TURNS) |i| {
+        if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv))
+            return (active_ctrl[i] orelse return false) <= at;
+    }
+    return false;
 }
 
 /// Back-compat shim for callers with no uid to hand (the scheduler runs as the task's owner, but its
@@ -2325,6 +2518,7 @@ pub fn endTurn(io: std.Io, conv: []const u8) void {
         if (active_lens[i] == conv.len and std.mem.eql(u8, active_convs[i][0..active_lens[i]], conv)) {
             active_lens[i] = 0;
             active_uids[i] = 0; // or the freed slot keeps counting against its owner's share forever
+            active_ctrl[i] = null; // and a stale cursor must not answer for the NEXT turn that takes this slot
             return;
         }
     }
@@ -2479,6 +2673,159 @@ test "ModelTrio.pick: unset thinking/prompting fall back to coding; configured r
     try std.testing.expect((Provider{ .base_url = "https://x/v1", .model = "m" }).isSet());
 }
 
+test "llm frame: the shared wire shape, parsed as a consumer would parse it" {
+    const gpa = std.testing.allocator;
+
+    // The SHARED EVENT CONTRACT, spelled out as a reader's struct. If a field is renamed, retyped, or dropped,
+    // this fails to parse or fails an assert — which is the point: the desk and the web app read these names.
+    const Frame = struct {
+        kind: []const u8 = "",
+        model: []const u8 = "",
+        role: []const u8 = "",
+        label: []const u8 = "",
+        ms: i64 = -1,
+        fb_ms: i64 = -1,
+        /// OPTIONAL ON PURPOSE, mirroring the contract: an older server omits it, and a reader must be able to
+        /// tell "the server didn't say" from "the server said false" even though it treats both as false.
+        streamed: ?bool = null,
+        in: i64 = -1,
+        out: i64 = -1,
+        ok: ?bool = null,
+        ts: i64 = 0,
+    };
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    try renderLlmFrame(gpa, &out, "chat", .coding, "kimi-k3", 18450, 1240, true, 92214, 1204, true, 1784165341);
+
+    // events.jsonl is line-delimited JSON: emitEvent adds the newline, so the object itself must contain none.
+    try std.testing.expect(std.mem.indexOfScalar(u8, out.items, '\n') == null);
+
+    const p = try std.json.parseFromSlice(Frame, gpa, out.items, .{ .ignore_unknown_fields = false });
+    defer p.deinit();
+    const f = p.value;
+    try std.testing.expectEqualStrings("llm", f.kind); // the NEW frame kind
+    try std.testing.expectEqualStrings("kimi-k3", f.model);
+    try std.testing.expectEqualStrings("coding", f.role);
+    try std.testing.expectEqualStrings("chat", f.label);
+    try std.testing.expectEqual(@as(i64, 18450), f.ms);
+    try std.testing.expectEqual(@as(i64, 1240), f.fb_ms);
+    try std.testing.expectEqual(@as(?bool, true), f.streamed); // the ONE streaming call: fb_ms is a real TTFB
+    try std.testing.expectEqual(@as(i64, 92214), f.in);
+    try std.testing.expectEqual(@as(i64, 1204), f.out);
+    try std.testing.expectEqual(@as(?bool, true), f.ok);
+    try std.testing.expectEqual(@as(i64, 1784165341), f.ts);
+
+    // Every role tag reaches the wire under the name the contract gives it.
+    for ([_]struct { r: Role, name: []const u8 }{
+        .{ .r = .coding, .name = "coding" },
+        .{ .r = .thinking, .name = "thinking" },
+        .{ .r = .prompting, .name = "prompting" },
+    }) |c| {
+        var o2: std.ArrayListUnmanaged(u8) = .empty;
+        defer o2.deinit(gpa);
+        try renderLlmFrame(gpa, &o2, "plan", c.r, "m", 1, 1, false, 0, 0, true, 5);
+        const p2 = try std.json.parseFromSlice(Frame, gpa, o2.items, .{});
+        defer p2.deinit();
+        try std.testing.expectEqualStrings(c.name, p2.value.role);
+    }
+
+    // FAILURES ARE EMITTED TOO, or the success rate read off the stream is 100% by construction. A failed call
+    // returns no usage block, so its token counts are honestly zero rather than absent.
+    var o3: std.ArrayListUnmanaged(u8) = .empty;
+    defer o3.deinit(gpa);
+    try renderLlmFrame(gpa, &o3, "searchq", .prompting, "cheap-driver", 900, 900, false, 0, 0, false, 42);
+    const p3 = try std.json.parseFromSlice(Frame, gpa, o3.items, .{});
+    defer p3.deinit();
+    try std.testing.expectEqual(@as(?bool, false), p3.value.ok);
+    try std.testing.expectEqual(@as(i64, 0), p3.value.in);
+    try std.testing.expectEqual(@as(i64, 0), p3.value.out);
+    // THE DEFECT THIS FIELD EXISTS FOR: a blocking call reports fb_ms == ms because there is no first byte to
+    // time, and averaged blind that makes the thinking/prompting models look 1-2 orders of magnitude slower to
+    // first byte than the streaming coder. The number stays (it is a true total); `streamed:false` is what tells
+    // a consumer to keep it out of the first-byte average.
+    try std.testing.expectEqual(@as(?bool, false), p3.value.streamed);
+    try std.testing.expectEqual(p3.value.ms, p3.value.fb_ms);
+
+    // A BYOK model id is arbitrary user text on this line. It must be escaped, not spliced: an unescaped quote
+    // would end the string early and corrupt every reader of the whole file from that byte on.
+    var o4: std.ArrayListUnmanaged(u8) = .empty;
+    defer o4.deinit(gpa);
+    try renderLlmFrame(gpa, &o4, "loop", .prompting, "we\"ird\\model\nname", 3, 3, false, 1, 2, true, 7);
+    const p4 = try std.json.parseFromSlice(Frame, gpa, o4.items, .{});
+    defer p4.deinit();
+    try std.testing.expectEqualStrings("we\"ird\\model\nname", p4.value.model);
+    try std.testing.expect(std.mem.indexOfScalar(u8, o4.items, '\n') == null); // the newline survived as \n
+
+    // `streamed` is a BARE JSON boolean, not the string "true" — a consumer reading it with a bool parser (the
+    // desk's jBool scans for `"streamed":` then `true`/`false`) must find one, and quoting it would break that
+    // silently while still parsing as a Frame if the field were typed as a string.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"streamed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, o3.items, "\"streamed\":false") != null);
+
+    // A PRE-CONTRACT FRAME (no `streamed`) must still parse, since that is exactly what an older server writes
+    // into a log a newer consumer later reads. `null` there is the reader's "didn't say" — treated as false.
+    const legacy = "{\"kind\":\"llm\",\"model\":\"m\",\"role\":\"thinking\",\"label\":\"plan\",\"ms\":900,\"fb_ms\":900,\"in\":1,\"out\":2,\"ok\":true,\"ts\":9}";
+    const p5 = try std.json.parseFromSlice(Frame, gpa, legacy, .{ .ignore_unknown_fields = false });
+    defer p5.deinit();
+    try std.testing.expectEqual(@as(?bool, null), p5.value.streamed);
+    try std.testing.expect(!(p5.value.streamed orelse false)); // the mandated safe reading
+}
+
+test "llm frame: `streamed` reports what the transport did, never what the call site hoped" {
+    const t0: i64 = 1_700_000_000_000;
+    const tok0: llm.TokUsage = .{ .in = 0, .out = 0 };
+
+    // The nine BLOCKING call sites never touch fb_ms — false by construction, and fb_ms falls back to the total
+    // so the number on the wire is still true, just not a first byte.
+    const blocking = meterReport(.{ .t0_ms = t0, .tok0 = tok0 }, t0 + 4200);
+    try std.testing.expect(!blocking.streamed);
+    try std.testing.expectEqual(@as(u64, 4200), blocking.ms);
+    try std.testing.expectEqual(@as(u64, 4200), blocking.fb_ms);
+
+    // The ONE streaming site, with a delta actually observed: fb_ms is a real time-to-first-byte and well under
+    // the total. This is the only shape a first-byte average may consume.
+    const streamed = meterReport(.{ .t0_ms = t0, .tok0 = tok0, .fb_ms = t0 + 310 }, t0 + 4200);
+    try std.testing.expect(streamed.streamed);
+    try std.testing.expectEqual(@as(u64, 310), streamed.fb_ms);
+    try std.testing.expectEqual(@as(u64, 4200), streamed.ms);
+
+    // STREAMING THAT DIDN'T STREAM: llm.completeStream silently falls back to a blocking complete() on trouble,
+    // and a reply with no deltas fires on_delta zero times. A hardcoded `true` at that call site would report a
+    // first byte that was never observed; deriving from the meter reports false, which is the honest answer.
+    const fell_back = meterReport(.{ .t0_ms = t0, .tok0 = tok0, .fb_ms = 0 }, t0 + 50);
+    try std.testing.expect(!fell_back.streamed);
+    try std.testing.expectEqual(@as(u64, 50), fell_back.fb_ms);
+
+    // A CLOCK THAT WENT BACKWARDS (a wall-clock adjustment mid-call) must not underflow the unsigned wire
+    // fields. A delta WAS seen here, so `streamed` stays true — the flag reports observation, not plausibility —
+    // and both durations clamp to 0 rather than wrapping to ~18 quintillion ms.
+    const backwards = meterReport(.{ .t0_ms = t0, .tok0 = tok0, .fb_ms = t0 - 5 }, t0 - 900);
+    try std.testing.expect(backwards.streamed);
+    try std.testing.expectEqual(@as(u64, 0), backwards.ms);
+    try std.testing.expectEqual(@as(u64, 0), backwards.fb_ms);
+}
+
+test "llm frame: unarmed thread emits nothing, and a too-long conv_dir is refused rather than truncated" {
+    // The emit target is thread-local (armed at runTurn entry). A recycled thread with no turn armed must not
+    // append a frame to whatever conversation ran on it last — emitLlmFrame returns before touching the App,
+    // which is also why passing an undefined *App here is safe.
+    disarmLlmFrames();
+    try std.testing.expectEqual(@as(usize, 0), llm_frame_dir_len);
+
+    armLlmFrames("C:/data/u1/_chat/convs/c123");
+    try std.testing.expectEqualStrings("C:/data/u1/_chat/convs/c123", llm_frame_dir[0..llm_frame_dir_len]);
+
+    // A path longer than the buffer is DISARMED, never clipped: a truncated path names a different directory.
+    const too_long = "x" ** (llm_frame_dir.len + 1);
+    armLlmFrames(too_long);
+    try std.testing.expectEqual(@as(usize, 0), llm_frame_dir_len);
+
+    armLlmFrames("");
+    try std.testing.expectEqual(@as(usize, 0), llm_frame_dir_len);
+    disarmLlmFrames();
+}
+
 /// Copy `s` into `dst` at `off.*`, advance the offset, and return the copied sub-slice. The blob-packing
 /// primitive spawnTurn uses to own every string arg in one allocation (the caller's arena dies at once).
 fn dupInto(dst: []u8, off: *usize, s: []const u8) []const u8 {
@@ -2594,6 +2941,10 @@ const StreamCtx = struct {
     conv_dir: []const u8,
     ctrl_cursor: usize = 0, // control.jsonl offset for the mid-stream abort check (chat Stop)
     streamed: bool = false,
+    /// Wall-clock ms at which the FIRST delta of any kind landed, or 0 if nothing streamed. Feeds `fb_ms` on
+    /// the call's `llm` frame: on the one streaming call of a turn, time-to-first-byte is measurable, and it is
+    /// the number that separates "the provider is slow to start" from "the reply was simply long".
+    fb_ms: i64 = 0,
     tok: [256]u8 = undefined,
     tok_len: usize = 0,
     rsn: [256]u8 = undefined,
@@ -2614,6 +2965,9 @@ fn streamShouldAbort(cx: *anyopaque) bool {
 fn streamOnDelta(cx: *anyopaque, kind: llm.DeltaKind, text: []const u8) void {
     if (text.len == 0) return;
     const sc: *StreamCtx = @ptrCast(@alignCast(cx));
+    // First byte of ANY kind — a tool_progress delta is the provider having started generating just as much as
+    // a content one, and on a step that composes a large tool call it is the only delta that ever arrives.
+    if (sc.fb_ms == 0) sc.fb_ms = nowMillis(sc.app.io);
     if (kind == .tool_progress) {
         // Composing a big tool call emits NO content/reasoning deltas — surface what's being written as a live
         // status line ("writing index.html — 12 KB...") so the user isn't staring at a silent turn. Not part of
@@ -2771,8 +3125,10 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     // cap is a ceiling, not a target (the model stops at the closing brace); it is raised only so a long plan
     // can't get truncated mid-JSON, which extractJsonObject would hand to the parser as an unbalanced object and
     // the whole board would come back empty.
+    const plan_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "plan", base_url, key, model, msgs.items, "", 1536, 0.3);
     defer step.deinit(gpa);
+    meterEnd(app, plan_cm, "plan", .thinking, model, step.ok);
     if (!step.ok) return empty;
     const obj = extractJsonObject(step.content);
     const tasks = cplan.parseDecomposition(gpa, obj);
@@ -4061,9 +4417,19 @@ fn runInnerAgentic(
         // tool_calls), so everything below is unchanged — and completeStream falls back to complete() itself
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
+        var chat_cm = meterBegin(app.io);
         var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
+        // AFTER streamFlush, deliberately: the desk treats a delta that follows a non-delta frame as an inference
+        // boundary, so the `llm` frame has to land where one genuinely is — past the tail of this reply, not
+        // interleaved into it. (It is the last thing this inference emits either way.)
+        //
+        // This assignment is what makes this — the ONLY streaming call of the ten — eligible to report
+        // `streamed:true`. It stays 0, and the frame stays false, when completeStream fell back to a blocking
+        // complete() or the reply carried no deltas at all: in either case there is no first byte we observed.
+        chat_cm.fb_ms = sctx.fb_ms;
+        meterEnd(app, chat_cm, "chat", .coding, model, step.ok);
 
         // STOP DURING STREAMING: the abort hook killed the stream mid-generation. Commit the partial that already
         // streamed to the user (step.content) as the stopped narration and end the turn — don't fall through to
@@ -4507,8 +4873,10 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, "In 1-3 sentences, tell the user what you accomplished this turn and what (if anything) remains. Do not call any tools.") catch return null;
     msgs.append(gpa, '}') catch return null;
+    const summary_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "summary", base_url, key, model, msgs.items, "", 1024, 0.5);
     defer step.deinit(gpa);
+    meterEnd(app, summary_cm, "summary", .thinking, model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t");
     if (t.len == 0) return null;
@@ -4593,8 +4961,10 @@ fn formulateSearch(app: *App, run_root: []const u8, p: Provider, intent: []const
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
+    const searchq_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "searchq", p.base_url, p.key, p.model, msgs.items, "", 48, 0.3);
     defer step.deinit(gpa);
+    meterEnd(app, searchq_cm, "searchq", .prompting, p.model, step.ok);
     if (!step.ok) return null;
     var q = std.mem.trim(u8, step.content, " \r\n\t\"'`*");
     if (std.mem.indexOfScalar(u8, q, '\n')) |nl| q = std.mem.trim(u8, q[0..nl], " \r\t\"'`*");
@@ -4634,8 +5004,10 @@ fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, rep
     msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, ask.items) catch return null;
     msgs.append(gpa, '}') catch return null;
+    const stuck_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "stuck", p.base_url, p.key, p.model, msgs.items, "", 256, 0.6);
     defer step.deinit(gpa);
+    meterEnd(app, stuck_cm, "stuck", .prompting, p.model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t`*\"'");
     if (t.len < 24 or t.len > 900) return null; // too vague to act on, or a plan rather than a step
@@ -4679,8 +5051,10 @@ fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []
     msgs.append(gpa, '}') catch return null;
     // A small output cap is part of the contract, not a saving: a correction that needs more room than this is a
     // rewrite, and it also bounds the abstain path, which is most calls.
+    const reflect_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "reflect", base_url, key, model, msgs.items, "", 320, 0.3);
     defer step.deinit(gpa);
+    meterEnd(app, reflect_cm, "reflect", .thinking, model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t`*\"'");
     if (t.len < CRITIQUE_MIN or t.len > CRITIQUE_MAX) return null;
@@ -5303,8 +5677,10 @@ fn summarizeInto(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     uc.appendSlice(gpa, "\n\nRewrite the running summary to incorporate these messages. Keep it under 250 words.") catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
+    const ctxsum_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "ctxsum", base_url, key, model, msgs.items, "", 1024, 0.3);
     defer step.deinit(gpa);
+    meterEnd(app, ctxsum_cm, "ctxsum", .thinking, model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t");
     if (t.len == 0) return null;
@@ -5341,8 +5717,10 @@ fn summarizeWorkingSpan(app: *App, run_root: []const u8, base_url: []const u8, k
     uc.appendSlice(gpa, "\n\nWrite the compressed progress note (<= 200 words).") catch return null;
     http.jstr(gpa, &msgs, uc.items) catch return null;
     msgs.append(gpa, '}') catch return null;
+    const compact_cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "compact", base_url, key, model, msgs.items, "", 1024, 0.3);
     defer step.deinit(gpa);
+    meterEnd(app, compact_cm, "compact", .thinking, model, step.ok);
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t");
     if (t.len == 0) return null;
@@ -5545,6 +5923,64 @@ test "turn slots: a full server says so, and endTurn clears the owner" {
     for (&active_lens) |*l| l.* = 0;
     for (&active_uids) |*u| u.* = 0;
     configureTurnLimits(64, 8); // restore the defaults for any later test
+}
+
+test "turnWillConsume: a running turn is not the same question as a readable op" {
+    const t = std.testing;
+    var threaded = std.Io.Threaded.init(t.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+    for (&active_ctrl) |*c| c.* = null;
+    configureTurnLimits(8, 4);
+
+    // NOTHING RUNNING. The op is on disk and every future turn will snapshot its cursor past it.
+    try t.expect(!isTurnLive(io, "k1"));
+    try t.expect(!turnWillConsume(io, "k1", 0));
+    try t.expect(!turnWillConsume(io, "k1", 4096));
+
+    // THE DEFECT, exactly. The slot is claimed and isTurnLive says true — truthfully — but the turn has not
+    // snapshotted its control cursor yet, so that snapshot will land PAST an op already on disk and skip it.
+    // Answering this endpoint with isTurnLive hands the client a `true` for words nobody will ever read.
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "k1", 1));
+    try t.expect(isTurnLive(io, "k1"));
+    try t.expect(!turnWillConsume(io, "k1", 900));
+
+    // Once the turn publishes where it starts reading, an op at or after that point IS inside every tail it
+    // reads, and an op before it is not.
+    publishCtrlCursor(io, "k1", 900);
+    try t.expect(turnWillConsume(io, "k1", 900)); // exactly at the cursor — drainChatControl reads from here
+    try t.expect(turnWillConsume(io, "k1", 1400)); // appended after the turn began — the ordinary steer
+    try t.expect(!turnWillConsume(io, "k1", 899)); // one byte behind: written before the turn looked
+
+    // A cursor of 0 (no control.jsonl existed when the turn began) must not orphan the very first op.
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "k2", 1));
+    publishCtrlCursor(io, "k2", 0);
+    try t.expect(turnWillConsume(io, "k2", 0));
+
+    // Conversations do not answer for each other, and an unknown conv is simply "no".
+    try t.expect(!turnWillConsume(io, "k3", 0));
+    try t.expect(!turnWillConsume(io, "", 0));
+
+    // A RELEASED SLOT MUST FORGET ITS CURSOR. Without that, the next turn to take the slot inherits a stale
+    // number and can report `true` for an op it will never read — the same lie, one turn later.
+    endTurn(io, "k1");
+    try t.expect(!turnWillConsume(io, "k1", 5000));
+    try t.expectEqual(TurnDenied.ok, beginTurn(io, "k1", 1));
+    try t.expect(isTurnLive(io, "k1"));
+    try t.expect(!turnWillConsume(io, "k1", 5000)); // re-claimed, not yet published → still "no"
+
+    // Publishing for a conv that holds no slot is a no-op, not a write into someone else's row.
+    publishCtrlCursor(io, "k9", 0);
+    try t.expect(!turnWillConsume(io, "k9", 0));
+    try t.expect(!turnWillConsume(io, "k1", 5000));
+
+    for (&active_lens) |*l| l.* = 0;
+    for (&active_uids) |*u| u.* = 0;
+    for (&active_ctrl) |*c| c.* = null;
+    configureTurnLimits(64, 8);
 }
 
 test "turn limits clamp to something sane rather than trusting the environment" {
