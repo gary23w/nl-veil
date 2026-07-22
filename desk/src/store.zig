@@ -280,6 +280,11 @@ pub const METRIC_RING = 120; // performance samples for the chat Metrics tab. 12
 pub const MAX_METRIC_MODELS = 8; // distinct models the ring can attribute samples to (a trio, plus headroom for
 //                                  a mid-session model change and the same id served by two providers)
 pub const METRIC_MODEL_NONE: u8 = 0xFF; // TurnMetric.model sentinel — this sample carries NO model identity
+pub const METRIC_ROLE_NONE: u8 = 0xFF; // TurnMetric.role sentinel — the role field was ABSENT, or carried a name
+//                                        this build does not know. Deliberately distinct from 0 (coding):
+//                                        folding an unrecognised role into coding would silently mis-attribute
+//                                        every call routed to a role added to the server's enum after this desk
+//                                        shipped, and adding an enum tag is exactly the kind of change made here.
 pub const METRIC_KIND_SERVER: u8 = 0xFF; // MetricModel.prov_kind sentinel — the SERVER resolved the provider,
 //                                          not this client, so no local kind/byok pair describes it
 pub const METRIC_MODEL_NAME_MAX = 96; // MetricModel.name capacity. Named so internMetricModel's LOOKUP key and
@@ -312,7 +317,8 @@ pub const TurnMetric = struct {
     // was off by one against that enum — anything decoding it named the wrong turn kind.)
     kind: u8 = 0,
     model: u8 = METRIC_MODEL_NONE, // index into Store.metric_models, or METRIC_MODEL_NONE when unattributed
-    role: u8 = 0, // the trio role this call was routed to: 0 coding / 1 thinking / 2 prompting
+    role: u8 = 0, // the trio role this call was routed to: 0 coding / 1 thinking / 2 prompting, or
+    //               METRIC_ROLE_NONE when the frame named a role this build does not recognise
     ok: bool = true, // completed vs errored
     // Did this call actually STREAM? Only then is first_byte_ms a real time-to-first-byte. Exactly one call per
     // server-side inference (the "chat" call, via completeStream) streams; the others go through blocking
