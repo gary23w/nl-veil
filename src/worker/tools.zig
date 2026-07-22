@@ -314,6 +314,13 @@ pub const ToolCtx = struct {
     // assistant to act on their own files — the workdir jail is a SWARM-mind boundary, not a client one.
     // Writes (write_file/edit_file/delete_file) stay workdir-locked everywhere. Never set for minds.
     roam: bool = false,
+    // OPERATE / APP-ATTACH bus protection. `operating` mirrors w.operating (a device/app is attached to this
+    // run's file bus); `app_attach` is the opt-in generic-app LEARN mode (NL_APP_ATTACH). When EITHER is set,
+    // the file-mutating tools refuse to write the reserved bus/oracle files (reservedBusName), so a mind can
+    // actuate/grade an attached host ONLY through the adjudicated host_* tools — closing the write_file bypass.
+    // app_attach additionally makes the phase read-only (no mutating host verb, no run_python/make_tool).
+    operating: bool = false,
+    app_attach: bool = false,
     // Capability tier for THIS caller — see Caps. Defaults to .full so every existing construction site
     // (swarm minds, the CLI, exec-tool, the desk) keeps today's behaviour untouched; only the chat turn
     // sets .sandboxed, and only for a non-admin.
@@ -980,6 +987,11 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
         std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
+    // APP-ATTACH LEARN phase is READ-ONLY: code execution and tool authoring are disabled because they could
+    // write the command bus (bypassing reservedBusName, which only guards the file tools) or actuate the app.
+    // The mind maps the app with host_explore and reasons with read_file/recall — it never runs code here.
+    if (ctx.app_attach and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
+        return dupe(gpa, "APP-ATTACH LEARN phase is read-only — run_python / make_tool / patch_system are disabled (they could actuate the app or write the bus). Map the app with host_explore (enumerate/expand/describe) and reason with read_file/recall/recall_hive; the learned surface persists in the lineage hive for the next attach.");
     if (std.mem.eql(u8, name, "run_python")) return runPython(ctx, args_json);
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
     if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, args_json);
@@ -1983,6 +1995,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
+    if ((ctx.operating or ctx.app_attach) and reservedBusName(p.value.path)) return dupe(gpa, "that name is a reserved OPERATE-bus/oracle file — the swarm cannot write it directly. Act on the attached host through host_command / host_explore (which adjudicate irreversible actions); the acceptance oracle (score.json) and the command bus (commands.jsonl) are never authored by a mind.");
     const npath = blk_np: {
         const wb = std.fs.path.basename(ctx.workdir);
         if (wb.len > 0 and p.value.path.len > wb.len + 1 and std.mem.startsWith(u8, p.value.path, wb) and p.value.path[wb.len] == '/')
@@ -2413,6 +2426,7 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
+    if ((ctx.operating or ctx.app_attach) and reservedBusName(p.value.path)) return dupe(gpa, "that name is a reserved OPERATE-bus/oracle file — the swarm cannot edit it directly. Act on the attached host through host_command / host_explore, never by editing the bus.");
     if (p.value.ops.len == 0 and p.value.search.len == 0) return dupe(gpa, "edit_file needs either an ops array (each op replace/insert_before/insert_after/delete with an exact anchor) OR a top-level search+replace.");
     const npath = blk_np: {
         const wb = std.fs.path.basename(ctx.workdir);
@@ -3200,6 +3214,11 @@ fn normalizeCmd(gpa: std.mem.Allocator, cmd: []const u8) []const u8 {
 
 fn hostCommand(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
+    // APP-ATTACH LEARN phase accepts NO actuating verb: attaching to an arbitrary app starts read-only, and a
+    // mutating/actuating vocabulary is enabled only once a trusted-source verb allowlist + human approval are
+    // wired (deferred). The existing security-daemon operate mode (ctx.operating, not app_attach) is unchanged.
+    if (ctx.app_attach)
+        return dupe(gpa, "APP-ATTACH LEARN phase is read-only: map the app with host_explore and report what you find. Actuating verbs are disabled until an app-specific verb allowlist and human approval are established for this assignment.");
     const A = struct { command: []const u8 = "", cmd: []const u8 = "", action: []const u8 = "", args: []const []const u8 = &.{} };
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
@@ -3315,6 +3334,7 @@ fn deleteFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
     defer p.deinit();
     if (!safeRel(p.value.path)) return dupe(gpa, "bad path — use a path RELATIVE to your workdir (no leading / or \\, no '..'), e.g. index.html or css/style.css");
+    if ((ctx.operating or ctx.app_attach) and reservedBusName(p.value.path)) return dupe(gpa, "that name is a reserved OPERATE-bus/oracle file — the swarm cannot delete it. The bus and the acceptance oracle are managed by the attached host, not a mind.");
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
     std.Io.Dir.cwd().deleteFile(ctx.io, full) catch return dupe(gpa, "could not delete (not found?)");
@@ -5378,6 +5398,43 @@ test "safeRel: relative only — rejects absolute, drive-colon, home, traversal"
     try std.testing.expect(!safeRel("~/notes.txt"));
     try std.testing.expect(!safeRel("a/../b"));
     try std.testing.expect(!safeRel(""));
+}
+
+/// True when `p`'s BASENAME is a reserved OPERATE-bus / oracle file — the command bus (commands.jsonl), the
+/// device telemetry (telemetry.json), the staged-action ledger (staged.jsonl), the read-only exploration lanes
+/// (explore.jsonl / explore_results.jsonl), the acceptance oracle (score.json), and the app-attach manifests
+/// (verbs.json / app.json). These are the seam through which a mind actuates and is GRADED on an attached
+/// host. A mind must reach them ONLY through the guarded host_* tools: writing commands.jsonl with write_file
+/// would ACTUATE the host un-adjudicated (bypassing stageAction), and writing score.json would FORGE the mind's
+/// own fitness. Callers gate this on operate/app-attach mode (ctx.operating/ctx.app_attach) so a NORMAL build
+/// can still ship an ordinary app.json / score.json deliverable — the reservation bites only where the bus is
+/// live. Case- and separator-insensitive on the basename, so "commands.jsonl" and "work/commands.jsonl" match.
+pub fn reservedBusName(p: []const u8) bool {
+    var base = p;
+    if (std.mem.lastIndexOfAny(u8, p, "/\\")) |i| base = p[i + 1 ..];
+    const reserved = [_][]const u8{
+        "commands.jsonl", "commands.json",          "telemetry.json",       "staged.jsonl",
+        "explore.jsonl",  "explore_results.jsonl",  "explore_results.json", "score.json",
+        "verbs.json",     "app.json",
+    };
+    for (reserved) |r| if (std.ascii.eqlIgnoreCase(base, r)) return true;
+    return false;
+}
+
+test "reservedBusName: the operate bus + oracle files are reserved, ordinary deliverables are not" {
+    // the actuation bus and the fitness oracle — the two that turn a file write into an un-gated host action
+    try std.testing.expect(reservedBusName("commands.jsonl"));
+    try std.testing.expect(reservedBusName("score.json"));
+    // a workdir-prefixed form matches the same basename (the bypass must not walk around the guard)
+    try std.testing.expect(reservedBusName("work/commands.jsonl"));
+    try std.testing.expect(reservedBusName("telemetry.json"));
+    try std.testing.expect(reservedBusName("STAGED.JSONL")); // case-insensitive
+    try std.testing.expect(reservedBusName("explore_results.jsonl"));
+    // ordinary build deliverables are never reserved (the guard is mode-gated by the caller anyway)
+    try std.testing.expect(!reservedBusName("index.html"));
+    try std.testing.expect(!reservedBusName("src/main.py"));
+    try std.testing.expect(!reservedBusName("package.json"));
+    try std.testing.expect(!reservedBusName("data/results.json"));
 }
 
 /// run.zig's builtInManifest key convention, mirrored: a probe carrying a directory ('/' or '\\') matches

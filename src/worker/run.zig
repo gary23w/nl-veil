@@ -260,6 +260,7 @@ pub const Worker = struct {
     never_stops: bool = false,
     discourse: bool = false,
     operating: bool = false,
+    app_attach: bool = false, // opt-in generic-app LEARN mode (NL_APP_ATTACH): read-only attach to an arbitrary app
     playbook_str: []const u8 = "",
     kindex_str: []const u8 = "",
     // MIND-FLOOR lesson stash: the newest still-unpaired hard failure, carried across rounds so a later
@@ -695,6 +696,18 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                 w.fence_writes = false;
                 w.act("engine", 0, "mode", "operate", "live host attached at startup — operational task; build-only faculties (blueprint / file-ownership) NOT scaffolded; fence-writes disabled (no file build)");
             } else |_| {}
+        }
+    }
+    // GENERIC APP-ATTACH (opt-in, NL_APP_ATTACH): attach READ-ONLY to an arbitrary app on the file bus. Distinct
+    // from the security-daemon operate mode: it forbids EVERY actuating verb + code execution (the mind maps the
+    // app with host_explore and the learned surface persists in the lineage hive for an instant second attach)
+    // and it arms the bus-file reservation (reservedBusName) on the file tools. Set independently of operate
+    // detection so an attach run is legibly read-only even before telemetry lands.
+    if (environ.get("NL_APP_ATTACH")) |v| {
+        const on = v.len > 0 and (v[0] == '1' or v[0] == 't' or v[0] == 'T' or v[0] == 'y' or v[0] == 'Y');
+        if (on) {
+            w.app_attach = true;
+            w.act("engine", 0, "mode", "app-attach", "generic app-attach LEARN mode (read-only): map the attached app with host_explore; actuating verbs, code execution, and bus/oracle writes are DISABLED. The learned surface persists in the lineage hive — a second attach with the same lineage starts already knowing the app.");
         }
     }
     if (live) {
@@ -3468,7 +3481,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     var had_reject = false; // this mind's work was refused this round (edit/salvage reject) — a NEGATIVE affect signal
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch (gpa.dupe(u8, w.run_dir) catch @panic("out of memory"));
     defer gpa.free(workdir);
-    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
+    var ctx = tools.ToolCtx{ .gpa = gpa, .io = w.io, .environ = environ, .run_dir = w.run_dir, .workdir = workdir, .scope = mi.scope, .mind = mi.name, .round = round, .mem = w.mem, .files_written = &files, .observed = &observed, .skills_saved = &skills_saved, .directives_set = &directives_set, .tools_made = &tools_made, .space = w.space, .share_obs = mi.scout, .internet = w.internet, .discourse = w.discourse, .blueprint = w.blueprint, .egress_allow = (environ.get("NL_EGRESS_ALLOWLIST") orelse ""), .gw_base = w.gw_base, .gw_key = w.gw_key, .gw_model = w.gateway_model, .fmtx = &w.files_mtx, .vcs_enabled = live and !w.quick and mi.team > 1, .anchored_reads = !w.discourse, .operating = w.operating, .app_attach = w.app_attach, .reject_notes = &w.reject_notes, .patch_root = w.patch_root };
     var mem_sink = tools.MemSink{ .gpa = gpa };
     defer mem_sink.deinit();
     const normalize_mem = w.cap.tier != .author;
