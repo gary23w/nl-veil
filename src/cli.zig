@@ -667,6 +667,7 @@ fn cmdRag(ctx: *Ctx, args: []const []const u8) u8 {
 fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u8, name_in: []const u8, cap: u32) u8 {
     const osc = @import("worker/oscillation.zig");
     const ragingest = @import("worker/ragingest.zig");
+    const tools_mod = @import("worker/tools.zig");
     if (path.len == 0) {
         out("rag ingest needs a file path: veil rag ingest C:/books/mybook.txt\n", .{});
         return 1;
@@ -688,9 +689,17 @@ fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u
     }
     var lb: [96]u8 = undefined;
     const label = if (name_in.len > 0) name_in else ragingest.labelFromPath(path, &lb);
+    // default target = the document's OWN knowledge__doc-<slug> sub-scope (same policy as the absorb
+    // tool): scope = document identity, read_doc pages it in order, across-recall reaches it from the
+    // base hive, and one book can never evict the shared knowledge scope. --scope still overrides.
+    var scb: [96]u8 = undefined;
+    const target = if (std.mem.eql(u8, scope, "knowledge"))
+        ragingest.docScope(tools_mod.KNOWLEDGE_SCOPE, label, &scb)
+    else
+        scope;
     const mem = osc.Mem.init(ctx.gpa, ctx.io, neuron_bin, db);
-    out("absorbing {s} ({d} KB) into scope '{s}' ...\n", .{ label, text.len / 1024, scope });
-    const st = ragingest.ingestText(mem, ctx.io, ctx.gpa, ctx.data, text, label, scope, cap);
+    out("absorbing {s} ({d} KB) into scope '{s}' ...\n", .{ label, text.len / 1024, target });
+    const st = ragingest.ingestText(mem, ctx.io, ctx.gpa, ctx.data, text, label, target, cap);
     if (st.stored == 0 and st.facts == 0) {
         out("no facts distilled — the file has little clean prose (a code file, a table dump, or already-structured data). Nothing was stored.\n", .{});
         return 1;
@@ -699,7 +708,9 @@ fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u
         out("distilled {d} facts but stored 0 — the neuron store could not be written. Check the neuron binary at {s} (or pass --db to a writable hive).\n", .{ st.facts, neuron_bin });
         return 1;
     }
-    out("absorbed {s}: {d} facts distilled, {d} stored into '{s}' ({s}).\nrecall them:  veil chat  →  \"what does {s} say about <topic>?\"  (or recall_hive)\n", .{ label, st.facts, st.stored, scope, db, label });
+    if (st.evicted > 0)
+        out("WARNING: the scope hit its fact cap and evicted {d} oldest fact(s) during the load — only the tail is retained. Raise --cap / use a dedicated --scope.\n", .{st.evicted});
+    out("absorbed {s}: {d} facts distilled, {d} stored into '{s}' ({s}).\nrecall them:  veil chat  →  \"what does {s} say about <topic>?\"  (or recall_hive; whole-document work: read_doc)\n", .{ label, st.facts, st.stored, target, db, label });
     return 0;
 }
 
