@@ -145,6 +145,7 @@ const Ui = struct {
     chat_file_hgrab: bool = false, // dragging the Files viewer horizontal scrollbar thumb
     chat_file_list_scroll: f32 = 0, // scroll offset (px) for the chat Files LEFT file list
     llm_scroll: f32 = 0, // Dashboard LLM BREAKDOWN vertical scroll (the model list can exceed its panel)
+    metrics_scroll: f32 = 0, // chat Metrics vertical scroll (one block PER MODEL — a trio never fits the panel)
     tbl_hscroll: [4]TblHScroll = .{ .{}, .{}, .{}, .{} }, // per chat-table horizontal scroll (content-keyed FIFO)
     tbl_hgrab: u64 = 0, // id of the chat table whose h-scrollbar thumb is being dragged (0 = none)
     msg_thumbs: [8]MsgThumb = .{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} }, // path-keyed transcript-image texture cache (FIFO)
@@ -1996,6 +1997,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     @memcpy(convs[0..conv_n], store.convs[0..conv_n]);
     // sized FROM the store field (a stale [32] literal here missed the conv-id widening and made selecting
     // any scheduled_* conversation an out-of-bounds render-thread panic — the click-to-view crash)
+    const now_s = store.last_refresh_s; // the poller's epoch clock — the UI thread's only wall clock (rail dates)
     var active: @TypeOf(store.conv_active) = undefined;
     const active_n: usize = @min(store.conv_active_len, active.len);
     @memcpy(active[0..active_n], store.conv_active[0..active_n]);
@@ -2166,7 +2168,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
         }
     }
 
-    drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n]);
+    drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n], now_s);
     drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
@@ -2475,7 +2477,103 @@ fn togglePane(store: *Store, left: bool) void {
     store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", "")); // persist the pane state
 }
 
-fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8) void {
+// ---- conversation rail: date organisation -------------------------------------------------------------------
+// The rail groups conversations under Today / Yesterday / This week / Earlier and stamps every row with a
+// relative time. THE TIERS AND THE RULES ARE THE WEB CLIENT'S (web/public/app.js convGroup + fmtWhen), on
+// purpose: the same account looking at the same chats in either UI has to see the same grouping, or the two
+// read as two products. ConvRow.mtime_s used to be a sort key and nothing else — the list was sorted by date
+// and showed no date anywhere, which is exactly the half of "chats do not organize themselves by date" the
+// desk was still guilty of.
+
+// The one OS fact this needs: the machine's UTC offset, so a day boundary is the USER's midnight and not
+// UTC's. Same shape and the same graceful degradation as the server's sched.localOffsetSecs — non-Windows
+// (and any query failure) falls back to UTC, which shifts a tier boundary but never breaks the rail.
+const wintz = if (builtin.os.tag == .windows) struct {
+    const SYSTEMTIME = extern struct { wYear: u16, wMonth: u16, wDayOfWeek: u16, wDay: u16, wHour: u16, wMinute: u16, wSecond: u16, wMilliseconds: u16 };
+    const TIME_ZONE_INFORMATION = extern struct {
+        Bias: i32,
+        StandardName: [32]u16,
+        StandardDate: SYSTEMTIME,
+        StandardBias: i32,
+        DaylightName: [32]u16,
+        DaylightDate: SYSTEMTIME,
+        DaylightBias: i32,
+    };
+    extern "kernel32" fn GetTimeZoneInformation(tzi: *TIME_ZONE_INFORMATION) callconv(.c) u32;
+} else struct {};
+
+/// Local offset from UTC in seconds (local = UTC + offset). Asked of the OS per call so a DST flip mid-uptime
+/// is picked up naturally; the call is once per frame at most and reads a cached OS value.
+fn localOffsetSecs() i64 {
+    if (builtin.os.tag != .windows) return 0;
+    var tzi: wintz.TIME_ZONE_INFORMATION = undefined;
+    const r = wintz.GetTimeZoneInformation(&tzi);
+    // Bias is minutes with UTC = local + Bias, so the local offset is its NEGATION; the active standard/daylight
+    // adjustment rides on top. An invalid answer (0xFFFFFFFF) degrades to UTC rather than guessing.
+    const bias_min: i64 = switch (r) {
+        0 => @as(i64, tzi.Bias),
+        1 => @as(i64, tzi.Bias) + @as(i64, tzi.StandardBias),
+        2 => @as(i64, tzi.Bias) + @as(i64, tzi.DaylightBias),
+        else => return 0,
+    };
+    return -bias_min * 60;
+}
+
+const ConvTier = enum(u8) { today, yesterday, week, earlier };
+
+/// The heading a conversation belongs under. `tz` is localOffsetSecs(); `now_s` the poller's epoch clock.
+/// Deliberately the same three distinctions fmtConvWhen draws (today / inside the last week / older) so a
+/// row's own stamp can never contradict the heading above it — "Yesterday" is only that tier's first day given
+/// a name of its own, because "Wed" sitting directly under "This week" tells a reader nothing new.
+fn convTier(mtime_s: i64, now_s: i64, tz: i64) ConvTier {
+    if (mtime_s <= 0) return .earlier; // no timestamp is not "now" — the web says Earlier here too
+    const day = @divFloor(mtime_s + tz, 86400);
+    const today = @divFloor(now_s + tz, 86400);
+    if (day >= today) return .today; // >= not ==: a file mtime a few seconds ahead of the poller's clock is today
+    if (day == today - 1) return .yesterday;
+    // The last-week test is the web's: a rolling 7x24h window, NOT seven calendar days.
+    if (now_s - mtime_s < 7 * 86400) return .week;
+    return .earlier;
+}
+
+fn convTierLabel(tier: ConvTier) [:0]const u8 {
+    return switch (tier) {
+        .today => t.z("Today", .{}),
+        .yesterday => t.z("Yesterday", .{}),
+        .week => t.z("This week", .{}),
+        .earlier => t.z("Earlier", .{}),
+    };
+}
+
+/// A row's own stamp: "15:04" today, "Wed" inside the last week, "Jul 12" beyond it — the web's fmtWhen, in the
+/// desk's 24-hour convention (every other clock this client prints is 24-hour). Empty when there is no
+/// timestamp at all, so a row without one shows nothing rather than a fake date.
+fn fmtConvWhen(mtime_s: i64, now_s: i64, tz: i64, buf: []u8) []const u8 {
+    if (mtime_s <= 0) return "";
+    const local = mtime_s + tz;
+    const day = @divFloor(local, 86400);
+    if (day >= @divFloor(now_s + tz, 86400)) {
+        // @divFloor keeps the second-of-day in [0, 86400) even for a negative `local`, so these casts are safe.
+        // They are also REQUIRED: "{d:0>2}" on a SIGNED integer renders a sign into the pad ("+8:+0"), so the
+        // clock has to be handed over unsigned.
+        const sod = local - day * 86400;
+        const hh: u32 = @intCast(@divTrunc(sod, 3600));
+        const mm: u32 = @intCast(@divTrunc(@mod(sod, 3600), 60));
+        return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hh, mm }) catch "";
+    }
+    if (now_s - mtime_s < 7 * 86400) {
+        // epoch day 0 (1970-01-01) was a Thursday, so +4 lands Sunday at index 0
+        const wd = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+        return wd[@intCast(@mod(day + 4, 7))];
+    }
+    const mons = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    if (local < 0) return ""; // EpochSeconds is unsigned — a pre-1970 stamp is corrupt, not a date
+    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(local) };
+    const cal = es.getEpochDay().calculateYearDay().calculateMonthDay();
+    return std.fmt.bufPrint(buf, "{s} {d}", .{ mons[cal.month.numeric() - 1], cal.day_index + 1 }) catch "";
+}
+
+fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.ConvRow, active: []const u8, now_s: i64) void {
     t.panelBordered(r, t.bg_dark, t.border);
     if (!open) {
         if (t.buttonGhost(.{ .x = r.x + 2, .y = r.y + 5, .width = r.width - 4, .height = 24 }, t.z(">", .{}), t.blue, true)) togglePane(store, true);
@@ -2503,8 +2601,28 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
 
     const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
     const row_h: f32 = 42;
-    // wheel-scroll the conversation list
-    const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h;
+    const head_h: f32 = 22; // a tier heading, inserted ABOVE the first row of each group
+    // Dating needs a wall clock, and the UI thread's only one is the poller's. Before its first pass (now_s
+    // == 0) every row would land in the same bogus tier, so the rail simply stays undated for those first
+    // frames rather than printing a group it would have to take back.
+    const tz = localOffsetSecs();
+    const dated = now_s > 0;
+
+    // ROW HEIGHTS VARY NOW, so the scroll extent can't be convs.len * row_h. Count the headings first, with the
+    // SAME tier walk the draw loop runs, and let both derive from it — the extent, the culling and the hit
+    // rects have to agree or a click lands on the wrong chat.
+    var heads: usize = 0;
+    if (dated) {
+        var prev: ?ConvTier = null;
+        for (convs) |*cv| {
+            const tier = convTier(cv.mtime_s, now_s, tz);
+            if (prev == null or prev.? != tier) {
+                heads += 1;
+                prev = tier;
+            }
+        }
+    }
+    const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h + @as(f32, @floatFromInt(heads)) * head_h;
     const max_scroll = if (total > list.height) total - list.height else 0;
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(list)) ui.conv_scroll -= wheel * row_h;
@@ -2512,10 +2630,24 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     if (ui.conv_scroll > max_scroll) ui.conv_scroll = max_scroll;
     rl.beginScissorMode(@intFromFloat(list.x), @intFromFloat(list.y), @intFromFloat(list.width), @intFromFloat(list.height));
     defer rl.endScissorMode();
+    const bot = r.y + r.height - 8;
     var yy: f32 = r.y + 42 - ui.conv_scroll;
+    var prev_tier: ?ConvTier = null;
     for (convs) |*cv| {
-        // cull rows outside the view but keep advancing yy so offsets stay stable
-        if (yy + row_h < list.y or yy > r.y + r.height - 8) {
+        // The tier walk runs for EVERY row, culled or not — it is what positions everything below it. Only the
+        // drawing and the input handling are skipped off-screen, and each advance of yy happens exactly once
+        // whether or not its element was drawn, so the hit rects stay aligned with the pixels.
+        if (dated) {
+            const tier = convTier(cv.mtime_s, now_s, tz);
+            if (prev_tier == null or prev_tier.? != tier) {
+                prev_tier = tier;
+                if (yy + head_h >= list.y and yy <= bot) {
+                    t.text(convTierLabel(tier), @intFromFloat(r.x + 15), @intFromFloat(yy + 7), 10, t.comment);
+                }
+                yy += head_h;
+            }
+        }
+        if (yy + row_h < list.y or yy > bot) { // cull, but keep advancing yy so offsets stay stable
             yy += row_h;
             continue;
         }
@@ -2535,7 +2667,14 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
             // Never show the raw conv id — it's a storage key, not a name. refreshConvs resolves a real title
             // (or the first message); a still-nameless conv reads as "New chat", not "c6a5a…".
             const title = if (cv.title_len > 0) cv.titleStr() else "New chat";
-            t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + (rr.height - 13) / 2), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
+            // Two lines, title over stamp. The rail is NARROW and the delete chip owns the right edge on hover,
+            // so a right-aligned stamp would either collide with it or vanish under it; stacking keeps the date
+            // visible at all times without stealing width from the title.
+            var whenb: [16]u8 = undefined;
+            const when = if (dated) fmtConvWhen(cv.mtime_s, now_s, tz, &whenb) else "";
+            const ty: f32 = if (when.len > 0) rr.y + 5 else rr.y + (rr.height - 13) / 2;
+            t.textClip(title, @intFromFloat(rr.x + 10), @intFromFloat(ty), 13, if (is_active) t.fg else t.fg_dim, @intFromFloat(rr.width - 44));
+            if (when.len > 0) t.textClip(when, @intFromFloat(rr.x + 10), @intFromFloat(rr.y + 21), 10, t.comment, @intFromFloat(rr.width - 44));
             const xb = t.Rect{ .x = rr.x + rr.width - 28, .y = rr.y + (rr.height - 22) / 2, .width = 22, .height = 22 };
             if (hot and !t.hovering(xb)) t.wantCursor(.pointing_hand);
             if (hot and t.buttonGhost(xb, t.z("x", .{}), t.red, true)) {
@@ -4160,8 +4299,10 @@ fn metricStat(x: f32, y: f32, label: [:0]const u8, value: [:0]const u8) void {
     t.text(value, @intFromFloat(x), @intFromFloat(y + 15), 18, t.fg);
 }
 
-/// A titled bar chart of `vals` (one bar per turn, newest at the right), scaled to its own max. Bars for a
-/// failed turn are tinted red. Returns the next y below the chart.
+/// A titled bar chart of `vals` (one bar per sample, newest at the right), scaled to its own max. Bars for a
+/// failed call are tinted red. Returns the next y below the chart — a fixed 92px below the y it was given, which
+/// the caller's block pitch depends on. WHICH samples belong on a chart is the CALLER's decision: the first-byte
+/// chart is fed only the streamed subset, because a blocking call has no first byte to plot.
 fn barRow(r: t.Rect, label: [:0]const u8, vals: []const f32, samples: []const store_mod.TurnMetric, color: t.Color, y: f32) f32 {
     const pad: f32 = 14;
     t.text(label, @intFromFloat(r.x + pad), @intFromFloat(y), 12, t.fg_dim);
@@ -4188,73 +4329,206 @@ fn barRow(r: t.Rect, label: [:0]const u8, vals: []const f32, samples: []const st
     return gy + gh + 20;
 }
 
-/// The Metrics inner tab — live per-turn performance graphs for the current model (tok/s, first-byte latency,
-/// turn time) + aggregate stats. This is both the "how is it doing" developer view and the harness for
-/// comparing open-source models on the same tasks.
+/// One model's slice of the metric ring — the unit the Metrics tab renders a block for. Built from the SAMPLES,
+/// never from Settings: a role nobody configured produced no samples and therefore gets no block, and a unified
+/// single-model setup shows exactly one. Nothing here can invent a model that never ran.
+const MetricGroup = struct {
+    model: u8 = store_mod.METRIC_MODEL_NONE, // index into the Store's interned model table
+    roles: u8 = 0, // bitmask of the trio roles this model served (1 coding | 2 thinking | 4 prompting)
+};
+
+fn roleBit(role: u8) u8 {
+    return switch (role) {
+        1 => 2,
+        2 => 4,
+        else => 1,
+    };
+}
+
+/// "coding + thinking" — every role combination a model can have served this session.
+fn rolesLabel(bits: u8) [:0]const u8 {
+    return switch (bits) {
+        2 => t.z("thinking", .{}),
+        3 => t.z("coding + thinking", .{}),
+        4 => t.z("prompting", .{}),
+        5 => t.z("coding + prompting", .{}),
+        6 => t.z("thinking + prompting", .{}),
+        7 => t.z("coding + thinking + prompting", .{}),
+        else => t.z("coding", .{}),
+    };
+}
+
+/// The provider that served a metric model. METRIC_KIND_SERVER means the SERVER chose it (server-side chat), so
+/// no local kind/byok pair describes it — say so rather than guessing a local provider.
+fn metricProvLabel(m: *const store_mod.MetricModel) [:0]const u8 {
+    if (m.prov_kind == store_mod.METRIC_KIND_SERVER) return t.z("server-side", .{});
+    return switch (m.prov_kind) {
+        1 => t.zs(catalog.providers[@min(m.prov_byok, catalog.providers.len - 1)].label),
+        2 => t.z("custom endpoint", .{}),
+        else => t.z("local (Ollama)", .{}),
+    };
+}
+
+/// The Metrics inner tab — live per-call performance graphs, ONE BLOCK PER MODEL that actually produced samples
+/// (tok/s, first-byte latency, turn time + aggregate stats, all computed over that model's own samples). This is
+/// both the "how is each of my three models doing" view and the harness for comparing models on the same tasks.
 fn drawChatMetrics(store: *Store, r: t.Rect) void {
     t.panelBordered(r, t.bg_dark, t.border);
     var samples: [store_mod.METRIC_RING]store_mod.TurnMetric = undefined;
-    var model_buf: [96]u8 = undefined;
+    var models: [store_mod.MAX_METRIC_MODELS]store_mod.MetricModel = undefined;
     store.lock();
     const total = store.turn_metric_count;
     const n = @min(total, store_mod.METRIC_RING);
     const startidx = if (total > store_mod.METRIC_RING) total % store_mod.METRIC_RING else 0;
     var i: usize = 0;
     while (i < n) : (i += 1) samples[i] = store.turn_metrics[(startidx + i) % store_mod.METRIC_RING];
-    const kind = store.settings.chat_kind;
-    const byok = store.settings.chat_byok;
-    const model_n = store.settings.chat_model_len;
-    @memcpy(model_buf[0..model_n], store.settings.chat_model[0..model_n]);
+    const model_n = @min(store.metric_model_count, models.len);
+    @memcpy(models[0..model_n], store.metric_models[0..model_n]);
     store.unlock();
 
     const pad: f32 = 14;
-    var y: f32 = r.y + 12;
-    const prov_lbl: [:0]const u8 = switch (kind) {
-        1 => t.zs(catalog.providers[@min(byok, catalog.providers.len - 1)].label),
-        2 => t.z("custom endpoint", .{}),
-        else => t.z("local (Ollama)", .{}),
-    };
-    t.text(t.z("Model performance", .{}), @intFromFloat(r.x + pad), @intFromFloat(y), 16, t.fg);
-    t.text(prov_lbl, @intFromFloat(r.x + r.width - pad - @as(f32, @floatFromInt(t.measure(prov_lbl, 12)))), @intFromFloat(y + 3), 12, t.comment);
-    y += 24;
-    t.textClip(if (model_n > 0) model_buf[0..model_n] else "(no model set)", @intFromFloat(r.x + pad), @intFromFloat(y), 13, t.cyan, @intFromFloat(r.width - pad * 2));
-    y += 26;
+    t.text(t.z("Model performance", .{}), @intFromFloat(r.x + pad), @intFromFloat(r.y + 12), 16, t.fg);
 
     if (n == 0) {
-        t.text(t.z("no turns recorded yet - send a message and the graphs populate here.", .{}), @intFromFloat(r.x + pad), @intFromFloat(y + 8), 12, t.comment);
+        t.text(t.z("no calls recorded yet - send a message and the graphs populate here.", .{}), @intFromFloat(r.x + pad), @intFromFloat(r.y + 44), 12, t.comment);
         return;
     }
 
-    // aggregates: tok/s + first-byte over successful turns; success rate over all
-    var sum_toks: f32 = 0;
-    var toks_n: usize = 0;
-    var sum_fb: f64 = 0;
-    var oks: usize = 0;
+    // GROUP the ring by model, in first-seen (oldest sample) order so the block order is stable frame to frame.
+    var groups: [store_mod.MAX_METRIC_MODELS + 1]MetricGroup = undefined; // +1: the unattributed bucket
+    var gn: usize = 0;
     for (samples[0..n]) |s| {
-        if (!s.ok) continue;
-        oks += 1;
-        sum_fb += @floatFromInt(s.first_byte_ms);
-        if (s.tok_per_s > 0) {
-            sum_toks += s.tok_per_s;
-            toks_n += 1;
+        var hit = false;
+        for (groups[0..gn]) |*g| {
+            if (g.model == s.model) {
+                g.roles |= roleBit(s.role);
+                hit = true;
+                break;
+            }
+        }
+        if (hit) continue;
+        if (gn >= groups.len) continue; // unreachable in practice (the intern table bounds distinct models)
+        groups[gn] = .{ .model = s.model, .roles = roleBit(s.role) };
+        gn += 1;
+    }
+    // header(22) + roles(18) + stat row(52) + three barRows(92 each) + separator(12). barRow returns the y it
+    // finished at, so each block is drawn from its own running y and then SNAPPED to this pitch — the scroll
+    // math and the drawing can never drift apart.
+    const BLOCK_H: f32 = 22 + 18 + 52 + 3 * 92 + 12;
+
+    // Three blocks do not fit the panel — scroll. Wheel-driven only, with an INDICATOR thumb (not a draggable
+    // one): a draggable thumb needs its grab state held across frames FOR THE WHOLE mouse-down, or the release
+    // frame recomputes from the pointer and the thumb snaps back — the same trap the pane drag-resize hit.
+    const top = r.y + 38;
+    const bot = r.y + r.height - 6;
+    const visible_h = @max(0, bot - top);
+    const content_h = BLOCK_H * @as(f32, @floatFromInt(gn));
+    const max_scroll = @max(0, content_h - visible_h);
+    const wheel = rl.getMouseWheelMove();
+    if (wheel != 0 and max_scroll > 0 and t.hovering(r)) ui.metrics_scroll -= wheel * 28;
+    if (ui.metrics_scroll < 0) ui.metrics_scroll = 0;
+    if (ui.metrics_scroll > max_scroll) ui.metrics_scroll = max_scroll;
+
+    {
+        rl.beginScissorMode(@intFromFloat(r.x), @intFromFloat(top - 2), @intFromFloat(r.width), @intFromFloat(visible_h + 2));
+        defer rl.endScissorMode();
+        var gs: [store_mod.METRIC_RING]store_mod.TurnMetric = undefined;
+        var vals: [store_mod.METRIC_RING]f32 = undefined;
+        var y: f32 = top - ui.metrics_scroll;
+        for (groups[0..gn]) |g| {
+            const block_top = y;
+            defer y = block_top + BLOCK_H;
+            if (block_top > bot or block_top + BLOCK_H < top) continue; // cull, but keep the pitch exact
+            // THIS MODEL'S SAMPLES ONLY — every number and every bar below is computed over gs[0..gc].
+            var gc: usize = 0;
+            for (samples[0..n]) |s| {
+                if (s.model != g.model) continue;
+                gs[gc] = s;
+                gc += 1;
+            }
+            if (gc == 0) continue; // can't happen (a group exists because a sample made it) — but never divide by 0
+
+            const named: ?*const store_mod.MetricModel = if (g.model < model_n) &models[g.model] else null;
+            const prov_lbl: [:0]const u8 = if (named) |m| metricProvLabel(m) else t.z("model not recorded", .{});
+            t.textClip(if (named) |m| m.nameStr() else "(unattributed)", @intFromFloat(r.x + pad), @intFromFloat(y), 13, t.cyan, @intFromFloat(@max(60, r.width - pad * 2 - @as(f32, @floatFromInt(t.measure(prov_lbl, 12))) - 12)));
+            t.text(prov_lbl, @intFromFloat(r.x + r.width - pad - @as(f32, @floatFromInt(t.measure(prov_lbl, 12)))), @intFromFloat(y + 2), 12, t.comment);
+            y += 22;
+            t.text(if (named == null) t.z("role not recorded", .{}) else t.z("role: {s}", .{rolesLabel(g.roles)}), @intFromFloat(r.x + pad), @intFromFloat(y), 11, t.fg_dim);
+            y += 18;
+
+            // aggregates: tok/s over this model's SUCCESSFUL calls; success rate over all of them.
+            //
+            // FIRST-BYTE IS DIFFERENT — it is averaged over the successful calls that ACTUALLY STREAMED. Exactly
+            // one call per server-side inference (the "chat" call) streams; the rest are blocking, and their
+            // frames report fb_ms == ms, i.e. total call time wearing a first-byte label. Averaging those in
+            // reported a model's whole round trip as its time-to-first-token — off by an order of magnitude and
+            // in the flattering-to-nobody direction. TurnMetric.streamed is that qualifier, and a sample without
+            // it (an older server, which cannot tell us) counts as NOT streamed. Non-streamed samples still
+            // count everywhere else: calls, tok/s, success and call time are all honest for them.
+            var sum_toks: f32 = 0;
+            var toks_n: usize = 0;
+            var sum_fb: f64 = 0;
+            var fb_oks: usize = 0; // successful AND streamed — the only samples the average may use
+            var oks: usize = 0;
+            var fbs: [store_mod.METRIC_RING]store_mod.TurnMetric = undefined; // the chartable (streamed) subset
+            var fb_c: usize = 0;
+            for (gs[0..gc]) |s| {
+                if (s.streamed) {
+                    fbs[fb_c] = s; // failures included, exactly as the other charts show them (in red)
+                    fb_c += 1;
+                }
+                if (!s.ok) continue;
+                oks += 1;
+                if (s.streamed) {
+                    sum_fb += @floatFromInt(s.first_byte_ms);
+                    fb_oks += 1;
+                }
+                if (s.tok_per_s > 0) {
+                    sum_toks += s.tok_per_s;
+                    toks_n += 1;
+                }
+            }
+            const avg_toks: f32 = if (toks_n > 0) sum_toks / @as(f32, @floatFromInt(toks_n)) else 0;
+            const avg_fb: f64 = if (fb_oks > 0) sum_fb / @as(f64, @floatFromInt(fb_oks)) else 0;
+            const okpct: f32 = @as(f32, @floatFromInt(oks)) / @as(f32, @floatFromInt(gc)) * 100.0;
+            // COUNT PER GROUP. This used to print store.turn_metric_count — the all-time, ring-unbounded total —
+            // while every other stat was computed over the window, so per-model blocks would all claim the same
+            // (wrong) turn count.
+            metricStat(r.x + pad, y, t.z("calls", .{}), t.z("{d}", .{gc}));
+            metricStat(r.x + pad + 120, y, t.z("avg tok/s", .{}), t.z("{d:.1}", .{avg_toks}));
+            // "n/a", never "0 ms": a model with nothing to average has no first-byte time, and a zero here would
+            // read as instant — the single most flattering lie this panel could tell.
+            metricStat(r.x + pad + 250, y, t.z("avg 1st-byte", .{}), if (fb_oks > 0) t.z("{d:.0} ms", .{avg_fb}) else t.z("n/a", .{}));
+            metricStat(r.x + pad + 400, y, t.z("success", .{}), t.z("{d:.0}%", .{okpct}));
+            y += 52;
+
+            for (0..gc) |k| vals[k] = gs[k].tok_per_s;
+            y = barRow(r, t.z("output tok/s (per call)", .{}), vals[0..gc], gs[0..gc], t.green, y);
+            if (fb_c > 0) {
+                // The label SAYS how many of the model's calls the chart speaks for, so a chart of 3 bars beside
+                // a 30-bar chart above it can't be misread as calls having gone missing.
+                const fb_lbl = if (fb_c == gc) t.z("first-byte latency (ms)", .{}) else t.z("first-byte latency (ms) - {d}/{d} calls streamed", .{ fb_c, gc });
+                for (0..fb_c) |k| vals[k] = @floatFromInt(fbs[k].first_byte_ms);
+                y = barRow(r, fb_lbl, vals[0..fb_c], fbs[0..fb_c], t.cyan, y);
+            } else {
+                // NOTHING to chart. Say why, in place of the chart — dropping the row silently (or drawing an
+                // empty axis labelled 0) both read as "instantaneous", which is the opposite of the truth.
+                t.text(t.z("first-byte latency (ms)", .{}), @intFromFloat(r.x + pad), @intFromFloat(y), 12, t.fg_dim);
+                t.textClip("no call from this model streamed - a blocking call reports total time, not a first byte", @intFromFloat(r.x + pad), @intFromFloat(y + 24), 11, t.comment, @intFromFloat(r.width - pad * 2));
+                y += 92; // barRow's exact pitch (18 label + 54 chart + 20) — the block layout must not shift
+            }
+            for (0..gc) |k| vals[k] = @floatFromInt(gs[k].total_ms);
+            y = barRow(r, t.z("call time (ms)", .{}), vals[0..gc], gs[0..gc], t.blue, y);
+            t.hline(@intFromFloat(r.x + pad), @intFromFloat(block_top + BLOCK_H - 7), @intFromFloat(r.width - pad * 2), t.border);
         }
     }
-    const avg_toks: f32 = if (toks_n > 0) sum_toks / @as(f32, @floatFromInt(toks_n)) else 0;
-    const avg_fb: f64 = if (oks > 0) sum_fb / @as(f64, @floatFromInt(oks)) else 0;
-    const okpct: f32 = @as(f32, @floatFromInt(oks)) / @as(f32, @floatFromInt(n)) * 100.0;
-    metricStat(r.x + pad, y, t.z("turns", .{}), t.z("{d}", .{total}));
-    metricStat(r.x + pad + 120, y, t.z("avg tok/s", .{}), t.z("{d:.1}", .{avg_toks}));
-    metricStat(r.x + pad + 250, y, t.z("avg 1st-byte", .{}), t.z("{d:.0} ms", .{avg_fb}));
-    metricStat(r.x + pad + 400, y, t.z("success", .{}), t.z("{d:.0}%", .{okpct}));
-    y += 52;
-
-    var vals: [store_mod.METRIC_RING]f32 = undefined;
-    for (0..n) |k| vals[k] = samples[k].tok_per_s;
-    y = barRow(r, t.z("output tok/s (per turn)", .{}), vals[0..n], samples[0..n], t.green, y);
-    for (0..n) |k| vals[k] = @floatFromInt(samples[k].first_byte_ms);
-    y = barRow(r, t.z("first-byte latency (ms)", .{}), vals[0..n], samples[0..n], t.cyan, y);
-    for (0..n) |k| vals[k] = @floatFromInt(samples[k].total_ms);
-    y = barRow(r, t.z("turn time (ms)", .{}), vals[0..n], samples[0..n], t.blue, y);
+    // vertical scrollbar (only when the blocks overflow) — a thin thumb hugging the panel's right edge
+    if (max_scroll > 0 and content_h > 0) {
+        const thumb_h = @max(24.0, visible_h * (visible_h / content_h));
+        const travel = visible_h - thumb_h;
+        const ty = top + (ui.metrics_scroll / max_scroll) * travel;
+        t.panel(.{ .x = r.x + r.width - 5, .y = ty, .width = 4, .height = thumb_h }, t.fg_dim);
+    }
 }
 
 fn castStatusColor(st: store_mod.CastStatus) t.Color {

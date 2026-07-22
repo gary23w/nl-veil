@@ -200,6 +200,13 @@ button {
 .btn-danger:hover { background: color-mix(in srgb, var(--danger) 26%, transparent); }
 .btn-sm { min-height: 28px; padding: 0 10px; font-size: calc(var(--fs-small) * var(--text-scale)); }
 
+/* Post — hand a line to the turn that is already running. It takes Send's place
+   mid-turn, so it is filled like Send rather than tonal: it IS the affirmative
+   action while a turn is live, and it sits beside Stop, which is destructive and
+   stays the only red thing on the row. */
+.btn-steer { background: var(--accent); color: var(--on-accent); }
+.btn-steer:hover { filter: brightness(1.08); }
+
 /* Send, when there is no model to send to. It must NOT look like the primary
    action — it does not send — but it is still a live control that goes to
    Settings, so it must not look inert either: amber tonal, the same colour the
@@ -582,6 +589,22 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
   font-size: calc(var(--fs-micro) * var(--text-scale)); color: var(--text-muted);
 }
 
+/* Date tier in the rail — Today / Yesterday / This week / Earlier.
+   A whisper, not a heading. The rail is ~260px and can be dragged to 110px, so
+   the dashboard's .section-head (h2-sized, with its own row of controls) would
+   swamp the conversation titles it is meant to organise: micro type, muted, no
+   rule, no weight. Sticky, because the label earns its line only once you have
+   scrolled past the first row under it — and the fill is the rail's own colour,
+   there to stop the passing row showing through, not to draw a band. */
+.conv-group {
+  position: sticky; top: 0; z-index: 1;
+  padding: 9px 12px 3px;
+  background: var(--surface-raised);
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+  letter-spacing: .07em; text-transform: uppercase;
+  color: var(--text-muted);
+}
+
 .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
@@ -850,6 +873,31 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .task-stats { display: flex; flex-wrap: wrap; gap: 12px; font-size: calc(var(--fs-micro) * var(--text-scale)); margin-bottom: 10px; }
 .task-stats .bad { color: var(--danger); }
 .task-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* The task's run transcripts, folded away under its actions. The scheduled runs
+   are kept out of the conversation rail on purpose, so this is the only door to
+   them — it has to read as a LIST of readable things, not as more metadata. Rows
+   borrow the rail's shape (hover fill, hairline separators) because that is what
+   they are: conversation rows. Capped and scrolled so a task with three hundred
+   runs cannot push the next card off the screen. */
+.task-runs {
+  margin-top: 10px; border-top: 1px solid var(--border);
+  max-height: 260px; overflow-y: auto;
+}
+.run-row {
+  display: flex; align-items: baseline; gap: 10px;
+  width: 100%; text-align: left; padding: 7px 4px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text); font-size: calc(var(--fs-small) * var(--text-scale));
+}
+.run-row:last-child { border-bottom: 0; }
+.run-row:hover { background: var(--surface-hover); }
+.run-when {
+  min-width: 74px; color: var(--text-muted);
+  font-size: calc(var(--fs-micro) * var(--text-scale));
+  font-variant-numeric: tabular-nums;
+}
+.run-msgs { white-space: nowrap; font-size: calc(var(--fs-micro) * var(--text-scale)); }
 
 .pill {
   padding: 2px 9px; border-radius: var(--radius-pill);
