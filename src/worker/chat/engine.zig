@@ -165,7 +165,14 @@ const CRITIQUE_PROMPT =
     "problem, so OK is the normal and expected reply: answer with exactly OK unless you can name something " ++
     "specific that is wrong. If there IS such a problem, reply with 1-3 sentences addressed to the user stating " ++
     "the correction directly and nothing else — do not restate or summarize the answer, and do not mention that a " ++
-    "review happened.";
+    "review happened.\n\n" ++
+    "THE TOOL RECORD ABOVE IS GROUND TRUTH AND YOU MAY NOT CONTRADICT IT. It lists every tool this turn " ++
+    "actually ran. If it shows a tool ran, the assistant DID have and DID use that capability — never reply that " ++
+    "the assistant cannot do something, has no such tool, or fabricated an action the record shows it performed. " ++
+    "Denying a real action is itself a false correction, and a confident false correction is worse than staying " ++
+    "silent. What the record does NOT settle is whether the effect reached the USER: a tool can succeed on this " ++
+    "machine and still not produce what the user asked for. That gap is worth a correction; a flat denial of the " ++
+    "assistant's capabilities is not.";
 
 /// Serializes edit_file's micro-VCS commits (vcs.zig) across concurrent chat turns IN THIS gateway process —
 /// the exact role chat_tools.chat_vcs_mtx plays for /api/v1/chat/tool. A live hive cast building in the same
@@ -1579,7 +1586,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // turn ended would race the NEXT turn's appends — and the desk disarms on {done}, so a message emitted after
     // it is a message nobody renders. Deferring inside the turn is the version that is actually safe.
     if (critique_src.len > 0) {
-        if (critiqueAnswer(app, run_root, think.base_url, think.key, think.model, user_text, critique_src)) |note| {
+        const tl = toolperf.ledger(&tool_perf, gpa);
+        defer if (tl) |s| gpa.free(s);
+        if (critiqueAnswer(app, run_root, think.base_url, think.key, think.model, user_text, critique_src, tl orelse "")) |note| {
             defer gpa.free(note);
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
@@ -4643,7 +4652,7 @@ fn stuckStep(app: *App, run_root: []const u8, p: Provider, goal: []const u8, rep
 /// the same guard from different angles: this call must never reproduce the answer, because appending a
 /// restatement is the swap-the-text failure in a costume. A borderline note being dropped is fine; silence is the
 /// default. A rewrite getting through is not.
-fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8) ?[]u8 {
+fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, answer: []const u8, tool_ledger: []const u8) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -4653,6 +4662,18 @@ fn critiqueAnswer(app: *App, run_root: []const u8, base_url: []const u8, key: []
     http.jstr(gpa, &msgs, user_text) catch return null;
     msgs.appendSlice(gpa, "},{\"role\":\"assistant\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, answer) catch return null;
+    // THE TOOL RECORD, as its own turn ahead of the instruction. Without it the critique was asked to spot
+    // "a claim that contradicts what the tools returned" while never being shown what they returned — so it
+    // guessed, and the plausible-sounding guess ("an assistant cannot drive a browser") was flatly false in
+    // a session that had driven one 31 times. Ground truth first, instruction second.
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    if (tool_ledger.len > 0) {
+        const rec = std.fmt.allocPrint(gpa, "TOOL RECORD for the turn that produced that answer — every tool that actually ran, with call counts: {s}", .{tool_ledger}) catch return null;
+        defer gpa.free(rec);
+        http.jstr(gpa, &msgs, rec) catch return null;
+    } else {
+        http.jstr(gpa, &msgs, "TOOL RECORD for the turn that produced that answer: no tools ran — the answer was written from the model's own knowledge and the conversation alone.") catch return null;
+    }
     msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
     http.jstr(gpa, &msgs, CRITIQUE_PROMPT) catch return null;
     msgs.append(gpa, '}') catch return null;

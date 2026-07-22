@@ -58,6 +58,47 @@ pub const Acc = struct {
     }
 };
 
+/// A one-line record of what THIS turn actually ran: "browser_click x40 ok, run_python x41 (3 failed)".
+/// Null when nothing ran. Caller frees.
+///
+/// This exists for the post-answer critique, which is asked to catch "a claim that contradicts what the
+/// tools actually returned" — and was never shown what the tools returned. Guessing from the answer alone,
+/// it repeatedly told users the assistant COULD NOT do things this ledger proves it had just done: denying
+/// a browser it had driven 31 times, denying Python it had run 41 times. A confident false correction is
+/// worse than no correction, so the critique is now given the record instead of asked to imagine it.
+pub fn ledger(self: *const Acc, gpa: std.mem.Allocator) ?[]u8 {
+    if (self.n == 0) return null;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < self.n) : (i += 1) {
+        const r = &self.rows[i];
+        var buf: [96]u8 = undefined;
+        const row = if (r.fails > 0)
+            std.fmt.bufPrint(&buf, "{s}{s} x{d} ({d} failed)", .{ if (out.items.len > 0) ", " else "", r.nameStr(), r.calls, r.fails })
+        else
+            std.fmt.bufPrint(&buf, "{s}{s} x{d} ok", .{ if (out.items.len > 0) ", " else "", r.nameStr(), r.calls });
+        out.appendSlice(gpa, row catch continue) catch {
+            out.deinit(gpa);
+            return null;
+        };
+    }
+    if (out.items.len == 0) return null;
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+test "ledger names what ran and flags failures; null when nothing ran" {
+    const gpa = std.testing.allocator;
+    var acc = Acc{};
+    try std.testing.expect(ledger(&acc, gpa) == null);
+    acc.record("browser_navigate", true, 10);
+    acc.record("browser_navigate", true, 10);
+    acc.record("run_python", false, 5);
+    const s = ledger(&acc, gpa).?;
+    defer gpa.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "browser_navigate x2 ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s, "run_python x1 (1 failed)") != null);
+}
+
 // The persistent JSON shape: n=total calls, f=total fails, ms=EWMA per-call latency.
 const PRow = struct { name: []const u8 = "", n: u32 = 0, f: u32 = 0, ms: u64 = 0 };
 const Persist = struct { v: u32 = 1, tools: []PRow = &.{} };
