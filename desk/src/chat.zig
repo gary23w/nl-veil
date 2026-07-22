@@ -1211,7 +1211,10 @@ pub const Chat = struct {
         const model = scUnescape(raw_model, &mb);
         if (model.len == 0) return;
         const role_s = scRawField(line, "role") orelse "";
-        const role: u8 = if (std.mem.eql(u8, role_s, "thinking")) 1 else if (std.mem.eql(u8, role_s, "prompting")) 2 else 0;
+        // An unknown or absent role is NOT coding. Collapsing all three of "it really was coding",
+        // "the field was missing" and "a role this build has never heard of" into 0 would quietly
+        // file every call routed to a newly-added server role under the coding model's block.
+        const role: u8 = if (std.mem.eql(u8, role_s, "coding")) 0 else if (std.mem.eql(u8, role_s, "thinking")) 1 else if (std.mem.eql(u8, role_s, "prompting")) 2 else store_mod.METRIC_ROLE_NONE;
         const ms_i = jInt(line, "ms") orelse 0;
         const fb_i = jInt(line, "fb_ms") orelse 0;
         const out_i = jInt(line, "out") orelse 0;
@@ -3724,8 +3727,25 @@ pub const Chat = struct {
             break :blk true;
         };
         if (!ok) return;
+        // /control answers {"ok":true,"live":..} — whether a running turn will actually CONSUME this op,
+        // not merely whether one exists. A steer landing after a turn stopped reading is written to
+        // control.jsonl and read by nobody, so drawing it in the transcript and saying "the veil will
+        // fold it in" would be a lie AND would lose the words. Three outcomes, three honest answers.
+        var delivered: ?bool = null;
         if (self.runner().chatControl(self.io, self.gpa, conv, w.buffered())) |r| {
-            if (r.body.len > 0) self.gpa.free(r.body);
+            defer if (r.body.len > 0) self.gpa.free(r.body);
+            // No "live" field = a server older than that contract; it accepted the op, so assume it lands.
+            delivered = if (r.status >= 200 and r.status < 300) (jBool(r.body, "live") orelse true) else false;
+        }
+        const landed = delivered orelse {
+            // The POST never completed. Never claim it was folded in — the text is still the user's.
+            self.store.pushNotif("Steer failed", "could not reach the turn; your text was not sent", 3);
+            return;
+        };
+        if (!landed) {
+            // The turn is already over. Send it as an ordinary message rather than drop it on the floor.
+            self.cmdSend(dd, txt);
+            return;
         }
         self.appendMsg(dd, .user, txt); // show the steer in the transcript
         self.setStatus("steer sent — the veil will fold it into the running turn");
@@ -10998,6 +11018,24 @@ fn scUnescape(raw: []const u8, buf: []u8) []const u8 {
     while (i < raw.len and n < buf.len) {
         const c = raw[i];
         if (c == '\\' and i + 1 < raw.len) {
+            // \uXXXX. The server escapes EVERY byte below 0x20 this way (gateway/http.zig), and the
+            // `model` field on an llm frame is BYOK-supplied text that goes through that escaper.
+            // Without this case the `else` branch below consumed the backslash and the 'u' and let the
+            // four hex digits through as literal text — which both mangles the name on screen and
+            // interns it as a DIFFERENT model row than the same model reaches by any other path,
+            // splitting one model's samples across two blocks in the Metrics tab.
+            if (raw[i + 1] == 'u' and i + 6 <= raw.len) {
+                if (std.fmt.parseInt(u21, raw[i + 2 ..][0..4], 16)) |cp| {
+                    // A lone surrogate half is not an encodable scalar; substitute rather than refuse
+                    // the whole line over one bad escape.
+                    const scalar: u21 = if (cp >= 0xD800 and cp <= 0xDFFF) 0xFFFD else cp;
+                    const need: usize = std.unicode.utf8CodepointSequenceLength(scalar) catch 1;
+                    if (n + need > buf.len) break; // no room — stop cleanly, never write past the buffer
+                    n += std.unicode.utf8Encode(scalar, buf[n..]) catch 0;
+                    i += 6;
+                    continue;
+                } else |_| {}
+            }
             buf[n] = switch (raw[i + 1]) {
                 'n' => '\n',
                 'r' => '\r',
@@ -14041,4 +14079,35 @@ test "prompt tiers: senseTier keys off the model id + endpoint locality" {
     // a custom LOCAL endpoint (LM Studio-style) with an unnamed model stays small; hosted unknown reads frontier
     try std.testing.expectEqual(catalog.Tier.small, senseTier(.{ .base_url = "http://localhost:1234/v1", .key = "", .model = "my-finetune-latest" }));
     try std.testing.expectEqual(catalog.Tier.large, senseTier(.{ .base_url = "https://api.example.com/v1", .key = "", .model = "my-finetune-latest" }));
+}
+
+test "scUnescape decodes unicode escapes, so a model id keeps ONE identity in the metric ring" {
+    // The server escapes every byte below 0x20 as a unicode escape (gateway/http.zig), and an llm
+    // frame's `model` is BYOK text passed through that escaper. Before this the backslash and the u
+    // were consumed and the four hex digits fell through literally, interning one model as two rows.
+    // NOTE the doubled backslashes: the INPUT is wire text literally containing a backslash then a u.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a\u{01}b", scUnescape("a\\u0001b", &buf));
+    try std.testing.expectEqualStrings("gpt-4o", scUnescape("gpt-4o", &buf));
+    // multi-byte scalars round-trip too, not just the control bytes the server actually emits
+    try std.testing.expectEqualStrings("\u{00e9}", scUnescape("\\u00e9", &buf));
+    try std.testing.expectEqualStrings("\u{4e2d}", scUnescape("\\u4e2d", &buf));
+    // a lone surrogate half is not an encodable scalar: substitute, never refuse the whole line
+    try std.testing.expectEqualStrings("\u{fffd}", scUnescape("\\ud800", &buf));
+    // ordinary escapes still work, and a truncated escape is left alone rather than read past the end
+    try std.testing.expectEqualStrings("u12", scUnescape("\\u12", &buf));
+    // a decoded scalar that would not fit stops cleanly instead of writing past the buffer
+    var tiny: [2]u8 = undefined;
+    try std.testing.expect(scUnescape("\\u4e2d", &tiny).len <= tiny.len);
+}
+
+test "jInt refuses an over-long literal instead of trapping (the desk builds ReleaseSafe)" {
+    // A corrupt or truncated event line carrying more digits than an i64 holds would overflow, and in
+    // ReleaseSafe that is a panic that kills the whole desk over one bad byte in a stream we don't own.
+    try std.testing.expectEqual(@as(?i64, 42), jInt("{\"ms\":42}", "ms"));
+    try std.testing.expectEqual(@as(?i64, -7), jInt("{\"ms\":-7}", "ms"));
+    try std.testing.expectEqual(@as(?i64, 9223372036854775807), jInt("{\"ms\":9223372036854775807}", "ms"));
+    try std.testing.expectEqual(@as(?i64, null), jInt("{\"ms\":99999999999999999999999}", "ms"));
+    try std.testing.expectEqual(@as(?i64, null), jInt("{\"ms\":-99999999999999999999999}", "ms"));
+    try std.testing.expectEqual(@as(?i64, null), jInt("{\"other\":1}", "ms"));
 }

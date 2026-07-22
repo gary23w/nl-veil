@@ -596,11 +596,23 @@ pub fn followConv(ctx: *Ctx, conv: []const u8) void {
         };
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
         if (resp.status == 200 and resp.body.len > 0) {
-            renderConvFrames(ctx, resp.body);
-            runDelegatedTools(ctx, conv, resp.body); // CLIENT MODE: execute any tool_request the server sent
-            from += resp.body.len;
-            idle = 0;
-            if (std.mem.indexOf(u8, resp.body, "\"kind\":\"done\"") != null) return;
+            // One events page is capped at 512KB server-side, so the body can end MID-LINE. Advancing
+            // `from` over those partial bytes would consume that frame without ever parsing it — and a
+            // dropped tool_request leaves the turn blocked forever on a result nobody will post. So only
+            // consume up to the last COMPLETE line and re-read the torn tail whole on the next poll.
+            const nl_end = if (resp.body[resp.body.len - 1] == '\n')
+                resp.body.len
+            else if (std.mem.lastIndexOfScalar(u8, resp.body, '\n')) |nl| nl + 1 else 0;
+            // A single line bigger than a whole page can never complete by re-reading; take it as-is
+            // rather than re-poll the same offset forever making no progress.
+            const use = if (nl_end == 0 and resp.body.len >= (512 << 10)) resp.body else resp.body[0..nl_end];
+            if (use.len > 0) {
+                renderConvFrames(ctx, use);
+                runDelegatedTools(ctx, conv, use); // CLIENT MODE: execute any tool_request the server sent
+                from += use.len;
+                idle = 0;
+                if (std.mem.indexOf(u8, use, "\"kind\":\"done\"") != null) return;
+            } else idle += 1; // only a partial line has arrived — nothing consumed, nothing rendered
         } else idle += 1;
         ctx.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
     }

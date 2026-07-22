@@ -2155,14 +2155,36 @@ async function pollEvents() {
     if (!r.ok) return;
     const next = r.headers.get('X-Next-Offset');
     const body = await r.text();
-    if (next) S.cursor = Number(next) || S.cursor;
-    if (!body) return;
+    if (!body) {
+      if (next) S.cursor = Number(next) || S.cursor;
+      return;
+    }
+    // The server caps one page at 512KB (service.zig), so `body` can end MID-LINE — and X-Next-Offset
+    // counts those partial bytes as consumed. Advancing the cursor to it before parsing (which is what
+    // this used to do) dropped that frame forever: a `token` frame left a hole in the reply, a `message`
+    // or `done` frame meant the turn's UI never settled. The old comment claimed the next poll re-read
+    // the torn line; it could not, because the cursor had already moved past it. So: hold back the torn
+    // tail and rewind the cursor over it, so the next poll reads that line whole.
+    const lines = body.split('\n');
+    const torn = body.endsWith('\n') ? '' : (lines.pop() || '');
+    if (next) {
+      const adv = Number(next);
+      if (Number.isFinite(adv)) {
+        // BYTE length, not .length — the cursor is a byte offset into the file, and a UTF-16
+        // code-unit count would desync it the moment a frame carries non-ASCII text.
+        const tornBytes = torn ? new TextEncoder().encode(torn).length : 0;
+        // A single line longer than one whole page can never be completed by rewinding; that would
+        // spin forever making no progress, so take the loss rather than stall the transcript.
+        const stuck = lines.length === 0 && tornBytes >= (512 << 10);
+        S.cursor = adv - (stuck ? 0 : tornBytes);
+      }
+    }
     let touched = false;
-    for (const line of body.split('\n')) {
+    for (const line of lines) {
       const s = line.trim();
       if (!s) continue;
       let f;
-      try { f = JSON.parse(s); } catch (e) { continue; }  // torn tail line; the next poll re-reads it
+      try { f = JSON.parse(s); } catch (e) { continue; }  // a complete line that is not JSON — skip it
       if (applyFrame(f)) touched = true;
     }
     if (touched) drawTranscript();
