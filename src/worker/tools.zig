@@ -2738,6 +2738,8 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const st = ragingest.ingestText(ctx.mem, ctx.io, gpa, ctx.run_dir, text, label, scope, cap);
     if (st.stored == 0 and st.facts == 0)
         return std.fmt.allocPrint(gpa, "absorbed nothing from {s} — it has little clean prose (a code file, a table dump, or already-structured data).", .{label}) catch dupe(gpa, "no facts distilled");
+    if (st.stored == 0 and st.facts > 0)
+        return std.fmt.allocPrint(gpa, "distilled {d} facts from {s} but the memory store rejected them (0 stored) — the neuron-db write failed. Nothing was learned; retry or check the store.", .{ st.facts, label }) catch dupe(gpa, "distilled facts but stored 0 — neuron write failed");
     ctx.observed.* += st.stored;
     return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into the '{s}' hive. Recall them any time with recall_hive — no re-read, no internet needed.", .{ label, st.facts, st.stored, scope }) catch dupe(gpa, "absorbed");
 }
