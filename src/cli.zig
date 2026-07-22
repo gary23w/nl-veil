@@ -565,6 +565,8 @@ fn cmdHelp() u8 {
         \\      --tier atlas|facts|full  manifest only | +INDEX+distilled facts (default) | +every pack page
         \\      --dest <dir>             sync somewhere else (e.g. vendor/nl-rag inside a source tree, pre-build)
         \\      --include-auto           also copy machine-grown packs (off-topic risk; off by default)
+        \\  rag ingest <file>            absorb a LOCAL book/doc/notes into the hive as recallable facts (offline)
+        \\      --scope S --name L --cap N --db <hive.sqlite>
         \\
         \\MISC
         \\  doctor                       check server + token health
@@ -581,10 +583,16 @@ fn cmdHelp() u8 {
 fn cmdRag(ctx: *Ctx, args: []const []const u8) u8 {
     const ragmirror = @import("worker/ragmirror.zig");
     var sub: []const u8 = "status";
+    var saw_sub = false;
     var from: []const u8 = "";
     var dest: []const u8 = "";
     var tier_s: []const u8 = "facts";
     var include_auto = false;
+    var path: []const u8 = ""; // ingest: the local file/dir to absorb
+    var scope: []const u8 = "knowledge";
+    var db: []const u8 = "";
+    var name: []const u8 = "";
+    var cap: u32 = 20000;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -599,10 +607,26 @@ fn cmdRag(ctx: *Ctx, args: []const []const u8) u8 {
             tier_s = args[i];
         } else if (std.mem.eql(u8, a, "--include-auto")) {
             include_auto = true;
+        } else if (std.mem.eql(u8, a, "--scope") and i + 1 < args.len) {
+            i += 1;
+            scope = args[i];
+        } else if (std.mem.eql(u8, a, "--db") and i + 1 < args.len) {
+            i += 1;
+            db = args[i];
+        } else if (std.mem.eql(u8, a, "--name") and i + 1 < args.len) {
+            i += 1;
+            name = args[i];
+        } else if (std.mem.eql(u8, a, "--cap") and i + 1 < args.len) {
+            i += 1;
+            cap = std.fmt.parseInt(u32, args[i], 10) catch cap;
         } else if (a.len > 0 and a[0] != '-') {
-            sub = a;
+            if (!saw_sub) {
+                sub = a;
+                saw_sub = true;
+            } else if (path.len == 0) path = a;
         }
     }
+    if (std.mem.eql(u8, sub, "ingest") or std.mem.eql(u8, sub, "absorb")) return cmdRagIngest(ctx, path, scope, db, name, cap);
     if (std.mem.eql(u8, sub, "sync")) {
         if (from.len == 0) {
             out("rag sync needs --from <path to a corpus checkout> (git clone https://github.com/gary23w/nl-rag)\n", .{});
@@ -630,8 +654,46 @@ fn cmdRag(ctx: *Ctx, args: []const []const u8) u8 {
         }
         return 0;
     }
-    out("usage: veil rag [status] | veil rag sync --from <dir> [--tier atlas|facts|full] [--dest <dir>] [--include-auto]\n", .{});
+    out("usage: veil rag [status] | veil rag sync --from <dir> [--tier atlas|facts|full] [--dest <dir>] [--include-auto]\n         | veil rag ingest <file> [--scope knowledge] [--name <label>] [--cap N] [--db <hive.sqlite>]\n", .{});
     return 1;
+}
+
+/// `veil rag ingest <file>` — absorb a LOCAL text file into the knowledge hive as recallable facts,
+/// offline (no internet, no rag repo, no LLM). Deterministic distillation → neuron import. The default db
+/// is the local user's chat hive, so the desk chat's recall_hive surfaces the absorbed facts immediately.
+fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u8, name_in: []const u8, cap: u32) u8 {
+    const osc = @import("worker/oscillation.zig");
+    const ragingest = @import("worker/ragingest.zig");
+    if (path.len == 0) {
+        out("rag ingest needs a file path: veil rag ingest C:/books/mybook.txt\n", .{});
+        return 1;
+    }
+    const neuron_exe = if (builtin.os.tag == .windows) "neuron.exe" else "neuron";
+    const neuron_bin = std.fmt.allocPrint(ctx.gpa, "{s}/bin/{s}", .{ ctx.home, neuron_exe }) catch return 1;
+    defer ctx.gpa.free(neuron_bin);
+    // default target = the local user's chat hive (uid 1), the store the desk chat recalls from
+    const db = if (db_in.len > 0) db_in else (std.fmt.allocPrint(ctx.gpa, "{s}/u1/_chat/hive.sqlite", .{ctx.data}) catch return 1);
+    defer if (db_in.len == 0) ctx.gpa.free(@constCast(db));
+    const text = std.Io.Dir.cwd().readFileAlloc(ctx.io, path, ctx.gpa, .limited(64 << 20)) catch {
+        out("could not read {s} (missing, unreadable, or larger than 64MB)\n", .{path});
+        return 1;
+    };
+    defer ctx.gpa.free(text);
+    if (std.mem.indexOfScalar(u8, text[0..@min(text.len, 4096)], 0) != null) {
+        out("{s} looks binary (PDF/EPUB/DOCX?). Convert it to text first (e.g. pdftotext book.pdf book.txt), then: veil rag ingest book.txt\n", .{path});
+        return 1;
+    }
+    var lb: [96]u8 = undefined;
+    const label = if (name_in.len > 0) name_in else ragingest.labelFromPath(path, &lb);
+    const mem = osc.Mem.init(ctx.gpa, ctx.io, neuron_bin, db);
+    out("absorbing {s} ({d} KB) into scope '{s}' ...\n", .{ label, text.len / 1024, scope });
+    const st = ragingest.ingestText(mem, ctx.io, ctx.gpa, ctx.data, text, label, scope, cap);
+    if (st.stored == 0 and st.facts == 0) {
+        out("no facts distilled — the file has little clean prose (a code file, a table dump, or already-structured data). Nothing was stored.\n", .{});
+        return 1;
+    }
+    out("absorbed {s}: {d} facts distilled, {d} stored into '{s}' ({s}).\nrecall them:  veil chat  →  \"what does {s} say about <topic>?\"  (or recall_hive)\n", .{ label, st.facts, st.stored, scope, db, label });
+    return 0;
 }
 
 // cmdChat + cmdHub are substantial enough to live in their own files (kept here as thin entry points).

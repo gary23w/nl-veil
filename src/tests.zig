@@ -30,6 +30,7 @@ test {
     _ = @import("worker/metrics.zig");
     _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
     _ = @import("worker/oscillation.zig");
+    _ = @import("worker/ragingest.zig"); // local-file → neuron-db distillation (offline "absorb the book")
     _ = @import("worker/ragmirror.zig"); // local knowledge-pack mirror: url→disk resolve + atlas extension
     _ = @import("worker/rate.zig");
     _ = @import("worker/recipes.zig"); // parse/substitute/validate — the granted-recipe trust boundary

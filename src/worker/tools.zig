@@ -7,6 +7,7 @@ const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
 const bufedit = @import("bufedit.zig");
 const hashline = @import("hashline.zig");
+const ragingest = @import("ragingest.zig");
 const vcs = @import("vcs.zig");
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
@@ -777,6 +778,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. Each line comes prefixed with its anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db) as recallable facts, so you and the hive can recall it later with recall/recall_hive WITHOUT re-reading it or needing the internet. Deterministic and offline. Pass path (relative to your workdir). Optional scope (default the shared knowledge hive), name (a short provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"patch_system","description":"RSI engine edit tool. Read/write/replace/apply_patch under NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT). Mutating edits are gated: provide proposal + measurable success_criterion; high-impact edits also require simulate_change; privileged zones require explicit operator approval.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative file path under the configured patch-system root (required for read/write/replace)"},"mode":{"type":"string","enum":["read","write","replace","patch"],"description":"operation (default: read)"},"content":{"type":"string","description":"new file content for write mode"},"find":{"type":"string","description":"exact text to replace (replace mode)"},"replace":{"type":"string","description":"replacement text (replace mode)"},"patch":{"type":"string","description":"apply_patch payload with *** Begin Patch / *** End Patch markers (patch mode)"},"proposal":{"type":"string","description":"proposal title/id from propose_change (required for mutating edits)"},"success_criterion":{"type":"string","description":"measurable success criterion tied to the proposal (required for mutating edits)"},"limit":{"type":"integer","description":"max bytes to read (default 12000, max 262144)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -864,6 +866,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db) as recallable facts — so you can recall it later with recall/recall_hive WITHOUT re-reading it or needing the internet. Deterministic and offline: use it when the user points you at a file to learn (\"absorb the book at C:/books/x.txt\"). Pass path (relative to the workdir, or an ABSOLUTE path on the user's machine). Optional scope (default the shared knowledge hive), name (a short provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; also accepts an ABSOLUTE path (C:/data) or ~/dir on the user's machine; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir (default '.'), or an absolute/~ path on the user's machine"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -981,6 +984,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, args_json);
     if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, args_json);
     if (std.mem.eql(u8, name, "read_file")) return readFile(ctx, args_json);
+    if (std.mem.eql(u8, name, "absorb")) return absorbFile(ctx, args_json);
     if (std.mem.eql(u8, name, "stage_file")) return stageFile(ctx, args_json);
     if (std.mem.eql(u8, name, "patch_system")) return patchSystem(ctx, args_json);
     if (std.mem.eql(u8, name, "list_dir")) return listDir(ctx, args_json);
@@ -1652,7 +1656,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
@@ -2700,6 +2704,42 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // spirals on tail-verification. Name the cut, the real size, AND how to see the rest (a line range), so the
     // reader windows the tail instead of re-reading the head.
     return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ view[0..cap], cap, view.len, p.value.path }) catch dupe(gpa, view[0..cap]);
+}
+
+/// absorb — distill a LOCAL text file into recallable neuron-db facts (offline; the same deterministic
+/// distillation `veil rag ingest` uses). A workdir-relative path always works; an ABSOLUTE/~ path only when
+/// this ctx roams (the client executor on the user's own machine, exactly like read_file). Facts land in the
+/// shared KNOWLEDGE hive by default, so recall_hive surfaces them for the whole team/conversation afterward —
+/// the answer to "tell the AI to absorb the book" when there's no rag repo and no internet.
+fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct { path: []const u8 = "", scope: []const u8 = "", name: []const u8 = "", cap: u32 = 0 };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    if (p.value.path.len == 0) return dupe(gpa, "absorb needs a file path (relative to your workdir, or an absolute path on the user's machine in chat)");
+    const roamed: ?[]u8 = if (!safeRel(p.value.path)) roamPath(ctx, p.value.path) else null;
+    defer if (roamed) |r| gpa.free(r);
+    if (!safeRel(p.value.path) and roamed == null)
+        return dupe(gpa, "bad path — a workdir-RELATIVE path, or (in chat, on the user's machine) an ABSOLUTE path like C:/books/x.txt");
+    const full = if (roamed) |r|
+        (gpa.dupe(u8, r) catch return dupe(gpa, "oom"))
+    else
+        (std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, p.value.path }) catch return dupe(gpa, "oom"));
+    defer gpa.free(full);
+    const text = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(64 << 20)) catch
+        return std.fmt.allocPrint(gpa, "could not read {s} (missing, unreadable, or larger than 64MB)", .{p.value.path}) catch dupe(gpa, "not found");
+    defer gpa.free(text);
+    if (std.mem.indexOfScalar(u8, text[0..@min(text.len, 4096)], 0) != null)
+        return std.fmt.allocPrint(gpa, "{s} looks binary (PDF/EPUB/DOCX?). Convert it to text first (e.g. pdftotext book.pdf book.txt), then absorb the .txt.", .{p.value.path}) catch dupe(gpa, "file is binary — convert to text first");
+    var lb: [96]u8 = undefined;
+    const label = if (p.value.name.len > 0) p.value.name else ragingest.labelFromPath(p.value.path, &lb);
+    const scope = if (p.value.scope.len > 0) p.value.scope else KNOWLEDGE_SCOPE;
+    const cap: u32 = if (p.value.cap > 0) p.value.cap else 4000;
+    const st = ragingest.ingestText(ctx.mem, ctx.io, gpa, ctx.run_dir, text, label, scope, cap);
+    if (st.stored == 0 and st.facts == 0)
+        return std.fmt.allocPrint(gpa, "absorbed nothing from {s} — it has little clean prose (a code file, a table dump, or already-structured data).", .{label}) catch dupe(gpa, "no facts distilled");
+    ctx.observed.* += st.stored;
+    return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into the '{s}' hive. Recall them any time with recall_hive — no re-read, no internet needed.", .{ label, st.facts, st.stored, scope }) catch dupe(gpa, "absorbed");
 }
 
 /// stage_file — copy a file from ANYWHERE the user's account can read INTO the conversation workdir, so a
