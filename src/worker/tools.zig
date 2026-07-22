@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const oscillation = @import("oscillation.zig");
 const Mem = oscillation.Mem;
 const bufedit = @import("bufedit.zig");
+const hashline = @import("hashline.zig");
 const vcs = @import("vcs.zig");
 const commons = @import("commons.zig");
 const llm = @import("llm.zig");
@@ -17,6 +18,7 @@ const browser_host = @import("browser/host.zig");
 const mcp_discovery = @import("mcp/discovery.zig");
 const pixelrag = @import("pixelrag.zig");
 const deps = @import("deps.zig");
+const ragmirror = @import("ragmirror.zig");
 const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
@@ -113,6 +115,11 @@ fn curlToText(ctx: *ToolCtx, url: []const u8, json: bool, deadline_ms: u32, limi
 /// format, so a page the engine prefetches is free for a scout to web_fetch later and vice versa. `mind` only
 /// names the per-fetch temp file; `egress_allow` gates caching + forbids redirects exactly as before.
 pub fn fetchCached(io: std.Io, gpa: std.mem.Allocator, run_dir: []const u8, mind: []const u8, url: []const u8, json: bool, deadline_ms: u32, limit: usize, egress_allow: []const u8) []u8 {
+    // LOCAL KNOWLEDGE MIRROR: a corpus url whose file exists in the local pack tree is served from disk —
+    // no network, works fully offline, and every consumer (engine prefetch, scout web_fetch, crawls) gets
+    // it for free because they all route through here. Gated off under an egress allowlist so a gated run
+    // keeps exactly its declared surface.
+    if (egress_allow.len == 0) if (ragmirror.resolve(io, gpa, url, limit)) |body| return body;
     const cache_ttl_s: i64 = 7 * 24 * 3600;
     var cpath: []const u8 = "";
     defer if (cpath.len > 0) gpa.free(@constCast(cpath));
@@ -297,6 +304,7 @@ pub const ToolCtx = struct {
     gw_model: []const u8 = "",
     fmtx: ?*std.Io.Mutex = null,
     vcs_enabled: bool = false, // route edit_file through the swarm micro-VCS (concurrent-safe merge commits)
+    anchored_reads: bool = false, // build mode: read_file prefixes every line with its edit-anchor tag (see hashline.zig)
     reject_notes: ?*std.ArrayListUnmanaged(u8) = null, // per-round write-refusal ledger (owned by the Worker) — folded into the fitness block so refusals are visible, not silent
     patch_root: []const u8 = "", // DEFAULT engine source root for patch_system when NL_PATCH_SYSTEM_ROOT is unset — a mind is root of its own VM (resolved once from the executable path by the worker)
     // CLIENT-EXECUTOR privilege (`veil exec-tool` only): READ-ONLY tools (read_file/list_dir) may take an
@@ -767,8 +775,8 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. Each line comes prefixed with its anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"patch_system","description":"RSI engine edit tool. Read/write/replace/apply_patch under NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT). Mutating edits are gated: provide proposal + measurable success_criterion; high-impact edits also require simulate_change; privileged zones require explicit operator approval.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative file path under the configured patch-system root (required for read/write/replace)"},"mode":{"type":"string","enum":["read","write","replace","patch"],"description":"operation (default: read)"},"content":{"type":"string","description":"new file content for write mode"},"find":{"type":"string","description":"exact text to replace (replace mode)"},"replace":{"type":"string","description":"replacement text (replace mode)"},"patch":{"type":"string","description":"apply_patch payload with *** Begin Patch / *** End Patch markers (patch mode)"},"proposal":{"type":"string","description":"proposal title/id from propose_change (required for mutating edits)"},"success_criterion":{"type":"string","description":"measurable success criterion tied to the proposal (required for mutating edits)"},"limit":{"type":"integer","description":"max bytes to read (default 12000, max 262144)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -854,7 +862,7 @@ pub const MCP_SCHEMA =
 pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
+    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; also accepts an ABSOLUTE path (C:/data) or ~/dir on the user's machine; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir (default '.'), or an absolute/~ path on the user's machine"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
@@ -903,8 +911,8 @@ pub const SCOUT_SCHEMA =
 /// sync with SCHEMA.
 pub const ASSEMBLER_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
-    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). Each op names an exact ANCHOR: a snippet copied VERBATIM from the current file, with enough lines that it appears exactly once. op is: replace (swap the anchored lines for text), insert_before / insert_after (add text around the anchor), delete (remove the anchored lines). read_file first so your anchors match byte-for-byte.","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. Each line comes prefixed with its anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Pull what the hive already LEARNED before you build: spreading-activation recall across the shared collective memory. You are shown a list of topics the hive knows — call this with the one you need (e.g. 'axum routing', 'JWT auth') to get the concrete pattern/snippet, instead of guessing or redoing research.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"save_skill","description":"When filling your slot taught you a REUSABLE technique (a pattern, snippet, or recipe a teammate will need again), save it to the swarm's shared skill library: a short name + the concrete how-to. Do this AFTER your file work, and do NOT re-save a skill you were already shown.","parameters":{"type":"object","properties":{"name":{"type":"string"},"skill":{"type":"string"}},"required":["name","skill"]}}},
@@ -2194,13 +2202,68 @@ fn editRejectMsg(gpa: std.mem.Allocator, npath: []const u8, perr: []const u8) ?[
     return std.fmt.allocPrint(gpa, "edit REJECTED — applying your ops would leave `{s}` unparseable ({s}); the file was NOT changed. Your SEARCH/REPLACE likely dropped an indented body or mismatched a block boundary. Re-issue the edit so the RESULT still compiles (copy the anchor lines verbatim, keep every block's indentation).", .{ npath, perr }) catch null;
 }
 
+/// Apply a tag-anchored batch: under concurrency it holds the same file lock the micro-VCS uses and
+/// re-reads the TRUE head in-lock — anchor validation against that head is the whole merge story (a
+/// teammate's change near your lines = staleness with fresh tags, never a silent mis-splice). Runs the
+/// same protocol/compile gates as the legacy path, then writes atomically and records the manifest row.
+fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: []const u8, hops: []const hashline.Op) []u8 {
+    const gpa = ctx.gpa;
+    var locked = false;
+    if (ctx.vcs_enabled) if (ctx.fmtx) |m| {
+        m.lockUncancelable(ctx.io);
+        locked = true;
+    };
+    defer if (locked) ctx.fmtx.?.unlock(ctx.io);
+    const head = blk: {
+        if (locked) {
+            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20))) |h| break :blk h else |_| {}
+        }
+        break :blk gpa.dupe(u8, original) catch return dupe(gpa, "oom");
+    };
+    defer gpa.free(head);
+    switch (hashline.applyBatch(gpa, head, hops)) {
+        .err => |e| return e, // owned; carries fresh tags + the atomic-batch retry instruction
+        .ok => |ap| {
+            defer gpa.free(ap.summary);
+            defer gpa.free(ap.content);
+            if (bufedit.editMarkerCorruption(ap.content) and !bufedit.editMarkerCorruption(head))
+                return dupe(gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
+            if (std.mem.endsWith(u8, npath, ".py")) {
+                if (pyCompileError(ctx, ap.content, head)) |perr| {
+                    defer gpa.free(perr);
+                    return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
+                }
+            }
+            if (!writeWorkFileAtomic(ctx, full, ap.content)) return dupe(gpa, "could not write the edited file");
+            ctx.files_written.* += 1;
+            {
+                lockFiles(ctx);
+                defer unlockFiles(ctx);
+                const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{ctx.run_dir}) catch "";
+                defer if (mpath.len > 0) gpa.free(mpath);
+                if (mpath.len > 0) {
+                    const existing = std.Io.Dir.cwd().readFileAlloc(ctx.io, mpath, gpa, .limited(64 << 10)) catch &[_]u8{};
+                    defer if (existing.len > 0) gpa.free(existing);
+                    var buf: std.ArrayListUnmanaged(u8) = .empty;
+                    defer buf.deinit(gpa);
+                    buf.appendSlice(gpa, existing) catch {};
+                    buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, ap.content.len }) catch "") catch {};
+                    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
+                }
+                recordRoundWrite(ctx, npath);
+            }
+            return std.fmt.allocPrint(gpa, "edited {s} — {d} tagged op(s) applied atomically; file is now {d} bytes.\n{s}", .{ npath, hops.len, ap.content.len, ap.summary }) catch dupe(gpa, "edited");
+        },
+    }
+}
+
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // Accept BOTH edit dialects: the hive prompt teaches {op, anchor, text}; the chat prompt teaches
     // {search, replace} (no op). Parsing only anchor/text silently drops search/replace, so every chat edit
     // runs with an EMPTY anchor and fails as a phantom "edit conflict". `search`/`replace` are aliases; `op`
     // defaults to "replace".
-    const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", search: []const u8 = "", text: []const u8 = "", replace: []const u8 = "", at: usize = 0 };
+    const OpJson = struct { op: []const u8 = "", anchor: []const u8 = "", search: []const u8 = "", text: []const u8 = "", replace: []const u8 = "", at: usize = 0, end: []const u8 = "", end_anchor: []const u8 = "" };
     // Top-level `search`/`replace` too: a FLAT {path, search, replace} call (no ops array) is what an XML-shaped
     // tool call converts to, and some models emit it directly — treat it as a single replace op.
     const A = struct { path: []const u8 = "", ops: []const OpJson = &.{}, search: []const u8 = "", replace: []const u8 = "" };
@@ -2232,6 +2295,42 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // reliable repair is a clean full rewrite, so route there instead of letting ops fight the markers.
     if (bufedit.editMarkerCorruption(original))
         return std.fmt.allocPrint(gpa, "{s} currently contains unresolved SEARCH/REPLACE / merge-conflict marker lines from an earlier bad edit — anchors are unreliable in it and partial cleanups leave broken residue. Do NOT edit it: REWRITE it clean in full with write_file path:\"{s}\" mode:\"overwrite\", sending the complete final code with ZERO marker lines.", .{ npath, npath }) catch dupe(gpa, "file is marker-corrupted — rewrite it in full with write_file mode:\"overwrite\"");
+    // HASH-ANCHORED DIALECT: any op whose anchor is a copied `42:abc:def` tag routes the WHOLE batch
+    // through the atomic anchor engine (hashline.zig) — anchors verify against the file AS IT IS NOW
+    // (that check IS the concurrent-edit guarantee: a teammate's change in your neighborhood surfaces as
+    // staleness, never a silent mis-splice), the batch applies all-or-nothing, and every failure returns
+    // FRESH tags so the mind retries immediately without re-reading.
+    var n_tagged: usize = 0;
+    for (p.value.ops) |o| {
+        if (hashline.isNumberedAnchor(if (o.anchor.len > 0) o.anchor else o.search)) n_tagged += 1;
+    }
+    if (n_tagged > 0) {
+        var hops: std.ArrayListUnmanaged(hashline.Op) = .empty;
+        defer hops.deinit(gpa);
+        for (p.value.ops) |o| {
+            const opname = if (o.op.len > 0) o.op else "replace";
+            const araw = if (o.anchor.len > 0) o.anchor else o.search;
+            const otext = if (o.text.len > 0) o.text else o.replace;
+            const a = hashline.parseAnchor(araw) orelse
+                return std.fmt.allocPrint(gpa, "mixed anchor dialects in one edit_file call — op anchor \"{s}\" is not a copied line tag while other ops use tags. Use the `N:abc:def` tags from your last read/edit result for EVERY op in this batch.", .{araw[0..@min(araw.len, 60)]}) catch dupe(gpa, "mixed anchor dialects — use line tags for every op");
+            var end_a: ?hashline.Anchor = null;
+            const eraw = if (o.end.len > 0) o.end else o.end_anchor;
+            if (eraw.len > 0) {
+                end_a = hashline.parseAnchor(eraw) orelse
+                    return std.fmt.allocPrint(gpa, "the `end` value \"{s}\" is not a line tag — copy the range's LAST line tag (`N:abc:def`) from your last read.", .{eraw[0..@min(eraw.len, 60)]}) catch dupe(gpa, "bad end tag");
+            }
+            const kind: hashline.OpKind = if (std.mem.eql(u8, opname, "insert_after"))
+                .insert_after
+            else if (std.mem.eql(u8, opname, "insert_before"))
+                .insert_before
+            else if (std.mem.eql(u8, opname, "replace") or std.mem.eql(u8, opname, "delete"))
+                .replace
+            else
+                return std.fmt.allocPrint(gpa, "op '{s}' does not take line tags — with tag anchors use replace | delete | insert_before | insert_after.", .{opname}) catch dupe(gpa, "unsupported op for tag anchors");
+            hops.append(gpa, .{ .kind = kind, .anchor = a, .end_anchor = end_a, .text = if (std.mem.eql(u8, opname, "delete")) "" else otext, .raw_anchor = araw }) catch return dupe(gpa, "oom");
+        }
+        return hashlineApply(ctx, npath, full, original, hops.items);
+    }
     var ops: std.ArrayListUnmanaged(bufedit.EditOp) = .empty;
     defer ops.deinit(gpa);
     for (p.value.ops) |o| {
@@ -2452,18 +2551,26 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     defer gpa.free(data);
     const clean = sanitizeModelText(gpa, data);
     defer gpa.free(clean);
+    // ANCHORED READ (build mode): every line is prefixed with its edit-anchor tag (`42:abc:def→`) — the
+    // copyable handles edit_file verifies. Rendered BEFORE windowing so a line window carries the same
+    // absolute tags as a whole-file read. Roamed (outside-workdir) and binary-ish reads stay plain.
+    const view = if (ctx.anchored_reads and roamed == null and std.mem.indexOfScalar(u8, clean, 0) == null)
+        hashline.renderRead(gpa, clean)
+    else
+        (gpa.dupe(u8, clean) catch return dupe(gpa, "oom"));
+    defer gpa.free(view);
     // A requested line window (start_line/end_line, or offset+limit) returns exactly those lines — this is how
     // you read the back half of a big file.
     const start_line = if (p.value.start_line > 0) p.value.start_line else p.value.offset;
     const end_line = if (p.value.end_line > 0) p.value.end_line else if (p.value.limit > 0 and start_line > 0) start_line + p.value.limit - 1 else 0;
-    if (start_line > 0 or end_line > 0) return readLineWindow(gpa, clean, start_line, end_line);
+    if (start_line > 0 or end_line > 0) return readLineWindow(gpa, view, start_line, end_line);
     const owned = ctx.my_files.len > 0 and fileOwnedBy(ctx.my_files, p.value.path);
     const cap: usize = if (owned) 32000 else 8000;
-    if (clean.len <= cap) return dupe(gpa, clean);
+    if (view.len <= cap) return dupe(gpa, view);
     // A silently-cut read looks EXACTLY like a truncated file — the reader then "fixes" a healthy file or
     // spirals on tail-verification. Name the cut, the real size, AND how to see the rest (a line range), so the
     // reader windows the tail instead of re-reading the head.
-    return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ clean[0..cap], cap, clean.len, p.value.path }) catch dupe(gpa, clean[0..cap]);
+    return std.fmt.allocPrint(gpa, "{s}\n[...view clipped: showing the first {d} of {d} bytes. The file on disk is WHOLE — to read the rest, call read_file again with a line range, e.g. {{\"path\":\"{s}\",\"start_line\":200,\"end_line\":320}}. Do NOT rewrite or re-verify the file just because this view ends here.]", .{ view[0..cap], cap, view.len, p.value.path }) catch dupe(gpa, view[0..cap]);
 }
 
 /// stage_file — copy a file from ANYWHERE the user's account can read INTO the conversation workdir, so a

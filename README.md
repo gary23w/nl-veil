@@ -640,6 +640,13 @@ The same binary covers very different jobs — the **mode emerges from your word
 - **Offline knowledge appliance.** `--offline` removes every web tool; a `corpus` in the run's
   manifest preloads knowledge (an nl-rag pack, say) into memory. A sealed appliance that reasons only
   over what you chose. `veil cast "Answer only from what I preload" --offline`
+- **Built-in knowledge base (local corpus mirror).** Point `NL_RAG_DIR` at a clone of
+  [nl-rag](https://github.com/gary23w/nl-rag) — or run `veil rag sync --from <clone>` to copy a tier
+  into the app's data dir (`veil rag status` shows what's active) — and every pack fetch serves from
+  disk: engine prefetch, scout page reads, deep crawls, all offline-capable. The corpus manifest also
+  EXTENDS the compiled source atlas at runtime (thousands of extra curated domains become routable),
+  with machine-grown packs excluded by default. A clone dropped at `vendor/nl-rag` before build works
+  too — the app carries its knowledge with it.
 
 ## Configuration
 
@@ -653,6 +660,7 @@ Each run has a `swarm.json` manifest — the web UI and the desktop write it for
 | `style` | `auto` · `build` · `discourse` · `investigate` · `debate` |
 | `internet` | `false` runs fully offline |
 | `corpus` / `corpus_cap` | a `.facts`/`.jsonl` pack to preload, and how many facts |
+| `bootstrap` | `false` disables the engine-run dependency installs of the deliverable's own manifests (npm/pip/cargo/go) |
 | `gateway_model` | optional cheaper/smaller model for mechanical calls (and the chat's fast voice) |
 
 **Endpoint resolution**, everywhere: a run's own `swarm.json` › `NL_LLM_*` env › `~/.veil/config.json`

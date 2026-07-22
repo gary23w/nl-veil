@@ -699,9 +699,24 @@ fn wordHit(text: []const u8, needle: []const u8) bool {
 
 const Scored = struct { loc: *const Loc, score: f32 };
 
+/// Runtime atlas EXTENSION — entries built from a local knowledge-corpus manifest (ragmirror.zig) covering
+/// the thousands of pack domains the compiled table doesn't. Set ONCE at process start (single-threaded),
+/// read-only on the match path afterwards; empty by default so a build without a mirror behaves exactly
+/// as before.
+var EXT: []const Loc = &.{};
+
+pub fn setExtension(ext: []const Loc) void {
+    EXT = ext;
+}
+
+pub fn extension() []const Loc {
+    return EXT;
+}
+
 /// Rank atlas entries against free text (gap report + goal). Score = word-bounded tag hits × the entry's
 /// trust prior. Returns the number of matches written into `out`, best first. Pure and allocation-free —
-/// callable from any hot path.
+/// callable from any hot path. Extension entries compete through a small fixed top-K so the runtime table
+/// (thousands of entries) costs one linear scan and zero allocations; compiled entries win ties.
 pub fn match(text: []const u8, out: []*const Loc) usize {
     var scored: [ATLAS.len]Scored = undefined;
     var n: usize = 0;
@@ -723,9 +738,39 @@ pub fn match(text: []const u8, out: []*const Loc) usize {
         while (j > 0 and scored[j - 1].score < key.score) : (j -= 1) scored[j] = scored[j - 1];
         scored[j] = key;
     }
-    const k = @min(n, out.len);
-    for (0..k) |x| out[x] = scored[x].loc;
-    return k;
+    // extension pass: sorted-insert into a bounded top-K (drop-the-tail, never allocate)
+    var es: [8]Scored = undefined;
+    var en: usize = 0;
+    for (EXT) |*loc| {
+        var hits: f32 = 0;
+        for (loc.tags) |t| {
+            if (wordHit(text, t)) hits += 1;
+        }
+        if (hits == 0) continue;
+        const sc = hits * loc.trust;
+        var j: usize = en;
+        while (j > 0 and es[j - 1].score < sc) : (j -= 1) {}
+        if (j >= es.len) continue;
+        if (en < es.len) en += 1;
+        var k = en - 1;
+        while (k > j) : (k -= 1) es[k] = es[k - 1];
+        es[j] = .{ .loc = loc, .score = sc };
+    }
+    // merge best-first; compiled wins ties so hand-tuned routing never loses to a generated entry
+    var oi: usize = 0;
+    var ci: usize = 0;
+    var ei: usize = 0;
+    while (oi < out.len and (ci < n or ei < en)) : (oi += 1) {
+        const take_compiled = ci < n and (ei >= en or scored[ci].score >= es[ei].score);
+        if (take_compiled) {
+            out[oi] = scored[ci].loc;
+            ci += 1;
+        } else {
+            out[oi] = es[ei].loc;
+            ei += 1;
+        }
+    }
+    return oi;
 }
 
 /// The "CANONICAL SOURCES" block appended to a research directive: the top matched domains with their seed
