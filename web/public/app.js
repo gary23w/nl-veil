@@ -643,6 +643,9 @@ function renderChat(host) {
         <div class="files-pane hide" id="filesPane"></div>
 
         <div class="composer" id="composer">
+          <button class="jump-latest hide" id="jumpLatest" aria-label="Jump to the latest message">
+            <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg> Latest
+          </button>
           <div class="composer-chips hide" id="chips"></div>
           <div class="composer-row">
             <textarea id="input" rows="1" placeholder="Ask the veil…" enterkeyhint="send"></textarea>
@@ -668,6 +671,12 @@ function renderChat(host) {
   el('filesBtn').addEventListener('click', toggleFiles);
   el('railToggle').addEventListener('click', toggleRail);
   el('railRestore').addEventListener('click', toggleRail);
+  el('jumpLatest').addEventListener('click', () => {
+    const t = el('transcript');
+    resumeFollowing(t);
+    stickToBottom(t);
+    el('jumpLatest').classList.add('hide');
+  });
   wireRailGrip();
   setRailCollapsed(LS.get('veil.railCollapsed', '0') === '1');
   // With no model this control is relabelled into a link to Settings (syncSetupState),
@@ -1235,7 +1244,7 @@ function drawTranscript() {
     host._rendered = 0;
     return;
   }
-  const stick = isPinnedToBottom(host);
+  let stick = following(host);
 
   // A shorter list than we have drawn means a different conversation (or a
   // delete) — start over. Otherwise append only what is new.
@@ -1243,6 +1252,10 @@ function drawTranscript() {
     host.innerHTML = '';
     host._emptyHtml = '';
     host._rendered = 0;
+    // Different conversation: the old one's reading position says nothing about this
+    // one, so open it at the bottom the way a freshly opened chat should read.
+    resumeFollowing(host);
+    stick = true;
   }
   // An empty conversation gets the same nudge, which by now is usually one line:
   // an account that already has a model and a key sees only "ask it something".
@@ -1261,7 +1274,7 @@ function drawTranscript() {
   host._rendered = S.msgs.length;
 
   renderLive(host);
-  if (stick) host.scrollTop = host.scrollHeight;
+  if (stick) stickToBottom(host);
 }
 
 /** The live block always sits last; committed messages insert before it. */
@@ -1366,12 +1379,12 @@ function typeTick() {
   // 60fps from ~25fps here, and this keeps a long code block from stuttering.
   if (now - _typeLastPaint > 40 || S.stream.shown >= total) {
     _typeLastPaint = now;
-    const stick = isPinnedToBottom(host);
+    const stick = following(host);
     paintTyped(live.querySelector('.msg-body'));
     const act = live.querySelector('.host-activity');
     const html = hostActivityHtml();
     if (act && act.innerHTML !== html) act.innerHTML = html;
-    if (stick) host.scrollTop = host.scrollHeight;
+    if (stick) stickToBottom(host);
   }
 
   // Keep ticking while there is text to reveal, or while a tool is running (the
@@ -1397,10 +1410,56 @@ function paintTyped(body) {
   }
 }
 
-function isPinnedToBottom(host) {
-  // Only auto-scroll when the reader is already at the bottom. Yanking the view
-  // while they read history is the worst thing a chat UI can do.
-  return host.scrollHeight - host.scrollTop - host.clientHeight < 80;
+/** Is the view still FOLLOWING new content? A latch on the reader's intent, not a
+    measurement of where the scrollbar happens to sit.
+
+    This used to be `scrollHeight - scrollTop - clientHeight < 80`, re-evaluated on
+    every frame — and that locked the transcript during a live turn. A trackpad or a
+    touch drag delivers 5-30px per scroll event; each one landed inside the 80px band,
+    so the very next tick (~25/sec while streaming) read "still pinned" and yanked the
+    view back to the bottom. The reader could never ACCUMULATE distance: every small
+    increment was independently reverted before the next arrived. Only a single gesture
+    bigger than 80px escaped, which is why a fast mouse wheel sometimes worked and a
+    phone never did.
+
+    Latching fixes it because scrolling UP is unambiguous intent, however small: one
+    upward pixel stops the following, and it stays stopped until the reader returns to
+    the bottom themselves. Our own auto-scroll only ever moves scrollTop DOWN, so it
+    can't trip the unstick, and it lands at distance ~0 which keeps the latch set. */
+function following(host) {
+  if (host._follow === undefined) host._follow = true;
+  // Compare against where WE last parked the view, not against a scroll event. If
+  // scrollTop now sits above that mark, something other than us moved it — which can
+  // only be the reader — so stop following. Deriving intent from the position itself
+  // needs no listener, so it cannot be defeated by a scroll event that is coalesced,
+  // delayed, or (as in a headless render) never dispatched at all.
+  if (host._parkedAt !== undefined && host.scrollTop < host._parkedAt - 2) host._follow = false;
+  // Arriving back at the bottom — by drag, wheel, keyboard or the jump below — resumes
+  // following. This is the only way back, and it is deliberately the reader's own act.
+  if (host.scrollHeight - host.scrollTop - host.clientHeight < 4) host._follow = true;
+  // Scrolling away now means new text lands off-screen, so say so. Every path that can
+  // change the answer runs through here, which is why the toggle lives here too.
+  if (host.id === 'transcript') {
+    const j = el('jumpLatest');
+    if (j) j.classList.toggle('hide', host._follow);
+  }
+  return host._follow;
+}
+
+/** Park the view at the bottom and remember where, so `following` can tell our own
+    scroll apart from the reader's on the next frame. */
+function stickToBottom(host) {
+  if (!host) return;
+  host.scrollTop = host.scrollHeight;
+  host._parkedAt = host.scrollTop; // post-clamp: the browser caps this at max scroll
+}
+
+/** Re-arm following after the reader has scrolled away. Clearing the park mark matters:
+    leaving a stale one above the current position would flip `_follow` straight back off. */
+function resumeFollowing(host) {
+  if (!host) return;
+  host._follow = true;
+  host._parkedAt = undefined;
 }
 
 function renderMsg(m) {
@@ -1679,6 +1738,9 @@ async function sendTurn() {
   // Optimistic echo: show the line immediately, then let the stream's own
   // `message` frame become the source of truth.
   S.msgs.push({ role: 'user', content: text, ts: Math.floor(Date.now() / 1000) });
+  // Sending is an explicit act: resume following even if they had scrolled up to read
+  // history. Without this the reply would stream in off-screen, below the fold.
+  resumeFollowing(el('transcript'));
   input.value = '';
   autoGrow(input);
   updateCharCount();
@@ -2097,6 +2159,7 @@ function openSwarm(id) {
   $$('.sw-events').forEach((b) => b.classList.add('hide'));
   box.classList.remove('hide');
   box.innerHTML = '<div class="muted">connecting…</div>';
+  resumeFollowing(box);   // a newly opened log starts pinned to the tail
   if (_swStream) _swStream.close();
   const lines = [];
   _swStream = new EventSource('/api/v1/swarms/' + encodeURIComponent(id) + '/stream');
@@ -2105,10 +2168,13 @@ function openSwarm(id) {
     try { o = JSON.parse(ev.data); } catch (e) { return; }
     lines.push(o);
     if (lines.length > 200) lines.shift();   // the tail is what matters
+    // Same intent latch as the transcript: a busy swarm emits constantly, and forcing
+    // the bottom on every event made the log unreadable while it was running.
+    const stick = following(box);
     box.innerHTML = lines.map((l) =>
       `<div class="sw-line"><span class="muted mono">${esc(l.kind || l.type || '')}</span> ${esc(l.text || l.msg || JSON.stringify(l).slice(0, 200))}</div>`
     ).join('');
-    box.scrollTop = box.scrollHeight;
+    if (stick) stickToBottom(box);
   };
   _swStream.onerror = () => { box.insertAdjacentHTML('beforeend', '<div class="muted">stream closed</div>'); };
 }
