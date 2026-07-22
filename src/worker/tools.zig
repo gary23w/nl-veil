@@ -1960,6 +1960,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { path: []const u8 = "", content: []const u8 = "", mode: []const u8 = "overwrite" };
     var salvage_note: []const u8 = "";
+    var truncated = false; // KNOWN-incomplete content (cut-off salvage) — the syntax note below must not double-flag it
     const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch blk_rep: {
         // strict parse failed — repair the arguments (raw newlines in "content", a cut-off tail) and
         // retry, so the file the model already composed lands instead of evaporating into an error.
@@ -1969,6 +1970,7 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         defer gpa.free(rep);
         const p2 = std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true }) catch
             return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
+        truncated = trunc;
         salvage_note = if (trunc)
             " NOTE: your arguments were CUT OFF mid-content — I closed and wrote what arrived. read_file to see where it stops, then send the REST with mode:\"append\"."
         else
@@ -2092,11 +2094,24 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         }
         recordRoundWrite(ctx, wpath);
     }
+    // SOFT SYNTAX NOTE — write_file must stay salvage-friendly (chunked appends and cut-off salvages are
+    // legitimately incomplete), so unlike edit_file this NEVER rejects: the bytes always land. But a plain
+    // overwrite (or an append that restarted the file) is a complete-file claim, so when THAT does not
+    // parse — the same extension-dispatched gate the edit paths use — say so in the SAME turn instead of
+    // letting the global scan report it rounds later. orig="" ⇒ the .py branch also flags internal
+    // duplicate defs, the signature corruption of a chunk-glued full write.
+    const syntax_note: []const u8 = blk: {
+        if (truncated or clean.len == 0 or (is_append and !restarted)) break :blk "";
+        const perr = syntaxGateError(ctx, wpath, clean, "") orelse break :blk "";
+        defer gpa.free(perr);
+        break :blk std.fmt.allocPrint(gpa, " WARNING: as saved, {s} does not parse ({s}) — the write landed anyway. If the file is complete, fix it NOW with edit_file; if you are still sending the rest, continue with mode:\"append\".", .{ wpath, perr }) catch "";
+    };
+    defer if (syntax_note.len > 0) gpa.free(@constCast(syntax_note));
     if (redirected)
-        return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.", .{ wpath, final_bytes, p.value.path }) catch dupe(gpa, "wrote");
+        return std.fmt.allocPrint(gpa, "wrote {s} ({d} bytes) — that is your ONE assigned file this moment, so the write landed there (you named {s}); finish THIS file, then the engine gives you the next.{s}", .{ wpath, final_bytes, p.value.path, syntax_note }) catch dupe(gpa, "wrote");
     if (restarted)
-        return std.fmt.allocPrint(gpa, "rewrote {s} — your append RE-STARTED the file (its body opens with the same line the file already starts with), so it REPLACED the old attempt instead of gluing two half-programs together; file is now {d} bytes. To truly append, send only the NEW lines that continue the existing file.", .{ wpath, final_bytes }) catch dupe(gpa, "rewrote");
-    return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes{s}", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes, salvage_note }) catch dupe(gpa, "wrote");
+        return std.fmt.allocPrint(gpa, "rewrote {s} — your append RE-STARTED the file (its body opens with the same line the file already starts with), so it REPLACED the old attempt instead of gluing two half-programs together; file is now {d} bytes. To truly append, send only the NEW lines that continue the existing file.{s}", .{ wpath, final_bytes, syntax_note }) catch dupe(gpa, "rewrote");
+    return std.fmt.allocPrint(gpa, "{s} {s} — file is now {d} bytes{s}{s}", .{ if (is_append) "appended to" else "wrote", wpath, final_bytes, salvage_note, syntax_note }) catch dupe(gpa, "wrote");
 }
 
 /// An "append" whose body RE-OPENS the file (the same first meaningful line as the existing head — the same
@@ -2193,8 +2208,126 @@ fn pyCompileError(ctx: *ToolCtx, source: []const u8, orig: []const u8) ?[]u8 {
     };
 }
 
+/// Distinguishes concurrent syntax-gate scratch files; two minds can gate-check in the same run_dir at once.
+var chk_seq = std.atomic.Value(u32).init(0);
+
+/// Distill node's --check stderr into one "line N: SyntaxError: ..." verdict. node prints the offending
+/// source line, a caret, then a column-0 `SyntaxError: ...` line, then stack frames — the LAST column-0
+/// SyntaxError line is the real verdict (a source line that itself starts with the word echoes EARLIER).
+/// null when stderr carries no SyntaxError at all: node failing for any other reason (EACCES, bad flag,
+/// missing file) must fail the gate OPEN, never reject the edit. Owned; caller frees.
+fn jsSyntaxErrLine(gpa: std.mem.Allocator, stderr: []const u8) ?[]u8 {
+    var verdict: []const u8 = "";
+    var it = std.mem.splitScalar(u8, stderr, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trimEnd(u8, ln, " \r\t");
+        if (std.mem.startsWith(u8, t, "SyntaxError")) verdict = t;
+    }
+    if (verdict.len == 0) return null;
+    if (verdict.len > 300) verdict = verdict[0..300]; // clip: this rides inside one reject sentence
+    // node's first stderr line is "<scratch path>:<lineno>" — salvage the line number from its tail (and
+    // never the scratch path itself: a .nlchk-N name would only confuse the mind that edited `app.js`).
+    const first_end = std.mem.indexOfScalar(u8, stderr, '\n') orelse stderr.len;
+    const first = std.mem.trimEnd(u8, stderr[0..first_end], " \r\t");
+    if (std.mem.lastIndexOfScalar(u8, first, ':')) |ci| {
+        if (std.fmt.parseInt(u64, first[ci + 1 ..], 10) catch null) |n|
+            return std.fmt.allocPrint(gpa, "line {d}: {s}", .{ n, verdict }) catch null;
+    }
+    return gpa.dupe(u8, verdict) catch null;
+}
+
+/// One `node --check` pass over `source`, staged as a run_dir scratch file with extension `ext` — the
+/// extension IS node's module-system selector (.cjs forces CommonJS, .mjs forces ESM), which keeps the
+/// verdict independent of whatever package.json happens to sit above run_dir. null = parses, or the check
+/// could not run (node missing, scratch write failed, timeout) — every non-verdict failure fails OPEN.
+fn nodeCheckOnce(ctx: *ToolCtx, source: []const u8, ext: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    const tmp = std.fmt.allocPrint(gpa, "{s}/.nlchk-{d}{s}", .{ ctx.run_dir, chk_seq.fetchAdd(1, .monotonic), ext }) catch return null;
+    defer gpa.free(tmp);
+    std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = tmp, .data = source }) catch return null;
+    defer std.Io.Dir.cwd().deleteFile(ctx.io, tmp) catch {};
+    const argv = [_][]const u8{ "node", "--no-warnings", "--check", tmp };
+    // ctx.environ must ride along (the main.zig empty-environ gotcha): spawned env-less on Windows, node
+    // aborts in OpenSSL's CSPRNG init (no SYSTEMROOT) BEFORE parsing anything — exit 134, no SyntaxError,
+    // and the gate silently fails open forever. Same timeout story as the python gate above: this can run
+    // while vcs.commitEdit holds the ONE worker file mutex. stderr gets more rope than stdout because node
+    // echoes the whole offending source line (minified JS = one huge line) BEFORE the SyntaxError verdict,
+    // and a clipped-off verdict = fail-open.
+    const r = std.process.run(gpa, ctx.io, .{ .argv = &argv, .environ_map = ctx.environ, .stdout_limit = .limited(4096), .stderr_limit = .limited(16 << 10), .timeout = .{ .duration = .{ .raw = .fromSeconds(15), .clock = .awake } } }) catch return null;
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    return switch (r.term) {
+        .exited => |c| if (c == 0) null else jsSyntaxErrLine(gpa, r.stderr),
+        else => null,
+    };
+}
+
+/// Syntax-check a candidate .js/.mjs/.cjs body via `node --check`. A bare `.js` has no module system of
+/// its own — the nearest package.json decides at RUN time, invisible from here — so it must fail as BOTH
+/// CommonJS and ESM before it rejects (an `import`-style .js in a type:module project stays editable; a
+/// dropped brace breaks under both readings and still rejects). When both fail, return the verdict that
+/// names the real break: the CJS one, unless it is just "cannot use import/export outside a module" —
+/// that is the dialect talking, not the bug. null = passes or node is missing (fail open); owned else.
+fn jsCheckError(ctx: *ToolCtx, npath: []const u8, source: []const u8) ?[]u8 {
+    const gpa = ctx.gpa;
+    if (std.mem.endsWith(u8, npath, ".mjs")) return nodeCheckOnce(ctx, source, ".mjs");
+    if (std.mem.endsWith(u8, npath, ".cjs")) return nodeCheckOnce(ctx, source, ".cjs");
+    const as_cjs = nodeCheckOnce(ctx, source, ".cjs") orelse return null;
+    const as_mjs = nodeCheckOnce(ctx, source, ".mjs") orelse {
+        gpa.free(as_cjs);
+        return null;
+    };
+    if (std.mem.indexOf(u8, as_cjs, "outside a module") != null) {
+        gpa.free(as_cjs);
+        return as_mjs;
+    }
+    gpa.free(as_mjs);
+    return as_cjs;
+}
+
+/// Validate a candidate .json body with std.json itself — native, no subprocess, so this gate can never be
+/// missing. null when it parses, and null for `//`‑`/*` COMMENT dialects too: tsconfig-style JSONC is a
+/// different language owned by its consumer, so the first comment byte fails the whole check OPEN rather
+/// than rejecting a file its own toolchain accepts. Anything else non-JSON returns an owned
+/// "line N: invalid JSON — ..." verdict (caller frees).
+fn jsonParseError(gpa: std.mem.Allocator, source_in: []const u8) ?[]u8 {
+    // A UTF-8 BOM is byte noise most JSON consumers tolerate; std.json does not — skip it, don't judge it.
+    const source = if (std.mem.startsWith(u8, source_in, "\xEF\xBB\xBF")) source_in[3..] else source_in;
+    var diag = std.json.Diagnostics{};
+    var scanner = std.json.Scanner.initCompleteInput(gpa, source);
+    defer scanner.deinit();
+    scanner.enableDiagnostics(&diag);
+    while (true) {
+        const tok = scanner.next() catch |e| switch (e) {
+            error.OutOfMemory, error.BufferUnderrun => return null, // gate trouble is never a verdict — fail open
+            error.SyntaxError, error.UnexpectedEndOfInput => {
+                const off: usize = @intCast(@min(diag.getByteOffset(), source.len));
+                const at = if (off < source.len) source[off] else 0;
+                const before = if (off > 0) source[off - 1] else 0;
+                if (at == '/' or before == '/') return null; // comment syntax ⇒ JSONC dialect, not ours to judge
+                const what: []const u8 = if (e == error.UnexpectedEndOfInput) "the file ends mid-value (truncated?)" else "syntax error";
+                return std.fmt.allocPrint(gpa, "line {d}: invalid JSON — {s}", .{ diag.getLine(), what }) catch null;
+            },
+        };
+        if (tok == .end_of_document) return null;
+    }
+}
+
+/// EXTENSION-DISPATCHED syntax gate shared by every edit path (and writeFile's soft note): .py compiles via
+/// the workdir python (plus its duplicate-def AST diff against `orig`), .js/.mjs/.cjs parse via
+/// `node --check`, .json parses natively. null = pass — and every subprocess gate fails OPEN when its
+/// toolchain is missing, so a machine without python/node simply has no gate for that language, never a
+/// stuck one. Non-null is an owned one-line verdict shaped for editRejectMsg (caller frees).
+fn syntaxGateError(ctx: *ToolCtx, npath: []const u8, source: []const u8, orig: []const u8) ?[]u8 {
+    if (std.mem.endsWith(u8, npath, ".py")) return pyCompileError(ctx, source, orig);
+    if (std.mem.endsWith(u8, npath, ".js") or std.mem.endsWith(u8, npath, ".mjs") or std.mem.endsWith(u8, npath, ".cjs"))
+        return jsCheckError(ctx, npath, source);
+    if (std.mem.endsWith(u8, npath, ".json")) return jsonParseError(ctx.gpa, source);
+    return null;
+}
+
 /// One reject message for BOTH edit paths (direct and VCS), so a gate rejection reads identically wherever it
-/// fires. `perr` is pyCompileError's output; a "duplicate ..." verdict gets the paste-a-second-copy guidance,
+/// fires. `perr` is the syntax gate's output; a "duplicate ..." verdict gets the paste-a-second-copy guidance,
 /// anything else the parse-break guidance. Owned; null only on OOM (caller falls back to a static string).
 fn editRejectMsg(gpa: std.mem.Allocator, npath: []const u8, perr: []const u8) ?[]u8 {
     if (std.mem.startsWith(u8, perr, "duplicate"))
@@ -2228,11 +2361,9 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
             defer gpa.free(ap.content);
             if (bufedit.editMarkerCorruption(ap.content) and !bufedit.editMarkerCorruption(head))
                 return dupe(gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
-            if (std.mem.endsWith(u8, npath, ".py")) {
-                if (pyCompileError(ctx, ap.content, head)) |perr| {
-                    defer gpa.free(perr);
-                    return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
-                }
+            if (syntaxGateError(ctx, npath, ap.content, head)) |perr| {
+                defer gpa.free(perr);
+                return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
             }
             if (!writeWorkFileAtomic(ctx, full, ap.content)) return dupe(gpa, "could not write the edited file");
             ctx.files_written.* += 1;
@@ -2345,8 +2476,9 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         ops.append(gpa, .{ .kind = .replace, .anchor = p.value.search, .text = p.value.replace, .at = 0 }) catch {};
     // When minds run concurrently, route through the micro-VCS: it reads HEAD in-lock and re-applies these ops
     // against it, so two minds editing one file merge instead of clobbering. `original` is this mind's base.
-    // The validator runs the SAME .py gate (compile + duplicate-definition) on the rebased result, in-lock,
-    // BEFORE the commit — the VCS branch returns from here, so without it team>1 runs had NO edit gate at all.
+    // The validator runs the SAME extension-dispatched syntax gate (.py compile + duplicate-definition,
+    // .js/.mjs/.cjs node --check, .json native parse) on the rebased result, in-lock, BEFORE the commit —
+    // the VCS branch returns from here, so without it team>1 runs had NO edit gate at all.
     if (ctx.vcs_enabled) if (ctx.fmtx) |m| {
         const Gate = struct {
             tc: *ToolCtx,
@@ -2358,8 +2490,7 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
                 // them stays editable, mirroring the NL_CHK_ORIG baseline rule).
                 if (bufedit.editMarkerCorruption(candidate) and !bufedit.editMarkerCorruption(head))
                     return dupe(g.tc.gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
-                if (!std.mem.endsWith(u8, g.path, ".py")) return null;
-                const perr = pyCompileError(g.tc, candidate, head) orelse return null;
+                const perr = syntaxGateError(g.tc, g.path, candidate, head) orelse return null;
                 defer g.tc.gpa.free(perr);
                 return editRejectMsg(g.tc.gpa, g.path, perr) orelse (dupe(g.tc.gpa, "edit rejected: result does not compile"));
             }
@@ -2386,15 +2517,13 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // case already returned above), so a single-mind run gets identical protection.
     if (bufedit.editMarkerCorruption(res.bytes))
         return dupe(gpa, "edit rejected — the result would ADD SEARCH/REPLACE / merge-conflict marker lines to the file: your `text` itself carries edit-script fences. Put ONLY the final code lines in `text` — never <<<<<<< SEARCH / ======= / >>>>>>> REPLACE.");
-    // POST-EDIT COMPILE GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py unparseable while
-    // edit_file still reports "edited", so the mind only learns rounds later via the global scan. Reject a
-    // parse-breaking edit and name the error NOW, in the same turn, keeping the last good file. Fail-open (a
-    // broken python env = no gate).
-    if (std.mem.endsWith(u8, npath, ".py")) {
-        if (pyCompileError(ctx, res.bytes, original)) |perr| {
-            defer gpa.free(perr);
-            return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
-        }
+    // POST-EDIT SYNTAX GATE: a SEARCH/REPLACE (esp. a loose-match reindent) can leave a .py/.js/.json
+    // unparseable while edit_file still reports "edited", so the mind only learns rounds later via the
+    // global scan. Reject a parse-breaking edit and name the error NOW, in the same turn, keeping the last
+    // good file. Fail-open (a missing python/node = no gate for that language).
+    if (syntaxGateError(ctx, npath, res.bytes, original)) |perr| {
+        defer gpa.free(perr);
+        return editRejectMsg(gpa, npath, perr) orelse dupe(gpa, "edit rejected: result does not compile");
     }
     if (!writeWorkFileAtomic(ctx, full, res.bytes)) return dupe(gpa, "could not write the edited file");
     ctx.files_written.* += 1;
@@ -5474,6 +5603,189 @@ test "pyAppendRedefines: a re-attempt that re-defines existing top-level names i
     // DECORATED repeats are legitimate (@singledispatch.register / @overload) — never flagged, either side
     try std.testing.expect(pyAppendRedefines("from functools import singledispatch\n@singledispatch\ndef convert(x):\n    pass\n", "@convert.register\ndef convert(x: int):\n    return x\n") == null);
     try std.testing.expect(pyAppendRedefines("@overload\ndef f(x):\n    pass\n", "@overload\ndef f(x, y):\n    pass\n") == null);
+}
+
+test "jsonParseError: broken JSON gets a line verdict; valid, BOM'd, and JSONC-comment bodies pass" {
+    const gpa = std.testing.allocator;
+    // valid — object, array, nesting, escapes: silence
+    try std.testing.expect(jsonParseError(gpa, "{\"a\": [1, 2, {\"b\": \"\\u00e9\\n\"}], \"c\": null}") == null);
+    try std.testing.expect(jsonParseError(gpa, "\xEF\xBB\xBF{\"bom\": true}") == null);
+    // JSONC (tsconfig-style comments) is its consumer's language, not ours — first comment byte fails OPEN
+    try std.testing.expect(jsonParseError(gpa, "{\n  // compiler options\n  \"strict\": true\n}") == null);
+    try std.testing.expect(jsonParseError(gpa, "[1, /* two */ 2]") == null);
+    { // truncation — the classic cut-off write — names its line and says so
+        const v = jsonParseError(gpa, "{\n  \"a\": 1,\n  \"b\": [2,").?;
+        defer gpa.free(v);
+        try std.testing.expect(std.mem.startsWith(u8, v, "line 3:"));
+        try std.testing.expect(std.mem.indexOf(u8, v, "truncated") != null);
+    }
+    { // a doubled comma is a plain syntax verdict, not a pass
+        const v = jsonParseError(gpa, "{\"a\": 1,, \"b\": 2}").?;
+        defer gpa.free(v);
+        try std.testing.expect(std.mem.startsWith(u8, v, "line 1:"));
+    }
+    { // a SECOND top-level value can never be one JSON document (splice corruption signature)
+        const v = jsonParseError(gpa, "{\"a\": 1}\n{\"b\": 2}").?;
+        defer gpa.free(v);
+        try std.testing.expect(std.mem.startsWith(u8, v, "line 2:"));
+    }
+}
+
+test "jsSyntaxErrLine: node stderr distills to one line-numbered verdict; non-syntax failures fail open" {
+    const gpa = std.testing.allocator;
+    { // the shape node actually prints (CRLF, echo line, caret, verdict, stack frames, version banner)
+        const stderr = "C:\\runs\\x\\.nlchk-3.cjs:2\r\nconst a = {;\r\n           ^\r\n\r\nSyntaxError: Unexpected token ';'\r\n    at wrapSafe (node:internal/modules/cjs/loader:1281:20)\r\nNode.js v20.11.0\r\n";
+        const v = jsSyntaxErrLine(gpa, stderr).?;
+        defer gpa.free(v);
+        try std.testing.expectEqualStrings("line 2: SyntaxError: Unexpected token ';'", v);
+    }
+    { // a source ECHO line that itself starts with "SyntaxError" must not shadow the real verdict below it
+        const stderr = "/tmp/.nlchk-4.mjs:9\nSyntaxError.prototype.x = (\n^\n\nSyntaxError: Unexpected end of input\n    at compileSourceTextModule (node:internal/modules/esm/utils:340:16)\n";
+        const v = jsSyntaxErrLine(gpa, stderr).?;
+        defer gpa.free(v);
+        try std.testing.expectEqualStrings("line 9: SyntaxError: Unexpected end of input", v);
+    }
+    // no SyntaxError anywhere (bad flag, EACCES, missing file) ⇒ null ⇒ the gate fails OPEN
+    try std.testing.expect(jsSyntaxErrLine(gpa, "node: bad option: --wat\n") == null);
+    try std.testing.expect(jsSyntaxErrLine(gpa, "Error: EACCES: permission denied, open '/x'\n") == null);
+    try std.testing.expect(jsSyntaxErrLine(gpa, "") == null);
+}
+
+test "syntaxGateError dispatches by extension: .json rejects natively, ungated extensions pass untouched" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = undefined, // .json validates natively and ungated extensions return before any I/O
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined,
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    const v = syntaxGateError(&ctx, "cfg/settings.json", "{\"a\": ", "").?;
+    defer gpa.free(v);
+    try std.testing.expect(std.mem.indexOf(u8, v, "invalid JSON") != null);
+    // the same broken bytes under an ungated extension: no verdict, no dispatch, no io touched
+    try std.testing.expect(syntaxGateError(&ctx, "notes/readme.md", "{\"a\": ", "") == null);
+    try std.testing.expect(syntaxGateError(&ctx, "styles.css", "body { color:", "") == null);
+}
+
+test "writeFile soft syntax note: a broken .json overwrite LANDS and warns; appends and valid writes stay quiet" {
+    // writeFile drops a few small allocations by design (manifest/ledger lines) — production runs it on the
+    // worker's per-turn allocator, so the test mirrors that with an arena instead of the leak-tracking gpa.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-wfgate-it-tmp"; // run_dir, relative to cwd (vcs.zig test idiom)
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa); // never spawns: .json validates natively
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root ++ "/work",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined, // the write path is file-only; mem belongs to the observe/recall tools
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    { // broken overwrite: the bytes LAND (soft gate — write_file never rejects on syntax) and the reply warns
+        const out = writeFile(&ctx, "{\"path\": \"cfg.json\", \"content\": \"{\\\"a\\\": 1,\"}");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "wrote cfg.json") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "does not parse") != null);
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/work/cfg.json", gpa, .limited(4096));
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("{\"a\": 1,", body);
+    }
+    { // an append is legitimately mid-chunk — no warning even though the glued file happens to parse now
+        const out = writeFile(&ctx, "{\"path\": \"cfg.json\", \"content\": \"...\", \"mode\": \"append\"}");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "appended to cfg.json") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "does not parse") == null);
+    }
+    { // a valid overwrite stays quiet
+        const out = writeFile(&ctx, "{\"path\": \"ok.json\", \"content\": \"{\\\"a\\\": 1}\"}");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "wrote ok.json") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "does not parse") == null);
+    }
+}
+
+test "jsCheckError via node --check: broken js rejects with a line verdict; ESM-in-.js and valid .cjs pass (skips without node)" {
+    const gpa = std.testing.allocator;
+    // The REAL process environ, exactly as main.zig builds it — spawned with an empty env map, node aborts
+    // in CSPRNG init on Windows (exit 134) before parsing a byte, and every check "passes" open.
+    const environ: std.process.Environ = if (@import("builtin").os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = environ.createMap(gpa) catch return error.SkipZigTest;
+    defer env.deinit();
+    { // no node on this machine ⇒ the gate is designed to not exist here — nothing to assert
+        const probe = std.process.run(gpa, io, .{ .argv = &.{ "node", "--version" }, .environ_map = &env, .stdout_limit = .limited(256), .stderr_limit = .limited(256), .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } } }) catch return error.SkipZigTest;
+        defer gpa.free(probe.stdout);
+        defer gpa.free(probe.stderr);
+        if (probe.term != .exited or probe.term.exited != 0) return error.SkipZigTest;
+    }
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = ".", // scratch .nlchk-* files land here and are deleted by the check itself
+        .workdir = ".",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined, // never touched: the gate only stages a scratch file and spawns node
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    { // a dropped bracket must reject in the same turn, naming the break
+        const v = jsCheckError(&ctx, "app.js", "function f() {\n  return [1, 2;\n}\n").?;
+        defer gpa.free(v);
+        try std.testing.expect(std.mem.indexOf(u8, v, "SyntaxError") != null);
+    }
+    // an import-style .js is valid in a type:module project — the ESM re-check keeps it editable
+    try std.testing.expect(jsCheckError(&ctx, "app.js", "import { x } from './m.js';\nexport const y = x + 1;\n") == null);
+    try std.testing.expect(jsCheckError(&ctx, "lib.cjs", "const fs = require('fs');\nmodule.exports = { fs };\n") == null);
+    try std.testing.expect(jsCheckError(&ctx, "mod.mjs", "export const one = 1;\n") == null);
+    { // broken ESM-style .js: the verdict must name the real break, not the module dialect
+        const v = jsCheckError(&ctx, "esm.js", "import { x } from './m.js';\nconst a = {;\n").?;
+        defer gpa.free(v);
+        try std.testing.expect(std.mem.indexOf(u8, v, "outside a module") == null);
+        try std.testing.expect(std.mem.indexOf(u8, v, "SyntaxError") != null);
+    }
 }
 
 test "wellFormedVerb relays any host verb the situation defines, rejecting only malformed input (FIX 3 — no allow-list)" {
