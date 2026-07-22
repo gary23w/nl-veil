@@ -497,9 +497,19 @@ fn parseModels(raw: []const u8, comptime want_key: []const u8) []const Model {
 // ---- tests: the EMBEDDED catalog itself is the fixture — CI fails on a bad edit -------------------------
 
 test "models.yaml parses: provider order pins the desk's persisted dropdown indices" {
-    try std.testing.expect(providers.len >= 13);
-    // the persisted dropdown indices — order is a compatibility contract (append-only)
-    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "workers-ai", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot" };
+    try std.testing.expect(providers.len >= 12);
+    // THE INDEX CONTRACT. The desk persists a provider as `byok: u8` — a raw index into this slice
+    // (desk/src/store.zig) — and dereferences it unfiltered (`catalog.providers[byok]`, chat.zig:5341)
+    // to pick the BASE URL. So the order is append-only by necessity: removing an entry shifts every
+    // later provider down one, and a desk that saved index N before the edit silently resolves to a
+    // DIFFERENT provider after it — the right model id sent to the wrong vendor's endpoint. That is
+    // why this list is spelled out rather than derived; it fails the build the moment order changes,
+    // which is the only warning anyone gets.
+    //
+    // workers-ai was commented out of models.yaml deliberately, so it is absent here and everything
+    // after it moved down one. Any desk config persisted BEFORE that edit with byok >= 3 now points a
+    // slot left; a desk that has since re-saved is self-consistent again.
+    const expect = [_][]const u8{ "anthropic", "openai", "ollama", "groq", "deepseek", "google", "mock", "huggingface", "zai", "tokengo", "openrouter", "moonshot" };
     for (expect, 0..) |k, i| try std.testing.expectEqualStrings(k, providers[i].key);
 }
 
@@ -577,11 +587,16 @@ test "models.yaml parses: fields, flags, models, quoted scalars, defaults" {
     try std.testing.expectEqualStrings("Claude Opus 4.8", providers[0].models[0].label);
     // local/keyless flags drive the server's deploy logic
     try std.testing.expect(isKeyless("ollama") and isLocal("ollama"));
-    try std.testing.expect(isKeyless("workers-ai") and !isLocal("workers-ai"));
     try std.testing.expect(isKeyless("mock") and !isKeyless("anthropic") and !isKeyless("nope"));
-    // quoted scalars survive (@cf model ids) and the {account} template survives
-    try std.testing.expectEqualStrings("@cf/meta/llama-3.3-70b-instruct-fp8-fast", providers[3].models[0].id);
-    try std.testing.expect(std.mem.indexOf(u8, providers[3].base_url, "{account}") != null and providers[3].needs_account);
+    // workers-ai is commented out of models.yaml, so isKeyless says NO for it — and that is load-bearing,
+    // not incidental: deploy/service.zig asks exactly this question before falling back to the keyless
+    // server-credential path, so a provider the operator removed can never be silently offered.
+    try std.testing.expect(!isKeyless("workers-ai"));
+    // Quoted scalars survive as model ids. This used to assert the @cf ids at providers[3]; workers-ai —
+    // the only entry carrying them and the only {account} template — is commented out of models.yaml, so
+    // there is no live provider left to check them on. defaults.cf_model below still exercises the quoted
+    // "@cf/…" scalar path through the defaults block, which is what the parser assertion was really for.
+    try std.testing.expectEqualStrings("groq", providers[3].key);
     // defaults
     try std.testing.expectEqualStrings("gpt-oss:20b", defaults.local_model);
     try std.testing.expectEqualStrings("@cf/meta/llama-3.3-70b-instruct-fp8-fast", defaults.cf_model);

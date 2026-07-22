@@ -48,13 +48,27 @@ pub const Auth = struct {
         self.admin_email = self.gpa.dupe(u8, e) catch null;
     }
 
+    /// EXACT match, deliberately — this compared with `eqlIgnoreCase` and that was an admin-takeover hole.
+    ///
+    /// The user map is keyed on the email's exact bytes (`users.contains(email)` in register, `users.get`
+    /// in login), so a case variant of the admin address is a DIFFERENT key. Registering
+    /// "Admin@host" against a seeded "admin@host" sailed past the EmailTaken check and created a second
+    /// account — and then this predicate, comparing case-INsensitively, declared it an admin. That is
+    /// `.caps = .full`, every admin route, run_python and patch_system: full host code execution from a
+    /// self-service signup. The same insensitive compare in isAdminEmail also minted it `.pro` on the way
+    /// in, one line from the check that had just missed it.
+    ///
+    /// Exact is safe here because seedDefaultAdmin registers `admin_email` VERBATIM (just below), so the
+    /// stored account email is byte-identical to the configured one — there is no lockout path.
+    /// Case-variant DUPLICATE accounts can still be created; that is an identity nuisance rather than an
+    /// escalation, and canonicalizing the map key is the durable follow-up.
     pub fn isAdmin(self: *Auth, u: User) bool {
-        if (self.admin_email) |e| return std.ascii.eqlIgnoreCase(u.email, e);
+        if (self.admin_email) |e| return std.mem.eql(u8, u.email, e);
         return u.id == 1;
     }
 
     fn isAdminEmail(self: *Auth, email: []const u8) bool {
-        if (self.admin_email) |e| return std.ascii.eqlIgnoreCase(email, e);
+        if (self.admin_email) |e| return std.mem.eql(u8, email, e);
         return self.next_id == 1;
     }
 

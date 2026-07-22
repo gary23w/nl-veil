@@ -187,7 +187,18 @@ pub fn deploySwarm(app: *App, arena: std.mem.Allocator, u: http.User, body: Depl
                 if (eff_base.len == 0) eff_base = sd.base_url;
             };
         }
-        if (eff_provider.len == 0) eff_provider = "workers-ai";
+        // LAST RESORT: the keyless server-credential provider — but only if the catalog still ships it.
+        // isKeyless() is catalog-driven, so this returns false the moment workers-ai is commented out of
+        // models.yaml (as it is today). Naming it unconditionally would send a caller who configured
+        // nothing down the Cloudflare branch and fail with "Workers AI needs a Cloudflare login" —
+        // pointing at a provider the operator deliberately removed from the menu. Say the true thing.
+        if (eff_provider.len == 0) {
+            if (modelcfg.isKeyless("workers-ai")) {
+                eff_provider = "workers-ai";
+            } else {
+                return failBad("no model to run this on — set a default model in Admin -> Default model, or pass a model/provider with the cast");
+            }
+        }
     }
 
     const wants_cf_ai = std.mem.eql(u8, eff_provider, "workers-ai") or std.mem.eql(u8, eff_provider, "cloudflare");
