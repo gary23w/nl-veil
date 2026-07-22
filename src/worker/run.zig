@@ -1812,6 +1812,7 @@ const ESCALATE_2 = 7;
 const ESCALATE_3 = 10;
 const REGRESS_MARGIN = 5;
 const RESTORE_AFTER = 2;
+const RESTORE_MASS_FLOOR_PCT = 60;
 const SATURATE_ROUNDS = 3;
 const GRADUATE_PCT = 85;
 const GRADUATE_FLAT = 3;
@@ -8099,6 +8100,65 @@ pub fn buildFileCount(w: *Worker, run_dir: []const u8, sub: []const u8) u32 {
     return n;
 }
 
+/// Total byte MASS (sum of stat sizes) of the manifest's deliverable files under run_dir/<sub> — the revert
+/// guard's second yardstick. File count alone cannot see a snapshot whose files all EXIST but were stashed
+/// as stubs: equal count, a fraction of the content, and a restore would still gut the build. Stat-only for
+/// the same reason as buildFileCount: sizes come from stat, so no deliverable is ever slurped to decide a copy.
+pub fn buildByteMass(w: *Worker, run_dir: []const u8, sub: []const u8) u64 {
+    const gpa = w.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{run_dir}) catch return 0;
+    defer gpa.free(mpath);
+    const data = std.Io.Dir.cwd().readFileAlloc(w.io, mpath, gpa, .limited(128 << 10)) catch return 0;
+    defer gpa.free(data);
+    var mass: u64 = 0;
+    var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer seen.deinit(gpa);
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trim(u8, raw, " \r\t");
+        const bar = std.mem.indexOfScalar(u8, ln, '|') orelse continue;
+        const path = ln[0..bar];
+        if (path.len == 0 or std.mem.indexOf(u8, path, "..") != null) continue;
+        var dup = false;
+        for (seen.items) |s| if (std.mem.eql(u8, s, path)) {
+            dup = true;
+        };
+        if (dup) continue;
+        seen.append(gpa, path) catch {};
+        const fp = std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ run_dir, sub, path }) catch continue;
+        defer gpa.free(fp);
+        const st = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch continue;
+        mass +|= st.size;
+    }
+    return mass;
+}
+
+/// The mass guard's pure threshold, split out so the boundary is testable: a snapshot is TOO LIGHT to restore
+/// when its byte mass has fallen below RESTORE_MASS_FLOOR_PCT of the live build's. Widened to u128 so stat
+/// sizes near the u64 ceiling cannot wrap the comparison. An empty live tree never refuses (nothing to protect).
+fn snapshotTooLight(snap_bytes: u64, live_bytes: u64) bool {
+    return @as(u128, snap_bytes) * 100 < @as(u128, live_bytes) * RESTORE_MASS_FLOOR_PCT;
+}
+
+test "snapshotTooLight: refuses a hollowed-out snapshot at the 60% mass floor, allows a real revert" {
+    // an equal-file-count snapshot holding a fraction of the live bytes is refused
+    try std.testing.expect(snapshotTooLight(5_000, 100_000));
+    // the floor is exclusive: exactly 60% restores, one byte under does not
+    try std.testing.expect(!snapshotTooLight(60, 100));
+    try std.testing.expect(snapshotTooLight(59, 100));
+    // a snapshot as heavy as (or heavier than) the live tree always restores
+    try std.testing.expect(!snapshotTooLight(100, 100));
+    try std.testing.expect(!snapshotTooLight(150, 100));
+    // an empty live tree never refuses (nothing to protect) — including the both-empty run
+    try std.testing.expect(!snapshotTooLight(0, 0));
+    try std.testing.expect(!snapshotTooLight(10, 0));
+    // an empty snapshot over a real tree is exactly the deletion the guard exists for
+    try std.testing.expect(snapshotTooLight(0, 1));
+    // stat sizes near the u64 ceiling must not wrap the comparison
+    try std.testing.expect(!snapshotTooLight(std.math.maxInt(u64), std.math.maxInt(u64)));
+    try std.testing.expect(snapshotTooLight(std.math.maxInt(u64) / 2, std.math.maxInt(u64)));
+}
+
 /// DELIVERABLE MASS — how much finished work exists right now, for the rounds where the SCORE cannot say.
 /// Required-file coverage when the goal or blueprint declares a required set (recorded this round by the
 /// caller, so this costs nothing), else the number of files the swarm has actually written. It is a ranking
@@ -8595,16 +8655,24 @@ fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u3
             // not fire in cast-355797 (`regressed` needs pct + margin < best_pct, unsatisfiable at best_pct 0)
             // but it is one passing check away from firing on any run: pass once, break, and the frozen
             // round-1 snapshot lands on a much larger tree. Guard on FILE COUNT — a revert is a revert of
-            // CONTENT, never a deletion of work.
+            // CONTENT, never a deletion of work — and then on BYTE MASS, because an equal-count snapshot of
+            // stubs is the same deletion wearing the right number of filenames.
             if (w.best_snapshot and w.regress_rounds >= RESTORE_AFTER) {
                 const snap_n = buildFileCount(w, run_dir, "DELIVERY");
                 const live_n = buildFileCount(w, run_dir, "work");
                 if (snap_n < live_n) {
                     w.act("engine", round, "restore_refused", "stale snapshot is smaller than the live build", std.fmt.allocPrint(w.a(), "declined to restore DELIVERY/ over work/: the snapshot holds {d} deliverable files and the live build holds {d} — restoring would discard work rather than revert a regression", .{ snap_n, live_n }) catch "restore declined: snapshot smaller than live build");
                     w.regress_rounds = 0; // don't re-attempt the same refused restore every round
-                } else if (copyBuild(w, run_dir, "DELIVERY", "work") > 0) {
-                    restored = true;
-                    w.regress_rounds = 0;
+                } else {
+                    const snap_mass = buildByteMass(w, run_dir, "DELIVERY");
+                    const live_mass = buildByteMass(w, run_dir, "work");
+                    if (snapshotTooLight(snap_mass, live_mass)) {
+                        w.act("engine", round, "restore_refused", "stale snapshot is far lighter than the live build", std.fmt.allocPrint(w.a(), "declined to restore DELIVERY/ over work/: the snapshot's {d} deliverable files weigh {d} bytes against the live build's {d} bytes ({d} files) — under the {d}% mass floor, restoring would hollow out the build rather than revert a regression", .{ snap_n, snap_mass, live_mass, live_n, RESTORE_MASS_FLOOR_PCT }) catch "restore declined: snapshot mass far below live build");
+                        w.regress_rounds = 0; // same refusal would repeat every round — stand down
+                    } else if (copyBuild(w, run_dir, "DELIVERY", "work") > 0) {
+                        restored = true;
+                        w.regress_rounds = 0;
+                    }
                 }
             }
         } else {
