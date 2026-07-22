@@ -661,6 +661,7 @@ Each run has a `swarm.json` manifest — the web UI and the desktop write it for
 | `internet` | `false` runs fully offline |
 | `corpus` / `corpus_cap` | a `.facts`/`.jsonl` pack to preload, and how many facts |
 | `bootstrap` | `false` disables the engine-run dependency installs of the deliverable's own manifests (npm/pip/cargo/go) |
+| `lineage` | a stable id (`veil cast … --lineage my-proj`) that persists the swarm's neuron-db across re-casts, so knowledge, playbook, skills, and learned trust **compound** run over run instead of resetting — a cast that gets better over time |
 | `gateway_model` | optional cheaper/smaller model for mechanical calls (and the chat's fast voice) |
 
 **Endpoint resolution**, everywhere: a run's own `swarm.json` › `NL_LLM_*` env › `~/.veil/config.json`

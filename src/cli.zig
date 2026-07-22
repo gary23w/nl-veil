@@ -216,12 +216,13 @@ fn cmdCast(ctx: *Ctx, args: []const []const u8) u8 {
     var style: []const u8 = "";
     var name: []const u8 = "";
     var mode: []const u8 = "";
+    var lineage: []const u8 = "";
     var offline = false;
     var follow = false;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (flagVal(args, &i, a, "--minutes")) |v| minutes = v else if (flagVal(args, &i, a, "--minds")) |v| minds = v else if (flagVal(args, &i, a, "--model")) |v| model = v else if (flagVal(args, &i, a, "--provider")) |v| provider = v else if (flagVal(args, &i, a, "--base-url")) |v| base_url = v else if (flagVal(args, &i, a, "--key")) |v| key = v else if (flagVal(args, &i, a, "--style")) |v| style = v else if (flagVal(args, &i, a, "--name")) |v| name = v else if (std.mem.eql(u8, a, "--continuous")) {
+        if (flagVal(args, &i, a, "--minutes")) |v| minutes = v else if (flagVal(args, &i, a, "--minds")) |v| minds = v else if (flagVal(args, &i, a, "--model")) |v| model = v else if (flagVal(args, &i, a, "--provider")) |v| provider = v else if (flagVal(args, &i, a, "--base-url")) |v| base_url = v else if (flagVal(args, &i, a, "--key")) |v| key = v else if (flagVal(args, &i, a, "--style")) |v| style = v else if (flagVal(args, &i, a, "--name")) |v| name = v else if (flagVal(args, &i, a, "--lineage")) |v| lineage = v else if (std.mem.eql(u8, a, "--continuous")) {
             mode = "continuous";
         } else if (std.mem.eql(u8, a, "--offline")) {
             offline = true;
@@ -232,7 +233,7 @@ fn cmdCast(ctx: *Ctx, args: []const []const u8) u8 {
         }
     }
     if (goal.len == 0) {
-        out("usage: veil cast \"<goal>\" [--minutes N] [--minds N] [--model M] [--provider P] [--continuous] [--follow]\n", .{});
+        out("usage: veil cast \"<goal>\" [--minutes N] [--minds N] [--model M] [--provider P] [--lineage <id>] [--continuous] [--follow]\n", .{});
         return 1;
     }
     var jb: std.ArrayListUnmanaged(u8) = .empty;
@@ -248,6 +249,7 @@ fn cmdCast(ctx: *Ctx, args: []const []const u8) u8 {
     if (style.len > 0) appendStr(ctx.gpa, &jb, "style", style);
     if (name.len > 0) appendStr(ctx.gpa, &jb, "name", name);
     if (mode.len > 0) appendStr(ctx.gpa, &jb, "mode", mode);
+    if (lineage.len > 0) appendStr(ctx.gpa, &jb, "lineage", lineage);
     jb.appendSlice(ctx.gpa, "}") catch return 1;
 
     const resp = call(ctx, "POST", "/api/v1/cast", jb.items, 30, true) catch return unreachable_msg(ctx);
@@ -522,6 +524,7 @@ fn cmdHelp() u8 {
         \\  cast "<goal>" [flags]        deploy a swarm to work a goal
         \\      --minutes N  --minds N  --model M  --provider P  --base-url U  --key K
         \\      --style S  --name N  --continuous  --offline  --follow
+        \\      --lineage <id>           persist this swarm's memory under <id> so re-casts COMPOUND (get better over time)
         \\  deploy "<goal>" [flags]      alias for cast --continuous (a sustained hive)
         \\  list | ls                    list your swarms
         \\  stop <id>                    ask a swarm to stop

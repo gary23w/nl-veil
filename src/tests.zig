@@ -24,6 +24,7 @@ test {
     _ = @import("worker/crawl.zig");
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
+    _ = @import("worker/lineage.zig"); // cross-run persistent swarm memory (stable neuron-db identity)
     _ = @import("worker/llm.zig");
     _ = @import("worker/locs/atlas.zig");
     _ = @import("worker/mcp/discovery.zig");
