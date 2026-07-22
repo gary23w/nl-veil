@@ -37,18 +37,27 @@ pub fn adminRecipes(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
 
 const RecipeGrantReq = struct { granted: bool };
 
-/// POST /api/v1/admin/users/:uid/recipes/:name — grant/revoke one already-loaded recipe.
-/// The name must resolve in the registry; stale grants therefore cannot turn an arbitrary string into a tool.
+/// POST /api/v1/admin/users/:uid/recipes/:name — grant/revoke one recipe.
+///
+/// GRANTING requires the name to resolve in the registry, so a grant can never invent a tool out of an
+/// arbitrary string. REVOKING must NOT: the registry check used to run for both verbs, so once a recipe
+/// file was deleted the only way to remove its grant returned 404 and the grant string stayed on the user
+/// record forever. Since resolveGrants re-intersects registry ∩ grants every turn, any LATER file loading
+/// under that same name — with entirely different steps — went instantly live for everyone who still held
+/// the stale grant. Revoke is always allowed; it can only ever remove access.
 pub fn adminSetRecipeGrant(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
     const uid_s = req.param("uid") orelse return badReq(res, "no uid");
     const uid = std.fmt.parseInt(u64, uid_s, 10) catch return badReq(res, "uid must be a number");
     const name = req.param("name") orelse return badReq(res, "no recipe name");
-    _ = app.recipes.get(name) orelse return notFound(res);
     const target = app.auth.userById(uid) orelse return notFound(res);
     const body = (try req.json(RecipeGrantReq)) orelse return badReq(res, "bad body");
+    if (body.granted) _ = app.recipes.get(name) orelse return notFound(res);
     _ = app.auth.setToolGrant(target.email, name, body.granted);
-    app.audit.record(admin.email, if (body.granted) "grant_recipe" else "revoke_recipe", name);
+    // Record WHO the grant was for — the log could not previously answer "who holds this recipe?", which
+    // is the first question asked when a recipe turns out to be dangerous.
+    const what = std.fmt.allocPrint(res.arena, "{s} -> uid {d} ({s})", .{ name, uid, target.email }) catch name;
+    app.audit.record(admin.email, if (body.granted) "grant_recipe" else "revoke_recipe", what);
     try res.json(.{ .ok = true, .uid = uid, .name = name, .granted = body.granted }, .{});
 }
 

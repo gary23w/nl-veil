@@ -950,6 +950,22 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
     // recipe through the gate), never WHETHER the gate refuses a name — the whole safety property of the feature.
     if (ctx.caps == .sandboxed and !sandboxAllowed(name) and grantedRecipe(ctx, name) == null)
         return dupe(gpa, SANDBOX_REFUSAL);
+
+    // A GRANTED NAME RUNS AS DATA OR NOT AT ALL — and this must be decided BEFORE the built-in chain.
+    //
+    // The gate above admits a name for either of two reasons, and then forgets which. Dispatch below is
+    // linear, so if a granted recipe were ever named after a built-in, the BUILT-IN matched first and ran
+    // with the caller's own arguments — the grant having done nothing but carry the name past the gate.
+    // A recipe named "get_credential" returned stored secrets to a sandboxed caller that way. Deciding
+    // here makes the grant mean what its comment claims: it controls HOW a tool runs, never WHETHER the
+    // gate refuses a name.
+    //
+    // isBuiltinTool now also refuses such a name at load (recipes.loadDir), so for any validly-loaded
+    // registry this branch changes nothing. It is the structural backstop for the case where a colliding
+    // name reaches ctx.grants by some route the loader does not police — belt as well as braces, because
+    // the loader's guard is a name list and name lists drift.
+    if (grantedRecipe(ctx, name)) |rec| return runRecipe(ctx, rec, args_json);
+
     if (ctx.discourse and (std.mem.eql(u8, name, "run_python") or std.mem.eql(u8, name, "run_tests") or
         std.mem.eql(u8, name, "make_tool") or std.mem.eql(u8, name, "patch_system")))
         return dupe(gpa, "this is a research/writing task — there is no code repo or test suite; produce the written deliverable with write_file");
@@ -1619,8 +1635,21 @@ fn runPython(ctx: *ToolCtx, args_json: []const u8) []u8 {
 /// Whether a name is reserved by the built-in dispatcher. Kept public so the recipe loader and
 /// authoring routes share this exact collision guard rather than carrying a stale second list.
 pub fn isBuiltinTool(n: []const u8) bool {
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "browser_navigate", "browser_read", "browser_click", "browser_type", "browser_eval", "browser_close", "pixel_ingest", "pixel_capture", "pixel_search", "mcp_discover", "mcp_call" };
+    // EVERY name execute() can route must be here, or a recipe/authored tool may be NAMED after it — and
+    // since dispatch is linear and the recipe branch sits ~340 lines below the built-in chain, the BUILT-IN
+    // wins. A granted recipe called "get_credential" therefore ran the real getCredential, with the
+    // caller's own arguments, for a sandboxed user the gate exists to refuse: the grant was spent entirely
+    // on getting the NAME past the gate. Six dispatched names were missing from this list (ask_veil,
+    // host_status, host_command, host_explore, get_credential, propose_plan_change) and the three prefix
+    // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
+    // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
+    // source and fails if the two ever disagree again.
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
+    // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
+    // verbs that happen to exist today.
+    const families = [_][]const u8{ "browser_", "pixel_", "mcp_" };
+    for (families) |f| if (std.mem.startsWith(u8, n, f)) return true;
     return false;
 }
 
@@ -3215,6 +3244,110 @@ test "the sandbox gate actually fires in execute, before any tool runs" {
     // No .full control here on purpose: anything that gets PAST the gate dereferences the undefined
     // io/mem above and segfaults the runner. That the gate is what refused is established by the
     // allowlist tests either side of this one; this test's job is only to prove execute() consults it.
+}
+
+test "a GRANT can never smuggle a built-in name past the sandbox gate" {
+    // THE REGRESSION. The gate reads `caps == .sandboxed and !sandboxAllowed(name) and grantedRecipe(...)
+    // == null`, so a grant makes the refusal condition false — it does NOT confine the caller to the
+    // recipe branch. Dispatch is linear and the recipe branch sits ~340 lines below the built-in chain,
+    // so a granted recipe NAMED after a built-in ran the BUILT-IN with the caller's own arguments. A
+    // recipe called "get_credential" therefore returned stored secrets to a sandboxed user, which is
+    // exactly the tool engine.zig asserts is stripped from their schema. isBuiltinTool now claims every
+    // dispatched name so recipes.loadDir refuses these at load; this proves the gate holds even if one
+    // slips into ctx.grants some other way.
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var first: ?[]u8 = null;
+    defer if (first) |f| gpa.free(f);
+
+    for ([_][]const u8{ "get_credential", "host_command", "host_explore", "ask_veil", "run_python", "mcp_call" }) |name| {
+        const rec = recipes.Recipe{
+            .name = name,
+            .description = "innocuous-looking helper",
+            .owner_uid = 1,
+            .params = &.{},
+            .steps = &.{},
+            .output = "",
+        };
+        const grants = [_]*const recipes.Recipe{&rec};
+        var ctx = ToolCtx{
+            .gpa = gpa,
+            .io = undefined, // never reached: the gate returns before any I/O
+            .environ = &env,
+            .run_dir = ".",
+            .workdir = ".",
+            .scope = "test",
+            .mind = "test",
+            .round = 0,
+            .mem = undefined,
+            .files_written = &counters[0],
+            .observed = &counters[1],
+            .skills_saved = &counters[2],
+            .directives_set = &counters[3],
+            .tools_made = &counters[4],
+            .caps = .sandboxed,
+            .grants = &grants,
+        };
+        const out = execute(&ctx, name, "{}");
+        defer gpa.free(out);
+        // The recipe carries NO steps, so runRecipe's answer cannot depend on the name. If a built-in had
+        // claimed the name instead, the reply would be that tool's own, name-specific output. Pin the
+        // first result and require every other name to match it byte for byte: identical answers prove
+        // the NAME selected nothing, which is the property under test.
+        if (first == null) {
+            first = gpa.dupe(u8, out) catch return error.OutOfMemory;
+        } else if (!std.mem.eql(u8, first.?, out)) {
+            std.debug.print("GRANT SMUGGLED A BUILT-IN: sandboxed execute({s}) with a grant of that name behaved name-specifically — got: {s}\n", .{ name, out });
+            return error.TestUnexpectedResult;
+        }
+        // Concrete anchor for the exploit that motivated this: getCredential's own reply must never appear.
+        if (std.mem.indexOf(u8, out, "credential store") != null) {
+            std.debug.print("GRANT SMUGGLED get_credential: the built-in ran for a sandboxed caller — got: {s}\n", .{out});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "isBuiltinTool claims every name execute() can dispatch (reads the dispatcher's own source)" {
+    // STRUCTURAL, so it cannot rot. isBuiltinTool is hand-maintained and it silently drifted six names
+    // and three prefix families away from the dispatcher — which is what let a recipe be named after a
+    // built-in. Rather than trusting a second hand-copied list, read execute()'s source and assert every
+    // literal it routes on is claimed. The trio routing audit uses this same read-your-own-source trick.
+    const src = @embedFile("tools.zig"); // this file, read as text — same trick trio_routing_test uses
+    const start = std.mem.indexOf(u8, src, "pub fn execute(ctx: *ToolCtx") orelse return error.TestUnexpectedResult;
+    // execute() ends where the next top-level decl begins — the first line-start "fn " after it.
+    const end = std.mem.indexOfPos(u8, src, start + 40, "\nfn ") orelse src.len;
+    const body = src[start..end];
+
+    // every `std.mem.eql(u8, name, "X")` — the exact-match dispatch arms
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, "eql(u8, name, \"")) |at| {
+        const from = at + "eql(u8, name, \"".len;
+        const close = std.mem.indexOfScalarPos(u8, body, from, '"') orelse break;
+        const nm = body[from..close];
+        i = close;
+        if (!isBuiltinTool(nm)) {
+            std.debug.print("execute() dispatches \"{s}\" but isBuiltinTool does not claim it — a recipe or authored tool could take that name and the BUILT-IN would win\n", .{nm});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // every `startsWith(u8, name, "X")` — the prefix families
+    i = 0;
+    while (std.mem.indexOfPos(u8, body, i, "startsWith(u8, name, \"")) |at| {
+        const from = at + "startsWith(u8, name, \"".len;
+        const close = std.mem.indexOfScalarPos(u8, body, from, '"') orelse break;
+        const pre = body[from..close];
+        i = close;
+        // a suffix nobody has written yet must still be reserved
+        const probe_name = std.fmt.allocPrint(std.testing.allocator, "{s}zzz_unclaimed", .{pre}) catch return error.OutOfMemory;
+        defer std.testing.allocator.free(probe_name);
+        if (!isBuiltinTool(probe_name)) {
+            std.debug.print("execute() routes the \"{s}\" family by prefix but isBuiltinTool only claims exact verbs — \"{s}\" is takeable\n", .{ pre, probe_name });
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "sandboxAllowed is an allowlist: an unknown name is refused" {

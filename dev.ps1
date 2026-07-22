@@ -6,9 +6,9 @@
 #
 # Run from anywhere: it cd's itself.
 #
-#   .\restart-veil.ps1              rebuild + launch the app (server + desktop window)
-#   .\restart-veil.ps1 -ServerOnly  rebuild + launch the server alone (web UI at :8787, no window)
-#   .\restart-veil.ps1 -NoGui       build with -Dapp=false (no raylib link at all — fastest loop,
+#   .\dev.ps1              rebuild + launch the app (server + desktop window)
+#   .\dev.ps1 -ServerOnly  rebuild + launch the server alone (web UI at :8787, no window)
+#   .\dev.ps1 -NoGui       build with -Dapp=false (no raylib link at all — fastest loop,
 #                                   ~5MB exe; use this when you are working on the server or web UI)
 param(
     [switch]$ServerOnly,

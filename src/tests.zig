@@ -3,6 +3,7 @@
 //! it is added to this list.
 
 test {
+    _ = @import("auth/auth_core.zig"); // tool_grants persistence + the admin-email predicate
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/server_config.zig");
@@ -29,6 +30,7 @@ test {
     _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
     _ = @import("worker/oscillation.zig");
     _ = @import("worker/rate.zig");
+    _ = @import("worker/recipes.zig"); // parse/substitute/validate — the granted-recipe trust boundary
     _ = @import("worker/rerank.zig");
     _ = @import("worker/rsi.zig");
     _ = @import("worker/run.zig");
