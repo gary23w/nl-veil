@@ -57,6 +57,8 @@ const DeployReq = struct {
     // the worker adopts them verbatim as the blueprint instead of guessing from goal prose. Comma or
     // newline separated. The MODEL reasons about what the deliverables are; the engine just carries them.
     files: []const u8 = "",
+    // CROSS-RUN identity: persist the swarm's neuron-db under this id so re-casts inherit prior memory (lineage.zig)
+    lineage: []const u8 = "",
     minds: []MindSpec,
 };
 
@@ -306,6 +308,10 @@ fn buildManifest(arena: std.mem.Allocator, body: DeployReq, eff_provider: []cons
         try mani.appendSlice(arena, ",\"files\":");
         try jstr(arena, &mani, body.files);
     }
+    if (body.lineage.len > 0) {
+        try mani.appendSlice(arena, ",\"lineage\":");
+        try jstr(arena, &mani, body.lineage);
+    }
     if (encrypted) try mani.appendSlice(arena, ",\"encrypted\":true");
     try mani.appendSlice(arena, ",\"minds\":[");
     for (body.minds, 0..) |m, i| {
@@ -467,6 +473,7 @@ pub const CastReq = struct {
     files: []const u8 = "", // DECLARED deliverables (comma/newline separated) — adopted verbatim as the blueprint
     publish: bool = false, // NEWS DESK: run as a research/briefing cast that posts a grounded, screened page to Telegraph
     post: bool = true, //     when publishing, actually post to Telegraph (false = grounded-and-screened to disk only)
+    lineage: []const u8 = "", // stable cross-run identity: a re-cast with the same id inherits prior memory (lineage.zig)
 };
 
 /// Count the entries in a comma/newline-separated declared-deliverables list (the workload-floor input).
@@ -573,6 +580,7 @@ pub fn castSwarm(app: *App, arena: std.mem.Allocator, u: http.User, rq: CastReq)
         // instead of chaining to a new self-chosen goal — the caller is waiting to collect.
         .cast = true,
         .files = rq.files,
+        .lineage = rq.lineage,
         // NEWS DESK: a publish cast runs discourse-mode (grounded briefing) and, with post on, posts to Telegraph.
         .publish = rq.publish,
         .post = rq.post,

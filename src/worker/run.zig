@@ -31,6 +31,7 @@ const writer = @import("writer.zig");
 const locs = @import("locs/atlas.zig");
 const ragmirror = @import("ragmirror.zig");
 const toolchain = @import("toolchain.zig");
+const lineage = @import("lineage.zig");
 const cctx = @import("chat/context.zig");
 
 const log = std.log.scoped(.worker);
@@ -52,6 +53,9 @@ const Manifest = struct {
     gap_assess: bool = true,
     /// engine-run installs of the deliverable's own dependency manifests (npm/pip/cargo/go) — see toolchain.zig
     bootstrap: bool = true,
+    /// stable cross-run identity: when set, the swarm's neuron-db is a persistent per-user store instead of a
+    /// throwaway {run_dir}/mind.sqlite, so re-casts with the same id COMPOUND their memory (see lineage.zig)
+    lineage: []const u8 = "",
     internet: bool = true,
     space: []const u8 = "",
     autonomous: bool = false,
@@ -614,7 +618,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     const model = if (cli_model.len > 0 and !std.mem.eql(u8, cli_model, "mock")) cli_model else m.model;
     const live = key.len > 0 and !std.mem.eql(u8, key, "nl-brokered") and !std.mem.eql(u8, m.provider, "mock");
 
-    const db_path = try std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir});
+    // CROSS-RUN MEMORY: a lineage id points the brain at a stable per-user store so a re-cast inherits the
+    // prior runs' knowledge/playbook/skills/trust instead of starting empty (lineage.zig). No id ⇒ the
+    // historical per-run {run_dir}/mind.sqlite. `lineage_inherited` records that this store PRE-EXISTED, so
+    // the minds can be told they stand on prior work rather than a blank slate.
+    const lineage_db: ?[]u8 = if (m.lineage.len > 0) lineage.dbPath(gpa, io, run_dir, m.lineage) else null;
+    const lineage_inherited = lineage_db != null and lineage.exists(io, gpa, lineage_db.?);
+    const db_path = lineage_db orelse try std.fmt.allocPrint(gpa, "{s}/mind.sqlite", .{run_dir});
     defer gpa.free(db_path);
 
     if (live) llm.probeCapabilities(gpa, io, run_dir, base_url, key, model);
@@ -1077,6 +1087,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         const acc = std.fmt.allocPrint(gpa, "checks:\n{s}\nsmoke: {s}\nprobes:\n{s}", .{ w.checks_str, w.smoke_cmd, w.probes_str }) catch "";
         defer if (acc.len > 0) gpa.free(acc);
         w.act("engine", 0, "acceptance", "goal DECLARES its own acceptance interface (VERIFY/SMOKE/PROBE) — adopted verbatim; engine-run, language-blind", acc);
+    }
+    // CROSS-RUN MEMORY announcement: a lineage run either INHERITS a prior brain (recall_hive already carries
+    // what past runs learned) or ESTABLISHES one for future casts. Recorded so the run is legibly a
+    // continuation, not a restart — the mechanism itself is automatic (the db IS the prior brain).
+    if (m.lineage.len > 0) {
+        const ln = if (lineage_inherited)
+            std.fmt.allocPrint(gpa, "lineage '{s}': INHERITS the memory of prior runs on this assignment — knowledge, playbook, skills, and learned trust persist at {s}. You continue prior work, not a blank slate; recall_hive surfaces what past runs learned.", .{ m.lineage, db_path }) catch ""
+        else
+            std.fmt.allocPrint(gpa, "lineage '{s}': first run on this assignment — a persistent brain is established at {s}, so every future cast with this id inherits what this run learns.", .{ m.lineage, db_path }) catch "";
+        defer if (ln.len > 0) gpa.free(ln);
+        if (ln.len > 0) w.act("engine", 0, "lineage", ln, "");
     }
     // LOCAL KNOWLEDGE MIRROR: adopt a local copy of the pack corpus when one exists (NL_RAG_DIR /
     // <data>/_rag / vendor/nl-rag). Pack urls then serve from disk through the shared fetch layer, and the
