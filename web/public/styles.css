@@ -586,6 +586,23 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; min-height: 0; }
 
+/* Shown only while the reader has scrolled away from a live answer, so they can get
+   back to the tail without a long drag on a phone. Anchored to the composer rather
+   than the pane, because the composer grows with the draft and the button has to
+   ride above it. */
+.jump-latest {
+  position: absolute; left: 50%; transform: translateX(-50%); bottom: 100%;
+  margin-bottom: 8px;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px; border-radius: 999px;
+  background: var(--surface-raised); color: var(--text);
+  border: 1px solid var(--border); box-shadow: 0 4px 14px rgba(0,0,0,.22);
+  font-size: calc(var(--fs-micro) * var(--text-scale)); letter-spacing: .06em;
+  text-transform: uppercase; z-index: 4;
+}
+.jump-latest svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
+.jump-latest:hover { background: var(--tonal-hover); }
+
 .chat-topline {
   flex: 0 0 auto;
   display: flex; align-items: center; gap: 8px;
@@ -779,6 +796,7 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* ---------------- composer ---------------- */
 .composer {
   flex: 0 0 auto;
+  position: relative;          /* anchors .jump-latest just above the composer */
   padding: 10px var(--pad);
   padding-bottom: calc(10px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--border);
