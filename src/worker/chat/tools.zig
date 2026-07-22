@@ -55,10 +55,10 @@ const ToolReq = struct {
 // memory DB, or degrade gracefully with no swarm context (probe → "no spatial grid", send_message → a note).
 const SAFE_TOOLS = [_][]const u8{
     "web_search",   "web_fetch",   "fetch_json",    "read_url",  "deep_crawl",
-    "recall_hive",  "recall",      "observe",       "share",     "note_stance",
-    "save_skill",   "journal",     "set_directive", "add_task",  "complete_task",
-    "send_message", "probe",       "write_file",    "edit_file", "read_file",
-    "list_dir",     "delete_file",
+    "recall_hive",  "recall",      "read_doc",      "observe",   "share",
+    "note_stance",  "save_skill",  "journal",       "set_directive", "add_task",
+    "complete_task", "send_message", "probe",       "write_file", "edit_file",
+    "read_file",    "list_dir",    "delete_file",
 };
 
 // ADMIN_TOOLS are the powerful ones — arbitrary code exec, HOST control, engine self-modification, tool

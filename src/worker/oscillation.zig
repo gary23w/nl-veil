@@ -454,6 +454,33 @@ pub const Mem = struct {
         return out orelse self.gpa.dupe(u8, "") catch @constCast("");
     }
 
+    /// assoc() widened over `<scope>__*` DOCUMENT sub-scopes (one spawn; the CLI fans in-process).
+    /// This is how hive recall reaches a book absorbed under its own `knowledge__doc-<slug>` scope
+    /// without the caller knowing document names. (--trust is scope-local today; across ignores it.)
+    pub fn assocAcross(self: Mem, scope: []const u8, query: []const u8, hops: u32, k: u32) []u8 {
+        const out = self.runEnv(&.{ "assoc", scope, query, "--across" }, hops, k);
+        return out orelse self.gpa.dupe(u8, "") catch @constCast("");
+    }
+
+    /// One insertion-order PAGE of a scope's facts (newline-joined; caller frees) — the full-document
+    /// read path: a summary walks a document scope page by page instead of asking top-k recall to
+    /// reconstruct it. Pair with factCount(scope) for the total. Empty on a missing scope/past-end page.
+    pub fn readPage(self: Mem, scope: []const u8, from: u32, limit: u32) []u8 {
+        var fb: [12]u8 = undefined;
+        var lb: [12]u8 = undefined;
+        const fs = std.fmt.bufPrint(&fb, "{d}", .{from}) catch "0";
+        const ls = std.fmt.bufPrint(&lb, "{d}", .{limit}) catch "100";
+        const out = self.run(&.{ "read", scope, "--from", fs, "--limit", ls });
+        return out orelse self.gpa.dupe(u8, "") catch @constCast("");
+    }
+
+    /// Every scope id in the db, newline-joined (caller frees). Used to enumerate `knowledge__doc-*`
+    /// document scopes so read_doc can resolve a document by name (or list what exists).
+    pub fn scopeIds(self: Mem) []u8 {
+        const out = self.run(&.{"list"});
+        return out orelse self.gpa.dupe(u8, "") catch @constCast("");
+    }
+
     pub fn chain(self: Mem, scope: []const u8, start: []const u8, rels: []const []const u8) []u8 {
         const miss = self.gpa.dupe(u8, "") catch @constCast("");
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;

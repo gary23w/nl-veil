@@ -223,7 +223,7 @@ const SANDBOX_TOOLS = [_][]const u8{
     // research
     "web_search", "web_fetch", "fetch_json", "read_url",
     // hive / memory — the whole surface, intentionally
-    "recall", "recall_hive", "observe", "share", "note_stance", "save_skill", "journal",
+    "recall", "recall_hive", "read_doc", "observe", "share", "note_stance", "save_skill", "journal",
     "set_directive", "probe", "add_task", "complete_task", "send_message", "propose_plan_change",
     // files, jailed to the conversation's own workdir
     "write_file", "edit_file", "read_file", "list_dir", "delete_file",
@@ -785,7 +785,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. Each line comes prefixed with its anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db) as recallable facts, so you and the hive can recall it later with recall/recall_hive WITHOUT re-reading it or needing the internet. Deterministic and offline. Pass path (relative to your workdir). Optional scope (default the shared knowledge hive), name (a short provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db) as recallable facts, filed under the document's OWN scope (knowledge__doc-<slug>; the result names it). Afterwards: targeted questions → recall_hive (it searches documents automatically); whole-document work (summarize/outline/review) → read_doc, which pages the document IN ORDER. Deterministic and offline. Pass path (relative to your workdir). Optional scope (override the target), name (provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"patch_system","description":"RSI engine edit tool. Read/write/replace/apply_patch under NL_PATCH_SYSTEM_ROOT (or legacy NL_OPEN_CLAW_ROOT). Mutating edits are gated: provide proposal + measurable success_criterion; high-impact edits also require simulate_change; privileged zones require explicit operator approval.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative file path under the configured patch-system root (required for read/write/replace)"},"mode":{"type":"string","enum":["read","write","replace","patch"],"description":"operation (default: read)"},"content":{"type":"string","description":"new file content for write mode"},"find":{"type":"string","description":"exact text to replace (replace mode)"},"replace":{"type":"string","description":"replacement text (replace mode)"},"patch":{"type":"string","description":"apply_patch payload with *** Begin Patch / *** End Patch markers (patch mode)"},"proposal":{"type":"string","description":"proposal title/id from propose_change (required for mutating edits)"},"success_criterion":{"type":"string","description":"measurable success criterion tied to the proposal (required for mutating edits)"},"limit":{"type":"integer","description":"max bytes to read (default 12000, max 262144)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir, default '.'"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -813,7 +813,8 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"propose_change","description":"Submit a structured RSI change proposal for engine governance (hypothesis, metric, risk, rollback). The engine evaluates proposals with simulation, critique, and canary checks.","parameters":{"type":"object","properties":{"title":{"type":"string","description":"short proposal title"},"hypothesis":{"type":"string","description":"why this change should improve capability"},"change":{"type":"string","description":"what exactly will be changed"},"metric":{"type":"string","description":"how success is measured"},"risk":{"type":"string","enum":["low","medium","high"],"description":"estimated downside"},"rollback":{"type":"string","description":"how to revert if it regresses"}},"required":["title","hypothesis","change","metric","risk","rollback"]}}},
     \\{"type":"function","function":{"name":"simulate_change","description":"Record a world-model simulation of a planned change before applying it: expected gains, failure modes, and side effects.","parameters":{"type":"object","properties":{"proposal":{"type":"string","description":"proposal title or id"},"expected":{"type":"string","description":"expected positive outcome"},"failures":{"type":"string","description":"possible failure modes"},"side_effects":{"type":"string","description":"non-target side effects to watch"}},"required":["proposal","expected","failures","side_effects"]}}},
     \\{"type":"function","function":{"name":"share","description":"Contribute one fact to the HIVE'S SHARED ASSOCIATIVE MIND — the collective memory every teammate reads. Use this for anything the whole hive should know (a finding, a decision, a constraint, an interface you settled on). Unlike observe (your private memory), this is the team's. Write one crisp sentence and include the key entities/names so it links into the associative graph.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
-    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory. Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only available when the swarm has a spatial substrate). You cannot see the grid directly — you sense it ONE cell at a time. probe(x,y) reads the cell at column x, row y (both 0-based) and AUTO-RECORDS it to the hive's shared map so every teammate sees it. This is the hive's spatial superpower: divide the grid into regions, each mind probes a DIFFERENT region in parallel, and the shared map fills in far faster than one mind alone. Check the 'Discovered map' you're shown before re-probing a known cell.","parameters":{"type":"object","properties":{"x":{"type":"integer","description":"column, 0-based"},"y":{"type":"integer","description":"row, 0-based"}},"required":["x","y"]}}}
 ;
 
@@ -873,7 +874,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db) as recallable facts — so you can recall it later with recall/recall_hive WITHOUT re-reading it or needing the internet. Deterministic and offline: use it when the user points you at a file to learn (\"absorb the book at C:/books/x.txt\"). Pass path (relative to the workdir, or an ABSOLUTE path on the user's machine). Optional scope (default the shared knowledge hive), name (a short provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db), filed under the document's OWN scope (knowledge__doc-<slug>; the result names it). Use it when the user points you at a file to learn (\"absorb the book at C:/books/x.txt\") — deterministic, offline. Afterwards: targeted questions → recall_hive (documents are searched automatically); whole-document work (summarize/outline/review) → read_doc, which pages the document IN ORDER. Pass path (relative to the workdir, or an ABSOLUTE path on the user's machine). Optional scope (override target), name (provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; also accepts an ABSOLUTE path (C:/data) or ~/dir on the user's machine; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir (default '.'), or an absolute/~ path on the user's machine"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
@@ -884,7 +885,8 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"observe","description":"Store one concrete fact you learned into your long-term memory.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
-    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory. Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of related facts reached by following shared entities. Use it for targeted questions. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
+    \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
     \\{"type":"function","function":{"name":"get_credential","description":"Fetch ONE stored credential VALUE from the user's durable memory (the YOUR MEMORY entries shown masked as '[withheld]'). Values never ride in prompts by default — call this in the turn that actually needs one, then use it directly in that call. NEVER echo a fetched credential into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"a few identifying words — the service or domain from the masked entry"}},"required":["query"]}}}
 ;
 
@@ -1088,7 +1090,9 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const A = struct { query: []const u8 = "" };
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
-        const core = ctx.mem.assoc(KNOWLEDGE_SCOPE, p.value.query, 1, 12);
+        // ACROSS the knowledge base scope AND its knowledge__doc-* document sub-scopes (one spawn),
+        // so an absorbed book/doc is reachable from plain hive recall without knowing its scope name.
+        const core = ctx.mem.assocAcross(KNOWLEDGE_SCOPE, p.value.query, 1, 12);
         defer gpa.free(core);
         const learned = ctx.mem.assoc(INTEL_SCOPE, p.value.query, 1, 12);
         defer gpa.free(learned);
@@ -1134,6 +1138,49 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             }
         }
         return dupe(gpa, out.items);
+    }
+    if (std.mem.eql(u8, name, "read_doc")) {
+        const A = struct { scope: []const u8 = "", name: []const u8 = "", from: u32 = 0, limit: u32 = 0 };
+        const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+        defer p.deinit();
+        var scb: [96]u8 = undefined;
+        var scope: []const u8 = p.value.scope;
+        if (scope.len == 0 and p.value.name.len > 0) scope = ragingest.docScope(KNOWLEDGE_SCOPE, p.value.name, &scb);
+        if (scope.len == 0) {
+            // no target given: list the stored document scopes so the model can pick one
+            const ids = ctx.mem.scopeIds();
+            defer gpa.free(ids);
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(gpa);
+            var it = std.mem.splitScalar(u8, ids, '\n');
+            const pfx = KNOWLEDGE_SCOPE ++ "__doc-";
+            while (it.next()) |ln| {
+                const id = std.mem.trim(u8, ln, " \r\t");
+                if (!std.mem.startsWith(u8, id, pfx)) continue;
+                out.print(gpa, "{s} ({d} facts)\n", .{ id, ctx.mem.factCount(id) }) catch {};
+            }
+            if (out.items.len == 0) return dupe(gpa, "no stored documents yet — absorb a file first, then read_doc its scope");
+            return std.fmt.allocPrint(gpa, "stored documents:\n{s}call read_doc again with scope set to one of these.", .{out.items}) catch dupe(gpa, "oom");
+        }
+        const total = ctx.mem.factCount(scope);
+        if (total == 0) return std.fmt.allocPrint(gpa, "scope '{s}' is empty or unknown — call read_doc with no args to list the stored documents", .{scope}) catch dupe(gpa, "empty scope");
+        const limit: u32 = if (p.value.limit > 0) @min(p.value.limit, 400) else 120;
+        const page = ctx.mem.readPage(scope, p.value.from, limit);
+        defer gpa.free(page);
+        var got: u32 = 0;
+        {
+            var itl = std.mem.splitScalar(u8, page, '\n');
+            while (itl.next()) |l| {
+                if (std.mem.trim(u8, l, " \r\t").len > 0) got += 1;
+            }
+        }
+        if (got == 0) return std.fmt.allocPrint(gpa, "[{s}: no facts at {d}..; the document has {d} — start from a smaller 'from']", .{ scope, p.value.from, total }) catch dupe(gpa, "past the end");
+        const from = p.value.from;
+        const next = from + got;
+        const body_txt = std.mem.trimEnd(u8, page, "\r\n");
+        if (next < total)
+            return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d}]\n{s}\n[more — continue with read_doc {{\"scope\":\"{s}\",\"from\":{d}}}]", .{ scope, from, next - 1, total, body_txt, scope, next }) catch dupe(gpa, body_txt);
+        return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d} — END]\n{s}", .{ scope, from, next - 1, total, body_txt }) catch dupe(gpa, body_txt);
     }
     if (std.mem.eql(u8, name, "probe")) {
         if (ctx.space.len == 0) return dupe(gpa, "this swarm has no spatial grid (the task isn't spatial) — there is nothing to probe");
@@ -1668,7 +1715,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "share", "recall_hive", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
@@ -2747,7 +2794,11 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         return std.fmt.allocPrint(gpa, "{s} looks binary (PDF/EPUB/DOCX?). Convert it to text first (e.g. pdftotext book.pdf book.txt), then absorb the .txt.", .{p.value.path}) catch dupe(gpa, "file is binary — convert to text first");
     var lb: [96]u8 = undefined;
     const label = if (p.value.name.len > 0) p.value.name else ragingest.labelFromPath(p.value.path, &lb);
-    const scope = if (p.value.scope.len > 0) p.value.scope else KNOWLEDGE_SCOPE;
+    // Default target = the document's OWN `knowledge__doc-<slug>` sub-scope, not the flat hive: the scope
+    // is the document's identity (insertion order = document order, so read_doc can page it), recall_hive's
+    // across-recall reaches it from the base scope, and one big absorb can never evict the shared hive.
+    var scb: [96]u8 = undefined;
+    const scope = if (p.value.scope.len > 0) p.value.scope else ragingest.docScope(KNOWLEDGE_SCOPE, label, &scb);
     const cap: u32 = if (p.value.cap > 0) p.value.cap else 4000;
     const st = ragingest.ingestText(ctx.mem, ctx.io, gpa, ctx.run_dir, text, label, scope, cap);
     if (st.stored == 0 and st.facts == 0)
@@ -2759,8 +2810,8 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // facts DURING a big load, so "N stored" alone once acked a book whose first 85% was already gone
     // (and whose recall then quietly answered from the tail). Never claim full recallability over a drain.
     if (st.evicted > 0)
-        return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} written into the '{s}' hive — BUT the scope hit its fact cap and evicted {d} oldest fact(s) during the load. Only the LAST part of the document (and whatever else survived) is recallable; earlier content is GONE from memory. Do not summarize from recall alone — re-read the source file for anything before the retained tail.", .{ label, st.facts, st.stored, scope, st.evicted }) catch dupe(gpa, "absorbed with evictions — earlier content was dropped");
-    return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into the '{s}' hive. Recall them any time with recall_hive — no re-read, no internet needed.", .{ label, st.facts, st.stored, scope }) catch dupe(gpa, "absorbed");
+        return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} written into scope '{s}' — BUT the scope hit its fact cap and evicted {d} oldest fact(s) during the load. Only the LAST part of the document (and whatever else survived) is recallable; earlier content is GONE from memory. Do not summarize from recall alone — re-read the source file for anything before the retained tail.", .{ label, st.facts, st.stored, scope, st.evicted }) catch dupe(gpa, "absorbed with evictions — earlier content was dropped");
+    return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into its own document scope '{s}'. Targeted questions: recall_hive finds it automatically. Whole-document work (summarize/outline/review): page it IN ORDER with read_doc (scope '{s}') — never build a summary from recall fragments.", .{ label, st.facts, st.stored, scope, scope }) catch dupe(gpa, "absorbed");
 }
 
 /// stage_file — copy a file from ANYWHERE the user's account can read INTO the conversation workdir, so a
@@ -3496,10 +3547,11 @@ test "sandboxAllowed: every host-reaching tool is refused, the whole hive surfac
     // The hive mind is the product: a sandboxed user keeps ALL of it. If a future change tiers one of
     // these as admin-only, that is a product regression and this test is the place it should surface.
     const kept = [_][]const u8{
-        "recall",        "recall_hive",  "observe",      "share",         "note_stance",
-        "save_skill",    "journal",      "set_directive", "probe",        "add_task",
-        "complete_task", "send_message", "web_search",   "web_fetch",     "read_file",
-        "write_file",    "edit_file",    "list_dir",     "delete_file",   "pixel_search",
+        "recall",        "recall_hive",  "read_doc",     "observe",       "share",
+        "note_stance",   "save_skill",   "journal",      "set_directive", "probe",
+        "add_task",      "complete_task", "send_message", "web_search",   "web_fetch",
+        "read_file",     "write_file",   "edit_file",    "list_dir",      "delete_file",
+        "pixel_search",
     };
     for (kept) |n| {
         if (!sandboxAllowed(n)) {
