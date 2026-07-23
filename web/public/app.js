@@ -1010,6 +1010,10 @@ async function openConv(id, focus) {
 async function deleteActiveConv() {
   if (!S.conv) return;
   if (!confirm('Delete this conversation? This cannot be undone.')) return;
+  const wasBranch = branchOf(S.conv);
+  // DELETE STOPS FIRST: a live server turn must not keep streaming into a removed tree.
+  // Best-effort — an idle conversation ignores the op.
+  try { await api.control(S.conv, { op: 'stop' }); } catch (e) {}
   try {
     await api.convDel(S.conv);
     toast('Deleted', S.conv, 'ok');
@@ -1021,7 +1025,9 @@ async function deleteActiveConv() {
   S.msgs = [];
   drawTranscript();
   el('chatRoot').classList.remove('on-thread');
-  refreshConvs();
+  await refreshConvs();
+  // a deleted SUB-CHAT lands back on its primary, matching the desk
+  if (wasBranch && S.convs.some((c) => c.id === wasBranch.parent)) openConv(wasBranch.parent, true);
 }
 
 function resetStream() {
