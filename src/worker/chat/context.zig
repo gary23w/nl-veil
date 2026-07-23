@@ -159,11 +159,14 @@ pub const MarkupRecovery = struct {
     calls: []RecoveredCall, // gpa-owned
 };
 
-/// True if `s` carries the Claude-style tool-call markup a local model may emit into the CONTENT channel instead
-/// of a structured tool_calls entry (`<｜｜DSML｜｜invoke name="…">` / `<｜｜DSML｜｜tool_calls>`). Anchors on the
-/// ASCII substrings so it is robust to sentinel variations (｜DSML｜ vs ｜｜DSML｜｜ vs none).
+/// True if `s` carries tool-call markup a model may emit into the CONTENT channel instead of a structured
+/// tool_calls entry. Two dialects are seen in the wild: the Claude/DSML style (`<｜｜DSML｜｜invoke name="…">` /
+/// `<｜｜DSML｜｜tool_calls>` — anchored on the ASCII substrings, robust to sentinel variations) and the
+/// hermes/Qwen style (`<tool_call>` + `<function=NAME>` + `<parameter=KEY>VALUE</parameter>`), which DeepSeek
+/// endpoints fall back to under load. Both leak as prose, run no tool, and stall the drive loop.
 pub fn looksLikeToolMarkup(s: []const u8) bool {
-    return std.mem.indexOf(u8, s, "invoke name=\"") != null or std.mem.indexOf(u8, s, "tool_calls>") != null;
+    return std.mem.indexOf(u8, s, "invoke name=\"") != null or std.mem.indexOf(u8, s, "tool_calls>") != null or
+        std.mem.indexOf(u8, s, "<function=") != null or std.mem.indexOf(u8, s, "<tool_call>") != null;
 }
 
 fn lastLtBefore(s: []const u8, pos: usize) usize {
@@ -179,6 +182,8 @@ pub fn contentBeforeMarkup(s: []const u8) []const u8 {
         const lt = lastLtBefore(s, tc);
         if (lt < start) start = lt;
     }
+    if (std.mem.indexOf(u8, s, "<function=")) |fnat| { if (fnat < start) start = fnat; }
+    if (std.mem.indexOf(u8, s, "<tool_call>")) |tc| { if (tc < start) start = tc; }
     return std.mem.trim(u8, s[0..start], " \r\n\t");
 }
 
@@ -271,8 +276,14 @@ fn buildArgs(gpa: std.mem.Allocator, region: []const u8) ![]u8 {
 /// content with the markup block stripped + the parsed calls, or null when there's nothing recoverable. `content`
 /// is BORROWED; on success the caller frees its old content and adopts `stripped`. On any allocation failure the
 /// partial work is freed and null is returned (caller keeps the original content — the drive-loop guard is the
-/// safety net).
+/// safety net). Dispatches by dialect: DSML (`invoke name="…"`) first, else hermes (`<function=NAME>`).
 pub fn recoverMarkupCalls(gpa: std.mem.Allocator, content: []const u8) ?MarkupRecovery {
+    if (std.mem.indexOf(u8, content, "invoke name=\"") != null) return recoverDsml(gpa, content);
+    if (std.mem.indexOf(u8, content, "<function=") != null) return recoverHermes(gpa, content);
+    return null;
+}
+
+fn recoverDsml(gpa: std.mem.Allocator, content: []const u8) ?MarkupRecovery {
     const INV = "invoke name=\"";
     const first_inv = std.mem.indexOf(u8, content, INV) orelse return null;
 
@@ -321,6 +332,103 @@ pub fn recoverMarkupCalls(gpa: std.mem.Allocator, content: []const u8) ?MarkupRe
         return null;
     };
     return .{ .stripped = stripped, .calls = owned };
+}
+
+/// The hermes/Qwen markup dialect: `<tool_call>` wrapper (optional) around `<function=NAME>` blocks whose
+/// arguments ride as `<parameter=KEY>\nVALUE\n</parameter>`. Seen live from a DeepSeek endpoint under load:
+/// the transport returned it as plain content with NO structured calls, so nothing executed and the drive
+/// loop nudged "continuing:" against prose — the reluctant-to-act failure. Values carry no type info, so a
+/// bare JSON scalar stays bare (line numbers must reach the tool's typed parse as numbers) and everything
+/// else is a quoted string.
+fn recoverHermes(gpa: std.mem.Allocator, content: []const u8) ?MarkupRecovery {
+    const FN = "<function=";
+    const first_fn = std.mem.indexOf(u8, content, FN) orelse return null;
+
+    // strip from the <tool_call> opener when it directly precedes the first function (whitespace only between)
+    var block_start = first_fn;
+    if (std.mem.lastIndexOf(u8, content[0..first_fn], "<tool_call>")) |tc| {
+        if (std.mem.trim(u8, content[tc + "<tool_call>".len .. first_fn], " \r\n\t").len == 0) block_start = tc;
+    }
+
+    var calls: std.ArrayListUnmanaged(RecoveredCall) = .empty;
+    defer calls.deinit(gpa);
+    var i: usize = first_fn;
+    while (std.mem.indexOfPos(u8, content, i, FN)) |fn_at| {
+        const name_start = fn_at + FN.len;
+        const name_end = std.mem.indexOfScalarPos(u8, content, name_start, '>') orelse break;
+        // tolerate <function="x"> and stray spaces; a sane tool name is short [a-z0-9_]
+        const name = std.mem.trim(u8, content[name_start..name_end], " \"\r\n\t");
+        if (name.len == 0 or name.len > 64) {
+            i = name_end;
+            continue;
+        }
+        const region_end = std.mem.indexOfPos(u8, content, name_end, FN) orelse content.len;
+        const args = buildArgsHermes(gpa, content[name_end..region_end]) catch break;
+        const nm = gpa.dupe(u8, name) catch {
+            gpa.free(args);
+            break;
+        };
+        calls.append(gpa, .{ .name = nm, .args = args }) catch {
+            gpa.free(args);
+            gpa.free(nm);
+            break;
+        };
+        i = region_end;
+    }
+    if (calls.items.len == 0) return null;
+
+    const stripped = gpa.dupe(u8, std.mem.trim(u8, content[0..block_start], " \r\n\t")) catch {
+        for (calls.items) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        return null;
+    };
+    const owned = calls.toOwnedSlice(gpa) catch {
+        gpa.free(stripped);
+        for (calls.items) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        return null;
+    };
+    return .{ .stripped = stripped, .calls = owned };
+}
+
+/// Args JSON from one hermes function region: each `<parameter=KEY>VALUE</parameter>` becomes `"KEY":VALUE`
+/// (bare when VALUE is a bare JSON scalar, else a quoted string). A missing closing tag takes the value up to
+/// the next parameter (or the region's end tags) rather than dropping the call.
+fn buildArgsHermes(gpa: std.mem.Allocator, region: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '{');
+    var first = true;
+    var j: usize = 0;
+    const PAR = "<parameter=";
+    while (std.mem.indexOfPos(u8, region, j, PAR)) |p_at| {
+        const k_start = p_at + PAR.len;
+        const k_end = std.mem.indexOfScalarPos(u8, region, k_start, '>') orelse break;
+        const key = std.mem.trim(u8, region[k_start..k_end], " \"\r\n\t");
+        // value runs to the EARLIEST terminator: its </parameter>, the next parameter (a model that forgot
+        // the closing tag), or the closing </function>/</tool_call> — never swallow a sibling parameter.
+        var v_end: usize = region.len;
+        for ([_][]const u8{ "</parameter", PAR, "</function", "</tool_call" }) |t| {
+            if (std.mem.indexOfPos(u8, region, k_end, t)) |at| {
+                if (at < v_end) v_end = at;
+            }
+        }
+        if (v_end < k_end + 1) v_end = k_end + 1;
+        const value = std.mem.trim(u8, region[k_end + 1 .. v_end], " \r\n\t");
+        j = v_end;
+        if (key.len == 0) continue;
+        if (!first) try out.append(gpa, ',');
+        first = false;
+        try appendJsonString(gpa, &out, key);
+        try out.append(gpa, ':');
+        if (isBareScalar(value)) try out.appendSlice(gpa, value) else try appendJsonString(gpa, &out, value);
+    }
+    try out.append(gpa, '}');
+    return out.toOwnedSlice(gpa);
 }
 
 // ------------------------------------------------------------------------------------------------- tests
@@ -531,4 +639,59 @@ test "recoverMarkupCalls: null when there is no markup; a non-numeric raw value 
     try std.testing.expectEqualStrings("{\"query\":\"three.js sprites\"}", rec.calls[0].args);
     try std.testing.expect(looksLikeToolMarkup(content));
     try std.testing.expect(!looksLikeToolMarkup("a clean answer"));
+}
+
+test "recoverMarkupCalls: parses the hermes <tool_call>/<function=…> dialect seen live from DeepSeek" {
+    const gpa = std.testing.allocator;
+    // EXACT shape from the live web-conv drive step that stalled as "continuing: <tool_call>…"
+    const content =
+        "Let me check the file first.\n\n" ++
+        "<tool_call>\n" ++
+        "<function=read_file>\n" ++
+        "<parameter=path>\n" ++
+        "gary-game.html\n" ++
+        "</parameter>\n" ++
+        "<parameter=start_line>\n" ++
+        "1\n" ++
+        "</parameter>\n" ++
+        "</function>\n" ++
+        "</tool_call>";
+    try std.testing.expect(looksLikeToolMarkup(content));
+    const rec = recoverMarkupCalls(gpa, content) orelse return error.NoRecovery;
+    defer {
+        gpa.free(rec.stripped);
+        for (rec.calls) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        gpa.free(rec.calls);
+    }
+    try std.testing.expectEqualStrings("Let me check the file first.", rec.stripped); // <tool_call> wrapper stripped too
+    try std.testing.expectEqual(@as(usize, 1), rec.calls.len);
+    try std.testing.expectEqualStrings("read_file", rec.calls[0].name);
+    // a path stays a string; a bare integer stays bare so the tool's typed parse accepts it
+    try std.testing.expectEqualStrings("{\"path\":\"gary-game.html\",\"start_line\":1}", rec.calls[0].args);
+}
+
+test "recoverMarkupCalls: two hermes functions in one block; a missing </parameter> doesn't swallow the sibling" {
+    const gpa = std.testing.allocator;
+    const content =
+        "<function=recall>\n<parameter=query>player name</parameter>\n</function>\n" ++
+        "<function=observe>\n<parameter=fact>\nthe user's name is Gary\n<parameter=></parameter>\n</function>";
+    const rec = recoverMarkupCalls(gpa, content) orelse return error.NoRecovery;
+    defer {
+        gpa.free(rec.stripped);
+        for (rec.calls) |c| {
+            gpa.free(c.name);
+            gpa.free(c.args);
+        }
+        gpa.free(rec.calls);
+    }
+    try std.testing.expectEqualStrings("", rec.stripped); // markup-only content -> empty narration
+    try std.testing.expectEqual(@as(usize, 2), rec.calls.len);
+    try std.testing.expectEqualStrings("recall", rec.calls[0].name);
+    try std.testing.expectEqualStrings("{\"query\":\"player name\"}", rec.calls[0].args);
+    try std.testing.expectEqualStrings("observe", rec.calls[1].name);
+    // the unclosed fact value ends at the NEXT <parameter=, not at the block's end
+    try std.testing.expectEqualStrings("{\"fact\":\"the user's name is Gary\"}", rec.calls[1].args);
 }
