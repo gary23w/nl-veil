@@ -232,7 +232,11 @@ if [ "${1:-}" != "--host-only" ]; then
     [ -n "$row" ] || continue
     ztarget=${row%%:*}; rest=${row#*:}; xos=${rest%%:*}; rest=${rest#*:}; xarch=${rest%%:*}; xexe=${rest#*:}
     printf '    %-18s ' "$xos/$xarch"
-    if ( cd "$ROOT" && "$ZIG" build --release=fast -Dtarget="$ztarget" --cache-dir "$CACHE" --prefix "$STAGE/xc/$ztarget" ) >/dev/null 2>&1; then
+    # -Dapp=false: these are SERVER-ONLY binaries, so build without the GUI. Since the desktop was merged
+    # into `veil` (-Dapp defaults true), omitting this cross-compiled raylib for each target — which only
+    # links for Windows (zig ships its stubs) and silently FAILED for every Linux/macOS target, so those
+    # server binaries never shipped. Server-only also cross-compiles cleanly (no GL/X11/framework deps).
+    if ( cd "$ROOT" && "$ZIG" build --release=fast -Dapp=false -Dtarget="$ztarget" --cache-dir "$CACHE" --prefix "$STAGE/xc/$ztarget" ) >/dev/null 2>&1; then
       cp "$STAGE/xc/$ztarget/bin/veil$xexe" "$XOUT/veil-server-v$VERSION-$xos-$xarch$xexe" 2>/dev/null && echo "ok" || echo "copy failed"
     else
       echo "FAILED"
