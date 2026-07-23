@@ -256,6 +256,15 @@ pub fn deleteConv(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg });
     std.Io.Dir.cwd().access(app.io, dir, .{}) catch return notFound(res);
     std.Io.Dir.cwd().deleteTree(app.io, dir) catch {};
+    // Deleting a PRIMARY chat cascades to its sub-chats ("<id>__s1..5") — a branch without its primary
+    // is an orphan no UI can reach (tabs live under the primary). Bounded, best-effort.
+    if (cpaths.branchParts(seg) == null) {
+        var n: u8 = 1;
+        while (n <= cpaths.MAX_BRANCHES) : (n += 1) {
+            const bd = std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}__s{d}", .{ app.data, u.id, seg, n }) catch break;
+            std.Io.Dir.cwd().deleteTree(app.io, bd) catch {};
+        }
+    }
     try res.json(.{ .ok = true }, .{});
 }
 
@@ -350,6 +359,17 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const id = req.param("id") orelse return badReq(res, "no id");
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
+
+    // SUB-CHAT GATE: a branch conv ("<parent>__sN") is only valid when its parent exists and is not
+    // itself a branch (ONE level of nesting). Convs are client-minted, so this turn entry is where the
+    // convention is enforced — an invalid branch id must never mint a stray conversation.
+    if (cpaths.branchParts(seg)) |bp| {
+        if (cpaths.branchParts(bp.parent) != null)
+            return badReq(res, "a sub-chat cannot branch again — branch from the primary chat");
+        const pdir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, bp.parent });
+        std.Io.Dir.cwd().access(app.io, pdir, .{}) catch
+            return badReq(res, "unknown primary chat for this sub-chat");
+    }
 
     const Body = struct {
         text: []const u8 = "",

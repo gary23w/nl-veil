@@ -1453,6 +1453,7 @@ pub const Chat = struct {
                 // and overwrite — the wrong chat. Mirror the cmdDeleteConv precedent: refuse with a clear notice
                 // instead of corrupting state.
                 .new_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before starting a new chat", 2) else self.cmdNewConv(dd),
+                .branch_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before opening a sub-chat", 2) else self.cmdBranchConv(dd),
                 .select_conv => if (self.busyForSwitch()) self.store.pushNotif("Busy", "let the current reply or cast finish before switching chats", 2) else self.cmdSelectConv(dd, c.idStr()),
                 .rename_conv => self.cmdRenameConv(dd, c.idStr(), c.textStr()),
                 .delete_conv => self.cmdDeleteConv(dd, c.idStr()),
@@ -3912,6 +3913,74 @@ pub const Chat = struct {
         self.refreshConvs(dd, true);
     }
 
+    /// Open a SUB-CHAT of the active conversation: mint "<primary>__s<N>" for the first free N (1..5)
+    /// and switch to it. Branching from a sub-chat creates a SIBLING under the same primary (one level —
+    /// the server's turn gate enforces the same). The server side gives the family one build workspace
+    /// and one recallable memory; the branch conv itself is just another conversation.
+    pub fn cmdBranchConv(self: *Chat, dd: []const u8) void {
+        var ab: [64]u8 = undefined;
+        const active = self.convScope(&ab);
+        if (active.len == 0) {
+            self.store.pushNotif("Sub-chats", "open a chat first — a sub-chat branches from it", 2);
+            return;
+        }
+        const primary = store_mod.branchConvRoot(active);
+        var free_n: u8 = 0;
+        var n: u8 = 1;
+        while (n <= store_mod.MAX_BRANCHES) : (n += 1) {
+            var idb: [72]u8 = undefined;
+            const cand = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, n }) catch return;
+            if (!self.convKnown(dd, cand)) {
+                free_n = n;
+                break;
+            }
+        }
+        if (free_n == 0) {
+            self.store.pushNotif("Sub-chats", "this chat already has 5 sub-chats", 2);
+            return;
+        }
+        self.detachToBackground(); // a live server turn keeps running in the background, like cmdNewConv
+        var idb: [72]u8 = undefined;
+        const id = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, free_n }) catch return;
+        var pb: [700]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
+        var tb: [48]u8 = undefined;
+        const title = std.fmt.bufPrint(&tb, "{{\"title\":\"sub-chat {d}\"}}\n", .{free_n}) catch return;
+        Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = title }) catch {
+            log.err("chat: cannot create sub-chat file", .{});
+            return;
+        };
+        {
+            self.store.lock();
+            defer self.store.unlock();
+            const cn = @min(id.len, self.store.conv_active.len);
+            @memcpy(self.store.conv_active[0..cn], id[0..cn]);
+            self.store.conv_active_len = @intCast(cn);
+            self.store.msg_count = 0;
+        }
+        self.conv_epoch += 1; // a sub-chat is a conversation switch — stale continuations must not post into it
+        self.reflect_msg_idx = null;
+        self.releaseServerCastDisplay("detached (left the conversation)");
+        self.resetArcFlags();
+        self.arc_goal_len = 0; // the sub-chat's own goal is its first message; the PRIMARY context arrives server-side
+        self.syncBuildDir(dd); // binds the FAMILY workspace (chatBuildRel resolves a branch to its primary's tree)
+        self.refreshConvs(dd, true);
+    }
+
+    /// Is a conv id already taken, locally (a desk chats file) or in the server conv list mirror?
+    fn convKnown(self: *Chat, dd: []const u8, id: []const u8) bool {
+        var pb: [700]u8 = undefined;
+        if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id })) |p| {
+            if (Io.Dir.cwd().statFile(self.io, p, .{})) |_| return true else |_| {}
+        } else |_| {}
+        self.store.lock();
+        defer self.store.unlock();
+        for (self.store.convs[0..self.store.conv_count]) |*cv| {
+            if (std.mem.eql(u8, cv.idStr(), id)) return true;
+        }
+        return false;
+    }
+
     fn cmdSelectConv(self: *Chat, dd: []const u8, id: []const u8) void {
         if (id.len == 0) return; // busy-guard is at the .select_conv dispatch (busyForSwitch), which also notifies
         self.detachToBackground(); // if the CURRENT conv has a live server turn, adopt it to a background slot first
@@ -4110,8 +4179,10 @@ pub const Chat = struct {
     /// desktop's admin user on localhost.
     fn chatBuildRel(self: *Chat, buf: []u8) []const u8 {
         var cb: [64]u8 = undefined;
-        const conv = self.convScope(&cb);
-        if (conv.len == 0) return "";
+        const conv_own = self.convScope(&cb);
+        if (conv_own.len == 0) return "";
+        // a SUB-CHAT shares its primary's build tree (LOCAL TWIN of server paths.zig branchRoot)
+        const conv = store_mod.branchConvRoot(conv_own);
         var uid: []const u8 = "u1";
         if (self.build_dir_len > 0) {
             const bd = self.build_dir[0..self.build_dir_len];

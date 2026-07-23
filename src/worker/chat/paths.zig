@@ -19,6 +19,47 @@
 
 const std = @import("std");
 
+// ---- SUB-CHAT BRANCHES -------------------------------------------------------------------------
+// A sub-chat is a conversation whose id is "<parent>__s<N>" (N = 1..5). The id convention IS the
+// metadata — no side-channel file: every resolver derives the same facts from the id alone.
+//   * build tree: a branch shares its PARENT's build root (one family workspace — the whole point
+//     is branching an idea without forking the work), via branchRoot() below.
+//   * memory: the branch's hippocampus scope is "chat:<parent>__s<N>" — automatically a `__` child
+//     of the family base "chat:<parent>", so the across-recall the document sub-scopes use makes
+//     the whole family (primary + all branches) one recallable mind while each conv's writes stay
+//     attributable to it.
+//   * nesting is a SINGLE level: a branch of a branch is rejected at the turn gate.
+
+pub const MAX_BRANCHES: u8 = 5;
+
+pub const BranchParts = struct { parent: []const u8, n: u8 };
+
+/// Parse a sub-chat id: "<parent>__s<N>" with N in 1..MAX_BRANCHES and a non-empty parent. null for
+/// ordinary convs — including a hand-named "x__s12" (out of range) or "x__s" (no digit).
+pub fn branchParts(conv: []const u8) ?BranchParts {
+    const mark = std.mem.lastIndexOf(u8, conv, "__s") orelse return null;
+    if (mark == 0) return null; // "__s1" with an empty parent is not a branch
+    const digits = conv[mark + 3 ..];
+    if (digits.len != 1 or digits[0] < '1' or digits[0] > '0' + MAX_BRANCHES) return null;
+    return .{ .parent = conv[0..mark], .n = digits[0] - '0' };
+}
+
+/// The build-family root id: a branch resolves to its parent, everything else to itself.
+pub fn branchRoot(conv: []const u8) []const u8 {
+    return if (branchParts(conv)) |bp| bp.parent else conv;
+}
+
+/// The recall FAMILY BASE for a memory scope: "chat:<parent>__s<N>" → "chat:<parent>"; every other
+/// scope is its own base. Gated on the "chat:" prefix so swarm/task scopes that merely contain
+/// "__s" can never be silently rerooted. Callers hand the base to across-recall so the primary and
+/// every branch read one family mind while writing their own partitions.
+pub fn scopeFamilyBase(scope: []const u8) []const u8 {
+    const P = "chat:";
+    if (!std.mem.startsWith(u8, scope, P)) return scope;
+    if (branchParts(scope[P.len..])) |bp| return scope[0 .. P.len + bp.parent.len];
+    return scope;
+}
+
 pub const SchedParts = struct { tid: []const u8, stamp: []const u8 };
 
 /// Parse a scheduled-run conversation id: "scheduled_{taskid}_{stamp}" where stamp is the trailing all-digit
@@ -42,23 +83,25 @@ pub fn schedParts(conv: []const u8) ?SchedParts {
 /// "u{uid}/_chat/builds/{conv}" otherwise. Files go in "{root}/work" exactly as before. Empty on overflow
 /// (conv ids are <= 64 bytes, so any sane buffer fits).
 pub fn buildRootRel(buf: []u8, uid: u64, conv: []const u8) []const u8 {
-    if (schedParts(conv)) |p| {
+    const root = branchRoot(conv); // a sub-chat builds in its parent's tree — one family workspace
+    if (schedParts(root)) |p| {
         return std.fmt.bufPrint(buf, "u{d}/_sched/{s}/runs/{s}", .{ uid, p.tid, p.stamp }) catch "";
     }
-    return std.fmt.bufPrint(buf, "u{d}/_chat/builds/{s}", .{ uid, conv }) catch "";
+    return std.fmt.bufPrint(buf, "u{d}/_chat/builds/{s}", .{ uid, root }) catch "";
 }
 
 /// Same mapping, composed from an absolute "{...}/u{d}/_chat" base (what the engine's call sites hold).
 /// For a scheduled run the "/_chat" tail is swapped for the task tree; a base without that tail (never the
 /// case today) falls back to the ordinary builds/ shape under it.
 pub fn buildRootFromChatBase(buf: []u8, chat_base: []const u8, conv: []const u8) []const u8 {
-    if (schedParts(conv)) |p| {
+    const root = branchRoot(conv); // a sub-chat builds in its parent's tree — one family workspace
+    if (schedParts(root)) |p| {
         if (std.mem.endsWith(u8, chat_base, "/_chat")) {
             const user_root = chat_base[0 .. chat_base.len - "/_chat".len];
             return std.fmt.bufPrint(buf, "{s}/_sched/{s}/runs/{s}", .{ user_root, p.tid, p.stamp }) catch "";
         }
     }
-    return std.fmt.bufPrint(buf, "{s}/builds/{s}", .{ chat_base, conv }) catch "";
+    return std.fmt.bufPrint(buf, "{s}/builds/{s}", .{ chat_base, root }) catch "";
 }
 
 /// The run-dir TAIL a scheduled conv's build root always ends with ("_sched/{tid}/runs/{stamp}") — what the
@@ -70,6 +113,36 @@ pub fn schedRunTail(buf: []u8, conv: []const u8) ?[]const u8 {
 }
 
 // ---- tests ----
+
+test "branchParts: sub-chat ids parse, everything else abstains" {
+    const b = branchParts("c6a616d35__s2").?;
+    try std.testing.expectEqualStrings("c6a616d35", b.parent);
+    try std.testing.expectEqual(@as(u8, 2), b.n);
+    try std.testing.expect(branchParts("c6a616d35") == null);
+    try std.testing.expect(branchParts("c6a616d35__s0") == null); // out of range
+    try std.testing.expect(branchParts("c6a616d35__s6") == null); // beyond MAX_BRANCHES
+    try std.testing.expect(branchParts("c6a616d35__s12") == null); // one digit only
+    try std.testing.expect(branchParts("c6a616d35__s") == null);
+    try std.testing.expect(branchParts("__s1") == null); // empty parent
+    // a branch-of-a-branch id still PARSES (parent = the inner branch) — the turn gate rejects it
+    const nested = branchParts("a__s1__s2").?;
+    try std.testing.expectEqualStrings("a__s1", nested.parent);
+}
+
+test "branchRoot + build roots: a sub-chat shares its parent's tree" {
+    try std.testing.expectEqualStrings("c42", branchRoot("c42__s3"));
+    try std.testing.expectEqualStrings("c42", branchRoot("c42"));
+    var b: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("u7/_chat/builds/c42", buildRootRel(&b, 7, "c42__s3"));
+    try std.testing.expectEqualStrings("data/u1/_chat/builds/c42", buildRootFromChatBase(&b, "data/u1/_chat", "c42__s1"));
+}
+
+test "scopeFamilyBase: chat branch scopes reroot to the family base, everything else stays" {
+    try std.testing.expectEqualStrings("chat:c42", scopeFamilyBase("chat:c42__s4"));
+    try std.testing.expectEqualStrings("chat:c42", scopeFamilyBase("chat:c42"));
+    try std.testing.expectEqualStrings("sched:tid__s1", scopeFamilyBase("sched:tid__s1")); // not chat: — untouched
+    try std.testing.expectEqualStrings("knowledge__doc-x", scopeFamilyBase("knowledge__doc-x"));
+}
 
 test "schedParts: run convs parse, ordinary and hand-named convs don't" {
     const p = schedParts("scheduled_daily-report-0301070500_03010705").?;

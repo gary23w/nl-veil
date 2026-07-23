@@ -1017,6 +1017,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             recall_frag.append(gpa, '}') catch return;
         }
     }
+    // SUB-CHAT FAMILY CONTEXT: a branch re-anchors on the primary (live goal + latest progress); a primary
+    // lists its live branches. Varies per turn → rides the recall-fragment channel, never the stable prefix.
+    injectFamilyContext(app, conv, base, &recall_frag);
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
     injectDurableMemory(app, uid, &conv_buf);
@@ -2362,7 +2365,10 @@ fn stepWeave(gpa: std.mem.Allocator, ctx: *tools.ToolCtx, ledger: *const FileLed
     // a step needs them. SATURATION spread — the activation wave follows every discriminative thread until
     // it settles (neuron-db's frontier-drain convergence), not a fixed hop budget; k + decay + trust bound
     // the output. One bounded subprocess per drive step; abstains quietly.
-    const rec = ctx.mem.assoc(ctx.scope, step_text, osc.Mem.SATURATE_HOPS, 6);
+    // FAMILY-WIDE for sub-chats: recall runs across the chat family base ("chat:<primary>" reaches the
+    // primary + every "__sN" branch partition), so the primary and its branches read ONE mind while each
+    // conversation's writes stay in its own partition. A plain conv's base is itself — behavior unchanged.
+    const rec = ctx.mem.assocAcross(cpaths.scopeFamilyBase(ctx.scope), step_text, osc.Mem.SATURATE_HOPS, 6);
     defer if (rec.len > 0) gpa.free(rec);
     if (rec.len > 0) {
         scrubUtf8(rec);
@@ -2416,6 +2422,94 @@ fn continuationShaped(text: []const u8) bool {
 /// The conversation's first user message (the pinned goal), parsed from messages.jsonl's head — the right
 /// recall cue for a continuation-shaped turn. Uses the same bounded head read as assembleHistory (a
 /// .limited readFileAlloc would FAIL outright on a long conversation's file). gpa-owned, or null.
+/// The LAST assistant message content of a conversation (tail-windowed read) — the sub-chat family
+/// block's "what is the primary up to right now". null when none is readable. gpa-owned.
+fn lastAssistantNote(app: *App, conv_dir: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return null;
+    defer gpa.free(mpath);
+    const head_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return null;
+    defer gpa.free(head_buf);
+    const tail_buf = gpa.alloc(u8, cctx.HEAD_READ_BYTES) catch return null;
+    defer gpa.free(tail_buf);
+    const ht = cctx.readHeadTail(app.io, mpath, head_buf, tail_buf) orelse return null;
+    var best: ?[]u8 = null;
+    var it = std.mem.splitScalar(u8, ht.tail, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (t.len == 0) continue;
+        const P = struct { role: []const u8 = "", content: []const u8 = "" };
+        const p = std.json.parseFromSlice(P, gpa, t, .{ .ignore_unknown_fields = true }) catch continue; // a mid-line tail start just skips
+        defer p.deinit();
+        if (std.mem.eql(u8, p.value.role, "assistant") and p.value.content.len > 0) {
+            if (best) |b| gpa.free(b);
+            best = gpa.dupe(u8, p.value.content) catch null;
+        }
+    }
+    return best;
+}
+
+/// SUB-CHAT FAMILY CONTEXT, appended to the per-turn recall fragment (the varying channel — never the
+/// stable prefix). A branch turn re-anchors on the PRIMARY live each turn: its goal plus its latest
+/// progress, so the branch follows one angle without losing the trunk — and it stays current as the
+/// primary moves, unlike a one-shot seed at branch creation. A primary with live branches gets them
+/// listed. Memory itself is shared structurally (scopeFamilyBase across-recall); this block is the
+/// CONVERSATIONAL half of "they must know the primary chat context".
+fn injectFamilyContext(app: *App, conv: []const u8, base: []const u8, recall_frag: *std.ArrayListUnmanaged(u8)) void {
+    const gpa = app.gpa;
+    var block: std.ArrayListUnmanaged(u8) = .empty;
+    defer block.deinit(gpa);
+    if (cpaths.branchParts(conv)) |bp| {
+        const pdir = std.fmt.allocPrint(gpa, "{s}/convs/{s}", .{ base, bp.parent }) catch return;
+        defer gpa.free(pdir);
+        block.print(gpa, "THIS IS SUB-CHAT {d} of a primary conversation. ", .{bp.n}) catch return;
+        const goal = firstUserGoal(app, pdir);
+        defer if (goal) |g| gpa.free(g);
+        if (goal) |g| {
+            block.appendSlice(gpa, "PRIMARY'S GOAL: \"") catch return;
+            block.appendSlice(gpa, clipBytes(g, 300)) catch return;
+            block.appendSlice(gpa, "\". ") catch return;
+        }
+        const last = lastAssistantNote(app, pdir);
+        defer if (last) |l| gpa.free(l);
+        if (last) |l| {
+            scrubUtf8(l);
+            block.appendSlice(gpa, "PRIMARY'S LATEST PROGRESS: \"") catch return;
+            block.appendSlice(gpa, clipBytes(l, 500)) catch return;
+            block.appendSlice(gpa, "\". ") catch return;
+        }
+        block.appendSlice(gpa, "Pursue THIS branch's angle in depth — do not re-do the primary's work. " ++
+            "The family shares ONE memory (recall reaches the primary and sibling branches) and ONE " ++
+            "workspace (the same files — coordinate through them, never clobber).") catch return;
+    } else {
+        // primary side: list live branches so the trunk knows its angles are being worked
+        var listed: u8 = 0;
+        var n: u8 = 1;
+        while (n <= cpaths.MAX_BRANCHES) : (n += 1) {
+            var db: [900]u8 = undefined;
+            const bdir = std.fmt.bufPrint(&db, "{s}/convs/{s}__s{d}", .{ base, conv, n }) catch continue;
+            std.Io.Dir.cwd().access(app.io, bdir, .{}) catch continue;
+            if (listed == 0) block.appendSlice(gpa, "ACTIVE SUB-CHATS branched from this conversation: ") catch return;
+            if (listed > 0) block.appendSlice(gpa, "; ") catch return;
+            block.print(gpa, "s{d}", .{n}) catch return;
+            const title = firstUserGoal(app, bdir);
+            defer if (title) |t| gpa.free(t);
+            if (title) |t| {
+                block.appendSlice(gpa, " \"") catch return;
+                block.appendSlice(gpa, clipBytes(t, 80)) catch return;
+                block.appendSlice(gpa, "\"") catch return;
+            }
+            listed += 1;
+        }
+        if (listed > 0)
+            block.appendSlice(gpa, ". Their findings are already in this conversation's shared memory (recall), and their files land in this same workspace.") catch return;
+    }
+    if (block.items.len == 0) return;
+    recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+    http.jstr(gpa, recall_frag, block.items) catch return;
+    recall_frag.append(gpa, '}') catch return;
+}
+
 fn firstUserGoal(app: *App, conv_dir: []const u8) ?[]u8 {
     const gpa = app.gpa;
     const mpath = std.fmt.allocPrint(gpa, "{s}/messages.jsonl", .{conv_dir}) catch return null;
