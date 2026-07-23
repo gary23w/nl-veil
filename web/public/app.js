@@ -37,6 +37,7 @@ const S = {
                         // runs live only here, and the Tasks tab reads them back out (taskRuns)
                         // — filtering the rail must not amount to deleting the only route to them.
   conv: null,           // active conversation id
+  subsOpen: {},         // primary conv id -> its sub-chat drop-down is expanded (session-local)
   msgs: [],             // [{role,content,kind,ts}]
   live: false,          // a turn is running for the active conv
   stream: { text: '', reasoning: '', tools: [], status: '' },
@@ -904,32 +905,81 @@ async function refreshConvs() {
   // Set on BOTH paths: a failed fetch is still an answer as far as the transcript is concerned, and
   // leaving it false would hold the blank state forever on an account whose list genuinely errored.
   S.convsLoaded = true;
-  const host = el('convScroll');
-  if (!host) return;
   // The transcript's no-conversation state depends on whether this account has any
   // history at all, and that is only known once this call lands.
   if (!S.conv) drawTranscript();
+  drawConvRail();
+}
+
+/* SUB-CHAT id convention (twin of the desk/server "<primary>__sN", N 1..5): the id IS the metadata.
+   Sub-chats render as an inner drop-down under their primary row — one rail entry per line of work. */
+const BRANCH_RE = /^(.+)__s([1-5])$/;
+function branchOf(id) { const m = BRANCH_RE.exec(id || ''); return m ? { parent: m[1], n: +m[2] } : null; }
+
+function drawConvRail() {
+  const host = el('convScroll');
+  if (!host) return;
   if (!S.convs.length) {
     host.innerHTML = '<div class="empty">no conversations yet</div>';
     return;
   }
+  // Group sub-chats under their primary; an ORPHANED branch (its primary gone) stays a plain row so
+  // it never becomes unreachable. Primaries keep the newest-first order and the date tiers.
+  const subs = {};
+  const tops = [];
+  for (const c of S.convs) {
+    const b = branchOf(c.id);
+    if (b && S.convs.some((p) => p.id === b.parent)) (subs[b.parent] = subs[b.parent] || []).push(c);
+    else tops.push(c);
+  }
+  for (const k in subs) subs[k].sort((a, b) => branchOf(a.id).n - branchOf(b.id).n);
+  const activeBranch = branchOf(S.conv || '');
   // Date tiers. The list is already sorted newest-first, so a heading is emitted
   // wherever the tier CHANGES — no grouping pass, no second sort, and the order
   // inside a tier stays exactly the order above.
   let tier = '';
-  host.innerHTML = S.convs.map((c) => {
+  host.innerHTML = tops.map((c) => {
     const g = convGroup(c.updated);
     const head = g === tier ? '' : `<div class="conv-group">${esc(g)}</div>`;
     tier = g;
+    const kids = subs[c.id] || [];
+    const open = kids.length && (S.subsOpen[c.id] || (activeBranch && activeBranch.parent === c.id));
+    const chev = kids.length ? `
+      <button class="conv-sub-toggle ${open ? 'open' : ''}" data-subs="${esc(c.id)}"
+              title="${kids.length} sub-chat${kids.length > 1 ? 's' : ''}" aria-label="Toggle sub-chats">
+        <svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>${kids.length}
+      </button>` : '';
+    const inner = open ? `<div class="conv-subs">` + kids.map((k) => `
+      <button class="conv-row conv-sub ${k.id === S.conv ? 'active' : ''}" data-conv="${esc(k.id)}">
+        <div class="conv-title ellip">${esc(k.title || ('sub-chat ' + branchOf(k.id).n))}</div>
+        <div class="conv-meta"><span>${esc(fmtWhen(k.updated))}</span><span>${k.msgs || 0} msgs</span></div>
+      </button>`).join('') +
+      (kids.length < 5 ? `<button class="conv-row conv-sub conv-sub-add" data-subadd="${esc(c.id)}">+ sub-chat</button>` : '') +
+      `</div>` : '';
     return head + `
-    <button class="conv-row ${c.id === S.conv ? 'active' : ''}" data-conv="${esc(c.id)}">
-      <div class="conv-title ellip">${esc(c.title || c.id)}</div>
-      <div class="conv-meta"><span>${esc(fmtWhen(c.updated))}</span><span>${c.msgs || 0} msgs</span></div>
-    </button>`;
+    <div class="conv-wrap">
+      <button class="conv-row ${c.id === S.conv ? 'active' : ''} ${kids.length ? 'has-subs' : ''}" data-conv="${esc(c.id)}">
+        <div class="conv-title ellip">${esc(c.title || c.id)}</div>
+        <div class="conv-meta"><span>${esc(fmtWhen(c.updated))}</span><span>${c.msgs || 0} msgs</span></div>
+      </button>${chev}${inner}
+    </div>`;
   }).join('');
-  // Still every row: the headings are siblings of the buttons, not wrappers, so
+  // Still every row: the headings are siblings of the wrappers, not parents, so
   // this selector reaches the same set it always did.
   $$('[data-conv]', host).forEach((b) => b.addEventListener('click', () => openConv(b.dataset.conv, true)));
+  $$('[data-subs]', host).forEach((b) => b.addEventListener('click', () => {
+    S.subsOpen[b.dataset.subs] = !S.subsOpen[b.dataset.subs];
+    drawConvRail(); // pure re-render from the list already in memory — no refetch
+  }));
+  $$('[data-subadd]', host).forEach((b) => b.addEventListener('click', () => {
+    const p = b.dataset.subadd;
+    const taken = (subs[p] || []).map((k) => branchOf(k.id).n);
+    let n = 1;
+    while (n <= 5 && taken.includes(n)) n++;
+    if (n > 5) return;
+    S.subsOpen[p] = true;
+    openConv(p + '__s' + n, true); // client-minted like every conv; the server gate validates the primary
+  }));
 }
 
 async function openConv(id, focus) {
