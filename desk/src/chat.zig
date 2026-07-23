@@ -4136,6 +4136,16 @@ pub const Chat = struct {
         var pb: [700]u8 = undefined;
         const path = std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}.jsonl", .{ dd, id }) catch return;
         Io.Dir.cwd().deleteFile(self.io, path) catch {};
+        // Deleting a PRIMARY cascades to its sub-chats' LOCAL files too (the server route already cascades
+        // its side): a leftover local "<id>__sN.jsonl" would re-merge as a phantom tab on the next refresh.
+        if (store_mod.branchConvParts(id) == null) {
+            var n: u8 = 1;
+            while (n <= store_mod.MAX_BRANCHES) : (n += 1) {
+                if (std.fmt.bufPrint(&pb, "{s}/.veil-desk/chats/{s}__s{d}.jsonl", .{ dd, id, n })) |bp| {
+                    Io.Dir.cwd().deleteFile(self.io, bp) catch {};
+                } else |_| {}
+            }
+        }
         // ALSO delete it server-side. A server-born conv (a scheduled_* run, or one merged into the sidebar)
         // has no local file, so unlinking the local file alone is a no-op and the next refreshConvs re-merges
         // it straight back — deletes appeared to do nothing. The server route removes the authoritative copy.
@@ -4154,6 +4164,12 @@ pub const Chat = struct {
         }
         self.refreshConvs(dd, true);
         if (was_active) {
+            // a deleted SUB-CHAT lands back on its primary (the tab strip's Main) — never on convs[0],
+            // which is "some newest chat" and would silently yank the user out of the family
+            if (store_mod.branchConvParts(id)) |bp| {
+                self.cmdSelectConv(dd, bp.parent);
+                return;
+            }
             // fall back to the newest remaining conversation
             var nid: [64]u8 = undefined;
             var nn: usize = 0;

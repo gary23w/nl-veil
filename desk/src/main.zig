@@ -3920,6 +3920,14 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                 if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(lbl), .height = tab_h }, lbl, is_on) and !is_on)
                     store.pushChatCmd(store_mod.mkChatCmd(.select_conv, bid, ""));
                 tx += t.tabW(lbl) + 4;
+                // the ACTIVE sub-chat carries its delete — sub-chats have no rail row (delete lived there),
+                // so the tab is the one place the affordance can exist. Lands back on Main (cmdDeleteConv).
+                if (is_on) {
+                    const xr = t.Rect{ .x = tx, .y = r.y + 3, .width = 18, .height = 20 };
+                    if (t.buttonGhost(xr, t.z("x", .{}), t.red, true))
+                        store.pushChatCmd(store_mod.mkChatCmd(.delete_conv, bid, ""));
+                    tx += 22;
+                }
             }
         }
         if (have_n < store_mod.MAX_BRANCHES and msgs.len > 0) {
