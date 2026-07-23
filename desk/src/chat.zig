@@ -4116,21 +4116,26 @@ pub const Chat = struct {
 
     fn cmdDeleteConv(self: *Chat, dd: []const u8, id: []const u8) void {
         if (id.len == 0) return;
-        // Refuse to delete the conversation whose turn is streaming: cmdSend/cmdSelectConv already guard
-        // on turn==idle, but without this guard deleting the ACTIVE chat mid-turn clears conv_active, the
-        // fallback select silently no-ops (its own guard), and the in-flight reply lands with no active
-        // conversation — appendMsg writes it to a stranded Store slot and never persists it (lost). A
-        // background conversation is always safe to delete.
-        if (self.turn != .idle) {
-            var active = false;
+        // DELETE STOPS FIRST, then removes: delete > stop chat > remove > land back (user directive).
+        // The old guard REFUSED to delete an active streaming chat; and a BACKGROUNDED conv's live server
+        // turn wasn't stopped at all — deleting left a zombie turn streaming into a removed tree. Now the
+        // active conv goes through the same routine as the Stop button (local stream abort + server
+        // control stop + cast display release), and a backgrounded conv gets the server control stop
+        // directly plus its background slot released; an idle conv ignores the op harmlessly.
+        {
+            var active_now = false;
             {
                 self.store.lock();
-                active = std.mem.eql(u8, self.store.conv_active[0..self.store.conv_active_len], id);
-                self.store.unlock();
+                defer self.store.unlock();
+                active_now = std.mem.eql(u8, self.store.conv_active[0..self.store.conv_active_len], id);
             }
-            if (active) {
-                self.store.pushNotif("Busy", "let the reply finish before deleting this chat", 2);
-                return;
+            if (active_now) {
+                if (self.turn != .idle or self.sc_active) self.stopTurn(dd);
+            } else {
+                if (self.runner().chatControl(self.io, self.gpa, id, "{\"op\":\"stop\"}")) |r| {
+                    if (r.body.len > 0) self.gpa.free(r.body);
+                }
+                _ = self.bgRemove(id);
             }
         }
         var pb: [700]u8 = undefined;
