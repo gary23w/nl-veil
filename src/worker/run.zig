@@ -1399,8 +1399,9 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
                         defer gpa.free(gfp);
                         const gdata = std.Io.Dir.cwd().readFileAlloc(io, gfp, gpa, .limited(64 << 10)) catch "";
                         defer if (gdata.len > 0) gpa.free(gdata);
-                        // a file whose landing was CUT mid-emission is on disk but NOT a deliverable yet
-                        if (std.mem.trim(u8, gdata, " \r\n\t").len <= 40 or truncPending(&w, gbp)) {
+                        // a file whose landing was CUT mid-emission — or a gutted page that never closes
+                        // </html> — is on disk but NOT a deliverable yet
+                        if (std.mem.trim(u8, gdata, " \r\n\t").len <= 40 or truncPending(&w, gbp) or salvageTruncatedHtml(gdata)) {
                             any_missing = true;
                             break;
                         }
@@ -1729,6 +1730,46 @@ fn writeDone(w: *Worker, reason: []const u8) void {
     const pp = std.fmt.allocPrint(w.gpa, "{s}/worker.pid", .{w.run_dir}) catch return;
     defer w.gpa.free(pp);
     std.Io.Dir.cwd().deleteFile(w.io, pp) catch {};
+    sweepKeyScratch(w);
+}
+
+/// SECURITY/HYGIENE sweep at clean exit: the cast's key material must not outlive the run. `keys.env`
+/// and each mind's curl scratch (`.curlcfg-<mind>` embeds `Authorization: Bearer …`; `.llmreq-<mind>.json`
+/// can be 100KB+ of request dumps) sit in a CHAT-owned build dir that is never tree-wiped, so left alone
+/// they strand the API key (and real waste) until retention GC — supervisor.cleanCastMeta only runs on
+/// stop/GC, not on natural completion. Mind names come from the run's own `minds/` dirs, so the sweep
+/// can never collide with the chat engine's live scratch (.curlcfg-chat/…) in the same dir.
+fn sweepKeyScratch(w: *Worker) void {
+    var buf: [1200]u8 = undefined;
+    for ([_][]const u8{ "keys.env", "keys.env.enc" }) |f| {
+        const kp = std.fmt.bufPrint(&buf, "{s}/{s}", .{ w.run_dir, f }) catch continue;
+        std.Io.Dir.cwd().deleteFile(w.io, kp) catch {};
+    }
+    const mroot = std.fmt.bufPrint(&buf, "{s}/minds", .{w.run_dir}) catch return;
+    var md = std.Io.Dir.cwd().openDir(w.io, mroot, .{ .iterate = true }) catch return;
+    defer md.close(w.io);
+    var names: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (names.items) |n| w.gpa.free(n);
+        names.deinit(w.gpa);
+    }
+    var it = md.iterate();
+    while (it.next(w.io) catch null) |ent| {
+        if (ent.kind != .directory) continue;
+        const dup = w.gpa.dupe(u8, ent.name) catch continue;
+        names.append(w.gpa, dup) catch {
+            w.gpa.free(dup);
+            continue;
+        };
+    }
+    for (names.items) |n| {
+        inline for ([_][]const u8{ ".curlcfg-{s}", ".llmreq-{s}.json" }) |pat| {
+            var fb: [512]u8 = undefined;
+            const rel = std.fmt.bufPrint(&fb, pat, .{n}) catch continue;
+            const fp = std.fmt.bufPrint(&buf, "{s}/{s}", .{ w.run_dir, rel }) catch continue;
+            std.Io.Dir.cwd().deleteFile(w.io, fp) catch {};
+        }
+    }
 }
 
 /// One real tool execution, recorded for lesson pairing: fails carry the failure note, oks don't. Fixed
@@ -5127,6 +5168,8 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8, f
     }
     if (salvageLeadConversational(body)) return "conversational lead-in (chatter, not a file body)";
     if (salvageHasToolFragment(body)) return "contains a raw tool-call fragment";
+    if (salvageTruncatedHtml(body)) return "opens a full HTML document but never closes </html> — the body is TRUNCATED; emit the COMPLETE page";
+    if (salvageHtmlIntoCodeSlot(salvage_slot, body)) return "the body is an HTML document but this slot is a code file — emit the slot's own language, not a page";
     const full = std.fmt.allocPrint(gpa, "{s}/work/{s}", .{ w.run_dir, salvage_slot }) catch return null;
     defer gpa.free(full);
     const existing: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, full, gpa, .limited(1 << 20)) catch null;
@@ -5149,6 +5192,12 @@ fn salvageRejectReason(w: *Worker, salvage_slot: []const u8, body: []const u8, f
     // Applies in quick mode too — quick's rewrite-in-place convergence also always emits fenced bodies.
     if (from_fallback and cur.len > 0 and !file_broken)
         return "prose reply without a fenced block cannot REPLACE an existing file — emit SEARCH/REPLACE edits on its exact current lines, or ONE fenced code block holding the complete corrected file";
+    // GUTTING FLOOR — applies in EVERY mode (quick included) and regardless of failure-implication,
+    // unlike the r1 no-clobber below. Live failure c6a616d35: quick mode skipped the no-clobber, a
+    // 374-byte fragment replaced the 16.7KB homepage, and every downstream signal (benchmark presence,
+    // fitness, auto-restore-best) was mass-blind, so the gutted file shipped as "best".
+    if (salvageGutsExisting(cur.len, body.len) and !file_broken)
+        return "the replacement is under 40% of the existing file — that is a truncation, not a rewrite; emit the COMPLETE file or SEARCH/REPLACE edits (if the file truly must shrink this much, delete_file it first)";
     if (std.mem.endsWith(u8, std.fs.path.basename(salvage_slot), ".py")) switch (pySalvageCheck(w, body)) {
         7 => return "fails py_compile (syntax error)",
         8 => return "defines the same top-level name TWICE — the body glues two copies of the module together; emit ONE clean copy of the file",
@@ -5375,10 +5424,44 @@ fn salvageHasToolFragment(body: []const u8) bool {
     // committed into a .tsx). General signals, no provider list:
     if (std.mem.indexOf(u8, t, "invoke name=") != null) return true;
     if (std.mem.indexOf(u8, t, "<tool_call") != null or std.mem.indexOf(u8, t, "tool_calls>") != null or std.mem.indexOf(u8, t, "<function_call") != null) return true;
+    if (std.mem.indexOf(u8, t, "<function=") != null) return true; // hermes dialect emitted WITHOUT its <tool_call> wrapper
     // a special-token delimiter rune (fullwidth bar U+FF5C, the "<|...|>" family rendered as text) —
     // these appear only in provider control tokens, never in a real source/document body
     if (std.mem.indexOf(u8, t, "\xef\xbd\x9c") != null) return true;
     return false;
+}
+
+/// Does the body CLAIM to be a full HTML document (opens <!DOCTYPE/<html>)? Shape-based, no extension
+/// needed — partials/templates that never open a document are unaffected.
+fn salvageClaimsFullHtml(body: []const u8) bool {
+    const t = std.mem.trim(u8, body, " \r\n\t");
+    return std.ascii.startsWithIgnoreCase(t, "<!doctype") or std.ascii.startsWithIgnoreCase(t, "<html");
+}
+
+/// A body that opens a full HTML document but never closes </html> is a TRUNCATED page, exactly the
+/// shape a degraded model emits (live failure c6a616d35: a corrective retry passed the length+fragment
+/// gates with a 374-byte <head> fragment and gutted the 16.7KB homepage).
+fn salvageTruncatedHtml(body: []const u8) bool {
+    if (!salvageClaimsFullHtml(body)) return false;
+    return std.ascii.indexOfIgnoreCase(body, "</html>") == null;
+}
+
+/// A full HTML document committed into a code slot (.js/.css/.json/…) is cross-type corruption — the
+/// same night's main.js briefly held an HTML head fragment. Extension-checked because HTML slots
+/// legitimately receive HTML.
+fn salvageHtmlIntoCodeSlot(slot: []const u8, body: []const u8) bool {
+    if (!salvageClaimsFullHtml(body)) return false;
+    const exts = [_][]const u8{ ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".json", ".css", ".py" };
+    for (exts) |e| if (std.ascii.endsWithIgnoreCase(slot, e)) return true;
+    return false;
+}
+
+/// A whole-file replacement under 40% of a non-trivial (>=2KB) existing file is a truncation, not a
+/// rewrite. The r1+ no-clobber guard is skipped in quick mode and opened by failure-implication — this
+/// floor holds in EVERY mode: a genuinely broken file (markers/known truncation) stays replaceable,
+/// everything else must arrive as edits or a complete body.
+fn salvageGutsExisting(cur_len: usize, body_len: usize) bool {
+    return cur_len >= 2048 and body_len * 5 < cur_len * 2;
 }
 
 fn containsKeyValue(s: []const u8, key: []const u8, val: []const u8) bool {
@@ -6793,10 +6876,15 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
         // substance check when it fits; fall back to stat for size when it doesn't.
         const data: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(w.io, fp, gpa, .limited(64 << 10)) catch null;
         defer if (data) |d| if (d.len > 0) gpa.free(d);
-        const substantive = if (data) |d| std.mem.trim(u8, d, " \r\n\t").len > 40 else blk: {
+        var substantive = if (data) |d| std.mem.trim(u8, d, " \r\n\t").len > 40 else blk: {
             const st = std.Io.Dir.cwd().statFile(w.io, fp, .{}) catch break :blk false;
             break :blk st.size > 40; // on disk and big — present by definition, whatever its bytes
         };
+        // MASS-AWARE presence: a page that opens a full HTML document but never closes it is a gutted
+        // file, not a deliverable. Presence-only counting scored the c6a616d35 corruption 7/7 through
+        // a 374-byte homepage — no score drop, so auto-restore never fired and quick_done shipped it.
+        const hollow = if (data) |d| salvageTruncatedHtml(d) else false;
+        if (hollow) substantive = false;
         const cut = truncPending(w, bp); // on disk but landed from a CUT emission — not complete
         if (substantive and !cut) {
             present += 1;
@@ -6805,7 +6893,7 @@ fn goalCoverage(w: *Worker, goal: []const u8) Coverage {
             // FULL path, not basename: "create __init__.py, __init__.py, __init__.py" names no directory
             // and the minds cannot act on it
             miss.appendSlice(gpa, bp) catch {};
-            if (cut) miss.appendSlice(gpa, " (on disk but CUT OFF mid-emission — finish its tail, do not restart it)") catch {};
+            if (cut) miss.appendSlice(gpa, " (on disk but CUT OFF mid-emission — finish its tail, do not restart it)") catch {} else if (hollow) miss.appendSlice(gpa, " (on disk but TRUNCATED — it never closes </html>; rebuild the COMPLETE page)") catch {};
         }
     }
     return .{ .present = present, .total = total, .missing = miss.toOwnedSlice(gpa) catch "" };
@@ -10148,6 +10236,32 @@ test "salvage gates catch the c6a5937fe corruption shapes: narration + path line
     // real file bodies stay committable: code, and a doc that merely starts with a heading
     try std.testing.expect(!salvageLeadConversational("import x from 'y'\nconst a = 1\nexport default a"));
     try std.testing.expect(!salvageLeadConversational("# Setup\n\nInstall the dependencies, then run the dev server."));
+}
+
+test "salvage gates catch the c6a616d35 corruption shapes: truncated page, html-into-js, gutting write" {
+    // the EXACT stub that gutted the homepage: opens a full document, dies mid-<title>, never closes
+    const stub = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n" ++
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n" ++
+        "  <title>Apex Home Renovations | Your Home, Perfected.";
+    try std.testing.expect(salvageTruncatedHtml(stub));
+    // a COMPLETE page passes, and a partial (never opens a document) is not html-shaped at all
+    try std.testing.expect(!salvageTruncatedHtml("<!DOCTYPE html>\n<html>\n<body>hi</body>\n</html>"));
+    try std.testing.expect(!salvageTruncatedHtml("<nav class=\"main-nav\">…</nav>"));
+
+    // the same night's cross-type corruption: an HTML document committed into src/js/main.js
+    try std.testing.expect(salvageHtmlIntoCodeSlot("src/js/main.js", "<!DOCTYPE html><html></html>"));
+    try std.testing.expect(!salvageHtmlIntoCodeSlot("index.html", "<!DOCTYPE html><html></html>"));
+    try std.testing.expect(!salvageHtmlIntoCodeSlot("src/js/main.js", "const nav = document.querySelector('nav');"));
+
+    // gutting floor: 374B over 16.7KB is a truncation; a 41% rewrite of the same file is not;
+    // small files (<2KB) stay freely rewritable
+    try std.testing.expect(salvageGutsExisting(16752, 374));
+    try std.testing.expect(!salvageGutsExisting(10000, 4100));
+    try std.testing.expect(salvageGutsExisting(10000, 3900));
+    try std.testing.expect(!salvageGutsExisting(1000, 100));
+
+    // the hermes shape WITHOUT its wrapper is still an invocation fragment, never a file body
+    try std.testing.expect(salvageHasToolFragment("<function=write_file>\n<parameter=path>x.js</parameter>"));
 }
 
 test "salvageFileBody picks the LARGEST fenced block, skipping a small Note block" {
