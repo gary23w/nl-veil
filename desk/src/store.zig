@@ -601,7 +601,24 @@ pub const LlmModelRow = struct {
 /// One local day of activity (the 14-day bars). `day` = local epoch-day from the server.
 pub const LlmDay = struct { day: i64 = 0, tin: u64 = 0, tout: u64 = 0, calls: u64 = 0 };
 
-pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
+pub const ChatCmdKind = enum { none, send, steer_turn, new_conv, branch_conv, select_conv, rename_conv, delete_conv, stop_cast, save_settings, save_key, console_run, console_cancel, loop_kick, stop_turn, chat_open_file, chat_open_folder, forget_mem, console_approve, console_deny, prop_accept, prop_reject, set_github_pat, set_github_user };
+
+// ---- SUB-CHAT id convention (LOCAL TWIN of the server's chat/paths.zig branchParts/branchRoot — kept
+// verbatim so the two mappings can never drift). A sub-chat's conv id is "<parent>__s<N>" (N = 1..5):
+// it shares the parent's build tree server-side and its memory scope is a family child. The desk shows
+// sub-chats as TABS inside the primary chat, never as top-level rail rows.
+pub const MAX_BRANCHES: u8 = 5;
+pub const BranchConvParts = struct { parent: []const u8, n: u8 };
+pub fn branchConvParts(conv: []const u8) ?BranchConvParts {
+    const mark = std.mem.lastIndexOf(u8, conv, "__s") orelse return null;
+    if (mark == 0) return null;
+    const digits = conv[mark + 3 ..];
+    if (digits.len != 1 or digits[0] < '1' or digits[0] > '0' + MAX_BRANCHES) return null;
+    return .{ .parent = conv[0..mark], .n = digits[0] - '0' };
+}
+pub fn branchConvRoot(conv: []const u8) []const u8 {
+    return if (branchConvParts(conv)) |bp| bp.parent else conv;
+}
 
 /// One durable memory the chat AI keeps for the user (a key, login, preference, fact). The value lives in
 /// neuron-db (the chat's local hippocampus, used for relevance recall) mirrored to memories.jsonl for display.

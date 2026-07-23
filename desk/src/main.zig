@@ -2169,7 +2169,7 @@ fn drawChat(store: *Store, body: t.Rect) void {
     }
 
     drawChatLeft(store, left, left_open, convs[0..conv_n], active[0..active_n], now_s);
-    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title);
+    drawChatCenter(store, center, msgs[0..msg_n], inflight, busy, status[0..status_n], cast_live, conv_title, convs[0..conv_n], active[0..active_n]);
     drawChatRight(store, right, right_open, casts[0..cast_n], tail[0..tail_n], plan[0..plan_n]);
     if (con_h > 0) drawMicroConsole(store, console, con_ai, con_buf[0..con_n], con_busy, con_cwd_buf[0..con_cwd_n]);
     // resize grips over the pane inner edges — drawn last so the pane fills don't overpaint them
@@ -2599,6 +2599,18 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         return;
     }
 
+    // SUB-CHATS never appear as top-level rail rows — they live as TABS inside their primary chat
+    // (drawChatCenter's family strip). Filter once; every count/extent/hit walk below uses the same
+    // filtered view so rows and pixels stay aligned.
+    var shown: [store_mod.MAX_CONVS]store_mod.ConvRow = undefined;
+    var shown_n: usize = 0;
+    for (convs) |*cv| {
+        if (store_mod.branchConvParts(cv.idStr()) != null) continue;
+        shown[shown_n] = cv.*;
+        shown_n += 1;
+    }
+    const rows = shown[0..shown_n];
+
     const list = t.Rect{ .x = r.x + 1, .y = r.y + 38, .width = r.width - 2, .height = r.height - 42 };
     const row_h: f32 = 42;
     const head_h: f32 = 22; // a tier heading, inserted ABOVE the first row of each group
@@ -2614,7 +2626,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     var heads: usize = 0;
     if (dated) {
         var prev: ?ConvTier = null;
-        for (convs) |*cv| {
+        for (rows) |*cv| {
             const tier = convTier(cv.mtime_s, now_s, tz);
             if (prev == null or prev.? != tier) {
                 heads += 1;
@@ -2622,7 +2634,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
             }
         }
     }
-    const total: f32 = @as(f32, @floatFromInt(convs.len)) * row_h + @as(f32, @floatFromInt(heads)) * head_h;
+    const total: f32 = @as(f32, @floatFromInt(rows.len)) * row_h + @as(f32, @floatFromInt(heads)) * head_h;
     const max_scroll = if (total > list.height) total - list.height else 0;
     const wheel = rl.getMouseWheelMove();
     if (wheel != 0 and t.hovering(list)) ui.conv_scroll -= wheel * row_h;
@@ -2633,7 +2645,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
     const bot = r.y + r.height - 8;
     var yy: f32 = r.y + 42 - ui.conv_scroll;
     var prev_tier: ?ConvTier = null;
-    for (convs) |*cv| {
+    for (rows) |*cv| {
         // The tier walk runs for EVERY row, culled or not — it is what positions everything below it. Only the
         // drawing and the input handling are skipped off-screen, and each advance of yy happens exactly once
         // whether or not its element was drawn, so the hit rects stay aligned with the pixels.
@@ -2694,7 +2706,7 @@ fn drawChatLeft(store: *Store, r: t.Rect, open: bool, convs: []const store_mod.C
         }
         yy += row_h;
     }
-    if (convs.len == 0) {
+    if (rows.len == 0) {
         t.text(t.z("no chats yet", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 42), 12, t.comment);
         t.text(t.z("type below to start one", .{}), @intFromFloat(r.x + 12), @intFromFloat(r.y + 60), 12, t.comment);
     }
@@ -3848,7 +3860,7 @@ fn drawSelection() void {
     }
 }
 
-fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8) void {
+fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, stream: []const u8, busy: bool, status: []const u8, cast_live: bool, conv_title: []const u8, convs: []const store_mod.ConvRow, active: []const u8) void {
     // The input row is USER-RESIZABLE (drag the grab strip above it): crafting a long prompt deserves
     // more than three lines. ui.input_extra persists for the session; the transcript view shrinks to
     // make room because everything below derives from input_h. Clamped so the transcript keeps space.
@@ -3869,6 +3881,54 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_metrics), .height = tab_h }, tl_metrics, ui.chat_inner == .metrics)) ui.chat_inner = .metrics;
     tx += t.tabW(tl_metrics) + 6;
     if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_files), .height = tab_h }, tl_files, ui.chat_inner == .files)) ui.chat_inner = .files;
+    tx += t.tabW(tl_files) + 14;
+    // ---- SUB-CHAT FAMILY TABS: Main | s1..s5 | +sub (max 5) ----
+    // A sub-chat is a full conversation ("<primary>__sN") shown as a TAB here instead of a rail row:
+    // same family workspace and shared memory server-side, so an idea branches without forking the work.
+    if (active.len > 0) {
+        const primary = store_mod.branchConvRoot(active);
+        const on_primary = std.mem.eql(u8, active, primary);
+        var have: [store_mod.MAX_BRANCHES]bool = @splat(false);
+        var have_n: usize = 0;
+        for (convs) |*cv| {
+            if (store_mod.branchConvParts(cv.idStr())) |bp| {
+                if (std.mem.eql(u8, bp.parent, primary) and !have[bp.n - 1]) {
+                    have[bp.n - 1] = true;
+                    have_n += 1;
+                }
+            }
+        }
+        // the ACTIVE sub-chat may be brand-new (not yet mirrored into the server list) — still a tab
+        if (!on_primary) if (store_mod.branchConvParts(active)) |bp| {
+            if (!have[bp.n - 1]) {
+                have[bp.n - 1] = true;
+                have_n += 1;
+            }
+        };
+        if (have_n > 0) {
+            const tl_main = t.z("Main", .{});
+            if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(tl_main), .height = tab_h }, tl_main, on_primary) and !on_primary)
+                store.pushChatCmd(store_mod.mkChatCmd(.select_conv, primary, ""));
+            tx += t.tabW(tl_main) + 4;
+            var bi: u8 = 0;
+            while (bi < store_mod.MAX_BRANCHES) : (bi += 1) {
+                if (!have[bi]) continue;
+                var idb: [72]u8 = undefined;
+                const bid = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, bi + 1 }) catch continue;
+                const is_on = std.mem.eql(u8, active, bid);
+                const lbl = t.z("s{d}", .{bi + 1});
+                if (t.tab(.{ .x = tx, .y = r.y, .width = t.tabW(lbl), .height = tab_h }, lbl, is_on) and !is_on)
+                    store.pushChatCmd(store_mod.mkChatCmd(.select_conv, bid, ""));
+                tx += t.tabW(lbl) + 4;
+            }
+        }
+        if (have_n < store_mod.MAX_BRANCHES and msgs.len > 0) {
+            const tl_plus = t.z("+sub", .{});
+            const pb = t.Rect{ .x = tx + 2, .y = r.y + 2, .width = t.btnW(tl_plus, 22), .height = 22 };
+            if (t.buttonGhost(pb, tl_plus, t.blue, true))
+                store.pushChatCmd(store_mod.mkChatCmd(.branch_conv, "", ""));
+        }
+    }
     // right-aligned in the same tab row: seed a task from THIS conversation (its first user ask becomes
     // the prompt, the latest answer the key details). Pure UI-thread prefill — no commands fired.
     if (msgs.len > 0) {

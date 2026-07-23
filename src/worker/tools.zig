@@ -21,6 +21,7 @@ const pixelrag = @import("pixelrag.zig");
 const deps = @import("deps.zig");
 const ragmirror = @import("ragmirror.zig");
 const recipes = @import("recipes.zig"); // recipe tools: DATA sequences over already-allowed tools (Feature: granted recipes)
+const cpaths = @import("chat/paths.zig"); // sub-chat family base for recall (chat:<parent>__sN → chat:<parent>)
 
 /// Injected into an authored tool's Python body ONLY when NL_BROWSER_DRIVER is enabled: a `browser(action,
 /// params)` helper that POSTs to the loopback broker so an INVENTED tool can compose the browser primitives
@@ -1062,8 +1063,10 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
         defer p.deinit();
         // saturation spread: follow the associative threads until the activation wave settles (neuron-db
-        // breaks on frontier drain) — k + decay + trust bound the output, not a fixed hop budget
-        const r = ctx.mem.assoc(ctx.scope, p.value.query, Mem.SATURATE_HOPS, 8);
+        // breaks on frontier drain) — k + decay + trust bound the output, not a fixed hop budget.
+        // FAMILY-WIDE for sub-chats: a "chat:<parent>__sN" scope recalls across its whole family base
+        // (primary + sibling branches); every other scope is its own base — behavior unchanged.
+        const r = ctx.mem.assocAcross(cpaths.scopeFamilyBase(ctx.scope), p.value.query, Mem.SATURATE_HOPS, 8);
         if (r.len == 0) {
             gpa.free(r);
             return dupe(gpa, "(nothing recalled yet)");
