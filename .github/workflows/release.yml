@@ -133,7 +133,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          body_path: docs/release/RELEASE-v1.0.0-alpha.1.md
+          # Bump this to the current release's notes on every tag (one notes file per release under docs/release/).
+          body_path: docs/release/RELEASE-v1.0.0-alpha.2.md
           # ALPHA: ships a known default admin password (changeme) and the web UI is not yet at desk parity.
           # Pre-release keeps it out of "Latest release" until v1.0.0 proper.
           prerelease: true
