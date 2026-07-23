@@ -1763,13 +1763,17 @@ fn sweepKeyScratch(w: *Worker) void {
         };
     }
     for (names.items) |n| {
-        inline for ([_][]const u8{ ".curlcfg-{s}", ".llmreq-{s}.json" }) |pat| {
-            var fb: [512]u8 = undefined;
-            const rel = std.fmt.bufPrint(&fb, pat, .{n}) catch continue;
-            const fp = std.fmt.bufPrint(&buf, "{s}/{s}", .{ w.run_dir, rel }) catch continue;
-            std.Io.Dir.cwd().deleteFile(w.io, fp) catch {};
-        }
+        delMindScratch(w, ".curlcfg-{s}", n);
+        delMindScratch(w, ".llmreq-{s}.json", n);
     }
+}
+
+fn delMindScratch(w: *Worker, comptime pat: []const u8, name: []const u8) void {
+    var fb: [512]u8 = undefined;
+    var pb: [1200]u8 = undefined;
+    const rel = std.fmt.bufPrint(&fb, pat, .{name}) catch return;
+    const fp = std.fmt.bufPrint(&pb, "{s}/{s}", .{ w.run_dir, rel }) catch return;
+    std.Io.Dir.cwd().deleteFile(w.io, fp) catch {};
 }
 
 /// One real tool execution, recorded for lesson pairing: fails carry the failure note, oks don't. Fixed
