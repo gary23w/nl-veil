@@ -886,6 +886,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     const workdir = std.fmt.allocPrint(gpa, "{s}/work", .{run_root}) catch return;
     defer gpa.free(workdir);
     _ = std.Io.Dir.cwd().createDirPathStatus(app.io, workdir, .default_dir) catch {};
+    // LLM SCRATCH DIR — the CONV dir, never the build root. llm.zig keys its per-call scratch
+    // (.curlcfg-<tag>, .llmreq-<tag>.json, .stream-<tag>.sse) by (dir, tag), and a SUB-CHAT FAMILY
+    // shares run_root: two concurrent family turns both labeled "chat" would collide on the same
+    // files — observed live (c6a61ff12): s2's stream read s1's half-written .stream-chat.sse tail
+    // and committed it as s2's reply, and the overwritten request body broke s1's thinking-mode
+    // reasoning_content echo-back. conv_dir is unique per conversation by construction.
+    const llm_dir = conv_dir;
     // RESTART RESUME: an empty ledger over a non-empty workdir (client restart, pre-ledger conversation)
     // seeds from a bounded disk survey — a "continue" turn then continues FROM the existing build instead
     // of re-scaffolding it from zero (the observed restart bug in c6a594cb1).
@@ -1153,7 +1160,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
         // so no in-progress work is lost.
         if (shouldPlan(user_text)) {
-            const fresh = planTask(app, run_root, think.base_url, think.key, think.model, user_text, &brief);
+            const fresh = planTask(app, llm_dir, think.base_url, think.key, think.model, user_text, &brief);
             if (fresh.len > 0) {
                 persistPlan(app, conv_dir, fresh);
                 persistBrief(app, conv_dir, brief);
@@ -1317,7 +1324,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // CROSS-STEP COMPACTION: fold accumulated drive-step growth (prior settled answers + compacted notes) into
         // one note when it crosses the budget, so a long multi-step / afk turn can't overflow the model window
         // across steps. No-op on the first step (nothing past the assembled prefix yet).
-        compactWorking(app, run_root, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs);
+        compactWorking(app, llm_dir, think.base_url, think.key, think.model, &conv_buf, assembled_len, &ctx, &tool_obs);
 
         // PLAN STEP: when a plan is active, take the next pending subtask and inject it as this step's working turn
         // (so the agentic pass works THAT subtask, route-hinted). No plan → drive step 0 works the user's message
@@ -1393,7 +1400,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, run_root, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -1605,7 +1612,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         http.jstr(gpa, &lq, LOOP_QUESTION) catch break :outer;
         lq.append(gpa, '}') catch break :outer;
         const loop_cm = meterBegin(app.io);
-        var next = llm.complete(gpa, app.io, run_root, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);
+        var next = llm.complete(gpa, app.io, llm_dir, "loop", prompt.base_url, prompt.key, prompt.model, lq.items, "", 512, 0.5);
         defer next.deinit(gpa);
         meterEnd(app, loop_cm, "loop", .prompting, prompt.model, next.ok);
 
@@ -1662,7 +1669,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 // afk: don't churn the same step — re-ground + research the blocker. PROMPTING writes the actual
                 // instruction from the transcript tail, which at this exact moment holds the failing command and
                 // its error; AFK_STUCK_TMPL is what a failed/implausible write degrades to, not the first choice.
-                stuck_written = stuckStep(app, run_root, prompt, user_text, trimmed, conv_buf.items) orelse &[_]u8{};
+                stuck_written = stuckStep(app, llm_dir, prompt, user_text, trimmed, conv_buf.items) orelse &[_]u8{};
                 next_step = if (stuck_written.len > 0) stuck_written else afk_stuck_msg;
             } else if (armed) {
                 // ARMED repeat while the hive runs = "the hive is working" narrated twice — that's a wait, not
@@ -1737,7 +1744,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     if (critique_src.len > 0) {
         const tl = toolperf.ledger(&tool_perf, gpa);
         defer if (tl) |s| gpa.free(s);
-        if (critiqueAnswer(app, run_root, think.base_url, think.key, think.model, user_text, critique_src, tl orelse "")) |note| {
+        if (critiqueAnswer(app, llm_dir, think.base_url, think.key, think.model, user_text, critique_src, tl orelse "")) |note| {
             defer gpa.free(note);
             appendMsg(app, conv_dir, "assistant", note, "veil", nowSecs(app.io));
             emitAssistant(app, conv_dir, note);
@@ -1745,13 +1752,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     }
     // SCHEDULED-RUN LEARNING: at normal completion, fold this run's outcome + one distilled lesson into the
     // TASK's memory so the next run starts smarter — the recursive-improvement loop for recurring tasks.
-    if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, run_root, think.base_url, think.key, think.model, &conv_buf);
+    if (sched_task) |tid| schedLearn(app, &ctx, mem_scope, uid, tid, conv, conv_dir, llm_dir, think.base_url, think.key, think.model, &conv_buf);
     // NORMAL COMPLETION: emit the answer's usage, then DEFER the rolling-summary fold-in to here (after the reply is
     // fully delivered) so it never blocked this turn's first token — it advances the summary for the NEXT turn. The
     // desk stays in its rendering state until {done}, so it naturally waits for this rather than sending early. Only
     // this path refreshes; Stop/error/empty end promptly via finishTurn (and the summary catches up next turn).
     emitUsage(app, conv_dir, usage_t0);
-    refreshSummary(app, conv_dir, run_root, think.base_url, think.key, think.model);
+    refreshSummary(app, conv_dir, llm_dir, think.base_url, think.key, think.model);
     emitEvent(app, conv_dir, "{\"kind\":\"done\"}");
 }
 
