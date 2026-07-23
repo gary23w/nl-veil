@@ -584,6 +584,27 @@ table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .conv-row:hover { background: var(--surface-hover); }
 .conv-row.active { background: var(--surface-selected); }
 .conv-title { font-size: calc(var(--fs-ui) * var(--text-scale)); }
+
+/* Sub-chats: an inner drop-down under the primary conversation row ("<primary>__sN").
+   The chevron is a SIBLING of the row button (a button can't nest a button), floated over
+   its top-right corner; the row reserves space for it via .has-subs. */
+.conv-wrap { position: relative; }
+.conv-row.has-subs { padding-right: 52px; }
+.conv-sub-toggle {
+  position: absolute; top: 8px; right: 8px;
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 7px; border: 1px solid var(--border); border-radius: 10px;
+  background: none; color: var(--text-muted);
+  font-size: calc(var(--fs-micro) * var(--text-scale)); cursor: pointer;
+}
+.conv-sub-toggle:hover { background: var(--surface-hover); color: var(--text); }
+.conv-sub-toggle svg { width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 2.4; transition: transform .12s ease; }
+.conv-sub-toggle.open svg { transform: rotate(90deg); }
+.conv-subs { margin-left: 16px; border-left: 2px solid var(--border); }
+.conv-row.conv-sub { padding: 7px 10px; }
+.conv-row.conv-sub .conv-title { font-size: calc(var(--fs-micro) * var(--text-scale) * 1.15); }
+.conv-sub-add { color: var(--text-muted); font-size: calc(var(--fs-micro) * var(--text-scale)); }
+.conv-sub-add:hover { color: var(--text); }
 .conv-meta {
   display: flex; justify-content: space-between; gap: 8px; margin-top: 3px;
   font-size: calc(var(--fs-micro) * var(--text-scale)); color: var(--text-muted);
