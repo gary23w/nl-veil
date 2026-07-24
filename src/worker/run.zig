@@ -9796,6 +9796,34 @@ fn neuronsForCfModel(model: []const u8, ti: u64, to: u64) u64 {
     return ((ti *| in_per_m) / 1_000_000) +| ((to *| out_per_m) / 1_000_000);
 }
 
+test "neuronsForCfModel agrees with the control plane's rate table on every row (the copies must not drift)" {
+    // The duplication above is DELIBERATE — the worker reports usage and must not link the
+    // control-plane billing module. This keeps the two honest anyway: the import lives INSIDE the
+    // test block, so nothing is coupled outside the test binary, and a rate edited in one copy and
+    // not the other fails the build instead of quietly billing users two different amounts.
+    const ledger = @import("../plan/neurons.zig");
+    const rows = [_][]const u8{
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast", // 70b row
+        "Llama-3.3-70B-Instruct", // ... and its capitalized spelling
+        "@cf/meta/llama-3.1-8b-instruct", // 8b row
+        "Llama-3.1-8B-Instruct",
+        "@cf/qwen/qwen2.5-coder-32b-instruct", // coder/qwen row
+        "Qwen2.5-Coder-32B-Instruct",
+        "some-model-nobody-has-priced-yet", // default row
+        "", // empty: still the default row, never free
+    };
+    for (rows) |m| {
+        // one million each side, so any per-million rate difference shows up as a whole neuron
+        try std.testing.expectEqual(ledger.neuronsForModel(m, 1_000_000, 0), neuronsForCfModel(m, 1_000_000, 0));
+        try std.testing.expectEqual(ledger.neuronsForModel(m, 0, 1_000_000), neuronsForCfModel(m, 0, 1_000_000));
+        // and the combined path, which also pins that both copies floor the two halves independently
+        try std.testing.expectEqual(ledger.neuronsForModel(m, 1_500_500, 999_999), neuronsForCfModel(m, 1_500_500, 999_999));
+    }
+    // saturation must match too — both use *| and +|, and a mismatch here means one copy overflows
+    const max64 = std.math.maxInt(u64);
+    try std.testing.expectEqual(ledger.neuronsForModel("unknown", max64, max64), neuronsForCfModel("unknown", max64, max64));
+}
+
 const EVENT_LOG_CAP: usize = 8 << 20;
 fn appendFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const u8) void {
     const dir = std.Io.Dir.cwd();
