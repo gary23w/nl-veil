@@ -1554,6 +1554,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // free-form drive inference below is SKIPPED (the plan is the driver).
         if (task_idx) |ti| {
             cplan.setStatus(gpa, &plan[ti], cplan.STATUS_DONE);
+            // and RECONCILE: this step may have completed later subtasks too (see planReconcile) — advance
+            // them now so the board tracks the work, then persist the whole updated board once.
+            if (inner.tools_ran and cplan.nextPending(plan) != null)
+                planReconcile(app, llm_dir, conv_dir, trio, plan, &file_ledger, answer);
             persistPlan(app, conv_dir, plan);
             // Plan complete (non-afk): a plain (unarmed) turn ends here; an ARMED one loops back so the top-of-loop
             // plan-complete branch can await a still-running cast hive before settling over it.
@@ -3252,6 +3256,61 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     return tasks;
 }
 
+/// SETTLE-TIME PLAN RECONCILE — the board must move at the pace of the WORK, not the pace of the loop.
+/// One drive step often completes more than its own subtask: the inner agentic pass keeps running tools
+/// until it settles, and a capable model finishes half the board inside subtask 1 (observed live: "plan
+/// 0/4" through an entire build, then a burst of ticks at the end). After each settled step, the cheap
+/// prompting model judges which REMAINING tasks are ALREADY complete — against the FILE LEDGER (engine
+/// ground truth), not the narration alone — and those advance too, so the desk's ~1Hz plan poll shows
+/// real progress at every settle. Best-effort: any failure or a "done: none" changes nothing.
+fn planReconcile(app: *App, llm_dir: []const u8, conv_dir: []const u8, trio: ModelTrio, plan: []cplan.Task, ledger: *const FileLedger, answer: []const u8) void {
+    const gpa = app.gpa;
+    var pending_n: usize = 0;
+    for (plan) |t| {
+        if (std.mem.eql(u8, t.status, cplan.STATUS_PENDING)) pending_n += 1;
+    }
+    if (pending_n == 0) return;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"user\",\"content\":") catch return;
+    var q: std.ArrayListUnmanaged(u8) = .empty;
+    defer q.deinit(gpa);
+    q.appendSlice(gpa, "A work step just finished. Judge which of the REMAINING plan tasks are ALREADY fully complete, using the evidence below. Count a task complete only when the EVIDENCE (files in the ledger, verified outcomes in the step result) shows it — a stated intention is not completion.\n\nREMAINING TASKS:\n") catch return;
+    for (plan, 1..) |t, i| {
+        if (!std.mem.eql(u8, t.status, cplan.STATUS_PENDING)) continue;
+        q.print(gpa, "{d}. {s}", .{ i, clipBytes(t.text, 200) }) catch return;
+        if (t.done_when.len > 0) q.print(gpa, " (done when: {s})", .{clipBytes(t.done_when, 160)}) catch return;
+        q.append(gpa, '\n') catch return;
+    }
+    q.appendSlice(gpa, "\nENGINE FILE LEDGER (ground truth of what exists on disk):\n") catch return;
+    ledgerBlock(gpa, ledger, &q);
+    q.appendSlice(gpa, "\nTHE STEP'S SETTLED RESULT:\n") catch return;
+    q.appendSlice(gpa, clipBytes(answer, 700)) catch return;
+    q.appendSlice(gpa, "\n\nAnswer with ONLY one line: 'done: <comma-separated task numbers>' or 'done: none'.") catch return;
+    http.jstr(gpa, &msgs, q.items) catch return;
+    msgs.append(gpa, '}') catch return;
+    const pr = trio.pick(.prompting);
+    const cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, llm_dir, "planrec", pr.base_url, pr.key, pr.model, msgs.items, "", 96, 0.0);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "planrec", .prompting, pr.model, step.ok);
+    if (!step.ok or step.content.len == 0) return;
+    const at = std.mem.indexOf(u8, step.content, "done:") orelse return;
+    var it = std.mem.tokenizeAny(u8, step.content[at + 5 ..], ", \r\n\t");
+    var advanced: usize = 0;
+    while (it.next()) |tok| {
+        const n = std.fmt.parseInt(usize, tok, 10) catch continue; // 'none' and stray prose just skip
+        if (n == 0 or n > plan.len) continue;
+        if (!std.mem.eql(u8, plan[n - 1].status, cplan.STATUS_PENDING)) continue;
+        cplan.setStatus(gpa, &plan[n - 1], cplan.STATUS_DONE);
+        advanced += 1;
+    }
+    if (advanced > 0) {
+        var nb: [96]u8 = undefined;
+        emitKV(app, conv_dir, "status", "text", std.fmt.bufPrint(&nb, "plan reconciled — {d} more subtask(s) were already complete", .{advanced}) catch "plan reconciled");
+    }
+}
+
 /// The brief lives beside plan.jsonl so a "continue" turn resumes under the SAME acceptance contract the work was
 /// planned against — the plan board survives across turns, and a contract that didn't would leave the resumed half
 /// of the job judged by nothing.
@@ -4543,6 +4602,12 @@ fn runInnerAgentic(
     var last_content: []u8 = empty;
     defer if (last_content.len > 0) gpa.free(last_content);
     var any_tool = false; // did any tool run this pass? gates the drive loop's LOOP_QUESTION for pure-prose answers
+    // FAILURE-STREAK deliberation state (this drive step): consecutive failed OUTCOMES of the same tool.
+    // The echo guard catches identical-RESULT loops; this catches a model grinding one tool through
+    // DIFFERENT failing attempts (observed live: six run_python tracebacks in a row for work write_file/
+    // list_dir do natively) — the moment deliberate tool WEIGHING should happen and doesn't.
+    var fail_streak_tool: u64 = 0;
+    var fail_streak: u32 = 0;
 
     // Everything already in conv_buf when this pass begins (system + bounded history + prior drive steps). This
     // pass's tool-call/result growth is measured against it so within-turn compaction can bound just the growth.
@@ -4838,6 +4903,27 @@ fn runInnerAgentic(
                 const dt = nowMillis(app.io) - t_call;
                 const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
                 tool_perf.record(c.name, ok, if (dt > 0) @intCast(dt) else 0);
+                // FAILURE-STREAK DELIBERATION NUDGE: the tool RAN but the OUTCOME failed — engine-refusal
+                // (`(…`), an "ok":false payload, or a non-zero `exit=` result (the run_python/run_tests
+                // contract; toolperf's `ok` deliberately counts those as tool-healthy). Two failed outcomes
+                // of the SAME tool in a row means one approach is being ground instead of weighed — append
+                // the option space to the failing result, at the exact moment it is being ignored. The
+                // model still chooses; the engine only makes the choice visible.
+                const outcome_bad = !ok or (std.mem.startsWith(u8, result, "exit=") and !std.mem.startsWith(u8, result, "exit=0"));
+                const th = std.hash.Fnv1a_64.hash(c.name);
+                if (outcome_bad) {
+                    if (th == fail_streak_tool) fail_streak +|= 1 else {
+                        fail_streak_tool = th;
+                        fail_streak = 1;
+                    }
+                } else if (th == fail_streak_tool) fail_streak = 0;
+                if (outcome_bad and fail_streak >= 2 and result.len > 0) {
+                    const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak }) catch result;
+                    if (nudged.ptr != result.ptr) {
+                        gpa.free(result);
+                        result = nudged;
+                    }
+                }
             }
             // TOOL-ECHO BOOKKEEPING: hash the result and track consecutive identical echoes; from the 2nd
             // identical repeat the model gets an in-band warning appended to the result so it self-corrects
