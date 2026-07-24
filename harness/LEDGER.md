@@ -9,7 +9,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
-| H3  | med | docs-src mirror, coverage half: 42 modules have no case file at all (all of `cli/`, `config/`, `plug/`, plus lineage, metrics, httpc, hashline, deps...) and are absent from the docs.js manifest. The truth half is DONE (0008): all 59 manifested case files are audited-grounded. Extend module by module — grounded-only, house format, manifest row + case file together. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
@@ -234,3 +233,39 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   with this entry.
 - next: H3 next batch (cli/, config/, plug/ case files) or H4 next bite; H14 awaits the owner's
   security-posture call.
+
+## 0012 — 2026-07-24 — H4 third bite: the audit chain gets teeth (and loses an injection)
+- did: `src/obs/audit_log.zig` — record() wrote fields into its JSON line UNESCAPED: one `"` in an
+  actor/action/target made that line unparseable and verify() reported the whole log corrupt
+  (an attacker-influencable target string could DoS auditability). Added `jesc` (quote/backslash/
+  newline/tab escaped; other control bytes \u-escaped, never dropped — the hash preimage is the
+  RAW bytes, so verify() must recover them exactly). Three test blocks pin the contract: chain
+  verifies and RECOVERY resumes it across a restart; hostile field bytes round-trip; and a flipped
+  byte, a deleted middle entry, and a garbage line are each detected as their distinct error.
+  Registered in tests.zig.
+- verified: Full oracle ALL GREEN, exit 0, src suite first-try (343 tests).
+- learned: chain()'s preimage bufPrint caps at 320 bytes and falls to "" beyond it — fields longer
+  than ~300 bytes weaken the binding (verify stays consistent, so no false alarms; noted, not
+  fixed — callers pass short ids today).
+- ratchet: lands with 0013 (same sitting).
+- next: fold the 41-file docs batch (writers running) and wrap: commit + push per the owner.
+
+## 0013 — 2026-07-24 — H3 CLOSED: the docs mirror is complete, 100/100 grounded
+- did: Three parallel writers created the 41 missing case files (cli x4, config x4, plug x3,
+  worker-flat x14, browser x7, chat x5, mcp x2, desk x2), each grounded in the module's header,
+  pub surface, and tests, with the footer-honesty rule enforced up front (a tests claim only when
+  test blocks exist). Manifest grew four new groups (CLI, PLUG, WORKER-BROWSER, WORKER-MCP) and
+  extensions to CONFIG/CHAT/WORKER/DESK — 100 entries. `trio_routing_test.zig` deliberately
+  excluded (a test harness, not a module) and the scan now skips `*_test.zig`.
+- verified: Independent grep-level adversarial check: 41/41 CLEAN — every claimed export exists,
+  footers match test reality bidirectionally (the 14 no-tests modules are exactly the 14
+  no-tests-claimed footers), zero invented-technology keywords, all multi-digit numbers matched to
+  source literals. Site renders 100 sheets, all paths resolving. `check.ps1 -Scan`:
+  "[docs] docs-src mirror complete", 0 actionable signals.
+- learned: Stating the footer-honesty rule in the writing prompt (instead of sweeping after)
+  produced exact bidirectional compliance — encode audit findings into the next generation's
+  instructions and the defect class never recurs.
+- ratchet: scan's docs signal skips `*_test.zig`; the site's sheet counter is the coverage proof
+  (SHEET n OF 100).
+- next: the coverage frontier is the standing lane (28 src + 8 desk modules without tests);
+  H10 (SELF lane) is the horizon; H14 still awaits the owner's security-posture call.
