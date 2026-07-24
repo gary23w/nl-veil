@@ -39,6 +39,8 @@ const cli = @import("cli.zig");
 const build_options = @import("build_options");
 
 const recipes = @import("worker/recipes.zig");
+const plugins = @import("plug/plugins.zig");
+const plug_theme = @import("plug/theme.zig");
 
 /// Whether the desktop GUI is compiled into this binary (`-Dapp`, default true). False = the server-only
 /// build: no raylib, no GL/X11, and no `desk` module in the graph at all — hence the comptime branch, which
@@ -569,7 +571,15 @@ pub fn main(init: std.process.Init) !void {
         gpa.destroy(recipe_registry);
     }
 
-    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
+    // PLUGINS + THEMES: the user-extension layer. Loaded once at startup from {data}/plugins/*/plugin.lua
+    // (each a sandboxed Lua manifest) and {data}/themes/*.lua (the shared theme workspace, seeded with the
+    // shipped dark/light/matrix themes on first boot). Like recipes it is immutable once loaded and never
+    // freed in place — a reload rebuilds and pointer-swaps. Never fails: a broken plugin loads as
+    // state=failed with its error kept, so one bad extension can't stop the server.
+    const plug_registry = plugins.loadAll(gpa, io, init.environ_map, paths.data, .{});
+    log.info("plugins: {d} loaded, {d} themes in workspace", .{ plug_registry.count(), plug_registry.themes.count });
+
+    var app = App{ .gpa = gpa, .io = io, .auth = &auth, .sup = &sup, .audit = &audit, .login_guard = &login_guard, .vault = &vault, .data = paths.data, .server_key = sup.server_key, .open_registration = open_reg, .cf_account_id = cf_account, .workers_ai_token = wai_token, .retention_days = retention_days, .production = production, .recipes = recipe_registry, .plugs = plug_registry, .ledger = &ledger, .keys = &api_keys, .cf_oauth_client_id = init.environ_map.get("NL_CF_OAUTH_CLIENT_ID") orelse cf_oauth.DEFAULT_CLIENT_ID, .cf_oauth_scopes = init.environ_map.get("NL_CF_OAUTH_SCOPES") orelse "account:read ai:write offline_access", .cf_oauth_redirect = cf_oauth_redirect, .cf_oauth_auth_url = init.environ_map.get("NL_CF_OAUTH_AUTH_URL") orelse "https://dash.cloudflare.com/oauth2/auth", .cf_oauth_token_url = init.environ_map.get("NL_CF_OAUTH_TOKEN_URL") orelse "https://dash.cloudflare.com/oauth2/token", .cf_oauth_accounts_url = init.environ_map.get("NL_CF_OAUTH_ACCOUNTS_URL") orelse "https://api.cloudflare.com/client/v4/accounts", .cfg = &server_cfg };
     // SCHEDULED TASKS run on their own background thread (the second one beside Supervisor.bgLoop, same ~5s
     // cadence): a due task spawns a full chat turn, which must never ride an httpz request thread. Spawned here
     // — not next to the sup.bgLoop spawn above — because it needs the fully-wired App; like sup, `app` lives on
@@ -629,6 +639,13 @@ pub fn main(init: std.process.Init) !void {
     // flat "X failed to run" afterward. Authed like /models/local; see healthDeps.
     router.get("/api/v1/health/deps", healthDeps, .{});
     router.get("/api/v1/fleet", fleet, .{});
+    // PLUGIN + THEME ECOSYSTEM. /themes is intentionally PUBLIC (no auth): the web app fetches it before
+    // login to paint the sign-in screen in the user's chosen theme, exactly as the CSS palette is public.
+    // /plugins needs a user (it names the extensions active on their turns). /plugins/reload is admin-only:
+    // it rescans {data}/plugins + {data}/themes and pointer-swaps the live registry with no restart.
+    router.get("/api/v1/themes", themesList, .{});
+    router.get("/api/v1/plugins", pluginsList, .{});
+    router.post("/api/v1/plugins/reload", pluginsReload, .{});
     router.post("/api/v1/auth/register", auth_api.register, .{});
     router.post("/api/v1/auth/login", auth_api.login, .{});
     router.post("/api/v1/auth/logout", auth_api.logout, .{});
@@ -931,6 +948,52 @@ fn preloadDesktopKey(gpa: std.mem.Allocator, io: std.Io, auth: *Auth, keys: *@im
 
 fn health(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
     try res.json(.{ .ok = true, .service = "veil", .version = VERSION }, .{});
+}
+
+/// GET /api/v1/themes → {ok:true, themes:[{id,name,dark,mono_ui,builtin,colors:{...}}]}. PUBLIC (no auth):
+/// the palette is not a secret and the web app paints its login screen from it, exactly like styles.css.
+/// Reads the live registry's theme workspace; if the plugin layer isn't wired (should not happen — main
+/// always loads it), falls back to the three compiled-in builtins so a client always gets a usable set.
+fn themesList(app: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    out.appendSlice(res.arena, "{\"ok\":true,\"themes\":") catch return http.serverErr(res, "oom");
+    if (plugins.current(&app.plugs)) |reg| {
+        plug_theme.writeJson(&reg.themes, res.arena, &out) catch return http.serverErr(res, "oom");
+    } else {
+        var set: plug_theme.ThemeSet = .{};
+        plug_theme.loadWorkspace(app.gpa, app.io, app.data, &set);
+        plug_theme.writeJson(&set, res.arena, &out) catch return http.serverErr(res, "oom");
+    }
+    out.append(res.arena, '}') catch return http.serverErr(res, "oom");
+    res.content_type = .JSON;
+    res.body = out.items;
+}
+
+/// GET /api/v1/plugins → {ok:true, plugins:[...]}. AUTHED: it names the extensions that hook a user's
+/// turns (and any that failed to load, with the error), so it is operational detail behind a login.
+fn pluginsList(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    const reg = plugins.current(&app.plugs) orelse {
+        res.content_type = .JSON;
+        res.body = "{\"ok\":true,\"plugins\":[]}";
+        return;
+    };
+    const arr = reg.listJson(app.gpa);
+    defer app.gpa.free(arr);
+    res.content_type = .JSON;
+    res.body = try std.fmt.allocPrint(res.arena, "{{\"ok\":true,\"plugins\":{s}}}", .{arr});
+}
+
+/// POST /api/v1/plugins/reload → rescan {data}/plugins + {data}/themes and atomic-swap the live registry.
+/// ADMIN-ONLY. The previous registry is intentionally leaked (a turn may still hold it) — reload is rare,
+/// the leak is bounded, and this is the same never-free-in-place discipline recipes use.
+fn pluginsReload(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireAdmin(app, req, res) orelse return;
+    const environ = app.sup.parent_env;
+    const new_reg = plugins.loadAll(app.gpa, app.io, environ, app.data, .{});
+    plugins.swap(&app.plugs, new_reg);
+    res.content_type = .JSON;
+    res.body = try std.fmt.allocPrint(res.arena, "{{\"ok\":true,\"plugins\":{d},\"themes\":{d}}}", .{ new_reg.count(), new_reg.themes.count });
 }
 
 /// GET /api/v1/health/deps → {ok:true, deps:[{name,present,version,hint}, …]} — one row per binary the

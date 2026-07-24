@@ -514,7 +514,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         store.unlock();
     }
 
-    syncThemeFromStore(&store);
+    syncThemeFromStore(&store, gpa, io);
 
     // AUTOMATION HOOK — poll <data>/.veil-desk/SIM.txt: whenever it exists AND the chat is idle + connected,
     // send its contents as a chat message and delete it. Drives multi-turn steering sims with zero synthetic
@@ -602,7 +602,10 @@ pub fn runApp(data_dir: ?[]const u8) !void {
         }
         tray.pump();
         pumpTray(&store, &tray, gpa);
-        syncThemeFromStore(&store);
+        // Cheap per-frame apply: pick up a theme the async loadSettings landed after boot, or a titlebar
+        // cycle. No JSON re-read here (the workspace was merged once at boot in syncThemeFromStore); this is
+        // just an id match against the already-loaded registry.
+        applyPersistedTheme(&store);
         if (!auto_selected) auto_selected = autoSelect(&store);
         sim_ticks += 1;
         // Command-approval controls must work WHILE the chat is busy (a parked shell command holds the turn),
@@ -965,28 +968,18 @@ fn drawTitlebar(store: *Store) void {
     if (t.hovering(fr)) t.wantCursor(.pointing_hand);
     if (t.hovering(fr) and rl.isMouseButtonPressed(.left)) ui.file_menu = !ui.file_menu;
 
-    // Theme selector beside File
+    // Theme selector beside File — click-through cycles the WHOLE workspace (the 3 shipped themes plus any
+    // the user authored in <data>/themes/*.lua, merged from the server's themes.json cache). The label shows
+    // the active theme's name; the chosen id is persisted so it survives a restart.
     const tr = tbThemeRect();
-    const scheme_now = t.getScheme();
     const theme_hot = t.hovering(tr);
     if (theme_hot) t.panel(tr, t.bg_hl);
-    const theme_label = switch (scheme_now) {
-        .light => t.z("Theme: Light", .{}),
-        .dark => t.z("Theme: Dark", .{}),
-        .matrix => t.z("Theme: Matrix", .{}),
-    };
-    t.text(theme_label, @intFromFloat(tr.x + 10), @intFromFloat(tr.y + (tr.height - 12) / 2), 12, if (theme_hot) t.fg else t.fg_dim);
+    t.textClip(t.z("Theme: {s}", .{t.activeName()}), @intFromFloat(tr.x + 10), @intFromFloat(tr.y + (tr.height - 12) / 2), 12, if (theme_hot) t.fg else t.fg_dim, @intFromFloat(tr.width - 16));
     if (theme_hot) t.wantCursor(.pointing_hand);
     if (theme_hot and rl.isMouseButtonPressed(.left)) {
-        // click-through: light -> dark -> matrix -> light
-        const next: t.Scheme = switch (scheme_now) {
-            .light => .dark,
-            .dark => .matrix,
-            .matrix => .light,
-        };
-        t.setScheme(next);
+        const new_id = t.advanceTheme();
         store.lock();
-        store.settings.theme = @intFromEnum(next);
+        store.setThemeId(new_id);
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }
@@ -1014,7 +1007,7 @@ fn drawTitlebar(store: *Store) void {
 }
 
 fn drawFileMenu(store: *Store) void {
-    const items = [_][:0]const u8{ t.z("New swarm", .{}), t.z("Refresh now", .{}), t.z("Open data folder", .{}), t.z("Quit", .{}) };
+    const items = [_][:0]const u8{ t.z("New swarm", .{}), t.z("Refresh now", .{}), t.z("Open data folder", .{}), t.z("Themes folder", .{}), t.z("Quit", .{}) };
     const w: f32 = 190;
     const ih: f32 = 32;
     const fr = tbFileRect();
@@ -1030,14 +1023,17 @@ fn drawFileMenu(store: *Store) void {
             t.panel(ir, t.bg_hl);
             t.wantCursor(.pointing_hand);
         }
-        t.text(it, @intFromFloat(ir.x + 12), @intFromFloat(ir.y + (ih - 13) / 2), 13, if (i == 3) t.red else t.fg);
+        t.text(it, @intFromFloat(ir.x + 12), @intFromFloat(ir.y + (ih - 13) / 2), 13, if (i == 4) t.red else t.fg);
         if (hot and rl.isMouseButtonPressed(.left)) {
             ui.file_menu = false;
             switch (i) {
                 0 => gotoDeploy(),
                 1 => store.pushCmd(store_mod.mkCmd(.refresh_now, "", "")),
                 2 => store.pushCmd(store_mod.mkCmd(.open_folder, "", "")),
-                3 => ui.close_req = true,
+                // Open <data>/themes so a user can drop in their own *.lua theme (see PLUGINS.md). The
+                // server compiles the workspace to themes.json, which the desk cycle reads.
+                3 => store.pushCmd(store_mod.mkCmd(.open_folder, "themes", "")),
+                4 => ui.close_req = true,
                 else => {},
             }
         }
@@ -1255,11 +1251,44 @@ fn makeIcon() rl.Image {
     return img;
 }
 
-fn syncThemeFromStore(store: *Store) void {
+fn syncThemeFromStore(store: *Store, gpa: std.mem.Allocator, io: std.Io) void {
+    // Merge the server's compiled theme workspace (user themes + builtins) from <data>/themes/themes.json,
+    // then apply the persisted choice by id. Falls back to the legacy u8 scheme (0/1/2) for a settings file
+    // written before themes became ids. loadThemesJson is offline-safe (keeps the 3 builtins if the cache
+    // is absent), so this runs every frame cheaply once loaded — but the JSON re-read is only worth doing
+    // when the persisted id actually changed, so callers gate the reload; see the boot + frame sites.
     store.lock();
-    const theme = store.settings.theme;
+    var dd_buf: [256]u8 = undefined;
+    const dd_src = store.settings.dataDir();
+    const dd_len = @min(dd_src.len, dd_buf.len);
+    @memcpy(dd_buf[0..dd_len], dd_src[0..dd_len]);
+    var tid_buf: [24]u8 = undefined;
+    const tid_src = store.settings.themeId();
+    const tid_len = @min(tid_src.len, tid_buf.len);
+    @memcpy(tid_buf[0..tid_len], tid_src[0..tid_len]);
+    const legacy = store.settings.theme;
     store.unlock();
-    t.setSchemeFromInt(theme);
+    _ = gpa;
+    t.initThemes();
+    if (dd_len > 0) t.loadThemesJson(std.heap.c_allocator, io, dd_buf[0..dd_len]);
+    const want = if (tid_len > 0) tid_buf[0..tid_len] else t.idForLegacyInt(legacy);
+    _ = t.applyById(want);
+}
+
+/// Cheap per-frame theme sync: apply the persisted theme id if it differs from the active one. No JSON
+/// read, no allocation — just a compare + (rare) palette swap. This is what catches the async loadSettings
+/// landing a persisted theme after boot, and keeps the frame loop honest without re-parsing the workspace.
+fn applyPersistedTheme(store: *Store) void {
+    store.lock();
+    var tid_buf: [24]u8 = undefined;
+    const tid_src = store.settings.themeId();
+    const tid_len = @min(tid_src.len, tid_buf.len);
+    @memcpy(tid_buf[0..tid_len], tid_src[0..tid_len]);
+    const legacy = store.settings.theme;
+    store.unlock();
+    const want = if (tid_len > 0) tid_buf[0..tid_len] else t.idForLegacyInt(legacy);
+    if (std.mem.eql(u8, want, t.activeId())) return; // already showing it — nothing to do
+    _ = t.applyById(want);
 }
 
 fn seedName(buf: []u8) usize {

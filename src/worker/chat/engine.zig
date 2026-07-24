@@ -19,6 +19,7 @@ const builtin = @import("builtin");
 const http = @import("../../gateway/http.zig");
 const tools = @import("../tools.zig");
 const recipes = @import("../recipes.zig"); // recipe tools: the per-turn granted set advertised in turn_tools + resolved onto ctx.grants
+const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/policy/tool hooks over the sandboxed Lua runtime
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
 const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
@@ -982,7 +983,20 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // runInnerAgentic so every drive pass sends the SAME bytes.
     var turn_tools_owned: ?[]u8 = null;
     defer if (turn_tools_owned) |t| gpa.free(t);
-    const turn_tools = buildTurnTools(gpa, &ctx, &turn_tools_owned);
+    var turn_tools = buildTurnTools(gpa, &ctx, &turn_tools_owned);
+    // PLUGIN TOOLS: advertise every loaded plugin's tools (plug_<name>_<tool>) after the built-ins + grants.
+    // reg.schemas is registry-stable and already ",\n"-prefixed, so it splices cleanly into the tools array
+    // and stays byte-identical across the turn's inferences — the same prefix-cache discipline buildTurnTools
+    // follows. execute-side interception (below) routes these names to the plugin executor.
+    if (plugins.current(&app.plugs)) |preg| {
+        if (preg.schemas.len > 0) {
+            if (std.fmt.allocPrint(gpa, "{s}{s}", .{ turn_tools, preg.schemas })) |merged| {
+                if (turn_tools_owned) |old| gpa.free(old);
+                turn_tools_owned = merged;
+                turn_tools = merged;
+            } else |_| {}
+        }
+    }
 
     // ---- seed the LLM conversation: system prompt + every persisted message (incl. the user turn just added) ----
     // `conv_buf` is the INSIDE of "messages":[ … ]; it grows in the loop with the assistant tool_call turns and
@@ -1036,6 +1050,22 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // SUB-CHAT FAMILY CONTEXT: a branch re-anchors on the primary (live goal + latest progress); a primary
     // lists its live branches. Varies per turn → rides the recall-fragment channel, never the stable prefix.
     injectFamilyContext(app, conv, base, &recall_frag);
+    // PLUGIN PROMPT HOOKS: any loaded plugin's veil.on_prompt(fn) may add system-prompt text for this turn
+    // (a house style, a compliance reminder, project context). Rides the per-turn recall channel — NEVER the
+    // stable prefix — so the provider prompt-prefix cache is untouched (same discipline as recall above).
+    // Inert when no plugin registers a prompt hook.
+    if (plugins.current(&app.plugs)) |preg| {
+        if (preg.promptText(gpa, uid, is_admin, conv)) |ptext| {
+            defer gpa.free(ptext);
+            var wrapped: std.ArrayListUnmanaged(u8) = .empty;
+            defer wrapped.deinit(gpa);
+            wrapped.appendSlice(gpa, "PLUGIN CONTEXT (added by an installed extension):\n") catch {};
+            wrapped.appendSlice(gpa, clipBytes(ptext, 3500)) catch {};
+            recall_frag.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+            http.jstr(gpa, &recall_frag, wrapped.items) catch return;
+            recall_frag.append(gpa, '}') catch return;
+        }
+    }
     // DURABLE USER MEMORY: inject the user's cross-conversation facts (keys/logins/preferences) from the shared
     // memories.jsonl — the desk's "YOUR MEMORY" block, which a server-served conv never had.
     injectDurableMemory(app, uid, &conv_buf);
@@ -4988,6 +5018,23 @@ fn runInnerAgentic(
                 // land before this tool's tool_request, and the client processes frames in order, so a delegated
                 // list_dir/read_file sees the hive's work on the client's own disk instead of "no such file".
                 if (tool_client) maybeSyncCastFiles(app, uid, conv, conv_dir, steer_cursor.*);
+                // PLUGIN POLICY HOOKS: any installed veil.on_policy(fn) sees this call (uid, admin, conv,
+                // tool, args) BEFORE it runs and may veto it. First deny wins; the denial string becomes the
+                // tool result (shaped like the engine's own "(...)" refusals). A hook that errors fails OPEN
+                // (logged) — a buggy plugin must never brick tool use. Runs for orchestration + mind tools
+                // alike, so a plugin can gate a cast the same as a shell command.
+                if (plugins.current(&app.plugs)) |preg| {
+                    if (preg.policyGate(gpa, uid, ctx.caps == .full, conv, c.name, run_args)) |denial| {
+                        executed = false; // a vetoed call never ran — don't smear its tool-perf stats
+                        emitKV(app, conv_dir, "status", "text", "a plugin policy denied a tool call");
+                        break :blk denial;
+                    }
+                }
+                // PLUGIN-OWNED TOOL: a name like plug_<plugin>_<tool> is dispatched to the plugin executor
+                // (a sandboxed Lua handler, or a bridged MCP server call) instead of the built-in table.
+                if (plugins.current(&app.plugs)) |preg| {
+                    if (preg.ownsTool(c.name)) break :blk preg.execTool(gpa, c.name, run_args);
+                }
                 // ORCHESTRATION verbs (cast/steer_swarm/stop_swarm/swarm_status) are the VEIL's — handled
                 // in-process via deploy_service + app.sup, NOT the mind-tool executor. get_credential is also
                 // SERVER-side always: its store is the server's memories.jsonl, and the client executor has no

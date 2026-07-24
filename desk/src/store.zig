@@ -102,7 +102,12 @@ pub const Settings = struct {
     token_len: u8 = 0,
     token_manual: bool = false, // user pasted+saved a token → don't auto-sync over it
     notify: bool = true,
-    theme: u8 = 1, // 0 dark / 1 light / 2 matrix
+    theme: u8 = 1, // LEGACY 0 dark / 1 light / 2 matrix — kept only to migrate a pre-workspace settings file
+    // The active theme's id (e.g. "dark", "matrix", or a user theme's slug). This SUPERSEDES `theme`: the
+    // desk now cycles the whole theme workspace (builtins + user-authored <data>/themes/*.lua), so a fixed
+    // u8 can't name a user theme. Empty ⇒ fall back to idForLegacyInt(theme) at load.
+    theme_id: [24]u8 = [_]u8{0} ** 24,
+    theme_id_len: u8 = 0,
 
     // --- chat model provider (Settings tab writes, chat thread reads; persisted to .veil-desk) ---
     chat_kind: u8 = 0, // 0 local (Ollama) / 1 BYOK (catalog provider) / 2 custom URL
@@ -158,6 +163,9 @@ pub const Settings = struct {
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];
+    }
+    pub fn themeId(s: *const Settings) []const u8 {
+        return s.theme_id[0..s.theme_id_len];
     }
     pub fn hostStr(s: *const Settings) []const u8 {
         return s.host[0..s.host_len];
@@ -856,6 +864,14 @@ pub const Store = struct {
     }
     pub fn unlock(s: *Store) void {
         s.mu.unlock();
+    }
+
+    /// Set the persisted active-theme id. CALLER MUST HOLD THE LOCK (the SpinLock is non-reentrant) — the
+    /// titlebar wraps this in lock/unlock. Truncates to the field's 24-byte capacity.
+    pub fn setThemeId(s: *Store, id: []const u8) void {
+        const n = @min(id.len, s.settings.theme_id.len);
+        @memcpy(s.settings.theme_id[0..n], id[0..n]);
+        s.settings.theme_id_len = @intCast(n);
     }
 
     /// UI thread: enqueue a command for the poller. Drops silently if the ring is full (poller is ~1s

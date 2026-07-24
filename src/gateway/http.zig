@@ -7,6 +7,11 @@ const auth_core = @import("../auth/auth_core.zig");
 // live handle so the admin routes and the turn executor share ONE registry. recipes.zig depends on nothing
 // but std, so this adds no import cycle.
 const recipes = @import("../worker/recipes.zig");
+// The user-extension (plugin) + theme-workspace registry. Imported for its type only; like recipes it is
+// held as a live pointer so the chat engine hooks, the tool executor, and the /themes + /plugins routes all
+// read ONE registry. plug/plugins.zig imports the mcp client + lua + theme under src/plug — no cycle back
+// into http.zig.
+const plugins = @import("../plug/plugins.zig");
 
 pub const Auth = auth_core.Auth;
 pub const User = auth_core.User;
@@ -46,6 +51,12 @@ pub const App = struct {
     // registry rather than one being mutated underfoot. Built by admin_service.buildRegistry — the one place
     // that knows the recipe dir and the built-in-name predicate the loader needs.
     recipes: *recipes.Registry,
+    // The live plugin + theme registry, loaded once at startup from {data}/plugins and {data}/themes.
+    // Null-safe everywhere it is read (engine hooks, tool dispatch, /api routes) so the whole feature is
+    // INERT until wired — a server built without ever calling plugins.loadAll behaves exactly as before.
+    // Reload is an atomic pointer swap (plugins.swap); a turn that captured the old pointer keeps reading a
+    // valid registry, same discipline as `recipes`.
+    plugs: ?*plugins.Registry = null,
     ledger: ?*NeuronLedger = null,
     keys: ?*ApiKeys = null,
     // Cloudflare OAuth (self-managed public client). Enabled only when cf_oauth_client_id is non-empty; all
