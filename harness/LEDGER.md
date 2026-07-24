@@ -269,3 +269,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   (SHEET n OF 100).
 - next: the coverage frontier is the standing lane (28 src + 8 desk modules without tests);
   H10 (SELF lane) is the horizon; H14 still awaits the owner's security-posture call.
+
+## 0014 — 2026-07-24 — the events-poll cursor: lockstep made structural
+- did: `control/fanout.zig` swarmEvents and `chat/service.zig` convEvents are twins — same probe
+  sentinel, same 512KiB page cap, same cursor arithmetic — kept in step by a "change one, change
+  the other" COMMENT, with the logic written out twice. Extracted to `src/worker/evcursor.zig`
+  (`PROBE`, `PAGE_MAX`, `parseFrom`, `isProbe`, `want`, `nextOffset`): std-only, no io, no httpz,
+  so the contract is directly testable. Both handlers now call it; behavior preserved exactly
+  (`want > 0` is equivalent to the old `size > from`, since a positive delta always yields >= 1).
+  6 test blocks: junk/overflow cursors degrade to 0, the probe sentinel round-trips through the
+  query string a client actually sends, the page cap bounds a burst, a short read advances only by
+  what arrived, and a catch-up walk over a 1.5MB file converges in 4 polls delivering every byte
+  exactly once. Case file + manifest row (CT-06) added.
+- verified: Full oracle ALL GREEN, exit 0 (4/4 gates). docs.js `node --check` clean, 101 manifest
+  entries, 0 unresolved paths.
+- learned: `want()` returns 0 when size <= from, so a SHRUNKEN events file parks a polling client
+  past EOF — the SSE loop facing the same file rewinds instead. events.jsonl only grows today, so
+  it is latent; pinned by a test and documented so it stays a decision. Also: PROBE is typed usize
+  = maxInt(u64), which pins the project to 64-bit targets (every shipped target is).
+- ratchet: the docs-mirror signal did its job — adding a module immediately made the mirror
+  incomplete, and the case file landed inside the same increment.
+- next: the privilege boundary is the biggest untested surface (entitlements, neurons ledger,
+  api_keys, login_guard, the control bus) — fanning out test writers.

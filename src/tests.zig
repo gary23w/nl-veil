@@ -24,6 +24,7 @@ test {
     _ = @import("worker/control/supervisor.zig");
     _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)
     _ = @import("worker/crawl.zig");
+    _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
     _ = @import("worker/lineage.zig"); // cross-run persistent swarm memory (stable neuron-db identity)
