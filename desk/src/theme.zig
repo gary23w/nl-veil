@@ -28,7 +28,7 @@ fn hex(comptime s: []const u8) Color {
     return .{ .r = hexByte(s[0], s[1]), .g = hexByte(s[2], s[3]), .b = hexByte(s[4], s[5]), .a = 255 };
 }
 
-pub const Scheme = enum(u8) { dark = 0, light = 1 };
+pub const Scheme = enum(u8) { dark = 0, light = 1, matrix = 2 };
 
 const Palette = struct {
     bg: Color,
@@ -91,6 +91,30 @@ const light_palette = Palette{
     .teal = hex("0f8a83"),
 };
 
+// Matrix / cyber-console palette: phosphor green on near-black. While it is active the whole shell
+// also renders in the mono (code) face — see theFont()/fontForKind() — so the app reads like a
+// terminal, not a dimmed dark theme. Accents keep their SEMANTIC jobs (red is still the alarm,
+// orange still the warn); the neutrals and the primary accent (`blue`) lean green, cyan/teal stay
+// in the phosphor family, and magenta goes neon violet so the brand mark still reads as itself.
+const matrix_palette = Palette{
+    .bg = hex("061106"),
+    .bg_dark = hex("030a03"),
+    .bg_hl = hex("0b200e"),
+    .bg_sel = hex("134020"),
+    .fg = hex("4aff7f"),
+    .fg_dim = hex("2fd465"),
+    .comment = hex("1d9448"),
+    .border = hex("15421f"),
+    .blue = hex("3bff9d"),
+    .cyan = hex("00ffd0"),
+    .green = hex("00ff41"),
+    .magenta = hex("bd66ff"),
+    .orange = hex("ffa028"),
+    .red = hex("ff4d4d"),
+    .yellow = hex("ffd93b"),
+    .teal = hex("00c9a0"),
+};
+
 var scheme: Scheme = .light;
 
 pub var bg: Color = light_palette.bg;
@@ -133,11 +157,19 @@ pub fn setScheme(s: Scheme) void {
     if (scheme == s) return;
     log.trace("theme.setScheme {t} -> {t}", .{ scheme, s });
     scheme = s;
-    applyPalette(if (s == .light) light_palette else dark_palette);
+    applyPalette(switch (s) {
+        .light => light_palette,
+        .dark => dark_palette,
+        .matrix => matrix_palette,
+    });
 }
 
 pub fn setSchemeFromInt(v: u8) void {
-    setScheme(if (v == 1) .light else .dark);
+    setScheme(switch (v) {
+        1 => .light,
+        2 => .matrix,
+        else => .dark,
+    });
 }
 
 pub fn getScheme() Scheme {
@@ -402,6 +434,12 @@ fn uploadMark(img: *rl.Image) bool {
     return false;
 }
 fn theFont() rl.Font {
+    // Matrix scheme: the WHOLE shell renders in the mono (code) face — the console font is as much
+    // the theme as the palette. This also overrides the dyslexia face while matrix is active; the
+    // other two schemes keep the accessibility font. Falls through if the mono TTF failed to load.
+    if (scheme == .matrix) {
+        if (mono_font) |m| return m;
+    }
     return ui_font orelse (rl.getFontDefault() catch unreachable);
 }
 fn theMono() rl.Font {
@@ -500,6 +538,9 @@ pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i
 pub const FontKind = enum { ui, strong, em, mono };
 
 fn fontForKind(k: FontKind) rl.Font {
+    // Matrix: every chat span (body, bold, italic, code) uses the console face; strong falls back
+    // to the double-strike path in textStyled since the mono face has no distinct bold variant.
+    if (scheme == .matrix) return theMono();
     return switch (k) {
         .ui => theFont(),
         .strong => strong_font orelse theFont(),
@@ -525,7 +566,7 @@ pub fn textStyled(s: [:0]const u8, x: f32, y: f32, size: i32, c: Color, kind: Fo
     const px = scaledUi(size);
     const f = fontForKind(kind);
     rl.drawTextEx(f, s, .{ .x = x, .y = y }, px, spacingFor(px), c);
-    if (kind == .strong and !strong_distinct) {
+    if (kind == .strong and (!strong_distinct or scheme == .matrix)) {
         rl.drawTextEx(f, s, .{ .x = x + 0.6, .y = y }, px, spacingFor(px), c);
     }
 }

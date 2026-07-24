@@ -89,7 +89,7 @@ fn tbFileRect() t.Rect {
     return .{ .x = 70, .y = 5, .width = 46, .height = TITLE_H - 10 };
 }
 fn tbThemeRect() t.Rect {
-    return .{ .x = 124, .y = 5, .width = 128, .height = TITLE_H - 10 };
+    return .{ .x = 124, .y = 5, .width = 146, .height = TITLE_H - 10 };
 }
 
 const InnerTab = enum { console, details, files };
@@ -966,10 +966,20 @@ fn drawTitlebar(store: *Store) void {
     const scheme_now = t.getScheme();
     const theme_hot = t.hovering(tr);
     if (theme_hot) t.panel(tr, t.bg_hl);
-    t.text(if (scheme_now == .light) t.z("Theme: Light", .{}) else t.z("Theme: Dark", .{}), @intFromFloat(tr.x + 10), @intFromFloat(tr.y + (tr.height - 12) / 2), 12, if (theme_hot) t.fg else t.fg_dim);
+    const theme_label = switch (scheme_now) {
+        .light => t.z("Theme: Light", .{}),
+        .dark => t.z("Theme: Dark", .{}),
+        .matrix => t.z("Theme: Matrix", .{}),
+    };
+    t.text(theme_label, @intFromFloat(tr.x + 10), @intFromFloat(tr.y + (tr.height - 12) / 2), 12, if (theme_hot) t.fg else t.fg_dim);
     if (theme_hot) t.wantCursor(.pointing_hand);
     if (theme_hot and rl.isMouseButtonPressed(.left)) {
-        const next: t.Scheme = if (scheme_now == .dark) .light else .dark;
+        // click-through: light -> dark -> matrix -> light
+        const next: t.Scheme = switch (scheme_now) {
+            .light => .dark,
+            .dark => .matrix,
+            .matrix => .light,
+        };
         t.setScheme(next);
         store.lock();
         store.settings.theme = @intFromEnum(next);
