@@ -23,9 +23,10 @@ const Row = struct {
     name: [48]u8 = undefined,
     name_len: usize = 0,
     calls: u32 = 0,
-    fails: u32 = 0,
+    fails: u32 = 0, // TOOL health: the call itself errored (engine refusal, transport failure)
+    bad: u32 = 0, // OUTCOME quality: the tool ran fine but its result was a failure (exit!=0, "ok":false)
     total_ms: u64 = 0,
-    fn nameStr(r: *const Row) []const u8 {
+    pub fn nameStr(r: *const Row) []const u8 {
         return r.name[0..r.name_len];
     }
 };
@@ -37,9 +38,10 @@ pub const Acc = struct {
     n: usize = 0,
 
     /// Tally one tool call. `ok` is the engine's success read (a real result, not an error/`"ok":false`);
-    /// `ms` is its wall latency. Only calls that genuinely executed should be recorded (skip dedup/budget
-    /// guards — they never ran the tool), so a guard can't smear a real tool's fail rate.
-    pub fn record(self: *Acc, name: []const u8, ok: bool, ms: u64) void {
+    /// `outcome_ok` is the stricter OUTCOME read (a run_python that returned exit=1 is a healthy tool with
+    /// a failed outcome — the distinction the belt ranking runs on); `ms` is wall latency. Only calls that
+    /// genuinely executed should be recorded (skip dedup/budget guards — they never ran the tool).
+    pub fn record(self: *Acc, name: []const u8, ok: bool, outcome_ok: bool, ms: u64) void {
         if (name.len == 0) return;
         var i: usize = 0;
         while (i < self.n) : (i += 1) {
@@ -54,9 +56,16 @@ pub const Acc = struct {
         }
         self.rows[i].calls += 1;
         if (!ok) self.rows[i].fails += 1;
+        if (!outcome_ok) self.rows[i].bad += 1;
         self.rows[i].total_ms += ms;
     }
+
+    /// Read-only view for the trust-reward pass at turn exit.
+    pub fn slice(self: *const Acc) []const Row {
+        return self.rows[0..self.n];
+    }
 };
+pub const AccRow = Row;
 
 /// A one-line record of what THIS turn actually ran: "browser_click x40 ok, run_python x41 (3 failed)".
 /// Null when nothing ran. Caller frees.
@@ -90,17 +99,18 @@ test "ledger names what ran and flags failures; null when nothing ran" {
     const gpa = std.testing.allocator;
     var acc = Acc{};
     try std.testing.expect(ledger(&acc, gpa) == null);
-    acc.record("browser_navigate", true, 10);
-    acc.record("browser_navigate", true, 10);
-    acc.record("run_python", false, 5);
+    acc.record("browser_navigate", true, true, 10);
+    acc.record("browser_navigate", true, true, 10);
+    acc.record("run_python", false, false, 5);
     const s = ledger(&acc, gpa).?;
     defer gpa.free(s);
     try std.testing.expect(std.mem.indexOf(u8, s, "browser_navigate x2 ok") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "run_python x1 (1 failed)") != null);
 }
 
-// The persistent JSON shape: n=total calls, f=total fails, ms=EWMA per-call latency.
-const PRow = struct { name: []const u8 = "", n: u32 = 0, f: u32 = 0, ms: u64 = 0 };
+// The persistent JSON shape: n=total calls, f=total fails, b=total failed OUTCOMES, ms=EWMA per-call
+// latency. `b` defaults 0 so pre-outcome aggregates parse unchanged.
+const PRow = struct { name: []const u8 = "", n: u32 = 0, f: u32 = 0, b: u32 = 0, ms: u64 = 0 };
 const Persist = struct { v: u32 = 1, tools: []PRow = &.{} };
 
 fn filePath(gpa: std.mem.Allocator, data: []const u8) ?[]u8 {
@@ -119,6 +129,7 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
     var name_lens: [MAX_TOOLS]usize = .{0} ** MAX_TOOLS;
     var ns: [MAX_TOOLS]u32 = .{0} ** MAX_TOOLS;
     var fs: [MAX_TOOLS]u32 = .{0} ** MAX_TOOLS;
+    var bs: [MAX_TOOLS]u32 = .{0} ** MAX_TOOLS; // failed-OUTCOME totals
     var msv: [MAX_TOOLS]u64 = .{0} ** MAX_TOOLS;
     var count: usize = 0;
     if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(FILE_CAP)) catch null) |raw| {
@@ -132,6 +143,7 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
                 name_lens[count] = nl;
                 ns[count] = t.n;
                 fs[count] = t.f;
+                bs[count] = t.b;
                 msv[count] = t.ms;
                 count += 1;
             }
@@ -155,6 +167,7 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
             name_lens[count] = nl;
             ns[count] = 0;
             fs[count] = 0;
+            bs[count] = 0;
             msv[count] = 0;
             count += 1;
             j = count - 1;
@@ -164,6 +177,7 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
         msv[j] = @intFromFloat(@max(0.0, blended));
         ns[j] +|= r.calls;
         fs[j] +|= r.fails;
+        bs[j] +|= r.bad;
     }
 
     // serialize back (hand-rolled: tiny object, avoids allocating a temp slice of structs)
@@ -177,11 +191,61 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
         if (wrote > 0) out.append(gpa, ',') catch return;
         out.appendSlice(gpa, "{\"name\":") catch return;
         writeJsonStr(gpa, &out, names[k][0..name_lens[k]]) catch return;
-        out.print(gpa, ",\"n\":{d},\"f\":{d},\"ms\":{d}}}", .{ ns[k], fs[k], msv[k] }) catch return;
+        out.print(gpa, ",\"n\":{d},\"f\":{d},\"b\":{d},\"ms\":{d}}}", .{ ns[k], fs[k], bs[k], msv[k] }) catch return;
         wrote += 1;
     }
     out.appendSlice(gpa, "]}") catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
+}
+
+/// BELT DIGEST — a compact per-step line ranking the tools the model can pick, RELIABLE-FIRST, by lived
+/// OUTCOME success on this machine: succ = 1 - (failed_outcomes / calls). Unlike digest() (which warns
+/// about the notably-bad, aimed at planning), the belt is the positive half — shown at the moment of
+/// choice so the option space arrives pre-weighted by history, not alphabetical. `trust_line`, when
+/// present (the neuron-db trust floor, feature-gated), is appended verbatim so earned cross-session
+/// preference rides alongside this session's raw rate. Null when too little has been learned to rank.
+/// gpa-owned; caller frees.
+pub fn belt(gpa: std.mem.Allocator, io: std.Io, data: []const u8, trust_line: []const u8) ?[]u8 {
+    const path = filePath(gpa, data) orelse return null;
+    defer gpa.free(path);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(FILE_CAP)) catch return null;
+    defer gpa.free(raw);
+    const parsed = std.json.parseFromSlice(Persist, gpa, raw, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+
+    const Item = struct { name: []const u8, succ: u64, n: u32 }; // succ = success permille (0..1000)
+    var items: [MAX_TOOLS]Item = undefined;
+    var ni: usize = 0;
+    for (parsed.value.tools) |t| {
+        if (ni >= MAX_TOOLS or t.name.len == 0 or t.n < MIN_SAMPLES) continue;
+        const succ: u64 = 1000 - (@as(u64, t.b) * 1000) / @max(1, t.n);
+        items[ni] = .{ .name = t.name, .succ = succ, .n = t.n };
+        ni += 1;
+    }
+    if (ni < 2) return null; // nothing to rank against
+    // descending by success permille, then by sample count (more-tested first on a tie)
+    var a: usize = 1;
+    while (a < ni) : (a += 1) {
+        const cur = items[a];
+        var b2: usize = a;
+        while (b2 > 0 and (items[b2 - 1].succ < cur.succ or (items[b2 - 1].succ == cur.succ and items[b2 - 1].n < cur.n))) : (b2 -= 1) items[b2] = items[b2 - 1];
+        items[b2] = cur;
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "TOOL BELT (this machine's lived success rate — prefer the reliable when several tools could do the job): ") catch return null;
+    const limit = @min(ni, MAX_DIGEST_TOOLS);
+    var w: usize = 0;
+    while (w < limit) : (w += 1) {
+        if (w > 0) out.appendSlice(gpa, ", ") catch return null;
+        out.print(gpa, "{s} {d}%", .{ items[w].name, items[w].succ / 10 }) catch return null;
+    }
+    out.append(gpa, '.') catch return null;
+    if (trust_line.len > 0) {
+        out.append(gpa, ' ') catch return null;
+        out.appendSlice(gpa, trust_line) catch return null;
+    }
+    return gpa.dupe(u8, out.items) catch null;
 }
 
 /// A compact prompt line naming the NOTABLE tools (slow or flaky, with enough samples) learned on this
@@ -263,10 +327,10 @@ fn writeJsonStr(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), s: []c
 
 test "Acc.record tallies calls, fails, and latency per tool" {
     var acc: Acc = .{};
-    acc.record("browser_navigate", true, 2000);
-    acc.record("browser_navigate", true, 2200);
-    acc.record("flaky", false, 50);
-    acc.record("flaky", true, 40);
+    acc.record("browser_navigate", true, true, 2000);
+    acc.record("browser_navigate", true, true, 2200);
+    acc.record("flaky", false, false, 50);
+    acc.record("flaky", true, true, 40);
     try std.testing.expectEqual(@as(usize, 2), acc.n);
     // find the browser row
     var bn: ?*const Row = null;
@@ -277,6 +341,36 @@ test "Acc.record tallies calls, fails, and latency per tool" {
     try std.testing.expectEqual(@as(u32, 2), bn.?.calls);
     try std.testing.expectEqual(@as(u32, 0), bn.?.fails);
     try std.testing.expectEqual(@as(u64, 4200), bn.?.total_ms);
+}
+
+test "belt ranks tools reliable-first by lived outcome success, and folds in a trust line" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const ag = arena.allocator();
+    var threaded = std.Io.Threaded.init(ag, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "zig-belt-it-tmp";
+    std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    // write_file always succeeds; run_python fails its OUTCOME half the time (healthy tool, bad results)
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/.tool_perf.json", .data =
+        \\{"v":1,"tools":[
+        \\{"name":"run_python","n":10,"f":0,"b":6,"ms":200},
+        \\{"name":"write_file","n":10,"f":0,"b":0,"ms":50},
+        \\{"name":"read_file","n":10,"f":0,"b":1,"ms":40}
+        \\]}
+    }) catch unreachable;
+    const b = belt(ag, io, dir, "trust: files > python").?;
+    // write_file (100%) ranks before read_file (90%) before run_python (40%)
+    const wf = std.mem.indexOf(u8, b, "write_file").?;
+    const rf = std.mem.indexOf(u8, b, "read_file").?;
+    const rp = std.mem.indexOf(u8, b, "run_python").?;
+    try std.testing.expect(wf < rf and rf < rp);
+    try std.testing.expect(std.mem.indexOf(u8, b, "run_python 40%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, b, "trust: files > python") != null);
 }
 
 test "digest names slow and flaky tools, skips fast/reliable and low-sample ones" {

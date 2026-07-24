@@ -34,6 +34,10 @@ pub const Task = struct {
     // The checkable condition that ends THIS subtask, in the planner's own words, or "" (gpa-owned). A model
     // that omits it leaves "" — the caller falls back to its generic closing line, which is the old behaviour.
     done_when: []u8 = &.{},
+    // The tool the planner expects this subtask to use, in its own words, or "" (gpa-owned). The planner sees
+    // the whole belt ONCE while decomposing, so it can suggest the fit cheaply; carried into the drive step as
+    // a hint (never a constraint — the model may pick another tool if the work turns out different).
+    tool_hint: []u8 = &.{},
 };
 
 pub fn freeTasks(gpa: std.mem.Allocator, tasks: []Task) void {
@@ -43,6 +47,7 @@ pub fn freeTasks(gpa: std.mem.Allocator, tasks: []Task) void {
         gpa.free(t.status);
         gpa.free(t.swarm_id);
         gpa.free(t.done_when);
+        gpa.free(t.tool_hint);
     }
     gpa.free(tasks);
 }
@@ -107,7 +112,7 @@ pub fn normalizeRoute(r: []const u8) []const u8 {
     return ROUTE_INLINE;
 }
 
-fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: []const u8, swarm_id: []const u8, done_when: []const u8) !Task {
+fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: []const u8, swarm_id: []const u8, done_when: []const u8, tool_hint: []const u8) !Task {
     const tx = try gpa.dupe(u8, text);
     errdefer gpa.free(tx);
     const rt = try gpa.dupe(u8, normalizeRoute(route));
@@ -117,7 +122,9 @@ fn mkTask(gpa: std.mem.Allocator, text: []const u8, route: []const u8, status: [
     const sw = try gpa.dupe(u8, swarm_id);
     errdefer gpa.free(sw);
     const dw = try gpa.dupe(u8, std.mem.trim(u8, done_when, " \r\n\t"));
-    return .{ .text = tx, .route = rt, .status = st, .swarm_id = sw, .done_when = dw };
+    errdefer gpa.free(dw);
+    const hint = try gpa.dupe(u8, std.mem.trim(u8, tool_hint, " \r\n\t"));
+    return .{ .text = tx, .route = rt, .status = st, .swarm_id = sw, .done_when = dw, .tool_hint = hint };
 }
 
 fn freeTask(gpa: std.mem.Allocator, t: Task) void {
@@ -126,6 +133,7 @@ fn freeTask(gpa: std.mem.Allocator, t: Task) void {
     gpa.free(t.status);
     gpa.free(t.swarm_id);
     gpa.free(t.done_when);
+    gpa.free(t.tool_hint);
 }
 
 /// Parse the model's decomposition reply — `{"plan":[{"task":"…","route":"…","done_when":"…"}, …]}` — into a
@@ -138,7 +146,7 @@ fn freeTask(gpa: std.mem.Allocator, t: Task) void {
 /// WHOLE board down to empty. So a failed strict parse retries with the original two-field row: the plan degrades
 /// to what it always was rather than vanishing.
 pub fn parseDecomposition(gpa: std.mem.Allocator, json: []const u8) []Task {
-    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, done_when: []const u8 = "" };
+    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, done_when: []const u8 = "", tool_hint: []const u8 = "" };
     const Doc = struct { plan: []const Row = &.{} };
     if (std.json.parseFromSlice(Doc, gpa, json, .{ .ignore_unknown_fields = true })) |parsed| {
         defer parsed.deinit();
@@ -154,7 +162,7 @@ pub fn parseDecomposition(gpa: std.mem.Allocator, json: []const u8) []Task {
         if (list.items.len >= MAX_TASKS) break;
         const text = std.mem.trim(u8, row.task, " \r\n\t");
         if (text.len == 0) continue;
-        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", "") catch break;
+        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", "", "") catch break;
         list.append(gpa, t) catch {
             freeTask(gpa, t);
             break;
@@ -171,7 +179,7 @@ fn collectRows(gpa: std.mem.Allocator, rows: anytype) []Task {
         if (list.items.len >= MAX_TASKS) break;
         const text = std.mem.trim(u8, row.task, " \r\n\t");
         if (text.len == 0) continue;
-        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", row.done_when) catch break;
+        const t = mkTask(gpa, text, row.route, STATUS_PENDING, "", row.done_when, row.tool_hint) catch break;
         list.append(gpa, t) catch {
             freeTask(gpa, t);
             break;
@@ -229,6 +237,8 @@ pub fn formatPlanLine(gpa: std.mem.Allocator, task: Task) ![]u8 {
     try appendJsonString(gpa, &l, task.swarm_id);
     try l.appendSlice(gpa, ",\"done_when\":");
     try appendJsonString(gpa, &l, task.done_when);
+    try l.appendSlice(gpa, ",\"tool_hint\":");
+    try appendJsonString(gpa, &l, task.tool_hint);
     try l.append(gpa, '}');
     return l.toOwnedSlice(gpa);
 }
@@ -249,7 +259,7 @@ pub fn formatPlan(gpa: std.mem.Allocator, tasks: []const Task) ![]u8 {
 /// Parse a persisted plan.jsonl back into a task list (for resuming across turns). Bad lines are skipped; a fully
 /// unreadable file → empty. Capped at MAX_TASKS.
 pub fn parsePlan(gpa: std.mem.Allocator, bytes: []const u8) []Task {
-    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, status: []const u8 = STATUS_PENDING, swarm_id: []const u8 = "", done_when: []const u8 = "" };
+    const Row = struct { task: []const u8 = "", route: []const u8 = ROUTE_INLINE, status: []const u8 = STATUS_PENDING, swarm_id: []const u8 = "", done_when: []const u8 = "", tool_hint: []const u8 = "" };
     var list: std.ArrayListUnmanaged(Task) = .empty;
     defer list.deinit(gpa);
     var it = std.mem.splitScalar(u8, bytes, '\n');
@@ -260,7 +270,7 @@ pub fn parsePlan(gpa: std.mem.Allocator, bytes: []const u8) []Task {
         const p = std.json.parseFromSlice(Row, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
         defer p.deinit();
         if (std.mem.trim(u8, p.value.task, " \r\n\t").len == 0) continue;
-        const t = mkTask(gpa, p.value.task, p.value.route, p.value.status, p.value.swarm_id, p.value.done_when) catch break;
+        const t = mkTask(gpa, p.value.task, p.value.route, p.value.status, p.value.swarm_id, p.value.done_when, p.value.tool_hint) catch break;
         list.append(gpa, t) catch {
             freeTask(gpa, t);
             break;
@@ -439,6 +449,21 @@ test "per-task done_when parses, round-trips, and a wrong-shaped done_when still
     try std.testing.expectEqual(@as(usize, 1), odd.len);
     try std.testing.expectEqualStrings("a", odd[0].text);
     try std.testing.expectEqualStrings("", odd[0].done_when);
+}
+
+test "per-task tool_hint parses and round-trips; absent ⇒ empty" {
+    const gpa = std.testing.allocator;
+    const tasks = parseDecomposition(gpa, "{\"plan\":[{\"task\":\"write the config\",\"route\":\"inline\",\"tool_hint\":\"write_file\"},{\"task\":\"b\",\"route\":\"inline\"}]}");
+    defer freeTasks(gpa, tasks);
+    try std.testing.expectEqual(@as(usize, 2), tasks.len);
+    try std.testing.expectEqualStrings("write_file", tasks[0].tool_hint);
+    try std.testing.expectEqualStrings("", tasks[1].tool_hint); // omitted ⇒ empty
+    const body = try formatPlan(gpa, tasks);
+    defer gpa.free(body);
+    const back = parsePlan(gpa, body);
+    defer freeTasks(gpa, back);
+    try std.testing.expectEqualStrings("write_file", back[0].tool_hint);
+    try std.testing.expectEqualStrings("", back[1].tool_hint);
 }
 
 test "parseDecomposition caps at MAX_TASKS" {
