@@ -35,7 +35,10 @@ pub fn sendMessage(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, frm:
     const i = countLines(existing);
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(gpa);
-    line.appendSlice(gpa, std.fmt.allocPrint(gpa, "{{\"i\":{d},\"round\":{d},\"from\":", .{ i, round }) catch return) catch return;
+    if (std.fmt.allocPrint(gpa, "{{\"i\":{d},\"round\":{d},\"from\":", .{ i, round })) |head| {
+        defer gpa.free(head);
+        line.appendSlice(gpa, head) catch return;
+    } else |_| return;
     llm.jstr(gpa, &line, frm) catch return;
     line.appendSlice(gpa, ",\"to\":") catch return;
     llm.jstr(gpa, &line, if (to.len > 0) to else "all") catch return;
@@ -87,7 +90,10 @@ pub fn addTask(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, by: []co
     const id = nextTaskId(gpa, io, run_dir);
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(gpa);
-    line.appendSlice(gpa, std.fmt.allocPrint(gpa, "{{\"type\":\"add\",\"id\":{d},\"by\":", .{id}) catch return id) catch return id;
+    if (std.fmt.allocPrint(gpa, "{{\"type\":\"add\",\"id\":{d},\"by\":", .{id})) |head| {
+        defer gpa.free(head);
+        line.appendSlice(gpa, head) catch return id;
+    } else |_| return id;
     llm.jstr(gpa, &line, by) catch return id;
     line.appendSlice(gpa, ",\"assignee\":") catch return id;
     llm.jstr(gpa, &line, if (assignee.len > 0) assignee else "all") catch return id;
@@ -103,7 +109,10 @@ pub fn completeTask(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, id:
     defer gpa.free(path);
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(gpa);
-    line.appendSlice(gpa, std.fmt.allocPrint(gpa, "{{\"type\":\"done\",\"id\":{d},\"by\":", .{id}) catch return) catch return;
+    if (std.fmt.allocPrint(gpa, "{{\"type\":\"done\",\"id\":{d},\"by\":", .{id})) |head| {
+        defer gpa.free(head);
+        line.appendSlice(gpa, head) catch return;
+    } else |_| return;
     llm.jstr(gpa, &line, by) catch return;
     line.appendSlice(gpa, ",\"result\":") catch return;
     llm.jstr(gpa, &line, result) catch return;
@@ -140,4 +149,75 @@ pub fn board(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8) Board {
         if (std.mem.indexOf(u8, ln, "\"type\":\"done\"") != null) dones += 1;
     }
     return .{ .done = dones, .open = if (adds > dones) adds - dones else 0 };
+}
+
+test "bus: delivery is to-me-or-broadcast, never my own; limit keeps the newest (real filesystem)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-commons-bus-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    sendMessage(gpa, io, root, "alpha", "", "hello everyone", 1); // empty `to` = broadcast
+    sendMessage(gpa, io, root, "beta", "alpha", "direct to alpha", 1);
+    sendMessage(gpa, io, root, "alpha", "beta", "from me", 2);
+    sendMessage(gpa, io, root, "gamma", "delta", "not for alpha", 2);
+
+    const in_alpha = inbox(gpa, io, root, "alpha", 10);
+    defer gpa.free(in_alpha);
+    try std.testing.expectEqualStrings("beta: direct to alpha\n", in_alpha);
+
+    const in_beta = inbox(gpa, io, root, "beta", 10);
+    defer gpa.free(in_beta);
+    try std.testing.expectEqualStrings("alpha: hello everyone\nalpha: from me\n", in_beta);
+
+    const newest = inbox(gpa, io, root, "beta", 1);
+    defer gpa.free(newest);
+    try std.testing.expectEqualStrings("alpha: from me\n", newest);
+}
+
+test "bus: quotes and newlines in a message survive the JSON round trip (real filesystem)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-commons-esc-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    sendMessage(gpa, io, root, "quoter", "", "say \"hi\"\nline2", 1);
+    const got = inbox(gpa, io, root, "reader", 10);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("quoter: say \"hi\"\nline2\n", got);
+}
+
+test "board: ids count prior adds, done closes open, and an escaped \"type\":\"add\" in task TEXT is not an event (real filesystem)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-commons-board-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    try std.testing.expectEqual(@as(u32, 0), addTask(gpa, io, root, "lead", "", "t0"));
+    try std.testing.expectEqual(@as(u32, 1), addTask(gpa, io, root, "lead", "beta", "t1"));
+    try std.testing.expectEqual(Board{ .done = 0, .open = 2 }, board(gpa, io, root));
+
+    completeTask(gpa, io, root, 0, "beta", "done t0");
+    try std.testing.expectEqual(Board{ .done = 1, .open = 1 }, board(gpa, io, root));
+
+    // The scans count event lines by the substring "type":"add" — a task TEXT quoting it arrives
+    // jstr-escaped (\" everywhere), so it must count as ONE add (its own event), not two.
+    try std.testing.expectEqual(@as(u32, 2), addTask(gpa, io, root, "lead", "", "mind the \"type\":\"add\" trap"));
+    try std.testing.expectEqual(Board{ .done = 1, .open = 2 }, board(gpa, io, root));
+
+    completeTask(gpa, io, root, 1, "beta", "done t1");
+    completeTask(gpa, io, root, 2, "lead", "done trap");
+    try std.testing.expectEqual(Board{ .done = 3, .open = 0 }, board(gpa, io, root));
 }

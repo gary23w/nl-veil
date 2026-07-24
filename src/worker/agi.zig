@@ -302,7 +302,10 @@ pub fn appendVeilChat(w: *Worker, frm: []const u8, text: []const u8) void {
     defer line.deinit(gpa);
     line.appendSlice(gpa, "{\"from\":") catch return;
     llm.jstr(gpa, &line, frm) catch return;
-    line.appendSlice(gpa, std.fmt.allocPrint(gpa, ",\"round\":{d},\"text\":", .{w.cur_round}) catch return) catch return;
+    if (std.fmt.allocPrint(gpa, ",\"round\":{d},\"text\":", .{w.cur_round})) |mid| {
+        defer gpa.free(mid);
+        line.appendSlice(gpa, mid) catch return;
+    } else |_| return;
     llm.jstr(gpa, &line, text) catch return;
     line.appendSlice(gpa, "}\n") catch return;
     const existing = std.Io.Dir.cwd().readFileAlloc(w.io, path, gpa, .limited(8 << 20)) catch (gpa.dupe(u8, "") catch return);

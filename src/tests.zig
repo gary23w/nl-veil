@@ -21,6 +21,7 @@ test {
     _ = @import("worker/chat/toolperf.zig");
     _ = @import("worker/chat/trio_routing_test.zig"); // label->role routing guard (reads engine.zig as source)
     _ = @import("worker/control/supervisor.zig");
+    _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)
     _ = @import("worker/crawl.zig");
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");
@@ -45,4 +46,5 @@ test {
     _ = @import("worker/toolchain.zig"); // dependency bootstrap + manifest-derived acceptance rows
     _ = @import("worker/tools.zig");
     _ = @import("worker/vcs.zig");
+    _ = @import("worker/writer.zig"); // grounding floor: numbered sources + citation resolution (pure parts)
 }
