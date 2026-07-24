@@ -29,9 +29,24 @@
       { p: 'auth/auth_core', c: 'AU-03', t: 'Auth core — users and sessions on neuron-db, argon2id', s: 'auth_core.zig' },
       { p: 'auth/login_guard', c: 'AU-04', t: 'Login guard — five fails per IP, five-minute lockout', s: 'login_guard.zig' }
     ]},
+    { key: 'cli/', label: 'CLI — THE VERBS', docs: [
+      { p: 'cli', c: 'CL-01', t: 'CLI client — every veil verb a thin authenticated call to the local server', s: 'cli.zig' },
+      { p: 'cli/chat', c: 'CL-02', t: 'veil chat REPL — server-side brain, client-mode tool delegation', s: 'cli/chat.zig' },
+      { p: 'cli/exec_tool', c: 'CL-03', t: 'Shared client tool executor — one tools.execute in the invoker cwd', s: 'cli/exec_tool.zig' },
+      { p: 'cli/hub', c: 'CL-04', t: 'Fleet console — roster, broadcast say/goal, stopall over the API', s: 'cli/hub.zig' }
+    ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
       { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },
-      { p: 'config/keys_api', c: 'CF-02', t: 'Keys API — POST sealed, GET metadata, DELETE by provider', s: 'keys_api.zig' }
+      { p: 'config/keys_api', c: 'CF-02', t: 'Keys API — POST sealed, GET metadata, DELETE by provider', s: 'keys_api.zig' },
+      { p: 'config/cf_oauth', c: 'CF-03', t: 'Log in with Cloudflare — PKCE public client, vault-sealed tokens', s: 'cf_oauth.zig' },
+      { p: 'config/lan', c: 'CF-04', t: 'LAN addresses — ipconfig/ifconfig parse for the startup URL', s: 'lan.zig' },
+      { p: 'config/local_models', c: 'CF-05', t: 'Installed Ollama models — loopback /api/tags relay', s: 'local_models.zig' },
+      { p: 'config/server_config', c: 'CF-06', t: 'Admin runtime defaults — model trio + browser preference, JSON-persisted', s: 'server_config.zig' }
+    ]},
+    { key: 'plug/', label: 'PLUG — THE EXTENSION LAYER', docs: [
+      { p: 'plug/plugins', c: 'PG-01', t: 'Plugin registry — Lua manifests, tool/policy/prompt hooks, swap-on-reload', s: 'plugins.zig' },
+      { p: 'plug/lua', c: 'PG-02', t: 'Embedded Lua 5.4 — sandboxed Vm with instruction and memory caps', s: 'lua.zig' },
+      { p: 'plug/theme', c: 'PG-03', t: 'Theme workspace — 16-slot Lua palettes, one model for web/desk/CLI', s: 'theme.zig' }
     ]},
     { key: 'gateway/', label: 'GATEWAY — THE ONLY DOOR IN', docs: [
       { p: 'gateway/http', c: 'GW-01', t: 'HTTP gateway — routing, middleware pipeline', s: 'http.zig' }
@@ -48,7 +63,25 @@
       { p: 'worker/chat/engine', c: 'CH-01', t: 'The chat brain — the server-side agentic turn loop', s: 'chat/engine.zig' },
       { p: 'worker/chat/service', c: 'CH-02', t: 'Chat REST handlers — convs, messages, events, control', s: 'chat/service.zig' },
       { p: 'worker/chat/tools', c: 'CH-03', t: 'Chat tool surface + the shared /chat/tool endpoint', s: 'chat/tools.zig' },
-      { p: 'worker/sched', c: 'CH-04', t: 'Scheduled tasks — each run is a server chat conversation', s: 'sched.zig' }
+      { p: 'worker/sched', c: 'CH-04', t: 'Scheduled tasks — each run is a server chat conversation', s: 'sched.zig' },
+      { p: 'worker/chat/context', c: 'CH-05', t: 'Context assembly — bounded LLM context for the turn', s: 'chat/context.zig' },
+      { p: 'worker/chat/paths', c: 'CH-06', t: 'Paths — conversation id to build-tree mapping', s: 'chat/paths.zig' },
+      { p: 'worker/chat/plan', c: 'CH-07', t: 'Plan board — the durable per-conversation plan', s: 'chat/plan.zig' },
+      { p: 'worker/chat/sync', c: 'CH-08', t: 'Workdir sync — the shared protocol pieces', s: 'chat/sync.zig' },
+      { p: 'worker/chat/toolperf', c: 'CH-09', t: 'Tool perf — per-machine learned tool behavior', s: 'chat/toolperf.zig' }
+    ]},
+    { key: 'worker/browser/', label: 'WORKER · BROWSER — THE DRIVER', docs: [
+      { p: 'worker/browser/manager', c: 'BR-01', t: 'Manager — the process-global browser-session registry', s: 'browser/manager.zig' },
+      { p: 'worker/browser/session', c: 'BR-02', t: 'Session — one headless browser', s: 'browser/session.zig' },
+      { p: 'worker/browser/cdp', c: 'BR-03', t: 'CDP — the self-contained DevTools WebSocket client', s: 'browser/cdp.zig' },
+      { p: 'worker/browser/launch', c: 'BR-04', t: 'Launch — browser discovery and headless start', s: 'browser/launch.zig' },
+      { p: 'worker/browser/host', c: 'BR-05', t: 'Host — the local-host daemon and its client side', s: 'browser/host.zig' },
+      { p: 'worker/browser/broker', c: 'BR-06', t: 'Broker — loopback broker for invented browser tools', s: 'browser/broker.zig' },
+      { p: 'worker/browser/util', c: 'BR-07', t: 'Util — raw-thread-safe browser helpers', s: 'browser/util.zig' }
+    ]},
+    { key: 'worker/mcp/', label: 'WORKER · MCP — THE FOREIGN TOOLS', docs: [
+      { p: 'worker/mcp/discovery', c: 'MC-01', t: 'Discovery — local MCP and AI-runtime discovery', s: 'mcp/discovery.zig' },
+      { p: 'worker/mcp/client', c: 'MC-02', t: 'Client — the minimal stdio MCP client', s: 'mcp/client.zig' }
     ]},
     { key: 'worker/control/', label: 'WORKER · CONTROL — THE SWARM CONTROL PLANE', docs: [
       { p: 'worker/control/supervisor', c: 'CT-01', t: 'Supervisor — detached swarm processes, re-adoption', s: 'control/supervisor.zig' },
@@ -70,7 +103,21 @@
       { p: 'worker/hyperspace', c: 'WK-10', t: 'Hyperspace — the working-memory oscillator over neuron-db', s: 'hyperspace.zig' },
       { p: 'worker/llm', c: 'WK-11', t: 'LLM — the client: loopback via httpc, hosted via curl', s: 'llm.zig' },
       { p: 'worker/locs/atlas', c: 'WK-12', t: 'Atlas — the source atlas pointing scouts at nl-rag packs', s: 'locs/atlas.zig' },
-      { p: 'worker/commons', c: 'WK-13', t: 'Commons — the swarm message bus + event-sourced task board', s: 'commons.zig' }
+      { p: 'worker/commons', c: 'WK-13', t: 'Commons — the swarm message bus + event-sourced task board', s: 'commons.zig' },
+      { p: 'worker/httpc', c: 'WK-14', t: 'httpc — bounded raw-socket HTTP/1.1 loopback client', s: 'httpc.zig' },
+      { p: 'worker/lineage', c: 'WK-15', t: 'Lineage — cross-run swarm memory keyed to a lineage id', s: 'lineage.zig' },
+      { p: 'worker/metrics', c: 'WK-16', t: 'Metrics — per-role LLM usage metering for the Dashboard', s: 'metrics.zig' },
+      { p: 'worker/modelcfg', c: 'WK-17', t: 'Modelcfg — the one model catalog, comptime from models.yaml', s: 'modelcfg.zig' },
+      { p: 'worker/hashline', c: 'WK-18', t: 'Hashline — hash-anchored line edits with atomic batches', s: 'hashline.zig' },
+      { p: 'worker/deps', c: 'WK-19', t: 'Deps — dependency probe: detect and instruct, never install', s: 'deps.zig' },
+      { p: 'worker/rate', c: 'WK-20', t: 'Rate — per-host outbound pacing for hosted LLM backends', s: 'rate.zig' },
+      { p: 'worker/rerank', c: 'WK-21', t: 'Rerank — second-stage LLM reranking with an abstain floor', s: 'rerank.zig' },
+      { p: 'worker/recipes', c: 'WK-22', t: 'Recipes — the granted-recipe data layer: parse, validate, substitute', s: 'recipes.zig' },
+      { p: 'worker/toolchain', c: 'WK-23', t: 'Toolchain — project-toolchain floor: bootstrap + derived checks', s: 'toolchain.zig' },
+      { p: 'worker/ragingest', c: 'WK-24', t: 'Ragingest — offline local-file RAG ingest into the hive', s: 'ragingest.zig' },
+      { p: 'worker/ragmirror', c: 'WK-25', t: 'Ragmirror — local nl-rag pack mirror + atlas extension', s: 'ragmirror.zig' },
+      { p: 'worker/ocr', c: 'WK-26', t: 'OCR — OS-native shims: vision as text', s: 'ocr.zig' },
+      { p: 'worker/pixelrag', c: 'WK-27', t: 'Pixelrag — screenshot-tile ingest and retrieval', s: 'pixelrag.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },
@@ -88,7 +135,9 @@
       { p: 'desk/catalog', c: 'DK-13', t: 'Model catalog — provider/model sets re-exported from models.yaml', s: 'catalog.zig' },
       { p: 'desk/secrets', c: 'DK-14', t: 'Secrets — plaintext key files (legacy DPAPI unseal only)', s: 'secrets.zig' },
       { p: 'desk/log', c: 'DK-15', t: 'Logger — ring buffer to veil-desk.log + the F12 overlay', s: 'log.zig' },
-      { p: 'desk/gitvc', c: 'DK-16', t: 'Gitvc — git + GitHub operations for the chat', s: 'gitvc.zig' }
+      { p: 'desk/gitvc', c: 'DK-16', t: 'Gitvc — git + GitHub operations for the chat', s: 'gitvc.zig' },
+      { p: 'desk/assets', c: 'DK-17', t: 'Assets — icons + OpenDyslexic embedded in the exe', s: 'assets.zig' },
+      { p: 'desk/runner', c: 'DK-18', t: 'Runner — the engine door to the server; loopback vtable', s: 'runner.zig' }
     ]}
   ];
 
