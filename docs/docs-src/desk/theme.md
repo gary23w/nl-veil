@@ -2,17 +2,17 @@
 
 **File:** `desk/src/theme.zig`  
 **Module:** `desk`  
-**Description:** The nl-veil desktop shell's visual language — dark/light palette tokens plus stateless draw-and-hit-test widget helpers layered over raylib.
+**Description:** The nl-veil desktop shell's visual language — dark/light/matrix palette tokens plus stateless draw-and-hit-test widget helpers layered over raylib.
 
 ---
 
 ## Purpose Summary
 
-Defines veil-desk's entire visual language: the Tokyo Night color scheme (the dark palette mirrored from web/public/styles.css so the native app and web UI read as one product, plus a light palette tuned by hand to the same language), a single spacing/sizing token scale, and a library of immediate-mode draw + hit-test helpers (text, panels, buttons, tabs, checkbox, stepper, cycle selector, window buttons, brand mark). It is retained-tree-free immediate-mode UI: the widget helpers hold no per-widget state and hit-test against the live mouse each frame, so the interface is a pure function of AppState (over the module's global theme/cursor state).
+Defines veil-desk's entire visual language: the Tokyo Night color scheme (the dark palette mirrored from web/public/styles.css so the native app and web UI read as one product, plus a light palette tuned by hand to the same language, plus a matrix palette — phosphor green on near-black that also swaps the whole shell to the mono/code face while active), a single spacing/sizing token scale, and a library of immediate-mode draw + hit-test helpers (text, panels, buttons, tabs, checkbox, stepper, cycle selector, window buttons, brand mark). It is retained-tree-free immediate-mode UI: the widget helpers hold no per-widget state and hit-test against the live mouse each frame, so the interface is a pure function of AppState (over the module's global theme/cursor state).
 
 ## Key Exports
 
-- `setScheme` / `setSchemeFromInt` / `getScheme` / `schemeInt` — swap the active dark/light Palette into the public mutable color globals (bg, fg, blue, red, ...) that every widget reads (setScheme early-returns if unchanged)
+- `setScheme` / `setSchemeFromInt` / `getScheme` / `schemeInt` — swap the active dark/light/matrix Palette into the public mutable color globals (bg, fg, blue, red, ...) that every widget reads (setScheme early-returns if unchanged); the matrix scheme additionally reroutes theFont()/fontForKind() to the mono face
 - `z` / `zs` — format/copy a string into the next slot of a 24-entry ring of 2 KB scratch buffers, returning a sentinel-terminated `[:0]const u8` for raylib (zs also runs foldAscii)
 - `foldAscii` — fold arbitrary (LLM-authored) UTF-8 to renderable single-line text: control bytes→space, transliterate the Unicode punctuation the atlas lacks, keep Latin-1/Greek/math/atlas-carried glyphs verbatim, drop emoji/CJK
 - `text` / `measure` / `textClip` / `textMono` / `measureMono` / `textMonoClip` — proportional and monospace draw/measure, with an ellipsis variant (textClip) and hard-clip variants
