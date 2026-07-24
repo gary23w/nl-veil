@@ -17,6 +17,7 @@ const Io = std.Io;
 const httpc = @import("worker/httpc.zig");
 const exec_tool = @import("cli/exec_tool.zig");
 const cync = @import("worker/chat/sync.zig");
+const toolperf = @import("worker/chat/toolperf.zig");
 
 const VEIL_EXE = if (builtin.os.tag == .windows) "veil.exe" else "veil";
 
@@ -84,7 +85,7 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "chat")) return cmdChat(ctx, args);
     if (std.mem.eql(u8, sub, "sched")) return cmdSched(ctx, args);
     if (std.mem.eql(u8, sub, "hub")) return cmdHub(ctx, args);
-    if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx);
+    if (std.mem.eql(u8, sub, "doctor") or std.mem.eql(u8, sub, "health")) return cmdDoctor(ctx, args);
     if (std.mem.eql(u8, sub, "desktop") or std.mem.eql(u8, sub, "desk")) return cmdDesktop(ctx);
     if (std.mem.eql(u8, sub, "exec-tool")) return exec_tool.cmd(ctx, args);
     if (std.mem.eql(u8, sub, "sync-manifest")) return exec_tool.cmdSyncManifest(ctx, args);
@@ -182,26 +183,138 @@ fn cmdVersion(ctx: *Ctx) u8 {
     return 0;
 }
 
-fn cmdDoctor(ctx: *Ctx) u8 {
+fn cmdDoctor(ctx: *Ctx, args: []const []const u8) u8 {
+    var growth = false;
+    for (args) |a| if (std.mem.eql(u8, a, "--growth")) {
+        growth = true;
+    };
     out("veil doctor\n", .{});
     out("  data dir : {s}\n", .{ctx.data});
     out("  token    : {s}\n", .{if (ctx.token_len > 0) "loaded (.desktop_key)" else "MISSING — start the server once to mint it"});
+    var rc: u8 = 1;
     if (serverUp(ctx)) {
-        const resp = call(ctx, "GET", "/api/v1/fleet", null, 4, false) catch {
+        rc = 0;
+        if (call(ctx, "GET", "/api/v1/fleet", null, 4, false)) |resp| {
+            defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+            out("  server   : UP on :{d}\n", .{ctx.port});
+            if (jsonStr(ctx.gpa, resp.body, "version")) |v| {
+                defer ctx.gpa.free(v);
+                out("  version  : {s}\n", .{v});
+            }
+            out("  fleet    : {s}\n", .{resp.body[0..@min(resp.body.len, 200)]});
+        } else |_| {
             out("  server   : up on :{d}\n", .{ctx.port});
-            return 0;
-        };
-        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
-        out("  server   : UP on :{d}\n", .{ctx.port});
-        if (jsonStr(ctx.gpa, resp.body, "version")) |v| {
-            defer ctx.gpa.free(v);
-            out("  version  : {s}\n", .{v});
         }
-        out("  fleet    : {s}\n", .{resp.body[0..@min(resp.body.len, 200)]});
-        return 0;
+    } else {
+        out("  server   : DOWN on :{d} (run `veil` to start it)\n", .{ctx.port});
     }
-    out("  server   : DOWN on :{d} (run `veil` to start it)\n", .{ctx.port});
-    return 1;
+    if (growth) growthReport(ctx);
+    return rc;
+}
+
+/// `doctor --growth` — the app's own runtime ledgers folded into one worker-readable health view:
+/// the engine's LEARNED tool behavior (toolperf digest), schedule fail-streaks (the outcome ledger
+/// on each task file), and a per-model LLM usage rollup. Reads {data} directly on purpose — the
+/// report works with the server down, and nothing here re-derives what the engine already learned.
+fn growthReport(ctx: *Ctx) void {
+    const gpa = ctx.gpa;
+    out("  -- growth --\n", .{});
+
+    // Tools: reuse the engine's own digest (EWMA latency + fail rates; only NOTABLE tools appear).
+    if (toolperf.digest(gpa, ctx.io, ctx.data)) |d| {
+        defer gpa.free(d);
+        out("  tools    : {s}\n", .{d});
+    } else {
+        out("  tools    : nothing notable (no slow or flaky tools with enough samples)\n", .{});
+    }
+
+    var root = std.Io.Dir.cwd().openDir(ctx.io, ctx.data, .{ .iterate = true }) catch {
+        out("  sched    : (data dir unreadable)\n", .{});
+        return;
+    };
+    defer root.close(ctx.io);
+
+    // Schedules: last_status + fail_streak straight off each task file.
+    var tasks: u32 = 0;
+    var streaks: u32 = 0;
+    var it = root.iterate();
+    while (it.next(ctx.io) catch null) |ent| {
+        if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
+        var pb: [700]u8 = undefined;
+        const sd = std.fmt.bufPrint(&pb, "{s}/{s}/_sched", .{ ctx.data, ent.name }) catch continue;
+        var dir = std.Io.Dir.cwd().openDir(ctx.io, sd, .{ .iterate = true }) catch continue;
+        defer dir.close(ctx.io);
+        var fit = dir.iterate();
+        while (fit.next(ctx.io) catch null) |f| {
+            if (f.kind != .file or !std.mem.endsWith(u8, f.name, ".json")) continue;
+            var fpb: [900]u8 = undefined;
+            const fp = std.fmt.bufPrint(&fpb, "{s}/{s}", .{ sd, f.name }) catch continue;
+            const raw = std.Io.Dir.cwd().readFileAlloc(ctx.io, fp, gpa, .limited(1 << 20)) catch continue;
+            defer gpa.free(raw);
+            const T = struct { last_status: []const u8 = "", fail_streak: i64 = 0 };
+            const p = std.json.parseFromSlice(T, gpa, raw, .{ .ignore_unknown_fields = true }) catch continue;
+            defer p.deinit();
+            tasks += 1;
+            if (p.value.fail_streak > 0) {
+                streaks += 1;
+                out("  sched    : {s}/{s} fail_streak={d} last={s}\n", .{ ent.name, f.name[0 .. f.name.len - 5], p.value.fail_streak, p.value.last_status[0..@min(p.value.last_status.len, 80)] });
+            }
+        }
+    }
+    if (streaks == 0) out("  sched    : {d} task(s), no fail streaks\n", .{tasks});
+
+    // Models: fold u*/_metrics/llm.jsonl (shape documented in worker/metrics.zig) per model.
+    const Stat = struct { name: [64]u8 = [_]u8{0} ** 64, nlen: usize = 0, turns: u64 = 0, calls: u64 = 0, tin: u64 = 0, tout: u64 = 0, ms: u64 = 0 };
+    var stats = [_]Stat{.{}} ** 24;
+    var nstats: usize = 0;
+    var it2 = root.iterate();
+    while (it2.next(ctx.io) catch null) |ent| {
+        if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
+        var pb: [700]u8 = undefined;
+        const mp = std.fmt.bufPrint(&pb, "{s}/{s}/_metrics/llm.jsonl", .{ ctx.data, ent.name }) catch continue;
+        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, mp, gpa, .limited(16 << 20)) catch continue;
+        defer gpa.free(data);
+        var lit = std.mem.splitScalar(u8, data, '\n');
+        while (lit.next()) |raw_ln| {
+            const ln = std.mem.trim(u8, raw_ln, " \r\t");
+            if (ln.len == 0) continue;
+            const R = struct { model: []const u8 = "", calls: u64 = 0, in: u64 = 0, out: u64 = 0, ms: u64 = 0 };
+            const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+            defer p.deinit();
+            const m = p.value.model;
+            if (m.len == 0 or m.len > 64) continue;
+            var s: ?*Stat = null;
+            for (stats[0..nstats]) |*cand| {
+                if (std.mem.eql(u8, cand.name[0..cand.nlen], m)) {
+                    s = cand;
+                    break;
+                }
+            }
+            if (s == null) {
+                if (nstats >= stats.len) continue;
+                stats[nstats].nlen = m.len;
+                @memcpy(stats[nstats].name[0..m.len], m);
+                s = &stats[nstats];
+                nstats += 1;
+            }
+            const st = s.?;
+            st.turns += 1;
+            st.calls += p.value.calls;
+            st.tin += p.value.in;
+            st.tout += p.value.out;
+            st.ms += p.value.ms;
+        }
+    }
+    if (nstats == 0) {
+        out("  models   : no llm.jsonl yet (served chat turns write it)\n", .{});
+        return;
+    }
+    for (stats[0..nstats]) |*st| {
+        out("  model    : {s} — {d} turn-rows, {d} calls, {d}k in / {d}k out, avg {d}ms/row\n", .{
+            st.name[0..st.nlen], st.turns, st.calls, st.tin / 1000, st.tout / 1000,
+            if (st.turns > 0) st.ms / st.turns else 0,
+        });
+    }
 }
 
 /// `veil cast <goal> [--minutes N] [--minds N] [--model M] [--provider P] [--base-url U] [--key K]
@@ -581,7 +694,9 @@ fn cmdHelp() u8 {
         \\  plugins reload               rescan <data>/plugins + <data>/themes and swap the live registry (admin)
         \\
         \\MISC
-        \\  doctor                       check server + token health
+        \\  doctor [--growth]            check server + token health; --growth folds the runtime
+        \\                               ledgers into app health (learned tool behavior, schedule
+        \\                               fail-streaks, per-model usage) — works with the server down
         \\  desktop                      open the app window (same as a bare `veil`, but detached)
         \\  version                      print the server version
         \\
