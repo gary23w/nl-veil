@@ -45,15 +45,47 @@ pub const AuditLog = struct {
         return std.fmt.bytesToHex(dig, .lower);
     }
 
+    // The JSON layer escapes; the hash preimage stays the RAW field bytes (chain() below), and
+    // verify() recomputes from the PARSED (unescaped) fields — so escaping here changes nothing
+    // about existing chains, it only makes a quoted/newlined field parseable instead of corrupting
+    // the whole log's readability.
+    fn jesc(out: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+        for (s) |c| switch (c) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            else => if (c < 0x20) {
+                // \u-escape, never drop: the hash preimage is the RAW bytes, so verify() must be
+                // able to recover them exactly from the JSON.
+                var ub: [8]u8 = undefined;
+                try out.appendSlice(gpa, std.fmt.bufPrint(&ub, "\\u{x:0>4}", .{c}) catch return);
+            } else try out.append(gpa, c),
+        };
+    }
+
     pub fn record(self: *AuditLog, actor: []const u8, action: []const u8, target: []const u8) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.seq += 1;
         const ts = std.Io.Timestamp.now(self.io, .real).toSeconds();
         const hex = chain(&self.last_hash, self.seq, ts, actor, action, target);
-        const line = std.fmt.allocPrint(self.gpa, "{{\"seq\":{d},\"ts\":{d},\"actor\":\"{s}\",\"action\":\"{s}\",\"target\":\"{s}\",\"prev\":\"{s}\",\"hash\":\"{s}\"}}\n", .{ self.seq, ts, actor, action, target, self.last_hash[0..], hex[0..] }) catch return;
-        defer self.gpa.free(line);
-        self.append(line);
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(self.gpa);
+        var nb: [96]u8 = undefined;
+        line.appendSlice(self.gpa, std.fmt.bufPrint(&nb, "{{\"seq\":{d},\"ts\":{d},\"actor\":\"", .{ self.seq, ts }) catch return) catch return;
+        jesc(&line, self.gpa, actor) catch return;
+        line.appendSlice(self.gpa, "\",\"action\":\"") catch return;
+        jesc(&line, self.gpa, action) catch return;
+        line.appendSlice(self.gpa, "\",\"target\":\"") catch return;
+        jesc(&line, self.gpa, target) catch return;
+        line.appendSlice(self.gpa, "\",\"prev\":\"") catch return;
+        line.appendSlice(self.gpa, self.last_hash[0..]) catch return;
+        line.appendSlice(self.gpa, "\",\"hash\":\"") catch return;
+        line.appendSlice(self.gpa, hex[0..]) catch return;
+        line.appendSlice(self.gpa, "\"}\n") catch return;
+        self.append(line.items);
         @memcpy(self.last_hash[0..], hex[0..]);
     }
 
@@ -89,3 +121,98 @@ pub const AuditLog = struct {
         return n;
     }
 };
+
+// ---------------------------------------------------------------------------
+// tests — the tamper-evidence contract, on a real file
+// ---------------------------------------------------------------------------
+
+test "audit chain: records verify, recovery resumes the chain across a restart" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-audit-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var log = AuditLog.init(gpa, io, root);
+    defer gpa.free(log.path);
+    log.record("admin@x", "ban", "u7");
+    log.record("admin@x", "kill_swarm", "sw-abc");
+    log.record("root", "plan_change", "u7:pro");
+    try std.testing.expectEqual(@as(u64, 3), try log.verify());
+
+    // restart: a fresh instance recovers seq + last_hash from the tail and keeps chaining
+    var log2 = AuditLog.init(gpa, io, root);
+    defer gpa.free(log2.path);
+    try std.testing.expectEqual(@as(u64, 3), log2.seq);
+    log2.record("admin@x", "unban", "u7");
+    try std.testing.expectEqual(@as(u64, 4), try log2.verify());
+}
+
+test "audit chain: quotes, backslashes, newlines and control bytes in fields survive the round trip" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-audit-esc-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var log = AuditLog.init(gpa, io, root);
+    defer gpa.free(log.path);
+    log.record("a\"b\\c", "do\nthing", "t\x01\targ");
+    try std.testing.expectEqual(@as(u64, 1), try log.verify());
+}
+
+test "audit chain: a flipped byte, a removed entry, and a garbage line are each detected" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-audit-tamper-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var log = AuditLog.init(gpa, io, root);
+    defer gpa.free(log.path);
+    log.record("admin", "ban", "victim-one");
+    log.record("admin", "delete", "victim-two");
+    log.record("admin", "restore", "victim-two");
+    const clean = std.Io.Dir.cwd().readFileAlloc(io, log.path, gpa, .limited(1 << 20)) catch unreachable;
+    defer gpa.free(clean);
+
+    // 1) flip a field byte: rewriting history breaks that entry's hash
+    {
+        const doctored = try std.mem.replaceOwned(u8, gpa, clean, "victim-one", "victim-0ne");
+        defer gpa.free(doctored);
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log.path, .data = doctored }) catch unreachable;
+        try std.testing.expectError(error.AuditHashMismatch, log.verify());
+    }
+    // 2) delete the middle entry: the next entry's prev no longer matches
+    {
+        var lines = std.mem.splitScalar(u8, std.mem.trim(u8, clean, "\r\n"), '\n');
+        var doctored: std.ArrayListUnmanaged(u8) = .empty;
+        defer doctored.deinit(gpa);
+        var i: usize = 0;
+        while (lines.next()) |ln| : (i += 1) {
+            if (i == 1) continue; // drop the second record
+            try doctored.appendSlice(gpa, ln);
+            try doctored.append(gpa, '\n');
+        }
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log.path, .data = doctored.items }) catch unreachable;
+        try std.testing.expectError(error.AuditChainBroken, log.verify());
+    }
+    // 3) a non-JSON line is corruption, loudly
+    {
+        var doctored: std.ArrayListUnmanaged(u8) = .empty;
+        defer doctored.deinit(gpa);
+        try doctored.appendSlice(gpa, clean);
+        try doctored.appendSlice(gpa, "not json at all\n");
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = log.path, .data = doctored.items }) catch unreachable;
+        try std.testing.expectError(error.AuditCorrupt, log.verify());
+    }
+}
