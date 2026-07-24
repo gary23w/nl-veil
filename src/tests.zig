@@ -3,7 +3,9 @@
 //! it is added to this list.
 
 test {
+    _ = @import("auth/api_keys.zig"); // nlk_ key minting, hash-only retention, exact-match verify, revoke
     _ = @import("auth/auth_core.zig"); // tool_grants persistence + the admin-email predicate
+    _ = @import("auth/login_guard.zig"); // per-IP fail window, lockout expiry, per-address isolation
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/server_config.zig");
@@ -21,7 +23,10 @@ test {
     _ = @import("worker/chat/sync.zig");
     _ = @import("worker/chat/toolperf.zig");
     _ = @import("worker/chat/trio_routing_test.zig"); // label->role routing guard (reads engine.zig as source)
+    _ = @import("plan/entitlements.zig"); // the plan -> caps wall
+    _ = @import("plan/neurons.zig"); // the metered-AI spend ledger
     _ = @import("worker/control/supervisor.zig");
+    _ = @import("worker/control/writer.zig"); // control-bus wire shape; escaping blocks op smuggling
     _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)
     _ = @import("worker/crawl.zig");
     _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
