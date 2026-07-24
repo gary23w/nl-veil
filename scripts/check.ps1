@@ -196,7 +196,8 @@ if ($Scan) {
         if (-not (Test-Path $m.docs)) { continue }
         Get-ChildItem $m.root -Recurse -Filter *.zig | ForEach-Object {
             $rel = $_.FullName.Substring($m.root.Length + 1)
-            if ($rel -eq "tests.zig") { return }
+            # tests.zig and *_test.zig are test harnesses, not modules -- no case file owed.
+            if ($rel -eq "tests.zig" -or $rel -like "*_test.zig") { return }
             $md = Join-Path $m.docs ($rel -replace '\.zig$', '.md')
             if (-not (Test-Path $md)) { $missingDocs += ($_.FullName.Substring($repo.Length + 1)) }
         }
