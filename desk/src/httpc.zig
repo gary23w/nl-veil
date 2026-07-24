@@ -54,11 +54,20 @@ pub fn request(io: Io, gpa: std.mem.Allocator, req: Req) Result {
     // Race the round trip against a sleeper. The round trip is spawned FIRST: if the backend is ever
     // out of concurrency and runs a task inline, we degrade to an unwatched (but framing-bounded)
     // request instead of always eating the full timeout before even connecting.
+    //
+    // `rt_done` is why the race stays CHEAP: the sleeper sleeps in short slices and exits as soon as the
+    // round trip has finished. Without it, every completed request left its losing timer asleep in a pool
+    // worker for the FULL timeout (Windows cancel can't interrupt a plain sleep mid-slice) — a few requests
+    // per second times 5-8s of residue pinned the whole Threaded pool at its async_limit, and at the limit
+    // io.async degrades to inline-on-caller: the freeze. Bonus: in that degraded inline case the flag is
+    // already set when the timer leg runs on the caller, so it returns at once instead of sleeping the
+    // whole timeout after the request already completed.
     const Race = union(enum) { rt: Inner, timer: void };
+    var rt_done: std.atomic.Value(bool) = .init(false);
     var sbuf: [2]Race = undefined;
     var sel = Io.Select(Race).init(io, &sbuf);
-    sel.async(.rt, roundTrip, .{ io, gpa, req.host, req.port, req_bytes, req.cap });
-    sel.async(.timer, sleeper, .{ io, req.timeout_s });
+    sel.async(.rt, roundTripFlag, .{ io, gpa, req.host, req.port, req_bytes, req.cap, &rt_done });
+    sel.async(.timer, sleeper, .{ io, req.timeout_s, &rt_done });
 
     const first = sel.await() catch { // our own task was cancelled — drain children, then bail
         drain(gpa, &sel);
@@ -89,8 +98,22 @@ fn drain(gpa: std.mem.Allocator, sel: anytype) void {
     };
 }
 
-fn sleeper(io: Io, seconds: u32) void {
-    io.sleep(.{ .nanoseconds = @as(u64, seconds) * std.time.ns_per_s }, .awake) catch {};
+fn sleeper(io: Io, seconds: u32, rt_done: *std.atomic.Value(bool)) void {
+    var remaining_ms: u64 = @as(u64, seconds) * std.time.ms_per_s;
+    while (remaining_ms > 0) {
+        if (rt_done.load(.acquire)) return; // round trip finished — release this worker now, not at deadline
+        const slice_ms: u64 = @min(remaining_ms, 200);
+        io.sleep(.{ .nanoseconds = slice_ms * std.time.ns_per_ms }, .awake) catch return;
+        remaining_ms -= slice_ms;
+    }
+}
+
+/// roundTrip + a completion flag the racing sleeper polls (see request). A wrapper so the flag store sits on
+/// every return path in one place and the protocol function below stays free of race bookkeeping.
+fn roundTripFlag(io: Io, gpa: std.mem.Allocator, host: []const u8, port: u16, req_bytes: []const u8, cap: usize, rt_done: *std.atomic.Value(bool)) Inner {
+    const r = roundTrip(io, gpa, host, port, req_bytes, cap);
+    rt_done.store(true, .release);
+    return r;
 }
 
 const Inner = union(enum) {

@@ -431,8 +431,12 @@ pub fn main() !void {
 pub fn runApp(data_dir: ?[]const u8) !void {
     const gpa = std.heap.c_allocator;
 
-    // carry the real process environ so spawned children (curl, explorer) get a working environment
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
+    // carry the real process environ so spawned children (curl, explorer) get a working environment.
+    // async_limit: at the default (cpu-1) ceiling io.async DEGRADES TO INLINE on the caller — every httpc
+    // timeout race then blocks its calling thread for request+timeout, and a saturated pool froze the window
+    // (poller probes inline on whoever calls them). Losing race timers hold slots ~5-8s each on Windows, so
+    // the default saturates under ordinary polling; a high ceiling only spawns threads when actually needed.
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -449,7 +453,7 @@ pub fn runApp(data_dir: ?[]const u8) !void {
 
     // The chat worker is the third thread (model turns + swarm casting); it owns its own Io instance so
     // the poller's cadence and the chat's long-running streams never contend.
-    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron() });
+    var chat_threaded = std.Io.Threaded.init(gpa, .{ .environ = llm.osEnviron(), .async_limit = .limited(256) });
     defer chat_threaded.deinit();
     var chat_worker = chat_mod.Chat{ .io = chat_threaded.io(), .gpa = gpa, .store = &store };
     const cth = try std.Thread.spawn(.{}, chat_mod.Chat.run, .{&chat_worker});

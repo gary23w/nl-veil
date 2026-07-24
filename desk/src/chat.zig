@@ -2623,11 +2623,20 @@ pub const Chat = struct {
             break :blk true;
         };
         if (!ok) return;
-        if (self.runner().chatToolResult(self.io, self.gpa, conv, w.buffered())) |resp| {
-            if (resp.body.len > 0) self.gpa.free(resp.body);
-            if (resp.status != 200 and resp.status != 202) log.warn("delegated tool_result POST -> {d}", .{resp.status});
-        } else {
-            log.warn("delegated tool_result POST unreachable (conv={s})", .{conv});
+        // RETRY the drop-proof call (its own doc says so): a transient 5xx/unreachable here used to lose the
+        // result outright, and the awaiting server turn then sat out its full client-tool timeout (observed
+        // live: one 500 = 180s of dead air). A duplicate append on a lost-response retry is harmless — the
+        // waiter settles on the first matching id line. Bounded: 4 attempts, 250ms apart, on the chat thread.
+        var attempt: usize = 0;
+        while (attempt < 4) : (attempt += 1) {
+            if (attempt > 0) self.io.sleep(.{ .nanoseconds = 250 * std.time.ns_per_ms }, .awake) catch {};
+            if (self.runner().chatToolResult(self.io, self.gpa, conv, w.buffered())) |resp| {
+                if (resp.body.len > 0) self.gpa.free(resp.body);
+                if (resp.status == 200 or resp.status == 202) return;
+                log.warn("delegated tool_result POST -> {d}{s}", .{ resp.status, if (attempt < 3) " — retrying" else " — giving up (turn will time the tool out)" });
+            } else {
+                log.warn("delegated tool_result POST unreachable (conv={s}){s}", .{ conv, if (attempt < 3) " — retrying" else " — giving up (turn will time the tool out)" });
+            }
         }
     }
 
