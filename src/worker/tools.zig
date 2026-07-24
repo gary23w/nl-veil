@@ -226,6 +226,9 @@ const SANDBOX_TOOLS = [_][]const u8{
     // hive / memory — the whole surface, intentionally
     "recall", "recall_hive", "read_doc", "observe", "share", "note_stance", "save_skill", "journal",
     "set_directive", "probe", "add_task", "complete_task", "send_message", "propose_plan_change",
+    // bounded observation of files/urls/ports/processes — read-only watching (its 'command' kind
+    // self-gates on caps inside pollTool, so a sandboxed caller keeps the observational kinds)
+    "poll",
     // files, jailed to the conversation's own workdir
     "write_file", "edit_file", "read_file", "list_dir", "delete_file",
     // local retrieval over this conversation's own attachments; renders nothing, touches no network
@@ -816,6 +819,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"share","description":"Contribute one fact to the HIVE'S SHARED ASSOCIATIVE MIND — the collective memory every teammate reads. Use this for anything the whole hive should know (a finding, a decision, a constraint, an interface you settled on). Unlike observe (your private memory), this is the team's. Write one crisp sentence and include the key entities/names so it links into the associative graph.","parameters":{"type":"object","properties":{"fact":{"type":"string"}},"required":["fact"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of what ANY teammate contributed — related facts that may share no words with your query but are reached by following shared entities. Use it to ask the collective what it knows before you act. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' simply call poll again — a long wait is a CHAIN of bounded polls, never one blind sleep.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
     \\{"type":"function","function":{"name":"probe","description":"PERCEIVE one cell of the hidden spatial grid (only available when the swarm has a spatial substrate). You cannot see the grid directly — you sense it ONE cell at a time. probe(x,y) reads the cell at column x, row y (both 0-based) and AUTO-RECORDS it to the hive's shared map so every teammate sees it. This is the hive's spatial superpower: divide the grid into regions, each mind probes a DIFFERENT region in parallel, and the shared map fills in far faster than one mind alone. Check the 'Discovered map' you're shown before re-probing a known cell.","parameters":{"type":"object","properties":{"x":{"type":"integer","description":"column, 0-based"},"y":{"type":"integer","description":"row, 0-based"}},"required":["x","y"]}}}
 ;
 
@@ -888,6 +892,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"recall","description":"Recall facts from your memory relevant to a query.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"recall_hive","description":"Think WITH the whole hive: spreading-activation recall across the shared collective memory AND every stored document (absorbed books/docs are searched automatically). Unlike recall (your own facts), this surfaces the CHAINED neighborhood of related facts reached by following shared entities. Use it for targeted questions. For WHOLE-document work use read_doc instead — fragments are not a summary.","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_doc","description":"Read a stored document from long-term memory IN ORDER, one page at a time — the ONLY correct path for whole-document work (summarize, outline, review, translate). recall/recall_hive return scattered fragments; this returns the document itself. Call with NO args to list the stored documents; then pass scope (absorb's result names it) and page with from until END. [section] lines are chapter markers.","parameters":{"type":"object","properties":{"scope":{"type":"string","description":"the document scope, e.g. knowledge__doc-mybook"},"name":{"type":"string","description":"alternative: the document's label, resolved to its scope"},"from":{"type":"integer","description":"start fact index (default 0)"},"limit":{"type":"integer","description":"facts per page (default 120, max 400)"}},"required":[]}}},
+    \\{"type":"function","function":{"name":"poll","description":"WATCH something to completion instead of guessing or checking once: a bounded observe loop that samples every interval_s until done or timeout_s, returning the observation log + a verdict (matched/up/open/running/gone/quiet/done/timeout). kinds: file (a log/output file — reports growth and the new tail; done when `until` text appears, or after quiet_s with no growth), url (probe an http(s) endpoint until it answers), port (until a local tcp port accepts), process (until a process is running — or exited, with until:'gone'), command (re-run a probe command until exit 0 or output contains `until`), swarm (until this conversation's cast finishes). Use it to wait on builds, servers coming up, downloads, logs, casts. On 'timeout' simply call poll again — a long wait is a CHAIN of bounded polls, never one blind sleep.","parameters":{"type":"object","properties":{"kind":{"type":"string","enum":["file","url","port","process","command","swarm"]},"target":{"type":"string","description":"path / url / port number / process name / probe command (kind swarm needs none)"},"until":{"type":"string","description":"text meaning DONE (file/command), an http status code (url), or 'gone' (process)"},"quiet_s":{"type":"integer","description":"file: also done after this many seconds of no growth"},"interval_s":{"type":"integer","description":"seconds between samples (default 3, max 30)"},"timeout_s":{"type":"integer","description":"this call's budget in seconds (default 60, max 180)"}},"required":["kind"]}}},
     \\{"type":"function","function":{"name":"get_credential","description":"Fetch ONE stored credential VALUE from the user's durable memory (the YOUR MEMORY entries shown masked as '[withheld]'). Values never ride in prompts by default — call this in the turn that actually needs one, then use it directly in that call. NEVER echo a fetched credential into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"a few identifying words — the service or domain from the masked entry"}},"required":["query"]}}}
 ;
 
@@ -1185,6 +1190,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d}]\n{s}\n[more — continue with read_doc {{\"scope\":\"{s}\",\"from\":{d}}}]", .{ scope, from, next - 1, total, body_txt, scope, next }) catch dupe(gpa, body_txt);
         return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d} — END]\n{s}", .{ scope, from, next - 1, total, body_txt }) catch dupe(gpa, body_txt);
     }
+    if (std.mem.eql(u8, name, "poll")) return pollTool(ctx, args_json);
     if (std.mem.eql(u8, name, "probe")) {
         if (ctx.space.len == 0) return dupe(gpa, "this swarm has no spatial grid (the task isn't spatial) — there is nothing to probe");
         const A = struct { x: i64 = -1, y: i64 = -1 };
@@ -1718,7 +1724,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
@@ -2815,6 +2821,199 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (st.evicted > 0)
         return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} written into scope '{s}' — BUT the scope hit its fact cap and evicted {d} oldest fact(s) during the load. Only the LAST part of the document (and whatever else survived) is recallable; earlier content is GONE from memory. Do not summarize from recall alone — re-read the source file for anything before the retained tail.", .{ label, st.facts, st.stored, scope, st.evicted }) catch dupe(gpa, "absorbed with evictions — earlier content was dropped");
     return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into its own document scope '{s}'. Targeted questions: recall_hive finds it automatically. Whole-document work (summarize/outline/review): page it IN ORDER with read_doc (scope '{s}') — never build a summary from recall fragments.", .{ label, st.facts, st.stored, scope, scope }) catch dupe(gpa, "absorbed");
+}
+
+// ------------------------------------------------------------------------------------------ poll (watch to completion)
+
+// Raw-thread sleep (engine.sleepMsRaw's twin): tool execution runs on raw worker/turn threads where
+// io.sleep can throw and a swallowed error busy-spins a core. Win32 Sleep on Windows.
+const pollsleep = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
+} else struct {};
+fn pollSleepMs(io: std.Io, ms: u64) void {
+    if (builtin.os.tag == .windows) {
+        pollsleep.Sleep(@intCast(@min(ms, 60_000)));
+    } else {
+        io.sleep(.{ .nanoseconds = ms * std.time.ns_per_ms }, .awake) catch {};
+    }
+}
+
+/// poll — WATCH SOMETHING TO COMPLETION instead of guessing or busy-asking: a bounded observe loop over a
+/// log file (growth/pattern), an http(s) url, a local tcp port, a process, a probe command, or this
+/// conversation's swarm. One call is bounded (timeout clamp 1..180s) and returns an observation log plus a
+/// verdict — on `timeout` the caller simply polls again, so a long wait is a chain of bounded calls the
+/// engine can always interrupt, never one unbounded hang.
+fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    const A = struct {
+        kind: []const u8 = "",
+        target: []const u8 = "",
+        until: []const u8 = "",
+        quiet_s: u32 = 0,
+        interval_s: u32 = 3,
+        timeout_s: u32 = 60,
+    };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    const kind = p.value.kind;
+    const target = std.mem.trim(u8, p.value.target, " \r\n\t");
+    const until = std.mem.trim(u8, p.value.until, " \r\n\t");
+    const interval: u64 = std.math.clamp(p.value.interval_s, 1, 30);
+    const timeout: u64 = std.math.clamp(p.value.timeout_s, 1, 180);
+    const K = enum { file, url, port, process, command, swarm };
+    const k: K = if (std.mem.eql(u8, kind, "file")) .file else if (std.mem.eql(u8, kind, "url")) .url else if (std.mem.eql(u8, kind, "port")) .port else if (std.mem.eql(u8, kind, "process")) .process else if (std.mem.eql(u8, kind, "command")) .command else if (std.mem.eql(u8, kind, "swarm")) .swarm else return dupe(gpa, "poll: kind must be file | url | port | process | command | swarm");
+    if (k != .swarm and target.len == 0) return dupe(gpa, "poll: 'target' is required (path / url / port / process name / command)");
+    // the COMMAND kind runs an arbitrary probe repeatedly — same power class as run_python, same gate
+    if (k == .command and ctx.caps == .sandboxed) return dupe(gpa, "poll kind 'command' is not available in this workspace — use kind file/url/port/process, which observe without executing");
+    if (k == .url and !ctx.internet and std.mem.indexOf(u8, target, "localhost") == null and std.mem.indexOf(u8, target, "127.0.0.1") == null)
+        return dupe(gpa, "web disabled: this is an OFFLINE run — poll may only watch localhost urls, files, ports, or processes");
+
+    const t0: i64 = std.Io.Timestamp.now(ctx.io, .real).toSeconds();
+    var log: std.ArrayListUnmanaged(u8) = .empty;
+    defer log.deinit(gpa);
+    var verdict: []const u8 = "timeout";
+    var last_size: u64 = 0;
+    var quiet_since: u64 = 0; // elapsed seconds when the file last grew
+    var have_size = false;
+    const obs = struct {
+        fn line(g: std.mem.Allocator, l: *std.ArrayListUnmanaged(u8), secs: u64, text: []const u8) void {
+            if (l.items.len > 6000) return; // bounded log — the verdict matters more than every tick
+            l.print(g, "t+{d}s: {s}\n", .{ secs, if (text.len > 220) text[0..220] else text }) catch {};
+        }
+    };
+    while (true) {
+        const elapsed: u64 = @intCast(@max(0, std.Io.Timestamp.now(ctx.io, .real).toSeconds() - t0));
+        switch (k) {
+            .file => {
+                const roamed: ?[]u8 = if (!safeRel(target)) roamPath(ctx, target) else null;
+                defer if (roamed) |r| gpa.free(r);
+                if (!safeRel(target) and roamed == null) return dupe(gpa, "poll: bad file path — workdir-relative (or absolute where this context roams)");
+                var fb: [1024]u8 = undefined;
+                const full = if (roamed) |r| r else (std.fmt.bufPrint(&fb, "{s}/{s}", .{ ctx.workdir, target }) catch return dupe(gpa, "poll: path overflow"));
+                if (std.Io.Dir.cwd().statFile(ctx.io, full, .{})) |st| {
+                    const size: u64 = st.size;
+                    if (!have_size or size != last_size) {
+                        // read the NEW tail (bounded) and scan it for the pattern
+                        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20)) catch null;
+                        defer if (data) |d| if (d.len > 0) gpa.free(d);
+                        const from: usize = if (have_size and data != null and last_size < data.?.len) @intCast(last_size) else 0;
+                        const chunk: []const u8 = if (data) |d| d[@min(from, d.len)..] else "";
+                        var nb: [200]u8 = undefined;
+                        obs.line(gpa, &log, elapsed, std.fmt.bufPrint(&nb, "grew to {d} bytes (+{d})", .{ size, size -| last_size }) catch "grew");
+                        if (chunk.len > 0) obs.line(gpa, &log, elapsed, std.mem.trim(u8, chunk[chunk.len -| 220..], " \r\n\t"));
+                        const hit = until.len > 0 and std.mem.indexOf(u8, chunk, until) != null;
+                        last_size = size;
+                        have_size = true;
+                        quiet_since = elapsed;
+                        if (hit) {
+                            verdict = "matched";
+                            break;
+                        }
+                    } else if (p.value.quiet_s > 0 and elapsed -| quiet_since >= p.value.quiet_s) {
+                        verdict = "quiet";
+                        break;
+                    }
+                } else |_| {
+                    obs.line(gpa, &log, elapsed, "(file does not exist yet)");
+                    have_size = false;
+                }
+            },
+            .url => {
+                var tb: [24]u8 = undefined;
+                const mt = std.fmt.bufPrint(&tb, "{d}", .{@min(interval * 2, 10)}) catch "5";
+                const r = std.process.run(gpa, ctx.io, .{ .argv = &.{ "curl", "-sS", "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null", "-w", "%{http_code}", "--max-time", mt, "--connect-timeout", mt, target }, .stdout_limit = .limited(64) }) catch {
+                    obs.line(gpa, &log, elapsed, "(curl unavailable)");
+                    verdict = "error";
+                    break;
+                };
+                defer gpa.free(r.stdout);
+                defer gpa.free(r.stderr);
+                const code = std.mem.trim(u8, r.stdout, " \r\n\t");
+                obs.line(gpa, &log, elapsed, if (code.len > 0 and !std.mem.eql(u8, code, "000")) code else "(no connection)");
+                const up = code.len == 3 and (code[0] == '2' or code[0] == '3' or (until.len > 0 and std.mem.eql(u8, code, until)));
+                if (up) {
+                    verdict = "up";
+                    break;
+                }
+            },
+            .port => {
+                var ub: [64]u8 = undefined;
+                const purl = std.fmt.bufPrint(&ub, "http://127.0.0.1:{s}/", .{target}) catch return dupe(gpa, "poll: bad port");
+                const r = std.process.run(gpa, ctx.io, .{ .argv = &.{ "curl", "-sS", "-o", if (builtin.os.tag == .windows) "NUL" else "/dev/null", "--max-time", "3", "--connect-timeout", "3", purl }, .stdout_limit = .limited(64) }) catch {
+                    verdict = "error";
+                    break;
+                };
+                defer gpa.free(r.stdout);
+                defer gpa.free(r.stderr);
+                // curl exit 7 = connection refused (port closed); anything that CONNECTED means the port is open,
+                // even if the service answered with garbage or a non-2xx.
+                const refused = r.term == .exited and r.term.exited == 7;
+                obs.line(gpa, &log, elapsed, if (refused) "port closed" else "port open");
+                if (!refused) {
+                    verdict = "open";
+                    break;
+                }
+            },
+            .process => {
+                const want_gone = std.mem.eql(u8, until, "gone");
+                const r = if (builtin.os.tag == .windows) blk: {
+                    var filt: [300]u8 = undefined;
+                    const f = std.fmt.bufPrint(&filt, "IMAGENAME eq {s}", .{target}) catch return dupe(gpa, "poll: process name too long");
+                    break :blk std.process.run(gpa, ctx.io, .{ .argv = &.{ "tasklist", "/FI", f, "/NH" }, .stdout_limit = .limited(8 << 10) }) catch {
+                        verdict = "error";
+                        break;
+                    };
+                } else std.process.run(gpa, ctx.io, .{ .argv = &.{ "pgrep", "-x", target }, .stdout_limit = .limited(8 << 10) }) catch {
+                    verdict = "error";
+                    break;
+                };
+                defer gpa.free(r.stdout);
+                defer gpa.free(r.stderr);
+                const present = if (builtin.os.tag == .windows) std.ascii.indexOfIgnoreCase(r.stdout, target) != null else (r.term == .exited and r.term.exited == 0);
+                obs.line(gpa, &log, elapsed, if (present) "process running" else "process not running");
+                if (present != want_gone) {
+                    verdict = if (present) "running" else "gone";
+                    break;
+                }
+            },
+            .command => {
+                const r = std.process.run(gpa, ctx.io, .{ .argv = if (builtin.os.tag == .windows) &.{ "cmd", "/C", target } else &.{ "sh", "-c", target }, .stdout_limit = .limited(32 << 10) }) catch {
+                    verdict = "error";
+                    break;
+                };
+                defer gpa.free(r.stdout);
+                defer gpa.free(r.stderr);
+                const out = std.mem.trim(u8, r.stdout, " \r\n\t");
+                const ok_exit = r.term == .exited and r.term.exited == 0;
+                obs.line(gpa, &log, elapsed, if (out.len > 0) out else if (ok_exit) "(exit 0)" else "(non-zero exit)");
+                const done = if (until.len > 0) std.mem.indexOf(u8, out, until) != null else ok_exit;
+                if (done) {
+                    verdict = "matched";
+                    break;
+                }
+            },
+            .swarm => {
+                var db2: [1024]u8 = undefined;
+                const dp = std.fmt.bufPrint(&db2, "{s}/DONE", .{ctx.run_dir}) catch return dupe(gpa, "poll: path overflow");
+                if (std.Io.Dir.cwd().readFileAlloc(ctx.io, dp, gpa, .limited(256)) catch null) |reason| {
+                    defer gpa.free(reason);
+                    var vb: [280]u8 = undefined;
+                    obs.line(gpa, &log, elapsed, std.fmt.bufPrint(&vb, "swarm DONE ({s})", .{std.mem.trim(u8, reason, " \r\n\t")}) catch "swarm DONE");
+                    verdict = "done";
+                    break;
+                }
+                obs.line(gpa, &log, elapsed, "swarm still working");
+            },
+        }
+        const now: u64 = @intCast(@max(0, std.Io.Timestamp.now(ctx.io, .real).toSeconds() - t0));
+        if (now + interval > timeout) break;
+        pollSleepMs(ctx.io, interval * 1000);
+    }
+    const guidance = if (std.mem.eql(u8, verdict, "timeout"))
+        " — still not there; call poll again to keep waiting, or act on what the log shows"
+    else
+        "";
+    return std.fmt.allocPrint(gpa, "poll {s} -> {s}{s}\n{s}", .{ kind, verdict, guidance, log.items }) catch dupe(gpa, verdict);
 }
 
 /// stage_file — copy a file from ANYWHERE the user's account can read INTO the conversation workdir, so a
@@ -5960,4 +6159,77 @@ test "wellFormedVerb relays any host verb the situation defines, rejecting only 
     try std.testing.expect(!wellFormedVerb("rm -rf /"));
     try std.testing.expect(!wellFormedVerb("kill;reboot"));
     try std.testing.expect(!wellFormedVerb("a" ** 41));
+}
+
+test "poll: gates fire before any observation — bad kind, missing target, sandboxed command" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = undefined, // every gate below returns before I/O
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined,
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    const bad = pollTool(&ctx, "{\"kind\":\"telepathy\",\"target\":\"x\"}");
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "kind must be") != null);
+    const missing = pollTool(&ctx, "{\"kind\":\"file\"}");
+    defer gpa.free(missing);
+    try std.testing.expect(std.mem.indexOf(u8, missing, "'target' is required") != null);
+    ctx.caps = .sandboxed;
+    const cmd = pollTool(&ctx, "{\"kind\":\"command\",\"target\":\"echo hi\"}");
+    defer gpa.free(cmd);
+    try std.testing.expect(std.mem.indexOf(u8, cmd, "not available in this workspace") != null);
+}
+
+test "poll file: an already-present pattern matches on the first sample, tail included (real filesystem)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-poll-it-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/build.log", .data = "compiling...\nlinking...\nBUILD SUCCEEDED in 4.2s\n" }) catch unreachable;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root,
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined,
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    const out = pollTool(&ctx, "{\"kind\":\"file\",\"target\":\"build.log\",\"until\":\"BUILD SUCCEEDED\",\"timeout_s\":1,\"interval_s\":1}");
+    try std.testing.expect(std.mem.indexOf(u8, out, "-> matched") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "BUILD SUCCEEDED") != null);
+    // a swarm poll with no DONE file times out fast and tells the caller to poll again
+    const sw = pollTool(&ctx, "{\"kind\":\"swarm\",\"timeout_s\":1,\"interval_s\":1}");
+    try std.testing.expect(std.mem.indexOf(u8, sw, "-> timeout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sw, "call poll again") != null);
 }
