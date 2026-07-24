@@ -52,4 +52,4 @@ Driven from veil-desk's scheduled-tasks builder and from `veil sched list|add|ru
 
 ---
 
-*Documentation generated for nl-veil — worker/sched.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

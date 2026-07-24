@@ -51,4 +51,4 @@ Entered only through `chat_service.postMessage`. ON by default; the kill switch 
 
 ---
 
-*Documentation generated for nl-veil — worker/chat/engine.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

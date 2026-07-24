@@ -36,4 +36,4 @@ All shared state is module-global: a fixed `g_lines: [CAP]Line` array (CAP=8192,
 
 ---
 
-*Documentation generated for nl-veil — desk/log.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

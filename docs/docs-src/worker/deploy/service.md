@@ -36,4 +36,4 @@ The engine behind `veil cast` / `veil deploy` / `veil list` / `veil rm` and the 
 
 ---
 
-*Documentation generated for nl-veil — worker/deploy/service.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

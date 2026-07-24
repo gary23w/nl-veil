@@ -2,35 +2,44 @@
 
 **File:** `src/worker/vcs.zig`  
 **Module:** `worker`  
-**Description:** Version-control integration: clone, pull, commit, push, branch management, and diff generation against remote git repositories.
+**Description:** Swarm micro version-control — serialized, corruption-safe commits so multiple minds can edit ONE shared file. Not git, and no remotes: this is the in-run merge law for concurrent editors.
 
 ---
 
 ## Purpose Summary
 
-Version-control integration: clone, pull, commit, push, branch management, and diff generation against remote git repositories.
+When several minds hold edits against the same file, someone's base is stale by the time they
+commit. This module decides what happens then — fast-forward, clean auto-merge, or an honest
+conflict — instead of letting the last writer clobber the rest.
 
 ## Key Exports
 
-- `Vcs` struct — git integration
-- `clone(url)` — clone repository
-- `commit(message)` — commit changes
-- `push()` — push to remote
-- `diff()` — working tree diff
+- `Decision` union — the merge verdict a caller acts on
+- `mergeDecision(gpa, cur, base, ops)` — given the file as it IS (`cur`), the base the editor saw,
+  and its anchored `bufedit.EditOp`s: fast-forward when nobody else moved HEAD; auto-merge a
+  disjoint edit onto an advanced HEAD; conflict when a teammate changed the same region (the
+  anchor is gone)
+- `Result` union — commit outcome
+- `Validator` — pre-commit validation hook; a rejected edit leaves HEAD untouched
+- `commitEdit(...)` — the serialized commit path: decide, validate, write
 
 ## Dependencies
 
-- `worker/commons` — shared types
-- Standard library: process execution (git), io, path manipulation
+- `worker/bufedit` — the line-addressable, anchor-based edit ops the merge reasons about
 
 ## Usage Context
 
-Used by RSI (to commit changes), writer (to sync outputs), and admin (for system updates).
+The write path for swarm minds editing shared deliverable files: tools-layer edits flow through
+`commitEdit` so two minds merging disjoint changes both land, and a third with a stale base gets a
+conflict instead of silent loss.
 
 ## Notable Implementation Details
 
-Shells out to the system `git` binary. Operations are retried with exponential backoff on network failures. Commit messages are formatted with structured metadata for traceability.
+Anchors, not line numbers, carry an edit onto a moved HEAD — if the anchor region survives, the
+edit travels; if a teammate rewrote it, that is a conflict by definition. The pre-commit validator
+runs inside the commit path (it used to be bypassable around the VCS; the tests pin that gate
+shut), and a failed validation leaves HEAD exactly as it was.
 
 ---
 
-*Documentation generated for nl-veil — vcs.zig source analysis.*
+*Case file grounded in the module's `//!` header, public API, and its tests.*

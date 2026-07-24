@@ -39,4 +39,4 @@ Concurrency/transport: no threads and no non-blocking child wait — the only \"
 
 ---
 
-*Documentation generated for nl-veil — desk/llm.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

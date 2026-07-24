@@ -37,4 +37,4 @@ All output is written into caller-provided fixed buffers via bounded putB/putS/p
 
 ---
 
-*Documentation generated for nl-veil — desk/mdutil.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

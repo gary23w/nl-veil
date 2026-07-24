@@ -45,4 +45,4 @@ The exact surface veil-desk and the `veil chat` CLI both drive: POST a message, 
 
 ---
 
-*Documentation generated for nl-veil — worker/chat/service.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

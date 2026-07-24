@@ -29,4 +29,4 @@ Sits behind the deploy routes (`worker/deploy/service.zig`) and the control rout
 
 ---
 
-*Documentation generated for nl-veil — worker/control/supervisor.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

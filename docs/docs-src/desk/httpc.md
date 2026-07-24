@@ -37,4 +37,4 @@ Concurrency: `request` uses `Io.Select` to race two async tasks — the actual `
 
 ---
 
-*Documentation generated for nl-veil — desk/httpc.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

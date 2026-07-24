@@ -27,4 +27,4 @@ Called on every recall and observe across the hive and the chat brain. Optionall
 
 ---
 
-*Documentation generated for nl-veil — worker/neuron/client.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

@@ -35,4 +35,4 @@ The load-bearing logic is the retry/triage in the private `httpReq`, keyed off i
 
 ---
 
-*Documentation generated for nl-veil — desk/netcli.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

@@ -28,4 +28,4 @@ Called by `chat/engine.zig` during a turn and by the desktop over the shared too
 
 ---
 
-*Documentation generated for nl-veil — worker/chat/tools.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

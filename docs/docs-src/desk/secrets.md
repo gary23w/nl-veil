@@ -2,35 +2,38 @@
 
 **File:** `desk/src/secrets.zig`  
 **Module:** `desk`  
-**Description:** secrets.zig provides save/load of the veil-desk BYOK chat API key to the untracked .veil-desk data dir, sealing it with Windows DPAPI (current-user scope) and falling back to a plain user-private file on POSIX.
+**Description:** At-rest storage for the chat API keys and the GitHub PAT — plaintext files inside the user-private, git-untracked data dir, with a one-time auto-unseal migration for legacy DPAPI blobs.
 
 ---
 
 ## Purpose Summary
 
-Handles at-rest protection of the single chat API key (BYOK) for the veil-desk native desktop app. On Windows it seals the key with DPAPI (CryptProtectData, current-user scope) so the on-disk blob is useless on another account/machine; on POSIX it writes a plain file inside the already user-private data dir, mirroring how the server keeps its own .desktop_key. The key is never written to a repo-tracked file — it lives only under the untracked <data>/.veil-desk sidecar dir.
+veil-desk is a LOCAL, single-user, login-gated app, so its secrets are deliberately kept as PLAINTEXT inside the untracked `<data>/` sidecar dir: the trust boundary is the OS login, not per-secret encryption. Plaintext-local is a feature — it lets the veil READ its own GitHub token (to curl or set a remote URL) instead of it being locked in an opaque blob it can't use. Each cloud/BYOK provider keeps its OWN key file keyed by catalog slug, so saving a DeepSeek key never overwrites the OpenAI one. Older builds DPAPI-sealed these files; loading transparently unseals such a legacy blob ONCE and rewrites it as plaintext.
 
 ## Key Exports
 
-- `save(io, gpa, dir, key) bool` — persists `key` under `dir`; on Windows seals via CryptProtectData to `chat_key.bin`, on POSIX writes plaintext to `chat_key`. An empty `key` deletes the stored secret (best-effort, ignoring delete errors) and returns true.
-- `load(io, gpa, dir, out) usize` — reads the stored key into caller-provided `out`, returns bytes written (0 = none stored / unreadable / DPAPI unseal failed); on Windows unseals via CryptUnprotectData, on POSIX trims surrounding whitespace. Truncates to `out.len` via @min.
+- `save(io, gpa, dir, key)` / `load(io, gpa, dir, out)` — the legacy single shared chat-key file (`chat_key` / `chat_key.bin`); an empty key deletes the file, load returns the byte length (0 = none/unreadable)
+- `saveFor(io, gpa, dir, slug, key)` / `loadFor(io, gpa, dir, slug, out)` — PER-PROVIDER keys at `<dir>/chat_key_<slug>[.bin]`; `slug` is the provider's stable catalog id ("deepseek", "workers-ai", "custom"), filesystem-safe by construction
+- `migrateLegacy(io, gpa, dir, slug, out)` — one-time upgrade: move the old single global key to the provider it was actually used for, delete the legacy file, and leave every OTHER provider correctly empty
+- `savePat(io, gpa, dir, pat)` / `loadPat(io, gpa, dir, out)` — the GitHub PAT (`github_pat[.bin]`), stored plaintext-local exactly like the chat keys
 
 ## Dependencies
 
-- std (std.Io for file IO, std.mem.Allocator, std.fmt.allocPrint, std.mem.trim)
-- builtin (compile-time builtin.os.tag == .windows branch selection)
-- log.zig (trace/warn/err logging)
-- Windows crypt32.dll: CryptProtectData / CryptUnprotectData (extern, .winapi callconv)
-- Windows kernel32.dll: LocalFree (frees the DPAPI-allocated output blob)
+- `std` (`std.Io` file I/O) and `builtin` (per-OS filename selection)
+- `log.zig` — trace/info/err logging
+- Windows `crypt32.CryptUnprotectData` + `kernel32.LocalFree` — UNSEAL ONLY, for the legacy migration; the module never seals anything
 
 ## Usage Context
 
-Called on the CHAT thread, which owns the io handle for all chat-side storage (per the module header). Invoked when the user sets or clears their BYOK chat API key (save) and to restore it (load). The `dir` argument is the .veil-desk sidecar directory. This is the desktop-side counterpart to the server's .desktop_key handling; the two share the same trust assumption that the data dir is user-private.
+Runs on the CHAT thread, which owns the io handle for all chat-side storage. `chat.zig` calls `saveFor`/`loadFor` around BYOK key entry (falling back to `migrateLegacy` on the first load of the base slot) and `savePat`/`loadPat` for the GitHub PAT; `store.zig` keeps key bytes in memory only and never writes them to settings.json. Nothing here ever reaches a repo-tracked file.
 
 ## Notable Implementation Details
 
-Platform split is compile-time via `builtin.os.tag == .windows`, and the on-disk filename differs by platform (FILE_WIN "chat_key.bin" vs FILE_POSIX "chat_key") — a blob written on one OS is not read by the other. DPAPI is called through hand-declared extern structs/functions: DATA_BLOB is `extern struct { cbData: u32, pbData: ?[*]u8 }`, and both crypt calls pass CRYPTPROTECT_UI_FORBIDDEN (0x1) so they never pop a UI prompt (safe for a headless/background thread). On save, `in_blob.pbData` is a `@constCast` of the caller's key pointer (DPAPI won't mutate it); the sealed output blob is allocated by Windows and freed with LocalFree via `defer` — not the Zig allocator. Failure model is intentionally lossy and non-throwing: every function returns bool/usize (never an error union), a failed CryptUnprotectData returns 0 with a warn logged ("blob from another account?" — the expected outcome when the file is copied to a different Windows user), a failed CryptProtectData logs an err and returns false, and empty-key deletion swallows deleteFile errors. `load` reads with a hard `.limited(4 << 10)` = 4 KiB cap on readFileAlloc, and both load paths copy at most `out.len` bytes into the fixed caller buffer via `@min`, silently truncating an oversized key. POSIX load trims " \r\n\t" around the value; Windows load does not trim (the sealed plaintext is exact bytes). `path()` builds "<dir>/<name>" with allocPrint and returns null on OOM, which the callers treat as save=false / load=0. The bundled test exercises the full round-trip plus empty-key removal against a real temp dir using std.Io.Threaded.
+- Storage is plaintext on ALL OSes now. The only cryptography left is the auto-unseal migration in the load path: on Windows a file's bytes are first offered to `CryptUnprotectData` — a legacy sealed blob unseals and is rewritten as plaintext (best-effort) so future loads read it directly; a plaintext file fails the unseal (DPAPI blobs are structured) and falls through unchanged.
+- The Windows filenames keep their historical `.bin` suffix precisely so old sealed files still resolve and get migrated.
+- Failure model is non-throwing: bool/usize returns, empty-key deletion swallows errors, loads cap reads at 4 KiB and truncate into the caller's fixed buffer; loaded values are whitespace-trimmed.
+- Tests pin the plaintext round-trip + empty-key removal, per-provider isolation (a provider never given a key reads empty), and that `migrateLegacy` moves the shared key to the CURRENT provider only and consumes the legacy file.
 
 ---
 
-*Documentation generated for nl-veil — desk/secrets.zig source analysis.*
+*Case file grounded in the module's `//!` header, public API, and its tests.*

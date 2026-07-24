@@ -40,4 +40,4 @@ Concurrency: all cross-thread state sits behind one custom `SpinLock` (atomic bo
 
 ---
 
-*Documentation generated for nl-veil — desk/store.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

@@ -49,4 +49,4 @@ Concurrency: three threads (UI/main, poller, chat), one shared Store behind a ti
 
 ---
 
-*Documentation generated for nl-veil — desk/main.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

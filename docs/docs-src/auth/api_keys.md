@@ -2,35 +2,40 @@
 
 **File:** `src/auth/api_keys.zig`  
 **Module:** `auth`  
-**Description:** Implements API key generation, storage, rotation, and revocation used by the authentication subsystem to secure machine-to-machine communication.
+**Description:** API keys — programmatic auth for the public API (alongside the SPA session cookie); only SHA-256 hashes are stored.
 
 ---
 
 ## Purpose Summary
 
-Implements API key generation, storage, rotation, and revocation used by the authentication subsystem to secure machine-to-machine communication.
+Mints, verifies, lists and revokes `nlk_` bearer keys so scripts can call the API without a browser session. A key is 24 random bytes as hex behind the `nlk_` prefix; the server keeps only its SHA-256 hex hash plus display metadata (uid, sanitized name, created, `nlk_XXXXXXXX…` prefix), persisted base64-encoded in neuron-db under scope `k_<hash>` and mirrored in an in-memory map for fast verification. The raw key is returned exactly once, at creation.
 
 ## Key Exports
 
-- `ApiKey` struct — key metadata (id, hash, scopes, expiry)
-- `generate_key()` — creates new key pair
-- `rotate_key()` — replaces key while keeping old valid briefly
-- `revoke_key()` — invalidates a key immediately
+- `PREFIX` — `"nlk_"`, the literal every key starts with
+- `View` — what listing exposes: id (the hash), display prefix, name, created
+- `ApiKeys.init` / `warm` — construct; reload all `k_` scopes from neuron-db at boot
+- `ApiKeys.create` — mint a key for a uid, store hash + metadata, return the raw key (only time it exists server-side)
+- `ApiKeys.verify` — hash a presented key, look it up, return the owning uid or null
+- `ApiKeys.list` — a uid's key views; never raw material
+- `ApiKeys.revoke` — delete by hash id, only if the key belongs to the calling uid
 
 ## Dependencies
 
-- `auth/auth_core` — base auth types
-- `config/key_vault` — secure key storage
-- Standard library: crypto, time
+- `../worker/neuron/client.zig` — `Neuron`, the persistence backend (`put`/`get`/`del`/`scopes`)
+- Std: `std.crypto.hash.sha2.Sha256`, `std.base64`, an `std.Io.Mutex` around the map
 
 ## Usage Context
 
-Used by the auth subsystem during key creation flows and by the gateway to validate incoming API key headers.
+Constructed and warmed in `main.zig`; hangs on the `App` as the optional `app.keys`. `auth_api.keyCreate/keyList/keyRevoke` are the HTTP surface (`/api/v1/apikeys`); `verify` is called by `requireUser` in `gateway/http.zig` (and by `auth_api.me`) when a request carries an `nlk_` bearer token instead of the session cookie.
 
 ## Notable Implementation Details
 
-Keys are hashed with Argon2 before storage; only the truncated prefix is logged for identification. Rotation keeps the previous key valid for a configurable overlap window.
+- Storage is hash-only: a leaked database yields no usable keys, and a lost key cannot be re-shown.
+- There is no rotation, expiry, or scoping — a key maps to its uid until revoked. Banned-account refusal happens in the caller (`requireUser`), since `verify` only answers "whose key is this".
+- Names are sanitized to 60 chars of `[A-Za-z0-9 ._-]` before being spliced into the stored JSON.
+- `verify` requires the prefix and a minimum length before hashing, so junk input short-circuits.
 
 ---
 
-*Documentation generated for nl-veil — api_keys.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

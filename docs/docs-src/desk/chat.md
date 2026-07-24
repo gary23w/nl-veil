@@ -41,4 +41,4 @@ The **local fallback engine** is the desk's own earlier chat brain, kept as a re
 
 ---
 
-*Documentation generated for nl-veil — desk/chat.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*
