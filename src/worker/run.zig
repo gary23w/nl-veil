@@ -7496,7 +7496,10 @@ fn consolidateState(w: *Worker, goal: []const u8, round: u32) void {
         defer gpa.free(data);
         const t = std.mem.trim(u8, data, " \r\n\t");
         if (t.len < 40) continue;
-        body.appendSlice(gpa, std.fmt.allocPrint(gpa, "\n== {s} ==\n", .{bp}) catch "") catch {};
+        if (std.fmt.allocPrint(gpa, "\n== {s} ==\n", .{bp})) |hdr| {
+            defer gpa.free(hdr);
+            body.appendSlice(gpa, hdr) catch {};
+        } else |_| {}
         body.appendSlice(gpa, clip(t, 700)) catch {};
         if (t.len > 1100) {
             body.appendSlice(gpa, "\n…\n") catch {};
@@ -9065,7 +9068,10 @@ pub fn buildTree(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, bluepr
     }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     if (paths.items.len > 0) {
-        out.appendSlice(gpa, std.fmt.allocPrint(gpa, "PROJECT TREE ({d} files):\n", .{paths.items.len}) catch "") catch {};
+        if (std.fmt.allocPrint(gpa, "PROJECT TREE ({d} files):\n", .{paths.items.len})) |hdr| {
+            defer gpa.free(hdr);
+            out.appendSlice(gpa, hdr) catch {};
+        } else |_| {}
         var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
         defer dirs.deinit(gpa);
         for (paths.items) |p| {
@@ -9135,7 +9141,10 @@ pub fn buildTree(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, bluepr
                 const words = docWords(gpa, io, run_dir, bp);
                 if (words >= doc_target) continue;
                 if (nunder > 0) under.appendSlice(gpa, ", ") catch {};
-                under.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s} ({d}/{d})", .{ std.fs.path.basename(bp), words, doc_target }) catch "") catch {};
+                if (std.fmt.allocPrint(gpa, "{s} ({d}/{d})", .{ std.fs.path.basename(bp), words, doc_target })) |entry| {
+                    defer gpa.free(entry);
+                    under.appendSlice(gpa, entry) catch {};
+                } else |_| {}
                 nunder += 1;
             }
             if (nunder > 0) {

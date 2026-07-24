@@ -192,7 +192,10 @@ fn buildNumberedSources(gpa: std.mem.Allocator, raw: []const u8) SourceList {
                 const title = if (pending_title.len > 0) pending_title else "(headline)";
                 s.urls[s.n] = url;
                 s.n += 1;
-                disp.appendSlice(gpa, std.fmt.allocPrint(gpa, "[{d}] {s}\n", .{ s.n, clip(title, 200) }) catch "") catch {};
+                if (std.fmt.allocPrint(gpa, "[{d}] {s}\n", .{ s.n, clip(title, 200) })) |numbered| {
+                    defer gpa.free(numbered);
+                    disp.appendSlice(gpa, numbered) catch {};
+                } else |_| {}
             }
             pending_title = "";
         } else if (std.mem.startsWith(u8, t, "- ")) {
@@ -239,7 +242,10 @@ fn resolveCitations(gpa: std.mem.Allocator, md: []const u8, urls: []const []cons
                         seen[num - 1] = true;
                         grounded += 1;
                     }
-                    out.appendSlice(gpa, std.fmt.allocPrint(gpa, "[[{d}]]({s})", .{ num, urls[num - 1] }) catch "") catch {};
+                    if (std.fmt.allocPrint(gpa, "[[{d}]]({s})", .{ num, urls[num - 1] })) |link| {
+                        defer gpa.free(link);
+                        out.appendSlice(gpa, link) catch {};
+                    } else |_| {}
                 }
                 i = j + 1;
                 continue;
@@ -267,4 +273,58 @@ fn resolveCitations(gpa: std.mem.Allocator, md: []const u8, urls: []const []cons
         i += 1;
     }
     return .{ .out = out.toOwnedSlice(gpa) catch (gpa.dupe(u8, md) catch @constCast("")), .grounded = grounded, .cited = cited };
+}
+
+// ---------------------------------------------------------------------------
+// tests — the grounding floor's pure machinery runs on fixed buffers, no Worker
+// ---------------------------------------------------------------------------
+
+test "urlEnd stops at delimiters and trims trailing punctuation" {
+    const a = "https://a.example/path). tail";
+    try std.testing.expectEqualStrings("https://a.example/path", a[0..urlEnd(a, 0)]);
+    const b = "https://b.example/x,\nrest";
+    try std.testing.expectEqualStrings("https://b.example/x", b[0..urlEnd(b, 0)]);
+    const c = "https://c.example.";
+    try std.testing.expectEqualStrings("https://c.example", c[0..urlEnd(c, 0)]);
+}
+
+test "buildNumberedSources numbers titles, dedups urls, and never shows the model a url" {
+    const raw =
+        "- First story\n" ++
+        "https://one.example/a\n" ++
+        "- Second story\n" ++
+        "https://one.example/a\n" ++
+        "https://two.example/b\n" ++
+        "http://a.b\n";
+    const s = buildNumberedSources(std.testing.allocator, raw);
+    defer std.testing.allocator.free(s.text);
+    try std.testing.expectEqual(@as(usize, 2), s.n);
+    try std.testing.expectEqualStrings("https://one.example/a", s.urls[0]);
+    try std.testing.expectEqualStrings("https://two.example/b", s.urls[1]);
+    try std.testing.expectEqualStrings("[1] First story\n[2] (headline)\n", s.text);
+    // the invariant this faculty exists for: the model-visible text carries NO urls to copy or mangle
+    try std.testing.expect(std.mem.indexOf(u8, s.text, "http") == null);
+}
+
+test "resolveCitations resolves [N], drops out-of-range, and strips invented links and bare urls" {
+    const urls = [_][]const u8{ "https://one.example/a", "https://two.example/b" };
+    const md = "See [1] and [1]; also [2] but [7] fake. Read [my take](https://evil.example/x) at https://bare.example/y.";
+    const r = resolveCitations(std.testing.allocator, md, &urls);
+    defer std.testing.allocator.free(r.out);
+    try std.testing.expectEqual(@as(u32, 3), r.cited);
+    try std.testing.expectEqual(@as(u32, 2), r.grounded);
+    try std.testing.expectEqualStrings(
+        "See [[1]](https://one.example/a) and [[1]](https://one.example/a); also [[2]](https://two.example/b) but  fake. Read my take at (source unverified).",
+        r.out,
+    );
+}
+
+test "resolveCitations strips [src:web] markers and storage-wrapper noise" {
+    const urls = [_][]const u8{"https://one.example/a"};
+    const md = "[src:web]Alpha {\"url\":\"x\"} beta :: gamma [1]";
+    const r = resolveCitations(std.testing.allocator, md, &urls);
+    defer std.testing.allocator.free(r.out);
+    try std.testing.expectEqual(@as(u32, 1), r.cited);
+    try std.testing.expectEqual(@as(u32, 1), r.grounded);
+    try std.testing.expectEqualStrings("Alpha  betagamma [[1]](https://one.example/a)", r.out);
 }

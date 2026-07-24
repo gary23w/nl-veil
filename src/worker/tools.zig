@@ -2172,7 +2172,10 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(gpa);
             buf.appendSlice(gpa, existing) catch {};
-            buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ wpath, final_bytes }) catch "") catch {};
+            if (std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ wpath, final_bytes })) |ln| {
+                defer gpa.free(ln);
+                buf.appendSlice(gpa, ln) catch {};
+            } else |_| {}
             std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
         }
         recordRoundWrite(ctx, wpath);
@@ -2461,7 +2464,10 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
                     var buf: std.ArrayListUnmanaged(u8) = .empty;
                     defer buf.deinit(gpa);
                     buf.appendSlice(gpa, existing) catch {};
-                    buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, ap.content.len }) catch "") catch {};
+                    if (std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, ap.content.len })) |ln| {
+                        defer gpa.free(ln);
+                        buf.appendSlice(gpa, ln) catch {};
+                    } else |_| {}
                     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
                 }
                 recordRoundWrite(ctx, npath);
@@ -2622,7 +2628,10 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             var buf: std.ArrayListUnmanaged(u8) = .empty;
             defer buf.deinit(gpa);
             buf.appendSlice(gpa, existing) catch {};
-            buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, res.bytes.len }) catch "") catch {};
+            if (std.fmt.allocPrint(gpa, "{s}|{d}\n", .{ npath, res.bytes.len })) |ln| {
+                defer gpa.free(ln);
+                buf.appendSlice(gpa, ln) catch {};
+            } else |_| {}
             std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = mpath, .data = buf.items }) catch {};
         }
         recordRoundWrite(ctx, npath);
@@ -4223,7 +4232,10 @@ fn crawlPageFit(ctx: *ToolCtx, url: []const u8, query: []const u8, max: usize) [
 fn queryEncode(gpa: std.mem.Allocator, q: []const u8) []u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     for (q) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') out.append(gpa, c) catch {} else if (c == ' ') out.append(gpa, '+') catch {} else out.appendSlice(gpa, std.fmt.allocPrint(gpa, "%{X:0>2}", .{c}) catch "") catch {};
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') out.append(gpa, c) catch {} else if (c == ' ') out.append(gpa, '+') catch {} else {
+            var pb: [3]u8 = undefined;
+            out.appendSlice(gpa, std.fmt.bufPrint(&pb, "%{X:0>2}", .{c}) catch "") catch {};
+        }
     }
     return out.toOwnedSlice(gpa) catch (gpa.dupe(u8, q) catch @constCast(""));
 }
@@ -4299,7 +4311,10 @@ pub fn crawlSearchPrim(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, tag:
 
     var hb: std.ArrayListUnmanaged(u8) = .empty;
     defer hb.deinit(gpa);
-    for (cd) |c| hb.appendSlice(gpa, std.fmt.allocPrint(gpa, "{d}\n", .{c}) catch "") catch {};
+    for (cd) |c| {
+        var nb: [24]u8 = undefined;
+        hb.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}\n", .{c}) catch "") catch {};
+    }
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = hpath, .data = hb.items }) catch {};
 
     if (!got) {
@@ -5901,7 +5916,10 @@ fn recordRoundWrite(ctx: *ToolCtx, path: []const u8) void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(gpa);
     buf.appendSlice(gpa, existing) catch {};
-    buf.appendSlice(gpa, std.fmt.allocPrint(gpa, "{d}|{s}|{s}\n", .{ ctx.round, ctx.mind, path }) catch "") catch {};
+    if (std.fmt.allocPrint(gpa, "{d}|{s}|{s}\n", .{ ctx.round, ctx.mind, path })) |ln| {
+        defer gpa.free(ln);
+        buf.appendSlice(gpa, ln) catch {};
+    } else |_| {}
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = rp, .data = buf.items }) catch {};
 }
 
