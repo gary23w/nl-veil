@@ -796,7 +796,7 @@ pub const SCHEMA =
     \\{"type":"function","function":{"name":"delete_file","description":"Delete a file you created in your build workdir (clean up a dead end, a wrong scaffold, or junk).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"host_status","description":"Read the LIVE state of the host/machine you are operating (its telemetry: mode, threat_score, processes, connections, persistence, infections). Call it to see the current state before you act and again after you act to VERIFY. Returns the raw telemetry.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"host_command","description":"OPERATE the host: issue ONE command to it directly (this is how you actually act on the machine — do NOT write files describing a fix). Use it to remediate: remove_persistence <unit> (the ROOT CAUSE), kill_proc <pid|name>, block_ip <ip>, restore_file <path>, isolate, scan. To fully clean an infection, remove its persistence AND block its C2 AND kill its process.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"one command line, e.g. 'remove_persistence sysupdate.timer'"}},"required":["command"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Automatically escalates to a browser-impersonating client (curl_cffi TLS/JA3 fingerprint) when a plain fetch hits a bot gate (Cloudflare/Datadome), so many blocked pages come through anyway. Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — returns the top results, each WITH a short excerpt of the source's actual page text (auto-fetched + fit to your query), so you usually don't need a separate fetch. For current events just search the topic + a date.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body (not HTML-stripped). Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -884,7 +884,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"run_tests","description":"Run the deliverable's test suite (pytest, else a test_*.py) in your build workdir and get the pass/fail output. VERIFY your code after writing or patching it — write, run_tests, fix, run_tests again. This is how you make sure a change actually works.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"delete_file","description":"Delete a file you created in your build workdir (clean up a dead end, a wrong scaffold, or junk).","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}},
-    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
+    \\{"type":"function","function":{"name":"web_fetch","description":"Fetch a URL and return its clean, readable text (our in-house crawler strips tags + prunes boilerplate + cites links). Automatically escalates to a browser-impersonating client (curl_cffi TLS/JA3 fingerprint) when a plain fetch hits a bot gate (Cloudflare/Datadome), so many blocked pages come through anyway. Optional 'query' fits the page to your topic and returns only the most relevant parts. Use it to read a page you already have the URL for.","parameters":{"type":"object","properties":{"url":{"type":"string"},"query":{"type":"string","description":"optional: a topic/question to fit the page to — returns only the parts that match"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — returns the top results, each WITH a short excerpt of the source's actual page text (auto-fetched + fit to your query), so you usually don't need a separate fetch. For current events just search the topic + a date.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"],"description":"web=general (default), or a specific source"},"limit":{"type":"integer","description":"max results (default 5)"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"fetch_json","description":"HTTP GET a JSON/text API endpoint and return the raw body (not HTML-stripped). Use for REST/JSON APIs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS and works on sites a plain fetch can't. Prefer this over web_fetch for real articles/pages.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
@@ -4097,11 +4097,63 @@ fn decodeEntity(s: []const u8) ?Entity {
     return null;
 }
 
+/// Should the fetch ESCALATE to the impersonating client? True when the body carries an anti-bot/paywall
+/// marker (reuses the existing looksBlocked signal set — Cloudflare "Just a moment", captcha, 403, …) OR is
+/// a near-empty stub (a block/redirect page that returned almost nothing). A false positive costs one extra
+/// curl_cffi attempt; a false negative just keeps the plain-curl body. Cheap substring/length checks only.
+fn botGated(body: []const u8) bool {
+    return body.len < 240 or looksBlocked(body);
+}
+
+/// Fetch a URL through curl_cffi (Python), impersonating a real Chrome TLS/JA3/HTTP2 fingerprint — the
+/// undetectable path that clears Cloudflare/Imperva/Datadome gates a plain curl cannot. HTTP-only (no JS):
+/// the belt for APIs, static pages, and bot-gated content; JS-rendered pages still want the browser driver.
+/// Writes the body to `tmp`, reads it back. Returns "" when python or curl_cffi is absent — this is a
+/// FALLBACK, so absence is silent (the caller keeps whatever the plain curl got), not a dep hint.
+fn curlCffiTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
+    const py = if (builtin.os.tag == .windows) "python" else "python3";
+    // argv-passed url + outpath + timeout — no shell, no escaping hazard. r.content is raw bytes (HTML/JSON).
+    const snippet =
+        \\import sys
+        \\try:
+        \\    from curl_cffi import requests
+        \\    r = requests.get(sys.argv[1], impersonate="chrome124", timeout=int(sys.argv[3]), allow_redirects=True)
+        \\    open(sys.argv[2], "wb").write(r.content)
+        \\except Exception:
+        \\    pass
+    ;
+    var tb: [8]u8 = undefined;
+    const ts = std.fmt.bufPrint(&tb, "{d}", .{@min(deadline_ms / 1000, 30)}) catch "20";
+    // clear any stale tmp so a failed run reads back as "" rather than the previous body
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    _ = spawnGuarded(io, &.{ py, "-c", snippet, url, tmp, ts }, deadline_ms);
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
+    std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    return raw;
+}
+
 /// curl a page with a BROWSER user-agent. The bot UA in curlToText is what makes sites block a plain curl; a
 /// browser UA makes a direct fetch work on most sites (and is what SERPs need). Primitive (no ToolCtx):
 /// browser-UA curl into `tmp`, guarded, read back. Lets non-tool callers (the engine's retrieval seed) reuse
 /// the exact same fetch. Caller frees the returned body.
+///
+/// curl_cffi ESCALATION: a plain curl still loses the TLS-fingerprint arms race against Cloudflare/Datadome.
+/// `.escalate` (the default) runs plain curl first and only retries through the impersonating client when the
+/// body looks gated (botGated) — the common case pays nothing, the hard case gets the stronger client.
+/// `.primary` tries curl_cffi FIRST (plain curl the fallback); `.off` disables it. Both paths degrade to each
+/// other, and to the dep hint only if BOTH clients are unavailable. The knob is NL_CURL_CFFI (read by the
+/// ctx-carrying wrapper `curlBrowser`); ctx-less callers pass `.escalate`.
+const CffiMode = enum { escalate, primary, off };
 fn curlBrowserTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
+    return curlBrowserMode(io, gpa, tmp, url, deadline_ms, limit, .escalate);
+}
+fn curlBrowserMode(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []const u8, deadline_ms: u32, limit: usize, mode: CffiMode) []u8 {
+    if (mode == .primary) {
+        const imp = curlCffiTo(io, gpa, tmp, url, deadline_ms, limit);
+        if (imp.len > 0 and !botGated(imp)) return imp;
+        gpa.free(imp); // impersonation unavailable or still gated — fall through to plain curl
+    }
+
     var av: std.ArrayListUnmanaged([]const u8) = .empty;
     defer av.deinit(gpa);
     av.appendSlice(gpa, &.{ "curl", "-sSL", "--max-time", "20", "--connect-timeout", "10", "-o", tmp, "-A", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36", "-H", "Accept-Language: en-US,en;q=0.9", url }) catch return dupe(gpa, "");
@@ -4111,14 +4163,32 @@ fn curlBrowserTo(io: std.Io, gpa: std.mem.Allocator, tmp: []const u8, url: []con
     }
     const raw = std.Io.Dir.cwd().readFileAlloc(io, tmp, gpa, .limited(limit)) catch (gpa.dupe(u8, "") catch @constCast(""));
     std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
+    // ESCALATE: plain curl came back gated (Cloudflare/Datadome/near-empty) — retry once through the
+    // impersonating client, which clears most such gates. Keep whichever body is real and un-gated.
+    if (mode == .escalate and botGated(raw)) {
+        const imp = curlCffiTo(io, gpa, tmp, url, deadline_ms, limit);
+        if (imp.len > 0 and !botGated(imp)) {
+            gpa.free(raw);
+            return imp;
+        }
+        gpa.free(imp);
+    }
     return raw;
+}
+
+/// Map NL_CURL_CFFI to a mode: "0"/"off" → off; "1"/"always"/"primary" → primary; anything else → escalate.
+fn cffiMode(ctx: *ToolCtx) CffiMode {
+    const v = ctx.environ.get("NL_CURL_CFFI") orelse return .escalate;
+    if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return .off;
+    if (std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "always") or std.ascii.eqlIgnoreCase(v, "primary")) return .primary;
+    return .escalate;
 }
 
 fn curlBrowser(ctx: *ToolCtx, url: []const u8, deadline_ms: u32, limit: usize) []u8 {
     const gpa = ctx.gpa;
     const tmp = std.fmt.allocPrint(gpa, "{s}/.crawl-{s}.tmp", .{ ctx.run_dir, ctx.mind }) catch return dupe(gpa, "");
     defer gpa.free(tmp);
-    return curlBrowserTo(ctx.io, gpa, tmp, url, deadline_ms, limit);
+    return curlBrowserMode(ctx.io, gpa, tmp, url, deadline_ms, limit, cffiMode(ctx));
 }
 
 /// fetch a URL (browser UA) and run it through the crawl4ai-port cleaner -> clean LLM-ready markdown. "" on thin output.
