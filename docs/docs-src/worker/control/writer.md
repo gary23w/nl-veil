@@ -26,4 +26,4 @@ Behind `veil stop <id>` (`{"op":"stop"}`), `veil hub all "<text>"` (broadcast `s
 
 ---
 
-*Documentation generated for nl-veil — worker/control/writer.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

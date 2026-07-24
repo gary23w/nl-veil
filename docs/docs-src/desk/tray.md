@@ -41,4 +41,4 @@ Single-threaded despite looking event-driven: the Win32 WndProc runs on the main
 
 ---
 
-*Documentation generated for nl-veil — desk/tray.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

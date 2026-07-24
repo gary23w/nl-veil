@@ -26,4 +26,4 @@ The event surface every watcher reads: `veil events <id> [--follow]` tails the c
 
 ---
 
-*Documentation generated for nl-veil — worker/control/fanout.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

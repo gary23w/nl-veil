@@ -37,4 +37,4 @@ Concurrency: one io-owning thread + a Store mutex is the entire model. Everythin
 
 ---
 
-*Documentation generated for nl-veil — desk/poller.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

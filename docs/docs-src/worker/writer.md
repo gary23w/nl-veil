@@ -2,34 +2,52 @@
 
 **File:** `src/worker/writer.zig`  
 **Module:** `worker`  
-**Description:** Output generation and formatting: produces structured responses, markdown output, code blocks, and report formatting for agent deliverables.
+**Description:** The small-model WRITING faculty — a grounding scaffold that makes a weak model produce coherent, grounded artifacts instead of fabricating. Sources are numbered so the model cites by [N] and never types a URL it could invent.
 
 ---
 
 ## Purpose Summary
 
-Output generation and formatting: produces structured responses, markdown output, code blocks, and report formatting for agent deliverables.
+A weak model asked to "write about X with sources" will invent links. This module removes that
+option: the engine retrieves real sources itself, shows the model only numbered titles, then
+resolves every `[N]` back to the verified URL and strips anything the model invented anyway.
 
 ## Key Exports
 
-- `Writer` struct — output formatter
-- `write(output)` — write formatted result
-- `format_markdown()` — convert to markdown
-- `WriterConfig` — output format and destination
+- `MAX_SOURCES` — cap on the numbered source list (12)
+- `compose(w, ground, topic, context, round)` — the writing entry: grounded in fetched sources, or
+  synthesized from the hive's own knowledge when `ground` is false
+- `normalizeFacts(w, candidates, evidence)` / `normalizeMessage(w, raw, evidence)` — the same
+  grounding affect applied to a weak model's lexical writes (memory, messages)
+
+Internal machinery (unit-tested against fixed buffers):
+
+- `buildNumberedSources` — parses fetched "- TITLE / URL / snippet" text into `[1] title …` display
+  text with a parallel array of real URLs; dedups; the model-visible text carries NO urls
+- `resolveCitations` — replaces each valid `[N]` with a real markdown link, drops out-of-range
+  numbers, strips model-typed links and bare URLs ("(source unverified)"), removes storage-wrapper
+  noise; returns `cited` (valid citation occurrences) and `grounded` (distinct sources used)
+- `seedSources` — engine-side retrieval via the shared web-search chain, with per-round seed and
+  domain-diversity accounting for the publish gates
 
 ## Dependencies
 
-- `worker/commons` — config types
-- Standard library: io, formatting
+- `worker/run` (`Worker`) — the swarm runtime this faculty serves
+- `worker/tools` — `searchWeb`, the shared retrieval chain
 
 ## Usage Context
 
-Called by AGI worker and RSI engine to produce formatted outputs, reports, and deliverables.
+General machinery with NO baked-in use case: subject, persona, tone, and structure come from the
+swarm's goal text; a news desk, research desk, and status desk all use the same `compose`.
+Publishing is a separate concern (run.zig orchestrates it) — this module never references any
+publishing capability.
 
 ## Notable Implementation Details
 
-Supports multiple output formats (markdown, plaintext, JSON). Uses Zig's `std.fmt` for type-safe formatting. Large outputs are streamed rather than buffered entirely.
+The enforced RAG floor: the model can only reference a source by number, so a fabricated citation
+is structurally impossible — an out-of-range `[N]` simply disappears in resolution, a typed URL is
+replaced with "(source unverified)", and `grounded`/`cited` counts feed the acceptance gates.
 
 ---
 
-*Documentation generated for nl-veil — writer.zig source analysis.*
+*Case file grounded in the module's `//!` header, public API, and its tests.*

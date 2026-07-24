@@ -21,28 +21,28 @@
       { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
-      { p: 'admin/admin_service', c: 'AD-01', t: 'Core admin service — API admin operations', s: 'admin_service.zig' }
+      { p: 'admin/admin_service', c: 'AD-01', t: 'Admin service — god-mode handlers, every action audited', s: 'admin_service.zig' }
     ]},
     { key: 'auth/', label: 'AUTH — WHO GOES THERE', docs: [
-      { p: 'auth/api_keys', c: 'AU-01', t: 'API key management — creation, rotation, revocation', s: 'api_keys.zig' },
-      { p: 'auth/auth_api', c: 'AU-02', t: 'Authentication HTTP API endpoints', s: 'auth_api.zig' },
-      { p: 'auth/auth_core', c: 'AU-03', t: 'Core authentication — tokens, sessions, validation', s: 'auth_core.zig' },
-      { p: 'auth/login_guard', c: 'AU-04', t: 'Login guard — rate limiting, brute-force protection', s: 'login_guard.zig' }
+      { p: 'auth/api_keys', c: 'AU-01', t: 'API keys — nlk_ bearer keys, only hashes stored', s: 'api_keys.zig' },
+      { p: 'auth/auth_api', c: 'AU-02', t: 'Auth API — register/login/logout/me, thin shims over auth_core', s: 'auth_api.zig' },
+      { p: 'auth/auth_core', c: 'AU-03', t: 'Auth core — users and sessions on neuron-db, argon2id', s: 'auth_core.zig' },
+      { p: 'auth/login_guard', c: 'AU-04', t: 'Login guard — five fails per IP, five-minute lockout', s: 'login_guard.zig' }
     ]},
     { key: 'config/', label: 'CONFIG — THE VAULT', docs: [
-      { p: 'config/key_vault', c: 'CF-01', t: 'Encrypted key vault — secure storage for secrets', s: 'key_vault.zig' },
-      { p: 'config/keys_api', c: 'CF-02', t: 'Key management HTTP API', s: 'keys_api.zig' }
+      { p: 'config/key_vault', c: 'CF-01', t: 'Key vault — write-only BYOK: seal in, never read out', s: 'key_vault.zig' },
+      { p: 'config/keys_api', c: 'CF-02', t: 'Keys API — POST sealed, GET metadata, DELETE by provider', s: 'keys_api.zig' }
     ]},
     { key: 'gateway/', label: 'GATEWAY — THE ONLY DOOR IN', docs: [
       { p: 'gateway/http', c: 'GW-01', t: 'HTTP gateway — routing, middleware pipeline', s: 'http.zig' }
     ]},
     { key: 'obs/', label: 'OBS — THE RECORD', docs: [
-      { p: 'obs/audit_log', c: 'OB-01', t: 'Audit log — structured event recording', s: 'audit_log.zig' }
+      { p: 'obs/audit_log', c: 'OB-01', t: 'Audit log — append-only, hash-chained privileged-action trail', s: 'audit_log.zig' }
     ]},
     { key: 'plan/', label: 'PLAN — THE LEDGER', docs: [
-      { p: 'plan/billing_seam', c: 'PL-01', t: 'Billing seam — pricing and metering integration', s: 'billing_seam.zig' },
-      { p: 'plan/entitlements', c: 'PL-02', t: 'Entitlements — feature gating by plan level', s: 'entitlements.zig' },
-      { p: 'plan/neurons', c: 'PL-03', t: 'Neuron plans — resource allocation models', s: 'neurons.zig' }
+      { p: 'plan/billing_seam', c: 'PL-01', t: 'Billing seam — the checkout stub (billing not live)', s: 'billing_seam.zig' },
+      { p: 'plan/entitlements', c: 'PL-02', t: 'Entitlements — the enforcement wall: plan to caps, pure', s: 'entitlements.zig' },
+      { p: 'plan/neurons', c: 'PL-03', t: 'Neuron ledger — the metered-AI budget per user', s: 'neurons.zig' }
     ]},
     { key: 'worker/chat/', label: 'WORKER · CHAT — THE BRAIN (server-side)', note: 'the chat loop', docs: [
       { p: 'worker/chat/engine', c: 'CH-01', t: 'The chat brain — the server-side agentic turn loop', s: 'chat/engine.zig' },
@@ -58,19 +58,19 @@
       { p: 'worker/neuron/client', c: 'CT-05', t: 'Neuron client — the neuron-db memory bridge (fail-open)', s: 'neuron/client.zig' }
     ]},
     { key: 'worker/', label: 'WORKER — THE YARDS (runtime)', docs: [
-      { p: 'worker/run', c: 'WK-01', t: 'Run loop — the main worker execution cycle', s: 'run.zig' },
-      { p: 'worker/agi', c: 'WK-02', t: 'AGI worker core — the autonomous reasoning loop', s: 'agi.zig' },
-      { p: 'worker/oscillation', c: 'WK-03', t: 'Oscillation — adaptive recursion, state exploration', s: 'oscillation.zig' },
-      { p: 'worker/rsi', c: 'WK-04', t: 'RSI — the recursive self-improvement engine', s: 'rsi.zig' },
-      { p: 'worker/writer', c: 'WK-05', t: 'Writer — output generation and formatting', s: 'writer.zig' },
-      { p: 'worker/tools', c: 'WK-06', t: 'Tool system — definitions and dispatch', s: 'tools.zig' },
+      { p: 'worker/run', c: 'WK-01', t: 'Run — the hive worker process, the per-round tick loop', s: 'run.zig' },
+      { p: 'worker/agi', c: 'WK-02', t: 'AGI — the Veil: consciousness faculties over the worker', s: 'agi.zig' },
+      { p: 'worker/oscillation', c: 'WK-03', t: 'Oscillation — the worker gateway to neuron-db', s: 'oscillation.zig' },
+      { p: 'worker/rsi', c: 'WK-04', t: 'RSI — outcome-driven self-tuning (params, roles, playbook — never source)', s: 'rsi.zig' },
+      { p: 'worker/writer', c: 'WK-05', t: 'Writer — the grounding scaffold: numbered sources, resolved citations', s: 'writer.zig' },
+      { p: 'worker/tools', c: 'WK-06', t: 'Tools — the toolbelt: schema array in, executed tool_call out', s: 'tools.zig' },
       { p: 'worker/vcs', c: 'WK-07', t: 'VCS — version control for concurrent minds', s: 'vcs.zig' },
-      { p: 'worker/bufedit', c: 'WK-08', t: 'Buffer editor — file editing operations', s: 'bufedit.zig' },
-      { p: 'worker/crawl', c: 'WK-09', t: 'Web crawler — resource discovery and fetching', s: 'crawl.zig' },
-      { p: 'worker/hyperspace', c: 'WK-10', t: 'Hyperspace — vector embedding and similarity search', s: 'hyperspace.zig' },
-      { p: 'worker/llm', c: 'WK-11', t: 'LLM integration — inference, prompt management', s: 'llm.zig' },
+      { p: 'worker/bufedit', c: 'WK-08', t: 'Bufedit — line-addressable, anchor-based edit ops', s: 'bufedit.zig' },
+      { p: 'worker/crawl', c: 'WK-09', t: 'Crawl — HTML to clean markdown, density heuristic, no browser', s: 'crawl.zig' },
+      { p: 'worker/hyperspace', c: 'WK-10', t: 'Hyperspace — the working-memory oscillator over neuron-db', s: 'hyperspace.zig' },
+      { p: 'worker/llm', c: 'WK-11', t: 'LLM — the client: loopback via httpc, hosted via curl', s: 'llm.zig' },
       { p: 'worker/locs/atlas', c: 'WK-12', t: 'Atlas — the source atlas pointing scouts at nl-rag packs', s: 'locs/atlas.zig' },
-      { p: 'worker/commons', c: 'WK-13', t: 'Common utilities — shared helpers', s: 'commons.zig' }
+      { p: 'worker/commons', c: 'WK-13', t: 'Commons — the swarm message bus + event-sourced task board', s: 'commons.zig' }
     ]},
     { key: 'desk/', label: 'DESK — THE NATIVE DASHBOARD (veil-desk)', note: 'zig + raylib', docs: [
       { p: 'desk/main', c: 'DK-01', t: 'Entry point — borderless raylib window, render loop, tabs', s: 'main.zig' },
@@ -85,9 +85,10 @@
       { p: 'desk/theme', c: 'DK-10', t: 'Theme + widgets — immediate-mode raylib UI, Tokyo Night', s: 'theme.zig' },
       { p: 'desk/mdutil', c: 'DK-11', t: 'Markdown util — block classification, math, inline cleanup', s: 'mdutil.zig' },
       { p: 'desk/tray', c: 'DK-12', t: 'System tray — icon + native toasts (Windows), no-op on POSIX', s: 'tray.zig' },
-      { p: 'desk/catalog', c: 'DK-13', t: 'Model catalog — provider/model/option sets for the picker', s: 'catalog.zig' },
-      { p: 'desk/secrets', c: 'DK-14', t: 'Key at rest — DPAPI-sealed on Windows, plain file on POSIX', s: 'secrets.zig' },
-      { p: 'desk/log', c: 'DK-15', t: 'Logger — ring buffer to veil-desk.log + the F12 overlay', s: 'log.zig' }
+      { p: 'desk/catalog', c: 'DK-13', t: 'Model catalog — provider/model sets re-exported from models.yaml', s: 'catalog.zig' },
+      { p: 'desk/secrets', c: 'DK-14', t: 'Secrets — plaintext key files (legacy DPAPI unseal only)', s: 'secrets.zig' },
+      { p: 'desk/log', c: 'DK-15', t: 'Logger — ring buffer to veil-desk.log + the F12 overlay', s: 'log.zig' },
+      { p: 'desk/gitvc', c: 'DK-16', t: 'Gitvc — git + GitHub operations for the chat', s: 'gitvc.zig' }
     ]}
   ];
 

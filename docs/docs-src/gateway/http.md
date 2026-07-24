@@ -54,4 +54,4 @@ The server ALWAYS mints an admin API key and drops it at `{data}/.desktop_key`, 
 
 ---
 
-*Documentation generated for nl-veil — gateway/http.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

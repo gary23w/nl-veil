@@ -42,4 +42,4 @@ Integration seam is a SUBPROCESS PER OPERATION, not an in-process library: `run(
 
 ---
 
-*Documentation generated for nl-veil — desk/neuron.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

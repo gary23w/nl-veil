@@ -40,4 +40,4 @@ Everything is fixed-buffer POD (inline byte arrays + u8/u16 length fields, MAX_L
 
 ---
 
-*Documentation generated for nl-veil — desk/scan.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*

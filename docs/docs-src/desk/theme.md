@@ -43,4 +43,4 @@ The RING OF 24 SCRATCH BUFFERS (ZBUFS=24, each [2048]u8) is the load-bearing tri
 
 ---
 
-*Documentation generated for nl-veil — desk/theme.zig source analysis.*
+*Case file grounded in the module's `//!` header and public API.*
