@@ -15,7 +15,10 @@
       { p: 'guide/architecture', c: 'GD-01', t: 'Architecture — one server, three clients (web, desk, CLI)', s: 'main.zig · build.zig' },
       { p: 'guide/server', c: 'GD-02', t: 'Running a server — first login, the bind, the default model, accounts', s: 'main.zig · config/' },
       { p: 'guide/accounts', c: 'GD-03', t: 'Accounts and the sandbox — what a non-admin can and cannot do', s: 'worker/tools.zig' },
-      { p: 'guide/models', c: 'GD-04', t: 'The model trio — which call runs on coding, thinking or prompting, and how to choose', s: 'chat/engine.zig · llm.zig' }
+      { p: 'guide/models', c: 'GD-04', t: 'The model trio — which call runs on coding, thinking or prompting, and how to choose', s: 'chat/engine.zig · llm.zig' },
+      { p: 'guide/extensions', c: 'GD-05', t: 'Extending veil — themes and plugins across web, desk and CLI', s: 'plug/' },
+      { p: 'guide/themes', c: 'GD-06', t: 'Authoring a theme — the 16 palette slots, mono_ui, the workspace', s: 'plug/theme.zig' },
+      { p: 'guide/plugins', c: 'GD-07', t: 'Writing a plugin — tools, policy + prompt hooks, MCP, the sandbox', s: 'plug/plugins.zig · plug/lua.zig' }
     ]},
     { key: 'admin/', label: 'ADMIN — SYSTEM MANAGEMENT', docs: [
       { p: 'admin/admin_service', c: 'AD-01', t: 'Core admin service — API admin operations', s: 'admin_service.zig' }

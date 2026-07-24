@@ -57,7 +57,7 @@ pub fn isCommand(sub: []const u8) bool {
         "rm",        "delete",        "events", "logs",    "watch",     "chat",
         "sched",     "hub",           "doctor", "health",  "desktop",   "desk",
         "help",      "--help",        "-h",     "version", "--version", "exec-tool",
-        "sync-read", "sync-manifest", "rag",
+        "sync-read", "sync-manifest", "rag",    "themes",  "plugins",   "plug",
     };
     for (verbs) |v| if (std.mem.eql(u8, sub, v)) return true;
     return false;
@@ -90,6 +90,8 @@ pub fn dispatch(ctx: *Ctx, sub: []const u8, args: []const []const u8) u8 {
     if (std.mem.eql(u8, sub, "sync-manifest")) return exec_tool.cmdSyncManifest(ctx, args);
     if (std.mem.eql(u8, sub, "sync-read")) return exec_tool.cmdSyncRead(ctx, args);
     if (std.mem.eql(u8, sub, "rag")) return cmdRag(ctx, args);
+    if (std.mem.eql(u8, sub, "themes")) return cmdThemes(ctx, args);
+    if (std.mem.eql(u8, sub, "plugins") or std.mem.eql(u8, sub, "plug")) return cmdPlugins(ctx, args);
     std.debug.print("unknown command '{s}' — run `veil help`\n", .{sub});
     return 1;
 }
@@ -571,6 +573,13 @@ fn cmdHelp() u8 {
         \\  rag ingest <file>            absorb a LOCAL book/doc/notes into the hive as recallable facts (offline)
         \\      --scope S --name L --cap N --db <hive.sqlite>
         \\
+        \\EXTENSIONS (themes + plugins — see PLUGINS.md)
+        \\  themes [<id>]                list installed themes; an id prints that theme's 16-slot palette
+        \\      --json                   dump the raw /api/v1/themes reply (PUBLIC — no auth needed)
+        \\  plugins | plug               list loaded plugins (name, version, state, kind, #tools, error)
+        \\      --json                   dump the raw /api/v1/plugins reply
+        \\  plugins reload               rescan <data>/plugins + <data>/themes and swap the live registry (admin)
+        \\
         \\MISC
         \\  doctor                       check server + token health
         \\  desktop                      open the app window (same as a bare `veil`, but detached)
@@ -712,6 +721,154 @@ fn cmdRagIngest(ctx: *Ctx, path: []const u8, scope: []const u8, db_in: []const u
         out("WARNING: the scope hit its fact cap and evicted {d} oldest fact(s) during the load — only the tail is retained. Raise --cap / use a dedicated --scope.\n", .{st.evicted});
     out("absorbed {s}: {d} facts distilled, {d} stored into '{s}' ({s}).\nrecall them:  veil chat  →  \"what does {s} say about <topic>?\"  (or recall_hive; whole-document work: read_doc)\n", .{ label, st.facts, st.stored, target, db, label });
     return 0;
+}
+
+/// `veil themes [<id>] [--json]` — the theme registry (GET /api/v1/themes). That endpoint is PUBLIC, so this
+/// needs no auth; the bearer is still sent when present and the server simply ignores it. Bare form prints a
+/// table (id, name, mode, mono, builtin, accent = the `blue` slot); an id prints that one theme's full 16-slot
+/// palette (slot + #hex per line); `--json` dumps the raw endpoint reply for scripts.
+fn cmdThemes(ctx: *Ctx, args: []const []const u8) u8 {
+    const theme = @import("plug/theme.zig"); // the FROZEN slot_names list, shared with the desk + web + endpoint
+    var want_json = false;
+    var id: []const u8 = "";
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--json")) want_json = true else if (a.len > 0 and a[0] != '-' and id.len == 0) id = a;
+    }
+    const resp = call(ctx, "GET", "/api/v1/themes", null, 6, true) catch return unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status != 200) {
+        std.debug.print("themes failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        return 1;
+    }
+    if (want_json) {
+        out("{s}\n", .{resp.body});
+        return 0;
+    }
+    // `veil themes <id>` — that one theme's full palette. Slot names only ever appear inside the nested
+    // `colors` object, so a whole-object field lookup pulls each slot's hex cleanly.
+    if (id.len > 0) {
+        var it = JsonObjs.init(resp.body);
+        while (it.next()) |obj| {
+            const tid = jsonStr(ctx.gpa, obj, "id") orelse continue;
+            defer ctx.gpa.free(tid);
+            if (!std.mem.eql(u8, tid, id)) continue;
+            const nm = jsonStr(ctx.gpa, obj, "name") orelse ctx.gpa.dupe(u8, "") catch return 1;
+            defer ctx.gpa.free(nm);
+            out("theme {s} — {s}\n", .{ tid, nm });
+            out("  mode: {s}   mono: {s}   builtin: {s}\n", .{
+                if (jsonBool(obj, "dark")) "dark" else "light",
+                if (jsonBool(obj, "mono_ui")) "yes" else "no",
+                if (jsonBool(obj, "builtin")) "yes" else "no",
+            });
+            for (theme.slot_names) |slot| {
+                const hex = jsonStr(ctx.gpa, obj, slot) orelse ctx.gpa.dupe(u8, "?") catch continue;
+                defer ctx.gpa.free(hex);
+                out("  {s: <8}  {s}\n", .{ slot, hex });
+            }
+            return 0;
+        }
+        std.debug.print("no theme with id '{s}' — run `veil themes` to list them\n", .{id});
+        return 1;
+    }
+    // the table
+    var it = JsonObjs.init(resp.body);
+    out("{s: <14}  {s: <18}  {s: <6}  {s: <5}  {s: <8}  {s}\n", .{ "ID", "NAME", "MODE", "MONO", "BUILTIN", "ACCENT" });
+    var count: usize = 0;
+    while (it.next()) |obj| {
+        const tid = jsonStr(ctx.gpa, obj, "id") orelse continue;
+        defer ctx.gpa.free(tid);
+        const nm = jsonStr(ctx.gpa, obj, "name") orelse ctx.gpa.dupe(u8, "") catch continue;
+        defer ctx.gpa.free(nm);
+        const accent = jsonStr(ctx.gpa, obj, "blue") orelse ctx.gpa.dupe(u8, "") catch continue;
+        defer ctx.gpa.free(accent);
+        out("{s: <14}  {s: <18}  {s: <6}  {s: <5}  {s: <8}  {s}\n", .{
+            tid[0..@min(tid.len, 14)],
+            nm[0..@min(nm.len, 18)],
+            if (jsonBool(obj, "dark")) "dark" else "light",
+            if (jsonBool(obj, "mono_ui")) "yes" else "no",
+            if (jsonBool(obj, "builtin")) "yes" else "no",
+            accent,
+        });
+        count += 1;
+    }
+    if (count == 0) out("(no themes)\n", .{});
+    return 0;
+}
+
+/// `veil plugins [reload] [--json]` (alias `plug`) — the extension registry. GET /api/v1/plugins requires an
+/// authenticated user; the CLI sends the admin .desktop_key as its bearer, so it works wherever that key is
+/// readable. A 401/403 (no local key, e.g. a remote host) prints a clear note and — for the read — exits
+/// clean rather than dumping a bare status. `reload` (POST /api/v1/plugins/reload) is admin-only.
+fn cmdPlugins(ctx: *Ctx, args: []const []const u8) u8 {
+    var want_json = false;
+    var do_reload = false;
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--json")) want_json = true else if (std.mem.eql(u8, a, "reload") or std.mem.eql(u8, a, "rescan")) do_reload = true;
+    }
+    if (do_reload) {
+        const resp = call(ctx, "POST", "/api/v1/plugins/reload", "{}", 20, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status == 401 or resp.status == 403) {
+            pluginsAuthNote(ctx);
+            return 1; // the admin reload did not happen — a non-zero code so a script sees the failure
+        }
+        if (resp.status != 200) {
+            std.debug.print("reload failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+            return 1;
+        }
+        out("reloaded: {d} plugins, {d} themes\n", .{ jsonNum(resp.body, "plugins"), jsonNum(resp.body, "themes") });
+        return 0;
+    }
+    const resp = call(ctx, "GET", "/api/v1/plugins", null, 6, true) catch return unreachable_msg(ctx);
+    defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+    if (resp.status == 401 or resp.status == 403) {
+        pluginsAuthNote(ctx);
+        return 0; // read-only query behind auth — exit clean (this just isn't the machine with the key)
+    }
+    if (resp.status != 200) {
+        std.debug.print("plugins failed (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 200)] });
+        return 1;
+    }
+    if (want_json) {
+        out("{s}\n", .{resp.body});
+        return 0;
+    }
+    var it = JsonObjs.init(resp.body);
+    out("{s: <18}  {s: <9}  {s: <7}  {s: <7}  {s: <5}  {s}\n", .{ "NAME", "VERSION", "STATE", "KIND", "TOOLS", "ERROR" });
+    var count: usize = 0;
+    while (it.next()) |obj| {
+        const nm = jsonStr(ctx.gpa, obj, "name") orelse continue;
+        defer ctx.gpa.free(nm);
+        const ver = jsonStr(ctx.gpa, obj, "version") orelse ctx.gpa.dupe(u8, "") catch continue;
+        defer ctx.gpa.free(ver);
+        const state = jsonStr(ctx.gpa, obj, "state") orelse ctx.gpa.dupe(u8, "?") catch continue;
+        defer ctx.gpa.free(state);
+        const kind = jsonStr(ctx.gpa, obj, "kind") orelse ctx.gpa.dupe(u8, "?") catch continue;
+        defer ctx.gpa.free(kind);
+        // The error column is only meaningful on a failed row; ok rows carry an empty string, so it prints blank.
+        const err = jsonStr(ctx.gpa, obj, "error") orelse ctx.gpa.dupe(u8, "") catch continue;
+        defer ctx.gpa.free(err);
+        out("{s: <18}  {s: <9}  {s: <7}  {s: <7}  {d: <5}  {s}\n", .{
+            nm[0..@min(nm.len, 18)],
+            ver[0..@min(ver.len, 9)],
+            state[0..@min(state.len, 7)],
+            kind[0..@min(kind.len, 7)],
+            jsonArrayLen(obj, "tools"),
+            err[0..@min(err.len, 80)],
+        });
+        count += 1;
+    }
+    if (count == 0) out("(no plugins loaded — drop a *.lua in <data>/plugins, then `veil plugins reload`)\n", .{});
+    return 0;
+}
+
+/// Explain a plugins 401/403: the read needs an authenticated session, which the CLI gets from the server's
+/// local admin key. Tailored to whether a key was even found, so the fix is concrete.
+fn pluginsAuthNote(ctx: *Ctx) void {
+    if (ctx.token_len == 0)
+        out("plugins need an authenticated session, but no admin key was found at {s}/.desktop_key. Start the server once on this machine (run `veil`) to mint it, then retry.\n", .{ctx.data})
+    else
+        out("plugins need an authenticated session and the local admin key at {s}/.desktop_key was not accepted. Run this on the machine that owns the server's session/key.\n", .{ctx.data});
 }
 
 // cmdChat + cmdHub are substantial enough to live in their own files (kept here as thin entry points).
@@ -1009,6 +1166,53 @@ pub fn jsonNum(json: []const u8, field: []const u8) u64 {
     return std.fmt.parseInt(u64, val[0..end], 10) catch 0;
 }
 
+/// A boolean field's value (false when absent / non-boolean). Reads the literal right after `"field":`.
+fn jsonBool(json: []const u8, field: []const u8) bool {
+    const val = rawField(json, field) orelse return false;
+    return std.mem.startsWith(u8, val, "true");
+}
+
+/// Number of top-level elements in the JSON array at `field` (0 when absent or empty). String- and
+/// nest-aware: separators inside nested strings/arrays/objects don't inflate the count — so a plugin's
+/// `#tools` is read without materializing the array.
+fn jsonArrayLen(json: []const u8, field: []const u8) usize {
+    const val = rawField(json, field) orelse return 0;
+    if (val.len == 0 or val[0] != '[') return 0;
+    var i: usize = 1;
+    var depth: usize = 1; // already inside the array's opening '['
+    var in_str = false;
+    var esc = false;
+    var commas: usize = 0;
+    var any = false;
+    while (i < val.len) : (i += 1) {
+        const c = val[i];
+        if (in_str) {
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => {
+                in_str = true;
+                any = true;
+            },
+            '[', '{' => {
+                depth += 1;
+                any = true;
+            },
+            ']', '}' => {
+                depth -= 1;
+                if (depth == 0) break; // the array's own closing bracket
+            },
+            ',' => if (depth == 1) {
+                commas += 1;
+            },
+            ' ', '\t', '\n', '\r' => {},
+            else => any = true,
+        }
+    }
+    return if (any) commas + 1 else 0;
+}
+
 /// The raw bytes right after `"field":` (whitespace-trimmed) up to the object's logical end. Finds the field
 /// as a real key: scans for `"field"` then requires the next non-space char to be `:`.
 fn rawField(json: []const u8, field: []const u8) ?[]const u8 {
@@ -1111,6 +1315,18 @@ test "jsonStr pulls a key value, string-aware" {
     defer gpa.free(goal);
     try std.testing.expectEqualStrings("build a {thing}", goal);
     try std.testing.expectEqual(@as(u64, 3), jsonNum(j, "minds"));
+}
+
+test "jsonBool and jsonArrayLen read flat fields, nest- and string-safe" {
+    const j = "{\"dark\":true,\"mono_ui\":false,\"tools\":[\"a\",\"b\",\"c\"]}";
+    try std.testing.expect(jsonBool(j, "dark"));
+    try std.testing.expect(!jsonBool(j, "mono_ui"));
+    try std.testing.expect(!jsonBool(j, "absent"));
+    try std.testing.expectEqual(@as(usize, 3), jsonArrayLen(j, "tools"));
+    try std.testing.expectEqual(@as(usize, 0), jsonArrayLen(j, "absent"));
+    try std.testing.expectEqual(@as(usize, 0), jsonArrayLen("{\"tools\":[]}", "tools"));
+    // a comma inside a quoted element must not inflate the count
+    try std.testing.expectEqual(@as(usize, 2), jsonArrayLen("{\"tools\":[\"a,b\",\"c\"]}", "tools"));
 }
 
 test "JsonObjs walks array objects inside an envelope, brace-in-string safe" {

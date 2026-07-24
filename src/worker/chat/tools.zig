@@ -23,6 +23,7 @@ const recipes = @import("../recipes.zig");
 const osc = @import("../oscillation.zig");
 const sup_mod = @import("../control/supervisor.zig"); // readTail (bounded event-log reads for swarm_status)
 const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled runs live under _sched/{task}/runs/)
+const plugins = @import("../../plug/plugins.zig"); // plugin registry: policy gate + plug_* tool dispatch on the direct tool surface
 
 const App = http.App;
 const requireUser = http.requireUser;
@@ -395,7 +396,16 @@ fn runMindTool(app: *App, u: http.User, tool: []const u8, args: []const u8, conv
         .caps = if (roam) .full else .sandboxed,
         .grants = resolveRecipeGrants(app, u, res.arena),
     };
-    const result = tools.execute(&ctx, tool, args);
+    // PLUGIN LAYER on the direct tool surface (the desk/CLI calls this endpoint, and a delegated plugin
+    // tool lands here). Same two hooks the engine drive loop runs: policy veto first (a denial becomes the
+    // result), then plug_<name>_<tool> dispatch to the plugin executor. Server-side by construction — the
+    // Lua VM lives here, so a plugin tool is never handed back to the client to run.
+    const admin_now = app.auth.isAdmin(u);
+    const result = if (plugins.current(&app.plugs)) |preg| blk: {
+        if (preg.policyGate(app.gpa, uid, admin_now, conv, tool, args)) |denial| break :blk denial;
+        if (preg.ownsTool(tool)) break :blk preg.execTool(app.gpa, tool, args);
+        break :blk tools.execute(&ctx, tool, args);
+    } else tools.execute(&ctx, tool, args);
     // A tool result can carry arbitrary bytes (web_fetch/read_url page text) — httpz res.json requires valid
     // UTF-8, so scrub invalid sequences to U+FFFD-as-'?' in place before serializing. Guard the free: an OOM
     // dupe() fallback in execute() can hand back a static "" (len 0) that must NOT be freed.

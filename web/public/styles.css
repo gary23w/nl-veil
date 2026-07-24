@@ -117,6 +117,13 @@
   color-scheme: dark;
 }
 
+/* A fetched theme may ask for its monospace face across the whole UI, not just
+   code blocks — the desk's mono_ui flag. applyTheme() toggles this class on
+   <html> when the active theme sets it; every other theme keeps the default
+   --font-ui. The full palette itself is applied inline by app.js from the
+   /api/v1/themes endpoint, so there is nothing else theme-specific to add here. */
+:root.mono-ui, .mono-ui { --font-ui: var(--font-mono); }
+
 /* ============================================================ base */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 

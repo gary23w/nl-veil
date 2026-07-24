@@ -373,6 +373,12 @@ FLEET
   hub goal "<text>"            set a new goal on every swarm
   hub stopall                  stop every swarm
 
+EXTENSIONS (themes + plugins — see PLUGINS.md)
+  themes                       list every theme (built-in + user)
+  themes <id>                  print one theme's full palette
+  plugins                      list loaded plugins, their tools + state
+  plugins reload               admin: rescan <data>/plugins + <data>/themes, hot-swap
+
 MISC
   doctor | health              check server + token health
   desktop | desk               open the app window (like a bare `veil`, but detached)
@@ -387,6 +393,28 @@ Cast in one line and watch it work:
 veil cast "Build a CLI todo app in Python with tests" --follow
 veil deploy "Keep researching fusion power and brief me each pass" --style discourse
 veil cast "add a search box to my landing page" --offline
+```
+
+## Make it your own — themes & plugins
+
+veil is extensible without a rebuild. Drop a Lua file into your data directory and it works across the
+whole product — web, desktop, and CLI:
+
+- **Themes** (`<data>/themes/*.lua`) re-skin everything. The shipped `dark`, `light`, and `matrix` themes
+  are seeded there on first run; copy one, change the `id` and a few of the 16 colors, and it appears in
+  every client's theme picker. `mono_ui = true` renders the whole UI in the code font (that's how `matrix`
+  gets its terminal look).
+- **Plugins** (`<data>/plugins/<name>/plugin.lua`) add tools the AI can call, **policy** hooks that gate
+  what runs, and **prompt** hooks that shape every turn — all in a locked-down Lua sandbox. You can also
+  bridge an external MCP server so its tools become veil tools.
+
+The complete, copy-paste authoring guide — the `veil.*` API, the hook reference, the sandbox model, and
+templates for both — is in **[PLUGINS.md](PLUGINS.md)**.
+
+```sh
+veil themes            # every theme, built-in and yours
+veil plugins           # loaded plugins, their tools and state
+veil plugins reload    # admin: pick up changes with no restart
 ```
 
 ## The chat brain runs in the server

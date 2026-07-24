@@ -28,8 +28,6 @@ fn hex(comptime s: []const u8) Color {
     return .{ .r = hexByte(s[0], s[1]), .g = hexByte(s[2], s[3]), .b = hexByte(s[4], s[5]), .a = 255 };
 }
 
-pub const Scheme = enum(u8) { dark = 0, light = 1, matrix = 2 };
-
 const Palette = struct {
     bg: Color,
     bg_dark: Color,
@@ -115,8 +113,6 @@ const matrix_palette = Palette{
     .teal = hex("00c9a0"),
 };
 
-var scheme: Scheme = .light;
-
 pub var bg: Color = light_palette.bg;
 pub var bg_dark: Color = light_palette.bg_dark;
 pub var bg_hl: Color = light_palette.bg_hl;
@@ -153,31 +149,213 @@ fn applyPalette(p: Palette) void {
     teal = p.teal;
 }
 
-pub fn setScheme(s: Scheme) void {
-    if (scheme == s) return;
-    log.trace("theme.setScheme {t} -> {t}", .{ scheme, s });
-    scheme = s;
-    applyPalette(switch (s) {
-        .light => light_palette,
-        .dark => dark_palette,
-        .matrix => matrix_palette,
-    });
+// ---- theme registry (dynamic) ----------------------------------------------------------------------
+// The desk carries the three shipped themes compiled in — the offline floor, always available even with no
+// server — and MERGES any user themes the server compiled from <data>/themes/*.lua and cached to
+// <data>/themes/themes.json (loadThemesJson). One registry, one active index; the titlebar cycles it, and
+// the active theme's mono_ui flag drives the whole-shell mono font. This replaces the old fixed 3-scheme
+// enum: a theme is now data (id + name + dark + mono_ui + 16 colors), authored anywhere in the ecosystem.
+const MAX_THEMES = 32;
+const ID_MAX = 24;
+const NAME_MAX = 48;
+
+pub const ThemeInfo = struct {
+    id_buf: [ID_MAX]u8 = undefined,
+    id_len: u8 = 0,
+    name_buf: [NAME_MAX]u8 = undefined,
+    name_len: u8 = 0,
+    dark: bool = true,
+    mono_ui: bool = false,
+    palette: Palette = light_palette,
+
+    pub fn id(t: *const ThemeInfo) []const u8 {
+        return t.id_buf[0..t.id_len];
+    }
+    pub fn name(t: *const ThemeInfo) []const u8 {
+        return t.name_buf[0..t.name_len];
+    }
+    fn setId(t: *ThemeInfo, s: []const u8) void {
+        t.id_len = @intCast(@min(s.len, ID_MAX));
+        @memcpy(t.id_buf[0..t.id_len], s[0..t.id_len]);
+    }
+    fn setName(t: *ThemeInfo, s: []const u8) void {
+        t.name_len = @intCast(@min(s.len, NAME_MAX));
+        @memcpy(t.name_buf[0..t.name_len], s[0..t.name_len]);
+    }
+};
+
+var reg: [MAX_THEMES]ThemeInfo = undefined;
+var reg_count: usize = 0;
+var cur_theme: usize = 0;
+var builtins_ready = false;
+
+fn mkBuiltin(id_s: []const u8, name_s: []const u8, dark: bool, mono: bool, pal: Palette) ThemeInfo {
+    var t = ThemeInfo{ .dark = dark, .mono_ui = mono, .palette = pal };
+    t.setId(id_s);
+    t.setName(name_s);
+    return t;
 }
 
-pub fn setSchemeFromInt(v: u8) void {
-    setScheme(switch (v) {
-        1 => .light,
-        2 => .matrix,
-        else => .dark,
-    });
+/// Seed the three shipped themes. Idempotent; safe to call before any load — the registry is never empty
+/// once this has run, so the desk always has at least dark/light/matrix even offline.
+pub fn initThemes() void {
+    if (builtins_ready) return;
+    reg[0] = mkBuiltin("dark", "Tokyo Night", true, false, dark_palette);
+    reg[1] = mkBuiltin("light", "Light", false, false, light_palette);
+    reg[2] = mkBuiltin("matrix", "Matrix", true, true, matrix_palette);
+    reg_count = 3;
+    cur_theme = 1; // light default (matches the previous scheme default)
+    builtins_ready = true;
 }
 
-pub fn getScheme() Scheme {
-    return scheme;
+pub fn count() usize {
+    return reg_count;
+}
+pub fn activeIndex() usize {
+    return cur_theme;
+}
+/// True when the active theme wants the whole UI in the mono/code face (see theFont/fontForKind).
+pub fn activeMonoUi() bool {
+    return builtins_ready and reg[cur_theme].mono_ui;
+}
+pub fn activeId() []const u8 {
+    return if (reg_count == 0) "light" else reg[cur_theme].id();
+}
+pub fn activeName() []const u8 {
+    return if (reg_count == 0) "Light" else reg[cur_theme].name();
 }
 
-pub fn schemeInt() u8 {
-    return @intFromEnum(scheme);
+/// Apply theme[i] (its 16 colors + mono flag) into the live palette globals every widget reads.
+pub fn applyIndex(i: usize) void {
+    if (i >= reg_count) return;
+    cur_theme = i;
+    applyPalette(reg[i].palette);
+}
+
+/// Apply the theme with this id; false (unchanged) if not found — a persisted id whose theme was deleted.
+pub fn applyById(theme_id: []const u8) bool {
+    initThemes();
+    for (reg[0..reg_count], 0..) |*t, i| {
+        if (std.mem.eql(u8, t.id(), theme_id)) {
+            applyIndex(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Advance to the next theme (the titlebar Theme chip). Wraps. Returns the new active id so the caller
+/// can persist it.
+pub fn advanceTheme() []const u8 {
+    initThemes();
+    if (reg_count == 0) return "light";
+    applyIndex((cur_theme + 1) % reg_count);
+    return activeId();
+}
+
+/// Legacy persistence bridge: the desk once wrote a u8 scheme (0 dark / 1 light / 2 matrix). Map it to an
+/// id so an old settings.json still resolves. New saves write the id string directly.
+pub fn idForLegacyInt(v: u8) []const u8 {
+    return switch (v) {
+        1 => "light",
+        2 => "matrix",
+        else => "dark",
+    };
+}
+
+fn jsonStr(obj: std.json.ObjectMap, key: [:0]const u8) ?[]const u8 {
+    return switch (obj.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+fn jsonBool(obj: std.json.ObjectMap, key: [:0]const u8, default: bool) bool {
+    return switch (obj.get(key) orelse return default) {
+        .bool => |b| b,
+        else => default,
+    };
+}
+fn hexColor(s: []const u8) ?Color {
+    var h = s;
+    if (h.len > 0 and h[0] == '#') h = h[1..];
+    if (h.len != 6) return null;
+    for (h) |ch| switch (ch) {
+        '0'...'9', 'a'...'f', 'A'...'F' => {},
+        else => return null,
+    };
+    return .{ .r = hexByte(h[0], h[1]), .g = hexByte(h[2], h[3]), .b = hexByte(h[4], h[5]), .a = 255 };
+}
+fn applyColorsInto(p: *Palette, obj: std.json.ObjectMap) void {
+    const slots = [_]struct { k: [:0]const u8, f: *Color }{
+        .{ .k = "bg", .f = &p.bg },           .{ .k = "bg_dark", .f = &p.bg_dark },
+        .{ .k = "bg_hl", .f = &p.bg_hl },     .{ .k = "bg_sel", .f = &p.bg_sel },
+        .{ .k = "fg", .f = &p.fg },           .{ .k = "fg_dim", .f = &p.fg_dim },
+        .{ .k = "comment", .f = &p.comment }, .{ .k = "border", .f = &p.border },
+        .{ .k = "blue", .f = &p.blue },       .{ .k = "cyan", .f = &p.cyan },
+        .{ .k = "green", .f = &p.green },     .{ .k = "magenta", .f = &p.magenta },
+        .{ .k = "orange", .f = &p.orange },   .{ .k = "red", .f = &p.red },
+        .{ .k = "yellow", .f = &p.yellow },   .{ .k = "teal", .f = &p.teal },
+    };
+    for (slots) |s| {
+        if (jsonStr(obj, s.k)) |hexs| {
+            if (hexColor(hexs)) |c| s.f.* = c;
+        }
+    }
+}
+
+/// Merge the server's compiled theme workspace (<data>/themes/themes.json, written by the server after it
+/// evaluates every *.lua theme) into the registry, PRESERVING the active theme by id. The cache lists the
+/// builtins first, so its entries rebuild the whole set — a user can even re-skin "dark". Never fails: on
+/// any missing-file / read / parse error the compiled-in builtins remain untouched, so the desk still
+/// themes offline. Call at boot and after a manual refresh.
+pub fn loadThemesJson(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8) void {
+    initThemes();
+    var prev_buf: [ID_MAX]u8 = undefined;
+    const prev_len = reg[cur_theme].id_len;
+    @memcpy(prev_buf[0..prev_len], reg[cur_theme].id_buf[0..prev_len]);
+    const prev_id = prev_buf[0..prev_len];
+
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/themes/themes.json", .{data_dir}) catch return;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 << 10)) catch return;
+    defer gpa.free(raw);
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return,
+    };
+    var n: usize = 0;
+    for (arr.items) |item| {
+        if (n >= MAX_THEMES) break;
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const id_s = jsonStr(obj, "id") orelse continue;
+        var t = ThemeInfo{};
+        t.setId(id_s);
+        t.setName(jsonStr(obj, "name") orelse id_s);
+        t.dark = jsonBool(obj, "dark", true);
+        t.mono_ui = jsonBool(obj, "mono_ui", false);
+        t.palette = if (t.dark) dark_palette else light_palette;
+        switch (obj.get("colors") orelse std.json.Value{ .null = {} }) {
+            .object => |co| applyColorsInto(&t.palette, co),
+            else => {},
+        }
+        reg[n] = t;
+        n += 1;
+    }
+    if (n == 0) return; // parsed to nothing usable — keep the builtins
+    reg_count = n;
+    cur_theme = 0;
+    for (reg[0..reg_count], 0..) |*t, i| {
+        if (std.mem.eql(u8, t.id(), prev_id)) {
+            cur_theme = i;
+            break;
+        }
+    }
+    applyIndex(cur_theme);
 }
 
 pub fn withAlpha(c: Color, a: u8) Color {
@@ -434,10 +612,10 @@ fn uploadMark(img: *rl.Image) bool {
     return false;
 }
 fn theFont() rl.Font {
-    // Matrix scheme: the WHOLE shell renders in the mono (code) face — the console font is as much
-    // the theme as the palette. This also overrides the dyslexia face while matrix is active; the
-    // other two schemes keep the accessibility font. Falls through if the mono TTF failed to load.
-    if (scheme == .matrix) {
+    // A mono_ui theme (e.g. Matrix): the WHOLE shell renders in the mono (code) face — the console font is
+    // as much the theme as the palette. This also overrides the dyslexia face while such a theme is active;
+    // ordinary themes keep the accessibility font. Falls through if the mono TTF failed to load.
+    if (activeMonoUi()) {
         if (mono_font) |m| return m;
     }
     return ui_font orelse (rl.getFontDefault() catch unreachable);
@@ -538,9 +716,9 @@ pub fn textMonoClip(s: []const u8, x: i32, y: i32, size: i32, c: Color, max_w: i
 pub const FontKind = enum { ui, strong, em, mono };
 
 fn fontForKind(k: FontKind) rl.Font {
-    // Matrix: every chat span (body, bold, italic, code) uses the console face; strong falls back
+    // mono_ui theme: every chat span (body, bold, italic, code) uses the console face; strong falls back
     // to the double-strike path in textStyled since the mono face has no distinct bold variant.
-    if (scheme == .matrix) return theMono();
+    if (activeMonoUi()) return theMono();
     return switch (k) {
         .ui => theFont(),
         .strong => strong_font orelse theFont(),
@@ -566,7 +744,7 @@ pub fn textStyled(s: [:0]const u8, x: f32, y: f32, size: i32, c: Color, kind: Fo
     const px = scaledUi(size);
     const f = fontForKind(kind);
     rl.drawTextEx(f, s, .{ .x = x, .y = y }, px, spacingFor(px), c);
-    if (kind == .strong and (!strong_distinct or scheme == .matrix)) {
+    if (kind == .strong and (!strong_distinct or activeMonoUi())) {
         rl.drawTextEx(f, s, .{ .x = x + 0.6, .y = y }, px, spacingFor(px), c);
     }
 }

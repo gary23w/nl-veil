@@ -237,6 +237,7 @@ const api = {
   fleet:    ()      => jget('/api/v1/fleet', 6000),
   metrics:  ()      => jget('/api/v1/metrics/llm', 10000),
   models:   ()      => jget('/models.json'),
+  themes:   ()      => jget('/api/v1/themes'),
   convs:    ()      => jget('/api/v1/chat/convs'),
   conv:     (id)    => jget('/api/v1/chat/convs/' + encodeURIComponent(id)),
   convDel:  (id)    => jdel('/api/v1/chat/convs/' + encodeURIComponent(id)),
@@ -253,9 +254,27 @@ const api = {
   adminRecipeGrant: (uid, name, granted) => jpost('/api/v1/admin/users/' + encodeURIComponent(uid) + '/recipes/' + encodeURIComponent(name), { granted }),
 };
 
-/* ============================================================ theme */
+/* ============================================================ theme
+   The palette is driven by GET /api/v1/themes (public): every built-in
+   (light / dark / matrix) plus any theme the user authored in the workspace.
+   The CSS light/dark palettes stay the pre-fetch base and the source of the
+   derived aliases; a fetched theme layers its 16 colours inline over them and
+   declares dark/light so color-scheme and the [data-theme=dark] rules resolve. */
+
+let THEMES = [];   // filled by loadThemes(); [] until then, or if the fetch fails
+
+// The 16 base palette custom properties, keyed as the endpoint returns them.
+// '_' → '-' turns each key into its CSS var (bg_dark → --bg-dark).
+const THEME_KEYS = ['bg', 'bg_dark', 'bg_hl', 'bg_sel', 'fg', 'fg_dim', 'comment',
+  'border', 'blue', 'cyan', 'green', 'magenta', 'orange', 'red', 'yellow', 'teal'];
 
 function currentTheme() { return document.documentElement.getAttribute('data-theme') || 'light'; }
+
+/** The fetched theme currently selected, or null before the fetch / on a miss. */
+function activeThemeObj() {
+  const id = LS.get('veil.themeId', '');
+  return THEMES.find((x) => x.id === id) || null;
+}
 
 function setTheme(t) {
   document.documentElement.setAttribute('data-theme', t);
@@ -263,10 +282,82 @@ function setTheme(t) {
   $$('meta[name=theme-color]').forEach((m) => m.remove());
   const meta = document.createElement('meta');
   meta.name = 'theme-color';
-  meta.content = t === 'dark' ? '#16161e' : '#e9edf5';
+  // Prefer the active theme's own chrome colour; fall back to the built-in pair
+  // so this still does the right thing before the fetch or when it failed.
+  const active = activeThemeObj();
+  meta.content = (active && active.colors && active.colors.bg_dark)
+    ? active.colors.bg_dark
+    : (t === 'dark' ? '#16161e' : '#e9edf5');
   document.head.appendChild(meta);
   const b = el('themeBtn');
-  if (b) b.innerHTML = themeIcon();
+  if (b) { b.innerHTML = themeIcon(); b.title = themeTitle(); }
+}
+
+/** Paint a fetched theme: its 16 palette vars inline (they override the CSS
+    base), the mono-ui flag, and data-theme so color-scheme, the derived aliases
+    and any remaining [data-theme=dark] rules still resolve. Persists the id. */
+function applyTheme(t) {
+  if (!t || !t.colors) return;
+  const root = document.documentElement;
+  THEME_KEYS.forEach((k) => {
+    const v = t.colors[k];
+    if (typeof v === 'string' && v) root.style.setProperty('--' + k.replace(/_/g, '-'), v);
+  });
+  // mono_ui: render the whole UI in the mono face, not just code. The CSS rule
+  // `.mono-ui { --font-ui: var(--font-mono) }` does the work; we only toggle it.
+  root.classList.toggle('mono-ui', !!t.mono_ui);
+  LS.set('veil.themeId', t.id || '');
+  // setTheme reads veil.themeId (via activeThemeObj) for the chrome colour and
+  // the button title, so persist the id first, then let it stamp data-theme.
+  setTheme(t.dark ? 'dark' : 'light');
+}
+
+/** After the fetch: apply the saved theme, else the built-in matching the
+    current light/dark base, else the first theme. A deleted/renamed saved id
+    falls through the same way. With no themes (fetch failed) the CSS base stays. */
+function applySavedTheme() {
+  if (!THEMES.length) return;
+  const savedId = LS.get('veil.themeId', '');
+  let t = THEMES.find((x) => x.id === savedId);
+  if (!t) {
+    const dark = currentTheme() === 'dark';
+    t = THEMES.find((x) => x.builtin && !!x.dark === dark)
+      || THEMES.find((x) => x.builtin)
+      || THEMES[0];
+  }
+  if (t) applyTheme(t);
+}
+
+/** Advance to the next theme in the fetched list, wrapping. Before the fetch (or
+    if it failed) there is nothing to cycle, so fall back to the light/dark flip. */
+function cycleTheme() {
+  if (!THEMES.length) { setTheme(currentTheme() === 'dark' ? 'light' : 'dark'); return null; }
+  const i = THEMES.findIndex((x) => x.id === LS.get('veil.themeId', ''));
+  const next = THEMES[(i + 1) % THEMES.length];   // i === -1 → 0; last → 0
+  applyTheme(next);
+  return next;
+}
+
+/** The active theme's display name, for the Settings button. */
+function currentThemeLabel() {
+  const a = activeThemeObj();
+  return a ? (a.name || a.id) : (currentTheme() === 'dark' ? 'Dark' : 'Light');
+}
+
+/** The themeBtn tooltip: the active theme name, or the plain hint pre-fetch. */
+function themeTitle() {
+  const a = activeThemeObj();
+  return a ? ('Theme: ' + (a.name || a.id) + ' (click to cycle)') : 'Toggle light / dark';
+}
+
+async function loadThemes() {
+  try {
+    const j = await api.themes();
+    THEMES = (j && Array.isArray(j.themes)) ? j.themes : [];
+  } catch (e) {
+    THEMES = [];   // offline / not deployed: the CSS light/dark base carries on
+  }
+  applySavedTheme();
 }
 
 function themeIcon() {
@@ -280,6 +371,7 @@ function themeIcon() {
 async function boot() {
   S.settings = loadSettings();
   loadModels();
+  loadThemes();   // public endpoint; paints the saved/custom palette once it lands
   // /auth/me never 401s: it answers {authed:false, open_registration} when
   // signed out and {authed:true, email, admin, plan, id, entitlements, …}
   // when signed in (auth_api.zig:55-59). There is no `user` wrapper.
@@ -451,7 +543,8 @@ function enterApp(user) {
         <svg viewBox="0 0 24 24"><path d="${t.icon}"/></svg>${t.label}</button>`).join('')}
     </nav>`;
 
-  el('themeBtn').addEventListener('click', () => setTheme(currentTheme() === 'dark' ? 'light' : 'dark'));
+  el('themeBtn').title = themeTitle();
+  el('themeBtn').addEventListener('click', cycleTheme);
   el('outBtn').addEventListener('click', async () => {
     try { await api.logout(); } catch (e) {}
     onSignedOut();
@@ -3110,8 +3203,8 @@ function renderSettings(host) {
       <div class="section-head"><h2>Appearance</h2></div>
       <div class="panel set-panel">
         <div class="set-row">
-          <div><b>Theme</b><div class="muted">Light and dark, matching the desktop app.</div></div>
-          <button class="btn btn-sm" id="setTheme">${currentTheme() === 'dark' ? 'Dark' : 'Light'}</button>
+          <div><b>Theme</b><div class="muted">Cycle built-in and custom themes from the workspace.</div></div>
+          <button class="btn btn-sm" id="setTheme">${esc(currentThemeLabel())}</button>
         </div>
         <div class="set-row">
           <div><b>Text size</b><div class="muted">Scales the whole interface.</div></div>
@@ -3189,8 +3282,8 @@ function renderSettings(host) {
     </div></div>`;
 
   el('setTheme').addEventListener('click', () => {
-    setTheme(currentTheme() === 'dark' ? 'light' : 'dark');
-    el('setTheme').textContent = currentTheme() === 'dark' ? 'Dark' : 'Light';
+    cycleTheme();
+    el('setTheme').textContent = currentThemeLabel();
   });
   el('setScale').addEventListener('change', (e) => setScale(e.target.value));
   el('setOne').addEventListener('change', (e) => {

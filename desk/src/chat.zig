@@ -4654,6 +4654,8 @@ pub const Chat = struct {
         var model: [96]u8 = undefined;
         var model_n: usize = 0;
         var theme: u8 = 0;
+        var theme_id: [24]u8 = undefined;
+        var theme_id_n: usize = 0;
         var lopen = true;
         var ropen = true;
         var shell_allow = false;
@@ -4678,6 +4680,8 @@ pub const Chat = struct {
             kind = s.chat_kind;
             byok = s.chat_byok;
             theme = s.theme;
+            theme_id_n = s.theme_id_len;
+            @memcpy(theme_id[0..theme_id_n], s.theme_id[0..theme_id_n]);
             base_n = s.chat_base_len;
             @memcpy(base[0..base_n], s.chat_base[0..base_n]);
             model_n = s.chat_model_len;
@@ -4714,7 +4718,9 @@ pub const Chat = struct {
         var jb: std.ArrayListUnmanaged(u8) = .empty;
         defer jb.deinit(self.gpa);
         jb.appendSlice(self.gpa, "{\"kind\":") catch return;
-        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"host\":\"", .{ kind, port, byok, theme }) catch return;
+        jb.print(self.gpa, "{d},\"port\":{d},\"byok\":{d},\"theme\":{d},\"theme_id\":\"", .{ kind, port, byok, theme }) catch return;
+        escJson(&jb, self.gpa, theme_id[0..theme_id_n]);
+        jb.appendSlice(self.gpa, "\",\"host\":\"") catch return;
         escJson(&jb, self.gpa, host[0..host_n]);
         jb.appendSlice(self.gpa, "\",\"base\":\"") catch return;
         escJson(&jb, self.gpa, base[0..base_n]);
@@ -4795,7 +4801,13 @@ pub const Chat = struct {
         }
         if (jInt(data, "kind")) |v| s.chat_kind = @intCast(@max(0, @min(v, 2)));
         if (jInt(data, "byok")) |v| s.chat_byok = @intCast(@max(0, @min(v, @as(i64, @intCast(catalog.providers.len - 1)))));
-        if (jInt(data, "theme")) |v| s.theme = @intCast(@max(0, @min(v, 1)));
+        if (jInt(data, "theme")) |v| s.theme = @intCast(@max(0, @min(v, 2))); // 0 dark / 1 light / 2 matrix (legacy)
+        if (llm.jsonUnescape(self.gpa, data, "theme_id")) |tid| {
+            defer self.gpa.free(tid);
+            const n = @min(tid.len, s.theme_id.len);
+            @memcpy(s.theme_id[0..n], tid[0..n]);
+            s.theme_id_len = @intCast(n);
+        }
         if (llm.jsonUnescape(self.gpa, data, "base")) |b| {
             defer self.gpa.free(b);
             const n = @min(b.len, s.chat_base.len);

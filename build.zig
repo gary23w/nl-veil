@@ -74,6 +74,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("models.json", .{ .root_source_file = b.path("web/public/models.json") });
     exe.root_module.addImport("modelcfg", modelcfg);
 
+    // ---- embedded Lua 5.4 (the plugin/theme runtime) ----
+    // vendor/lua is compiled straight into the binary; src/plug/lua.zig binds it. This is what makes
+    // themes and plugins (src/plug/*) load. libc comes along with it (the server-only build otherwise
+    // does not link libc — Lua needs it, so addLua sets it).
+    addLua(b, exe.root_module);
+
     // ---- the desktop GUI, compiled IN (one binary) ----
     // Was: shell out to desk/'s own `zig build` and ship a second veil-desk.exe that the server SPAWNED.
     // Now: desk/src/main.zig is imported as the module "desk" and src/main.zig calls desk.runApp() on the
@@ -153,6 +159,7 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addImport("httpz", httpz.module("httpz"));
     tests.root_module.addImport("modelcfg", modelcfg); // the catalog module carries its own models.yaml embed
+    addLua(b, tests.root_module); // src/plug/* tests bind the embedded Lua
     // The suite is server-side only and never links raylib, so it always sees gui=false — a test module that
     // pulled the GUI in would need GL on every CI box, which is exactly what -Dapp=false exists to avoid.
     const test_options = b.addOptions();
@@ -169,6 +176,28 @@ pub fn build(b: *std.Build) void {
     // A module needs its own test artifact; this is that artifact.
     const modelcfg_tests = b.addTest(.{ .root_module = modelcfg });
     test_step.dependOn(&b.addRunArtifact(modelcfg_tests).step);
+}
+
+/// Compile the vendored Lua 5.4 core into `mod` and make its headers reachable. The plugin/theme
+/// runtime (src/plug/lua.zig) declares the C API as externs, so no translate-c step is needed — just
+/// the objects + libc. UBSan is disabled for these files: Lua's GC and VM do intentional
+/// aliasing/overflow the standard C sanitizer flags, and they are not our bugs to trap.
+fn addLua(b: *std.Build, mod: *std.Build.Module) void {
+    const lua_sources = [_][]const u8{
+        "lapi.c",    "lauxlib.c",  "lbaselib.c", "lcode.c",    "lcorolib.c", "lctype.c",
+        "ldblib.c",  "ldebug.c",   "ldo.c",      "ldump.c",    "lfunc.c",    "lgc.c",
+        "linit.c",   "liolib.c",   "llex.c",     "lmathlib.c", "lmem.c",     "loadlib.c",
+        "lobject.c", "lopcodes.c", "loslib.c",   "lparser.c",  "lstate.c",   "lstring.c",
+        "lstrlib.c", "ltablib.c",  "ltable.c",   "ltm.c",      "lundump.c",  "lutf8lib.c",
+        "lvm.c",     "lzio.c",
+    };
+    mod.addCSourceFiles(.{
+        .root = b.path("vendor/lua"),
+        .files = &lua_sources,
+        .flags = &.{ "-std=gnu99", "-fno-sanitize=undefined" },
+    });
+    mod.addIncludePath(b.path("vendor/lua"));
+    mod.link_libc = true;
 }
 
 /// Register the desk's bundled art + type as anonymous imports so desk/src/assets.zig can @embedFile them.
