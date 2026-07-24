@@ -87,6 +87,7 @@
       { p: 'worker/control/supervisor', c: 'CT-01', t: 'Supervisor — detached swarm processes, re-adoption', s: 'control/supervisor.zig' },
       { p: 'worker/control/writer', c: 'CT-02', t: 'Control writer — the swarm control bus (stop / steer / goal)', s: 'control/writer.zig' },
       { p: 'worker/control/fanout', c: 'CT-03', t: 'Event fanout — swarm events.jsonl cursor + SSE stream', s: 'control/fanout.zig' },
+      { p: 'worker/evcursor', c: 'CT-06', t: 'Event cursor — the poll contract both events endpoints share', s: 'evcursor.zig' },
       { p: 'worker/deploy/service', c: 'CT-04', t: 'Deploy service — cast/deploy + swarm files and lifecycle', s: 'deploy/service.zig' },
       { p: 'worker/neuron/client', c: 'CT-05', t: 'Neuron client — the neuron-db memory bridge (fail-open)', s: 'neuron/client.zig' }
     ]},

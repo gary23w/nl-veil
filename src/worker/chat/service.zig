@@ -29,6 +29,7 @@ const modelcfg = @import("modelcfg");
 /// wholesale instead of inventing a second secret store.
 pub const SERVER_KEY_UID: u64 = 0;
 const cpaths = @import("paths.zig");
+const evcursor = @import("../evcursor.zig"); // the poll cursor contract, shared with control/fanout swarmEvents
 const tools = @import("../tools.zig");
 
 const App = http.App;
@@ -280,17 +281,17 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     std.Io.Dir.cwd().access(app.io, dir, .{}) catch return notFound(res);
 
     const ev_path = try std.fmt.allocPrint(res.arena, "{s}/events.jsonl", .{dir});
-    var from: usize = 0;
     const q = try req.query();
-    if (q.get("from") orelse q.get("offset")) |fs| from = std.fmt.parseInt(usize, fs, 10) catch 0;
-    // SIZE PROBE (from == max u64): answer the events file's TOTAL length as tiny JSON instead of a body.
-    // The desk baselines its server-turn watch at the TAIL with this — transferring the whole backlog broke
-    // on long conversations (the desk HTTP client caps one response at 1MB, so a from=0 fetch of a bigger
-    // file could NEVER complete; the silently-0 cursor then replayed history as live delegations — the
-    // tool-bridge bug). An older desk never sends the sentinel; an older server treats it as past-the-end
-    // and returns an empty 200, which the new desk detects and falls back from. Probe answers 200 even for
-    // a not-yet-written events file (len 0) — the conv-dir 404 above still gates unknown conversations.
-    if (from == std.math.maxInt(u64)) {
+    // The cursor contract (sentinel, page cap, offset arithmetic) lives in worker/evcursor.zig and is
+    // SHARED with this endpoint's twin, control/fanout.zig swarmEvents — one client polls both.
+    const from = evcursor.parseFrom(q.get("from") orelse q.get("offset"));
+    // SIZE PROBE: answer the events file's TOTAL length as tiny JSON instead of a body. The desk baselines
+    // its server-turn watch at the TAIL with this — transferring the whole backlog broke on long
+    // conversations (the desk HTTP client caps one response at 1MB, so a from=0 fetch of a bigger file
+    // could NEVER complete; the silently-0 cursor then replayed history as live delegations — the
+    // tool-bridge bug). Probe answers 200 even for a not-yet-written events file (len 0) — the conv-dir
+    // 404 above still gates unknown conversations.
+    if (evcursor.isProbe(from)) {
         var size: usize = 0;
         if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
             defer f.close(app.io);
@@ -307,14 +308,12 @@ pub fn convEvents(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (std.Io.Dir.cwd().openFile(app.io, ev_path, .{})) |f| {
         defer f.close(app.io);
         const size: usize = std.math.cast(usize, f.length(app.io) catch 0) orelse 0;
-        if (size > from) {
-            // PAGE bound UNDER the desk httpc's 1MB response cap (was 8MB — a burst bigger than the client
-            // could swallow wedged its poll forever: the delta only grows). Catch-up pages across polls.
-            const want = @min(size - from, 512 << 10);
+        const want = evcursor.want(size, from);
+        if (want > 0) {
             if (res.arena.alloc(u8, want)) |buf| {
                 const n = f.readPositionalAll(app.io, buf, from) catch 0;
                 body = buf[0..n];
-                next_off = from + n;
+                next_off = evcursor.nextOffset(from, n);
             } else |_| {} // OOM → empty this poll; the client re-polls (cursor unchanged)
         }
     } else |_| {} // no events.jsonl yet → empty body (a fresh conv)
