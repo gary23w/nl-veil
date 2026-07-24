@@ -36,7 +36,7 @@ const cpaths = @import("paths.zig"); // conv → build-tree mapping (scheduled r
 const winsleep = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
 } else struct {};
-fn sleepMsRaw(io: std.Io, ms: u64) void {
+pub fn sleepMsRaw(io: std.Io, ms: u64) void {
     if (builtin.os.tag == .windows) {
         winsleep.Sleep(@intCast(ms));
     } else {
@@ -5695,8 +5695,8 @@ fn forgetDurableMemory(app: *App, uid: u64, match_in: []const u8) void {
     if (match.len < 2) return;
     var pb: [700]u8 = undefined;
     const path = memoriesPath(app, uid, &pb) orelse return;
-    http.appendLock(app.io);
-    defer http.appendUnlock(app.io);
+    http.appendLock(app.io, path);
+    defer http.appendUnlock(app.io, path);
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, path, gpa, .limited(256 << 10)) catch return;
     defer gpa.free(data);
     var out: std.ArrayListUnmanaged(u8) = .empty;

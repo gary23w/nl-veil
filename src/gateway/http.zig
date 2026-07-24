@@ -121,28 +121,37 @@ pub fn sessionToken(req: *httpz.Request) ?[]const u8 {
 /// Append `data` to `path` as an O(1) positioned write at end-of-file: open-or-create WITHOUT truncating, no
 /// whole-file rewrite. The file grows monotonically, so a byte-cursor reader (the events poller) never sees it
 /// shrink. Zig 0.16 has no O_APPEND (CreateFileOptions has no append mode), so this emulates it with
-/// statFile-then-writePositionalAll — correct only for ONE writer at a time. The process-wide mutex makes the
+/// statFile-then-writePositionalAll — correct only for ONE writer at a time. The per-path lock stripe makes the
 /// stat→write pair atomic across threads: control.jsonl in particular has multiple writers (the /control
 /// endpoint + the detached turn thread), and without the lock two racing appends read the same offset and
-/// clobber each other. Each append is a few microseconds, so contention is negligible. (The worker has its own
-/// appendFile; this covers only the gateway/chat/control callers.)
-var append_mtx: std.Io.Mutex = .init;
+/// clobber each other. STRIPED, not process-wide: one global mutex serialized every append in the process —
+/// every concurrent conversation's event frames queued behind whichever file the filesystem was slowest on
+/// (an AV scan or sync-client touch stalls ONE file for seconds), coupling unrelated turns into one convoy.
+/// Same-path appends still fully exclude each other; distinct paths only collide on a stripe hash collision,
+/// which merely coarsens the lock. (The worker has its own appendFile; this covers gateway/chat/control.)
+var append_mtxs: [16]std.Io.Mutex = @splat(.init);
 
-/// Hold the append lock across a caller's own read-modify-write of an append-log file. A whole-file rewrite
-/// (e.g. dropping a durable-memory line) must be mutually exclusive with appendFile: without this a concurrent
-/// append that lands between the rewrite's read and its write is clobbered. The caller MUST NOT call appendFile
-/// while holding it (std.Io.Mutex is non-reentrant → deadlock); do the read + writeFile directly, then unlock.
-pub fn appendLock(io: std.Io) void {
-    append_mtx.lockUncancelable(io);
+fn appendStripe(path: []const u8) *std.Io.Mutex {
+    return &append_mtxs[std.hash.Wyhash.hash(0, path) & (append_mtxs.len - 1)];
 }
-pub fn appendUnlock(io: std.Io) void {
-    append_mtx.unlock(io);
+
+/// Hold `path`'s append stripe across a caller's own read-modify-write of that append-log file. A whole-file
+/// rewrite (e.g. dropping a durable-memory line) must be mutually exclusive with appendFile on the SAME path:
+/// without this a concurrent append that lands between the rewrite's read and its write is clobbered. The
+/// caller MUST NOT call appendFile on that path while holding it (std.Io.Mutex is non-reentrant → deadlock);
+/// do the read + writeFile directly, then unlock with the same path.
+pub fn appendLock(io: std.Io, path: []const u8) void {
+    appendStripe(path).lockUncancelable(io);
+}
+pub fn appendUnlock(io: std.Io, path: []const u8) void {
+    appendStripe(path).unlock(io);
 }
 
 pub fn appendFile(io: std.Io, alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
     _ = alloc; // no scratch buffer needed for a positioned append
-    append_mtx.lockUncancelable(io);
-    defer append_mtx.unlock(io);
+    const mtx = appendStripe(path);
+    mtx.lockUncancelable(io);
+    defer mtx.unlock(io);
     const dir = std.Io.Dir.cwd();
     // The end-of-file offset MUST come from statFile of the path, NOT `f.length()` on a freshly
     // createFile(.truncate=false) handle — that returns 0 here (Windows/Io), so every write would land at offset

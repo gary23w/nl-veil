@@ -527,7 +527,21 @@ pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         try http.jstr(app.gpa, &line, b.result);
         try line.appendSlice(app.gpa, "}\n");
     }
-    http.appendFile(app.io, app.gpa, path, line.items) catch return http.serverErr(res, "could not record tool result");
+    // A transient append failure (AV scan window / sync-client touch mid-stat) must NOT surface as a 500
+    // here: the client treats the POST as delivered-or-dead, so a dropped result line stalls the awaiting
+    // turn for its FULL client-tool timeout (observed live: one 500 = 180 seconds of dead air mid-turn).
+    // Absorb the blip with two quick retries; only a persistent failure earns the 500.
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        http.appendFile(app.io, app.gpa, path, line.items) catch {
+            if (attempt < 2) {
+                chat_engine.sleepMsRaw(app.io, 25);
+                continue;
+            }
+            return http.serverErr(res, "could not record tool result");
+        };
+        break;
+    }
     try res.json(.{ .ok = true }, .{});
 }
 

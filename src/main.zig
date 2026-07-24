@@ -313,7 +313,13 @@ pub fn main(init: std.process.Init) !void {
         .{ .block = .global }
     else
         .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
-    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ });
+    // async_limit: Threaded defaults to cpu_count-1 concurrent async tasks, and AT the limit io.async runs the
+    // task INLINE ON THE CALLER — httpc's timeout race then sleeps/blocks the calling thread (unbounded when the
+    // request leg runs unwatched), which froze the merged GUI+server process solid during tool-heavy turns: a
+    // losing race timer holds its slot for its full 5-8s on Windows (blocked sockets can't be canceled at all),
+    // so ordinary chat traffic pinned the pool at saturation and every caller degraded to serial inline waits.
+    // Threads spawn on demand only, so a high ceiling costs nothing when quiet.
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = environ, .async_limit = .limited(512) });
     defer threaded.deinit();
     const io = threaded.io();
 
