@@ -63,6 +63,7 @@ const EXPECTED = [_]struct { label: []const u8, role: Role }{
     .{ .label = "searchq", .role = .prompting }, // rewrites a web_search query before it executes
     .{ .label = "stuck", .role = .prompting }, // writes the afk stuck-recovery instruction
     .{ .label = "planrec", .role = .prompting }, // settle-time plan reconcile: a cheap ledger-vs-tasks verdict, not reasoning
+    .{ .label = "arbiter", .role = .prompting }, // streak-3 tool arbiter: which tool next — a routing verdict, not the task's reasoning
 };
 
 /// Every public entry point in llm.zig that takes the (run_dir, tag, base_url, key, model) prefix. If a

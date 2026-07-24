@@ -142,10 +142,12 @@ const PLAN_PROMPT =
     "state what DONE means before any work starts: one-sentence \"objective\", a \"done_when\" list of conditions " ++
     "that can each be CHECKED (a command that must exit clean, a file that must exist, an output that must " ++
     "appear — not \"it works well\"), and a \"watch_for\" list of failure modes you expect on THIS task. Give each " ++
-    "subtask its own short \"done_when\" too. Reply with ONLY compact JSON: {\"objective\":\"…\",\"done_when\":" ++
-    "[\"…\"],\"watch_for\":[\"…\"],\"plan\":[{\"task\":\"…\",\"route\":\"hive|research|inline\",\"done_when\":\"…\"}" ++
-    ", …]}. If the request is a simple question, a greeting, or a single trivial step that needs no plan, reply " ++
-    "exactly {\"plan\":[]}.";
+    "subtask its own short \"done_when\" too, and a \"tool_hint\" naming the single tool you expect it to use " ++
+    "(e.g. write_file, edit_file, read_file, list_dir, poll, web_fetch, read_url, web_search, read_doc, " ++
+    "recall_hive, run_python, open_subchat, cast — or \"\" if unsure). Reply with ONLY compact JSON: " ++
+    "{\"objective\":\"…\",\"done_when\":[\"…\"],\"watch_for\":[\"…\"],\"plan\":[{\"task\":\"…\",\"route\":" ++
+    "\"hive|research|inline\",\"done_when\":\"…\",\"tool_hint\":\"…\"}, …]}. If the request is a simple question, " ++
+    "a greeting, or a single trivial step that needs no plan, reply exactly {\"plan\":[]}.";
 
 const REFLECT_MIN: usize = 240;
 /// The reply that means "nothing worth saying", and the shortest note that is worth appending. ABSTAIN IS THE
@@ -1049,6 +1051,23 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             conv_buf.append(gpa, '}') catch return;
         }
     }
+    // TOOL BELT: the positive half of the same learning — the tools ranked RELIABLE-FIRST by lived
+    // outcome success on this machine, blended with the neuron-db trust floor's earned cross-session
+    // preference when the floor holds a verdict for this scope. Turn-stable (the aggregate only writes at
+    // turn exit), so it rides the stable prefix beside the digest and is seen at every inference — the
+    // option space arrives pre-weighted by history, not alphabetical. Absent until >=2 tools have samples.
+    {
+        const tl = trustBeltLine(app, mem_scope);
+        defer if (tl.len > 0) gpa.free(tl);
+        if (toolperf.belt(gpa, app.io, app.data, tl)) |bl| {
+            defer gpa.free(bl);
+            if (bl.len > 0) {
+                conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
+                http.jstr(gpa, &conv_buf, bl) catch return;
+                conv_buf.append(gpa, '}') catch return;
+            }
+        }
+    }
     // ATTACHED IMAGE (vision-as-text): the desk can attach ONE raster image this turn (image_b64 = STANDARD
     // base64 of the raw PNG). It has no DOM, so its text comes from OS-native OCR (Windows.Media.Ocr / macOS
     // Vision — free/offline/private), or, where the OS has none, a vision-model fallback (pixelrag.ingestImage →
@@ -1139,6 +1158,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // and off every hot path — the merge is one file read+write at turn exit.
     var tool_perf: toolperf.Acc = .{};
     defer toolperf.merge(app.io, gpa, app.data, &tool_perf);
+    // TRUST FLOOR (feature-gated, fail-safe): at turn exit, reward/penalize each tool's `tool:<name>` class
+    // in the neuron-db trust ledger by its OUTCOME rate this turn — so tool preference is EARNED across
+    // sessions, not just prompted. Engine-driven only (the model never writes it). No-op when the neuron
+    // binary lacks the trust verb (classTrust/trustReward both fail-safe), so this is safe before deploy.
+    defer rewardToolTrust(&ctx, mem_scope, &tool_perf);
 
     // ---- PLAN-BOARD: the veil's first move on a non-trivial task is to decompose it into routed subtasks. Try a
     // fresh decomposition of THIS message; if it yields a plan, that's the new board (persist + show it). If not
@@ -3256,6 +3280,88 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     return tasks;
 }
 
+/// EARN TOOL PREFERENCE across sessions: at turn exit, reward each tool's `tool:<name>` trust class by
+/// its OUTCOME rate this turn. A tool whose outcomes were mostly good nudges its class UP; mostly bad,
+/// DOWN — so a tool that keeps failing at a job (run_python for file work) slowly loses standing while a
+/// tool that keeps succeeding gains it, learned from real outcomes rather than prompted. trustReward
+/// takes ONE delta per class list, so this issues at most two calls (the good batch, the bad batch).
+/// No-op when the neuron binary lacks the trust verb (trustReward fail-safes). Engine-driven only.
+fn rewardToolTrust(ctx: *tools.ToolCtx, mem_scope: []const u8, acc: *const toolperf.Acc) void {
+    _ = mem_scope; // the trust ledger is ONE global ledger per DB (not scope-keyed); ctx.mem is that DB
+    const gpa = ctx.gpa;
+    var good: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (good.items) |c| gpa.free(c);
+        good.deinit(gpa);
+    }
+    var bad: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer {
+        for (bad.items) |c| gpa.free(c);
+        bad.deinit(gpa);
+    }
+    for (acc.slice()) |*r| {
+        if (r.calls == 0) continue;
+        const bad_rate: f32 = @as(f32, @floatFromInt(r.bad)) / @as(f32, @floatFromInt(r.calls));
+        const cls = std.fmt.allocPrint(gpa, "tool:{s}", .{r.nameStr()}) catch continue;
+        // majority-good → reward; majority-bad → penalize; a 50/50 tool stays put (no class minted)
+        if (bad_rate <= 0.34) {
+            good.append(gpa, cls) catch gpa.free(cls);
+        } else if (bad_rate >= 0.66) {
+            bad.append(gpa, cls) catch gpa.free(cls);
+        } else gpa.free(cls);
+    }
+    // small deltas: many turns of consistent behavior move a class, one bad turn barely does — the floor
+    // is a slow learner by design (matching neuron-db's outcome-reinforcement contract).
+    if (good.items.len > 0) ctx.mem.trustReward(0.10, good.items);
+    if (bad.items.len > 0) ctx.mem.trustReward(-0.10, bad.items);
+}
+
+/// The trust half of the belt line: the neuron-db floor's earned per-tool preference, as a short
+/// "earned: write_file↑ run_python↓" clause the belt appends. Reads the whole ledger in ONE spawn and
+/// names only tool: classes that have moved meaningfully from neutral (1.0). "" when the floor is off /
+/// empty / near-neutral — the belt then shows session stats alone. Turn-stable → built once in the prefix.
+fn trustBeltLine(app: *App, mem_scope: []const u8) []u8 {
+    const gpa = app.gpa;
+    // reach the same trust DB the chat Mem uses (mem_scope "chat:<conv>" → the conv's hive.sqlite is the
+    // engine's; the trust ledger is global-per-DB). Reuse the ctx-built handle path via a throwaway Mem.
+    _ = mem_scope;
+    var db_pb: [700]u8 = undefined;
+    const db = std.fmt.bufPrint(&db_pb, "{s}/hive.sqlite", .{app.data}) catch return &.{};
+    var m = osc.Mem.init(gpa, app.io, app.sup.neuron_bin, db);
+    m.trust = true;
+    const dump = m.trustDump();
+    defer gpa.free(dump);
+    if (dump.len == 0) return &.{};
+    var up: std.ArrayListUnmanaged(u8) = .empty;
+    defer up.deinit(gpa);
+    var down: std.ArrayListUnmanaged(u8) = .empty;
+    defer down.deinit(gpa);
+    var it = std.mem.splitScalar(u8, dump, '\n');
+    while (it.next()) |ln| {
+        const t = std.mem.trim(u8, ln, " \r\t");
+        if (!std.mem.startsWith(u8, t, "tool:")) continue;
+        var f = std.mem.splitScalar(u8, t, '\t');
+        const cls = f.next() orelse continue;
+        const wstr = f.next() orelse continue;
+        const w = std.fmt.parseFloat(f32, wstr) catch continue;
+        const nm = cls["tool:".len..];
+        if (w >= 1.08) {
+            if (up.items.len > 0) up.append(gpa, ' ') catch {};
+            up.appendSlice(gpa, nm) catch {};
+        } else if (w <= 0.92) {
+            if (down.items.len > 0) down.append(gpa, ' ') catch {};
+            down.appendSlice(gpa, nm) catch {};
+        }
+    }
+    if (up.items.len == 0 and down.items.len == 0) return &.{};
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "Earned on this machine —") catch return &.{};
+    if (up.items.len > 0) out.print(gpa, " reliable: {s};", .{up.items}) catch {};
+    if (down.items.len > 0) out.print(gpa, " has been unreliable: {s};", .{down.items}) catch {};
+    return gpa.dupe(u8, out.items) catch &.{};
+}
+
 /// SETTLE-TIME PLAN RECONCILE — the board must move at the pace of the WORK, not the pace of the loop.
 /// One drive step often completes more than its own subtask: the inner agentic pass keeps running tools
 /// until it settles, and a capable model finishes half the board inside subtask 1 (observed live: "plan
@@ -3415,7 +3521,14 @@ fn subtaskInstruction(gpa: std.mem.Allocator, task: cplan.Task, idx: usize, tota
         (std.fmt.bufPrint(&cb, "DONE WHEN: {s} — verify that, then briefly say how you met it (or why you couldn't).", .{clipBytes(task.done_when, 300)}) catch generic)
     else
         generic;
-    return std.fmt.allocPrint(gpa, "Work this subtask now — step {d} of {d} in your plan: {s}\nSuggested route ({s}): {s}\n{s}", .{ idx + 1, total, task.text, task.route, hint, closing }) catch null;
+    // TOOL HINT: the planner's own suggestion of the fitting tool, carried as a hint (not a constraint —
+    // the model may pick another if the work turns out different). One line, only when the planner filled it.
+    var tb: [200]u8 = undefined;
+    const tool_line: []const u8 = if (task.tool_hint.len > 0)
+        (std.fmt.bufPrint(&tb, "\nSuggested tool: {s} (a hint from planning — use a better-fitting tool if this step needs one).", .{clipBytes(task.tool_hint, 120)}) catch "")
+    else
+        "";
+    return std.fmt.allocPrint(gpa, "Work this subtask now — step {d} of {d} in your plan: {s}\nSuggested route ({s}): {s}{s}\n{s}", .{ idx + 1, total, task.text, task.route, hint, tool_line, closing }) catch null;
 }
 
 /// A plan subtask was mid-flight when the turn aborted (Stop / hard error / empty answer). Mark it DONE + persist
@@ -4902,7 +5015,6 @@ fn runInnerAgentic(
             if (executed) {
                 const dt = nowMillis(app.io) - t_call;
                 const ok = result.len > 0 and result[0] != '(' and std.mem.indexOf(u8, result, "\"ok\":false") == null;
-                tool_perf.record(c.name, ok, if (dt > 0) @intCast(dt) else 0);
                 // FAILURE-STREAK DELIBERATION NUDGE: the tool RAN but the OUTCOME failed — engine-refusal
                 // (`(…`), an "ok":false payload, or a non-zero `exit=` result (the run_python/run_tests
                 // contract; toolperf's `ok` deliberately counts those as tool-healthy). Two failed outcomes
@@ -4910,6 +5022,7 @@ fn runInnerAgentic(
                 // the option space to the failing result, at the exact moment it is being ignored. The
                 // model still chooses; the engine only makes the choice visible.
                 const outcome_bad = !ok or (std.mem.startsWith(u8, result, "exit=") and !std.mem.startsWith(u8, result, "exit=0"));
+                tool_perf.record(c.name, ok, !outcome_bad, if (dt > 0) @intCast(dt) else 0);
                 const th = std.hash.Fnv1a_64.hash(c.name);
                 if (outcome_bad) {
                     if (th == fail_streak_tool) fail_streak +|= 1 else {
@@ -4917,11 +5030,25 @@ fn runInnerAgentic(
                         fail_streak = 1;
                     }
                 } else if (th == fail_streak_tool) fail_streak = 0;
-                if (outcome_bad and fail_streak >= 2 and result.len > 0) {
+                if (outcome_bad and fail_streak == 2 and result.len > 0) {
+                    // STREAK 2 — the cheap generic nudge: name the option space, no LLM cost.
                     const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak }) catch result;
                     if (nudged.ptr != result.ptr) {
                         gpa.free(result);
                         result = nudged;
+                    }
+                } else if (outcome_bad and fail_streak == 3 and result.len > 0) {
+                    // STREAK 3 — ESCALATE, once: a bounded prompting-tier ARBITER reads the goal, the failing
+                    // call, its error, and this machine's tool belt, and returns ONE concrete next move. The
+                    // generic nudge was ignored twice; a specific suggestion breaks the grind. Deliberation as
+                    // escalation (fires once per streak), never a per-call tax. Never auto-executed — advice only.
+                    if (toolArbiter(app, run_root, trio.pick(.prompting), intent, c.name, run_args, result)) |adv| {
+                        defer gpa.free(adv);
+                        const noted = std.fmt.allocPrint(gpa, "{s}\n(engine arbiter — {s} failed 3x; a focused look at your goal, this error, and your tool belt suggests: {s} Weigh it; you decide.)", .{ result, c.name, adv }) catch result;
+                        if (noted.ptr != result.ptr) {
+                            gpa.free(result);
+                            result = noted;
+                        }
                     }
                 }
             }
@@ -5125,6 +5252,47 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
     if (!step.ok) return null;
     const t = std.mem.trim(u8, step.content, " \r\n\t");
     if (t.len == 0) return null;
+    return gpa.dupe(u8, t) catch null;
+}
+
+/// STREAK-ESCALATED MICRO-ARBITER: after a tool has failed its OUTCOME three times running, one bounded
+/// prompting-tier call looks at what the turn is FOR, the exact failing call + its error, and this machine's
+/// learned tool belt, and returns ONE concrete next move (a different tool, or the specific fix). Advice only
+/// — never auto-executed; the caller appends it to the failing result as an engine note. Null on any failure
+/// (the generic streak-2 nudge already fired, so silence here just means no extra hint). gpa-owned.
+fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8, tool_name: []const u8, tool_args: []const u8, err_result: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    const belt = toolperf.belt(gpa, app.io, app.data, "") orelse gpa.dupe(u8, "") catch return null;
+    defer gpa.free(belt);
+    var ask: std.ArrayListUnmanaged(u8) = .empty;
+    defer ask.deinit(gpa);
+    ask.appendSlice(gpa, "A tool keeps failing and the agent is stuck repeating it. Recommend ONE concrete next move — either a DIFFERENT tool better suited to the job, or the specific fix for the exact error. Be terse and actionable (1-2 sentences, name the tool + how).\n\nWHAT THE TURN IS FOR: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(intent, 500)) catch return null;
+    ask.appendSlice(gpa, "\n\nTHE FAILING CALL: ") catch return null;
+    ask.appendSlice(gpa, tool_name) catch return null;
+    ask.appendSlice(gpa, "  args: ") catch return null;
+    ask.appendSlice(gpa, clipBytes(tool_args, 300)) catch return null;
+    ask.appendSlice(gpa, "\nITS ERROR/OUTPUT (3rd failure): ") catch return null;
+    ask.appendSlice(gpa, clipBytes(err_result, 600)) catch return null;
+    if (belt.len > 0) {
+        ask.appendSlice(gpa, "\n\n") catch return null;
+        ask.appendSlice(gpa, clipBytes(belt, 500)) catch return null;
+    }
+    ask.appendSlice(gpa, "\n\nAVAILABLE TOOL FAMILIES: files (write_file/edit_file/read_file/list_dir/delete_file), waiting/watching (poll), web (web_fetch/read_url/web_search/fetch_json), stored docs & memory (read_doc/recall_hive/recall), side-thread (open_subchat), a team (cast), code (run_python/run_tests). Your recommendation:") catch return null;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, "You are a tool-use arbiter. The agent is grinding one failing tool. In 1-2 terse sentences, tell it the single best next move — a better-suited tool (name it) or the exact fix for the error. Never suggest re-running the same call unchanged.") catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, ask.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+    const cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, run_root, "arbiter", p.base_url, p.key, p.model, msgs.items, "", 160, 0.3);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "arbiter", .prompting, p.model, step.ok);
+    if (!step.ok) return null;
+    const t = std.mem.trim(u8, step.content, " \r\n\t\"'`*");
+    if (t.len < 8 or t.len > 600) return null;
     return gpa.dupe(u8, t) catch null;
 }
 

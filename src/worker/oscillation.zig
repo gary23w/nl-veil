@@ -536,6 +536,13 @@ pub const Mem = struct {
         return std.fmt.parseFloat(f32, std.mem.trim(u8, t[0..end], " \r\n\t")) catch 1.0;
     }
 
+    /// The WHOLE trust ledger in one spawn: "class\tweight\trewards\tpenalties" per line (caller frees).
+    /// Empty when the feature is off / the verb is missing / nothing learned yet — fail-safe like classTrust.
+    /// Lets a caller rank many classes at once without one spawn per class.
+    pub fn trustDump(self: Mem) []u8 {
+        return self.run(&.{"trust_dump"}) orelse (self.gpa.dupe(u8, "") catch @constCast(""));
+    }
+
     /// PLAIN (untrusted) wide recall on `scope` for `query`, returning the DISTINCT tag-classes of the
     /// surfaced facts — leading "[tok]" -> tok, else the scope; lowercased; caller owns each + the slice.
     /// The engine uses this to choose which classes to reward; forcing NO --trust keeps the sample honest
