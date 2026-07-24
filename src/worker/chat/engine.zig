@@ -190,6 +190,12 @@ const SYSTEM_PROMPT =
     "about it. For WHOLE-document work (summarize, outline, review), recall fragments are NOT the document -- " ++
     "page it in order with read_doc and work from those pages; if read_doc has nothing, fall back to read_file " ++
     "on the source.\n" ++
+    "SIDE-THREADS. When a distinct sub-idea deserves its own focused thread (a tangent the user raised, a " ++
+    "parallel angle of the main work), open_subchat branches this chat into a tab that starts working it " ++
+    "immediately -- same files, same memory, so its findings flow back here. Lighter than a hive.\n" ++
+    "WAITING. Never guess whether something finished and never re-check blind -- poll watches a file, url, " ++
+    "port, process, probe command, or your cast to completion in bounded steps and reports what it saw; on " ++
+    "timeout, poll again.\n" ++
     "HOW YOU WORK A TASK. Your FIRST move on any non-trivial request is to BREAK IT DOWN into a concrete list of " ++
     "smaller subtasks -- however many it takes, a handful or dozens -- and show the user that plan. Then work the " ++
     "list, and for EACH subtask decide the best route: (a) DELEGATE TO A HIVE -- if a team building or " ++
@@ -252,7 +258,8 @@ const ORCH_TOOLS =
     \\{"type":"function","function":{"name":"schedule_update","description":"Revise an EXISTING scheduled task in place (partial update — ONLY the fields you pass change; everything else keeps its stored value). This is how a task self-heals and self-improves over time: during a scheduled run, call it on YOUR OWN task id (given in the run context) to fold what this run learned into the prompt/details, tune the cadence, or repair a broken definition; in normal chat, use it when the user asks to change an existing schedule. Always pass reason — it is recorded into the task's cross-run memory so future runs know why the definition changed. Provider credentials cannot be changed here. Revisions must preserve the task's goal.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id (a scheduled run's own id is in its RUN CONTEXT; schedule_list shows all ids)"},"name":{"type":"string","description":"new short task name"},"prompt":{"type":"string","description":"the new SELF-CONTAINED instruction future runs execute (replaces the old prompt verbatim)"},"details":{"type":"string","description":"new pinned specifics future runs should use (replaces the old details verbatim — restate what should survive)"},"kind":{"type":"string","enum":["once","every","daily"]},"every_min":{"type":"integer","description":"every: new interval in minutes"},"hm":{"type":"string","description":"daily: new local wall-clock HH:MM"},"in_min":{"type":"integer","description":"once: re-arm to fire this many minutes from now"},"enabled":{"type":"boolean","description":"false pauses the task (it keeps its memory and can be re-armed later); true re-enables it"},"reason":{"type":"string","description":"one sentence: WHY this revision (recorded in task memory for future runs)"}},"required":["id","reason"]}}},
     \\{"type":"function","function":{"name":"schedule_list","description":"List the user's scheduled tasks (id, name, kind, next due, run count, enabled, plus FAILING/self-tuned health markers) — check before creating a duplicate, and to find ids for schedule_update/schedule_delete.","parameters":{"type":"object","properties":{},"required":[]}}},
     \\{"type":"function","function":{"name":"schedule_delete","description":"Delete a scheduled task by its id (from schedule_list). Use when the user asks to cancel/remove a schedule.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"the task id"}},"required":["id"]}}},
-    \\{"type":"function","function":{"name":"sync_dir","description":"PROJECT a folder from the user's machine into this conversation's workdir (read-only copy, hash-diffed: only changed files transfer, the source is NEVER written back to). Use when the user points you at a project that lives OUTSIDE the workdir — an app inside a game-engine folder, a repo elsewhere on disk, an immutable system — so you AND any hive you cast can work with its files. Re-run it to refresh (cheap: unchanged files skip). Text files only, capped 64 files / 4MB — project the SPECIFIC subfolder that matters, not a whole engine install.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"ABSOLUTE folder on the user's machine (e.g. C:/dev/mygame/src or /home/u/app — no ~, expand it first)"},"as":{"type":"string","description":"optional folder name inside the workdir (default: the source folder's name)"}},"required":["path"]}}}
+    \\{"type":"function","function":{"name":"sync_dir","description":"PROJECT a folder from the user's machine into this conversation's workdir (read-only copy, hash-diffed: only changed files transfer, the source is NEVER written back to). Use when the user points you at a project that lives OUTSIDE the workdir — an app inside a game-engine folder, a repo elsewhere on disk, an immutable system — so you AND any hive you cast can work with its files. Re-run it to refresh (cheap: unchanged files skip). Text files only, capped 64 files / 4MB — project the SPECIFIC subfolder that matters, not a whole engine install.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"ABSOLUTE folder on the user's machine (e.g. C:/dev/mygame/src or /home/u/app — no ~, expand it first)"},"as":{"type":"string","description":"optional folder name inside the workdir (default: the source folder's name)"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"open_subchat","description":"BRANCH this conversation into a SUB-CHAT (a tab of this chat, max 5) and start it working on a goal — for a side-thread worth its own focused context: a tangent the user raised, a parallel angle of the main work, a deep-dive that would clutter this thread. The sub-chat is a full conversation in the SAME family: one shared workspace (files), one shared memory (what it learns becomes recallable here and vice versa), and it sees this chat's live context every turn. Its first turn starts immediately, server-side, with this turn's models. Lighter than cast (one focused conversation, not a swarm). Tell the user which tab it opened.","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"the sub-chat's first instruction — self-contained and concrete (it also receives the primary's live context automatically)"}},"required":["goal"]}}}
 ;
 // The chat surface = the REACHABLE mind-tool subset (tools.CHAT_SCHEMA, not the full ~33-tool SCHEMA whose
 // swarm-mind/host-sim/RSI-only verbs a solo chat turn can't use) + the veil's orchestration verbs. Trimming the
@@ -3514,6 +3521,7 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (ctx.caps == .sandboxed) {
         const escalates = std.mem.eql(u8, name, "cast") or std.mem.eql(u8, name, "steer_swarm") or
             std.mem.eql(u8, name, "answer_swarm") or std.mem.eql(u8, name, "sync_dir") or
+            std.mem.eql(u8, name, "open_subchat") or // mints a new server-side turn — execution, not observation
             std.mem.startsWith(u8, name, "schedule_");
         if (escalates)
             return ctx.gpa.dupe(u8, "that is not available in this workspace — deploying swarms and scheduling runs are reserved for the server's admin, because they execute outside this conversation's sandbox.") catch null;
@@ -3530,7 +3538,51 @@ fn orchTool(app: *App, uid: u64, ctx: *tools.ToolCtx, conv: []const u8, conv_dir
     if (std.mem.eql(u8, name, "schedule_list")) return scheduleListTool(app, uid);
     if (std.mem.eql(u8, name, "schedule_delete")) return scheduleDeleteTool(app, uid, args);
     if (std.mem.eql(u8, name, "sync_dir")) return syncDirTool(app, conv, conv_dir, ctrl_cursor, args, tool_client);
+    if (std.mem.eql(u8, name, "open_subchat")) return openSubchatTool(app, uid, conv, conv_dir, trio, args);
     return null;
+}
+
+/// open_subchat — the veil branches THIS conversation into a tabbed sub-chat ("<primary>__sN") and starts
+/// its first turn. The sub-chat is a full family member: shared workspace, shared across-recall memory, a
+/// live primary-context block every turn. The spawned turn runs SERVER-SIDE (tools execute on the server in
+/// the shared workdir — no client needed) with THIS turn's model trio, through the same per-conv/per-user
+/// turn slots a message POST claims, so orchestration cannot exceed the server's concurrency contract.
+fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, trio: ModelTrio, args: []const u8) []u8 {
+    const gpa = app.gpa;
+    const A = struct { goal: []const u8 = "", topic: []const u8 = "" };
+    const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "open_subchat: could not parse args JSON");
+    defer p.deinit();
+    const goal = std.mem.trim(u8, if (p.value.goal.len > 0) p.value.goal else p.value.topic, " \r\n\t");
+    if (goal.len == 0) return orchErr(gpa, "open_subchat: 'goal' is required — the branch's own first instruction");
+    // ONE nesting level: called from a sub-chat, the new branch is a SIBLING under the same primary
+    const primary = cpaths.branchRoot(conv);
+    const at = std.mem.lastIndexOf(u8, conv_dir, "/convs/") orelse return orchErr(gpa, "open_subchat: cannot resolve the conversations root");
+    const convs_root = conv_dir[0 .. at + "/convs".len + 1]; // ".../convs/" — trailing slash for direct concat
+    var free_n: u8 = 0;
+    var n: u8 = 1;
+    while (n <= cpaths.MAX_BRANCHES) : (n += 1) {
+        var bb: [900]u8 = undefined;
+        const bdir = std.fmt.bufPrint(&bb, "{s}{s}__s{d}", .{ convs_root, primary, n }) catch continue;
+        std.Io.Dir.cwd().access(app.io, bdir, .{}) catch {
+            free_n = n;
+            break;
+        };
+    }
+    if (free_n == 0) return orchErr(gpa, "this chat already has 5 sub-chats — one must be closed (the x on its tab) before another can open");
+    var idb: [96]u8 = undefined;
+    const bid = std.fmt.bufPrint(&idb, "{s}__s{d}", .{ primary, free_n }) catch return orchErr(gpa, "open_subchat: id overflow");
+    // claim the sub-chat's turn slot exactly as the message POST does; spawnTurn's thread releases it
+    switch (beginTurn(app.io, bid, uid)) {
+        .ok => {},
+        .conv_busy => return orchErr(gpa, "that sub-chat slot already has a turn running"),
+        .user_at_cap, .server_full => return orchErr(gpa, "no free turn slot right now — work the branch idea inline, or try again in a moment"),
+    }
+    if (llm.isLocal(trio.coding.base_url) and !tryClaimLocal(app)) {
+        endTurn(app.io, bid);
+        return orchErr(gpa, "the local model has no free concurrency for a parallel sub-chat turn — work the idea inline, or switch to a hosted model for parallel branches");
+    }
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "");
+    return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
 
 /// sync_dir — PROJECT a directory from the CLIENT's machine into this conversation's workdir (read-only,
