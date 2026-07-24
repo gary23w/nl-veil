@@ -1113,9 +1113,19 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
         defer out.deinit(gpa);
         for ([_][]const u8{ core, learned, skills }) |part| {
             if (part.len == 0) continue;
-            if (out.items.len > 0) out.append(gpa, '\n') catch {};
-            out.appendSlice(gpa, part) catch {};
+            var pit = std.mem.splitScalar(u8, part, '\n');
+            while (pit.next()) |ln| {
+                // LEXICAL RELEVANCE FLOOR (engine.hiveRelevant's twin thresholds): spreading recall always
+                // returns its argmax, so a scope holding ANY residue answers EVERY query with it — observed
+                // live: a zoo-facts task recalled book prose sharing one incidental stem. Keep a hit only
+                // when it shares >=2 distinct query terms, or one term of >=8 chars (a rare specific word).
+                // The LLM rerank below still refines further when a gateway is configured.
+                if (!lexRelevant(p.value.query, ln)) continue;
+                if (out.items.len > 0) out.append(gpa, '\n') catch {};
+                out.appendSlice(gpa, ln) catch {};
+            }
         }
+        if (out.items.len == 0) return dupe(gpa, "(the hive holds facts but none share real vocabulary with that query — refine the query, or research it externally rather than assuming the hive already knows)");
         // SECOND-STAGE RERANK: first-stage assoc always returns its argmax even when nothing truly matches the
         // query. When a gateway (BYOK) endpoint is configured and there's a real field to reorder, judge the
         // hits against the query through the selected API: reorder+filter to the genuinely-relevant ones, or
@@ -2821,6 +2831,54 @@ fn absorbFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     if (st.evicted > 0)
         return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} written into scope '{s}' — BUT the scope hit its fact cap and evicted {d} oldest fact(s) during the load. Only the LAST part of the document (and whatever else survived) is recallable; earlier content is GONE from memory. Do not summarize from recall alone — re-read the source file for anything before the retained tail.", .{ label, st.facts, st.stored, scope, st.evicted }) catch dupe(gpa, "absorbed with evictions — earlier content was dropped");
     return std.fmt.allocPrint(gpa, "absorbed {s}: {d} facts distilled, {d} stored into its own document scope '{s}'. Targeted questions: recall_hive finds it automatically. Whole-document work (summarize/outline/review): page it IN ORDER with read_doc (scope '{s}') — never build a summary from recall fragments.", .{ label, st.facts, st.stored, scope, scope }) catch dupe(gpa, "absorbed");
+}
+
+/// LOCAL TWIN of the chat engine's hiveRelevant thresholds, applied per fact line (see recall_hive):
+/// does this line share real vocabulary with the query? Keep when >=2 distinct query terms (each >=4
+/// chars) appear, or one >=8-char term (a rare specific word). Substring, case-insensitive — permissive
+/// enough that a related fact never drops, strict enough that ONE incidental shared stem no longer
+/// carries residue prose into an unrelated task (observed live: book fragments answering a zoo query).
+fn lexRelevant(query: []const u8, line: []const u8) bool {
+    var distinct: usize = 0;
+    var longest: usize = 0;
+    var seen: [24][24]u8 = undefined;
+    var seen_len: [24]usize = .{0} ** 24;
+    var seen_n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, query, " \t\r\n.,;:!?\"'()[]{}");
+    while (it.next()) |t| {
+        if (t.len < 4 or t.len > 24) continue;
+        var dup = false;
+        var si: usize = 0;
+        while (si < seen_n) : (si += 1) {
+            if (std.ascii.eqlIgnoreCase(seen[si][0..seen_len[si]], t)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (seen_n < seen.len) {
+            @memcpy(seen[seen_n][0..t.len], t);
+            seen_len[seen_n] = t.len;
+            seen_n += 1;
+        }
+        if (std.ascii.indexOfIgnoreCase(line, t) != null) {
+            distinct += 1;
+            longest = @max(longest, t.len);
+        }
+    }
+    if (seen_n == 0) return true; // a query with no real terms can't discriminate — pass everything through
+    return distinct >= 2 or (distinct >= 1 and longest >= 8);
+}
+
+test "lexRelevant: shared vocabulary keeps a line, one incidental stem does not" {
+    // the live failure shape: book prose vs a zoo query sharing nothing real
+    try std.testing.expect(!lexRelevant("toronto zoo animals list", "[The Green Overcoat - Hilaire Belloc] Most of the men were standing up in the audience."));
+    // one long specific term is enough
+    try std.testing.expect(lexRelevant("stratoflights regulations", "Canadian balloon launches follow Transport Canada regulations for unmanned free balloons."));
+    // two shorter shared terms are enough
+    try std.testing.expect(lexRelevant("weather balloon parts", "the balloon envelope and parachute are the two parts that fail first"));
+    // a vocabulary-free query cannot discriminate — everything passes (the rerank still refines)
+    try std.testing.expect(lexRelevant("y?", "anything at all"));
 }
 
 // ------------------------------------------------------------------------------------------ poll (watch to completion)
