@@ -9,6 +9,10 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
+| H17 | med | `LoginGuard.by_ip` grows without bound: only `success()` removes an entry, and lock expiry leaves the record behind. A distributed guesser sweeping source addresses grows the map forever with nothing to evict it. Add TTL eviction on the sliding-window boundary. |
+| H18 | med | Latent use-after-free: `ApiKeys.list()` returns `View.id` borrowing the map's own key memory, which `revoke()` frees. Not reachable today (keyList copies into res.arena and is a separate request), but a future in-process list→revoke→read sequence would read freed memory. Return owned ids or document the borrow at the call site. |
+| H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
+| H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
@@ -291,3 +295,47 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   incomplete, and the case file landed inside the same increment.
 - next: the privilege boundary is the biggest untested surface (entitlements, neurons ledger,
   api_keys, login_guard, the control bus) — fanning out test writers.
+
+## 0015 — 2026-07-24 — the privilege boundary gets tests; a billing overflow panic found and fixed
+- did: Three parallel test writers took the untested security surface: `plan/entitlements` (4) and
+  `plan/neurons` (15), `auth/api_keys` (6) and `auth/login_guard` (5), `worker/control/writer` (3)
+  and `worker/browser/util` (5) — 38 tests, each pinning the module's REAL constants. Registered
+  the five unreachable modules in tests.zig (browser/util was already reachable via manager).
+  One justified non-test extraction: `controlLine` pulled verbatim out of `swarmControl` so the
+  wire format is testable without an HTTP harness (same move as evcursor in 0014).
+  REAL BUG FIXED — `plan/neurons.status()` overflowed: `addTopup`/`charge` write saturating (`+|`)
+  so topup/used can legitimately reach maxInt(u64), but status() summed with a plain `+` and
+  `@intCast`ed to i64 — a panic inside an httpz handler in Debug, UB and a silently wrong balance
+  in the shipped ReleaseFast build, reachable from `POST /admin/billing`, which parses `topup` as
+  a raw u64 from the body and passes it unclamped. Fix: `+|` plus `std.math.cast(...) orelse
+  maxInt(i64)` on both sides.
+- verified: per-lane green during the run; the whole tree verified together in 0016 below.
+- learned: (1) `std.Io.Threaded.init(gpa, .{})` hands spawned children an EMPTY environment — under
+  `zig build test` the neuron binary came up with no TEMP/SystemRoot, its writes silently failed
+  into a `catch {}`, and the ledger read as permanently empty. Pass `.environ = .{ .block =
+  .global }` (as worker/tools.zig:6246 already does) for any test that spawns a real subprocess.
+  (2) The control-bus escaping is load-bearing SECURITY, not tidiness: a steer text carrying
+  `}\n{"op":"stop"}` must stay one `say` op — proven counterfactually, a naive writer turns it
+  into three lines and the worker honors the injected stop.
+- ratchet: CI now runs `sh scripts/check.sh --full` instead of re-spelling the gates in YAML — one
+  definition of done for CI and both local oracles, so they cannot drift.
+- next: H16 (the duplicated billing rate table) is the sharpest remaining item — two sources of
+  truth for what a user is charged.
+
+## 0016 — 2026-07-24 — H16 CLOSED: the billing copies can no longer drift
+- did: The token→neuron rate table exists twice — `plan/neurons.zig` neuronsForModel (the control
+  plane charges) and `run.zig` neuronsForCfModel (the worker reports). Reading the code first paid
+  off: the duplication is DELIBERATE and documented ("kept INLINE so the worker stays decoupled
+  from the control-plane billing module"), so collapsing it would have broken a real boundary.
+  Kept the boundary, killed the drift instead: a test in run.zig with the `@import` INSIDE the
+  test block (nothing coupled outside the test binary) asserts the two agree on all four rate rows
+  plus their capitalized spellings, the empty/unknown default, a combined call that pins
+  independent flooring, and maxInt saturation. A rate edited in one copy now fails the build.
+- verified: covered by the same final oracle as 0015 (below/at commit time) — ALL GREEN.
+- learned: "duplicated code" is not automatically a defect to collapse. Read the WHY first: here
+  the copy is an architectural boundary, and the right fix was a test-only bridge rather than a
+  production import. Same shape as evcursor (0014) but the opposite conclusion about merging.
+- ratchet: the pattern itself — a test-block-local `@import` is how this repo can pin agreement
+  between deliberately decoupled copies without linking them.
+- next: H17-H20 (unbounded IP map, latent list/revoke UAF, revoked-key startup cost, lowercase-only
+  model matching); H10 SELF lane on the horizon; H14 still the owner's call.

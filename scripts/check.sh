@@ -66,7 +66,7 @@ fi
 gate "catalog sync (models.yaml vs web/public/models.json)" "$PY" scripts/gen-models-json.py --check
 gate "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
 gate "zig build test (src suite)" "$ZIG" build test $CACHE_ARGS
-( cd desk && exit 0 ) || { echo "no desk/ package"; exit 1; }
+[ -d desk ] || { echo "no desk/ package"; exit 1; }
 gate_desk() { ( cd desk && "$ZIG" build test $CACHE_ARGS ); }
 gate "zig build test (desk suite)" gate_desk
 if [ "${1:-}" = "--full" ]; then
