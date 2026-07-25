@@ -159,6 +159,15 @@ pub fn build(b: *std.Build) void {
     });
     tests.root_module.addImport("httpz", httpz.module("httpz"));
     tests.root_module.addImport("modelcfg", modelcfg); // the catalog module carries its own models.yaml embed
+    // The SAME web assets the exe embeds (above). Without these the test module cannot even name
+    // ASSET_HTML/ASSET_JS — `@embedFile("index.html")` fails to resolve — so no test could assert
+    // anything about the shipped page. It went unnoticed because Zig's analysis is lazy: main.zig
+    // compiles fine under test right up until some test actually REFERENCES one of these consts,
+    // which nothing did until the homepage-route audit. Same lazy-collection trap as the tests that
+    // silently never ran (ledger 0029), wearing different clothes. (0077)
+    inline for (.{ "index.html", "app.js", "styles.css", "models.json" }) |asset| {
+        tests.root_module.addAnonymousImport(asset, .{ .root_source_file = b.path("web/public/" ++ asset) });
+    }
     addLua(b, tests.root_module); // src/plug/* tests bind the embedded Lua
     // The suite is server-side only and never links raylib, so it always sees gui=false — a test module that
     // pulled the GUI in would need GL on every CI box, which is exactly what -Dapp=false exists to avoid.

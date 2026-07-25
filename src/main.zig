@@ -1480,3 +1480,39 @@ test "the public list stays honest: every entry is a real, still-ungated route" 
         }
     }
 }
+
+test "the homepage only references assets the router actually serves" {
+    // index.html's own comment records the bug this prevents: "/icon.png has no route on the server,
+    // so a linked icon 404s on every load". Two things that must agree — the URLs baked into the
+    // page and the route table below — with nothing but attention holding them together. Add a
+    // reference without a route (or rename a route and miss the page) and the build stays green
+    // while every visitor silently 404s on an asset.
+    var refs: usize = 0;
+    for ([_][]const u8{ "href=\"", "src=\"" }) |attr| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, ASSET_HTML, i, attr)) |at| {
+            const vs = at + attr.len;
+            const ve = vs + (std.mem.indexOfScalarPos(u8, ASSET_HTML, vs, '"') orelse break) - vs;
+            const url = ASSET_HTML[vs..ve];
+            i = ve;
+            // Same-origin absolute paths only: data: URIs and anything external are not ours to serve.
+            if (url.len < 2 or url[0] != '/') continue;
+            refs += 1;
+
+            var route_buf: [128]u8 = undefined;
+            if (url.len + 16 > route_buf.len) return error.UrlTooLongForAudit;
+            // The needle is SPLIT on purpose. The router audit above scans this same file's source
+            // for any line containing `router.` and reads it as a route declaration — so writing
+            // this contiguously makes THIS line look like a route named "{s}" and fails that test.
+            // Two source-reading audits living in one file will read each other; keep needles apart.
+            const needle = try std.fmt.bufPrint(&route_buf, "router" ++ ".get(\"{s}\"", .{url});
+            if (std.mem.indexOf(u8, MAIN_SRC, needle) == null) {
+                std.debug.print("\nindex.html references '{s}' but no route serves it — every load 404s on it\n", .{url});
+                return error.HomepageAssetHasNoRoute;
+            }
+        }
+    }
+    // Not vacuous: the page really does carry same-origin references, so the loop above did work.
+    // If a rewrite ever inlines everything, this floor fails loudly rather than passing on zero.
+    try std.testing.expect(refs >= 4);
+}

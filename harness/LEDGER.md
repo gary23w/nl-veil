@@ -1910,3 +1910,35 @@ edit, confirm it applied, then run.
 - ratchet: the gate itself, plus the corrected note.
 - next (verified): `index.html` and `styles.css` still have no structural check — a gutted or
   truncated one would ship the same way. Named as a real remaining gap, not as work I started.
+
+## 0077 — 2026-07-25 — the test binary could not see the shipped page at all
+- did: followed 0076's named gap — `index.html` had no structural check. Its own comment records the
+  bug worth preventing: "/icon.png has no route on the server, so a linked icon 404s on every load".
+  That is two things that must agree — the URLs baked into the page and main.zig's route table —
+  held together by attention. Now audited: every same-origin `href`/`src` in the page must have a
+  matching route, with a floor (>= 4 refs) so a rewrite that inlines everything fails loudly rather
+  than passing on zero.
+- FOUND, and bigger than the test: `@embedFile("index.html")` **does not resolve in the test build**.
+  build.zig adds the four web assets to `exe.root_module` only, so the test module cannot even NAME
+  `ASSET_HTML`/`ASSET_JS`/`ASSET_CSS`/`ASSET_MODELS`. No test could ever assert anything about the
+  shipped page, and nobody noticed because Zig's analysis is LAZY: main.zig compiles fine under test
+  right up until a test actually references one of those consts — which nothing did until this one.
+  Same trap as ledger 0029's silently-uncollected tests, wearing different clothes: absence of a
+  reference looked identical to absence of a problem. Fixed in build.zig; the test module now gets
+  the same four imports the exe does.
+- FOUND, second: my needle `router.get("{s}"` made the PRE-EXISTING router audit fail — that audit
+  scans this same file's source for any line containing `router.` and parses it as a declaration, so
+  my format string read as a route named `{s}`. Split the literal (`"router" ++ ".get(\"{s}\""`)
+  with a comment saying why. Worth knowing generally: two source-reading audits in one file WILL
+  read each other, and the second one written is the one that discovers it.
+- verified: src suite exit 0. Counterfactual with the injection printed — adding a
+  `href="/nonexistent-asset.png"` fails the new test with the URL named and the consequence spelled
+  out. Full oracle green.
+- learned: the interesting defect was not the missing test, it was that the missing test was
+  IMPOSSIBLE to write and nothing said so. A capability gap in the build hid behind lazy analysis
+  and looked exactly like "nobody got around to it". When a whole category of assertion is absent,
+  check whether it is unwritten or unwritable before assuming the former.
+- ratchet: the build.zig imports (unlocks asset assertions generally, not just this one) and the
+  route audit.
+- next (verified): `styles.css` is partly covered by the `[theme]` palette signal — a truncation
+  losing slots would trip it. `app.js` now parses (0076). No further web-asset gap identified.
