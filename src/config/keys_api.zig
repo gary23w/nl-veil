@@ -15,7 +15,7 @@ pub fn putKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = (try req.json(KeyReq)) orelse return badReq(res, "bad body");
     app.vault.put(u.id, body.provider, body.key, body.base_url) catch |e| return badReq(res, switch (e) {
         error.BadProvider => "invalid provider (use a-z0-9-_ , <=32 chars)",
-        error.BadKey => "invalid key (1..512 chars, no quotes/backslashes/control chars)",
+        error.BadKey => "invalid key (1..512 chars, valid UTF-8, no quotes/backslashes/control chars)",
         error.BadBaseUrl => "invalid base_url",
         else => "could not store key",
     });

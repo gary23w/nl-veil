@@ -213,9 +213,15 @@ pub const KeyVault = struct {
         for (p) |c| if (!(std.ascii.isAlphanumeric(c) or c == '-' or c == '_')) return false;
         return true;
     }
+    /// The record is built by interpolating this value straight into a JSON string and read back
+    /// through `std.json`, so what this admits has to be what the READER can recover. Quotes,
+    /// backslashes and control bytes would break out of the string; invalid UTF-8 passes every
+    /// byte check but makes std.json reject the whole record with SyntaxError — which meant a key
+    /// could be accepted, sealed, answered 201 Created, and then be permanently unresolvable, with
+    /// the miss cached as "no key here". Valid multi-byte UTF-8 is unaffected.
     fn cleanValue(s: []const u8) bool {
         for (s) |c| if (c == '"' or c == '\\' or c < 0x20) return false;
-        return true;
+        return std.unicode.utf8ValidateSlice(s);
     }
     fn scopeKey(uid: u64, provider: []const u8, buf: *[80]u8) []const u8 {
         return std.fmt.bufPrint(buf, "kv_{d}_{s}", .{ uid, provider }) catch "";
@@ -775,6 +781,36 @@ test "cleanValue is the record's JSON boundary: what it accepts round-trips thro
     const up = try std.json.parseFromSlice(StoredKey, gpa, utf, .{ .ignore_unknown_fields = true });
     defer up.deinit();
     try std.testing.expectEqualStrings("clé-café", up.value.key);
+}
+
+test "cleanValue rejects invalid UTF-8, because the reader would refuse the record it produces" {
+    const gpa = std.testing.allocator;
+    // Bytes that clear every character check (no quote, no backslash, nothing under 0x20) but do
+    // not form UTF-8: a lone continuation byte, a truncated two- and three-byte sequence, a raw
+    // 0xFF, and a valid key with one stray high byte pasted into the middle.
+    const bad = [_][]const u8{
+        "\x80",
+        "sk-live\xC3",
+        "\xE2\x82",
+        "\xFF\xFE",
+        "sk-live-\xC0\xAFabc",
+    };
+    for (bad) |b| {
+        try std.testing.expect(!KeyVault.cleanValue(b));
+
+        // THE COUNTERFACTUAL, and the reason this is a rejection rather than a nicety: the old
+        // check passed these, the record was sealed and stored, 201 Created was returned — and
+        // then every read of it failed here, permanently, with the miss cached as "no key".
+        const rec = try std.fmt.allocPrint(gpa, "{{\"key\":\"{s}\",\"base_url\":\"\",\"created\":7}}", .{b});
+        defer gpa.free(rec);
+        try std.testing.expectError(
+            error.SyntaxError,
+            std.json.parseFromSlice(StoredKey, gpa, rec, .{ .ignore_unknown_fields = true }),
+        );
+    }
+    // The boundary stays where it was for everything legitimate: ASCII and real multi-byte UTF-8.
+    try std.testing.expect(KeyVault.cleanValue("sk-live-0123456789"));
+    try std.testing.expect(KeyVault.cleanValue("clé-café-日本語-🔑"));
 }
 
 // ------------------------------------------------------------------ the half that needs a real datastore
