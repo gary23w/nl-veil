@@ -225,6 +225,137 @@ pub fn authErr(res: *httpz.Response, e: anyerror) !void {
 }
 
 // ---------------------------------------------------------------------------
+// TEST HARNESS. Handlers all take `*App`, and App wires seven subsystems, which is why every
+// handler in this repo was untested and why each increment had to extract a pure helper first
+// (worker/evcursor.zig, control/writer's controlLine, plan/parsePlan) to get anything under test.
+//
+// It turns out to be cheap: every subsystem's init is pure bookkeeping — none of them touch the
+// disk or spawn anything until first use, and the neuron-backed ones fail open when the binary
+// is absent. So a fully-wired App over a throwaway data dir is just this. Pair it with
+// `httpz.testing.init(.{})` for the request/response side:
+//
+//     var ta = try testApp(std.testing.allocator, io, "zig-myhandler-tmp");
+//     defer ta.deinit();
+//     var web = httpz.testing.init(.{});
+//     defer web.deinit();
+//     web.header("authorization", "Bearer nlk_whatever");
+//     try std.testing.expect(requireUser(&ta.app, web.req, web.res) == null);
+//
+// It is HEAP-allocated on purpose: App holds pointers INTO this struct, so it must not move.
+// ---------------------------------------------------------------------------
+
+pub const TestApp = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []u8,
+    auth: Auth,
+    sup: Supervisor,
+    audit: AuditLog,
+    guard: LoginGuard,
+    vault: KeyVault,
+    cfg: ServerConfig,
+    reg: recipes.Registry,
+    app: App,
+
+    pub fn deinit(self: *TestApp) void {
+        const gpa = self.gpa;
+        const io = self.io;
+        const root = self.root;
+        self.reg.deinit();
+        self.vault.deinit();
+        self.guard.deinit();
+        gpa.free(self.audit.path); // AuditLog.init allocPrints its path and has no deinit
+        gpa.destroy(self);
+        std.Io.Dir.cwd().deleteTree(io, root) catch {};
+        gpa.free(root);
+    }
+};
+
+/// TEST ONLY. A fully-wired `App` over a throwaway `root` data dir (created here, deleted by
+/// `deinit`). `keys`, `ledger` and `plugs` stay null — a test that needs one sets it. The neuron
+/// binary is pointed at the repo's `bin/` so a test CAN go live; when it is absent every
+/// neuron-backed call fails open, which is what keeps this usable in CI.
+pub fn testApp(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !*TestApp {
+    const Neuron = @import("../worker/neuron/client.zig").Neuron;
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const self = try gpa.create(TestApp);
+    errdefer gpa.destroy(self);
+    self.gpa = gpa;
+    self.io = io;
+    self.root = try gpa.dupe(u8, root);
+
+    const db = try std.fmt.allocPrint(gpa, "{s}/test.db", .{root});
+    defer gpa.free(db);
+    const nb = Neuron.init(gpa, io, "bin/neuron.exe", db);
+
+    self.auth = Auth.init(gpa, nb);
+    self.sup = Supervisor.init(gpa, io, "bin/neuron.exe");
+    self.audit = AuditLog.init(gpa, io, self.root);
+    self.guard = LoginGuard.init(gpa, io);
+    self.vault = KeyVault.init(gpa, io, nb, [_]u8{0x5A} ** 32); // fixed, obviously-fake test key
+    self.cfg = ServerConfig.init(gpa, io, self.root);
+    self.reg = .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+
+    self.app = .{
+        .gpa = gpa,
+        .io = io,
+        .auth = &self.auth,
+        .sup = &self.sup,
+        .audit = &self.audit,
+        .login_guard = &self.guard,
+        .vault = &self.vault,
+        .data = self.root,
+        .server_key = [_]u8{0x5A} ** 32,
+        .cfg = &self.cfg,
+        .recipes = &self.reg,
+    };
+    return self;
+}
+
+test "the gate every route depends on: an unauthenticated request is refused, not admitted" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try testApp(gpa, io, "zig-http-app-tmp");
+    defer ta.deinit();
+
+    // No credential at all.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        try std.testing.expect(requireUser(&ta.app, web.req, web.res) == null);
+        try web.expectStatus(401);
+    }
+    // A session cookie that names no session.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", COOKIE ++ "=not-a-real-session");
+        try std.testing.expect(requireUser(&ta.app, web.req, web.res) == null);
+        try web.expectStatus(401);
+    }
+    // A bearer key, with the key store not even wired (app.keys is null) — the API-key arm must
+    // not admit anyone just because it cannot check.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("authorization", "Bearer nlk_0000000000000000000000000000000000000000000000");
+        try std.testing.expect(requireUser(&ta.app, web.req, web.res) == null);
+        try web.expectStatus(401);
+    }
+    // requireAdmin is strictly narrower: no user means no admin, and it says 401 too.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        try std.testing.expect(requireAdmin(&ta.app, web.req, web.res) == null);
+        try web.expectStatus(401);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tests — the two primitives the rest of the server builds its guarantees on:
 // jstr (every hand-rolled JSON line in this repo escapes through it) and appendFile
 // (every append-log the byte-cursor readers poll). The handler helpers need an httpz

@@ -61,6 +61,29 @@ is not.
   passing mid-test cannot flip a verdict. A synthetic `t = 1_000_000` put a "still locked" record
   1.7 billion seconds in the past (0017).
 
+## HTTP handlers
+
+Do NOT extract a pure helper just to get a handler under test — that was the workaround before the
+harness existed. `http.testApp` builds a fully-wired `App` over a throwaway data dir, and
+`httpz.testing` (vendored) supplies the request/response side:
+
+```zig
+var ta = try @import("../gateway/http.zig").testApp(std.testing.allocator, io, "zig-mything-tmp");
+defer ta.deinit();
+var web = httpz.testing.init(.{});
+defer web.deinit();
+web.header("authorization", "Bearer nlk_obviously-fake");
+web.param("id", "abc");            // route params
+web.json(.{ .provider = "openai" }); // request body
+try myHandler(&ta.app, web.req, web.res);
+try web.expectStatus(400);
+```
+
+`keys`, `ledger` and `plugs` start null — set them if the handler needs one. Registering a real
+user needs the neuron binary, so prefer the unauthenticated and rejection paths (they are the
+security-relevant ones anyway) and skip honestly for the rest. (Extraction is still right when the
+LOGIC deserves to be its own tested unit — evcursor, parsePlan — just not as a testing workaround.)
+
 ## Proving a property instead of a spelling
 
 - For escaping, **round-trip through a real parser** and compare the recovered value, rather than

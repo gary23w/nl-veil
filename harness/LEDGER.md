@@ -9,7 +9,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
-| H21 | med | No HTTP-handler test harness, which is why every increment so far had to extract a pure helper first (evcursor, controlLine, parsePlan, jstrAlloc) to get anything under test. SCOPED: `vendor/httpz/src/testing.zig` already provides what's needed on the request/response side (`testing.init(config)`, `.param()`, `.header()`, `.json()`, `.expectStatus()`, `.getJson()`). The blocker is `App`: handlers need `*Auth` (neuron-db-backed — `warm()` spawns the neuron binary), `*Supervisor`, `*AuditLog`, `*LoginGuard`, `*KeyVault`, `*ServerConfig`, `*recipes.Registry`. Two candidate shapes — a `testApp()` builder that stubs the neuron-backed pieces and skips honestly when the binary is absent, or narrowing handler signatures to the fields they actually use. Would unlock admin_service, auth_api, keys_api, deploy/service, chat/service and fanout at once. |
+| H24 | med | The handler harness exists now (`http.testApp`) — USE it: admin_service, auth_api, keys_api, deploy/service, chat/service and fanout are all still untested, and their auth gates, status codes and error mappings are now reachable from a test. Registering a real user needs the neuron binary, so cover the unauthenticated/rejection paths first and skip honestly for the rest. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
@@ -493,3 +493,24 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   the gap sat between two correct-looking halves.
 - ratchet: none this sitting.
 - next: H21 (App test-constructor) is the last big unlock; desk package coverage in parallel.
+
+## 0024 — 2026-07-24 — H21 CLOSED: handlers are testable, and it cost 60 lines
+- did: `http.testApp(gpa, io, root)` builds a fully-wired `App` over a throwaway data dir and
+  `TestApp.deinit` tears it down. The scoping in H21 assumed this was expensive; reading the code
+  first showed every subsystem's `init` is pure bookkeeping — none touch the disk or spawn anything
+  until first use, and the neuron-backed ones fail open when the binary is absent, so the whole
+  harness is ~60 lines with no stubs, no interfaces and no narrowing of handler signatures.
+  Heap-allocated on purpose: `App` holds pointers INTO the struct, so it must not move. Paired
+  with `httpz.testing.init(.{})`, which was in vendor all along. First test covers the widest
+  security surface in the server — `requireUser` REFUSES rather than admits: no credential, a
+  cookie naming no session, a bearer key while the key store is not even wired (the arm that
+  cannot check must not admit), and `requireAdmin` being strictly narrower.
+- verified: Full oracle ALL GREEN, exit 0, first try.
+- learned: the estimate was wrong in the cheap direction, and only reading the constructors showed
+  it. "This needs a big harness" deserves the same five minutes of reading as "this is duplicated
+  code deserves collapsing" (0016) — both scopings were decided by what the code actually does,
+  not by what the shape suggested.
+- ratchet: `harness/TESTING.md` gained a Handlers section pointing at testApp, so the next worker
+  reaches for it instead of extracting yet another pure helper; H21 is retired and replaced by H24,
+  which names the six modules it unlocks.
+- next: H24 (handler coverage) and the desk lane; H10 SELF remains the horizon.
