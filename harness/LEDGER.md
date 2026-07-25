@@ -18,7 +18,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). PATTERN SET 0053: count, never time — `Neuron.exec` carries an `is_test`-gated `spawn_probe` and `client.zig` pins reading N records at exactly N+1 spawns. A wall-clock budget on a dev box measures Defender and gets muted. Engine hot paths still unpriced; find each one's choke point first. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
-| H12 | low | Marker debt: 23 TODO/FIXME/HACK/XXX across src + desk/src. |
+| H12-DONE | closed 0059 | Marker debt was never 23, and is not 12 either — it is effectively ZERO. Both oracles' `[markers]` signal matched `XXX` unbounded, so ten `\uXXXX` doc-comment mentions (JSON escape notation) counted as debt; word-bounding drops the class. The 2 that remain are the same comment mirrored in the httpc twins, describing a TODO in **Zig's own stdlib** (`netConnectIpWindows`), not ours. Nothing to pay down. The real defect was the signal: one that always reports phantom work is one a worker learns to skip, which costs more than the debt would have. |
 | H13 | low | check.ps1 verdict anomaly, root-cause only: the `Confirm-Gate` guard (0003) makes the verdict immune and self-diagnosing, so this is now a forensic itch — if the magenta `[h13]` trace ever fires, its typed dump IS the repro; record it here. Also remember: background task runners may re-execute an exit-1 script, truncating its output file. |
 
 ## Entries
@@ -1381,3 +1381,29 @@ edit, confirm it applied, then run.
 - ratchet: the guard itself, plus a vacuity floor (`found >= 25`) so a refactor that changes the
   dispatch idiom fails loudly instead of silently scanning nothing and passing.
 - next: H8's remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
+
+## 0059 — 2026-07-25 — H12 CLOSED: the debt was phantom, the signal was the defect
+- did: H12 sat in open items as "23 TODO/FIXME/HACK/XXX", and both oracles' `[markers]` signal
+  reported 12. The real number is effectively ZERO. Ten of the twelve were `\uXXXX` — JSON escape
+  notation inside doc comments, matched because the pattern was unbounded. The other two are the
+  same comment mirrored across the httpc twins, describing a TODO in **Zig's own stdlib**
+  (`netConnectIpWindows`), not ours. `\bXXX\b` cannot match inside `XXXX`, so word-bounding drops
+  the whole class; both scripts now report 2, and both were checked independently before the edit.
+- did: the signal, not the debt, was the thing worth fixing. One that always reports phantom work is
+  one a worker learns to scroll past — and then it is worth less than nothing, because a REAL marker
+  arriving later lands in noise the reader has already been trained to ignore. Its own header showed
+  this had happened before (an earlier pass cut 23 to 11 by going case-sensitive) and stopped short.
+- ratchet: the marker pattern is now a TWIN across check.ps1 and check.sh, and the oracle-parity
+  signal compares GATES only, so nothing policed it — the two scans are deliberately different sizes
+  and wholesale parity would be wrong. So: pin the one thing that must match. check.ps1 now fails the
+  scan if check.sh's pattern differs.
+- verified: both scans report 2 and agree; counterfactual desyncs check.sh's pattern and the new
+  signal fires, 0 signals after restore. Full oracle green.
+- learned: my FIRST counterfactual for that guard did nothing — the `sed` was over-escaped, check.sh
+  was never modified, the guard correctly stayed silent, and I read the silence as "the guard is
+  worthless". I was a step from deleting a check that works. A counterfactual has TWO halves, inject
+  and observe, and only the second is ever looked at. Every earlier one this sitting printed an
+  injection count (`grep -c` after the edit) and this one did not, which is exactly why it fooled me.
+  That is now a rule in TESTING.md: no injection count, no counterfactual.
+- next: H8's remaining engine paths. Frontier 5 src + 2 desk, all device/UI-bound. H10, H14b, H26,
+  H28 are the owner's.

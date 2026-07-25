@@ -244,12 +244,25 @@ if ($Scan) {
         Write-Host "[docs] docs-src mirror complete" -ForegroundColor Green
     }
 
-    # 5) marker debt. Case-sensitive: the markers are an uppercase convention, and insensitive
-    #    matching inflated the count with prose hits (23 vs the true 11 when this was aligned
-    #    with check.sh's grep).
+    # 5) marker debt. Case-sensitive (the markers are an uppercase convention; insensitive matching
+    #    inflated this to 23 with prose hits), and WORD-BOUNDED, which is the bigger correction: of
+    #    the 12 this reported without \b, ten were `\uXXXX` -- JSON escape notation in doc comments,
+    #    not debt. `\bXXX\b` cannot match inside `XXXX`, so the whole class drops out. A signal that
+    #    always reports phantom work is one a worker learns to skip past, which costs more than the
+    #    debt would have. Keep IDENTICAL to check.sh's grep: signal 7 below compares GATES only, so
+    #    drift between the two scans is not caught by anything (ledger 0059).
+    $markerPattern = '\bTODO\b|\bFIXME\b|\bHACK\b|\bXXX\b'
     $todo = @(Get-ChildItem (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Recurse -Filter *.zig |
-        Select-String -CaseSensitive -Pattern 'TODO|FIXME|HACK|XXX').Count
+        Select-String -CaseSensitive -Pattern $markerPattern).Count
     Write-Host "[markers] $todo TODO/FIXME/HACK/XXX across src + desk/src"
+    # The two scans are deliberately NOT the same size (check.sh's is a lighter subset), so the
+    # oracle-parity signal cannot police them wholesale. This pattern IS shared though, and it was
+    # wrong in both for as long as it existed -- so pin the one thing that must match.
+    $shScan = Join-Path $repo "scripts\check.sh"
+    if ((Test-Path $shScan) -and -not (Select-String -LiteralPath $shScan -SimpleMatch -Pattern $markerPattern -Quiet)) {
+        $signals += 1
+        Write-Host "[markers] check.sh uses a DIFFERENT marker pattern -- the two scans would report different debt" -ForegroundColor Yellow
+    }
 
     # 6) allocPrint-append leaks: appendSlice COPIES the formatted slice, so a gpa-backed
     #    allocPrint result passed inline is never freed -- a slow per-call bleed in a long-lived
