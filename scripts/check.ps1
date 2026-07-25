@@ -329,6 +329,34 @@ if ($Scan) {
         Write-Host ("[oracles] check.ps1 and check.sh gate on the same {0} things" -f $a.Count) -ForegroundColor Green
     }
 
+    # 8) JSON escapers missing the control-byte arm. This tree hand-rolls the same nine-line escaper
+    #    in a dozen places, and the bug has now come back THREE times: hub's broadcast died on a
+    #    pasted CRLF, desk/main.jesc emitted raw control bytes, and cli.jstr silently killed tool
+    #    results (0055). Bytes under 0x20 are illegal inside a JSON string, so one missing arm means
+    #    a request the server's parser rejects, with nothing printed to explain it. Each copy gets
+    #    fixed alone and the siblings stay broken, so this looks for the escape table anywhere in
+    #    src/ and desk/src/ and requires the 0x20 branch near it. A NEW copy is caught wherever it
+    #    lands -- which is the part a test in one module cannot do.
+    $noesc = @()
+    foreach ($zf in Get-ChildItem -Path (Join-Path $repo "src"), (Join-Path $repo "desk\src") -Filter *.zig -Recurse -ErrorAction SilentlyContinue) {
+        $lines = Get-Content -LiteralPath $zf.FullName -ErrorAction SilentlyContinue
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if (-not $lines[$i].Contains("'\t' =>")) { continue }
+            $hi = [Math]::Min($i + 8, $lines.Count - 1)
+            $window = ($lines[$i..$hi] -join "`n")
+            if ($window -notmatch '0x20') {
+                $noesc += ("{0}:{1}" -f $zf.FullName.Substring($repo.Length + 1), ($i + 1))
+            }
+        }
+    }
+    if ($noesc.Count -gt 0) {
+        $signals += $noesc.Count
+        Write-Host ("[jsonesc] {0} JSON escaper(s) do NOT escape bytes below 0x20 -- malformed body, request silently dropped:" -f $noesc.Count) -ForegroundColor Yellow
+        $noesc | ForEach-Object { Write-Host "    $_" }
+    } else {
+        Write-Host "[jsonesc] every JSON escaper handles the control range" -ForegroundColor Green
+    }
+
     Write-Host ""
     Write-Host ("scan done: {0} actionable signal(s). Cross-check harness/LEDGER.md open items." -f $signals) -ForegroundColor Cyan
     exit 0

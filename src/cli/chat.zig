@@ -166,15 +166,8 @@ fn readLine(ctx: *Ctx, buf: []u8) ?[]const u8 {
     return buf[0..n];
 }
 
-fn appendJsonStr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) void {
-    list.append(gpa, '"') catch return;
-    for (s) |c| switch (c) {
-        '"' => list.appendSlice(gpa, "\\\"") catch return,
-        '\\' => list.appendSlice(gpa, "\\\\") catch return,
-        '\n' => list.appendSlice(gpa, "\\n") catch return,
-        '\r' => list.appendSlice(gpa, "\\r") catch return,
-        '\t' => list.appendSlice(gpa, "\\t") catch return,
-        else => list.append(gpa, c) catch return,
-    };
-    list.append(gpa, '"') catch return;
-}
+/// The user's typed or pasted line goes into `{"text":...}` and is parsed by the server. This was a
+/// private copy that stopped at `\t` and let every other control byte through raw — so pasting
+/// terminal output to ask about it (colour is ESC, 0x1B) built invalid JSON and the message simply
+/// never sent. One escaper now (0055).
+const appendJsonStr = cli.jstr;
