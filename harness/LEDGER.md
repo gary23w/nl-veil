@@ -11,7 +11,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 |-----|-----|------|
 | H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
 | H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
-| H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
@@ -946,6 +945,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new.
 - next: H13/H20 are the low remainder; H14, H26, H10 are the owner's; coverage frontier is
   UI/device-shaped.
+
+## 0043 — 2026-07-25 — H20 CLOSED: case never changes a bill again
+- did: The neuron rate table spelled its SIZE markers both ways ("70b"/"70B") but its FAMILY markers
+  lowercase only, so `Qwen2.5-Coder-32B-Instruct` — a spelling vendors actually publish — missed the
+  qwen row and fell to the default: cheaper on input, DEARER on output, which no reading of that
+  table intends. Both copies now case-fold once and match lowercase needles, which also removes the
+  dual-spelling duplication that caused the asymmetry.
+- verified: full oracle ALL GREEN, exit 0, first try. The 0016 cross-check test is what made this
+  safe to attempt: it feeds the capitalized id to BOTH copies, so fixing plan/neurons.zig while
+  leaving run.zig alone would have failed the build rather than letting a user's REPORTED usage
+  disagree with what they are CHARGED.
+- learned: the item was filed as "pinned as-is, changing it changes real bills", which reads like an
+  owner call — but that was checkable and false. Every id in models.yaml is lowercase, so no shipped
+  configuration takes a different path; the old behaviour was not a pricing decision, it was two
+  markers written one way and two written both ways. A caveat inherited from an earlier note is
+  still a claim, and worth testing before deferring to it.
+- ratchet: none new — 0016's cross-check did the work, which is the second time that test has paid
+  for itself.
+- next: H13 is the last low item (forensic only); H14, H26, H10 are the owner's calls.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,

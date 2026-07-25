@@ -9783,13 +9783,20 @@ fn keysEnvVal(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, name: []c
 fn neuronsForCfModel(model: []const u8, ti: u64, to: u64) u64 {
     var in_per_m: u64 = 40_000;
     var out_per_m: u64 = 120_000;
-    if (std.mem.indexOf(u8, model, "70b") != null or std.mem.indexOf(u8, model, "70B") != null) {
+    // Case-folded once, lowercase needles — same shape as plan/neurons.zig, which this mirrors on
+    // purpose (the worker reports usage; the control plane charges). A capitalized family marker
+    // used to miss its row and fall to the default rate; the test below pins the two copies equal.
+    var lb: [256]u8 = undefined;
+    const n = @min(model.len, lb.len);
+    for (model[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const m = lb[0..n];
+    if (std.mem.indexOf(u8, m, "70b") != null) {
         in_per_m = 26_668;
         out_per_m = 204_805;
-    } else if (std.mem.indexOf(u8, model, "8b") != null or std.mem.indexOf(u8, model, "8B") != null) {
+    } else if (std.mem.indexOf(u8, m, "8b") != null) {
         in_per_m = 25_608;
         out_per_m = 75_147;
-    } else if (std.mem.indexOf(u8, model, "coder") != null or std.mem.indexOf(u8, model, "qwen") != null) {
+    } else if (std.mem.indexOf(u8, m, "coder") != null or std.mem.indexOf(u8, m, "qwen") != null) {
         in_per_m = 60_000;
         out_per_m = 90_909;
     }

@@ -106,11 +106,21 @@ pub const NeuronLedger = struct {
 
 pub fn neuronsForModel(model: []const u8, tokens_in: u64, tokens_out: u64) u64 {
     const Rate = struct { in_per_m: u64, out_per_m: u64 };
-    const r: Rate = if (std.mem.indexOf(u8, model, "70b") != null or std.mem.indexOf(u8, model, "70B") != null)
+    // Case-folded ONCE, then matched with lowercase needles. The parameter-count markers were
+    // already spelled both ways ("70b"/"70B"), but the family markers were not — so a vendor
+    // publishing `Qwen2.5-Coder-32B-Instruct` (as they do) missed the coder row and silently fell
+    // to the default: cheaper on input, DEARER on output, against the table's plain intent. Every
+    // id shipped in models.yaml is lowercase, so no bill changes today; this is the case that was
+    // one vendor rename away. MIRRORED in worker/run.zig — a test asserts the two agree.
+    var lb: [256]u8 = undefined;
+    const n = @min(model.len, lb.len);
+    for (model[0..n], 0..) |c, i| lb[i] = std.ascii.toLower(c);
+    const m = lb[0..n];
+    const r: Rate = if (std.mem.indexOf(u8, m, "70b") != null)
         .{ .in_per_m = 26_668, .out_per_m = 204_805 }
-    else if (std.mem.indexOf(u8, model, "8b") != null or std.mem.indexOf(u8, model, "8B") != null)
+    else if (std.mem.indexOf(u8, m, "8b") != null)
         .{ .in_per_m = 25_608, .out_per_m = 75_147 }
-    else if (std.mem.indexOf(u8, model, "coder") != null or std.mem.indexOf(u8, model, "qwen") != null)
+    else if (std.mem.indexOf(u8, m, "coder") != null or std.mem.indexOf(u8, m, "qwen") != null)
         .{ .in_per_m = 60_000, .out_per_m = 90_909 }
     else
         .{ .in_per_m = 40_000, .out_per_m = 120_000 };
@@ -145,21 +155,27 @@ test "neuronsForModel: the three Workers AI models the catalog ships each bill a
     try std.testing.expectEqual(@as(u64, 90_909), neuronsForModel(cfq, 0, 1_000_000));
 }
 
-test "neuronsForModel: family matching is first-match-wins, and only the parameter-count marker is case-tolerant" {
+test "neuronsForModel: family matching is first-match-wins, and case never changes the bill" {
     // Position in the if-chain is the whole tie-break rule: a qwen coder at 70b bills as 70b, not as coder.
     try std.testing.expectEqual(@as(u64, 26_668), neuronsForModel("@cf/qwen/qwen2.5-coder-70b-instruct", 1_000_000, 0));
     // …and 8b likewise outranks coder/qwen, for the same reason.
     try std.testing.expectEqual(@as(u64, 25_608), neuronsForModel("@cf/qwen/qwen2.5-coder-8b-instruct", 1_000_000, 0));
 
-    // Both spellings of the size marker are searched for explicitly, so case does not change the bill.
+    // The size markers were always case-tolerant.
     try std.testing.expectEqual(@as(u64, 26_668), neuronsForModel("Llama-3.3-70B-Instruct", 1_000_000, 0));
     try std.testing.expectEqual(@as(u64, 25_608), neuronsForModel("Llama-3.1-8B-Instruct", 1_000_000, 0));
 
-    // "coder"/"qwen" are matched LOWERCASE ONLY, so a capitalised vendor spelling drops to the default row
-    // (40k in / 120k out) instead of the qwen row (60k / 90.9k) — cheaper on input, dearer on output. Pinned
-    // as the behaviour that ships: every id in the catalog is lowercase, and changing it changes real bills.
-    try std.testing.expectEqual(@as(u64, 40_000), neuronsForModel("Qwen2.5-Coder-32B-Instruct", 1_000_000, 0));
-    try std.testing.expectEqual(@as(u64, 120_000), neuronsForModel("Qwen2.5-Coder-32B-Instruct", 0, 1_000_000));
+    // …and the FAMILY markers are now too. A capitalised vendor spelling used to miss the qwen row and fall
+    // to the default (40k in / 120k out) — cheaper on input, DEARER on output — which no reading of this
+    // table intends. Every id in models.yaml is lowercase, so no bill changes today; this closes the case
+    // that was one vendor rename away.
+    try std.testing.expectEqual(@as(u64, 60_000), neuronsForModel("Qwen2.5-Coder-32B-Instruct", 1_000_000, 0));
+    try std.testing.expectEqual(@as(u64, 90_909), neuronsForModel("Qwen2.5-Coder-32B-Instruct", 0, 1_000_000));
+    // Mixed case anywhere in the id lands on the same row as its lowercase twin.
+    try std.testing.expectEqual(
+        neuronsForModel("@cf/qwen/qwen2.5-coder-32b-instruct", 1_000_000, 1_000_000),
+        neuronsForModel("@CF/QWEN/QWEN2.5-CODER-32B-INSTRUCT", 1_000_000, 1_000_000),
+    );
 }
 
 test "neuronsForModel: an unknown or empty model bills at the default rate rather than going free" {
