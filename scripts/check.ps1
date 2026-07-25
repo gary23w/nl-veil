@@ -231,8 +231,15 @@ if ($Scan) {
         if (-not (Test-Path $m.docs)) { continue }
         Get-ChildItem $m.root -Recurse -Filter *.zig | ForEach-Object {
             $rel = $_.FullName.Substring($m.root.Length + 1)
-            # tests.zig and *_test.zig are test harnesses, not modules -- no case file owed.
+            # tests.zig and *_test.zig are test harnesses, not modules -- no case file owed. So is a
+            # shared test HELPER, which the name pattern misses: worker/fakehttp.zig is a canned
+            # server two test files dial, with no shipped behaviour to write a case file about, and
+            # renaming it *_test.zig to dodge this would claim it contains tests when it has none.
+            # So the file DECLARES itself instead -- a `//! TEST-ONLY` doc header -- which cannot
+            # drift from what the file is the way a filename convention can (ledger 0060).
             if ($rel -eq "tests.zig" -or $rel -like "*_test.zig") { return }
+            $head = (Get-Content -LiteralPath $_.FullName -TotalCount 1 -ErrorAction SilentlyContinue)
+            if ($head -and $head.StartsWith("//! TEST-ONLY")) { return }
             $md = Join-Path $m.docs ($rel -replace '\.zig$', '.md')
             if (-not (Test-Path $md)) { $missingDocs += ($_.FullName.Substring($repo.Length + 1)) }
         }

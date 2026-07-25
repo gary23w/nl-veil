@@ -6,8 +6,10 @@
 //! Two entry points: chat() for a one-shot system+user completion, and complete() for the agentic tool loop
 //! (a pre-built messages array + a tools array → content OR parsed tool_calls).
 const std = @import("std");
+const builtin = @import("builtin");
 const httpc = @import("httpc.zig");
 const rate = @import("rate.zig");
+const fakehttp = @import("fakehttp.zig"); // TEST ONLY: the canned gateway the H11 test at the bottom dials
 
 pub const Reply = struct {
     content: []u8,
@@ -2609,4 +2611,42 @@ test "an overlong turn drops flight LINES, never tokens" {
     try std.testing.expect(callLogDropped() > 0); // the 8KB buffer filled
     try std.testing.expectEqual(@as(u64, 500), roleCosts()[0].calls); // …and the cost table did not care
     try std.testing.expectEqual(@as(u64, 5000), roleCosts()[0].in);
+}
+
+// ---------------------------------------------------------------------------
+// H11: the in-repo stand-in. Until now "keyless runs only exercise the inline provider=mock moment"
+// and live routing needed an external endpoint, so it went untested. The canned loopback server that
+// config/local_models.zig already had is now shared (worker/fakehttp.zig), and chat() reaches it
+// through the REAL path: loopback plain-http skips the curl child, so httpc.request dials the fake
+// in-process and completeBody parses a genuine provider-shaped response.
+// ---------------------------------------------------------------------------
+
+test "chat() against a canned gateway: the real request path, and the assistant text that comes back" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-fake-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var srv: fakehttp.Server = undefined;
+    srv.start(io, fakehttp.wire(
+        \\{"choices":[{"message":{"content":"the fake answered"}}],"usage":{"prompt_tokens":11,"completion_tokens":7}}
+    )) catch return error.SkipZigTest; // no free loopback port in the scan range
+    defer srv.stop();
+
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+
+    const r = chat(gpa, io, root, "h11", base, "", "fake-model", "you are a test", "say something", 64);
+    defer gpa.free(r.content);
+
+    try std.testing.expect(r.ok);
+    try std.testing.expectEqualStrings("the fake answered", r.content);
+    // ...and it genuinely DIALED. Without this, a code path that short-circuited before the request
+    // (a cache, an early return, a mock branch) would still satisfy every assertion above.
+    try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
 }

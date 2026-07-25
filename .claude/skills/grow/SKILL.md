@@ -25,6 +25,14 @@ Run the loop:
    new capability (see `harness/HORIZON.md`) → polish. If your pick can't be verified today, shrink
    it, or split the remainder into new open items instead of half-landing it.
 
+   **Re-derive the row before you act on it.** An open item describes the tree as it was when
+   someone wrote it, and the tree moved. Three rows touched in one sitting were each wrong about
+   their own subject: H4 counted 31 untested modules when 6 remained, H12 reported 23 markers of
+   debt that were `\uXXXX` in doc comments and an upstream-Zig TODO, and H11 asked for a mock server
+   that already existed one directory away, private and unreachable — the difference between a day's
+   work and moving 76 lines. Cheap to check, and it changes what the increment IS. If the row turns
+   out to be wrong, correcting it *is* a legitimate increment; say so in the entry.
+
 4. **CHANGE** — Smallest diff that moves it. Obey the hard rules in CLAUDE.md: register new test
    files in `src/tests.zig` / `desk/src/tests.zig`, mirror the httpc twins, re-read files right
    before editing, feed `docs/docs-src/` when modules appear or move. Writing tests? `harness/

@@ -17,7 +17,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **5 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `browser/{broker,host,session}`, `desk/{main,tray}` (`plan/billing_seam` covered 0054). Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). PATTERN SET 0053: count, never time — `Neuron.exec` carries an `is_test`-gated `spawn_probe` and `client.zig` pins reading N records at exactly N+1 spawns. A wall-clock budget on a dev box measures Defender and gets muted. Engine hot paths still unpriced; find each one's choke point first. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
-| H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
+| H11-DONE | closed 0060 | In-repo stand-in gateway now exists at `src/worker/fakehttp.zig` — and it mostly already did: `config/local_models.zig` had a well-built canned loopback server, private and named for one caller, so nobody could reach it. Shared rather than re-built (a second copy is what 0055 spent an entry undoing), and `llm.chat()` is now driven through the REAL path against it: loopback plain-http skips the curl child, so `httpc.request` dials the fake in-process and `completeBody` parses a genuine provider-shaped response. NEXT if wanted: the server drains and discards the request, so nothing yet asserts the REQUEST body (trio routing per role, the tools array, temperature quirks) — capturing it is the natural extension and would let the trio-routing claims be checked end to end rather than by source audit. |
 | H12-DONE | closed 0059 | Marker debt was never 23, and is not 12 either — it is effectively ZERO. Both oracles' `[markers]` signal matched `XXX` unbounded, so ten `\uXXXX` doc-comment mentions (JSON escape notation) counted as debt; word-bounding drops the class. The 2 that remain are the same comment mirrored in the httpc twins, describing a TODO in **Zig's own stdlib** (`netConnectIpWindows`), not ours. Nothing to pay down. The real defect was the signal: one that always reports phantom work is one a worker learns to skip, which costs more than the debt would have. |
 | H13 | low | check.ps1 verdict anomaly, root-cause only: the `Confirm-Gate` guard (0003) makes the verdict immune and self-diagnosing, so this is now a forensic itch — if the magenta `[h13]` trace ever fires, its typed dump IS the repro; record it here. Also remember: background task runners may re-execute an exit-1 script, truncating its output file. |
 
@@ -1407,3 +1407,38 @@ edit, confirm it applied, then run.
   That is now a rule in TESTING.md: no injection count, no counterfactual.
 - next: H8's remaining engine paths. Frontier 5 src + 2 desk, all device/UI-bound. H10, H14b, H26,
   H28 are the owner's.
+
+## 0060 — 2026-07-25 — H11 CLOSED: the stand-in gateway already existed, it just could not be reached
+- did: H11 asked for an in-repo mock-LLM server so live routing could be tested without an external
+  endpoint. Before building one I went looking, and `config/local_models.zig` already had it: a
+  careful canned loopback server (binds a scanned port, counts connections, drains the request head
+  first so httpc's write-then-read cannot reset the peer, and a `stop` that dials its OWN port so a
+  serve loop parked in `accept` always wakes). Private, and named `FakeOllama` for its one caller.
+  So the increment was to SHARE it, not write a second one — `src/worker/fakehttp.zig`, lifted
+  verbatim so the move cannot change behaviour, with local_models aliasing it. Copying instead would
+  have created exactly the twin 0055 spent an entry collapsing.
+- did: `llm.chat()` now runs against it through the REAL path. Loopback plain-http takes the
+  in-process branch (no curl child, no scratch files), so `httpc.request` dials the fake and
+  `completeBody` parses a genuine provider-shaped `{"choices":[{"message":{"content":…}}]}`. The
+  test asserts the returned text AND `conns == 1` — without the second, a path that short-circuited
+  before the request (a cache, an early return, a mock branch) would satisfy every other assertion.
+- verified: src suite exit 0. Counterfactual with the injection PRINTED first (0059's new rule):
+  expecting the wrong string fails the named test, so it genuinely runs rather than skipping on a
+  busy port. Full oracle green.
+- learned: "build a mock server" was the wrong framing and I nearly took it at face value. The open
+  item described a MISSING capability when the real state was an UNREACHABLE one — the difference
+  between a day's work and moving 76 lines. Read the row, then go look; an item written months ago
+  describes the tree as it was, and this one had been overtaken by 0044's local_models work without
+  anyone updating it. Same failure as H4's stale count and H12's phantom debt: three of the rows I
+  have touched this sitting were wrong about their own subject.
+- ratchet: fakehttp.zig's header names its callers and states why it is shared rather than copied,
+  so the next person reaching for a canned server finds it instead of writing a third. The new file
+  also immediately tripped `[docs]` ("no docs-src case file"), which was the signal doing its job:
+  its exclusion covered `tests.zig` and `*_test.zig` but not a shared test HELPER, which has no
+  shipped behaviour to write a case file about. Renaming it `*_test.zig` to dodge the check would
+  claim it contains tests when it has none — so the exclusion now reads a `//! TEST-ONLY` doc
+  header, which cannot drift from what the file IS the way a filename convention can. Counterfactual
+  with the injection printed: strip the header and it is flagged again.
+- next: capture the REQUEST body in fakehttp (see H11-DONE) — that turns trio routing, the tools
+  array and the temperature quirks into end-to-end assertions instead of source audits. H8's
+  remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
