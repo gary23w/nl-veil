@@ -1942,3 +1942,28 @@ edit, confirm it applied, then run.
   route audit.
 - next (verified): `styles.css` is partly covered by the `[theme]` palette signal — a truncation
   losing slots would trip it. `app.js` now parses (0076). No further web-asset gap identified.
+
+## 0078 — 2026-07-25 — the rest of the "unwritable" check, and where this sitting ends
+- did: 0077's gap was that `exe.root_module` had imports the test module lacked, making a whole
+  category of assertion impossible rather than merely unwritten. That question is mechanical, so I
+  finished it: diffed what each module is given in build.zig.
+- verified CLEAN: after 0077's fix the two differ by exactly ONE import — `desk` — and that omission
+  is deliberate and already documented in build.zig ("a test module that pulled the GUI in would
+  need GL on every CI box, which is exactly what -Dapp=false exists to avoid"), with the desk
+  package carrying its own suite. No other category of assertion is blocked by build configuration.
+  Recorded so the next worker does not re-derive the diff.
+- state of the tree at the end of this sitting, for whoever picks it up: open items are H13 (a watch
+  item — record the trace if it ever fires) and four OWNER decisions (H10 self-lane, H14b PAT
+  sealing, H26 pixel_search placement, H28 the workers_ai copy). H4's remainder is documented as
+  deliberately uncovered. Six audit sweeps this sitting found NO bugs (result enums, fixed-size
+  memcpy, security-claim strings, constant-degrading bufPrint, narrowing @intCast, module config);
+  two found real gaps (swallowed at-rest-key write; the entire web-asset surface, unparsed and
+  untestable). That ratio is the honest signal about where the remaining risk is: not in the Zig.
+- learned across the whole sitting, if only one thing survives: the recurring defect here is not
+  wrongness, it is SILENCE — a message that never sends, a test that never runs, a key that never
+  persists, a UI that never parses, each behind a green build. Every increment that mattered came
+  from asking "what would fail without saying so?" rather than "what looks wrong?".
+- verified: full oracle green.
+- ratchet: none — this entry is a recorded negative result plus a handoff, which 0067 established is
+  worth writing down rather than dressing up as work.
+- next (verified): nothing worker-actionable. The four owner decisions are the only open work.
