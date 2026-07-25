@@ -1442,3 +1442,38 @@ edit, confirm it applied, then run.
 - next: capture the REQUEST body in fakehttp (see H11-DONE) — that turns trio routing, the tools
   array and the temperature quirks into end-to-end assertions instead of source audits. H8's
   remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
+
+## 0061 — 2026-07-25 — the fake gateway now records what we SEND
+- did: 0060's stand-in drained the request and threw it away, so the tests could only prove we PARSE
+  a response. Everything about what leaves the process — which URL, which model, whether the system
+  prompt is attached at all — was still "verified" by reading the source. A provider only ever sees
+  that side. `fakehttp.Server` now captures the first request (head + body) and exposes it via
+  `request()`, and a new llm test asserts the POST path is `/v1/chat/completions` (the OpenAI route,
+  not Ollama's native one — wrong here is a 404 against a real provider), that the caller's model
+  reaches the wire rather than a default or the trio fallback, and that BOTH roles are present in
+  order. A silently dropped system prompt degrades every answer without failing anything.
+- FOUND IN MY OWN CHANGE, before commit: `startAt` did not initialise `req_len`. Callers declare
+  `var srv: Server = undefined` — they must, since the serve thread holds a pointer and the struct
+  cannot be copied into place — and `= undefined` skips field defaults. So `req_len` was garbage,
+  and `capture`'s `req.len - req_len` would underflow and memcpy past a 32 KB buffer. The suite went
+  GREEN anyway: the garbage happened not to be 0, so `first` was false and `capture` was never
+  reached. A passing run proved nothing about the path that mattered. Initialising in `startAt` is
+  the fix — an invariant belongs to the thing that establishes it, not to every caller.
+- verified: src suite exit 0; counterfactual (injection printed) on the path assertion fails the
+  named test. Full oracle green.
+- learned: a field default is a trap on any struct that must be initialised in place. `= undefined`
+  is not an unusual way to write these — it is the ONLY way when a thread takes a pointer to the
+  struct — so `req_len: usize = 0` reads like a safety net while providing none. Worse, the failure
+  is silent and load-bearing on garbage: green today, out-of-bounds write tomorrow when the stack
+  happens to hold a zero. I only caught it by asking why the first test still passed when it never
+  set the field.
+- ratchet: the comment on that line says WHY it cannot rely on the default, so the next person does
+  not "tidy" the assignment away.
+- next: I first wrote here that trio routing could now be tested end to end and that this "would
+  retire the source-audit half of trio_routing_test". WRONG, corrected before commit — read that
+  file's header. The label→role mapping is not data, it is TEN hand-written positional argument
+  lists threaded through helper chains, where swapping `think` for `prompt` still type-checks and
+  still passes everything. The audit re-derives all ten exhaustively; a live wire test would cover
+  only the one or two call sites it happened to exercise and would miss precisely the misroute the
+  audit is built to catch. It is the right tool, not a placeholder for one. Do not replace it.
+  Remaining: H8's other engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.

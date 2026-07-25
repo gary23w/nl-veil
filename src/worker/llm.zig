@@ -2650,3 +2650,46 @@ test "chat() against a canned gateway: the real request path, and the assistant 
     // (a cache, an early return, a mock branch) would still satisfy every assertion above.
     try std.testing.expectEqual(@as(u32, 1), srv.conns.load(.monotonic));
 }
+
+test "chat() sends what it claims to: the path, the model, and both message roles" {
+    // The reply-side test above proves we PARSE a response. This proves the REQUEST -- until the fake
+    // captured it, everything about what we send (which model, which URL, whether the system prompt
+    // is actually attached) was verified by reading the source and hoping. A provider only ever sees
+    // this side, so it is the half that decides whether a call works at all.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = if (builtin.os.tag == .windows) .{ .block = .global } else .{ .block = .{ .slice = std.mem.span(std.c.environ) } } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-llm-req-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    var srv: fakehttp.Server = undefined;
+
+    srv.start(io, fakehttp.wire(
+        \\{"choices":[{"message":{"content":"ok"}}]}
+    )) catch return error.SkipZigTest;
+
+    var ub: [64]u8 = undefined;
+    const base = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/v1", .{srv.port});
+    const r = chat(gpa, io, root, "h11req", base, "", "some-model-v2", "SYSTEM-SIDE", "USER-SIDE", 32);
+    gpa.free(r.content);
+
+    srv.stop(); // joins the serve thread -- request() is only safe once it has
+    const req = srv.request();
+
+    // The OpenAI path, not Ollama's native one: completeBody goes through post(), which always
+    // appends /chat/completions. Getting this wrong is a 404 against a real provider.
+    try std.testing.expect(std.mem.startsWith(u8, req, "POST /v1/chat/completions "));
+    // The model the caller asked for reaches the wire -- not a default, not the trio's fallback.
+    try std.testing.expect(std.mem.indexOf(u8, req, "some-model-v2") != null);
+    // BOTH roles are attached, in order. A system prompt silently dropped here degrades every
+    // answer the model gives without failing anything anywhere.
+    const sys = std.mem.indexOf(u8, req, "SYSTEM-SIDE") orelse return error.TestUnexpectedResult;
+    const usr = std.mem.indexOf(u8, req, "USER-SIDE") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(sys < usr);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"user\"") != null);
+}
