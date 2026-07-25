@@ -2,6 +2,17 @@
 //! recall, chain, reinforce, assoc) plus the operator preamble + baseline tables. One seam for all
 //! memory traffic — the place to instrument, debug, and gate it.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// COST PROBE — bumped only in test builds. `Mem.run` is the single `std.process.run` in this file,
+/// so this counts every neuron-db PROCESS SPAWN the hive memory makes, which is what this module's
+/// batching claims are actually about (`observeBatch`: "ONE subprocess instead of one spawn per
+/// fact", against a 40-tool storm that used to pay ~40 serialized launches).
+///
+/// Counted, never timed: a wall-clock budget on a dev box measures Defender and background load, so
+/// it flakes and then gets muted. A spawn count is exact and identical on every machine. Mirrors
+/// `neuron/client.zig`'s probe, which prices the OTHER neuron-db seam. See harness/TESTING.md.
+pub var spawn_probe: u64 = 0;
 
 // Operator preamble + build-time string tables (generated; do not hand-edit the byte tables or anchors).
 fn mix(s: []const u8) u64 {
@@ -334,6 +345,7 @@ pub const Mem = struct {
         const maxs = std.fmt.bufPrint(&maxbuf, "{d}", .{MAX_FACTS}) catch "20000";
         argv.appendSlice(self.gpa, &.{ self.bin, "--db", dbp, "--max", maxs }) catch return null;
         argv.appendSlice(self.gpa, args) catch return null;
+        if (builtin.is_test) spawn_probe += 1;
         const r = std.process.run(self.gpa, self.io, .{ .argv = argv.items, .stdout_limit = .limited(1 << 20) }) catch return null;
         self.gpa.free(r.stderr);
         if (r.term != .exited or r.term.exited != 0) {
@@ -352,9 +364,15 @@ pub const Mem = struct {
         const clean = cleanFactInto(&nb, fact) orelse return 0;
         self.lockW();
         defer self.unlockW();
-        const out = self.run(&.{ "observe", scope, clean }) orelse return 0;
+        // --json for the SAME reason observeBatch needs it one screen down: plain `observe` prints a
+        // PROSE summary ("stored 1 fact(s)"), and parseInt on that fails every time, so this returned
+        // 0 for every successful write. That sibling bug was found and fixed for `import`; this one
+        // survived because its only consumer (run.zig's mock path) reads `if (facts > 0) facts else
+        // round` and the fallback made the always-0 invisible. It also silently disabled a test's
+        // liveness probe, which is how it finally surfaced (ledger 0063).
+        const out = self.run(&.{ "--json", "observe", scope, clean }) orelse return 0;
         defer self.gpa.free(out);
-        return std.fmt.parseInt(u32, std.mem.trim(u8, out, " \r\n\t"), 10) catch 0;
+        return jsonUint(out, "\"wrote\":");
     }
 
     /// Store MANY facts in ONE neuron subprocess (via `import` of a temp pack) instead of one spawn per fact.
@@ -764,4 +782,69 @@ test "cleanFactInto: folds newlines, collapses runs, drops junk, clips at the bu
     @memset(&big, 'x');
     const clipped = cleanFactInto(&b, &big).?;
     try std.testing.expectEqual(@as(usize, 64), clipped.len);
+}
+
+// ---------------------------------------------------------------------------
+// H8: this module's batching claims, PRICED. `Mem.run` is the one spawn site, so the counts below
+// are exact and machine-independent. See harness/TESTING.md ("Cost: count it, never time it").
+// ---------------------------------------------------------------------------
+
+const NEURON_BIN_T = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+
+fn testEnvironOsc() std.process.Environ {
+    return if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
+test "observeBatch stores N facts in ONE spawn; the loop it replaced costs N" {
+    // The header promises "ONE neuron subprocess instead of one spawn per fact", because the
+    // turn-exit hippocampus flush used to pay ~40 serialized process launches on a 40-tool storm.
+    // Nothing priced that, so folding observeBatch back into a loop of observe() -- which is the
+    // obvious "simplification", and passes every behavioural test since the facts still land --
+    // would silently restore the whole cost.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnvironOsc() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-osc-cost-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const m = Mem.init(gpa, io, NEURON_BIN_T, root ++ "/n.db");
+
+    // Real sentences, not tokens: neuron-db atomises input and stores NOTHING for what it cannot
+    // atomise, while still exiting 0 (ledger 0053). A test using "a"/"b" would assert against a
+    // store that quietly kept nothing.
+    const notes = [_][]const u8{
+        "the build oracle runs four gates before it reports green",
+        "a refused connection on windows arrives as an unexpected status",
+        "the desk suite is hermetic and needs no running server",
+        "escapers must handle every byte below the control boundary",
+        "cost claims are counted rather than measured with a stopwatch",
+    };
+
+    if (m.observe("probe_scope", notes[0]) == 0) return error.SkipZigTest; // no binary / dead store
+
+    spawn_probe = 0;
+    const stored = m.observeBatch("batch_scope", &notes);
+    const batch_spawns = spawn_probe;
+
+    // ONE spawn for all five, whatever they stored.
+    try std.testing.expectEqual(@as(u64, 1), batch_spawns);
+    try std.testing.expect(stored > 0); // and it really wrote -- not one cheap no-op
+
+    // The counterfactual, measured rather than asserted: the loop it replaced costs one PER note.
+    // This is what makes the 1 above meaningful instead of a number with nothing to compare to.
+    spawn_probe = 0;
+    for (notes) |n| _ = m.observe("loop_scope", n);
+    try std.testing.expectEqual(@as(u64, notes.len), spawn_probe);
+
+    // The single-note path deliberately skips the temp-pack dance and delegates to observe() --
+    // still one spawn, and no file written beside the db.
+    spawn_probe = 0;
+    _ = m.observeBatch("one_scope", notes[0..1]);
+    try std.testing.expectEqual(@as(u64, 1), spawn_probe);
 }
