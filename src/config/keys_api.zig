@@ -49,3 +49,45 @@ pub fn delKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.vault.del(u.id, provider);
     try res.json(.{ .ok = true, .provider = provider, .deleted = true }, .{});
 }
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). These are the routes that read and write other
+// people's provider secrets, so the property worth pinning first is that NONE of them does any
+// work before the caller is identified.
+// ---------------------------------------------------------------------------
+
+test "every vault route is gated: an anonymous caller gets 401 and the vault is never touched" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-keysapi-tmp");
+    defer ta.deinit();
+
+    // Each handler, unauthenticated, with a body and params good enough that ONLY the auth gate can
+    // be what rejects it — so a future edit that moves requireUser below the work shows up here.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.json(.{ .provider = "openai", .key = "sk-live-not-a-real-key", .base_url = "" });
+        try putKey(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        try listKeys(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.param("provider", "openai");
+        try delKey(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+
+    // And nothing reached the store: an anonymous POST must not have written a key for anyone.
+    // (uid 0 is what a caller-less request would fall to if the gate were ever bypassed.)
+    try std.testing.expect(!ta.vault.has(0, "openai"));
+}

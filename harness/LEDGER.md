@@ -9,6 +9,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
+| H25 | med | `Auth` has no `deinit` (users map + sessions map + each User's duped email/pwhash/tool_grants), so an AUTHENTICATED handler test leaks under std.testing.allocator — which currently caps handler coverage at the unauthenticated paths. Give it one (per TESTING.md: a real deinit, not a test-only drain helper) and call it from `TestApp.deinit`; that unlocks register→login→session→handler tests for the whole H24 list. |
 | H24 | med | The handler harness exists now (`http.testApp`) — USE it: admin_service, auth_api, keys_api, deploy/service, chat/service and fanout are all still untested, and their auth gates, status codes and error mappings are now reachable from a test. Registering a real user needs the neuron binary, so cover the unauthenticated/rejection paths first and skip honestly for the rest. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
@@ -514,3 +515,19 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   reaches for it instead of extracting yet another pure helper; H21 is retired and replaced by H24,
   which names the six modules it unlocks.
 - next: H24 (handler coverage) and the desk lane; H10 SELF remains the horizon.
+
+## 0025 — 2026-07-24 — first handlers under test: every vault route is gated
+- did: `config/keys_api.zig` — the module the key-vault lane had to report as untestable ("all
+  three handlers take httpz Request/Response and go through requireUser… there is no httpz.testing
+  harness anywhere in this repo") — now has one. Each of putKey/listKeys/delKey is called
+  anonymously with a body and params good enough that ONLY the auth gate can be what rejects it,
+  so an edit that ever moves `requireUser` below the work surfaces here rather than in production;
+  plus an assertion that nothing reached the store.
+- verified: Full oracle ALL GREEN, exit 0, first try.
+- learned: the value of the harness showed up immediately as a REPORT being overturned — an
+  "untestable" finding from one lane became a tested module one lane later, because the blocker was
+  missing tooling rather than an untestable design. Worth re-reading old "can't be tested" notes
+  after any tooling change.
+- ratchet: none new; 0024's harness and TESTING.md section carried it.
+- next: H25 (Auth.deinit) is the gate on everything else — authenticated handler tests leak until
+  it exists.
