@@ -9,7 +9,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
-| H24 | med | The handler harness exists now (`http.testApp`) — USE it: admin_service, auth_api, keys_api, deploy/service, chat/service and fanout are all still untested, and their auth gates, status codes and error mappings are now reachable from a test. Registering a real user needs the neuron binary, so cover the unauthenticated/rejection paths first and skip honestly for the rest. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
@@ -728,3 +727,31 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: the sweep pattern now has a second instance and a sharper rule (filter by signature, not
   by name), which is the version worth copying to chat/service.
 - next: chat/service is the last H24 module; then 4 desk modules. H14 and H10 remain the owner's.
+
+## 0034 — 2026-07-25 — H24 CLOSED: every server handler module now has a gated, guarded sweep
+- did: `worker/chat/service.zig` — the last one. Its isolation model is different from the swarm
+  routes and that shaped the tests: a conversation's path is built from the CALLER'S OWN session
+  uid plus `safeSeg(id)`, so there is no uid field to compare — `safeSeg` IS the boundary. Sweep of
+  all 9 handlers (anonymous -> 401) with the `@embedFile` exhaustiveness guard; safeSeg pinned
+  against 12 hostile ids (traversal both slash directions, an embedded `a/../..`, an absolute path,
+  a bare `..`, a NUL, a newline, spaces, empty, whitespace-only, and the 65-char case) while
+  ordinary ids and the exact 64-char cap survive untouched; and a behavioural twin check against
+  the second copy in `chat/tools.zig`, which guards the same directory tree from the shared tool
+  endpoint — a rule relaxed at one entry point and not the other now fails the build.
+  H24 is closed: admin_service, auth_api, keys_api, deploy/service, fanout and chat/service all
+  have an auth sweep plus a guard that keeps it exhaustive.
+- verified: full oracle ALL GREEN, exit 0 (on the run started AFTER the edits landed — see below).
+- learned: `postMessage` looked ungated on a first grep because its kill switch (VEIL_CHAT_BACKEND
+  =0 -> 501) deliberately runs BEFORE auth; reading it rather than trusting the grep is what
+  settled it. Same lesson as the deploy probe whose loop was broken by prefix matching: a grep is a
+  hypothesis, not a finding.
+- ratchet: safeSeg's twin is now compared behaviourally rather than by eye — the third duplicated
+  pair in this codebase pinned this way (httpc bodies, the neuron rate table, and now safeSeg).
+- next: 4 desk modules (main, poller, runner, tray) are the remaining coverage frontier; H14 and
+  H10 are the owner's calls.
+
+PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
+edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
+once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both
+wasted a full run, and one produced an exit-0 that was ambiguous rather than reassuring. Apply the
+edit, confirm it applied, then run.

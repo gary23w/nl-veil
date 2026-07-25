@@ -826,3 +826,111 @@ test "the host default fills each role on its own, and never mixes a pair" {
     const unset = roleDefault("", "", "", "");
     try t.expectEqualStrings("", unset.model);
 }
+
+// ---------------------------------------------------------------------------
+// handler tests — see harness/TESTING.md. This module is addressed differently from the swarm
+// routes: a conversation's path is built from the CALLER'S OWN uid plus `safeSeg(id)`, so there is
+// no uid field to compare — the isolation IS the id filter. That makes safeSeg the security
+// boundary, and these tests treat it as one.
+// ---------------------------------------------------------------------------
+
+const Handler = *const fn (*App, *httpz.Request, *httpz.Response) anyerror!void;
+
+const CHAT_ROUTES = [_]struct { name: []const u8, f: Handler }{
+    .{ .name = "listConvs", .f = listConvs },
+    .{ .name = "getConv", .f = getConv },
+    .{ .name = "deleteConv", .f = deleteConv },
+    .{ .name = "convEvents", .f = convEvents },
+    .{ .name = "postMessage", .f = postMessage },
+    .{ .name = "toolResult", .f = toolResult },
+    .{ .name = "chatControl", .f = chatControl },
+    .{ .name = "convFiles", .f = convFiles },
+    .{ .name = "convFile", .f = convFile },
+};
+
+test "exhaustiveness: every chat route in this file is covered by the auth sweep" {
+    const SRC = @embedFile("service.zig");
+    var it = std.mem.splitScalar(u8, SRC, '\n');
+    var found: usize = 0;
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "pub fn ")) continue;
+        if (std.mem.indexOf(u8, line, "*httpz.Request") == null) continue; // handlers only
+        const open = std.mem.indexOfScalar(u8, line, '(') orelse continue;
+        const name = line["pub fn ".len..open];
+        found += 1;
+        var listed = false;
+        for (CHAT_ROUTES) |r| {
+            if (std.mem.eql(u8, r.name, name)) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) {
+            std.debug.print("\nchat route '{s}' is not in CHAT_ROUTES — add it to the auth sweep\n", .{name});
+            return error.UnsweptRoute;
+        }
+    }
+    try std.testing.expectEqual(CHAT_ROUTES.len, found);
+}
+
+test "no conversation route serves an anonymous caller" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chatsvc-gate-tmp");
+    defer ta.deinit();
+
+    for (CHAT_ROUTES) |r| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.param("id", "c0ffee");
+        try r.f(&ta.app, web.req, web.res);
+        web.expectStatus(401) catch |e| {
+            // postMessage answers 501 first when VEIL_CHAT_BACKEND=0 — that is deliberate and
+            // documented, but it must not be how a stranger gets past the gate in a normal server.
+            std.debug.print("\n{s} answered a stranger with {d}\n", .{ r.name, web.res.status });
+            return e;
+        };
+    }
+}
+
+test "safeSeg is the isolation boundary: no conversation id can name another user's directory" {
+    // The conv path is `{data}/u{uid}/_chat/convs/{safeSeg(id)}` with uid taken from the SESSION, so
+    // a hostile id is the only way to aim at someone else's tree. safeSeg answers "" for anything
+    // outside [A-Za-z0-9_-], and every caller treats "" as not-found.
+    const ESCAPES = [_][]const u8{
+        "../u2/_chat/convs/theirs",
+        "..\\u2",
+        "a/../../u2",
+        "/etc/passwd",
+        ".",
+        "..",
+        "conv id with spaces",
+        "sneaky\x00null",
+        "sneaky\nnewline",
+        "",
+        "   ",
+        "a" ** 65, // past the 64-char cap
+    };
+    for (ESCAPES) |bad| try std.testing.expectEqualStrings("", safeSeg(bad));
+
+    // …while ordinary ids survive untouched, including the surrounding whitespace a client may send.
+    try std.testing.expectEqualStrings("c0ffee", safeSeg("c0ffee"));
+    try std.testing.expectEqualStrings("c0ffee", safeSeg("  c0ffee\n"));
+    try std.testing.expectEqualStrings("a_b-c", safeSeg("a_b-c"));
+    try std.testing.expectEqualStrings("a" ** 64, safeSeg("a" ** 64)); // exactly at the cap
+}
+
+test "safeSeg's twin in chat/tools.zig has not drifted from this one" {
+    // Two copies of the same allowlist guard the same directory tree from different entry points
+    // (the REST routes here, the shared tool endpoint there). A rule relaxed in one and not the
+    // other is a hole, so the copies are compared behaviourally rather than by eye.
+    const tools_safeSeg = @import("tools.zig").safeSegForTest;
+    const CASES = [_][]const u8{
+        "c0ffee",           "  c0ffee\n", "a_b-c",  "../u2/_chat",
+        "..",               "/etc/passwd", "with space", "",
+        "a" ** 64, "a" ** 65, "tab\there", "semi;colon",
+    };
+    for (CASES) |c| try std.testing.expectEqualStrings(safeSeg(c), tools_safeSeg(c));
+}
