@@ -683,3 +683,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   guards (a new ungated route) is exactly the one a hand-written list would otherwise miss.
 - next: deploy/service, chat/service and fanout close out H24; 4 desk modules remain; H14 and H10
   are still the owner's.
+
+## 0032 — 2026-07-25 — whose run you may read
+- did: `worker/control/fanout.zig` — a swarm's events.jsonl IS the run (prompts, outputs, every
+  tool call), so the tests lead with ownership: a stranger is refused, and the OTHER logged-in
+  account is refused with no event bytes anywhere in the response — a leak that still set 401 would
+  pass a status-only assertion. Both the poll endpoint and the SSE endpoint gate identically (the
+  latter checked before it takes over the socket). An unknown id answers 404 while someone else's
+  answers 401, so a client can tell "gone" from "not yours". Then the byte-cursor contract clients
+  actually consume, through the handler rather than in isolation (evcursor owns the unit tests):
+  the owner gets the whole log with X-Next-Offset at its end, a caught-up cursor gets an empty body
+  with the cursor unchanged, a mid-file cursor gets exactly the remainder, and the PROBE sentinel
+  answers a length instead of a backlog. Registering a swarm needed a test-only helper, since
+  `Supervisor.spawn` launches a real process — it frees its own entries (the map key aliases
+  `sw.id`, same one-allocation trap as Auth's users map, 0026).
+- verified: full oracle ALL GREEN, exit 0, first try. No store needed, so it runs on a clean
+  checkout.
+- learned: cross-tenant reads are the failure mode that unit tests structurally miss — evcursor's
+  own tests are thorough and say nothing about WHOSE file is being paged. The handler is where
+  identity and the cursor meet, and it was untested until the harness existed.
+- ratchet: none new; the pattern (assert the body, not just the status, when testing a refusal) is
+  worth copying and is stated in the test's comments.
+- next: deploy/service and chat/service close out H24.
