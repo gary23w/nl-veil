@@ -578,3 +578,152 @@ fn tailLines(s: []const u8, max: usize) []const u8 {
     if (start < s.len) start += 1;
     return s[start..];
 }
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). This is ONE HTTP surface that runs hive tools for
+// "any external client", and the only thing standing between a hosted non-admin tenant and
+// arbitrary code execution on the host is the admin check in chatTool. So the tests drive that
+// gate from the REAL lists rather than from names copied into a fixture.
+// ---------------------------------------------------------------------------
+
+/// Tools that are in ADMIN_TOOLS here AND sandbox-allowed by the engine — i.e. refused to a
+/// non-admin on this one-shot endpoint but runnable by that same user inside a sandboxed chat turn.
+/// This endpoint takes the stricter reading (admin_only wins in chatTool below), so it is an
+/// INCONSISTENCY rather than a hole, and resolving it is a capability decision: `pixel_search` only
+/// reads already-ingested tiles, while its siblings `pixel_capture`/`pixel_ingest` touch the host
+/// screen and are unambiguously admin-only. Recorded in harness/LEDGER.md as H26 for the owner.
+const KNOWN_CAP_OVERLAP = [_][]const u8{"pixel_search"};
+
+test "the capability split stays a partition, apart from the one overlap on record" {
+    // Two lists describing the same tool registry from different surfaces is exactly how a hole
+    // opens quietly, so anything NEW in both fails here. The known case is pinned so that fixing it
+    // also fails — and whoever fixes it updates this list deliberately.
+    for (ADMIN_TOOLS) |a| {
+        if (!toolSafe(a)) continue;
+        var known = false;
+        for (KNOWN_CAP_OVERLAP) |k| {
+            if (std.mem.eql(u8, k, a)) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            std.debug.print("\n'{s}' is admin-only here but sandbox-allowed by the engine — new drift\n", .{a});
+            return error.CapabilityOverlap;
+        }
+    }
+    for (KNOWN_CAP_OVERLAP) |k| {
+        if (!toolSafe(k)) {
+            std.debug.print("\n'{s}' no longer overlaps — drop it from KNOWN_CAP_OVERLAP\n", .{k});
+            return error.StaleKnownOverlap;
+        }
+    }
+    // And the dangerous set is not accidentally empty — a refactor that emptied it would make every
+    // assertion below vacuous.
+    try std.testing.expect(ADMIN_TOOLS.len >= 20);
+}
+
+test "a non-admin is refused every admin-only tool, and told it is admin-only" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chattool-caps-tmp");
+    defer ta.deinit();
+
+    // uid 1 is admin by default, so the SECOND account is the hosted tenant this gate exists for.
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("tenant@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok = ta.auth.login("tenant@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    try std.testing.expect(!ta.auth.isAdmin(ta.auth.whoami(tok) orelse return error.TestUnexpectedResult));
+
+    // Every one of them — run_python, host_command, patch_system, the browser drive, mcp_call…
+    for (ADMIN_TOOLS) |tool| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .tool = tool, .args = "{}" });
+        try chatTool(&ta.app, web.req, web.res);
+        web.expectStatus(403) catch |e| {
+            std.debug.print("\nnon-admin reached '{s}' with {d}\n", .{ tool, web.res.status });
+            return e;
+        };
+    }
+}
+
+test "an unknown tool is refused rather than passed through to the executor" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chattool-unknown-tmp");
+    defer ta.deinit();
+
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok = ta.auth.login("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    // Even as ADMIN: admin-ness lifts the admin-only gate, it does not invent tools.
+    try std.testing.expect(ta.auth.isAdmin(ta.auth.whoami(tok) orelse return error.TestUnexpectedResult));
+
+    // Names that must NOT resolve to a tool. Deliberately no padded-but-real name here: the trim
+    // happens before matching, so " run_python" IS run_python, and an admin caller would actually
+    // execute it — a test must not fire a host-touching tool to prove a point (it did, once, and
+    // answered 500 from the failed spawn).
+    const NOT_TOOLS = [_][]const u8{
+        "definitely_not_a_tool",
+        "run_python_", // near-miss on a dangerous name
+        "RUN_PYTHON", // case is not a way in
+        "run python", // nor is a space in the middle
+        "../../etc/passwd",
+    };
+    for (NOT_TOOLS) |tool| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .tool = tool, .args = "{}" });
+        try chatTool(&ta.app, web.req, web.res);
+        web.expectStatus(400) catch |e| {
+            std.debug.print("\n'{s}' answered {d} instead of a refusal\n", .{ tool, web.res.status });
+            return e;
+        };
+    }
+    // A missing tool name is a readable 400, not a crash.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .tool = "", .args = "{}" });
+        try chatTool(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // And a malformed body is a readable 400 too — the calling model has to be able to react to it.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.body("{not json at all");
+        try chatTool(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+}
+
+test "the tool endpoint refuses a stranger before it looks at the tool name" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chattool-anon-tmp");
+    defer ta.deinit();
+
+    // A dangerous tool with a well-formed body: only the auth gate can be what refuses this.
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    web.json(.{ .tool = "host_command", .args = "{\"cmd\":\"whoami\"}" });
+    try chatTool(&ta.app, web.req, web.res);
+    try web.expectStatus(401);
+}
