@@ -1320,3 +1320,36 @@ edit, confirm it applied, then run.
   counter from 0053.
 - next: H8's remaining engine paths (tool round-trips per turn, context rebuilds) still unpriced.
   Frontier 5 src + 2 desk, all device/UI-bound. H10, H14b, H26, H28 are the owner's.
+
+## 0057 — 2026-07-25 — "keep them in sync" was an instruction to a human, and it was also wrong
+- did: `CHAT_SCHEMA` ends with "Defs are copied VERBATIM from SCHEMA above ... keep them in sync." Two
+  hand-maintained copies of one tool contract, with a comment as the only mechanism. Edit a
+  description in SCHEMA, forget the copy, and the chat veil goes on advertising the old contract to
+  the model — no error, no test, just a surface promising behaviour the tool no longer has.
+- found: measuring it first was the whole game. Of 19 CHAT_SCHEMA defs, 13 are verbatim, 4
+  deliberately DIFFER, and 2 exist only there. The four differ for good reasons — the chat veil runs
+  on the USER'S machine, so `read_file`/`list_dir`/`absorb` widen paths to absolute/`~`, and
+  `recall_hive` drops "what ANY teammate contributed" because a solo veil has none. So the comment
+  was not merely unenforced, it was FALSE, and a worker who believed it and "fixed the drift" would
+  have deleted correct behaviour. I nearly did: my first read of the diff was "4 defs are stale".
+- did: verbatim is now the rule, with the exceptions DECLARED — `CHAT_ADAPTED_DEFS` and
+  `CHAT_ONLY_DEFS`, each entry carrying its reason. An undeclared difference fails; so does a
+  declared exception that has stopped being one, so the lists cannot rot. Same shape as
+  `KNOWN_CAP_OVERLAP` in chat/tools.zig, which is the house pattern for exactly this.
+- also: `SCOUT_SCHEMA` carried the same "keep these defs in sync with their twins" line and is 14/15
+  ADAPTED — its `read_file` deliberately drops SCHEMA's edit_file anchor-tag guidance, because a
+  scout has no edit_file. Taken literally that line would have someone advertise a tool the mind
+  cannot call. Corrected to describe what it is (an adapted subset) and to say why there is no
+  verbatim rule to enforce there. No guard added: at 1/15 verbatim there is no rule, and inventing
+  one to look symmetrical would be worse than the comment was.
+- verified: src suite exit 0 — and the Zig guard independently reproduces the split my throwaway
+  script found (13/4/2), which is the second opinion that made me trust the number. Counterfactual:
+  dropping `list_dir` from the declared list fails with the tool named and both fixes offered.
+  Full oracle green.
+- learned: a comment that asks a human to maintain agreement is a defect report about the code, not
+  a safeguard — and it should be read as evidence the invariant is UNCHECKED, not as evidence it
+  holds. But check what it claims before enforcing it: two of the three "sync" comments in this file
+  described a rule the code had deliberately outgrown, and mechanically enforcing either would have
+  broken working behaviour. Measure first, then decide whether the comment or the code is wrong.
+- ratchet: the CHAT_SCHEMA guard itself, plus both corrected headers.
+- next: H8's remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
