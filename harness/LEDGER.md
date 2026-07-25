@@ -13,8 +13,8 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H14b | OWNER | The STRINGS now tell the truth (0048), which was the part that could be fixed without a decision. The decision itself is still open: leave the GitHub PAT plaintext-local (current, defensible for a local login-gated app) or restore sealing at rest (`secrets.zig` says "we never seal again" — a deliberate past choice, and DPAPI is Windows-only so it would not be uniform). Nothing is lying to a user in the meantime. |
 | H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
-| H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
-| H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
+| H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **6 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `plan/billing_seam`, `browser/{broker,host,session}`, `desk/{main,tray}`. Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
+| H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). PATTERN SET 0053: count, never time — `Neuron.exec` carries an `is_test`-gated `spawn_probe` and `client.zig` pins reading N records at exactly N+1 spawns. A wall-clock budget on a dev box measures Defender and gets muted. Engine hot paths still unpriced; find each one's choke point first. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
 | H12 | low | Marker debt: 23 TODO/FIXME/HACK/XXX across src + desk/src. |
@@ -1191,3 +1191,41 @@ edit it was meant to verify had landed (once because I fired it in the same brea
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both
 wasted a full run, and one produced an exit-0 that was ambiguous rather than reassuring. Apply the
 edit, confirm it applied, then run.
+
+## 0053 — 2026-07-25 — H8 (part): cost is COUNTED, not timed — and a live test that never ran
+- did: went after H8 ("no perf gate; 'faster' is an unverifiable claim") and deliberately did NOT
+  build a wall-clock gate. A millisecond budget on this box measures Defender, OneDrive and
+  background load; it flakes, gets muted, and the muting becomes the habit — worse than no gate.
+  Every neuron-db call funnels through `Neuron.exec`, so a `builtin.is_test`-gated counter there
+  prices the thing the claims are actually about: PROCESS SPAWNS. Deterministic, identical on every
+  machine, assertable EXACTLY. Ledger 0042 cut startup from 6N spawns to N+1 and recorded
+  `ratchet: none new`; the win rested on a filter nothing priced. Now: reading N records asserts
+  exactly N+1 spawns (one `list`, one `export` per record).
+- found (the real prize, and I was not looking for it): the standalone run printed test 2 as SKIP
+  while my new test 3 PASSED — same binary, same probe pattern. Both cannot be true. `put`'s probe
+  value was `cHJvYmU`, and neuron-db ATOMISES input into facts and stores NOTHING for input it
+  cannot atomise: `observe s "hello world"` prints `stored 0 fact(s)` and EXITS 0. So put() reports
+  success, the scope still appears in `list` (the `forget` inside put registers it), and get() reads
+  null. Silent data loss behind a success return. The live UPSERT test — put/get/del/scopes, the
+  failure semantics of every stateful thing the server owns — had been skipping on EVERY machine,
+  reported as "no binary on this box", which was false. Its assertions had never executed once,
+  INCLUDING the satellite guard that 0042 named as its ratchet. Fixing the probe alone would have
+  turned SKIP into FAIL: the test's own data (`"first"`, `"second"`, `"1"`) are dropped shapes too.
+- verified: full oracle green. Counterfactual run: `if (false) continue` in place of the satellite
+  filter fails TWO tests now (the cost gate and the newly-live satellite assertion), restored after.
+  Every literal was checked against the real binary BEFORE going in the file, not assumed from shape.
+  Checked the other three probes in the tree (keys_api, key_vault, neurons) — all long base64, all
+  genuinely store; this was one bad literal, not a pattern. Real callers all store base64 of a JSON
+  record, which always atomises, which is why the app works and nobody noticed.
+- learned: SKIP is not a neutral outcome, it is a test reporting that it did not run, and it was
+  wearing a comment that explained the skip away ("no binary on this box"). A confident wrong
+  explanation is worse than none — it is why nobody looked for eight entries. The only reason it
+  surfaced is that adding a SECOND test to the same file put two contradictory results side by side.
+  Also: four tests each hand-rolled their own probe value, and one drew a bad one — so the fix is one
+  shared `probeStore`, not one corrected literal. Fix the duplication that let it be wrong once.
+- ratchet: `probeStore` (a real write→read round trip, so "binary absent" and "store cannot persist"
+  are told apart, both skipping only after proof); the exact N+1 spawn assertion; and a CANARY test
+  pinning the silent-drop contract — if a neuron-db upgrade starts storing short values it goes red,
+  which is good news arriving deliberately rather than as a mystery.
+- next: H8's engine hot paths are still unpriced — this establishes the counted-not-timed pattern on
+  one real claim. H13 (watch); H10, H14b, H26 remain the owner's.
