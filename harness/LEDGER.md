@@ -965,6 +965,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   for itself.
 - next: H13 is the last low item (forensic only); H14, H26, H10 are the owner's calls.
 
+## 0044 — 2026-07-25 — the two oracles can no longer drift apart
+- did: `check.ps1` is what a worker runs; `check.sh` is what CI runs. Nothing made them agree — a
+  gate added to one and not the other means local green with CI red, or the reverse, which is worse.
+  I nearly caused it myself: I edited BOTH scripts several times this session (the failure summary,
+  the capture restructure) and kept them aligned purely by hand. `-Scan` now extracts the top-level
+  gate names from each and compares them as normalised sets, reporting anything present in only one.
+  Normalisation exists because the ps1 routes its two test gates through a helper that labels them
+  "src suite" where the sh spells "zig build test (src suite)"; the helper's own internal gates
+  carry `$label` and are excluded as not-top-level.
+- verified: reports "gate on the same 5 things" today, and by COUNTERFACTUAL — inserting an invented
+  gate into check.sh made it print `only in check.sh: zigbuildinventedgatedfake` and count an
+  actionable signal; restored (git diff clean) and the full oracle is green.
+- learned: I have now written three signals whose value is entirely in catching a divergence between
+  two things that are supposed to say the same thing — httpc's twin bodies, the billing rate table,
+  and now the oracles themselves. That is the dominant defect shape in this codebase: not a wrong
+  line, but two right lines that stopped agreeing. Worth reaching for first when picking work here.
+- ratchet: this entry IS the ratchet — the harness now checks its own halves against each other.
+- next: H13 (forensic) is the last low item; H14, H26, H10 are the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

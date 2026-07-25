@@ -267,6 +267,39 @@ if ($Scan) {
         Write-Host "[leaks] no inline allocPrint(gpa)-into-append sites" -ForegroundColor Green
     }
 
+    # 7) the two oracles must gate on the SAME things. check.ps1 is what a worker runs; check.sh is
+    #    what CI runs. A gate added to one and not the other means local green and CI red (or worse,
+    #    the reverse) — the drift class this repo keeps finding, and one I nearly caused myself
+    #    editing both by hand. Names are normalised because the ps1 routes its two test gates
+    #    through a helper that labels them "src suite" where the sh spells out "zig build test
+    #    (src suite)"; the $label entries inside that helper are internal, not top-level gates.
+    function Gate-Keys([string[]]$names) {
+        $out = @()
+        foreach ($n in $names) {
+            if ($n -match '\$label') { continue }
+            $out += (($n -replace 'zig build test', '') -replace '[^a-zA-Z0-9]', '').ToLower()
+        }
+        return $out | Sort-Object -Unique
+    }
+    $ps1_names = (Select-String -Path $PSCommandPath -Pattern 'Invoke-(?:Gate|ZigTests) "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
+    $shPath = Join-Path $repo "scripts\check.sh"
+    $sh_names = @()
+    if (Test-Path $shPath) {
+        $sh_names = (Select-String -Path $shPath -Pattern '^\s*gate "([^"]+)"' -AllMatches).Matches | ForEach-Object { $_.Groups[1].Value }
+    }
+    $a = Gate-Keys $ps1_names
+    $b = Gate-Keys $sh_names
+    $onlyPs1 = $a | Where-Object { $b -notcontains $_ }
+    $onlySh = $b | Where-Object { $a -notcontains $_ }
+    if ($onlyPs1.Count -gt 0 -or $onlySh.Count -gt 0) {
+        $signals += ($onlyPs1.Count + $onlySh.Count)
+        Write-Host "[oracles] check.ps1 and check.sh gate on DIFFERENT things -- local and CI would disagree:" -ForegroundColor Yellow
+        $onlyPs1 | ForEach-Object { Write-Host "    only in check.ps1: $_" }
+        $onlySh | ForEach-Object { Write-Host "    only in check.sh:  $_" }
+    } else {
+        Write-Host ("[oracles] check.ps1 and check.sh gate on the same {0} things" -f $a.Count) -ForegroundColor Green
+    }
+
     Write-Host ""
     Write-Host ("scan done: {0} actionable signal(s). Cross-check harness/LEDGER.md open items." -f $signals) -ForegroundColor Cyan
     exit 0
