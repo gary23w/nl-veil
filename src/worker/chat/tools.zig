@@ -109,6 +109,11 @@ fn resolveRecipeGrants(app: *App, u: http.User, arena: std.mem.Allocator) []cons
     return list.toOwnedSlice(arena) catch &.{};
 }
 
+/// TEST ONLY. Lets chat/service.zig's tests compare this copy against its twin behaviourally — the
+/// two guard the same directory tree from different entry points (the REST routes there, the shared
+/// tool endpoint here), so a rule relaxed in one and not the other is a hole nobody sees.
+pub const safeSegForTest = safeSeg;
+
 /// Sanitize a conversation id into a single safe path segment for the build workdir (no separators, no "..",
 /// bounded length). Empty / unsafe → "" so the caller falls back to the shared workdir.
 fn safeSeg(id: []const u8) []const u8 {
