@@ -10527,3 +10527,55 @@ test "goalNamedFiles adopts the goal's explicit files as a verbatim blueprint" {
     defer if (none.len > 0) gpa.free(@constCast(none));
     try std.testing.expectEqualStrings("", none);
 }
+
+test "the swarm system prompt keeps its STABLE PREFIX: per-mind data rides the tail" {
+    // A MEASURED contract, not a style rule. The provider's KV cache serves a request only up to the
+    // first byte that differs from the previous one, so anything per-mind at the HEAD forks a
+    // separate cache lineage per mind. The name used to sit at byte 8 ("You are {name}, ..."), and
+    // cast-355797 measured the result: the swarm got 21.6% cached tokens while a chat turn on the
+    // SAME model and endpoint in the same ten minutes got 81.1% -- every mind separately re-billing
+    // ~11.2 KB of doctrine that was byte-identical between them.
+    //
+    // Identity now rides the TAIL, behind "YOU, SPECIFICALLY". Nothing enforced that, and the edit
+    // that breaks it is the natural-sounding one: putting the mind's name back where a reader
+    // expects it. The cost would not show up in any behavioural test -- every answer stays correct,
+    // the bill just triples. So this reads the format string and checks the SHAPE.
+    const SRC = @embedFile("run.zig");
+    const anchor = "You are an autonomous mind in a swarm";
+    const at = std.mem.indexOf(u8, SRC, anchor) orelse return error.PromptAnchorMissing;
+    const rest = SRC[at..];
+    const end = std.mem.indexOf(u8, rest, "\", .{") orelse return error.PromptEndMissing;
+    const fmt = rest[0..end];
+
+    const marker = "YOU, SPECIFICALLY";
+    const m = std.mem.indexOf(u8, fmt, marker) orelse return error.IdentityMarkerMissing;
+
+    // Count the substitutions on each side of the identity marker. Four run-stable clauses lead
+    // (constitution, discourse, offline, fence doctrine); the three PER-MIND values -- mi.name,
+    // w.roster, space_clause -- must all land after it.
+    var before: usize = 0;
+    var after: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, fmt, i, "{s}")) |k| : (i = k + 3) {
+        if (k < m) before += 1 else after += 1;
+    }
+    if (before != 4 or after != 3) {
+        std.debug.print(
+            "\nswarm prompt prefix moved: {d} substitution(s) before the identity marker, {d} after (expected 4 and 3).\n" ++
+                "A PER-MIND value ahead of \"YOU, SPECIFICALLY\" gives every mind its own provider cache lineage,\n" ++
+                "each separately re-billing the shared doctrine -- measured at 21.6% cached vs 81.1% for a chat turn.\n",
+            .{ before, after },
+        );
+        return error.StablePrefixBroken;
+    }
+
+    // ...and the three trailing substitutions really are the per-mind ones, in placeholder order.
+    // Without this the counts above could be satisfied by swapping a stable clause for a per-mind one.
+    const args = rest[end..];
+    const tail = std.mem.indexOf(u8, args, "mi.name, w.roster, space_clause") orelse return error.PerMindArgsMoved;
+    _ = tail;
+
+    // The marker is genuinely near the END -- a guard against the whole doctrine being restructured
+    // so that "stable head" becomes a few bytes and the assertion above passes vacuously.
+    try std.testing.expect(m * 2 > fmt.len);
+}

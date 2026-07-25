@@ -1546,3 +1546,31 @@ edit, confirm it applied, then run.
   both probes.
 - next: H8's remaining paths (context rebuilds, tool round-trips per turn). Frontier 5 src + 2 desk.
   H10, H14b, H26, H28 are the owner's.
+
+## 0064 — 2026-07-25 — the swarm's stable-prefix contract, guarded
+- did: run.zig carries a MEASURED cache contract in a comment: the system message's head holds only
+  per-run-stable content, and everything per-mind or per-round rides the tail, because a provider's
+  KV cache serves a request only up to the first byte that differs. The mind's NAME used to sit at
+  byte 8 ("You are {name}, ..."), so N minds forked N cache lineages, each separately re-billing
+  ~11.2 KB of doctrine that was byte-identical between them. Cast-355797 measured it: the swarm got
+  21.6% cached tokens while a chat turn on the SAME model and endpoint in the same ten minutes got
+  81.1%. Identity was moved to the tail. Nothing enforced that it stays there.
+- did: a source audit of the format string — 4 substitutions before the `YOU, SPECIFICALLY` marker
+  (the run-stable clauses), 3 after (mi.name, w.roster, space_clause), plus a check that those three
+  really are the trailing args in placeholder order, plus a vacuity guard that the marker sits past
+  the literal's midpoint so the "stable head" cannot be shrunk to nothing and still pass.
+- why a source audit and not a live assertion: same reason as trio_routing_test (see its header) —
+  the invariant lives in the SHAPE of one allocPrint, not in data any runtime value exposes. There
+  is nothing to call that returns "the prefix"; there is only the argument list.
+- verified: src suite exit 0. Counterfactual, injection printed first: putting `{s}` for mi.name
+  back at the head — the natural-sounding edit, since a reader expects identity first — fails the
+  named test. Full oracle green.
+- learned: this is the most expensive class of regression in the tree and the least visible. Every
+  answer stays correct, every test stays green, and the only symptom is the bill. The comment even
+  says WHY the name has to be in the awkward place ("the cost of that move is that identity is no
+  longer the first thing the model reads"), which makes moving it back a plausible, well-intentioned
+  edit — precisely the kind a guard has to catch, because review will not.
+- ratchet: the audit itself; and it names the measured numbers in its failure message, so whoever
+  trips it learns the cost rather than just the rule.
+- next: H8's remaining unpriced paths are context rebuilds and tool round-trips per turn. Frontier
+  5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
