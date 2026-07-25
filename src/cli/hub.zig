@@ -131,13 +131,53 @@ fn help() u8 {
     return 0;
 }
 
+/// Escape one JSON string. Kept identical in effect to gateway/http.zig's `jstr` and worker/llm.zig's
+/// — the broadcast body this builds is parsed by the server, so anything it emits raw that JSON
+/// forbids is a request that silently fails.
+///
+/// It used to escape only `"`, `\` and `\n`, passing every other control byte through untouched.
+/// `veil hub all "<text>"` feeds operator-typed text straight in, so pasting anything copied on
+/// Windows (CRLF) put a raw carriage return inside the string, and a tab did the same — invalid
+/// JSON, a broadcast that never reached the swarms, and nothing on screen to say why.
 fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) void {
     list.append(gpa, '"') catch return;
     for (s) |c| switch (c) {
         '"' => list.appendSlice(gpa, "\\\"") catch return,
         '\\' => list.appendSlice(gpa, "\\\\") catch return,
         '\n' => list.appendSlice(gpa, "\\n") catch return,
-        else => list.append(gpa, c) catch return,
+        '\r' => list.appendSlice(gpa, "\\r") catch return,
+        '\t' => list.appendSlice(gpa, "\\t") catch return,
+        else => if (c < 0x20) {
+            var b: [6]u8 = undefined;
+            list.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch "") catch return;
+        } else list.append(gpa, c) catch return,
     };
     list.append(gpa, '"') catch return;
+}
+
+test "hub's broadcast body survives whatever an operator pastes into it" {
+    // The reachable case: text copied on Windows carries CRLF, and a raw CR inside a JSON string is
+    // invalid — the broadcast used to be dropped by the server's parser with nothing to show for it.
+    const gpa = std.testing.allocator;
+    const HOSTILE = [_][]const u8{
+        "line one\r\nline two", // CRLF paste — the one that bit
+        "col\tcol", // a tab
+        "say \"hello\"", // quotes
+        "back\\slash",
+        "bell\x07 and nul\x00 and vt\x0b",
+        "", // empty is still a valid string
+    };
+    for (HOSTILE) |s| {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.appendSlice(gpa, "{\"text\":");
+        jstr(gpa, &body, s);
+        try body.appendSlice(gpa, ",\"after\":1}");
+
+        const P = struct { text: []const u8 = "", after: i64 = 0 };
+        const parsed = try std.json.parseFromSlice(P, gpa, body.items, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(s, parsed.value.text); // byte-for-byte, nothing lost
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.after); // and the object still closes
+    }
 }
