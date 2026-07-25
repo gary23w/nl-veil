@@ -1,6 +1,7 @@
 //! AES-256-GCM at-rest sealing + a write-only BYOK key vault (seal/open primitives + per-user provider keys).
 
 const std = @import("std");
+const log = std.log.scoped(.vault);
 const Neuron = @import("../worker/neuron/client.zig").Neuron;
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 const NL = Aes256Gcm.nonce_length;
@@ -38,7 +39,23 @@ pub fn deriveServerKey(gpa: std.mem.Allocator, io: std.Io, environ: *const std.p
     var b64buf: [64]u8 = undefined;
     const b64 = b64buf[0..enc.calcSize(32)];
     _ = enc.encode(b64, &key);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = b64 }) catch {};
+    // A swallowed failure here is the worst kind: this boot seals every BYOK key with a key that was
+    // never written down, so the NEXT boot generates a different one and nothing sealed today can be
+    // opened again — permanently, with no error anywhere. The function still returns the key (the
+    // server must run), but the operator has to be TOLD, because the damage accrues silently for as
+    // long as the process lives and only surfaces after a restart, far from the cause. (Ledger 0070;
+    // the swallow itself was found by sweeping for writes whose failure goes unreported.)
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = b64 }) catch |e| {
+        // warn, not err, on this repo's own precedent: `seedDefaultAdmin` logs the default-password
+        // condition at warn — serious, security-relevant, operator-fixable, server keeps running.
+        // Same shape. It also keeps the case testable: Zig's runner fails any test that logs an err,
+        // so an `err` here could only be asserted by never exercising it, which is the wrong trade
+        // for a diagnostic whose whole job is to fire.
+        log.warn(
+            "at-rest key could not be persisted to {s} ({t}) — this boot's stored provider keys will NOT be readable after a restart. Fix the data dir's permissions, or set NL_SECRET so the key is derived instead of stored.",
+            .{ path, e },
+        );
+    };
     return key;
 }
 
@@ -1131,4 +1148,48 @@ test "live neuron-db: an OAuth bundle round-trips whole, and its refresh token i
     try std.testing.expectEqual(@as(usize, 0), plain.refresh_token.len);
     try std.testing.expectEqual(@as(usize, 0), plain.account_id.len);
     try std.testing.expectEqual(@as(i64, 0), plain.expires_at);
+}
+
+test "deriveServerKey: an UNPERSISTABLE key is not stable across boots — the case that loses data" {
+    // The existing invariant test covers a writable data dir. This is the combination it cannot
+    // reach: NO NL_SECRET (so the key comes from the file, not the secret) AND a data dir that
+    // cannot be written. deriveServerKey swallows the write error by design — the server still has
+    // to boot — so the failure is invisible at the time, and the loss only shows up on the NEXT
+    // start, when everything sealed today refuses to open. Pinned so the behaviour is a documented
+    // consequence with an operator-visible log.err beside it, rather than a surprise.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    // no NL_SECRET on purpose: with one set, the key is derived and the unwritable dir is irrelevant.
+
+    const nowhere = "zig-vault-unwritable/definitely/not/created";
+    const k1 = deriveServerKey(gpa, io, &env, nowhere);
+    const k2 = deriveServerKey(gpa, io, &env, nowhere);
+
+    // It still returns a USABLE key rather than crashing or handing back zeroes — the server boots.
+    var zero = true;
+    for (k1) |b| {
+        if (b != 0) {
+            zero = false;
+            break;
+        }
+    }
+    try std.testing.expect(!zero);
+
+    // ...but it is a DIFFERENT key each time, which is precisely the data loss: whatever this boot
+    // sealed, the next boot cannot open. If this ever starts passing as equal, the key became
+    // stable by some other route and the log.err above is now lying — re-read both.
+    try std.testing.expect(!std.mem.eql(u8, &k1, &k2));
+
+    // And sealing round-trips WITHIN one boot, so the failure really is confined to restarts.
+    const blob = try seal(gpa, io, k1, "provider-key-material");
+    defer gpa.free(blob);
+    const back = open(gpa, k1, blob) orelse return error.TestUnexpectedResult;
+    defer gpa.free(back);
+    try std.testing.expectEqualStrings("provider-key-material", back);
+    try std.testing.expect(open(gpa, k2, blob) == null); // ...and NOT with the next boot's key
 }
