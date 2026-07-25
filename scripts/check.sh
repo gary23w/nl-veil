@@ -36,10 +36,23 @@ fail=0
 gate() { # gate <name> <cmd...>
   name="$1"; shift
   printf '>> %s\n' "$name"
-  if "$@"; then
+  log="${TMPDIR:-/tmp}/nlveil-gate.$$.log"
+  if "$@" >"$log" 2>&1; then
+    cat "$log"
     printf '   PASS\n'
+    rm -f "$log"
   else
-    printf '   FAIL (%s)\n' "$?"
+    code=$?
+    cat "$log"
+    printf '   FAIL (%s)\n' "$code"
+    # WHAT ACTUALLY BROKE, last — where a CI log is read from. A failing desk run buries its one
+    # real assertion under CONNECTION_REFUSED stack dumps from tests that hit a dead port ON
+    # PURPOSE, and a compile error can sit above a page of linker chatter.
+    if grep -qE "^error: '.*' failed:|\.zig:[0-9]+:[0-9]+: error:|^error: the following" "$log"; then
+      printf '   -- what failed --\n'
+      grep -E "^error: '.*' failed:|\.zig:[0-9]+:[0-9]+: error:|^error: the following" "$log" | tail -8 | sed 's/^/   > /'
+    fi
+    rm -f "$log"
     fail=1
   fi
 }
