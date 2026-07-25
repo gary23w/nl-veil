@@ -884,7 +884,7 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
-    \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
+    \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. Workdir lines come prefixed with their anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. A whole-file read is CLIPPED to its head, so for a big file pass start_line/end_line (1-indexed, inclusive) and read the window you are about to edit: never edit from a clipped view, and never rewrite a file just because the view ended.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"absorb","description":"Absorb a local text file (a book, doc, notes, dataset) into long-term memory (neuron-db), filed under the document's OWN scope (knowledge__doc-<slug>; the result names it). Use it when the user points you at a file to learn (\"absorb the book at C:/books/x.txt\") — deterministic, offline. Afterwards: targeted questions → recall_hive (documents are searched automatically); whole-document work (summarize/outline/review) → read_doc, which pages the document IN ORDER. Pass path (relative to the workdir, or an ABSOLUTE path on the user's machine). Optional scope (override target), name (provenance label), cap (max facts).","parameters":{"type":"object","properties":{"path":{"type":"string"},"scope":{"type":"string"},"name":{"type":"string"},"cap":{"type":"integer"}},"required":["path"]}}},
     \\{"type":"function","function":{"name":"list_dir","description":"List the files (with sizes) in a directory so you can SEE what exists before reading or editing. Defaults to your build workdir; also accepts an ABSOLUTE path (C:/data) or ~/dir on the user's machine; pass root=\"system\" to list the patch_system engine root.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"relative dir (default '.'), or an absolute/~ path on the user's machine"},"root":{"type":"string","enum":["workdir","system"],"description":"workdir (default) or the patch_system root"}},"required":[]}}},
     \\{"type":"function","function":{"name":"stage_file","description":"Copy a file from the user's machine (ABSOLUTE or ~ path) INTO the build workdir, so a HIVE you cast can use it — hives only see the workdir (it syncs to them), never the rest of the machine. Reading for YOURSELF needs no staging (read_file takes absolute paths directly); stage only what a hive must build on.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"absolute or ~ source path on the user's machine"},"as":{"type":"string","description":"optional workdir-relative name (default: the source's file name)"}},"required":["path"]}}},
@@ -2134,6 +2134,28 @@ test "repairToolJson: raw newlines escape, truncation closes, prose/garbage drop
     try std.testing.expectEqualStrings("{\"path\":\"x\"}", r4);
 }
 
+test "a salvaged tool call OWNS its strings — the repair buffer is freed while the parsed value is still in use" {
+    const gpa = std.testing.allocator;
+    // The invariant both salvage sites depend on. std.json's default for a slice input is .alloc_if_needed:
+    // a string with no escapes comes back as a SLICE INTO the input. The repair buffer is function-local and
+    // freed as soon as the salvage block exits, so under the default every salvaged `path`/`content` dangled —
+    // write_file then reported "could not write file" for whatever the freed pages happened to hold. Assert
+    // the aliasing directly (a symptom test would depend on allocator recycling luck).
+    const A = struct { path: []const u8 = "", content: []const u8 = "" };
+    var trunc = false;
+    const rep = repairToolJson(gpa, "{\"path\": \"demo.html\", \"content\": \"<h1>partial", &trunc).?;
+    try std.testing.expect(trunc);
+    const p = try std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+    defer p.deinit();
+    const lo = @intFromPtr(rep.ptr);
+    const hi = lo + rep.len;
+    try std.testing.expect(@intFromPtr(p.value.path.ptr) < lo or @intFromPtr(p.value.path.ptr) >= hi);
+    try std.testing.expect(@intFromPtr(p.value.content.ptr) < lo or @intFromPtr(p.value.content.ptr) >= hi);
+    gpa.free(rep); // exactly what the salvage block's `defer` does, while `p` is still the live value
+    try std.testing.expectEqualStrings("demo.html", p.value.path);
+    try std.testing.expectEqualStrings("<h1>partial", p.value.content);
+}
+
 fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     const A = struct { path: []const u8 = "", content: []const u8 = "", mode: []const u8 = "overwrite" };
@@ -2146,7 +2168,13 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         const rep = repairToolJson(gpa, args_json, &trunc) orelse
             return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
         defer gpa.free(rep);
-        const p2 = std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true }) catch
+        // .alloc_always is LOAD-BEARING, not a style choice. std.json's default for a slice input is
+        // .alloc_if_needed: a string with no escapes comes back as a SLICE INTO `rep`, which this block frees
+        // on the way out — so `path`/`content` became dangling pointers the moment the salvage succeeded, and
+        // write_file reported "could not write file" for garbage bytes. It read as a filesystem failure and
+        // cost five 4096-token turns in one build. Forcing copies makes the parsed value own its strings, so
+        // the repaired buffer is genuinely free to go.
+        const p2 = std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
             return dupe(gpa, "write_file arguments were not valid JSON — your file was likely too long and got cut off. Write a shorter version (or fewer changes this turn), then improve it next turn.");
         truncated = trunc;
         salvage_note = if (trunc)
@@ -2215,6 +2243,12 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     // detects OUR markers, not any language's syntax), so it guards every toolchain the goal can declare.
     if (bufedit.editMarkerCorruption(clean))
         return dupe(gpa, "write REJECTED — your content contains SEARCH/REPLACE or merge-conflict marker lines (<<<<<<< / >>>>>>>): that is an EDIT SCRIPT, not a file body. To change an existing file, call edit_file with ops; to write this file, send the complete final body with ZERO marker lines.");
+    // The read view pasted back as content. Anchor tags are an ADDRESSING scheme layered over a read; committing
+    // them would leave every line of the file prefixed with `42:abc:def→` — and since a read is exactly what a
+    // model reaches for before rewriting a file it just edited, this is the write that would follow a tagged
+    // read most naturally. Same shape of guard as the marker check above, for the same reason.
+    if (hashline.taggedBody(clean))
+        return dupe(gpa, "write REJECTED — your content still carries the read view's anchor tags (`42:abc:def\u{2192}` at the start of most lines). Those tags are addressing for edit_file, NOT part of the file: they exist so you can point at a line without retyping it. To CHANGE this file, call edit_file with those tags as anchors (no re-emitting); to write it, send the file's real lines with every tag prefix stripped.");
     const is_append = std.mem.eql(u8, p.value.mode, "append") and p.value.content.len > 0;
     var final_bytes: usize = clean.len;
     var restarted = false;
@@ -2226,7 +2260,11 @@ fn writeFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         // sloppily re-emits one earlier def; replacing the file would destroy chunk 1's other definitions). The
         // only safe move is REJECT with the exact conflicting name and route the model to edit_file / a clean
         // append / an explicit overwrite.
-        const redef: ?[]const u8 = if (std.mem.endsWith(u8, wpath, ".py")) pyAppendRedefines(prior, clean) else null;
+        // Python keeps its decorator-aware check (a real parser reading a real language); EVERY file — any
+        // extension, or none — then goes through the language-blind one, which learns what a definition looks
+        // like from the file it is handed.
+        const redef: ?[]const u8 = (if (std.mem.endsWith(u8, wpath, ".py")) pyAppendRedefines(prior, clean) else null) orelse
+            appendRedefines(gpa, prior, clean);
         if (appendRestartsFile(prior, clean)) {
             restarted = true;
             if (!writeWorkFileAtomic(ctx, full, clean)) return dupe(gpa, "could not write file");
@@ -2328,6 +2366,67 @@ fn pyTopDefName(line: []const u8) ?[]const u8 {
     while (end < s.len and (std.ascii.isAlphanumeric(s[end]) or s[end] == '_')) : (end += 1) {}
     if (end == kw) return null;
     return s[kw..end];
+}
+
+/// The first whitespace-delimited token of a line — the word a language puts in front of a definition
+/// (`function`, `class`, `def`, `pub`, `func`, `export`, `impl`, …) without this code having to know which
+/// of those any given file uses. "" for a blank line.
+fn leadToken(line: []const u8) []const u8 {
+    const t = std.mem.trim(u8, line, " \t\r");
+    const end = std.mem.indexOfAny(u8, t, " \t") orelse t.len;
+    return t[0..end];
+}
+
+/// Is `idx` a COLUMN-0 line that opens an indented body? The universal shape of a definition — a header at
+/// the margin with its contents pushed in under it — read off the text rather than off a keyword table.
+fn opensIndentedBlock(lines: []const []const u8, idx: usize) bool {
+    const ln = lines[idx];
+    if (ln.len < 6 or ln[0] == ' ' or ln[0] == '\t') return false;
+    var j = idx + 1;
+    while (j < lines.len and std.mem.trim(u8, lines[j], " \t\r").len == 0) j += 1; // skip blanks
+    if (j >= lines.len) return false;
+    return lines[j][0] == ' ' or lines[j][0] == '\t';
+}
+
+/// The first definition the append `body` RE-DECLARES — the shape behind "editing a big file leaves duplicate
+/// methods". A model whose surgical edit was rejected falls back to appending a corrected copy of one function;
+/// appendRestartsFile only REPLACES the file when the body is at least half of it, so anything smaller gets
+/// glued on as a second definition. This was a Python-only protection for as long as it existed.
+///
+/// It knows no languages and no file types. Three signals, all read off the two texts in front of it:
+///   1. the appended line sits at column 0 and opens an INDENTED body — a header, in any language
+///   2. its leading word is one THIS FILE uses as a definition word (it heads 3+ other column-0 lines) —
+///      so `.btn {` in a stylesheet or a lone `<div>` never qualifies, while `function`/`def`/`pub`/`func` do
+///   3. the identical header already appears in the file EXACTLY ONCE — a construct the file legitimately
+///      repeats (a CSS selector, an HTML tag, a Rust `impl`) is evidently repeatable and left alone; a header
+///      that was unique is one the append is about to duplicate
+/// Returns the offending header line (borrowed from `body`), or null when the append is safe to glue.
+fn appendRedefines(gpa: std.mem.Allocator, prior: []const u8, body: []const u8) ?[]const u8 {
+    var plines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer plines.deinit(gpa);
+    var pit = std.mem.splitScalar(u8, prior, '\n');
+    while (pit.next()) |ln| plines.append(gpa, std.mem.trimEnd(u8, ln, "\r")) catch return null;
+    var blines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer blines.deinit(gpa);
+    var bit = std.mem.splitScalar(u8, body, '\n');
+    while (bit.next()) |ln| blines.append(gpa, std.mem.trimEnd(u8, ln, "\r")) catch return null;
+    if (plines.items.len < 3 or blines.items.len == 0) return null;
+
+    for (blines.items, 0..) |bl, bi| {
+        if (!opensIndentedBlock(blines.items, bi)) continue;
+        const word = leadToken(bl);
+        if (word.len == 0) continue;
+        // (2) does THIS file treat `word` as a definition word, and (3) is this exact header unique in it?
+        var word_heads: usize = 0;
+        var exact: usize = 0;
+        for (plines.items, 0..) |pl, pi| {
+            if (pl.len == 0 or pl[0] == ' ' or pl[0] == '\t') continue;
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, pl, " \t"), std.mem.trimEnd(u8, bl, " \t"))) exact += 1;
+            if (opensIndentedBlock(plines.items, pi) and std.mem.eql(u8, leadToken(pl), word)) word_heads += 1;
+        }
+        if (exact == 1 and word_heads >= 3) return bl;
+    }
+    return null;
 }
 
 /// First top-level def/class name the append `body` shares with the existing `prior` — a genuine continuation
@@ -2505,7 +2604,89 @@ fn syntaxGateError(ctx: *ToolCtx, npath: []const u8, source: []const u8, orig: [
     if (std.mem.endsWith(u8, npath, ".js") or std.mem.endsWith(u8, npath, ".mjs") or std.mem.endsWith(u8, npath, ".cjs"))
         return jsCheckError(ctx, npath, source);
     if (std.mem.endsWith(u8, npath, ".json")) return jsonParseError(ctx.gpa, source);
+    return balanceError(ctx.gpa, source, orig);
+}
+
+/// The delimiter pairs the balance gate below can reason about. Not a language list — a file selects which of
+/// these apply to it by demonstrably balancing them.
+const DELIMS = [_][2]u8{ .{ '{', '}' }, .{ '[', ']' }, .{ '(', ')' } };
+
+/// STRUCTURAL GATE for everything with no parser on hand. `.py`/`.js`/`.json` get real ones; every other file
+/// the veil is pointed at — .ts, .zig, .rs, .css, .lua, a config, an extension nobody has thought of yet — had
+/// NO gate at all, so an edit that dropped a closing delimiter landed silently and surfaced later as a build
+/// failure with nothing pointing back at the edit that caused it.
+///
+/// Nothing here is keyed on a file type. Each delimiter pair ARMS ITSELF from the file in hand: the pre-edit
+/// text must contain enough of that pair to be meaningful AND count to exactly zero, which is the file proving
+/// it balances them. Prose, markdown, CSV, a stylesheet with a stray brace in a string — none of them balance
+/// under this scan, so none of them get gated. The only edit this can reject is one that BROKE a balance the
+/// file demonstrably had, which is precisely the corruption it exists to catch.
+fn balanceError(gpa: std.mem.Allocator, source: []const u8, orig: []const u8) ?[]u8 {
+    if (orig.len == 0) return null; // a fresh write has no baseline to compare against
+    for (DELIMS) |d| {
+        const before = delimiterDepth(orig, d[0], d[1]) orelse continue;
+        // The file must USE this pair enough for balance to mean something (a handful of parentheses in a
+        // paragraph is not a structure) and must count to exactly zero — that is the file proving it balances.
+        if (before.depth != 0 or before.count < 8) continue;
+        const after = delimiterDepth(source, d[0], d[1]) orelse continue;
+        if (after.depth == 0) continue;
+        return if (after.depth > 0)
+            std.fmt.allocPrint(gpa, "{d} unclosed '{c}' — the result opens more than it closes (it did balance before this edit)", .{ after.depth, d[0] }) catch null
+        else
+            std.fmt.allocPrint(gpa, "{d} unmatched '{c}' — the result closes more than it opens (it did balance before this edit)", .{ -after.depth, d[1] }) catch null;
+    }
     return null;
+}
+
+/// Net nesting depth and total occurrences of one delimiter pair, skipping string/char literals and `//` and
+/// `/* */` comments — lexical conventions general enough to be near-universal in text formats, and where they
+/// do not hold the scan simply refuses to answer. null whenever it cannot trust itself (an unterminated string
+/// or comment): the caller treats that as "no verdict" rather than guessing, so an unusual format disarms the
+/// gate instead of being fought by it.
+fn delimiterDepth(text: []const u8, open: u8, close: u8) ?struct { depth: i32, count: usize } {
+    var depth: i32 = 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == open) {
+            depth += 1;
+            count += 1;
+            continue;
+        }
+        if (c == close) {
+            depth -= 1;
+            count += 1;
+            continue;
+        }
+        switch (c) {
+            '/' => {
+                if (i + 1 >= text.len) continue;
+                if (i > 0 and text[i - 1] == ':') continue; // `http://…` in a url is not a line comment
+                if (text[i + 1] == '/') {
+                    i = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse return .{ .depth = depth, .count = count };
+                } else if (text[i + 1] == '*') {
+                    const end = std.mem.indexOfPos(u8, text, i + 2, "*/") orelse return null;
+                    i = end + 1;
+                }
+            },
+            '"', '\'', '`' => {
+                var j = i + 1;
+                while (j < text.len) : (j += 1) {
+                    if (text[j] == '\\') {
+                        j += 1;
+                        continue;
+                    }
+                    if (text[j] == c) break;
+                    if (text[j] == '\n' and c != '`') return null; // unterminated on its line: don't guess
+                }
+                if (j >= text.len) return null;
+                i = j;
+            },
+            else => {},
+        }
+    }
+    return .{ .depth = depth, .count = count };
 }
 
 /// One reject message for BOTH edit paths (direct and VCS), so a gate rejection reads identically wherever it
@@ -2531,7 +2712,7 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
     defer if (locked) ctx.fmtx.?.unlock(ctx.io);
     const head = blk: {
         if (locked) {
-            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20))) |h| break :blk h else |_| {}
+            if (std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(EDIT_MAX_BYTES))) |h| break :blk h else |_| {}
         }
         break :blk gpa.dupe(u8, original) catch return dupe(gpa, "oom");
     };
@@ -2550,8 +2731,13 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
             if (!writeWorkFileAtomic(ctx, full, ap.content)) return dupe(gpa, "could not write the edited file");
             ctx.files_written.* += 1;
             {
-                lockFiles(ctx);
-                defer unlockFiles(ctx);
+                // DEADLOCK. lockFiles takes ctx.fmtx — the SAME mutex this function already holds when it read
+                // HEAD in-lock, and std.Io.Mutex is not reentrant. So a tag-anchored edit under vcs_enabled
+                // (a multi-mind cast, and now every chat edit) hung HERE, forever, holding the file lock: the
+                // mind never returned, and every other writer behind that lock stopped too. Acquire only when
+                // this function is not already the holder.
+                if (!locked) lockFiles(ctx);
+                defer if (!locked) unlockFiles(ctx);
                 const mpath = std.fmt.allocPrint(gpa, "{s}/.build_manifest", .{ctx.run_dir}) catch "";
                 defer if (mpath.len > 0) gpa.free(mpath);
                 if (mpath.len > 0) {
@@ -2573,6 +2759,13 @@ fn hashlineApply(ctx: *ToolCtx, npath: []const u8, full: []const u8, original: [
     }
 }
 
+/// Ceiling on a file edit_file will load. Deliberately well above the 1MiB the edit paths used to cap at: a
+/// large EXISTING file is exactly the case where a surgical edit matters most, and refusing it pushed the model
+/// onto write_file — a full rewrite of a file it has only ever seen the head of. ALIASES vcs.MAX_FILE_BYTES so
+/// editFile, hashlineApply's in-lock head re-read, and the micro-VCS commit can never disagree about what is
+/// editable (a file one accepts and another cannot read is an edit that fails forever).
+const EDIT_MAX_BYTES: usize = vcs.MAX_FILE_BYTES;
+
 fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     const gpa = ctx.gpa;
     // Accept BOTH edit dialects: the hive prompt teaches {op, anchor, text}; the chat prompt teaches
@@ -2589,7 +2782,10 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
         const rep = repairToolJson(gpa, args_json, &trunc) orelse
             return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
         defer gpa.free(rep);
-        break :blk_rep std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true }) catch
+        // .alloc_always for the same reason as write_file's salvage above: without it every parsed string is a
+        // slice into `rep`, which this block frees — so a cut-off edit_file batch ran its ops against freed
+        // memory. Copies here, freedom to release `rep` there.
+        break :blk_rep std.json.parseFromSlice(A, gpa, rep, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch
             return dupe(gpa, "edit_file arguments were not valid JSON (likely cut off) — send fewer/smaller ops this turn.");
     };
     defer p.deinit();
@@ -2604,22 +2800,58 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     };
     const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, npath }) catch return dupe(gpa, "oom");
     defer gpa.free(full);
-    const original = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(1 << 20)) catch
-        return std.fmt.allocPrint(gpa, "{s} does not exist (or is over 1MiB) — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
+    // A file BIGGER than the ordinary slurp cap must still be editable. The old single read capped at 1MiB and
+    // reported failure as "{path} does not exist … use write_file to create a new one" — for a large EXISTING
+    // file that is a lie that ends in a destructive from-scratch overwrite, i.e. the worst outcome of the very
+    // failure mode edit_file exists to prevent. Stat first: only a genuinely absent file says "does not exist",
+    // and a file past even the raised ceiling says so honestly and forbids the rewrite.
+    const original = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(EDIT_MAX_BYTES)) catch blk_big: {
+        const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch
+            return std.fmt.allocPrint(gpa, "{s} does not exist — edit_file only changes an EXISTING file; use write_file to create a new one.", .{npath}) catch dupe(gpa, "file not found — use write_file to create it");
+        if (st.size > EDIT_MAX_BYTES)
+            return std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large for edit_file to load. It was NOT modified — do NOT rewrite it with write_file (that would destroy it). Narrow the change: read the exact region with read_file start_line/end_line, or split the file first.", .{ npath, st.size }) catch dupe(gpa, "file too large to edit — do not rewrite it");
+        break :blk_big std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(@intCast(st.size + 1))) catch
+            return std.fmt.allocPrint(gpa, "{s} could not be read ({d} bytes). It was NOT modified — do NOT rewrite it with write_file.", .{ npath, st.size }) catch dupe(gpa, "could not read the file to edit — do not rewrite it");
+    };
     defer gpa.free(original);
     // A marker-corrupted file is structurally edit-hostile: its repeated `<<<<<<<`/`=======`/`>>>>>>>` lines
     // make anchors ambiguous ("matches more than one place") and partial cleanups strand residue. The only
     // reliable repair is a clean full rewrite, so route there instead of letting ops fight the markers.
     if (bufedit.editMarkerCorruption(original))
         return std.fmt.allocPrint(gpa, "{s} currently contains unresolved SEARCH/REPLACE / merge-conflict marker lines from an earlier bad edit — anchors are unreliable in it and partial cleanups leave broken residue. Do NOT edit it: REWRITE it clean in full with write_file path:\"{s}\" mode:\"overwrite\", sending the complete final code with ZERO marker lines.", .{ npath, npath }) catch dupe(gpa, "file is marker-corrupted — rewrite it in full with write_file mode:\"overwrite\"");
+    // A tag belongs in an op's ANCHOR, never in its replacement TEXT: text is what lands in the file, so a
+    // tag-prefixed line there commits the addressing scheme into the source. Cheap to confuse — the model has
+    // the tagged view right in front of it — and invisible afterwards, so reject before anything is spliced.
+    for (p.value.ops, 0..) |o, i| {
+        const otext = if (o.text.len > 0) o.text else o.replace;
+        if (hashline.hasTaggedLine(otext))
+            return std.fmt.allocPrint(gpa, "op{d} REJECTED (nothing was changed) — its replacement text carries anchor tags (`42:abc:def\u{2192}`). Tags are how you POINT at a line; they are not part of the line. Put the tag in `anchor` and the file's REAL code (tag prefixes stripped) in `text`.", .{i + 1}) catch dupe(gpa, "replacement text carries anchor tags — strip the `N:abc:def\u{2192}` prefixes; tags belong in anchor, not text");
+    }
+    if (hashline.hasTaggedLine(p.value.replace))
+        return dupe(gpa, "edit REJECTED (nothing was changed) — your `replace` text carries anchor tags (`42:abc:def\u{2192}`). Tags are how you POINT at a line; they are not part of the line. Send the file's real code with every tag prefix stripped.");
     // HASH-ANCHORED DIALECT: any op whose anchor is a copied `42:abc:def` tag routes the WHOLE batch
     // through the atomic anchor engine (hashline.zig) — anchors verify against the file AS IT IS NOW
     // (that check IS the concurrent-edit guarantee: a teammate's change in your neighborhood surfaces as
     // staleness, never a silent mis-splice), the batch applies all-or-nothing, and every failure returns
     // FRESH tags so the mind retries immediately without re-reading.
+    // The file's lines, for resolving tag anchors against it AS IT IS NOW. Built once here and reused by the
+    // dialect count and the op loop below (hashlineApply re-reads and re-validates in-lock regardless).
+    var flines = hashline.splitLines(gpa, original) catch return dupe(gpa, "oom");
+    defer flines.deinit(gpa);
     var n_tagged: usize = 0;
     for (p.value.ops) |o| {
-        if (hashline.isNumberedAnchor(if (o.anchor.len > 0) o.anchor else o.search)) n_tagged += 1;
+        if (hashline.isTagAnchor(flines.items, if (o.anchor.len > 0) o.anchor else o.search)) n_tagged += 1;
+    }
+    // A tag copied WITHOUT its line number (`wcj:dwp→</body>` for `467:wcj:dwp→</body>`) that no longer names
+    // a line must say THAT. Untouched it falls through to text matching, where nothing in the file looks like
+    // a tag, so the edit failed as "anchor not found" AND the stale-region hint reported the region as removed
+    // from the file entirely — the one thing that was certainly false, since the model had just read it there.
+    if (n_tagged == 0) {
+        for (p.value.ops, 0..) |o, i| {
+            const araw = if (o.anchor.len > 0) o.anchor else o.search;
+            if (!hashline.looksLikeUnlinedTag(araw)) continue;
+            return std.fmt.allocPrint(gpa, "op{d}: anchor \"{s}\" is a line tag with its LINE NUMBER dropped, and its hashes match no line in {s} as it is now — that line changed since you read it. Nothing was modified. read_file the region and copy a FRESH tag COMPLETE with its number (`42:abc:def`).", .{ i + 1, araw[0..@min(araw.len, 60)], npath }) catch dupe(gpa, "stale line tag — read_file the region and copy a fresh `42:abc:def` tag, number included");
+        }
     }
     if (n_tagged > 0) {
         var hops: std.ArrayListUnmanaged(hashline.Op) = .empty;
@@ -2628,12 +2860,12 @@ fn editFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
             const opname = if (o.op.len > 0) o.op else "replace";
             const araw = if (o.anchor.len > 0) o.anchor else o.search;
             const otext = if (o.text.len > 0) o.text else o.replace;
-            const a = hashline.parseAnchor(araw) orelse
+            const a = hashline.resolveAnchor(flines.items, araw) orelse
                 return std.fmt.allocPrint(gpa, "mixed anchor dialects in one edit_file call — op anchor \"{s}\" is not a copied line tag while other ops use tags. Use the `N:abc:def` tags from your last read/edit result for EVERY op in this batch.", .{araw[0..@min(araw.len, 60)]}) catch dupe(gpa, "mixed anchor dialects — use line tags for every op");
             var end_a: ?hashline.Anchor = null;
             const eraw = if (o.end.len > 0) o.end else o.end_anchor;
             if (eraw.len > 0) {
-                end_a = hashline.parseAnchor(eraw) orelse
+                end_a = hashline.resolveAnchor(flines.items, eraw) orelse
                     return std.fmt.allocPrint(gpa, "the `end` value \"{s}\" is not a line tag — copy the range's LAST line tag (`N:abc:def`) from your last read.", .{eraw[0..@min(eraw.len, 60)]}) catch dupe(gpa, "bad end tag");
             }
             const kind: hashline.OpKind = if (std.mem.eql(u8, opname, "insert_after"))
@@ -2857,31 +3089,48 @@ fn readFile(ctx: *ToolCtx, args_json: []const u8) []u8 {
     else
         (std.fmt.allocPrint(gpa, "{s}/{s}", .{ ctx.workdir, rpath }) catch return dupe(gpa, "oom"));
     defer gpa.free(full);
+    // A requested line window (start_line/end_line, or offset+limit) returns exactly those lines — this is how
+    // you read the back half of a big file. Resolved BEFORE the read because it decides how big a file this
+    // call will accept: a whole-file read of something huge is refused, a WINDOW of it is the documented way
+    // through, and those two used to share one ceiling — so a file over the whole-read limit answered "read it
+    // in pieces with a line range" to a call that ALREADY passed one. That dead end is what made a big file
+    // unreadable, therefore un-anchorable, therefore only ever rewritable.
+    const start_line = if (p.value.start_line > 0) p.value.start_line else p.value.offset;
+    const end_line = if (p.value.end_line > 0) p.value.end_line else if (p.value.limit > 0 and start_line > 0) start_line + p.value.limit - 1 else 0;
+    const windowed = start_line > 0 or end_line > 0;
     const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(256 << 10)) catch blk_big: {
         // Not a plain small file. A DIRECTORY gets its listing; a file BIGGER than the slurp cap gets read
         // with a raised ceiling — a bare "not found" would be a LIE for both (a large source would read as
         // nonexistent, hiding the file that mattered most).
         if (dirListing(ctx, full, rpath)) |listing| return listing;
         const st = std.Io.Dir.cwd().statFile(ctx.io, full, .{}) catch return dupe(gpa, "not found");
-        if (st.size > (4 << 20)) return std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large to read whole — read it in pieces with a line range: {{\"path\":\"{s}\",\"start_line\":1,\"end_line\":400}}", .{ rpath, st.size, p.value.path }) catch dupe(gpa, "file too large");
+        const ceiling: u64 = if (windowed) EDIT_MAX_BYTES else (4 << 20);
+        if (st.size > ceiling) return if (windowed)
+            std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is past the {d}-byte limit for reading at all — it cannot be windowed or edited in place. Split it, or work on it with run_python.", .{ rpath, st.size, ceiling }) catch dupe(gpa, "file too large to read")
+        else
+            std.fmt.allocPrint(gpa, "{s} EXISTS ({d} bytes) but is too large to read whole — read it in pieces with a line range: {{\"path\":\"{s}\",\"start_line\":1,\"end_line\":400}}", .{ rpath, st.size, p.value.path }) catch dupe(gpa, "file too large");
         break :blk_big std.Io.Dir.cwd().readFileAlloc(ctx.io, full, gpa, .limited(@intCast(st.size + 1))) catch return dupe(gpa, "not found");
     };
     defer gpa.free(data);
     const clean = sanitizeModelText(gpa, data);
     defer gpa.free(clean);
     // ANCHORED READ (build mode): every line is prefixed with its edit-anchor tag (`42:abc:def→`) — the
-    // copyable handles edit_file verifies. Rendered BEFORE windowing so a line window carries the same
-    // absolute tags as a whole-file read. Roamed (outside-workdir) and binary-ish reads stay plain.
-    const view = if (ctx.anchored_reads and roamed == null and std.mem.indexOfScalar(u8, clean, 0) == null)
+    // copyable handles edit_file verifies. Roamed (outside-workdir) and binary-ish reads stay plain.
+    const tagged = ctx.anchored_reads and roamed == null and std.mem.indexOfScalar(u8, clean, 0) == null;
+    // WINDOWED: tag only the requested lines. Tags are ABSOLUTE (line number + the file's own 8-line chunk
+    // fingerprints), so a window's anchors are identical to a whole-file read's — but rendering the whole file
+    // first, as this did, meant a 400-line window of a 20 MB file hashed every one of its ~500k lines and built
+    // a second whole-file buffer to throw away.
+    if (windowed) {
+        if (!tagged) return readLineWindow(gpa, clean, start_line, end_line);
+        return hashline.renderReadWindow(gpa, clean, start_line, end_line) orelse
+            std.fmt.allocPrint(gpa, "[the requested line range is past the end of {s} — read a lower range]", .{rpath}) catch dupe(gpa, "line range past end of file");
+    }
+    const view = if (tagged)
         hashline.renderRead(gpa, clean)
     else
         (gpa.dupe(u8, clean) catch return dupe(gpa, "oom"));
     defer gpa.free(view);
-    // A requested line window (start_line/end_line, or offset+limit) returns exactly those lines — this is how
-    // you read the back half of a big file.
-    const start_line = if (p.value.start_line > 0) p.value.start_line else p.value.offset;
-    const end_line = if (p.value.end_line > 0) p.value.end_line else if (p.value.limit > 0 and start_line > 0) start_line + p.value.limit - 1 else 0;
-    if (start_line > 0 or end_line > 0) return readLineWindow(gpa, view, start_line, end_line);
     const owned = ctx.my_files.len > 0 and fileOwnedBy(ctx.my_files, p.value.path);
     const cap: usize = if (owned) 32000 else 8000;
     if (view.len <= cap) return dupe(gpa, view);
@@ -6186,6 +6435,36 @@ test "appendRestartsFile: a restarted attempt is caught; a real continuation app
     try std.testing.expect(appendRestartsFile(big_prior, big_prior)); // a full same-size re-attempt still rewrites
 }
 
+test "appendRedefines: the duplicate-definition guard learns what a definition is from the file it is given" {
+    // THE REPORTED FAILURE, reduced: a surgical edit is rejected, the model appends a corrected copy of ONE
+    // function, and appendRestartsFile passes it through (a fragment is far under half the file) — so the glue
+    // leaves TWO renderBoards. This was Python-only. It is now language-blind, and stays so: nothing below
+    // names a language or an extension.
+    const gpa = std.testing.allocator;
+    const js = "export function renderBoard(state) {\n  return 1;\n}\nexport function tick() {\n  step();\n}\nexport function pause() {\n  halt();\n}\n";
+    try std.testing.expectEqualStrings("export function renderBoard(state) {", appendRedefines(gpa, js, "export function renderBoard(state) {\n  return 2;\n}\n").?);
+    try std.testing.expect(appendRedefines(gpa, js, "export function resume() {\n  go();\n}\n") == null); // new name: glue it
+    // The SAME rule on a language with different syntax entirely — learned from the text, not configured.
+    const zig = "pub fn load(p: []const u8) void {\n    a();\n}\npub fn save(p: []const u8) void {\n    b();\n}\npub fn drop() void {\n    c();\n}\n";
+    try std.testing.expectEqualStrings("pub fn save(p: []const u8) void {", appendRedefines(gpa, zig, "pub fn save(p: []const u8) void {\n    fixed();\n}\n").?);
+    // …and on one with no braces at all
+    const py = "def load(p):\n    a()\ndef save(p):\n    b()\ndef drop():\n    c()\n";
+    try std.testing.expectEqualStrings("def save(p):", appendRedefines(gpa, py, "def save(p):\n    fixed()\n").?);
+
+    // WHAT IT LEAVES ALONE, without being told to. A construct the file evidently REPEATS is repeatable:
+    // a stylesheet re-opening a selector, or markup with the same block, is ordinary content, not a redefinition.
+    const css = ".btn {\n  color: red;\n}\n.btn {\n  border: 0;\n}\n.card {\n  color: blue;\n}\n";
+    try std.testing.expect(appendRedefines(gpa, css, ".btn {\n  padding: 0;\n}\n") == null);
+    const html = "<div>\n  <p>a</p>\n</div>\n<div>\n  <p>b</p>\n</div>\n";
+    try std.testing.expect(appendRedefines(gpa, html, "<div>\n  <p>c</p>\n</div>\n") == null);
+    // A leading word the file does not use as a definition word (it heads only this one block) stays out of it.
+    const mixed = "title:\n  a\nnotes:\n  b\n";
+    try std.testing.expect(appendRedefines(gpa, mixed, "title:\n  c\n") == null);
+    // And an append with no column-0 block header in it at all is never the guard's business.
+    try std.testing.expect(appendRedefines(gpa, js, "  // a trailing comment\n") == null);
+    try std.testing.expect(appendRedefines(gpa, "", "export function tick() {\n  x();\n}\n") == null);
+}
+
 test "pyAppendRedefines: a re-attempt that re-defines existing top-level names is caught even with a different opening line" {
     // a second full copy of the module, opening with a DIFFERENT first line (a comment) glued below the
     // first — the first-line restart guard alone would miss it.
@@ -6333,6 +6612,200 @@ test "writeFile soft syntax note: a broken .json overwrite LANDS and warns; appe
         try std.testing.expect(std.mem.indexOf(u8, out, "wrote ok.json") != null);
         try std.testing.expect(std.mem.indexOf(u8, out, "does not parse") == null);
     }
+}
+
+test "a cut-off write_file LANDS what arrived, and an edit_file tag missing its line number still anchors" {
+    // Both halves of one real build failure: a 500-line page whose write_file kept hitting the turn's output
+    // ceiling, and the edit that was supposed to repair the tail. writeFile drops a few small allocations by
+    // design (manifest/ledger lines), so this mirrors production's per-turn allocator with an arena.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-salvage-it-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa); // .html has no syntax gate — nothing spawns
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root ++ "/work",
+        .scope = "test",
+        .mind = "test",
+        .round = 0,
+        .mem = undefined,
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+    };
+    { // arguments cut off mid-content: the bytes that DID arrive land, and the reply says to append the rest
+        const out = writeFile(&ctx, "{\"path\": \"demo.html\", \"content\": \"<!DOCTYPE html>\\n<body>\\n<p>partia");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "wrote demo.html") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "CUT OFF") != null);
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/work/demo.html", gpa, .limited(4096));
+        defer gpa.free(body);
+        try std.testing.expectEqualStrings("<!DOCTYPE html>\n<body>\n<p>partia", body);
+    }
+    { // the anchor dialect: a read renders `3:abc:def→…` and models routinely send back only `abc:def→…`
+        const body = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/work/demo.html", gpa, .limited(4096));
+        defer gpa.free(body);
+        var lines = try hashline.splitLines(gpa, body);
+        defer lines.deinit(gpa);
+        var ab: [24]u8 = undefined;
+        const full = hashline.renderAnchor(lines.items, 2, &ab); // the `<p>partia` line
+        const half = full[std.mem.indexOfScalar(u8, full, ':').? + 1 ..];
+        const args = try std.fmt.allocPrint(gpa, "{{\"path\":\"demo.html\",\"ops\":[{{\"op\":\"replace\",\"anchor\":\"{s}\u{2192}<p>partia\",\"text\":\"<p>whole</p>\"}}]}}", .{half});
+        defer gpa.free(args);
+        const out = editFile(&ctx, args);
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "1 tagged op(s) applied atomically") != null);
+        const after = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/work/demo.html", gpa, .limited(4096));
+        defer gpa.free(after);
+        // the salvaged content had no trailing newline and the edit does not invent one
+        try std.testing.expectEqualStrings("<!DOCTYPE html>\n<body>\n<p>whole</p>", after);
+    }
+    { // a tag whose line has since changed is named as a STALE TAG, never as a missing text snippet
+        const out = editFile(&ctx, "{\"path\":\"demo.html\",\"ops\":[{\"op\":\"replace\",\"anchor\":\"wcj:dwp\u{2192}<p>partia\",\"text\":\"x\"}]}");
+        defer gpa.free(out);
+        try std.testing.expect(std.mem.indexOf(u8, out, "LINE NUMBER") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "removed from the current file") == null);
+    }
+}
+
+test "balanceError: the structural gate arms itself off the FILE, not off a list of file types" {
+    const gpa = std.testing.allocator;
+    // Same edit, four unrelated languages, one of them an extension this code has never heard of. Nothing is
+    // keyed on the name: each file balances its braces, so each one is gated.
+    const cases = [_][2][]const u8{
+        .{ "export function f() {\n  return 1;\n}\nexport function g() {\n  return 2;\n}\nexport function h() {\n  return 3;\n}\nexport function i() {\n  return 4;\n}\n", "export function f() {\n  return 1;\nexport function g() {\n  return 2;\n}\nexport function h() {\n  return 3;\n}\nexport function i() {\n  return 4;\n}\n" },
+        .{ "pub fn f() void {\n  a();\n}\npub fn g() void {\n  b();\n}\npub fn h() void {\n  c();\n}\npub fn i() void {\n  d();\n}\n", "pub fn f() void {\n  a();\npub fn g() void {\n  b();\n}\npub fn h() void {\n  c();\n}\npub fn i() void {\n  d();\n}\n" },
+        .{ ".a {\n  color: red;\n}\n.b {\n  color: blue;\n}\n.c {\n  color: teal;\n}\n.d {\n  color: gray;\n}\n", ".a {\n  color: red;\n.b {\n  color: blue;\n}\n.c {\n  color: teal;\n}\n.d {\n  color: gray;\n}\n" },
+        .{ "local t = {\n  x = 1,\n}\nlocal u = {\n  y = 2,\n}\nlocal v = {\n  z = 3,\n}\nlocal w = {\n  q = 4,\n}\n", "local t = {\n  x = 1,\nlocal u = {\n  y = 2,\n}\nlocal v = {\n  z = 3,\n}\nlocal w = {\n  q = 4,\n}\n" },
+    };
+    for (cases, 0..) |c, i| {
+        const e = balanceError(gpa, c[1], c[0]) orelse {
+            std.debug.print("\ncase {d}: a dropped '}}' went unnoticed\n", .{i});
+            return error.MissedUnbalancedEdit;
+        };
+        defer gpa.free(e);
+        try std.testing.expect(std.mem.indexOf(u8, e, "unclosed") != null);
+        try std.testing.expect(balanceError(gpa, c[0], c[0]) == null); // the intact file passes, every time
+    }
+    { // the mirror case, and parens/brackets are gated on the same terms as braces
+        const ok = "(a (b (c)) (d))\n(e (f))\n";
+        const e = balanceError(gpa, ok ++ ")\n", ok) orelse return error.MissedExtraDelimiter;
+        defer gpa.free(e);
+        try std.testing.expect(std.mem.indexOf(u8, e, "unmatched ')'") != null);
+    }
+    // DISARMED rather than misfiring — the gate only ever fires on a balance the file itself demonstrated.
+    const prose = "A note (one) with (two), (three), (four) and a stray ) at the end.\nAnother line.\n";
+    try std.testing.expect(balanceError(gpa, prose ++ "and ((( more\n", prose) == null); // never balanced ⇒ never gated
+    try std.testing.expect(balanceError(gpa, "fn f() {\n", "") == null); // no baseline: nothing to compare
+    const few = "a { x }\nb { y }\n"; // balanced, but too little of it to call a structure
+    try std.testing.expect(balanceError(gpa, "a { x\nb { y }\n", few) == null);
+    try std.testing.expect(delimiterDepth("const c = '{';\nfn f() {}\n", '{', '}').?.depth == 0); // char literal
+    try std.testing.expect(delimiterDepth("// a } in a comment\nfn f() {}\n", '{', '}').?.depth == 0);
+    try std.testing.expect(delimiterDepth("a { background: url(http://x/y); }\n", '{', '}').?.depth == 0);
+    try std.testing.expect(delimiterDepth("/* unterminated\n{\n", '{', '}') == null); // no verdict beats a wrong one
+}
+
+test "chat surface, large file: window-read → copy tag → edit lands surgically (the whole reported failure, end to end)" {
+    // THE REPORTED FAILURE, driven through the real tools on a real file: "when a chat tries to edit a large
+    // file it typically fails … it ends up creating duplicate lines/methods … corrupting the file and having to
+    // rewrite the whole thing". Every assertion here is a step of that spiral, checked at its own link:
+    //   1. a window read of a big file WORKS (it used to dead-end past the whole-read ceiling)
+    //   2. the window carries copyable tags (the chat ctx never set anchored_reads, so it did not)
+    //   3. a tag edit lands surgically — one line changes, the file's line count does not, nothing duplicates
+    //   4. the text anchor the model was forced onto instead is genuinely AMBIGUOUS in a repetitive file
+    // The ctx below is the chat surface's: anchored_reads + the micro-VCS, exactly as engine.zig builds it.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-bigedit-it-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/work", .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 6;
+    var fmtx: std.Io.Mutex = .init;
+    var ctx = ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = root,
+        .workdir = root ++ "/work",
+        .scope = "test",
+        .mind = "chat",
+        .round = 0,
+        .mem = undefined, // file tools only
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = &fmtx,
+        .vcs_enabled = true,
+        .anchored_reads = true,
+    };
+
+    // A file too big to ever see whole, whose lines REPEAT — the shape every real large source has, and the one
+    // text anchors cannot address. `.txt` keeps the syntax gate (and its node spawn) out of this test's way.
+    var src: std.ArrayListUnmanaged(u8) = .empty;
+    var n: usize = 0;
+    while (n < 900) : (n += 1) {
+        try src.print(gpa, "export function step{d}(x) {{\n  const v = x + 1;\n  return v;\n}}\n\n", .{n});
+    }
+    const total_lines = std.mem.count(u8, src.items, "\n");
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/work/big.txt", .data = src.items });
+
+    // 1+2. A WINDOW of it reads, headed and tagged. (A whole-file read of the same path is head-clipped — the
+    // model is told to window, and windowing must therefore work.)
+    const win = readFile(&ctx, "{\"path\":\"big.txt\",\"start_line\":2496,\"end_line\":2500}");
+    try std.testing.expect(std.mem.indexOf(u8, win, "[lines 2496-2500 of ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, win, "\u{2192}") != null);
+    // pull the tag off the line the model would target — exactly what a model copies out of this view
+    const marker = std.mem.indexOf(u8, win, "\u{2192}export function step499(x) {") orelse return error.MarkerMissing;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, win[0..marker], '\n')) |nl| nl + 1 else 0;
+    const tag = win[line_start..marker];
+    try std.testing.expect(hashline.isNumberedAnchor(tag)); // a real copyable anchor, not decoration
+
+    // 3. The edit lands: one line replaced, line count untouched, no second copy of anything.
+    const args = try std.fmt.allocPrint(gpa, "{{\"path\":\"big.txt\",\"ops\":[{{\"op\":\"replace\",\"anchor\":\"{s}\",\"text\":\"export function step499(y) {{\"}}]}}", .{tag});
+    const res = editFile(&ctx, args);
+    if (std.mem.indexOf(u8, res, "edited big.txt") == null) {
+        std.debug.print("\ntag edit on a large file failed: {s}\n", .{res});
+        return error.TagEditRejected;
+    }
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/work/big.txt", gpa, .limited(EDIT_MAX_BYTES));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, after, "export function step499(y) {"));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, after, "export function step499(x) {"));
+    try std.testing.expectEqual(@as(usize, 900), std.mem.count(u8, after, "export function step")); // none lost, none doubled
+    try std.testing.expectEqual(total_lines, std.mem.count(u8, after, "\n")); // surgical: no line added or dropped
+
+    // 4. …and the plain-text anchor the model had to use before is exactly as unusable as it felt: the body
+    // line it would copy appears 900 times, so the edit cannot be addressed at all without tags.
+    const ambiguous = editFile(&ctx, "{\"path\":\"big.txt\",\"ops\":[{\"op\":\"replace\",\"anchor\":\"  const v = x + 1;\",\"text\":\"  const v = x + 2;\"}]}");
+    try std.testing.expect(std.mem.indexOf(u8, ambiguous, "more than one place") != null);
+
+    // The tags must never make it back INTO the file, by either route.
+    const pasted = try std.fmt.allocPrint(gpa, "{{\"path\":\"big.txt\",\"ops\":[{{\"op\":\"replace\",\"anchor\":\"{s}\",\"text\":\"{s}\\u2192export function step499(z) {{\"}}]}}", .{ tag, tag });
+    try std.testing.expect(std.mem.indexOf(u8, editFile(&ctx, pasted), "REJECTED") != null);
+    const echoed = try std.fmt.allocPrint(gpa, "{{\"path\":\"echo.txt\",\"content\":\"1:abc:def\\u2192a();\\n2:bcd:def\\u2192b();\\n3:cde:def\\u2192c();\\n\"}}", .{});
+    try std.testing.expect(std.mem.indexOf(u8, writeFile(&ctx, echoed), "REJECTED") != null);
 }
 
 test "jsCheckError via node --check: broken js rejects with a line verdict; ESM-in-.js and valid .cjs pass (skips without node)" {

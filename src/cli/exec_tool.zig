@@ -42,6 +42,12 @@ pub fn runTool(ctx: *cli.Ctx, workdir: []const u8, name: []const u8, args_json: 
         .internet = true,
         .fmtx = &fmtx,
         .vcs_enabled = false,
+        // The DELEGATED half of the chat file surface (the desk runs read_file/edit_file here, on the user's
+        // own machine) — so it must hand back the same `42:abc:def` anchors the server-side turn does, or a
+        // delegated read silently reverts the model to verbatim-snippet anchors and large-file edits start
+        // failing again on exactly the surface the desk uses most. Roamed (absolute-path) reads stay plain:
+        // edit_file cannot touch anything outside the workdir anyway.
+        .anchored_reads = true,
         // CLIENT privilege: this executor runs on the user's own machine at the user's own request — read-only
         // tools may take absolute/~ paths, and stage_file may copy outside files into the workdir. Swarm minds
         // never get this (their ToolCtx builders don't set it).
