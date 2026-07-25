@@ -945,3 +945,239 @@ pub fn swarmDelete(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     app.sup.remove(sw.id);
     try res.json(.{ .ok = true, .deleted = true }, .{});
 }
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). This module creates swarms and serves their work
+// trees, so three things matter before any of its behaviour does: nobody anonymous gets in, nobody
+// reads another account's swarm, and no path escapes the swarm's own work directory.
+// ---------------------------------------------------------------------------
+
+const Handler = *const fn (*App, *httpz.Request, *httpz.Response) anyerror!void;
+
+const DEPLOY_ROUTES = [_]struct { name: []const u8, f: Handler }{
+    // HTTP handlers only. `deploySwarm`/`castSwarm` are the inner functions these handlers call
+    // once the caller is already authenticated (they take a User and return a DeployOutcome), so
+    // the router never reaches them — and the guard below skips them by signature for the same
+    // reason, which is why it filters on `*httpz.Request` rather than on `pub fn`.
+    .{ .name = "deploy", .f = deploy },
+    .{ .name = "run", .f = run },
+    .{ .name = "cast", .f = cast },
+    .{ .name = "resolve", .f = resolve },
+    .{ .name = "listSwarms", .f = listSwarms },
+    .{ .name = "swarmFile", .f = swarmFile },
+    .{ .name = "swarmFilePut", .f = swarmFilePut },
+    .{ .name = "swarmFiles", .f = swarmFiles },
+    .{ .name = "swarmBundle", .f = swarmBundle },
+    .{ .name = "swarmArchive", .f = swarmArchive },
+    .{ .name = "swarmSite", .f = swarmSite },
+    .{ .name = "swarmDeployCf", .f = swarmDeployCf },
+    .{ .name = "adminBilling", .f = adminBilling },
+    .{ .name = "swarmDelete", .f = swarmDelete },
+};
+
+test "exhaustiveness: every pub route in this file is covered by the auth sweep" {
+    const SRC = @embedFile("service.zig");
+    var it = std.mem.splitScalar(u8, SRC, '\n');
+    var found: usize = 0;
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "pub fn ")) continue;
+        const open = std.mem.indexOfScalar(u8, line, '(') orelse continue;
+        const name = line["pub fn ".len..open];
+        // handler signature only — this file also exports helpers the router never sees
+        if (std.mem.indexOf(u8, line, "*httpz.Request") == null) continue;
+        found += 1;
+        var listed = false;
+        for (DEPLOY_ROUTES) |r| {
+            if (std.mem.eql(u8, r.name, name)) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) {
+            std.debug.print("\nroute '{s}' is not in DEPLOY_ROUTES — add it to the auth sweep\n", .{name});
+            return error.UnsweptRoute;
+        }
+    }
+    try std.testing.expectEqual(DEPLOY_ROUTES.len, found);
+}
+
+test "no route serves an anonymous caller" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-deploy-gate-tmp");
+    defer ta.deinit();
+
+    for (DEPLOY_ROUTES) |r| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.param("id", "whatever");
+        try r.f(&ta.app, web.req, web.res);
+        web.expectStatus(401) catch |e| {
+            std.debug.print("\n{s} answered a stranger with {d}\n", .{ r.name, web.res.status });
+            return e;
+        };
+    }
+}
+
+test "another account's swarm is neither readable, writable, nor deletable" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-deploy-tenant-tmp");
+    defer ta.deinit();
+    defer tail_fanout.dropTestSwarms(ta.app.sup, gpa);
+
+    ta.auth.register("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("two@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok_one = ta.auth.login("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok_one);
+    const tok_two = ta.auth.login("two@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok_two);
+    const cookie_two = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok_two});
+    defer gpa.free(cookie_two);
+    const uid_one = (ta.auth.whoami(tok_one) orelse return error.TestUnexpectedResult).id;
+
+    const run_dir = "zig-deploy-tenant-tmp/run-one";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir ++ "/work", .default_dir) catch {};
+    const SECRET = "the other account's deliverable";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/work/notes.md", .data = SECRET });
+    try tail_fanout.addTestSwarm(ta.app.sup, gpa, "sw-one", uid_one, run_dir);
+
+    // Every per-swarm route, as the WRONG logged-in account.
+    const PER_SWARM = [_]struct { name: []const u8, f: Handler }{
+        .{ .name = "swarmFile", .f = swarmFile },
+        .{ .name = "swarmFilePut", .f = swarmFilePut },
+        .{ .name = "swarmFiles", .f = swarmFiles },
+        .{ .name = "swarmBundle", .f = swarmBundle },
+        .{ .name = "swarmArchive", .f = swarmArchive },
+        .{ .name = "swarmDeployCf", .f = swarmDeployCf },
+        .{ .name = "swarmDelete", .f = swarmDelete },
+    };
+    for (PER_SWARM) |r| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_two);
+        web.param("id", "sw-one");
+        web.query("path", "notes.md");
+        try r.f(&ta.app, web.req, web.res);
+        web.expectStatus(401) catch |e| {
+            std.debug.print("\n{s} served another account's swarm with {d}\n", .{ r.name, web.res.status });
+            return e;
+        };
+        // and no part of the deliverable rode along in the body
+        try std.testing.expect(std.mem.indexOf(u8, web.res.body, SECRET) == null);
+    }
+    // the swarm survived every one of those attempts
+    try std.testing.expect(ta.app.sup.get("sw-one") != null);
+}
+
+test "a swarm file path cannot climb out of that swarm's work directory" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-deploy-path-tmp");
+    defer ta.deinit();
+    defer tail_fanout.dropTestSwarms(ta.app.sup, gpa);
+
+    ta.auth.register("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok = ta.auth.login("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    const uid = (ta.auth.whoami(tok) orelse return error.TestUnexpectedResult).id;
+
+    const run_dir = "zig-deploy-path-tmp/run";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir ++ "/work", .default_dir) catch {};
+    // A file OUTSIDE the work tree, i.e. what a traversal would be reaching for.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/secrets.txt", .data = "not yours" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/work/ok.txt", .data = "fine" });
+    try tail_fanout.addTestSwarm(ta.app.sup, gpa, "sw", uid, run_dir);
+
+    const BAD = [_][]const u8{
+        "../secrets.txt",
+        "../../etc/passwd",
+        "work/../../secrets.txt",
+        "/etc/passwd",
+        "\\windows\\win.ini",
+        "",
+    };
+    for (BAD) |p| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "sw");
+        web.query("path", p);
+        try swarmFile(&ta.app, web.req, web.res);
+        web.expectStatus(400) catch |e| {
+            std.debug.print("\npath '{s}' was not refused: {d}\n", .{ p, web.res.status });
+            return e;
+        };
+        try std.testing.expect(std.mem.indexOf(u8, web.res.body, "not yours") == null);
+    }
+    // the honest case still works, so the guard is not just refusing everything
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "sw");
+        web.query("path", "ok.txt");
+        try swarmFile(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expectEqualStrings("fine", web.res.body);
+    }
+}
+
+test "admin billing: only an admin, and a plan name it does not recognise is refused" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-deploy-billing-tmp");
+    defer ta.deinit();
+
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const admin_tok = ta.auth.login("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(admin_tok);
+    const user_tok = ta.auth.login("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(user_tok);
+    const admin_cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{admin_tok});
+    defer gpa.free(admin_cookie);
+    const user_cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{user_tok});
+    defer gpa.free(user_cookie);
+
+    // an ordinary account cannot change anyone's plan
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", user_cookie);
+        web.json(.{ .email = "normal@example.test", .plan = "max" });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+    try std.testing.expectEqual(ent.Plan.free, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+
+    // a mistyped plan is refused rather than silently applied as free (ledger 0021)
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .plan = "Premium" });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // the real thing still works, case-insensitively
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", admin_cookie);
+        web.json(.{ .email = "normal@example.test", .plan = "PRO" });
+        try adminBilling(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    try std.testing.expectEqual(ent.Plan.pro, (ta.auth.whoami(user_tok) orelse return error.TestUnexpectedResult).plan);
+}
