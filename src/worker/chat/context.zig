@@ -173,6 +173,66 @@ fn lastLtBefore(s: []const u8, pos: usize) usize {
     return if (std.mem.lastIndexOfScalar(u8, s[0..pos], '<')) |lt| lt else pos;
 }
 
+/// Is `inner` (the text between `<` and `>`) a BARE provider sentinel tag — the control token spelled as
+/// markup, carrying no verb or attributes? Accepts every decoration variant seen in the wild: `DSML`,
+/// `/DSML`, `|DSML|`, `｜｜DSML｜｜` (fullwidth bar U+FF5C, the raw special-token spelling), with or without
+/// spaces. REJECTS anything carrying real content — `｜｜DSML｜｜invoke name="read_file"` has `=` and quotes,
+/// so it stays a tool-call for recoverMarkupCalls to parse; only the empty wrapper is a wrapper.
+fn isSentinelTag(inner: []const u8) bool {
+    var letters: [8]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) {
+        const c = inner[i];
+        if (c == '/' or c == '|' or c == ' ' or c == '\t') {
+            i += 1;
+            continue;
+        }
+        if (c == 0xEF and i + 2 < inner.len and inner[i + 1] == 0xBD and inner[i + 2] == 0x9C) {
+            i += 3; // U+FF5C fullwidth vertical bar
+            continue;
+        }
+        if (std.ascii.isAlphanumeric(c) or c == '_') {
+            if (n >= letters.len) return false; // longer than any sentinel name — a real tag
+            letters[n] = std.ascii.toLower(c);
+            n += 1;
+            i += 1;
+            continue;
+        }
+        return false; // punctuation/attributes ⇒ a real tag, not a bare sentinel
+    }
+    return std.mem.eql(u8, letters[0..n], "dsml");
+}
+
+/// Strip BARE provider control-token wrappers from a finished reply: some models wrap their whole answer in
+/// their own sentinel (`<DSML>…</DSML>`, `<｜DSML｜>…</｜DSML｜>`), which leaks to the user as literal tag
+/// text. These tokens are never part of a real answer, so any bare sentinel tag is removed wherever it sits
+/// and the result is trimmed. Returns null when there is nothing to strip (the caller keeps its original —
+/// no allocation on the common path). Tool-call markup is deliberately untouched: it carries a verb, fails
+/// isSentinelTag, and belongs to recoverMarkupCalls / contentBeforeMarkup instead.
+pub fn stripSentinelTags(gpa: std.mem.Allocator, s: []const u8) ?[]u8 {
+    if (std.ascii.indexOfIgnoreCase(s, "dsml") == null) return null; // fast path: nothing to do
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    var i: usize = 0;
+    var dropped = false;
+    while (i < s.len) {
+        if (s[i] == '<') {
+            if (std.mem.indexOfScalarPos(u8, s, i, '>')) |close| {
+                if (close - i <= 48 and isSentinelTag(s[i + 1 .. close])) {
+                    i = close + 1;
+                    dropped = true;
+                    continue;
+                }
+            }
+        }
+        out.append(gpa, s[i]) catch return null;
+        i += 1;
+    }
+    if (!dropped) return null;
+    return gpa.dupe(u8, std.mem.trim(u8, out.items, " \r\n\t")) catch null;
+}
+
 /// The portion of `s` BEFORE any tool-call markup block (trimmed) — used to strip leaked markup from a reply
 /// shown to the user when it couldn't be recovered into an actual call. Returns `s` (trimmed) when there's none.
 pub fn contentBeforeMarkup(s: []const u8) []const u8 {
@@ -639,6 +699,30 @@ test "recoverMarkupCalls: null when there is no markup; a non-numeric raw value 
     try std.testing.expectEqualStrings("{\"query\":\"three.js sprites\"}", rec.calls[0].args);
     try std.testing.expect(looksLikeToolMarkup(content));
     try std.testing.expect(!looksLikeToolMarkup("a clean answer"));
+}
+
+test "stripSentinelTags: unwraps a reply wrapped in its own control token, in every decoration variant" {
+    const gpa = std.testing.allocator;
+    // the reported shape: the whole answer wrapped in bare <DSML>…</DSML>
+    const plain = stripSentinelTags(gpa, "<DSML>Here is the summary you asked for.</DSML>").?;
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("Here is the summary you asked for.", plain);
+
+    // fullwidth-bar spelling (U+FF5C), the raw special-token form, with newlines around the body
+    const bars = stripSentinelTags(gpa, "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}>\nthe answer\n</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}>").?;
+    defer gpa.free(bars);
+    try std.testing.expectEqualStrings("the answer", bars);
+
+    // ASCII-pipe spelling, and a stray opener with no closer still goes
+    const pipes = stripSentinelTags(gpa, "<|DSML|>real text").?;
+    defer gpa.free(pipes);
+    try std.testing.expectEqualStrings("real text", pipes);
+
+    // NO-OP on clean prose (and no allocation): null means "keep what you had"
+    try std.testing.expect(stripSentinelTags(gpa, "A perfectly normal answer with <html> in it.") == null);
+
+    // TOOL-CALL markup is NOT a bare wrapper — it carries a verb, so it survives for recoverMarkupCalls
+    try std.testing.expect(stripSentinelTags(gpa, "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}invoke name=\"read_file\">") == null);
 }
 
 test "recoverMarkupCalls: parses the hermes <tool_call>/<function=…> dialect seen live from DeepSeek" {

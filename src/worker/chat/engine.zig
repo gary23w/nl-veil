@@ -1511,9 +1511,13 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             .stopped => {
                 // stop landed mid tool-loop — commit the last narration (if any) so the user keeps it, then close.
                 planStepInterrupted(app, conv_dir, plan, task_idx);
-                if (inner.content.len > 0) {
-                    appendMsg(app, conv_dir, "assistant", inner.content, "veil", nowSecs(app.io));
-                    emitAssistant(app, conv_dir, inner.content);
+                // same control-token unwrap the settled path does — a stopped partial is still shown to the user
+                const partial = cctx.stripSentinelTags(gpa, inner.content);
+                defer if (partial) |p| gpa.free(p);
+                const shown = partial orelse inner.content;
+                if (shown.len > 0) {
+                    appendMsg(app, conv_dir, "assistant", shown, "veil", nowSecs(app.io));
+                    emitAssistant(app, conv_dir, shown);
                 }
                 gpa.free(inner.content);
                 finishTurn(app, conv_dir, usage_t0);
@@ -1524,6 +1528,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Commit the settled answer as the assistant turn (durable + narrated) and thread it into the LLM context.
         var answer = inner.content;
+
+        // Strip a leaked CONTROL-TOKEN WRAPPER first: some models wrap the whole reply in their own sentinel
+        // (`<DSML>…</DSML>`), which reaches the user as literal tag text. Bare wrappers only — tool-call markup
+        // carries a verb and falls through to the recovery strip below.
+        if (cctx.stripSentinelTags(gpa, answer)) |clean| {
+            gpa.free(answer);
+            answer = clean;
+        }
 
         // Strip any leaked tool-call markup the recovery couldn't parse into a call, so the user never sees raw
         // `<｜｜DSML｜｜invoke …>` in the reply.
