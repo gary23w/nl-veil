@@ -1720,3 +1720,36 @@ edit, confirm it applied, then run.
   MODULE COUNT (H4: "4 src + 2 desk") made it invisible — six modules sounds small, but one of them
   is 7.9k lines. Count what the number is standing in for, not the number.
 - next: H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0070 — 2026-07-25 — the at-rest key that fails to save and says nothing
+- did: every real bug this sitting shared ONE shape — silent failure (an escaper that dropped
+  messages, `Mem.observe` returning 0, a test that skipped, `stored 0 fact(s)` at exit 0). So I
+  measured for it directly: writes whose failure is swallowed. 1,274 `catch {}` sites tree-wide, 72
+  of them on `writeFile`. Most are legitimately best-effort (swarm journals, draw calls, cleanup).
+  Two were not, and they behave very differently.
+- `obs/audit_log.zig`'s append swallows its write, but that DEGRADES SAFELY: a missing entry breaks
+  the hash chain, so `verify()` reports it. The failure announces itself later. Left alone.
+- `config/key_vault.zig`'s `deriveServerKey` does not. It generates the at-rest key, fails to
+  persist it silently, and returns it anyway — so this boot seals every stored provider key with a
+  key that was never written down, the next boot generates a different one, and nothing sealed today
+  can ever be opened again. No error, anywhere, at any point. The damage accrues for the life of the
+  process and only surfaces after a restart, far from the cause.
+- did: the swallow STAYS (the server must boot), but it now logs — with the consequence and the two
+  fixes (data-dir permissions, or set NL_SECRET so the key is derived rather than stored). `warn`
+  not `err` on this repo's own precedent: `seedDefaultAdmin` logs the default-password condition at
+  warn — serious, security-relevant, operator-fixable, process continues. Same shape. It also keeps
+  the case testable, since Zig's runner fails any test that logs an err, so `err` could only be
+  asserted by never exercising it — the wrong trade for a diagnostic whose whole job is to fire.
+- did: pinned the combination the existing tests cannot reach. The invariant test covers a WRITABLE
+  data dir; the NL_SECRET test covers an unwritable one but with a secret set, where the file is
+  irrelevant. Untested until now: no secret AND unwritable — the only path that loses data. The test
+  asserts the key is still usable (the server boots), that two calls DIFFER (which IS the loss), that
+  sealing round-trips within one boot, and that the next boot's key cannot open it.
+- verified: src suite exit 0. Counterfactual with the injection printed: making the unpersisted key
+  stable fails BOTH the new test and the pre-existing invariant test. Full oracle green.
+- learned: the sweep was aimed at a SHAPE rather than a place — "where does a failure go unreported"
+  — and that is what found a site no coverage or scan signal pointed at. Also worth separating: the
+  code was not wrong, it was UNOBSERVABLE. Those need different fixes, and conflating them produces
+  either a bogus bug report or a missing diagnostic.
+- ratchet: none new; the log line and the test are the mechanism.
+- next: H13 watch; H10, H14b, H26, H28 owner's.
