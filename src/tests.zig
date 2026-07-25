@@ -52,6 +52,7 @@ test {
     _ = @import("worker/mcp/client.zig"); // JSON-RPC demux: right id only, errors/close -> null
     _ = @import("worker/mcp/discovery.zig");
     _ = @import("worker/metrics.zig");
+    _ = @import("worker/neuron/client.zig"); // the datastore bridge: upsert semantics + who errors vs stays silent
     _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
     _ = @import("plug/lua.zig"); // embedded Lua sandbox: whitelist, budgets, json bridge
     _ = @import("plug/theme.zig"); // shared theme workspace: parse/seed/scan/json
