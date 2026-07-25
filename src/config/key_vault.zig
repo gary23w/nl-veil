@@ -1193,3 +1193,39 @@ test "deriveServerKey: an UNPERSISTABLE key is not stable across boots — the c
     try std.testing.expectEqualStrings("provider-key-material", back);
     try std.testing.expect(open(gpa, k2, blob) == null); // ...and NOT with the next boot's key
 }
+
+test "scopeKey can never collapse to the empty string — the three properties that keep it apart" {
+    // scopeKey ends in `catch ""`, and an empty scope key would be a CROSS-TENANT COLLISION: two
+    // users' vault records landing in the same neuron-db scope, each able to overwrite and read the
+    // other's provider key. It is unreachable today, but only because three separate facts line up,
+    // none of which mentions the others:
+    //   1. the buffer is a typed *[80]u8, so every call site passes exactly 80 bytes;
+    //   2. validProvider caps the provider at 32 chars;
+    //   3. both write paths (put, putOAuth) validate BEFORE calling scopeKey.
+    // Raise the cap to 64 and leave the buffer at 80 and the collision becomes reachable, with
+    // nothing failing. This test is the line between those three.
+    var sb: [80]u8 = undefined;
+
+    // The worst case that can actually reach scopeKey: the largest u64 uid and a max-length
+    // provider. "kv_" + 20 digits + "_" + 32 = 56 bytes, so there is real headroom in the 80.
+    const max_provider = "abcdefghijklmnopqrstuvwxyz012345"; // 32
+    try std.testing.expectEqual(@as(usize, 32), max_provider.len);
+    try std.testing.expect(KeyVault.validProvider(max_provider));
+
+    const worst = KeyVault.scopeKey(std.math.maxInt(u64), max_provider, &sb);
+    try std.testing.expect(worst.len > 0); // never the "" that would collide
+    try std.testing.expect(worst.len <= sb.len);
+    try std.testing.expect(std.mem.startsWith(u8, worst, "kv_"));
+    try std.testing.expect(std.mem.endsWith(u8, worst, max_provider));
+
+    // One char past the cap is REFUSED rather than silently truncated into a shared prefix.
+    try std.testing.expect(!KeyVault.validProvider(max_provider ++ "x"));
+    try std.testing.expect(!KeyVault.validProvider(""));
+
+    // And distinct (uid, provider) pairs stay distinct — including the uid-prefix trap the live
+    // vault test covers from the other side (1 vs 11 share a prefix up to the separator).
+    var b1: [80]u8 = undefined;
+    var b2: [80]u8 = undefined;
+    try std.testing.expect(!std.mem.eql(u8, KeyVault.scopeKey(1, "openai", &b1), KeyVault.scopeKey(11, "openai", &b2)));
+    try std.testing.expect(!std.mem.eql(u8, KeyVault.scopeKey(7, "openai", &b1), KeyVault.scopeKey(7, "openaix", &b2)));
+}

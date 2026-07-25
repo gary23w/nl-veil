@@ -1753,3 +1753,32 @@ edit, confirm it applied, then run.
   either a bogus bug report or a missing diagnostic.
 - ratchet: none new; the log line and the test are the mechanism.
 - next: H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0071 — 2026-07-25 — a clean audit, and the coupling it left unguarded
+- did: kept measuring SHAPES rather than places. This one: `bufPrint(...) catch "<constant>"`, which
+  degrades a too-small buffer into a FIXED STRING instead of an error. 93 sites. Harmless in status
+  text ("subtask", "waiting on the hive"), but dangerous anywhere the result is an IDENTIFIER —
+  two distinct things collapsing to one constant is a collision, not a cosmetic bug.
+- audited the identifier-shaped ones and they are CLEAN. `plan/neurons.zig`'s `n_{d}` cannot overflow
+  a [24]u8. `key_vault.zig`'s `scopeKey` ends in `catch ""`, and an empty scope key WOULD be a
+  cross-tenant collision — two users' vault records in one neuron-db scope, each able to read and
+  overwrite the other's provider key — but it is unreachable, because three separate facts line up:
+  the buffer is a typed `*[80]u8` (compile-time, every call site), `validProvider` caps the provider
+  at 32, and BOTH write paths (`put`, `putOAuth`) validate before calling it. Longest possible key:
+  3 + 20 + 1 + 32 = 56 of 80.
+- did: pinned the COUPLING, which is the part nothing guarded. There was already a test on the
+  32-char cap — in isolation. Nothing said why 32 matters, so raising it to 64 while leaving the
+  buffer at 80 would make the collision reachable with the existing test still passing on its own
+  terms. The new test states the relationship: the worst case that can reach `scopeKey` (max u64 uid
+  + max-length provider) still fits with headroom and never returns "".
+- verified: src suite exit 0; counterfactual with the injection printed (cap 32 → 64) fails BOTH the
+  new test and the pre-existing cap test. Full oracle green.
+- learned: the useful output was not a bug, it was a MISSING EDGE. Two facts were each guarded and
+  the line between them was not, which is the same shape as every twin-drift defect in this ledger —
+  only here the two things that must agree are a constant and a buffer size in different functions.
+  Worth asking of any invariant that rests on several facts: is each one pinned, or is their
+  RELATIONSHIP pinned? Only the second survives someone editing one of them for a good reason.
+- ratchet: the coupling test.
+- next: audit yield is falling — four sweeps this stretch (result enums, fixed-size memcpy, security
+  claim strings, constant-degrading bufPrint) found no bugs; the fifth (swallowed writes, 0070)
+  found a diagnostic gap. The tree is in genuinely good shape. H13 watch; H10, H14b, H26, H28 owner's.
