@@ -1689,3 +1689,34 @@ edit, confirm it applied, then run.
   test copies the structure (assert the allowed case first; prove the target is reachable-in-
   principle; assert the secret never appears rather than only that an error came back).
 - next: nothing worker-actionable outstanding. H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0069 — 2026-07-25 — the biggest untested file in the tree, and the rounding bug inside it
+- did: measured coverage against SIZE rather than trusting the frontier list, and one file dwarfed
+  everything: `desk/src/main.zig`, 7,930 lines and ZERO tests (next worst: run.zig 10.5k/64,
+  chat.zig 14.2k/116). It sits under H4's "UI-bound" label, and most of it genuinely is — but 7.9k
+  lines is a lot to write off wholesale, and the small pure helpers UNDER the drawing need no
+  window. It now has the first tests in its history, and main.zig is registered in desk/tests.zig.
+- FOUND: `fmtSize` computed its tenths digit as `(sz % MiB) / (105 * 1024)`. A tenth of a MiB is
+  104,857.6; the divisor used is 107,520 — 2.5% high, so the fraction always read LOW. 1.5 MiB
+  rendered as "1.4M", and 54 of the tenth-steps under 10 MiB were off by one. Cosmetic, but wrong
+  everywhere it showed. `fmtCount` right beside it uses exact powers of ten.
+- the fix is the interesting part: the OBVIOUS repair, `/ (1024 * 1024 / 10)`, is wrong the other
+  way — integer division gives 104,857, so a remainder of 1,048,575 yields 10 and prints "1.10M".
+  `rem * 10 / MiB` is exact and cannot leave [0,9] because rem is always < MiB. The test walks
+  1→4 MiB on a 9,973-byte stride asserting the fraction stays ONE digit, which is what would have
+  caught the naive repair.
+- also pinned: `fmtCount`'s thresholds and its "?" degradation on a too-small buffer; `wrap`'s
+  forward/backward cycling at both edges; and `fmtConvWhen`, clock-anchored through its `now_s`/`tz`
+  parameters — including the zero-padded UNSIGNED clock, which the code comments record as having
+  once rendered "+8:+0", and that a tz offset moves which local day a timestamp lands on.
+- noted, NOT changed: `wrap(cur, delta, n)` evaluates `n - 1` when the index goes negative, so
+  `n == 0` underflows. Its only call site passes a comptime 3-element array, so it is unreachable —
+  recorded in the test as a note for whoever gives it a runtime-sized list, rather than adding a
+  guard to a path that cannot happen (0067's line: hardening is fine, inventing a bug is not).
+- verified: desk suite exit 0; counterfactual with the injection printed — restoring `105 * 1024`
+  fails `main.test.fmtSize`, which also proves main.zig is genuinely COLLECTED and not silently
+  skipped (0053). Full oracle green.
+- learned: "UI-bound" hid the largest untested surface in the repo, and a coverage row organised by
+  MODULE COUNT (H4: "4 src + 2 desk") made it invisible — six modules sounds small, but one of them
+  is 7.9k lines. Count what the number is standing in for, not the number.
+- next: H13 watch; H10, H14b, H26, H28 owner's.
