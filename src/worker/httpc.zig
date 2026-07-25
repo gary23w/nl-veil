@@ -21,6 +21,7 @@
 //! surfaces as `.timed_out` instead of a frozen thread.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const Resp = struct {
@@ -135,7 +136,20 @@ fn roundTrip(io: Io, gpa: std.mem.Allocator, host: []const u8, port: u16, req_by
     // No connect timeout option: this Zig's Windows backend panics on one (netConnectIpWindows TODO),
     // and loopback connects resolve immediately either way — the Select sleeper bounds the rest.
     var stream = Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |e| {
-        return if (e == error.ConnectionRefused) .refused else .failed;
+        // WINDOWS: a refused connection arrives as STATUS_CONNECTION_REFUSED (0xc0000236), which this
+        // Zig's netConnectIpWindows does not translate — it surfaces as error.Unexpected, not
+        // error.ConnectionRefused. Reading that as `.failed` is not cosmetic: cli.zig maps `.refused`
+        // to "auto-start the daemon and retry once" and `.failed` to a hard ServerError, so the
+        // documented cold-start (`veil cast` on a machine with no server running) reported an error
+        // instead of bringing the server up. A connect that fails for ANY unexpected reason means
+        // "nothing usable at that address", and fail-fast-then-autostart is the right reading of it.
+        //
+        // This does NOT quiet the `NTSTATUS=0xc0000236` stack dumps in the test logs: std prints
+        // those inside unexpectedStatus, at the point of failure, before this catch is reached.
+        // Only std or a translated status upstream can stop them.
+        if (e == error.ConnectionRefused) return .refused;
+        if (builtin.os.tag == .windows and e == error.Unexpected) return .refused;
+        return .failed;
     };
     defer stream.close(io);
 
@@ -375,4 +389,29 @@ test "buildRequest carries auth and body in-process (framing exact)" {
     defer std.testing.allocator.free(req);
     try std.testing.expectEqualStrings("POST /api/v1/cast HTTP/1.1\r\nHost: 127.0.0.1:8787\r\nConnection: close\r\nAccept: application/json\r\n" ++
         "Authorization: Bearer sekrit\r\nContent-Type: application/json\r\nContent-Length: 12\r\n\r\n{\"goal\":\"x\"}", req);
+}
+
+test "a dead port answers .refused, which is what makes the CLI start the daemon" {
+    // NOT cosmetic triage: cli.zig maps `.refused` to "auto-start the server and retry once" and
+    // `.failed` to a hard ServerError. Get this wrong and `veil cast` from a cold machine reports a
+    // server error instead of bringing the server up — the exact behaviour cli.zig's header promises.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 1 on loopback: privileged, and nothing in this project or on a normal system listens
+    // there. desk/src/chat.zig's auto-title test already leans on exactly this, for this reason.
+    const r = request(io, gpa, .{ .method = "GET", .port = 1, .path = "/api/v1/health", .timeout_s = 3 });
+    switch (r) {
+        .refused => {},
+        .ok => |resp| {
+            gpa.free(resp.body);
+            return error.SomethingIsListeningOnTheDeadPort;
+        },
+        else => |other| {
+            std.debug.print("\ndead port answered .{t} — the CLI will NOT auto-start the daemon\n", .{other});
+            return error.DeadPortNotReportedAsRefused;
+        },
+    }
 }

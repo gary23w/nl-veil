@@ -18,7 +18,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
 | H12 | low | Marker debt: 23 TODO/FIXME/HACK/XXX across src + desk/src. |
-| H27 | low | On Windows `Io.net.IpAddress.connect` reports a refused connection as `error.Unexpected` (NTSTATUS 0xc0000236), not `error.ConnectionRefused` — so `httpc.roundTrip` maps it to `.failed` rather than `.refused`. Those two mean different things to netcli's triage: `.refused` is fail-fast, `.failed` is "retry if idempotent". So a dead port on Windows gets retried where it should not, and std prints a Debug stack dump each time (the noise in the desk suite log). Map the NTSTATUS explicitly in httpc's connect arm — BOTH twins. |
 | H13 | low | check.ps1 verdict anomaly, root-cause only: the `Confirm-Gate` guard (0003) makes the verdict immune and self-diagnosing, so this is now a forensic itch — if the magenta `[h13]` trace ever fires, its typed dump IS the repro; record it here. Also remember: background task runners may re-execute an exit-1 script, truncating its output file. |
 
 ## Entries
@@ -1154,6 +1153,38 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   here that version had the same content.
 - ratchet: none — the tree needed no change, which is the point of the entry.
 - next: unchanged. H27 (low); H10, H14b, H26 are the owner's.
+
+## 0052 — 2026-07-25 — H27 was not low: `veil cast` could not cold-start on Windows
+- did: I filed H27 as "a dead port gets retried where it shouldn't, plus stack-dump noise". The retry
+  semantics were the small half. `cli.zig:118` keys its AUTO-START-THE-DAEMON path on `.refused` and
+  returns a hard ServerError on `.failed` — and on Windows a refused connection arrives as
+  `error.Unexpected` (STATUS_CONNECTION_REFUSED 0xc0000236, which this Zig's netConnectIpWindows
+  does not translate), so it became `.failed`. Net effect: on the primary platform, `veil cast` on a
+  machine with no server running answered a server error instead of starting the server — exactly
+  the cold-start behaviour cli.zig's own header advertises. Fixed in httpc's connect arm (a connect
+  failing for ANY unexpected reason means "nothing usable at that address", and fail-fast-then-
+  autostart is the right reading), mirrored into the desk twin, bodies verified identical.
+- verified: test-first, and the failing run is the evidence — before the fix it printed
+  `dead port answered .failed — the CLI will NOT auto-start the daemon`; after, full oracle ALL
+  GREEN, exit 0. The test drives the real `request()` against loopback port 1, so it exercises the
+  actual connect path rather than a mocked error.
+- NOT fixed, and I said otherwise before checking: the `NTSTATUS=0xc0000236` stack dumps are STILL
+  in the suite logs. std prints them inside `unexpectedStatus`, at the point of failure, before this
+  catch is reached — nothing on our side of the error can suppress them. The green run made that
+  plain and the code comment now says so. The semantics are fixed; the noise is std's.
+- learned: THREE lessons, the last two about me. (1) A triage enum is only as good as what the
+  callers DO with it — I nearly wrote this off as cosmetic because I read `.refused` vs `.failed` as
+  a logging distinction without grepping the consumers; one `grep -n refused src/cli.zig` turned a
+  "low" into a broken documented workflow. (2) My own severity label was wrong in the ledger and
+  stayed wrong for two entries. Filing an item is not the same as understanding it, and a stale
+  severity is a lie the next worker will act on. (3) I then over-claimed the FIX — asserting it
+  would also quiet the stack dumps, in a code comment, before looking at the output. The very next
+  green run showed them still there. Two opposite errors about one small bug in one sitting:
+  understating what it broke, then overstating what the fix covered.
+- ratchet: none new — the twin-body scan signal covered the mirroring, and the counterfactual came
+  free because the test was written before the fix.
+- next: H13 (watch); H10, H14b, H26 are the owner's. Coverage frontier: 6 src, 2 desk, all UI or
+  device-bound.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
