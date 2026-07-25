@@ -1293,3 +1293,30 @@ edit, confirm it applied, then run.
   defect has recurred three times, the fix is not a better manual pass; it is a check that runs
   without me. Also: five copies means the recurrence was never really a bug, it was duplication.
 - next: H8 engine hot paths still unpriced. Frontier 5 src + 2 desk. H10, H14b, H26, H28 owner's.
+
+## 0056 — 2026-07-25 — H8: the prompt-prefix cache claim is now asserted, not just documented
+- did: `buildTurnTools` carries an explicit promise in its header — the turn's tools block is
+  "turn-stable and byte-identical across every inference of the turn, so it never re-bills the
+  prompt-prefix cache" — and the same discipline is restated in four more comments around it
+  (lines 280, 300, 974, 982). Nothing tested any of it; `buildTurnTools` had no test at all. That is
+  H8's "faster is an unverifiable claim" in its most expensive form, because a broken prefix has NO
+  local symptom: every response still looks right, the provider just re-bills the entire prefill.
+  Nobody notices by using it.
+- did: pinned three properties, all exactly, none with a stopwatch. (1) No grants ⇒ the static base
+  is returned BY POINTER (`got.ptr == TURN_TOOLS_FULL.ptr`) and `owned` stays null — the zero-
+  allocation common path, where a length or content check would pass just as happily against a
+  fresh copy per turn. (2) `caps` and nothing else chooses the base. (3) With grants the base still
+  LEADS the buffer unchanged, and building twice yields identical bytes — appended schemas extend
+  the prompt, they never rewrite the part already cached.
+- verified: src suite exit 0. Counterfactual: appending `base[1..]` instead of `base` fails the new
+  test at the startsWith assertion, so it runs and it bites. Full oracle green.
+- learned: the codebase was already RIGHT here — five comments describing the discipline, and the
+  code honours it. That is the interesting part. A correct invariant explained five times and
+  checked zero times is still one careless edit from being false, and its failure mode is a bigger
+  invoice rather than a red test. Confidence in a comment is not coverage; the density of the prose
+  was itself the signal that something load-bearing had no gate under it.
+- ratchet: harness/TESTING.md's cost section gained the two exact non-count measures this used —
+  pointer identity for "zero allocation", byte identity for "cache hit" — alongside the spawn
+  counter from 0053.
+- next: H8's remaining engine paths (tool round-trips per turn, context rebuilds) still unpriced.
+  Frontier 5 src + 2 desk, all device/UI-bound. H10, H14b, H26, H28 are the owner's.
