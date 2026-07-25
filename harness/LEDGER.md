@@ -9,6 +9,9 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
+| H21 | med | No HTTP-handler test harness, which is why every increment so far had to extract a pure helper first (evcursor, controlLine, parsePlan, jstrAlloc) to get anything under test. SCOPED: `vendor/httpz/src/testing.zig` already provides what's needed on the request/response side (`testing.init(config)`, `.param()`, `.header()`, `.json()`, `.expectStatus()`, `.getJson()`). The blocker is `App`: handlers need `*Auth` (neuron-db-backed — `warm()` spawns the neuron binary), `*Supervisor`, `*AuditLog`, `*LoginGuard`, `*KeyVault`, `*ServerConfig`, `*recipes.Registry`. Two candidate shapes — a `testApp()` builder that stubs the neuron-backed pieces and skips honestly when the binary is absent, or narrowing handler signatures to the fields they actually use. Would unlock admin_service, auth_api, keys_api, deploy/service, chat/service and fanout at once. |
+| H22 | med | A BYOK key containing INVALID UTF-8 is accepted and sealed (`cleanValue` admits any byte >= 0x20, including raw 0x80-0xFF), but `resolve()` reads the record back through `std.json`, which rejects invalid UTF-8 with SyntaxError — so the key is stored, answered 201, and is then permanently unresolvable, with the miss cached as "no key here". Valid multi-byte UTF-8 round-trips fine (pinned by a test). Either reject at the door or store bytes the reader can recover. |
+| H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
@@ -446,3 +449,30 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   pattern came straight from it).
 - next: fold the key-vault lane; then the frontier is mostly HTTP handlers needing a request
   harness, so the honest next lane may be H10 (SELF) rather than more unit tests.
+
+## 0022 — 2026-07-24 — the vault's at-rest key could be undefined stack memory
+- did: 14 tests on `config/key_vault.zig` (10 pure, 4 against a throwaway neuron-db) — seal/open
+  round-trips for empty/1-byte/3000-byte/full-binary payloads with the blob length leaking nothing
+  but size; a wrong key and all 32 one-bit-off near misses failing closed; a bit flipped at EVERY
+  offset of the blob rejected; a fresh nonce per seal; the blob surviving the store's line-oriented
+  pipe; scopeKey injectivity across uids x providers; validProvider's path-traversal boundary; and
+  cleanValue as the JSON boundary WITH the counterfactual (an unescaped quote parses cleanly as a
+  different record and sets a field the caller never supplied). Live: write-only at rest, per-user
+  isolation, rotation/revocation beating the TTL cache, OAuth bundles.
+  REAL BUG FIXED — `deriveServerKey` gated the on-disk path on
+  `dec.decode(...) != error.InvalidPadding`. `calcSizeForSlice` only measures length and padding,
+  never the alphabet, so a `.server.key` with the right length but one out-of-alphabet character
+  sizes as 32, decode fails with InvalidCharacter, and `!= error.InvalidPadding` read that as
+  SUCCESS — returning `var key: [32]u8 = undefined` that the decoder had never written. The
+  server's AES-256 at-rest key became undefined stack memory: no guaranteed entropy, never
+  persisted, different on the next call, so every secret sealed during that boot was permanently
+  unopenable after a restart. Now gated on the decode succeeding; an undecodable file falls
+  through to regenerate-and-persist. Also added `KeyVault.deinit` per TESTING.md.
+- verified: agent ran green (410 tests standalone); confirmed independently by a full oracle here.
+- learned: `!= error.SomeSpecificError` is a trap wherever a function can fail more than one way —
+  it reads as "success" for every OTHER error. The counterfactual is what proved it: restoring the
+  old spelling made the new test fail with the corrupt file still on disk.
+- ratchet: the agent needed only a three-line pointer to `harness/TESTING.md` and produced the
+  house patterns unprompted (skip-honestly, counterfactual, deinit-not-drain-helper, exhaustive
+  boundaries) — 0019 paying for itself one lane later.
+- next: H22/H23 from this lane; H21 (handler harness) is now scoped; H10 SELF remains the horizon.
