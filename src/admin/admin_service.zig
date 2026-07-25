@@ -303,3 +303,169 @@ pub fn adminAudit(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .TEXT;
     res.body = data;
 }
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). These are the god-mode routes: ban, delete,
+// force-kill, read anyone's activity, rewrite the server's defaults. What matters is not what they
+// DO but who may reach them, so the sweep runs every one as a stranger AND as an ordinary
+// logged-in account, and the guard above it fails the build when a new route skips the sweep.
+// ---------------------------------------------------------------------------
+
+const Handler = *const fn (*App, *httpz.Request, *httpz.Response) anyerror!void;
+
+const ADMIN_ROUTES = [_]struct { name: []const u8, f: Handler }{
+    .{ .name = "adminUsers", .f = adminUsers },
+    .{ .name = "adminRecipes", .f = adminRecipes },
+    .{ .name = "adminSetRecipeGrant", .f = adminSetRecipeGrant },
+    .{ .name = "adminPutKey", .f = adminPutKey },
+    .{ .name = "adminListKeys", .f = adminListKeys },
+    .{ .name = "adminDelKey", .f = adminDelKey },
+    .{ .name = "adminGetConfig", .f = adminGetConfig },
+    .{ .name = "adminSetConfig", .f = adminSetConfig },
+    .{ .name = "adminCreateUser", .f = adminCreateUser },
+    .{ .name = "adminUserActivity", .f = adminUserActivity },
+    .{ .name = "adminModerate", .f = adminModerate },
+    .{ .name = "adminSwarms", .f = adminSwarms },
+    .{ .name = "adminKill", .f = adminKill },
+    .{ .name = "adminAudit", .f = adminAudit },
+};
+
+test "exhaustiveness: every pub admin route in this file is covered by the sweep" {
+    // A source audit, in the spirit of chat/trio_routing_test.zig: a new god-mode handler that
+    // nobody adds to ADMIN_ROUTES fails HERE rather than shipping unswept.
+    const SRC = @embedFile("admin_service.zig");
+    var it = std.mem.splitScalar(u8, SRC, '\n');
+    var found: usize = 0;
+    while (it.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "pub fn admin")) continue;
+        const open = std.mem.indexOfScalar(u8, line, '(') orelse continue;
+        const name = line["pub fn ".len..open];
+        found += 1;
+        var listed = false;
+        for (ADMIN_ROUTES) |r| {
+            if (std.mem.eql(u8, r.name, name)) {
+                listed = true;
+                break;
+            }
+        }
+        if (!listed) {
+            std.debug.print("\nadmin route '{s}' is not in ADMIN_ROUTES — add it to the auth sweep\n", .{name});
+            return error.UnsweptAdminRoute;
+        }
+    }
+    try std.testing.expectEqual(ADMIN_ROUTES.len, found); // nothing listed that no longer exists, either
+}
+
+test "no god-mode route answers a stranger, or an ordinary logged-in user" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-gate-tmp");
+    defer ta.deinit();
+
+    // No store probe needed: Auth keeps users and sessions in memory and fails open on the write,
+    // so this runs on a clean checkout (ledger 0030). uid 1 is admin by default (isAdmin falls back
+    // to id == 1 with no admin_email), so the SECOND account is the ordinary user under test.
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok = ta.auth.login("normal@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    // Asserted, not assumed — if uid 2 were somehow admin, the whole sweep would pass vacuously.
+    const normal = ta.auth.whoami(tok) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!ta.auth.isAdmin(normal));
+
+    for (ADMIN_ROUTES) |r| {
+        {
+            var web = httpz.testing.init(.{});
+            defer web.deinit();
+            try r.f(&ta.app, web.req, web.res);
+            web.expectStatus(401) catch |e| {
+                std.debug.print("\n{s} answered a stranger with {d}\n", .{ r.name, web.res.status });
+                return e;
+            };
+        }
+        {
+            var web = httpz.testing.init(.{});
+            defer web.deinit();
+            web.header("cookie", cookie);
+            try r.f(&ta.app, web.req, web.res);
+            web.expectStatus(401) catch |e| {
+                std.debug.print("\n{s} let a non-admin through with {d}\n", .{ r.name, web.res.status });
+                return e;
+            };
+        }
+    }
+    // And nothing the sweep touched took effect: the ordinary account is still unbanned.
+    const still = ta.auth.whoami(tok) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!still.banned);
+}
+
+test "moderation: a ban bites, an admin cannot ban themselves, and the act lands in the audit chain" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-admin-mod-tmp");
+    defer ta.deinit();
+
+    ta.auth.register("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("victim@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const admin_tok = ta.auth.login("boss@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(admin_tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{admin_tok});
+    defer gpa.free(cookie);
+    try std.testing.expect(ta.auth.isAdmin(ta.auth.whoami(admin_tok).?));
+
+    // Self-moderation is refused, case-insensitively — the anti-lockout rule.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .email = "BOSS@example.test", .action = "ban" });
+        try adminModerate(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // An unknown verb is refused rather than guessed at.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .email = "victim@example.test", .action = "vaporise" });
+        try adminModerate(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // A real ban lands...
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .email = "victim@example.test", .action = "ban" });
+        try adminModerate(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    // ...and bites: a banned account cannot log back in, which is the whole point of a ban.
+    try std.testing.expectError(error.BadCredentials, ta.auth.login("victim@example.test", "correct horse battery"));
+    // Moderating someone who does not exist is a 404, not a silent success.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .email = "ghost@example.test", .action = "ban" });
+        try adminModerate(&ta.app, web.req, web.res);
+        try web.expectStatus(404);
+    }
+    // The trail: attributed to the admin who acted, and the chain still verifies (obs/audit_log.zig
+    // owns the tamper tests; this pins that admin acts REACH it at all).
+    const n = try ta.audit.verify();
+    try std.testing.expect(n >= 1);
+    const log = try std.Io.Dir.cwd().readFileAlloc(io, ta.audit.path, gpa, .limited(1 << 20));
+    defer gpa.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"actor\":\"boss@example.test\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"action\":\"ban\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"target\":\"victim@example.test\"") != null);
+    // A refused act is not an audit event.
+    try std.testing.expect(std.mem.indexOf(u8, log, "vaporise") == null);
+}
