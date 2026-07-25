@@ -267,6 +267,35 @@ if ($Scan) {
         Write-Host "[leaks] no inline allocPrint(gpa)-into-append sites" -ForegroundColor Green
     }
 
+    # 6b) the built-in palettes are mirrored BY HAND into the web stylesheet — plug/theme.zig says so
+    #     ("web/public/styles.css mirrors the same hex set"). Nothing checked it. A slot recoloured in
+    #     one and not the other is the kind of drift nobody reports as a bug; it just looks slightly
+    #     wrong in one client.
+    $themePath = Join-Path $repo "src\plug\theme.zig"
+    $cssPath = Join-Path $repo "web\public\styles.css"
+    if ((Test-Path $themePath) -and (Test-Path $cssPath)) {
+        $css = (Get-Content $cssPath -Raw).ToLower()
+        $themeSrc = Get-Content $themePath -Raw
+        $missing = @()
+        $total = 0
+        foreach ($set in @("dark_colors", "light_colors")) {
+            $m = [regex]::Match($themeSrc, "const\s+$set\s*=\s*\[SLOT_COUNT\]u32\{(.*?)\}", 'Singleline')
+            if (-not $m.Success) { continue }
+            foreach ($hx in [regex]::Matches($m.Groups[1].Value, '0x([0-9a-fA-F]{6})')) {
+                $total++
+                $hex = $hx.Groups[1].Value.ToLower()
+                if ($css -notmatch "#$hex") { $missing += "$set 0x$hex" }
+            }
+        }
+        if ($missing.Count -gt 0) {
+            $signals += $missing.Count
+            Write-Host ("[theme] {0} of {1} palette slots are NOT in web/public/styles.css -- the mirror drifted:" -f $missing.Count, $total) -ForegroundColor Yellow
+            $missing | ForEach-Object { Write-Host "    $_" }
+        } else {
+            Write-Host ("[theme] all {0} palette slots mirrored in web/public/styles.css" -f $total) -ForegroundColor Green
+        }
+    }
+
     # 7) the two oracles must gate on the SAME things. check.ps1 is what a worker runs; check.sh is
     #    what CI runs. A gate added to one and not the other means local green and CI red (or worse,
     #    the reverse) — the drift class this repo keeps finding, and one I nearly caused myself
