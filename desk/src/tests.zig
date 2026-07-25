@@ -16,6 +16,7 @@ test {
     _ = @import("mdutil.zig");
     _ = @import("netcli.zig");
     _ = @import("poller.zig"); // the server-reply parsers: user text can't imitate a field
+    _ = @import("runner.zig"); // vtable dispatch fidelity: every verb reaches its own slot
     _ = @import("neuron.zig");
     _ = @import("scan.zig");
     _ = @import("secrets.zig");
