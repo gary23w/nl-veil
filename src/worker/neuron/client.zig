@@ -49,16 +49,31 @@ pub const Neuron = struct {
         self.gpa.free(out);
     }
 
+    /// Scope names under `prefix`, EXCLUDING neuron-db's per-scope satellites (`<scope>::var`,
+    /// `::instr`, `::stance`, `::affect`, `::persona`).
+    ///
+    /// Those satellites are created by `forget` — and since `put` is forget-then-observe, EVERY
+    /// key-value record here has five of them. They are not records: `export` on one returns
+    /// nothing. Every caller of this function (api_keys.warm, auth_core's user + session warms,
+    /// key_vault.list) then spent one `neuron export` SUBPROCESS on each, so a store holding N
+    /// records was paying 6N spawns to read N values — at every startup, growing with every key
+    /// ever created, revoked ones included. Filtering here rather than at the four call sites
+    /// because this client is the only thing that reads scope listings; the hive's own memory
+    /// surface goes through Mem/oscillation and never touches it.
     pub fn scopes(self: Neuron, prefix: []const u8) ![][]u8 {
         const argv = [_][]const u8{ self.bin, "--db", self.db, "list" };
         const out = try self.exec(&argv);
         defer self.gpa.free(out);
         var list: std.ArrayList([]u8) = .empty;
-        errdefer list.deinit(self.gpa);
+        errdefer {
+            for (list.items) |s| self.gpa.free(s);
+            list.deinit(self.gpa);
+        }
         var it = std.mem.splitScalar(u8, out, '\n');
         while (it.next()) |line| {
             const t = std.mem.trim(u8, line, " \r\t");
             if (t.len == 0 or t[0] == '#') continue;
+            if (std.mem.indexOf(u8, t, "::") != null) continue; // a satellite, not a record
             if (prefix.len == 0 or std.mem.startsWith(u8, t, prefix)) {
                 try list.append(self.gpa, try self.gpa.dupe(u8, t));
             }
@@ -152,4 +167,14 @@ test "live: put is an UPSERT — a second write wins, which the forget-first is 
     }
     try std.testing.expectEqual(@as(usize, 2), found.len);
     for (found) |s| try std.testing.expect(std.mem.startsWith(u8, s, "pfx_a_"));
+
+    // …and EXACTLY two: neuron-db materialises five satellites per scope (::var, ::instr, ::stance,
+    // ::affect, ::persona) the moment `forget` runs, which `put` does on every write. They are not
+    // records — `export` on one returns nothing — but every caller here would spend a subprocess
+    // discovering that, turning N records into 6N spawns at startup. The listing must stay clean.
+    for (found) |s| try std.testing.expect(std.mem.indexOf(u8, s, "::") == null);
+    const raw_list = try nb.exec(&[_][]const u8{ nb.bin, "--db", nb.db, "list" });
+    defer gpa.free(raw_list);
+    try std.testing.expect(std.mem.indexOf(u8, raw_list, "::") != null); // the satellites DO exist…
+    // …so the filter above is doing real work, not asserting a store that never had any.
 }
