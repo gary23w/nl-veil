@@ -5,7 +5,8 @@ const Neuron = @import("../worker/neuron/client.zig").Neuron;
 
 const log = std.log.scoped(.auth);
 
-pub const Plan = @import("../plan/entitlements.zig").Plan;
+const ent = @import("../plan/entitlements.zig");
+pub const Plan = ent.Plan;
 
 pub const User = struct {
     id: u64,
@@ -207,7 +208,10 @@ pub const Auth = struct {
                 .id = v.id,
                 .email = try self.gpa.dupe(u8, v.email),
                 .pwhash = try self.gpa.dupe(u8, v.pwhash),
-                .plan = if (std.mem.eql(u8, v.plan, "max")) .max else if (std.mem.eql(u8, v.plan, "pro")) .pro else .free,
+                // Deliberate fall-back to least privilege: an unreadable plan on a stored row must
+                // not hand out caps. Shares one spelling table with the admin API, which REJECTS
+                // an unknown name rather than coercing it.
+                .plan = ent.parsePlan(v.plan) orelse .free,
                 .created = v.created,
                 .banned = v.banned,
                 // dup out of the parse arena before its deinit; owned like email/pwhash from here on.

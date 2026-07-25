@@ -910,7 +910,10 @@ pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     var plan_set = false;
     var topup_applied = false;
     if (want_plan) {
-        const plan: ent.Plan = if (std.mem.eql(u8, body.plan, "max")) .max else if (std.mem.eql(u8, body.plan, "pro")) .pro else .free;
+        // An unrecognised name is REJECTED, not coerced. This used to fall through to .free while
+        // still answering ok, so `{"plan":"Pro"}` silently downgraded a paying customer and the
+        // admin had no way to tell.
+        const plan = ent.parsePlan(body.plan) orelse return badReq(res, "unknown plan (want free, pro or max)");
         plan_set = app.auth.setPlan(body.email, plan);
     }
     if (want_topup) {

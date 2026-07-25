@@ -2,6 +2,21 @@
 
 pub const Plan = enum { free, pro, max };
 
+/// Parse a plan NAME (surrounding whitespace and letter case forgiven); null when it names no tier.
+///
+/// The spelling table used to be written out at each call site as `if eql("max") .max else if
+/// eql("pro") .pro else .free`, which silently turned every unrecognised string into free — so
+/// `POST /admin/billing {"plan":"Pro"}` answered ok while quietly putting a paying customer on the
+/// free tier. Callers decide what an unknown name means: the admin endpoint rejects it, while
+/// loading a stored user record keeps falling back to `.free` (least privilege on a corrupt row).
+pub fn parsePlan(s: []const u8) ?Plan {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    inline for (@typeInfo(Plan).@"enum".fields) |f| {
+        if (std.ascii.eqlIgnoreCase(t, f.name)) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
 pub const Entitlements = struct {
     max_swarms: usize,
     max_minds: usize,
@@ -34,7 +49,7 @@ pub fn monthlyNeuronGrant(plan: Plan) u64 {
 // to the user as the upgrade pitch. A silent widening here gives a paid feature away; a silent narrowing locks
 // a paying customer out of something they bought. So the rows are pinned literally, not re-derived.
 
-const std = @import("std");
+const std = @import("std"); // used by parsePlan above as well as by the tests below
 
 test "entitlements: each plan buys exactly the caps this file states" {
     // Three plans today, and BOTH switches in this file are exhaustive (no `else` arm) — a fourth variant is a
@@ -93,4 +108,24 @@ test "monthlyNeuronGrant: a strictly increasing per-plan constant that the admin
     // a self-hosted operator sitting on `free` still runs on 500k neurons a period. If that ever needs to
     // change it has to change HERE, not by teaching the ledger about admins.
     try std.testing.expect(entitlements(.free, true).max_swarms > entitlements(.free, false).max_swarms);
+}
+
+test "parsePlan: every tier answers to its own name, and nothing else is quietly a plan" {
+    // Exhaustive over the enum, so a tier added without a spelling fails here instead of becoming
+    // silently unreachable through the admin API.
+    inline for (@typeInfo(Plan).@"enum".fields) |f| {
+        try std.testing.expectEqual(@as(?Plan, @enumFromInt(f.value)), parsePlan(f.name));
+    }
+    // Forgiving about shape…
+    try std.testing.expectEqual(@as(?Plan, .pro), parsePlan("Pro"));
+    try std.testing.expectEqual(@as(?Plan, .pro), parsePlan("PRO"));
+    try std.testing.expectEqual(@as(?Plan, .max), parsePlan("  max\n"));
+    // …and unforgiving about meaning: these used to coerce to .free while reporting success, which
+    // is how an admin could downgrade a paying customer by typo.
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan(""));
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan("   "));
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan("proo"));
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan("pro plan"));
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan("enterprise"));
+    try std.testing.expectEqual(@as(?Plan, null), parsePlan("0"));
 }
