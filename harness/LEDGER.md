@@ -1135,6 +1135,26 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   triages it as retryable `.failed` instead of fail-fast `.refused`, and prints a stack dump each
   time. Owner decisions unchanged (H10, H14b, H26).
 
+## 0051 — 2026-07-25 — a red X that was not ours (and how that was established)
+- did: `pages-build-deployment` failed on 7bdb6cd — 10 minutes stuck in `updating_pages`, then
+  "Timeout reached, aborting!". Diagnosed rather than assumed, in this order: (1) the BUILD phase
+  succeeded — the artifact was created, found and fetched, so only the deploy status-poll stalled;
+  (2) `git diff --name-only 2eb5576..7bdb6cd` touches ONLY `harness/` and `src/` — no `docs/`, no
+  `web/`, so the published bytes were IDENTICAL to a deploy that had succeeded 36 minutes earlier,
+  and content cannot explain a failure when content did not change; (3) `pages-build-deployment` is
+  GitHub's built-in builder, not a workflow in this repo, so the `release.yml` edit could not reach
+  it. Re-ran the same run: SUCCESS, same commit, same bytes.
+- verified: `gh run list` shows pages green on 4131d74, f1cc880, 2eb5576, red only on 7bdb6cd, then
+  green again on the re-run of that same id.
+- learned: worth writing the DIAGNOSTIC ORDER down, because "CI is flaky" is the lazy version of
+  this and is indistinguishable from it until you check. The question that settled it in one command
+  was "did the inputs to this job change at all since it last passed?" — for a deployment, that is
+  the diff of the deployed paths, not the diff of the commit.
+  A failed Pages deploy is also harmless by construction: the previous version keeps serving, and
+  here that version had the same content.
+- ratchet: none — the tree needed no change, which is the point of the entry.
+- next: unchanged. H27 (low); H10, H14b, H26 are the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both
