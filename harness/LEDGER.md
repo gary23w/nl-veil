@@ -605,3 +605,52 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   outcome 0019 was written for.
 - next: desk still has 4 untested modules (main, poller, runner, tray); on the server side H24's
   admin_service, deploy/service, chat/service and fanout remain.
+
+## 0029 — 2026-07-24 — the reachability signal was lying, and had been since 0001
+- did: A correction to 0028, not a new increment. The desk lane's report showed `desk/assets.zig`'s
+  3 tests were NEVER COLLECTED — despite `-Scan` calling desk reachability "clean" and despite
+  `theme.zig` importing assets. Cause: Zig collects tests only from imports it ANALYZES, and lazy
+  analysis means a textual `@import` chain proves nothing; nothing in a test build reaches theme's
+  icon paths, so that import was never analyzed. My scan walked import TEXT and reported a
+  guarantee it could not make — a false green in the tool whose entire job is catching silently
+  unrun tests. Registered assets (plus catalog/log/neuron directly), added a second scan signal for
+  test-bearing files reachable only INDIRECTLY, and exempted named-module roots (modelcfg has its
+  own test artifact; a path import would double-own the file). The new signal immediately found 5
+  more in src — key_vault, deps, browser/launch, browser/util (registered) and modelcfg (exempt).
+- verified: `assets.test.*` now runs as 2-4/194 where it ran zero times before; desk suite 193
+  passed / 1 skipped, exit 0; scan's indirect list empty; full oracle green.
+- learned: (1) I shipped 0028 asserting "reachability clean" on this tool's word — the check ran,
+  was green, and was wrong; a signal that cannot fail is worth less than no signal, because it is
+  believed. (2) I broke my own ASCII-only rule (ledger 0001) writing the new message, and PS 5.1
+  turned an em-dash into nine parse errors.
+- ratchet: `-Scan` now distinguishes "outside the graph" (certainly dead) from "reachable only
+  indirectly" (not guaranteed), and TESTING.md's first rule is now REGISTER DIRECTLY rather than
+  "reachability is transitive" — the advice it gave three lanes of agents was subtly wrong.
+  Also documented raylib's stdout logging, which hangs `zig build test` via the runner's IPC
+  channel unless a decoding test sets `rl.setTraceLogLevel(.none)`.
+- next: unchanged — H24's remaining handlers, the 4 desk modules, H14 and H10 for the owner.
+
+## 0030 — 2026-07-24 — CI caught what a green local oracle could not
+- did: The first CI run of the new `check.sh --full` gate on my own work came back RED, and it was
+  right twice over. (1) The keys_api authenticated round trip failed on CI with 201 vs 400: CI has
+  no neuron binary (bin/ is gitignored), so the vault write could not land — and my skip guard was
+  useless because it inferred "the store works" from register/login SUCCEEDING, which Auth does
+  with no store at all. Replaced with a direct store probe (put -> get -> compare, skip otherwise),
+  the same shape key_vault's own Live harness already used. (2) Attribution mattered here: `gh run
+  list` shows green at 3ae8ca6, 08faf43, ab8b075, 7a2b807, 62c41de, 6f83808 and 3a05256 — all
+  already running check.sh --full, GUI build included — and red only at 821ae15, so BOTH failures
+  arrived with my last push rather than being pre-existing.
+- verified: full oracle green locally (which is exactly the point below); CI is the judge for the
+  Linux-only half.
+- learned: this is the second fail-open bite in four entries (0026 was the same asymmetry seen from
+  the other side), and the deeper lesson is about the ORACLE, not the bug: my local box has
+  bin/neuron.exe, so every store-dependent test ran and passed here while being unrunnable on a
+  clean checkout. A green local oracle proves the code works ON THIS MACHINE; only CI proves it
+  works on a machine that has nothing. Tests that need an external binary must probe for it, or
+  they encode my desk into the gate.
+- ratchet: TESTING.md's Handlers section now says PROBE THE STORE, do not infer it from
+  register/login, with the exact snippet — the third rule in that file bought by a real failure.
+- next: watch the next CI run to discriminate the second failure — a raylib/LLD link error in the
+  GUI build (`libraylib.a` archive members that are system .so files, escalated by Zig's
+  "unexpected LLD stderr"). Not reproducible on Windows; if it recurs it is real and needs a
+  Linux-side fix, if it clears it was runner-environment flake. UNATTRIBUTED until then.

@@ -5,10 +5,13 @@ parentheses. Read this before adding tests; hand it to any agent you ask to writ
 
 ## The shape
 
-- **Register it.** `zig build test` only collects `test` blocks reachable from `src/tests.zig`
-  (and `desk/src/tests.zig`) through `@import` chains. Reachability is transitive — a module
-  imported by a registered module is covered — so check with `scripts\check.ps1 -Scan`, which
-  walks the graph and names any test-bearing file that never runs (0001).
+- **Register it DIRECTLY in `src/tests.zig` or `desk/src/tests.zig`.** Do not rely on being
+  imported by something already registered: Zig collects tests only from imports it *analyzes*, and
+  lazy analysis means a textual import chain proves nothing. `desk/assets.zig` was in the graph via
+  `theme.zig` and its tests never ran once, because no test reaches theme's icon paths — and the
+  scan called it clean (0029). `scripts\check.ps1 -Scan` now reports both files outside the graph
+  (certainly dead) and files reachable only indirectly (not guaranteed); name yours and neither
+  applies. If you want proof, count your test names in the runner output.
 - **Name the property, not the mechanism.** `"sweep retires only records the throttle would never
   act on again"` forces a future tuning change to restate the invariant; `"sweep works"` does not
   (0017).
@@ -52,6 +55,17 @@ spawned binary then comes up with no `TEMP`/`SystemRoot`, its writes fail silent
 If the external dependency is absent, `return error.SkipZigTest` — a skip is honest, a faked pass
 is not.
 
+## raylib in a desk test
+
+raylib logs every decode to **stdout**, which under `zig build test` is the runner's `--listen=-`
+IPC channel — four `INFO: IMAGE: Data loaded successfully…` lines hang the build indefinitely while
+the same binary passes standalone. Silence it around anything that decodes:
+
+```zig
+rl.setTraceLogLevel(.none);
+defer rl.setTraceLogLevel(.info);
+```
+
 ## Time
 
 - **Never sleep** for expiry logic. Move the stored stamps instead.
@@ -89,8 +103,20 @@ var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
 ```
 
 `keys`, `ledger` and `plugs` start null — set them if the handler needs one. An authenticated test
-can `auth.register` then `auth.login` for a session token and pass it as the `nl_sess` cookie; skip
-honestly if either fails, since that means no usable store on this box. (Extraction is still right when the
+can `auth.register` then `auth.login` for a session token and pass it as the `nl_sess` cookie.
+
+**Probe the store; do not infer it from register/login.** Auth fails OPEN, so both succeed off its
+in-memory maps with no neuron binary present — which is CI's normal state, since `bin/` is
+gitignored. A test that treats a successful login as "the store works" will then fail somewhere
+else entirely (a vault write answering 400 where 201 was due). Probe and skip:
+
+```zig
+const probe = "cHJvYmU";
+ta.vault.nb.put("nl_x_probe", probe) catch return error.SkipZigTest;
+const got = (ta.vault.nb.get("nl_x_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+defer gpa.free(got);
+if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+``` (Extraction is still right when the
 LOGIC deserves to be its own tested unit — evcursor, parsePlan — just not as a testing workaround.)
 
 ## Proving a property instead of a spelling

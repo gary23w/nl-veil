@@ -100,6 +100,19 @@ test "the authenticated round trip: store a key, list it as metadata only, delet
     var ta = try http.testApp(gpa, io, "zig-keysapi-auth-tmp");
     defer ta.deinit();
 
+    // The STORE has to work, and register/login cannot tell us that: Auth fails OPEN, so both
+    // succeed off its in-memory maps with no neuron binary present (CI has none — bin/ is
+    // gitignored) and the failure would surface three steps later as an inexplicable 400 from the
+    // vault, which is exactly how this test first went red on CI. Probe it directly and skip
+    // honestly instead.
+    {
+        const probe = "bmxfdmVpbF9rZXlzYXBpX3Byb2Jl";
+        ta.vault.nb.put("nl_keysapi_probe", probe) catch return error.SkipZigTest;
+        const got = (ta.vault.nb.get("nl_keysapi_probe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+        defer gpa.free(got);
+        if (!std.mem.eql(u8, got, probe)) return error.SkipZigTest;
+    }
+
     // A real account and a real session, through the same doors the server uses.
     ta.auth.register("someone@example.test", "correct horse battery") catch |e| switch (e) {
         else => return error.SkipZigTest, // no usable store on this box
