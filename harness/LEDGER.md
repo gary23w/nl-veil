@@ -1655,3 +1655,37 @@ edit, confirm it applied, then run.
   item deleted). Both are legitimate; not every increment leaves a mechanism behind.
 - next: nothing worker-actionable remains. H13 is a watch item. H10, H14b, H26, H28 are decisions
   for the owner, and H4's remainder is documented as deliberately uncovered.
+
+## 0068 — 2026-07-25 — the plugin sandbox's file boundary, tested adversarially
+- did: went looking for a boundary nobody had stress-tested and picked the Lua plugin sandbox — a
+  plugin is untrusted third-party code the user installed, so if it can walk out of its folder it
+  reads the vault db, `.desktop_key`, and everything else under the data dir. The escape classes the
+  author had already thought about were covered (bytecode via `load`, instruction budget, memory
+  cap, stdlib whitelist). The FILE boundary was not.
+- audited first, and `require` is airtight for a reason worth writing down: module names are
+  restricted to `[A-Za-z0-9_.]` — no separators — and then every `.` is rewritten to `/`, so a
+  literal `..` cannot survive into the path even when the name is `..`. Two independent properties,
+  either of which alone would be enough.
+- did: `veil.read_file` (plugins.zig) rejects empty, leading `/` or `\`, a drive letter, and `..`
+  ANYWHERE rather than only as a leading segment. Correct, and untested — the existing test near it
+  exercises the POLICY gate for the name "read_file", not the path guard. Now driven end to end: a
+  real plugin whose Lua handler calls `veil.read_file`, so the test hits the guard exactly as a
+  third-party plugin would, not a predicate lifted out for convenience.
+- the shape that makes it worth something: a CANARY. A real file with known contents sits outside
+  the plugin folder, and every refusal is asserted alongside "the canary never appears in the
+  answer". Without it, `nil` proves only that a path was bad — not that the file was unreachable.
+  And the ALLOWED read is asserted FIRST: a guard that refuses everything is not a guard, it is a
+  broken feature that looks secure, and every refusal below it would be vacuous.
+- verified: src suite exit 0; eight escape shapes refused (`..` leading, doubled, and BURIED behind
+  a real segment; backslash; absolute posix; UNC; drive letter; empty). Counterfactual with the
+  injection printed: deleting the `..` check makes the test report
+  `ACCEPTED an escaping path: '../../escape-target.txt' -> READ:outside-the-sandbox-canary` — an
+  actual demonstrated escape, which is the proof the canary exists to produce. Full oracle green.
+- learned: the audit found no bug, and the test still earned its place. "Already correct" and "will
+  stay correct" are different claims, and for a security boundary the second one needs a mechanism.
+  This is the distinction 0067 got right by declining to invent a bug: report the audit honestly,
+  then decide separately whether the boundary deserves a guard. Here it does.
+- ratchet: the test itself, and the canary pattern written into its comments so the next security
+  test copies the structure (assert the allowed case first; prove the target is reachable-in-
+  principle; assert the secret never appears rather than only that an error came back).
+- next: nothing worker-actionable outstanding. H13 watch; H10, H14b, H26, H28 owner's.
