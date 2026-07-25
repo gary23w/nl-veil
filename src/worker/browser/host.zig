@@ -158,3 +158,82 @@ pub fn forward(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envir
         else => return gpa.dupe(u8, "{\"ok\":false,\"error\":\"local browser host unreachable\"}") catch @constCast(""),
     }
 }
+
+// ---------------------------------------------------------------------------
+// tests — the DISCOVERY FILE is how a tool call finds the machine's browser daemon: it carries the
+// port to dial and the token that authorises the dial. A stale or corrupt one must yield NOTHING,
+// never a half-read port/token, because the caller would send browser traffic somewhere arbitrary.
+// No browser and no daemon needed for any of this. See harness/TESTING.md.
+// ---------------------------------------------------------------------------
+
+test "discovery file: a real round trip, and every malformed shape reads as absent" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-host-disc-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const path = root ++ "/nl-veil-localhost.json";
+
+    // A file nobody wrote is absent, not a crash and not a zero-port "success".
+    try std.testing.expect(readInfo(gpa, io, path) == null);
+
+    // Round trip: what the daemon publishes is exactly what a client reads back.
+    const token = "0123456789abcdef0123456789abcdef"; // 32, the only length readInfo accepts
+    writeDiscovery(gpa, io, path, 45123, token);
+    const got = readInfo(gpa, io, path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 45123), got.port);
+    try std.testing.expectEqualStrings(token, &got.token);
+
+    // port 0 means the broker never bound. Reading it as a live daemon would dial port 0.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"port\":0,\"token\":\"" ++ token ++ "\",\"pid\":1}" });
+    try std.testing.expect(readInfo(gpa, io, path) == null);
+
+    // A SHORT token is the sharp one: info.token is a fixed [32]u8 filled by @memcpy, so the length
+    // check is the only thing standing between a truncated file and a read past the parsed slice.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"port\":45123,\"token\":\"abc\",\"pid\":1}" });
+    try std.testing.expect(readInfo(gpa, io, path) == null);
+    // ...and a LONG one is refused too rather than silently truncated to the first 32 bytes.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"port\":45123,\"token\":\"" ++ token ++ "extra\",\"pid\":1}" });
+    try std.testing.expect(readInfo(gpa, io, path) == null);
+
+    // Not JSON at all (a half-written file, a crashed daemon) reads as absent.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"port\":451" });
+    try std.testing.expect(readInfo(gpa, io, path) == null);
+
+    // Unknown fields are IGNORED on purpose: a newer daemon may publish more, and an older client
+    // must still find it rather than refusing the whole file.
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "{\"port\":45123,\"token\":\"" ++ token ++ "\",\"pid\":1,\"future\":\"x\"}" });
+    try std.testing.expect(readInfo(gpa, io, path) != null);
+}
+
+test "discoveryPath prefers local temp, and falls back rather than failing" {
+    // It must NOT land under the repo/OneDrive (the header's reason: OneDrive locks and delays it).
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+
+    try env.put("TEMP", "C:/localtmp");
+    const p1 = discoveryPath(gpa, &env) orelse return error.TestUnexpectedResult;
+    defer gpa.free(p1);
+    try std.testing.expectEqualStrings("C:/localtmp/nl-veil-localhost.json", p1);
+
+    // TMPDIR is the POSIX spelling and must work when TEMP/TMP are absent.
+    var env2 = std.process.Environ.Map.init(gpa);
+    defer env2.deinit();
+    try env2.put("TMPDIR", "/var/tmp");
+    const p2 = discoveryPath(gpa, &env2) orelse return error.TestUnexpectedResult;
+    defer gpa.free(p2);
+    try std.testing.expectEqualStrings("/var/tmp/nl-veil-localhost.json", p2);
+
+    // No temp var at all: still returns a usable relative path instead of null, so discovery
+    // degrades to the working directory rather than the daemon becoming unfindable.
+    var env3 = std.process.Environ.Map.init(gpa);
+    defer env3.deinit();
+    const p3 = discoveryPath(gpa, &env3) orelse return error.TestUnexpectedResult;
+    defer gpa.free(p3);
+    try std.testing.expectEqualStrings("./nl-veil-localhost.json", p3);
+}
