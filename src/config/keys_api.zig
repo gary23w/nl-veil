@@ -58,7 +58,7 @@ pub fn delKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
 
 test "every vault route is gated: an anonymous caller gets 401 and the vault is never touched" {
     const gpa = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
     defer threaded.deinit();
     const io = threaded.io();
     var ta = try http.testApp(gpa, io, "zig-keysapi-tmp");
@@ -90,4 +90,69 @@ test "every vault route is gated: an anonymous caller gets 401 and the vault is 
     // And nothing reached the store: an anonymous POST must not have written a key for anyone.
     // (uid 0 is what a caller-less request would fall to if the gate were ever bypassed.)
     try std.testing.expect(!ta.vault.has(0, "openai"));
+}
+
+test "the authenticated round trip: store a key, list it as metadata only, delete it" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-keysapi-auth-tmp");
+    defer ta.deinit();
+
+    // A real account and a real session, through the same doors the server uses.
+    ta.auth.register("someone@example.test", "correct horse battery") catch |e| switch (e) {
+        else => return error.SkipZigTest, // no usable store on this box
+    };
+    const token = ta.auth.login("someone@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(token);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+
+    const SECRET = "sk-live-obviously-fake-9999";
+
+    // A bad provider is rejected on ITS message, not the key's — the error mapping is the contract
+    // the UI shows the user.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .provider = "../../etc", .key = SECRET, .base_url = "" });
+        try putKey(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // Stored: 201, and the reply echoes only last4 + fingerprint — never the key.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.json(.{ .provider = "openai", .key = SECRET, .base_url = "" });
+        try putKey(&ta.app, web.req, web.res);
+        try web.expectStatus(201);
+        const body = (try web.getJson()).object;
+        try std.testing.expectEqualStrings("9999", body.get("last4").?.string);
+        try std.testing.expect(body.get("fingerprint").?.string.len == 16);
+        try std.testing.expect(std.mem.indexOf(u8, web.res.body, SECRET) == null);
+    }
+    // The list is metadata: the secret must not appear anywhere in the response body.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        try listKeys(&ta.app, web.req, web.res);
+        const body = web.res.body;
+        try std.testing.expect(std.mem.indexOf(u8, body, "openai") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, "9999") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body, SECRET) == null);
+    }
+    // Deleted, and the vault agrees.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("provider", "openai");
+        try delKey(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+    }
+    try std.testing.expect(!ta.vault.has(1, "openai"));
 }

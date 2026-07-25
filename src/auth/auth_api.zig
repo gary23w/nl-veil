@@ -68,7 +68,10 @@ fn keyNameFromBody(req: *httpz.Request) []const u8 {
     while (i < b.len and (b[i] == ':' or b[i] == ' ' or b[i] == '"')) : (i += 1) {}
     var j = i;
     while (j < b.len and b[j] != '"') : (j += 1) {}
-    return if (j > i and j - i <= 60) b[i..j] else "API key";
+    // `j < b.len` means a CLOSING quote was actually found. Without it an empty name ({"name":""})
+    // skipped both quotes and ran to the end of the body, handing back "}" as the key's name —
+    // and any unterminated name did the same with the rest of the request.
+    return if (j < b.len and j > i and j - i <= 60) b[i..j] else "API key";
 }
 
 pub fn keyCreate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
@@ -102,4 +105,145 @@ pub fn keyRevoke(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const ks = app.keys orelse return http.serverErr(res, "api keys unavailable");
     const ok = ks.revoke(u.id, id);
     try res.json(.{ .ok = ok, .revoked = ok }, .{});
+}
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). This is the front door: who may create an account,
+// how fast someone may guess a password, and what an anonymous caller is told.
+// ---------------------------------------------------------------------------
+
+test "a private instance stays private: registration is refused and no account appears" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-closed-tmp");
+    defer ta.deinit();
+
+    try std.testing.expect(!ta.app.open_registration); // the default this whole test rests on
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    web.json(.{ .email = "stranger@example.test", .password = "correct horse battery" });
+    try register(&ta.app, web.req, web.res);
+    try web.expectStatus(403);
+    // Refused, not merely unreported: nobody can log in as that address afterwards.
+    try std.testing.expectError(error.BadCredentials, ta.auth.login("stranger@example.test", "correct horse battery"));
+}
+
+test "the login throttle answers 429 before it ever looks at the credentials" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-throttle-tmp");
+    defer ta.deinit();
+
+    // Wrong password, over and over, from one address — the shape of a guessing run.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.json(.{ .email = "someone@example.test", .password = "wrong-guess" });
+        try login(&ta.app, web.req, web.res);
+        try web.expectStatus(401); // each attempt is refused on its merits…
+    }
+    // …and then the address itself is refused, which is the property that bounds the guess rate.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.json(.{ .email = "someone@example.test", .password = "wrong-guess" });
+        try login(&ta.app, web.req, web.res);
+        try web.expectStatus(429);
+    }
+    // The lockout is not a password check: a caller sending NO body at all still gets 429, proving
+    // the guard runs before parsing, so a locked-out address cannot even reach auth_core.
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        try login(&ta.app, web.req, web.res);
+        try web.expectStatus(429);
+    }
+}
+
+test "me tells an anonymous caller nothing beyond the public shape" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-me-tmp");
+    defer ta.deinit();
+
+    var web = httpz.testing.init(.{});
+    defer web.deinit();
+    try me(&ta.app, web.req, web.res);
+    const body = (try web.getJson()).object;
+    try std.testing.expect(!body.get("authed").?.bool);
+    // No identity, no plan, no entitlements for a caller who has not identified themselves.
+    try std.testing.expect(body.get("email") == null);
+    try std.testing.expect(body.get("plan") == null);
+    try std.testing.expect(body.get("entitlements") == null);
+    try std.testing.expect(body.get("admin") == null);
+}
+
+test "the API-key routes are gated, and a bogus session is not a session" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-keys-tmp");
+    defer ta.deinit();
+
+    // Anonymous, and with a cookie that names no session — both are 401, and neither reaches the
+    // "api keys unavailable" branch below the gate (app.keys is null here, so a bypass would 500).
+    for ([_]?[]const u8{ null, http.COOKIE ++ "=nope" }) |cookie| {
+        {
+            var web = httpz.testing.init(.{});
+            defer web.deinit();
+            if (cookie) |c| web.header("cookie", c);
+            try keyCreate(&ta.app, web.req, web.res);
+            try web.expectStatus(401);
+        }
+        {
+            var web = httpz.testing.init(.{});
+            defer web.deinit();
+            if (cookie) |c| web.header("cookie", c);
+            try keyList(&ta.app, web.req, web.res);
+            try web.expectStatus(401);
+        }
+        {
+            var web = httpz.testing.init(.{});
+            defer web.deinit();
+            if (cookie) |c| web.header("cookie", c);
+            web.param("id", "deadbeef");
+            try keyRevoke(&ta.app, web.req, web.res);
+            try web.expectStatus(401);
+        }
+    }
+}
+
+test "keyNameFromBody takes a name without trusting it, and falls back rather than failing" {
+    // It hand-scans the raw body instead of parsing, so the cases that matter are the malformed
+    // ones — and the name it returns is interpolated into JSON downstream by api_keys.create,
+    // which sanitises it there (see its own tests).
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-authapi-name-tmp");
+    defer ta.deinit();
+
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "{\"name\":\"laptop\"}", .want = "laptop" },
+        .{ .body = "{\"name\": \"with spaces\"}", .want = "with spaces" },
+        .{ .body = "{}", .want = "API key" }, // absent
+        .{ .body = "not json", .want = "API key" }, // unparseable
+        .{ .body = "{\"name\":\"\"}", .want = "API key" }, // empty name is not a name
+        .{ .body = "{\"name\":\"" ++ "x" ** 61 ++ "\"}", .want = "API key" }, // past the 60-char cap
+    };
+    for (cases) |c| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.body(c.body);
+        try std.testing.expectEqualStrings(c.want, keyNameFromBody(web.req));
+    }
 }
