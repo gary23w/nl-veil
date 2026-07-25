@@ -1035,3 +1035,80 @@ test "plugins: empty/missing dir loads an empty registry with themes" {
     try std.testing.expect(reg.policyGate(t_alloc, 1, false, "", "anything", "{}") == null);
     try std.testing.expect(reg.promptText(t_alloc, 1, false, "") == null);
 }
+
+test "plugins: veil.read_file cannot escape the plugin folder, and the target really is out there" {
+    // The sandbox's FILE boundary, driven through the real wiring: a plugin's own Lua calls
+    // veil.read_file, so this exercises the guard exactly as a third-party plugin would hit it —
+    // not a predicate lifted out for convenience. A plugin is untrusted code the user installed;
+    // if it can walk out of its folder it can read the vault db, .desktop_key, or anything else
+    // under the data dir.
+    var threaded = std.Io.Threaded.init(t_alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A REAL file outside the plugin folder. Every refusal below is only meaningful because this
+    // exists and is readable — otherwise "nil" would prove nothing but a bad path.
+    const SECRET = "outside-the-sandbox-canary";
+    try tmp.dir.writeFile(io, .{ .sub_path = "escape-target.txt", .data = SECRET });
+
+    try writePlugin(io, tmp.dir,
+        "reader",
+        \\veil.plugin{ name = "reader", version = "1.0", description = "reads" }
+        \\veil.tool{
+        \\  name = "get",
+        \\  description = "read a path",
+        \\  params = { p = { type = "string", description = "path", required = true } },
+        \\  handler = function(args)
+        \\    local body, err = veil.read_file(args.p)
+        \\    if body == nil then return "REFUSED:" .. tostring(err) end
+        \\    return "READ:" .. body
+        \\  end,
+        \\}
+    );
+    // ...and a legitimate file INSIDE the folder, so the guard is proven to still allow real reads.
+    var b: [128]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = std.fmt.bufPrint(&b, "plugins/reader/data.txt", .{}) catch unreachable, .data = "inside-ok" });
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &path_buf);
+    const reg = loadAll(t_alloc, io, null, path_buf[0..plen], .{ .skip_mcp_listing = true });
+    defer {
+        reg.deinit();
+        t_alloc.destroy(reg);
+    }
+
+    // The allowed case FIRST: if this fails the refusals below are vacuous (a guard that refuses
+    // everything is not a guard, it is a broken feature that happens to look secure).
+    {
+        const ok = reg.execTool(t_alloc, "plug_reader_get", "{\"p\":\"data.txt\"}");
+        defer t_alloc.free(ok);
+        try std.testing.expectEqualStrings("READ:inside-ok", ok);
+    }
+
+    // Every shape that would leave the folder. `..` is rejected ANYWHERE in the path rather than
+    // only as a leading segment, which is why the buried and doubled forms fail too.
+    const escapes = [_][]const u8{
+        "../escape-target.txt", // one level up: the canary written above
+        "../../escape-target.txt",
+        "sub/../../escape-target.txt", // buried traversal, not leading
+        "..\\escape-target.txt", // windows separator
+        "/etc/passwd", // absolute posix
+        "\\\\server\\share\\x", // UNC
+        "C:/Windows/win.ini", // drive letter
+        "", // empty
+    };
+    for (escapes) |p| {
+        var args: [256]u8 = undefined;
+        const a = try std.fmt.bufPrint(&args, "{{\"p\":\"{s}\"}}", .{p});
+        const r = reg.execTool(t_alloc, "plug_reader_get", a);
+        defer t_alloc.free(r);
+        if (!std.mem.startsWith(u8, r, "REFUSED:")) {
+            std.debug.print("\nveil.read_file ACCEPTED an escaping path: '{s}' -> {s}\n", .{ p, r });
+            return error.SandboxEscape;
+        }
+        // The canary must never appear, by any route, in any answer.
+        try std.testing.expect(std.mem.indexOf(u8, r, SECRET) == null);
+    }
+}
