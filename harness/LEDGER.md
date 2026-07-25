@@ -9,8 +9,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
-| H17 | med | `LoginGuard.by_ip` grows without bound: only `success()` removes an entry, and lock expiry leaves the record behind. A distributed guesser sweeping source addresses grows the map forever with nothing to evict it. Add TTL eviction on the sliding-window boundary. |
-| H18 | med | Latent use-after-free: `ApiKeys.list()` returns `View.id` borrowing the map's own key memory, which `revoke()` frees. Not reachable today (keyList copies into res.arena and is a separate request), but a future in-process list→revoke→read sequence would read freed memory. Return owned ids or document the borrow at the call site. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
@@ -339,3 +337,30 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   between deliberately decoupled copies without linking them.
 - next: H17-H20 (unbounded IP map, latent list/revoke UAF, revoked-key startup cost, lowercase-only
   model matching); H10 SELF lane on the horizon; H14 still the owner's call.
+
+## 0017 — 2026-07-24 — H17 + H18: the login guard stops hoarding, the key list stops lending
+- did: H17 — `LoginGuard.by_ip` only ever shrank via success(), so every address that ever mistyped
+  a password kept a heap key forever (internet background noise alone grows it; a distributed
+  guesser spreading attempts thin enough never to trip a lock grows it faster). Added `sweepLocked`:
+  drops records whose window has passed AND whose lock has expired — provably invisible, since such
+  a record carries no state a verdict could use. Runs on a WINDOW_SECS cadence, plus immediately
+  past 4096 entries, and the size trigger is rate-limited to once a second so a flood holding the
+  map at the threshold with LIVE records can't make every failed login pay an O(n) sweep — the
+  defence becoming its own amplifier. Also promoted the test-only drain helper to a real `deinit`.
+  H18 — `ApiKeys.list()` returned Views whose id, prefix AND name all borrowed map memory that
+  revoke() frees; now duped into the caller's allocator, with the ownership contract documented on
+  the function and a test that reads a view AFTER revoking its key.
+- verified: TWO self-inflicted reds before green, both in the new test, neither in the fix. (1) I
+  stamped records with a synthetic `t = 1_000_000` while `allowed()` reads the REAL clock, so a
+  "still locked" record sat ~1.7 billion seconds in the past — anchored `t` to the real clock with
+  drift-safe margins (lock at t+3600, expiry exactly at t). (2) I asserted 3 survivors when the
+  scenario retires 2 of 4 — a leftover from an earlier draft's shape. Third run ALL GREEN.
+- learned: a test that moves stored timestamps must anchor them to the same clock the code under
+  test reads — synthetic time is only safe for functions that TAKE the time as a parameter
+  (sweepLocked does; allowed() does not). Also: when a test's SHAPE changes (3 addresses + a
+  trigger became 4 addresses + a direct call), re-derive every count in it rather than carrying
+  the old numbers forward — the oracle caught both, which is the system working, not failing.
+- ratchet: the eviction predicate is stated as a property in the test name ("retires only records
+  the throttle would never act on again") rather than as a threshold, so a future tuning change
+  has to restate the invariant instead of silently widening it.
+- next: H19/H20 are low; the honest next lane is either H10 (SELF cast) or more coverage.
