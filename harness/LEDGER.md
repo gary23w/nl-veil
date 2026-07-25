@@ -1808,3 +1808,28 @@ edit, confirm it applied, then run.
 - ratchet: the size-equality test.
 - next: audit yield has fallen to near zero on fresh sweeps; the productive vein is now converting
   the tree's own "must match" notes into checks. H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0073 — 2026-07-25 — "must match EXACTLY" had four copies
+- did: followed 0072's vein — comments that PREDICT a specific failure are tests nobody wrote — and
+  grepped for "must match / must stay / must agree". `run.zig`'s promote gate carried the sharpest:
+  "The condition must match trackConvergence's own `has_score` EXACTLY (status .ok AND total > 0) —
+  it is the only thing that writes best_pct, so gating on a broader condition would compare against
+  a best_pct that never moves and block promotion for the whole run."
+- found: FOUR copies of that predicate in one file — the promote gate (1517), trackConvergence's
+  `has_score` (8801), `fitnessSource` (1838), and a fourth at 1432 carrying an extra clause. The
+  comment asked a human to keep two of them identical and did not know about the other two.
+- did: made it structural instead of asserted. `BenchResult.hasScore()` is now the single predicate
+  and all four sites call it, so there is nothing left to keep in sync — the same move as 0055's one
+  escaper and 0060's one canned server, which is now three times this has been the right answer.
+- verified: src suite exit 0; counterfactual with the injection printed — broadening it to
+  `status == .ok`, the exact drift the comment describes, fails the new test. Full oracle green.
+- learned: the comment was RIGHT, specific, and load-bearing, and it still lost — because a note can
+  only reach whoever reads that function, and the predicate had spread to three others. That is the
+  same lesson as 0063's `Mem.observe` (a fix plus a note beside it, while the sibling kept the bug).
+  Prose scales with readers; structure scales with the codebase. When a comment says two things must
+  agree, the question is not "is it still true" but "can I delete the comment by making it
+  impossible to violate".
+- ratchet: the shared predicate + its test; the "must match" grep is now a named vein in this ledger
+  for the next worker (0072 converted one, this converted another; `run.zig:9829`'s saturating-op
+  pair is the next candidate and is NOT yet done).
+- next: H13 watch; H10, H14b, H26, H28 owner's.

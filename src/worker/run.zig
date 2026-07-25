@@ -1429,7 +1429,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
             // the check runner, then a retrospective writes that false lesson into persistent directives).
             // Signal-level and language-blind: failure-text hash constant (digits stripped, so timings/counts
             // don't defeat equality) × tree hash changing. Purely advisory — scoring is untouched.
-            if (w.last_bench.status == .ok and w.last_bench.total > 0 and w.last_bench.passed < w.last_bench.total) {
+            if (w.last_bench.hasScore() and w.last_bench.passed < w.last_bench.total) {
                 var fpb: std.ArrayListUnmanaged(u8) = .empty;
                 defer fpb.deinit(gpa);
                 for (w.last_bench.failures) |fc| if (!std.ascii.isDigit(fc)) fpb.append(gpa, fc) catch {};
@@ -1514,7 +1514,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         // reflects THIS round. Do not move this gate above that call.
         // This gate only carries real signal because the acceptance-gate fixes stopped an unrunnable VERIFY
         // string from pinning the score at 0% — on a pinned score it would just be a permanent promote block.
-        if (live and !w.discourse and w.last_bench.status == .ok and w.last_bench.total > 0 and w.best_pct <= prev_best_pct) w.promo_streak = 0;
+        if (live and !w.discourse and w.last_bench.hasScore() and w.best_pct <= prev_best_pct) w.promo_streak = 0;
         if (live and !w.discourse) rsi.adaptCapacity(&w, round, results[0..minds.items.len]);
         // ADAPTIVE FENCE flip (single-threaded here): a backend that failed to PARSE large tool calls twice
         // will keep failing on every full-file write_file — switch the whole worker to fenced writes, exactly
@@ -1829,13 +1829,27 @@ pub const BenchResult = struct {
     declared: bool = false, // the score came from the goal's own VERIFY rows — not from an engine guess
     coverage: bool = false, // the score is required-file COVERAGE standing in for an unrunnable benchmark
     failures: []u8 = &.{},
+
+    /// Is there a fitness reading here that can be COMPARED to another round's? `.ok` alone is not
+    /// enough — a run with zero checks reports ok and carries no signal.
+    ///
+    /// This exists as ONE predicate because the promote gate's comment (search "must match
+    /// trackConvergence's own `has_score` EXACTLY") spelled out what happens when the two drift:
+    /// trackConvergence is the only thing that writes `best_pct`, so gating promotion on a BROADER
+    /// condition compares against a best_pct that never moves and blocks promotion for the entire
+    /// run. That comment asked a human to keep two expressions identical, and there were FOUR copies
+    /// of it by the time anyone counted. Now the relationship is structural instead of asserted:
+    /// there is nothing left to keep in sync. (Ledger 0073.)
+    pub fn hasScore(self: BenchResult) bool {
+        return self.status == .ok and self.total > 0;
+    }
 };
 
 pub const FitnessSource = enum { host, doc, @"test", none };
 pub fn fitnessSource(b: BenchResult, operating: bool, doc_target: u32, discourse: bool, goal_doc_only: bool) FitnessSource {
     if (b.host) return .host;
     if (operating) return .host;
-    if (b.status == .ok and b.total > 0) {
+    if (b.hasScore()) {
         return if (discourse or doc_target > 0 or goal_doc_only) .doc else .@"test";
     }
     return .none;
@@ -8798,7 +8812,7 @@ fn goalIsDocOnly(gpa: std.mem.Allocator, goal: []const u8) bool {
 fn trackConvergence(w: *Worker, run_dir: []const u8, goal: []const u8, round: u32) void {
     const gpa = w.gpa;
     var b = w.last_bench;
-    const has_score = b.status == .ok and b.total > 0;
+    const has_score = b.hasScore();
     var phase: []const u8 = "progressing";
     var restored = false;
     var prog_now: u32 = 0;
@@ -10578,4 +10592,19 @@ test "the swarm system prompt keeps its STABLE PREFIX: per-mind data rides the t
     // The marker is genuinely near the END -- a guard against the whole doctrine being restructured
     // so that "stable head" becomes a few bytes and the assertion above passes vacuously.
     try std.testing.expect(m * 2 > fmt.len);
+}
+
+test "BenchResult.hasScore: the one predicate the promote gate and the curve must share" {
+    // `.ok` alone is not a score. A run with zero checks reports ok and carries no comparable
+    // signal, so treating it as one would compare this round against a best_pct nothing ever wrote.
+    try std.testing.expect((BenchResult{ .status = .ok, .total = 5, .passed = 3 }).hasScore());
+    try std.testing.expect((BenchResult{ .status = .ok, .total = 1, .passed = 0 }).hasScore()); // 0% IS a score
+    try std.testing.expect(!(BenchResult{ .status = .ok, .total = 0 }).hasScore()); // ran nothing
+    try std.testing.expect(!(BenchResult{ .status = .no_tests, .total = 5 }).hasScore());
+    try std.testing.expect(!(BenchResult{ .status = .err, .total = 5 }).hasScore());
+    try std.testing.expect(!(BenchResult{}).hasScore()); // the default is .err — no score
+
+    // A HARNESS failure (the check never executed) reports .err by design — see the field's comment —
+    // so it must not read as a score no matter what totals came back with it.
+    try std.testing.expect(!(BenchResult{ .status = .err, .total = 9, .passed = 9, .harness = true }).hasScore());
 }
