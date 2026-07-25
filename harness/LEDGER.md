@@ -1477,3 +1477,35 @@ edit, confirm it applied, then run.
   only the one or two call sites it happened to exercise and would miss precisely the misroute the
   audit is built to catch. It is the right tool, not a placeholder for one. Do not replace it.
   Remaining: H8's other engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
+
+## 0062 — 2026-07-25 — the constitution was telling workers to wave through a hang
+- did: after finding THREE open-item rows wrong about their own subject (H4, H12, H11), I turned the
+  same suspicion on the docs a fresh worker reads FIRST. CLAUDE.md said: "The desk suite's final net
+  test needs a live server on :8787 — until it's hermetic (ledger item H2), the earlier tests are the
+  verdict when only that one hangs." Wrong three ways. H2 was CLOSED in ledger 0006. The test
+  (`desk/src/netcli.zig`) early-returns without `../data/.desktop_key`, so it needs no server. And
+  since the bounded-httpc rework every call carries a hard timeout, so it cannot hang.
+- why it mattered more than an ordinary stale line: it did not merely misinform, it INSTRUCTED —
+  "the earlier tests are the verdict when only that one hangs" trains a worker to accept a hang as
+  expected and move on. A real hang in the desk suite would have been waved through by anyone
+  following the constitution correctly. A wrong fact costs a re-derivation; a wrong instruction
+  costs the thing the instruction was protecting.
+- did: corrected it to state the suite is hermetic and a hang is NOT normal, kept the fact that is
+  still true and useful (when a server happens to be up, that test casts a 1-minute mock swarm at
+  it, so it side-effects a live instance), and filled two Map gaps — `harness/TESTING.md` and
+  `SELF-LANE.md` existed but the Map listed neither, and `scripts/check.sh` (what CI actually runs)
+  was absent beside check.ps1. Added fakehttp.zig so the next worker finds it before writing a third
+  stand-in.
+- did: HORIZON.md's Ring 1 read as entirely future when most of it had landed — `doctor --growth` is
+  live, the scan set has grown to nine signals, hermetic desk tests turned out already true. Marked
+  LIVE / PARTLY honestly, with H8's remaining half stated concretely rather than as an aspiration.
+  A roadmap that lists finished work as pending gets a worker to rebuild it.
+- verified: full oracle green. Every claim re-derived against the tree before writing it, per 0060.
+- learned: staleness concentrates in the documents NOBODY re-reads while working — the ones read
+  once at the start and then trusted. Four of the five wrong things I have found this sitting were
+  in exactly those (three ledger rows, one constitution line); none were in code comments next to
+  code people edit. Prose adjacent to working code gets corrected by whoever touches the code;
+  orientation prose has no such gardener. Re-derive it on a schedule, not on suspicion.
+- ratchet: none new — this WAS the ratchet (the harness's own orientation docs made true).
+- next: H8's remaining engine paths. Frontier 5 src + 2 desk, genuinely device/UI-bound. H10, H14b,
+  H26, H28 are the owner's.

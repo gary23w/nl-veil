@@ -34,9 +34,15 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
   than a spelling. Every rule there was paid for by a real failure.
 - Known local flakes: Windows Defender can break test-runner IPC (the failure names no test, just
   `failed command: ...test.exe --listen=-`); check.ps1 self-heals by rerunning that exact exe
-  standalone. The flake is NONDETERMINISTIC — a rerun may pass the runner directly. The desk
-  suite's final net test needs a live server on :8787 — until it's hermetic (ledger item H2), the
-  earlier tests are the verdict when only that one hangs.
+  standalone. The flake is NONDETERMINISTIC — a rerun may pass the runner directly.
+- The desk suite is HERMETIC — do not accept a hang as normal there. This file used to say its net
+  test "needs a live server on :8787" and that "the earlier tests are the verdict when only that one
+  hangs", citing an open item that ledger 0006 had already CLOSED: `desk/src/netcli.zig` early-
+  returns without `../data/.desktop_key`, and since the bounded-httpc rework every call carries a
+  hard timeout, so the hang premise is gone. Left standing, that caveat trained a worker to wave
+  through a REAL hang as the expected one. What IS true and worth knowing: when a server happens to
+  be up, that test casts a 1-minute mock swarm at it — deliberate (the exact door the chat uses),
+  but it does side-effect a running instance.
 - Oracle honesty caveats: background task runners may silently RE-EXECUTE a script that exits
   nonzero, truncating its output file — a retried run can mask the first verdict, so treat the
   exit code + the check-logs directory as authoritative, not a mid-run read of task output. The
@@ -77,5 +83,10 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
   (own build.zig + tests.zig). `src/plug/` — the Lua plugin/theme extension layer. `docs/` — the
   annotated-source case-file site; `docs/docs-src/` mirrors `src/` one .md per module — feed it
   when you add or rename modules.
-- `harness/` — LEDGER.md (growth journal + open items, the cross-worker memory) and HORIZON.md
-  (the long arc). `scripts/check.ps1` — the oracle.
+- `harness/` — LEDGER.md (growth journal + open items, the cross-worker memory), TESTING.md (the
+  house test rules; read before writing any test), HORIZON.md (the long arc), and SELF-LANE.md (the
+  designed-not-wired self lane and its safety floor — owner's call, H10).
+- `scripts/check.ps1` — the oracle, and `scripts/check.sh` its POSIX twin, which is what CI runs.
+  A gate added to one and not the other means local green and CI red; `-Scan` compares them.
+- `src/worker/fakehttp.zig` — TEST-ONLY canned loopback server (`local_models`, `llm`). Reach for it
+  before writing a third stand-in.
