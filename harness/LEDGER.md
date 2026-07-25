@@ -803,6 +803,48 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   it grows automatically with the table.
 - next: 4 desk modules (main, poller, runner, tray); H14, H26, H10 remain the owner's.
 
+## 0037 — 2026-07-25 — the desk's parsers, and a "limitation" that turned out to be a guarantee
+- did: `desk/src/poller.zig` — the hand-rolled parsers that turn a server reply into what the desk
+  renders, running on the io thread over a mix of server fields and USER-AUTHORED text (task names,
+  prompts), where a field-extraction bug shows up as a misread row rather than a crash. The
+  headline test exercises a claim the code makes about itself: `scan.nextJsonPair`'s comment says a
+  key-shaped needle inside free text can never be misread as a field, so a task prompt containing
+  `\"at\":99`, `\"enabled\":false` and `\"every_min\":1` is parsed and the REAL fields must win
+  while the prompt round-trips intact. Plus: unknown server keys skipped (additive fields stay
+  safe), unparseable/negative numbers falling back to 0 rather than corrupting, an unknown `kind`
+  defaulting to "once", only the literal `true` counting as enabled, and the totals object not
+  inheriting the previous row.
+- verified: one red — MY assertion was wrong, and the truth was better than my claim. I wrote
+  `valueForKey` up as having a KNOWN LIMIT (key-shaped text in an earlier value wins) and asserted
+  the spoof succeeds; it does not. A literal quote inside a JSON string must be escaped, so an
+  imitation reads as `\"account_id\":\"` and cannot match the needle `"account_id":"` — on
+  well-formed input the real field always wins. Rewrote it to assert that, AND to demonstrate the
+  actual boundary: hand-built JSON with an unescaped quote can be fooled, which is why the two call
+  sites stay pointed at Cloudflare's own replies. Second run ALL GREEN.
+- learned: THREE wrong assertions of mine in one increment, and each taught something different.
+  (1) I nearly enshrined a FALSE WEAKNESS: I wrote `valueForKey` up as having a known limit and
+  asserted the spoof succeeds. It does not — a literal quote inside a JSON string must be escaped,
+  so an imitation reads as `\"account_id\":\"` and cannot match. A test documenting a limitation
+  the code does not have is a lie in the other direction; check the claim before writing the caveat.
+  (2) `SchedRow.enabled` DEFAULTS to true and is only read from a real JSON bool, so my
+  `"enabled":"yes"` case left the default standing rather than flipping it — assert against the
+  default, not against intuition.
+  (3) The one that matters: the failing test exposed that my PASSING test was weak. The prompt's
+  imitations sat BEFORE the real fields, so a fooled walker would have been overwritten by the
+  genuine values landing afterwards — it would have passed against broken code. Moving the
+  imitations last inverts that: a misparse now overwrites the real values and every assertion
+  fails. Counterfactual discipline applies to ORDERING, not just to implementation.
+  Also: the PowerShell tool was briefly unavailable mid-increment and `sh scripts/check.sh` carried
+  the verification — the POSIX twin (H6, ledger 0007) earning its keep as a genuine fallback.
+- NEAR-MISS worth more than the increment: I ran that fallback as `sh scripts/check.sh | tail -12`,
+  and the runner duly reported "exit code 0" — which was TAIL's exit code, not the oracle's. The
+  run had actually failed (a shared-cache `unable to read results of configure phase … FileNotFound`
+  flake). I had already written this entry claiming ALL GREEN and was one step from committing it;
+  the monitor, which greps the TEXT for "NOT GREEN" rather than trusting the status, is what caught
+  it. Never pipe the oracle — a pipeline's exit status belongs to its last command, and every
+  "verified" claim in this ledger rests on that status meaning what it says.
+- next: 3 desk modules left (main, runner, tray); H14, H26, H10 remain the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

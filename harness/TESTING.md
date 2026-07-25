@@ -133,6 +133,11 @@ LOGIC deserves to be its own tested unit — evcursor, parsePlan — just not as
 ## Verifying
 
 `scripts\check.ps1` (or `sh scripts/check.sh`) is the definition of done — the same gates CI runs.
+
+**Never pipe it.** `sh scripts/check.sh | tail -12` reports *tail's* exit status, so a failed run
+looks like a pass — this nearly put a false ALL GREEN in the ledger (0037). Run it bare and read
+the exit code, or grep the output for the literal `NOT GREEN`.
+
 Two local quirks worth knowing:
 
 - Windows Defender can kill the build runner's test IPC: the failure names no test, just
