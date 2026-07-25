@@ -10,7 +10,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | id  | pri | item |
 |-----|-----|------|
 | H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
-| H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
@@ -904,6 +903,27 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   for every worker. Friction you have normalised is worth an increment of its own.
 - ratchet: this entry IS the ratchet.
 - next: 2 desk modules (main, tray), 12 src; H14, H26, H10 remain the owner's.
+
+## 0041 — 2026-07-25 — H23 CLOSED, and the same flaw in the fix I wrote for H18
+- did: `KeyVault.list` duped four fields inside a struct literal with `catch continue`, abandoning
+  every earlier dupe of that row on the way out (H23). Fixed by building the row field by field so
+  a partial failure frees what it already took. Then the uncomfortable half: `ApiKeys.list` had the
+  SAME shape — because I put it there in 0026 while fixing the use-after-free, duping three fields
+  with `try` inside a literal, which orphans the first on a second failure AND leaks every row
+  already appended, since the caller receives an error and never sees the slice. Now built with
+  per-field `errdefer` plus a whole-list `errdefer` that unwinds what was built.
+- verified: full oracle ALL GREEN, exit 0, first try.
+- learned: I fixed one bug and introduced a smaller one in the same edit, then filed the identical
+  pattern as an open item against a DIFFERENT function without noticing it described my own code.
+  Writing a ledger item about a pattern is the moment to grep for that pattern everywhere, not just
+  where it was spotted.
+  Severity, stated honestly rather than inflated: both call sites pass `res.arena` in production, so
+  nothing was ever actually lost. The reason to fix it is that both signatures promise any
+  `Allocator`, and the next in-process caller — or any test that frees its own memory — pays for
+  the assumption.
+- ratchet: none new; the lesson is the grep-the-pattern habit, recorded above.
+- next: remaining frontier is UI- and device-shaped (desk main/tray, browser session/cdp/host,
+  ocr/pixelrag, cli/*). H14, H26 and H10 are still the owner's calls.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,

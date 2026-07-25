@@ -124,14 +124,28 @@ pub const ApiKeys = struct {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);
         var out: std.ArrayListUnmanaged(View) = .empty;
+        // On the error path the caller gets an error and never sees the slice, so nothing would
+        // free what was already built — this hands back a clean allocator instead of a pile of
+        // orphaned rows. (Same reasoning as key_vault.list: production passes an arena, but the
+        // signature promises any Allocator.)
+        errdefer {
+            for (out.items) |v| {
+                gpa.free(v.id);
+                gpa.free(v.prefix);
+                gpa.free(v.name);
+            }
+            out.deinit(gpa);
+        }
         var it = self.keys.iterator();
-        while (it.next()) |e| if (e.value_ptr.uid == uid)
-            try out.append(gpa, .{
-                .id = try gpa.dupe(u8, e.key_ptr.*),
-                .prefix = try gpa.dupe(u8, e.value_ptr.prefix),
-                .name = try gpa.dupe(u8, e.value_ptr.name),
-                .created = e.value_ptr.created,
-            });
+        while (it.next()) |e| if (e.value_ptr.uid == uid) {
+            const id = try gpa.dupe(u8, e.key_ptr.*);
+            errdefer gpa.free(id);
+            const pfx = try gpa.dupe(u8, e.value_ptr.prefix);
+            errdefer gpa.free(pfx);
+            const nm = try gpa.dupe(u8, e.value_ptr.name);
+            errdefer gpa.free(nm);
+            try out.append(gpa, .{ .id = id, .prefix = pfx, .name = nm, .created = e.value_ptr.created });
+        };
         return out.toOwnedSlice(gpa);
     }
 
