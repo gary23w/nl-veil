@@ -1353,3 +1353,31 @@ edit, confirm it applied, then run.
   broken working behaviour. Measure first, then decide whether the comment or the code is wrong.
 - ratchet: the CHAT_SCHEMA guard itself, plus both corrected headers.
 - next: H8's remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
+
+## 0058 — 2026-07-25 — isCommand vs dispatch, and a false finding I nearly filed
+- did: `isCommand` carries a hardcoded list of 30 CLI verbs and its header says "Kept in sync with
+  `dispatch` below" — another instruction to a human. main.zig gates on it:
+  `if (cli_sub.len > 0 and cli.isCommand(cli_sub))` dispatches, and ANYTHING else falls through to
+  booting the server. So a verb added to dispatch and forgotten here does not error — `veil <verb>`
+  silently starts the daemon instead of running the command. Now a source audit reads dispatch's
+  chain out of `@embedFile("cli.zig")` and requires every verb to be listed (the
+  trio_routing_test.zig pattern).
+- verified: they AGREE today, 30 for 30 — this guard keeps them agreeing, it did not fix a break.
+  Counterfactual: removing `themes` fails with "'themes' is dispatched but missing from isCommand —
+  `veil themes` would boot the daemon instead". Full oracle green.
+- learned — the actual value of this entry. My FIRST measurement said dispatch handled four verbs
+  (`absorb`, `ingest`, `status`, `sync`) that isCommand was missing, which would have been four
+  working commands unreachable from the command line. I had the ledger entry half-written. It was
+  wrong: my extractor bounded dispatch's body by "the next `pub fn`", and `cmdRag` further down is a
+  PRIVATE `fn` that reuses a local named `sub`, so the scan ran straight past dispatch and picked up
+  `veil rag`'s sub-verbs. Brace-matching the body gives 30/30. The guard now bounds on `\nfn ` OR
+  `\npub fn `, and its comment says why, because the next person will reach for the same shortcut.
+- learned (2): that is the THIRD ad-hoc extractor to mislead me this sitting — a hand grep that
+  missed a fifth JSON escaper (0055), a `| grep | head` that returned silence instead of a verdict
+  (0054), and this. The pattern is not carelessness about the code, it is trusting a throwaway
+  script the way I would trust a test. A one-off extractor is a HYPOTHESIS: before reporting what it
+  found, re-derive the number a second way. Brace-matching disagreed with the regex, and the
+  disagreement was the whole finding.
+- ratchet: the guard itself, plus a vacuity floor (`found >= 25`) so a refactor that changes the
+  dispatch idiom fails loudly instead of silently scanning nothing and passing.
+- next: H8's remaining engine paths. Frontier 5 src + 2 desk. H10, H14b, H26, H28 are the owner's.

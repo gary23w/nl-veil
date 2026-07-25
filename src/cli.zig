@@ -1506,3 +1506,41 @@ test "a tool result carrying a control byte still forms valid JSON" {
     try std.testing.expectEqualStrings(result, parsed.value.object.get("result").?.string);
     try std.testing.expectEqualStrings("call_7", parsed.value.object.get("id").?.string);
 }
+
+test "isCommand lists every verb dispatch handles - or the verb boots the daemon instead" {
+    // main.zig gates on this: `if (cli_sub.len > 0 and cli.isCommand(cli_sub))` dispatches, and ANYTHING
+    // else falls through to booting the server. So a verb added to dispatch and forgotten here does not
+    // error - `veil <verb>` silently starts the daemon instead of running the command. The header says
+    // "Kept in sync with dispatch below", which is an instruction to a human; this reads the dispatch chain
+    // out of the source and checks it (same approach as chat/trio_routing_test.zig and tools.zig's dispatch
+    // audit). They agree today - this keeps them agreeing.
+    const SRC = @embedFile("cli.zig");
+
+    // Bound the scan to dispatch's own body: from `pub fn dispatch` to the next top-level function. Stopping
+    // at the next `pub fn` alone is NOT enough - private `fn cmdRag` further down reuses a local named `sub`,
+    // and a scan that runs into it reports four verbs that are really `veil rag` sub-verbs (ledger 0058).
+    const start = std.mem.indexOf(u8, SRC, "pub fn dispatch").?;
+    const rest = SRC[start + 5 ..];
+    const a = std.mem.indexOf(u8, rest, "\nfn ");
+    const b = std.mem.indexOf(u8, rest, "\npub fn ");
+    const stop = if (a != null and b != null) @min(a.?, b.?) else (a orelse b.?);
+    const body = rest[0..stop];
+
+    const needle = "eql(u8, sub, \"";
+    var i: usize = 0;
+    var found: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, needle)) |at| {
+        const vs = at + needle.len;
+        const ve = vs + (std.mem.indexOfScalar(u8, body[vs..], '"') orelse break);
+        const verb = body[vs..ve];
+        i = ve;
+        found += 1;
+        if (!isCommand(verb)) {
+            std.debug.print("\n'{s}' is dispatched but missing from isCommand - `veil {s}` would boot the daemon instead\n", .{ verb, verb });
+            return error.UnreachableVerb;
+        }
+    }
+    // Not vacuous: if the scan found nothing (dispatch refactored, needle changed), every assertion above
+    // passed without testing anything - which is how this guard would rot silently.
+    try std.testing.expect(found >= 25);
+}
