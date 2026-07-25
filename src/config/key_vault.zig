@@ -374,13 +374,35 @@ pub const KeyVault = struct {
             std.crypto.hash.sha2.Sha256.hash(k, &dig, .{});
             const fp = std.fmt.bytesToHex(dig[0..8], .lower);
             const last4 = if (k.len >= 4) k[k.len - 4 ..] else k;
-            try out.append(alloc, .{
-                .provider = alloc.dupe(u8, sc[prefix.len..]) catch continue,
-                .last4 = alloc.dupe(u8, last4) catch continue,
-                .fingerprint = alloc.dupe(u8, fp[0..]) catch continue,
-                .base_url = alloc.dupe(u8, parsed.value.base_url) catch "",
+            // Built field by field so a partial failure frees what it already took. The old form
+            // duped all four inside the struct literal with `catch continue`, which abandoned every
+            // earlier dupe of that row on the way out. Production passes res.arena, so nothing was
+            // ever actually lost — but the signature takes any Allocator, and a caller that frees
+            // its own memory (a test, or any future in-process use) would have paid for it.
+            const provider = alloc.dupe(u8, sc[prefix.len..]) catch continue;
+            const l4 = alloc.dupe(u8, last4) catch {
+                alloc.free(provider);
+                continue;
+            };
+            const fpz = alloc.dupe(u8, fp[0..]) catch {
+                alloc.free(provider);
+                alloc.free(l4);
+                continue;
+            };
+            const burl = alloc.dupe(u8, parsed.value.base_url) catch "";
+            out.append(alloc, .{
+                .provider = provider,
+                .last4 = l4,
+                .fingerprint = fpz,
+                .base_url = burl,
                 .created = parsed.value.created,
-            });
+            }) catch {
+                alloc.free(provider);
+                alloc.free(l4);
+                alloc.free(fpz);
+                if (burl.len > 0) alloc.free(burl);
+                continue;
+            };
         }
         return out.toOwnedSlice(alloc);
     }
