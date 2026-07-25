@@ -3,12 +3,19 @@
 //! on this list never run.
 
 test {
+    // Registered EXPLICITLY even though theme.zig imports it: Zig collects tests only from imports it
+    // ANALYZES, and nothing in a test build reaches theme's icon paths, so that import never pulls
+    // assets in. Its tests were silently not running. Textual reachability is not collection.
+    _ = @import("assets.zig");
+    _ = @import("catalog.zig");
     _ = @import("chat.zig");
     _ = @import("gitvc.zig");
     _ = @import("httpc.zig");
     _ = @import("llm.zig");
+    _ = @import("log.zig");
     _ = @import("mdutil.zig");
     _ = @import("netcli.zig");
+    _ = @import("neuron.zig");
     _ = @import("scan.zig");
     _ = @import("secrets.zig");
     _ = @import("store.zig");

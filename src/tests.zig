@@ -9,6 +9,9 @@ test {
     _ = @import("auth/login_guard.zig"); // per-IP fail window, lockout expiry, per-address isolation
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
+    _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
+    // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
+    // the same way (ledger 0029).
     _ = @import("config/keys_api.zig"); // every vault route is gated (handler tests via http.testApp)
     _ = @import("config/server_config.zig");
     _ = @import("config/lan.zig");
@@ -31,7 +34,10 @@ test {
     _ = @import("worker/control/supervisor.zig");
     _ = @import("worker/control/writer.zig"); // control-bus wire shape; escaping blocks op smuggling
     _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)
+    _ = @import("worker/browser/launch.zig"); // direct, per ledger 0029
+    _ = @import("worker/browser/util.zig");
     _ = @import("worker/crawl.zig");
+    _ = @import("worker/deps.zig");
     _ = @import("worker/evcursor.zig"); // events.jsonl poll cursor: probe sentinel, page cap, catch-up walk
     _ = @import("worker/httpc.zig");
     _ = @import("worker/hyperspace.zig");

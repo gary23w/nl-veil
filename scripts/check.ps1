@@ -97,9 +97,12 @@ if ($Scan) {
         $hot | ForEach-Object { Write-Host "    $_" }
     }
 
-    # 1) test reachability: `zig build test` only collects test blocks from files REACHABLE from the
-    #    test root (tests.zig) through @import chains, plus named modules that get their own test
-    #    artifact in build.zig. A test-bearing file outside that graph is a suite that never runs.
+    # 1) test registration. Zig collects test blocks only from imports it ANALYZES, and lazy
+    #    analysis means a textual @import chain is NOT proof of collection: desk/assets.zig sat in
+    #    the graph via theme.zig for months with its tests never running, because no test reaches
+    #    theme's icon paths. So this reports two things — files outside the import graph entirely
+    #    (certainly dead), and test-bearing files not named DIRECTLY in tests.zig (only probably
+    #    live). Direct registration is the only guarantee.
     foreach ($pkg in @(
         @{ root = (Join-Path $repo "src");      tests = (Join-Path $repo "src\tests.zig");      build = (Join-Path $repo "build.zig");      label = "src" },
         @{ root = (Join-Path $repo "desk\src"); tests = (Join-Path $repo "desk\src\tests.zig"); build = (Join-Path $repo "desk\build.zig"); label = "desk" }
@@ -122,6 +125,10 @@ if ($Scan) {
                 }
             }
         }
+        # Named-module roots are exempt below: build.zig gives them their OWN test artifact, and a
+        # path import in tests.zig would double-own the file ("file exists in modules 'root' and X").
+        $modRoots = @{}
+        foreach ($q in $queue.ToArray()) { if ($q -ne $pkg.tests) { $modRoots[([IO.Path]::GetFullPath($q)).ToLower()] = $true } }
         $reach = @{}
         while ($queue.Count -gt 0) {
             $f = [IO.Path]::GetFullPath($queue.Dequeue())
@@ -150,6 +157,21 @@ if ($Scan) {
             $orphans | ForEach-Object { Write-Host "    $_" }
         } else {
             Write-Host ("[{0}] test reachability: clean (every test-bearing file is in the test graph)" -f $pkg.label) -ForegroundColor Green
+        }
+        # Indirect = in the graph but not named in tests.zig. Lazy analysis can drop these silently,
+        # which is exactly how desk/assets.zig's tests went unrun; name them and the doubt is gone.
+        $indirect = @()
+        Get-ChildItem $pkg.root -Recurse -Filter *.zig | ForEach-Object {
+            $rel = $_.FullName.Substring($pkg.root.Length + 1)
+            if ($rel -eq "tests.zig" -or $rel -like "*_test.zig") { return }
+            if (-not (Select-String -Path $_.FullName -Pattern '^\s*test[\s"{]' -Quiet)) { return }
+            if ($orphans -contains $rel) { return }
+            if ($modRoots.ContainsKey($_.FullName.ToLower())) { return } # its own test artifact
+            if (-not (Select-String -Path $pkg.tests -SimpleMatch ('"' + ($rel -replace '\\', '/') + '"') -Quiet)) { $indirect += $rel }
+        }
+        if ($indirect.Count -gt 0) {
+            Write-Host ("[{0}] {1} test-bearing file(s) reach the root only INDIRECTLY -- collection is not guaranteed; register them:" -f $pkg.label, $indirect.Count) -ForegroundColor Yellow
+            $indirect | ForEach-Object { Write-Host "    $_" }
         }
         Write-Host ("[{0}] {1} module(s) carry no test blocks at all (coverage frontier)" -f $pkg.label, $untested)
     }
