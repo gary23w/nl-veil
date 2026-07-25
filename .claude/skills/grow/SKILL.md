@@ -27,8 +27,9 @@ Run the loop:
 
 4. **CHANGE** — Smallest diff that moves it. Obey the hard rules in CLAUDE.md: register new test
    files in `src/tests.zig` / `desk/src/tests.zig`, mirror the httpc twins, re-read files right
-   before editing, feed `docs/docs-src/` when modules appear or move. Big sweeps may fan out to
-   subagents; the increment and the ledger entry stay singular.
+   before editing, feed `docs/docs-src/` when modules appear or move. Writing tests? `harness/
+   TESTING.md` is the house pattern — read it, and paste it into any agent you delegate tests to.
+   Big sweeps may fan out to subagents; the increment and the ledger entry stay singular.
 
 5. **VERIFY** — `scripts\check.ps1` green, plus increment-specific proof (run the new test alone,
    probe the API, exercise the binary). No green, no done. If a gate fails for a pre-existing

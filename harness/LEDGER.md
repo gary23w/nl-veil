@@ -384,3 +384,22 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   instead of one particular spelling of the escape.
 - next: coverage frontier continues (deploy/service's unknown-plan coercion, chat/tools); H10 SELF
   lane remains the horizon; H14 is the owner's call.
+
+## 0019 — 2026-07-24 — the test lore stops living in my head
+- did: Wrote `harness/TESTING.md` — the house test patterns, every rule tagged with the ledger
+  entry that paid for it: register/reachability, testing.allocator (a leak is a bug; 13 real ones
+  found), never an arena to make a leak pass, the temp-dir pattern, `.environ = .{ .block =
+  .global }` for subprocess tests, skip honestly when a dependency is absent, never sleep for
+  expiry (and anchor synthetic stamps to the clock the code actually reads), prove escaping by
+  round-tripping through a real parser, check the counterfactual, and the test-block-local
+  `@import` for deliberately duplicated code. Linked from CLAUDE.md and the /grow skill's CHANGE
+  step, with the instruction to paste it into any agent delegated test work.
+- verified: docs + instructions only, no compiled code touched — `check.ps1 -Scan` clean, 0
+  actionable signals (last full oracle green at 0018, tree unchanged since apart from markdown).
+- learned: I hand-wrote these same patterns into three agent prompts this session, and the two
+  reds in 0017 were both violations of rules I already knew. Lore that lives only in the driver's
+  head gets re-derived (or re-broken) by every worker who follows. Coverage frontier is down from
+  31 untested src modules to 21 across this session.
+- ratchet: this entry IS the ratchet — the harness now teaches its own test conventions instead of
+  depending on whoever is driving.
+- next: coverage frontier (deploy/service, chat/tools); H10 SELF lane; H14 the owner's call.

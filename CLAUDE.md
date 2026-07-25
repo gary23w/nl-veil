@@ -27,7 +27,11 @@ follow the growth loop in `.claude/skills/grow/SKILL.md` (`/grow`).
   `models.yaml` requires regenerating the mirror: `python scripts/gen-models-json.py`.
 - Tests are OPT-IN: Zig only collects `test` blocks from files reachable from `src/tests.zig`
   (and `desk/src/tests.zig`) through @import chains. A new module's tests silently do not run until
-  something in that graph references it — register new test-bearing files in tests.zig.
+  something in that graph references it — register new test-bearing files in tests.zig (`-Scan`
+  names any that fell outside it). **Read `harness/TESTING.md` before writing tests**, and paste it
+  into any agent you delegate tests to: allocator rules (a leak is a bug — 13 real ones found so
+  far), the temp-dir and subprocess patterns, clock anchoring, and how to prove a property rather
+  than a spelling. Every rule there was paid for by a real failure.
 - Known local flakes: Windows Defender can break test-runner IPC (the failure names no test, just
   `failed command: ...test.exe --listen=-`); check.ps1 self-heals by rerunning that exact exe
   standalone. The flake is NONDETERMINISTIC — a rerun may pass the runner directly. The desk
