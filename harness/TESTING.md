@@ -55,6 +55,34 @@ spawned binary then comes up with no `TEMP`/`SystemRoot`, its writes fail silent
 If the external dependency is absent, `return error.SkipZigTest` — a skip is honest, a faked pass
 is not.
 
+**But a skip is not a neutral outcome — it is a test reporting that it did not run.** Read the
+SKIP lines; a permanent skip is a test you are no longer paying for. `client.zig`'s live UPSERT
+test skipped on every machine for eight ledger entries (0053) behind a comment confidently
+explaining it as "no binary on this box", which was false — the probe VALUE was one neuron-db
+silently discards. A wrong explanation for a skip is worse than none, because it stops the looking.
+
+Two consequences worth copying:
+
+- **Share the probe, don't re-hand-roll it.** Four tests wrote their own probe value; one drew a bad
+  one. `probeStore()` is now a single real write→read round trip, so "binary absent" and "store
+  cannot persist" are told apart and both skip only after proof.
+- **Match the shape production uses.** neuron-db atomises input into facts and stores NOTHING for
+  input it cannot atomise, while `observe` still exits 0 — so `put` reports success and `get` reads
+  null. Real callers store base64 of a JSON record, which always atomises. A test using `"first"`
+  or `"v"` is asserting against a store that quietly kept nothing.
+
+## Cost: count it, never time it
+
+A wall-clock budget on a dev box measures Defender, OneDrive and whatever else is running. It
+flakes, it gets muted, and the muting becomes the habit — worse than no gate at all. Assert a
+**count** instead: process spawns, allocations, round trips. Those are deterministic, identical on
+every machine, and can be pinned EXACTLY rather than with a slack factor that hides drift.
+
+`Neuron.exec` carries a `builtin.is_test`-gated `spawn_probe` counter for exactly this, and
+`client.zig` asserts that reading N records costs N+1 spawns. Put the counter at the one choke
+point every call already passes through; if there isn't one, that is worth knowing before you
+optimise anything.
+
 ## raylib in a desk test
 
 raylib logs every decode to **stdout**, which under `zig build test` is the runner's `--listen=-`
