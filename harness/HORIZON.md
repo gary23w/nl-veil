@@ -26,6 +26,9 @@ those inward and outward:
 
 ## Ring 2 — self-hosting: the app is its own deliverable
 
+> Designed in detail in `harness/SELF-LANE.md` (ledger 0049), including the safety floor and a
+> dry-run path. Not wired: enabling it is the owner's decision, not a worker's.
+
 The engine already has everything a self-directed builder needs — goal-declared acceptance rows
 (`VERIFY:` / `SMOKE:` / `PROBE:` in run.zig), a governor that accepts or rolls back proposals,
 playbooks, and cross-run lineage. It just never points them at this repo. Ring 2 closes the loop:

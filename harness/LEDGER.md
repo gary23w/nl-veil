@@ -15,9 +15,10 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
-| H10 | horizon | SELF lane: let `veil cast` target this repo with acceptance rows that run the real oracle, under a standing `lineage: nl-veil-self` id; retrospectives append here (Ring 2). |
+| H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
 | H12 | low | Marker debt: 23 TODO/FIXME/HACK/XXX across src + desk/src. |
+| H27 | low | On Windows `Io.net.IpAddress.connect` reports a refused connection as `error.Unexpected` (NTSTATUS 0xc0000236), not `error.ConnectionRefused` — so `httpc.roundTrip` maps it to `.failed` rather than `.refused`. Those two mean different things to netcli's triage: `.refused` is fail-fast, `.failed` is "retry if idempotent". So a dead port on Windows gets retried where it should not, and std prints a Debug stack dump each time (the noise in the desk suite log). Map the NTSTATUS explicitly in httpc's connect arm — BOTH twins. |
 | H13 | low | check.ps1 verdict anomaly, root-cause only: the `Confirm-Gate` guard (0003) makes the verdict immune and self-diagnosing, so this is now a forensic itch — if the magenta `[h13]` trace ever fires, its typed dump IS the repro; record it here. Also remember: background task runners may re-execute an exit-1 script, truncating its output file. |
 
 ## Entries
@@ -1071,6 +1072,68 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new.
 - next: H26 and H14b need the OWNER; H13 is a watch item, not work; H10 is the horizon and I am not
   building self-modification of this repo without an explicit go-ahead.
+
+## 0049 — 2026-07-25 — H10 designed, deliberately not switched on
+- did: Wrote `harness/SELF-LANE.md` — the full Ring 2 design (what it is, why it is worth doing, why
+  it is dangerous, and the safety floor), plus a pointer from HORIZON.md. NOTHING is wired.
+  The floor, all-or-nothing: a SELF cast may not touch the oracle scripts, CI, either tests.zig, or
+  harness/ (a path deny-list in the writer, not an instruction — an agent that can edit its own
+  acceptance criteria has none); work lands on a branch and stops, never main; the acceptance rows
+  run the REAL oracle and a red result DISCARDS the increment rather than retrying against a
+  weakened test; one increment per cast; the ledger stays append-only for the swarm exactly as it
+  is for everyone else; and a `--plan-only` dry-run comes first, exercised on ten real increments
+  and judged by a human, before anything can write.
+- verified: n/a — a design document changes no behaviour. The oracle ran green over the increment
+  it shares a commit with.
+- learned: the honest part of this design is its last section. The mechanism is easy; the judgement
+  is not. Everything genuinely valuable in this ledger came from noticing that two things which
+  should agree had stopped agreeing — which took reading comments, measuring the RIGHT operation
+  (0042), and being willing to conclude "clean, nothing to fix" (0048). A metric-chasing loop does
+  exactly those three things worst. A SELF lane would produce volume; whether it produces THIS is
+  untested, and the dry-run is how you would find out before it costs anything.
+- ratchet: the deny-list principle is the transferable bit — the boundary is enforced by the writer,
+  not by asking an agent nicely to stay out of its own gates.
+- next: owner decisions only (H10 enable, H14b posture, H26 capability); coverage frontier is
+  device-shaped.
+
+## 0050 — 2026-07-25 — the device-shaped frontier turns out to be mostly testable after all
+- did: Two parallel lanes on modules I had written off as needing a device. 38 tests, one real bug.
+  * `browser/cdp.zig` (13) — the claim "needs a live browser" was wrong: `matchReply`, `readMessage`,
+    `sendText`, `sendPong` and `nextBytes` touch only gpa/prng/msg and the two stream INTERFACES, so
+    a Cdp over `Io.Reader.fixed`/`Io.Writer.fixed` drives the real demultiplexer and real RFC-6455
+    framing with no socket. Pins: a reply is matched by id and NEVER another call's (event frames,
+    string/float/null ids, an id-less error all miss); a JSON-RPC error maps to .err even with a
+    result beside it; a stream ending early is `error.Closed`, not a bogus result; header arithmetic
+    at 0/1/125/126/0xFFFF/0x10000 across both length hinges, mask applied across the 2048-byte chunk
+    seam; ping answered with a correct masked pong and nothing else written.
+  * `pixelrag.zig` (14) — doc-id path safety, fact sanitising, and query→tile scoring, all asserted
+    against records the REAL writer produced rather than hand-rolled JSON.
+    REAL BUG: `resolveDocId`'s two OOM fallbacks returned `@constCast("doc")` — a string LITERAL —
+    while all four call sites `defer gpa.free(doc_id)`. On OOM that hands the allocator an invalid
+    free. Now a zero-length slice, which `free` returns early on (the contract `dupe()` two lines
+    above already keeps).
+  * `config/local_models.zig` (6) — driven through the real handler against a canned loopback
+    server, so nothing depends on a developer's Ollama. Best of them: the auth gate is proven to run
+    BEFORE the local dial by asserting the fake server saw ZERO connections — moving requireUser
+    below the dial still answers 401, so status alone would not catch it.
+  * `worker/ocr.zig` (5) — shim written once, degradation to "" on a missing tool or a non-zero
+    exit, and a source audit requiring the PowerShell flag in `extractWin`'s argv to match the
+    parameter name declared in OCR_PS1 (rename one side and OCR silently returns "" forever).
+- verified: full oracle ALL GREEN, exit 0, bare (not piped). Both lanes ran counterfactuals on their
+  own key properties and reported which tests went red.
+- learned: TWO of the four modules were only reachable through the analysed import graph, and
+  `config/local_models.zig` was NOT COLLECTED AT ALL — main.zig imports it, but lazy analysis never
+  reaches it, so its tests would have sat there passing zero times. 0029's `-Scan` signal flagged
+  both automatically while the lanes were still running. That is the second time that signal has
+  caught this class without anyone looking for it.
+  Also: "needs a device" was doing a lot of unexamined work in my own planning. cdp's framing is
+  pure arithmetic; local_models' contract is testable against ANY canned server. The frontier was
+  smaller than the label suggested.
+- ratchet: none new — 0029's signal and TESTING.md carried both lanes; the agents needed only a
+  pointer to the latter.
+- next: H27 (new, low) — on Windows a refused connection surfaces as `error.Unexpected`, so httpc
+  triages it as retryable `.failed` instead of fail-fast `.refused`, and prints a stack dump each
+  time. Owner decisions unchanged (H10, H14b, H26).
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
