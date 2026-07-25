@@ -872,8 +872,14 @@ pub const MCP_SCHEMA =
 /// call that burns a whole agentic round-trip. Keeps exactly the tools SYSTEM_PROMPT (chat_engine.zig) names:
 /// the web trio (web_search/web_fetch/read_url, + fetch_json for JSON APIs), the build set (read/write/edit/
 /// list_dir/run_python/run_tests/delete_file), and memory (observe/recall/recall_hive). Orchestration verbs
-/// (cast/steer_swarm/…) are concatenated separately in chat_engine.zig (ORCH_TOOLS). Defs are copied VERBATIM
-/// from SCHEMA above so the block stays byte-identical (stable provider prefix cache); keep them in sync.
+/// (cast/steer_swarm/…) are concatenated separately in chat_engine.zig (ORCH_TOOLS).
+///
+/// Defs are copied VERBATIM from SCHEMA above so the block stays byte-identical (stable provider prefix cache)
+/// — with two declared exceptions, because "keep them in sync" used to be the whole instruction and it was not
+/// true: 4 of these defs deliberately DIFFER and 2 exist only here. A worker who took the old wording literally
+/// would have "fixed" the drift and deleted correct behaviour. The exceptions are pinned in CHAT_ADAPTED_DEFS
+/// and CHAT_ONLY_DEFS below, and the test there fails on any UNDECLARED difference — so an accidentally stale
+/// copy is caught, while an intentional adaptation has to be written down.
 pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
@@ -896,11 +902,101 @@ pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"get_credential","description":"Fetch ONE stored credential VALUE from the user's durable memory (the YOUR MEMORY entries shown masked as '[withheld]'). Values never ride in prompts by default — call this in the turn that actually needs one, then use it directly in that call. NEVER echo a fetched credential into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"a few identifying words — the service or domain from the masked entry"}},"required":["query"]}}}
 ;
 
+/// CHAT_SCHEMA defs that deliberately DIFFER from their SCHEMA twin, each with the reason. The chat veil runs
+/// on the USER'S machine and has no teammates, so three defs widen paths to absolute/~ and one drops the
+/// collective framing. Pinned so an UNDECLARED difference fails the test below -- that is an accidentally
+/// stale copy, exactly what "keep them in sync" was asking a human to prevent by hand.
+const CHAT_ADAPTED_DEFS = [_][]const u8{
+    "read_file", // chat reads the user's OWN machine: adds ABSOLUTE / ~ paths
+    "list_dir", // same
+    "absorb", // same, plus the "absorb the book at C:/..." phrasing
+    "recall_hive", // a solo veil has no teammates: drops "what ANY teammate contributed"
+};
+
+/// Defs that exist ONLY in CHAT_SCHEMA -- chat-surface tools with no swarm-mind equivalent in SCHEMA.
+const CHAT_ONLY_DEFS = [_][]const u8{
+    "stage_file", // copies a file off the user's machine INTO the workdir so a cast hive can see it
+    "get_credential", // reads the user's durable memory; a swarm mind has no such store
+};
+
+fn defNameOf(def: []const u8) ?[]const u8 {
+    const k = "\"name\":\"";
+    const i = std.mem.indexOf(u8, def, k) orelse return null;
+    const rest = def[i + k.len ..];
+    const j = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
+    return rest[0..j];
+}
+
+fn findSchemaDef(block: []const u8, want: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, block, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r,");
+        const n = defNameOf(line) orelse continue;
+        if (std.mem.eql(u8, n, want)) return line;
+    }
+    return null;
+}
+
+fn defListHas(list: []const []const u8, name: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, name)) return true;
+    return false;
+}
+
+test "CHAT_SCHEMA stays a verbatim subset of SCHEMA, apart from the adaptations on record" {
+    // Two hand-maintained copies of one tool contract is how a surface starts advertising a stale one: edit a
+    // description in SCHEMA, forget this block, and the chat veil keeps promising the old behaviour with
+    // nothing to notice. The old instruction was a comment saying "keep them in sync", which was not even
+    // accurate -- 4 defs differ ON PURPOSE. So: verbatim is the rule, exceptions are declared, and a declared
+    // exception that stops being one ALSO fails, so the lists cannot rot. Same shape as KNOWN_CAP_OVERLAP.
+    var verbatim: usize = 0;
+    var it = std.mem.splitScalar(u8, CHAT_SCHEMA, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r,");
+        const name = defNameOf(line) orelse continue;
+
+        if (defListHas(&CHAT_ONLY_DEFS, name)) {
+            if (findSchemaDef(SCHEMA, name) != null) {
+                std.debug.print("\n'{s}' exists in SCHEMA now -- drop it from CHAT_ONLY_DEFS\n", .{name});
+                return error.StaleChatOnlyDef;
+            }
+            continue;
+        }
+        const twin = findSchemaDef(SCHEMA, name) orelse {
+            std.debug.print("\n'{s}' is in CHAT_SCHEMA but not SCHEMA -- declare it in CHAT_ONLY_DEFS\n", .{name});
+            return error.UndeclaredChatOnlyDef;
+        };
+        const same = std.mem.eql(u8, twin, line);
+        if (defListHas(&CHAT_ADAPTED_DEFS, name)) {
+            if (same) {
+                std.debug.print("\n'{s}' matches SCHEMA again -- drop it from CHAT_ADAPTED_DEFS\n", .{name});
+                return error.StaleAdaptation;
+            }
+            continue;
+        }
+        if (!same) {
+            std.debug.print("\n'{s}' drifted from its SCHEMA twin -- copy it across, or declare it in CHAT_ADAPTED_DEFS with the reason\n", .{name});
+            return error.ChatSchemaDrift;
+        }
+        verbatim += 1;
+    }
+    // Not vacuous: most of the block really is shared, so the rule above is doing real work.
+    try std.testing.expect(verbatim >= 10);
+}
+
+
 /// The SCOUT's tool set — a RESEARCH-ONLY subset of SCHEMA. The build tools (run_python, write_file) are
 /// deliberately ABSENT so the learner mind STRUCTURALLY cannot drift into building: an imperative "do not build"
 /// prompt did not hold (the LLM scout ignored it and wrote files like everyone else), so the engine simply
 /// withholds the ability. The scout can read context, search/read the web, store facts, save skills, and
-/// message teammates — its only outputs are KNOWLEDGE. Keep these defs in sync with their twins in SCHEMA.
+/// message teammates — its only outputs are KNOWLEDGE.
+///
+/// These defs are NOT verbatim copies of their SCHEMA twins, and should not be made into them: 14 of 15 are
+/// ADAPTED to this surface, correctly. `read_file` drops SCHEMA's edit_file anchor-tag guidance because a
+/// scout has no edit_file to use it with, and gains "see what the team is building and what to research";
+/// `web_search` drops the source enum. So there is no verbatim rule here to enforce and no drift guard —
+/// unlike CHAT_SCHEMA, which IS mostly verbatim and has one. (The line here used to read "keep these defs in
+/// sync with their twins", which described neither the code nor the intent; taken literally it would have had
+/// someone advertise edit_file to a mind that cannot call it. Ledger 0057.)
 pub const SCOUT_SCHEMA =
     \\{"type":"function","function":{"name":"web_search","description":"Keyless web search — returns the top results, each WITH a short excerpt of the source's actual page text (auto-fetched + fit to your query), so you usually don't need a separate fetch. For current events just search the topic + a date.","parameters":{"type":"object","properties":{"query":{"type":"string"},"source":{"type":"string","enum":["web","wikipedia","hackernews","arxiv"]},"limit":{"type":"integer"}},"required":["query"]}}},
     \\{"type":"function","function":{"name":"read_url","description":"Read a URL as clean, LLM-ready text via a reader proxy that renders JS. Prefer this over web_fetch for real articles/specs.","parameters":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}}},
