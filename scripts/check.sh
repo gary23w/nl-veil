@@ -80,6 +80,17 @@ fi
 
 # shellcheck disable=SC2086  # CACHE_ARGS is deliberately word-split
 gate "catalog sync (models.yaml vs web/public/models.json)" "$PY" scripts/gen-models-json.py --check
+# web/public/app.js is @embedFile'd VERBATIM into the binary — nothing compiles or parses it, so a
+# syntax error or a truncated write ships a dead web UI behind a fully green build. That is the
+# silent-failure shape this repo keeps producing, on the one artifact a user actually loads. Script
+# dialect on purpose: the file carries no import/export, and --check would reject a plain script if
+# asked to parse it as a module. Node is OPTIONAL here (Zig + Python are the real toolchain), so an
+# absent node SKIPS LOUDLY rather than failing or passing quietly.
+gate_webjs() {
+  if command -v node >/dev/null 2>&1; then node --check web/public/app.js; else
+    echo "SKIPPED: node not on PATH — web/public/app.js was NOT parsed"; fi
+}
+gate "web assets parse (node --check app.js)" gate_webjs
 gate "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
 gate "zig build test (src suite)" "$ZIG" build test $CACHE_ARGS
 [ -d desk ] || { echo "no desk/ package"; exit 1; }
