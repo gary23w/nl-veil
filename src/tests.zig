@@ -25,6 +25,7 @@ test {
     _ = @import("worker/agi.zig");
     _ = @import("worker/hashline.zig"); // hash-anchored atomic line edits (tag dialect of edit_file)
     _ = @import("worker/browser/cdp.zig"); // JSON-RPC demux + RFC-6455 framing, no socket needed
+    _ = @import("worker/browser/host.zig"); // the discovery file: where a tool call finds the browser daemon
     _ = @import("worker/browser/manager.zig");
     _ = @import("worker/pixelrag.zig"); // doc-id safety, fact sanitising, query→tile scoring
     _ = @import("worker/bufedit.zig");

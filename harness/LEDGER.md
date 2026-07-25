@@ -14,7 +14,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H14b | OWNER | The STRINGS now tell the truth (0048), which was the part that could be fixed without a decision. The decision itself is still open: leave the GitHub PAT plaintext-local (current, defensible for a local login-gated app) or restore sealing at rest (`secrets.zig` says "we never seal again" — a deliberate past choice, and DPAPI is Windows-only so it would not be uniform). Nothing is lying to a user in the meantime. |
 | H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
-| H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **5 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `browser/{broker,host,session}`, `desk/{main,tray}` (`plan/billing_seam` covered 0054). Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
+| H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **4 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `browser/{broker,session}`, `desk/{main,tray}` (`plan/billing_seam` covered 0054, `browser/host` 0066). The remainder really is thin: what is left in them is smoke harnesses that drive a real browser, plus helpers like `clip`/`pStr` whose only consumer is a debug print. Testing those would move the number without protecting anything -- say so rather than closing this row with theater. Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
 | H8-DONE | closed 0065 | "Faster" is no longer an unverifiable claim: every cost claim in the tree that HAS a choke point is now pinned, counted and never timed (a wall-clock budget on a dev box measures Defender, flakes, and gets muted). Pinned: `Neuron.exec` spawns — reading N records = N+1 (0053); `Mem.run` spawns — `observeBatch` = 1 for N facts vs N for the loop it replaced (0063); `buildTurnTools` — POINTER identity for "zero allocation", BYTE identity for the chat prompt prefix (0056); run.zig's swarm system prompt — the stable-prefix SHAPE, guarding a measured 21.6%→81.1% cache-hit gap (0064). The row previously also named "context rebuilds" and "tool round-trips per turn": both re-derived and neither is real work. context.zig is pure, 13 tests, makes no cost claim; `MAX_ITERS = 24` is a safety CEILING with a documented rationale, not an optimization, and asserting a constant equals itself is tautology. REOPEN only on a NEW claim with a real choke point — do not manufacture gates to fill this row. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11-DONE | closed 0060 | In-repo stand-in gateway now exists at `src/worker/fakehttp.zig` — and it mostly already did: `config/local_models.zig` had a well-built canned loopback server, private and named for one caller, so nobody could reach it. Shared rather than re-built (a second copy is what 0055 spent an entry undoing), and `llm.chat()` is now driven through the REAL path against it: loopback plain-http skips the curl child, so `httpc.request` dials the fake in-process and `completeBody` parses a genuine provider-shaped response. NEXT if wanted: the server drains and discards the request, so nothing yet asserts the REQUEST body (trio routing per role, the tools array, temperature quirks) — capturing it is the natural extension and would let the trio-routing claims be checked end to end rather than by source audit. |
@@ -1600,3 +1600,31 @@ edit, confirm it applied, then run.
   ratchet the HORIZON principle "if a harness piece isn't earning its keep, prune it" asks for.
 - next: no priced-cost work remains without a new claim. Frontier is 5 src + 2 desk, genuinely
   device/UI-bound. H13 is a watch item. H10, H14b, H26, H28 are the owner's decisions.
+
+## 0066 — 2026-07-25 — the discovery file, which decides where browser traffic goes
+- did: `browser/host.zig` sat on the frontier labelled device-bound. Most of it is (spawning a
+  daemon, pinging it), but `writeDiscovery`/`readInfo` are a plain write→read pair over a JSON file
+  and needed no browser at all — 0044's lesson exactly, that the label is usually unexamined. That
+  file is how a tool call FINDS the machine's browser daemon: it carries the port to dial and the
+  token that authorises the dial, so a stale or half-written one must read as ABSENT rather than as
+  a half-valid daemon somewhere arbitrary.
+- did: pinned the round trip and every malformed shape — missing file, `port: 0` (the broker never
+  bound; reading it live would dial port zero), non-JSON truncation, and both token-length failures.
+  The short/long token cases are the sharp ones: `Info.token` is a fixed `[32]u8` filled by
+  `@memcpy`, and the `token.len != 32` check is the only thing between a truncated file and a read
+  past the parsed slice. Also pinned that unknown fields are IGNORED — a newer daemon may publish
+  more and an older client must still find it — and that `discoveryPath` honours TEMP/TMP/TMPDIR and
+  degrades to a relative path rather than returning null (the daemon must not become unfindable).
+- verified: src suite exit 0. Counterfactual with the injection printed: relaxing `!= 32` to `< 32`
+  — the plausible edit, since "at least 32" reads permissive rather than wrong — fails the
+  long-token assertion, because it would silently truncate instead of refusing. Full oracle green.
+  Registered DIRECTLY in src/tests.zig (0029).
+- learned: "device-bound" was again a label rather than a finding. Four modules were written off
+  that way in 0044 and turned out mostly testable; this is the fifth. But the REMAINDER of the
+  frontier is now genuinely thin — smoke harnesses that drive a real browser, and helpers like
+  `clip`/`pStr` whose only consumer is a debug print. Testing those would move H4's number without
+  protecting anything, so the row now says so instead of inviting the next worker to close it.
+- ratchet: H4 recounted (4 src + 2 desk) and annotated with WHY the rest should stay uncovered —
+  a coverage row that does not say where to stop is an invitation to write theater.
+- next: nothing worker-actionable but H4's genuinely-thin remainder. H13 is a watch item. H10, H14b,
+  H26, H28 are the owner's decisions.
