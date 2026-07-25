@@ -845,6 +845,27 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   "verified" claim in this ledger rests on that status meaning what it says.
 - next: 3 desk modules left (main, runner, tray); H14, H26, H10 remain the owner's.
 
+## 0038 — 2026-07-25 — the datastore bridge, and the asymmetry that cost two reds
+- did: `worker/neuron/client.zig` — 68 lines through which EVERY stateful thing the server owns
+  passes (user records, sessions, API keys, the BYOK vault, the neuron ledger), untested until now.
+  Two tests. (1) The failure semantics, stated explicitly at last: `del` swallows so a cleanup path
+  can never fail, while `put`/`get`/`scopes` PROPAGATE so a caller must decide — which is exactly
+  why Auth looks like it fails open (it catches, and its in-memory maps carry on) while the vault
+  turns the same dead store into a 400. That asymmetry cost me a red in 0026 and another in 0030;
+  it is now a test rather than folklore. (2) The live round trip, whose centrepiece is the UPSERT
+  property the module header explains: `observe` appends and `get` reads the FIRST line, so if the
+  forget inside `put` were ever removed, an update would never take — every session, key, vault
+  entry and ledger row would silently keep its ORIGINAL value forever, with nothing erroring and
+  reads simply returning stale data. Plus: an unwritten scope reads null (not an error, not ""),
+  a double `del` stays silent, and `scopes(prefix)` does not leak one caller's records into
+  another's listing — the mechanism the vault and key store use to enumerate per-user data.
+- verified: full oracle ALL GREEN, exit 0, first try (unpiped — see 0037).
+- learned: the most valuable test in an increment is often the one guarding a property whose
+  regression is SILENT. A missing binary announces itself; a missing `del` inside `put` does not,
+  and would look like "the setting didn't save" months later.
+- ratchet: none new this sitting.
+- next: 3 desk modules (main, runner, tray) and 12 src; H14, H26, H10 remain the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

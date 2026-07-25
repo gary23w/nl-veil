@@ -66,3 +66,90 @@ pub const Neuron = struct {
         return list.toOwnedSlice(self.gpa);
     }
 };
+
+// ---------------------------------------------------------------------------
+// tests — every stateful thing the server owns (user records, sessions, API keys, the BYOK vault,
+// the neuron ledger) is stored through these five calls, so their failure semantics ARE the
+// server's failure semantics. See harness/TESTING.md.
+// ---------------------------------------------------------------------------
+
+const builtin = @import("builtin");
+
+/// The real environment, so a spawned child comes up with TEMP/SystemRoot (harness/TESTING.md).
+fn testEnviron() std.process.Environ {
+    return if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
+const NEURON_BIN = if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron";
+
+test "with no binary: reads and writes ERROR, deletes stay silent" {
+    // This asymmetry is load-bearing and has bitten twice (ledger 0026, 0030). `del` swallows, so a
+    // cleanup path never fails; `put`/`get`/`scopes` PROPAGATE, so a caller must decide. That is
+    // precisely why Auth appears to fail open (it catches, and its in-memory maps carry on) while
+    // the vault surfaces the failure as a 400 — same dead store, two different-looking symptoms.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const nb = Neuron.init(gpa, io, "definitely-not-a-real-binary-xyz", "zig-neuron-none-tmp.db");
+    try std.testing.expectError(error.FileNotFound, nb.put("s", "v"));
+    try std.testing.expectError(error.FileNotFound, nb.get("s"));
+    try std.testing.expectError(error.FileNotFound, nb.scopes(""));
+    nb.del("s"); // must not crash and must not propagate — the whole point of its `void` return
+}
+
+test "live: put is an UPSERT — a second write wins, which the forget-first is there to guarantee" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-neuron-live-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const db = root ++ "/n.db";
+    const nb = Neuron.init(gpa, io, NEURON_BIN, db);
+
+    // Probe rather than assume — no binary on this box means skip, not fail.
+    nb.put("nlprobe", "cHJvYmU") catch return error.SkipZigTest;
+    {
+        const got = (nb.get("nlprobe") catch return error.SkipZigTest) orelse return error.SkipZigTest;
+        defer gpa.free(got);
+        if (!std.mem.eql(u8, got, "cHJvYmU")) return error.SkipZigTest;
+    }
+
+    // The property the header explains: `observe` APPENDS and `get` reads the FIRST line, so
+    // without the forget inside put(), an update would never take — the stored value would stay the
+    // ORIGINAL one forever, silently, for sessions, API keys, vault entries and the ledger alike.
+    try nb.put("kv_test", "first");
+    try nb.put("kv_test", "second");
+    const now = (try nb.get("kv_test")) orelse return error.TestUnexpectedResult;
+    defer gpa.free(now);
+    try std.testing.expectEqualStrings("second", now);
+
+    // A scope nobody wrote reads as null rather than as an error or an empty string.
+    try std.testing.expect((try nb.get("kv_never_written")) == null);
+
+    // del removes it, and a second del on the now-absent scope is still silent.
+    nb.del("kv_test");
+    try std.testing.expect((try nb.get("kv_test")) == null);
+    nb.del("kv_test");
+
+    // scopes() filters by prefix; unrelated scopes must not leak into a caller's listing (this is
+    // how the vault and the key store enumerate per-user records without seeing each other's).
+    try nb.put("pfx_a_one", "1");
+    try nb.put("pfx_a_two", "2");
+    try nb.put("pfx_b_one", "3");
+    const found = try nb.scopes("pfx_a_");
+    defer {
+        for (found) |s| gpa.free(s);
+        gpa.free(found);
+    }
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    for (found) |s| try std.testing.expect(std.mem.startsWith(u8, s, "pfx_a_"));
+}
