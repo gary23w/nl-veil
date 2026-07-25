@@ -368,7 +368,137 @@ function themeIcon() {
 
 /* ============================================================ boot */
 
+/* ---------------- PWA: install this web app from the domain you connected to ----------------
+   The manifest the server mints is origin-relative (see pwaManifest in src/main.zig), so an install
+   always binds to THIS origin — localhost when you are on the machine, the public name when you are
+   not. Everything here is additive: a browser that offers no install path just shows why, and the app
+   behaves exactly as it always did. */
+const PWA = {
+  prompt: null,      // the deferred `beforeinstallprompt`, held so the USER picks the moment
+  installed: false,  // this page is already running as an installed app
+  swOk: false,       // the service worker registered (installability needs it on most engines)
+};
+
+/** Are we running as an installed app rather than in a browser tab? */
+function pwaStandalone() {
+  try {
+    return matchMedia('(display-mode: standalone)').matches ||
+           matchMedia('(display-mode: window-controls-overlay)').matches ||
+           matchMedia('(display-mode: minimal-ui)').matches ||
+           navigator.standalone === true; // iOS home-screen apps
+  } catch (e) { return false; }
+}
+
+function pwaIsLocalHost() {
+  return /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/i.test(location.host);
+}
+
+/** iOS/iPadOS Safari never fires beforeinstallprompt — installing there is Share → Add to Home Screen. */
+function pwaIsIos() {
+  return /iphone|ipad|ipod/i.test(navigator.userAgent) ||
+         (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS masquerades as Mac
+}
+
+function initPwa() {
+  PWA.installed = pwaStandalone();
+  addEventListener('beforeinstallprompt', (e) => {
+    e.preventDefault();           // hold it; the Settings button fires it deliberately
+    PWA.prompt = e;
+    refreshInstallCard();
+  });
+  addEventListener('appinstalled', () => {
+    PWA.prompt = null;
+    PWA.installed = true;
+    toast('Installed', 'the veil is now an app on this device', 'ok');
+    refreshInstallCard();
+  });
+  // A service worker needs a SECURE CONTEXT: https, or localhost (which browsers count as secure). A
+  // failure here is never fatal — the app runs exactly as before, it simply cannot be installed.
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(() => { PWA.swOk = true; refreshInstallCard(); })
+      .catch(() => { PWA.swOk = false; });
+  }
+}
+
+async function doInstall() {
+  if (!PWA.prompt) return;
+  const ev = PWA.prompt;
+  PWA.prompt = null; // a deferred prompt is single-use; the browser re-offers one later if dismissed
+  try {
+    ev.prompt();
+    const choice = await ev.userChoice;
+    if (choice && choice.outcome === 'dismissed') {
+      toast('Not installed', 'no problem — you can install any time from here', 'warn');
+    }
+  } catch (e) {
+    toast('Install failed', (e && e.message) || 'the browser refused the prompt', 'err');
+  }
+  refreshInstallCard();
+}
+
+/** The Install panel's inner HTML — a pure function of where we are and what the browser offers. */
+function installCardHtml() {
+  const host = location.host;
+  const local = pwaIsLocalHost();
+  // WHICH DOMAIN this install binds to. Said plainly, because it is the whole point: install from the
+  // public name and the app opens the public server; install from localhost and it opens this machine.
+  const target = `<div class="set-row">
+      <div><b>Install target</b>
+        <div class="muted">Installs from <span class="mono">${esc(location.origin)}</span> —
+          ${local
+            ? 'this machine. The app will open your local server, and only works while it is running.'
+            : 'the domain you are connected to. The app will open this server from anywhere.'}</div>
+      </div>
+    </div>`;
+
+  if (PWA.installed) {
+    return target + `<div class="set-row">
+      <div><b>Installed</b><div class="muted">You are running the veil as an app. Uninstall from your OS or browser.</div></div>
+      <button class="btn btn-sm" disabled>Installed</button>
+    </div>`;
+  }
+  if (PWA.prompt) {
+    return target + `<div class="set-row">
+      <div><b>Install the app</b><div class="muted">Opens in its own window, with its own icon — no browser chrome.</div></div>
+      <button class="btn btn-solid btn-sm" id="pwaInstall">Install</button>
+    </div>`;
+  }
+  if (pwaIsIos()) {
+    return target + `<div class="set-row">
+      <div><b>Add to Home Screen</b>
+        <div class="muted">On iPhone/iPad, install from Safari: tap the <b>Share</b> button, then
+          <b>Add to Home Screen</b>. It then opens like any other app.</div></div>
+    </div>`;
+  }
+  if (!window.isSecureContext) {
+    return target + `<div class="set-row">
+      <div><b>Needs a secure connection</b>
+        <div class="muted">Browsers only install apps served over <span class="mono">https</span> (or from
+          localhost). Put this server behind TLS — or reach it at <span class="mono">localhost</span> — and
+          the Install button appears here.</div></div>
+    </div>`;
+  }
+  return target + `<div class="set-row">
+    <div><b>Install the app</b>
+      <div class="muted">Your browser has not offered an install yet. Chrome and Edge offer it after a
+        moment of use — reload this page, or use the install icon in the address bar. Firefox desktop
+        does not support installing web apps.</div></div>
+    <button class="btn btn-sm" disabled>Not offered yet</button>
+  </div>`;
+}
+
+/** Repaint the Install panel in place (no full Settings re-render, so nothing else loses state). */
+function refreshInstallCard() {
+  const host = el('installPanel');
+  if (!host) return; // not on the Settings tab — the next render picks up the new state
+  host.innerHTML = installCardHtml();
+  const b = el('pwaInstall');
+  if (b) b.addEventListener('click', doInstall);
+}
+
 async function boot() {
+  initPwa();
   S.settings = loadSettings();
   loadModels();
   loadThemes();   // public endpoint; paints the saved/custom palette once it lands
@@ -3215,6 +3345,9 @@ function renderSettings(host) {
         </div>
       </div>
 
+      <div class="section-head"><h2>Install</h2></div>
+      <div class="panel set-panel" id="installPanel">${installCardHtml()}</div>
+
       <div class="section-head"><h2>Models</h2></div>
       <div class="panel set-panel">
         ${S.serverDefault && S.serverDefault.model ? `
@@ -3314,6 +3447,9 @@ function renderSettings(host) {
     syncSetupState();
   });
   el('kKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addProviderKey(); } });
+
+  // wires the Install button (and re-reads the current install state, which can change between renders)
+  refreshInstallCard();
 
   drawRolePanels();
   refreshKeys();

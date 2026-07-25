@@ -18,6 +18,11 @@
        linked icon 404s on every load. Local-first also means no CDN fonts —
        the stylesheet uses the system stack the desk itself falls back to. -->
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%238a3ffc'/%3E%3Cpath d='M8 10l8 13 8-13' fill='none' stroke='%23fff' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <!-- PWA. The manifest is generated PER REQUEST from the Host header, so installing binds to whichever
+       domain served this page — localhost or a public name — and never to a baked-in one. The icon route
+       exists now (see pwaIcon), so unlike the favicon above these can be real links. -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script>
     /* Resolve the theme before first paint so there is no flash of the wrong

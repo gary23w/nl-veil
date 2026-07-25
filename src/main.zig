@@ -633,6 +633,12 @@ pub fn main(init: std.process.Init) !void {
     router.get("/app.js", staticJs, .{});
     router.get("/styles.css", staticCss, .{});
     router.get("/models.json", staticModels, .{});
+    // PWA (public, like every other shell asset): the manifest is minted from the request's Host so an
+    // install binds to the domain the user actually reached — localhost or a public name. See pwaManifest.
+    router.get("/manifest.webmanifest", pwaManifest, .{});
+    router.get("/sw.js", pwaServiceWorker, .{});
+    router.get("/icon.svg", pwaIcon, .{});
+    router.get("/icon-maskable.svg", pwaIconMaskable, .{});
     router.get("/api/v1/health", health, .{});
     // What binaries this HOST is missing (python/node/npm/curl/git/browser) and how to fix each — read by
     // the desk + the AI BEFORE a tool spawn, so a missing dep is named up front instead of decoded from a
@@ -1172,6 +1178,124 @@ fn staticCss(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
 fn staticModels(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .JSON;
     serveStatic(req, res, &static_models);
+}
+
+// ---------------------------------------------------------------------------
+// PWA — install the web app from whatever domain the user actually connected to.
+//
+// The manifest is built PER REQUEST from the Host header instead of being another @embedFile: an install
+// binds to the ORIGIN that served the manifest, and this server is reached at both `localhost:8787` and
+// whatever public name a deploy fronts it with. A baked-in start_url would pin every install to one of
+// those and quietly break the other. Every URL field stays RELATIVE — relative resolves against the
+// manifest's own URL, so it is right on every origin including a proxy with a path prefix, and it cannot
+// mis-resolve the way a hand-built absolute URL can when a header lies. The host only ever reaches the
+// human-readable `description`, so a bad Host header costs a cosmetic string, never a broken install.
+//
+// Icons are inline SVG rather than PNG files: Chromium accepts `sizes:"any"` SVG for installability, and
+// keeping them here avoids adding two binaries to web/public (each of which is its own build.zig module).
+const PWA_ICON_SVG =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="the veil">
+    \\<rect width="512" height="512" rx="112" fill="#8a3ffc"/>
+    \\<path d="M128 160l128 208 128-208" fill="none" stroke="#fff" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+    \\</svg>
+;
+// MASKABLE: full-bleed fill (the OS applies its own mask/rounding) with the mark pulled inside the inner
+// 80% safe circle, so a circular or squircle mask can never clip the V.
+const PWA_ICON_MASKABLE_SVG =
+    \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="the veil">
+    \\<rect width="512" height="512" fill="#8a3ffc"/>
+    \\<path d="M166 198l90 146 90-146" fill="none" stroke="#fff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+    \\</svg>
+;
+
+/// A Host header is attacker-controlled, and it lands inside a JSON string. Keep only what a hostname can
+/// legally contain and bound it; anything else collapses to a neutral label rather than escaping into the
+/// document. Returns a slice of `host` (no allocation) or a static fallback.
+fn safeHost(host: []const u8) []const u8 {
+    if (host.len == 0 or host.len > 128) return "this server";
+    for (host) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == ':' or c == '_' or c == '[' or c == ']';
+        if (!ok) return "this server";
+    }
+    return host;
+}
+
+fn pwaManifest(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const host = safeHost(req.header("host") orelse "");
+    res.header("Content-Type", "application/manifest+json; charset=utf-8");
+    // Revalidate every load: the manifest VARIES BY HOST, so a shared cache keyed on the URL alone could
+    // otherwise hand a public visitor the copy minted for localhost.
+    res.header("Cache-Control", "no-cache, must-revalidate");
+    res.header("Vary", "Host");
+    res.body = try std.fmt.allocPrint(res.arena,
+        \\{{"id":"/","name":"the veil","short_name":"veil",
+        \\"description":"A hive mind you talk to — chat, swarms, and scheduled tasks. Installed from {s}.",
+        \\"start_url":"/","scope":"/","display":"standalone","display_override":["window-controls-overlay","standalone","minimal-ui"],
+        \\"orientation":"any","background_color":"#1a1b26","theme_color":"#1a1b26","categories":["productivity","developer"],
+        \\"icons":[{{"src":"/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}},
+        \\{{"src":"/icon-maskable.svg","sizes":"any","type":"image/svg+xml","purpose":"maskable"}}]}}
+    , .{host});
+}
+
+fn pwaServiceWorker(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    res.content_type = .JS;
+    // A worker may only control paths at or below its own URL, so it MUST be served from the root — and the
+    // browser re-checks the script on every navigation, so it must never be cached hard.
+    res.header("Cache-Control", "no-cache, must-revalidate");
+    res.header("Service-Worker-Allowed", "/");
+    // NETWORK-FIRST, shell-only. The app is a live view of a local server: caching API responses would
+    // serve stale turns, stale auth, and stale event cursors, so /api/ is skipped entirely and only the
+    // three shell files are ever stored — enough to open the app offline and have it say the server is
+    // unreachable, which is the honest offline state for a client whose whole job is talking to a server.
+    // VERSION rides in the cache name, so a new binary orphans the old cache and activate() sweeps it.
+    res.body = try std.fmt.allocPrint(res.arena,
+        \\const CACHE = 'veil-shell-{s}';
+        \\const SHELL = ['/', '/app.js', '/styles.css'];
+        \\self.addEventListener('install', (e) => {{
+        \\  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()).catch(() => {{}}));
+        \\}});
+        \\self.addEventListener('activate', (e) => {{
+        \\  e.waitUntil(caches.keys()
+        \\    .then((ks) => Promise.all(ks.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+        \\    .then(() => self.clients.claim()).catch(() => {{}}));
+        \\}});
+        \\self.addEventListener('fetch', (e) => {{
+        \\  const req = e.request;
+        \\  if (req.method !== 'GET') return;
+        \\  const url = new URL(req.url);
+        \\  if (url.origin !== self.location.origin) return;
+        \\  if (url.pathname.startsWith('/api/')) return;   // live server state — never cached
+        \\  e.respondWith(fetch(req).then((r) => {{
+        \\    if (r && r.ok && SHELL.includes(url.pathname)) {{
+        \\      const copy = r.clone();
+        \\      caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {{}});
+        \\    }}
+        \\    return r;
+        \\  }}).catch(() => caches.match(req).then((hit) => hit || caches.match('/'))));
+        \\}});
+    , .{VERSION});
+}
+
+fn pwaIcon(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    res.header("Content-Type", "image/svg+xml; charset=utf-8");
+    res.header("Cache-Control", "public, max-age=86400");
+    res.body = PWA_ICON_SVG;
+}
+
+fn pwaIconMaskable(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    res.header("Content-Type", "image/svg+xml; charset=utf-8");
+    res.header("Cache-Control", "public, max-age=86400");
+    res.body = PWA_ICON_MASKABLE_SVG;
+}
+
+test "safeHost: passes real hostnames, neutralizes anything that could break out of the JSON string" {
+    try std.testing.expectEqualStrings("localhost:8787", safeHost("localhost:8787"));
+    try std.testing.expectEqualStrings("veil.example.com", safeHost("veil.example.com"));
+    try std.testing.expectEqualStrings("[::1]:8787", safeHost("[::1]:8787"));
+    // a quote/backslash/newline in Host must never reach the manifest body
+    try std.testing.expectEqualStrings("this server", safeHost("evil\",\"name\":\"pwned"));
+    try std.testing.expectEqualStrings("this server", safeHost("a\\b"));
+    try std.testing.expectEqualStrings("this server", safeHost(""));
 }
 
 // ---------------------------------------------------------------------------
