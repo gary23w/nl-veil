@@ -1173,3 +1173,186 @@ fn staticModels(_: *App, req: *httpz.Request, res: *httpz.Response) !void {
     res.content_type = .JSON;
     serveStatic(req, res, &static_models);
 }
+
+// ---------------------------------------------------------------------------
+// ROUTER AUDIT. Each handler module's own tests prove that handler REFUSES an unauthorised caller;
+// none of them prove the router points at the handler anyone thinks it does. A route wired to the
+// wrong function — an admin path aimed at a merely-authenticated handler, a new endpoint added
+// without a gate — is invisible to every one of those sweeps, and it is the one mistake that
+// silently undoes all of them.
+//
+// So this reads the route table as text and re-derives, for every route, whether its handler
+// actually gates: directly, or through ONE local helper (sched.zig wraps requireUser in `gate()`,
+// which a naive body scan reads as ungated).
+// ---------------------------------------------------------------------------
+
+const MAIN_SRC = @embedFile("main.zig");
+
+const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
+    .{ .alias = "auth_api", .src = @embedFile("auth/auth_api.zig") },
+    .{ .alias = "deploy_service", .src = @embedFile("worker/deploy/service.zig") },
+    .{ .alias = "tail_fanout", .src = @embedFile("worker/control/fanout.zig") },
+    .{ .alias = "control_writer", .src = @embedFile("worker/control/writer.zig") },
+    .{ .alias = "chat_tools", .src = @embedFile("worker/chat/tools.zig") },
+    .{ .alias = "chat_service", .src = @embedFile("worker/chat/service.zig") },
+    .{ .alias = "sched", .src = @embedFile("worker/sched.zig") },
+    .{ .alias = "metrics", .src = @embedFile("worker/metrics.zig") },
+    .{ .alias = "admin_service", .src = @embedFile("admin/admin_service.zig") },
+    .{ .alias = "billing_seam", .src = @embedFile("plan/billing_seam.zig") },
+    .{ .alias = "keys_api", .src = @embedFile("config/keys_api.zig") },
+    .{ .alias = "local_models", .src = @embedFile("config/local_models.zig") },
+    .{ .alias = "cf_oauth", .src = @embedFile("config/cf_oauth.zig") },
+};
+
+/// Routes that are deliberately reachable without a session. Each needs a REASON, because the only
+/// thing separating this list from a hole is that a human wrote down why.
+const PUBLIC_ROUTES = [_]struct { path: []const u8, why: []const u8 }{
+    .{ .path = "/api/v1/health", .why = "liveness probe; reports version only" },
+    .{ .path = "/api/v1/health/deps", .why = "dependency probe for the installer" },
+    .{ .path = "/api/v1/fleet", .why = "dev.ps1 and `veil doctor` probe this before a key exists" },
+    .{ .path = "/api/v1/themes", .why = "documented PUBLIC in the CLI: themes are presentation data" },
+    .{ .path = "/api/v1/auth/register", .why = "you cannot hold a session before registering" },
+    .{ .path = "/api/v1/auth/login", .why = "ditto; throttled by login_guard instead" },
+    .{ .path = "/api/v1/auth/logout", .why = "clearing a cookie must work even with a dead session" },
+    .{ .path = "/api/v1/auth/me", .why = "answers authed:false to a stranger — that IS its job" },
+    .{ .path = "/api/v1/oauth/cloudflare/callback", .why = "the IdP redirects the browser here" },
+};
+
+const Gate = enum { admin, user, none, missing };
+
+/// The body of `fn name(` / `pub fn name(` in `src`, up to the next top-level fn.
+fn fnBodyIn(src: []const u8, name: []const u8) ?[]const u8 {
+    var buf: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "fn {s}(", .{name}) catch return null;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+        // must start a line, optionally after "pub "
+        const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
+        const prefix = src[line_start..at];
+        if (prefix.len == 0 or std.mem.eql(u8, prefix, "pub ")) {
+            const rest = src[at..];
+            const end = std.mem.indexOfPos(u8, rest, 1, "\nfn ") orelse
+                std.mem.indexOfPos(u8, rest, 1, "\npub fn ") orelse rest.len;
+            return rest[0..end];
+        }
+        i = at + 1;
+    }
+    return null;
+}
+
+fn gateOfFn(src: []const u8, name: []const u8, depth: u8) Gate {
+    const body = fnBodyIn(src, name) orelse return .missing;
+    if (std.mem.indexOf(u8, body, "requireAdmin") != null) return .admin;
+    if (std.mem.indexOf(u8, body, "requireUser") != null) return .user;
+    if (depth == 0) {
+        // one hop: a local helper taking (app, req, res) — sched.zig's `gate()` is the real case
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, body, i, "(app, req, res)")) |at| {
+            i = at + 1;
+            const before = body[0..at];
+            var s = before.len;
+            while (s > 0) {
+                const c = before[s - 1];
+                if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') s -= 1 else break;
+            }
+            const callee = before[s..];
+            if (callee.len == 0) continue;
+            const g = gateOfFn(src, callee, depth + 1);
+            if (g == .admin or g == .user) return g;
+        }
+    }
+    return .none;
+}
+
+test "the router: every admin path is admin-gated, and nothing else is open by accident" {
+    var checked: usize = 0;
+    var gated: usize = 0;
+    var it = std.mem.splitScalar(u8, MAIN_SRC, '\n');
+    while (it.next()) |line| {
+        const rp = std.mem.indexOf(u8, line, "router.") orelse continue;
+        const q1 = std.mem.indexOfScalarPos(u8, line, rp, '"') orelse continue;
+        const q2 = std.mem.indexOfScalarPos(u8, line, q1 + 1, '"') orelse continue;
+        const path = line[q1 + 1 .. q2];
+        const after = line[q2 + 1 ..];
+        const comma = std.mem.indexOfScalar(u8, after, ',') orelse continue;
+        var handler = std.mem.trim(u8, after[comma + 1 ..], " ,");
+        if (std.mem.indexOfScalar(u8, handler, ',')) |c| handler = handler[0..c];
+        if (handler.len == 0) continue;
+        checked += 1;
+
+        // resolve handler -> (source, fn name)
+        var src: []const u8 = MAIN_SRC;
+        var fname = handler;
+        if (std.mem.indexOfScalar(u8, handler, '.')) |dot| {
+            const alias = handler[0..dot];
+            fname = handler[dot + 1 ..];
+            var found = false;
+            for (ROUTE_MODS) |m| {
+                if (std.mem.eql(u8, m.alias, alias)) {
+                    src = m.src;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std.debug.print("\nroute {s} -> {s}: module alias '{s}' is not in ROUTE_MODS (add its @embedFile)\n", .{ path, handler, alias });
+                return error.UnknownRouteModule;
+            }
+        }
+        const g = gateOfFn(src, fname, 0);
+        if (g == .missing) {
+            std.debug.print("\nroute {s}: handler '{s}' not found in its module\n", .{ path, handler });
+            return error.HandlerNotFound;
+        }
+        if (g != .none) gated += 1;
+
+        // ADMIN PATHS: nothing less than requireAdmin will do.
+        if (std.mem.startsWith(u8, path, "/api/v1/admin")) {
+            if (g != .admin) {
+                std.debug.print("\nADMIN route {s} -> {s} is only '{t}' — it must call requireAdmin\n", .{ path, handler, g });
+                return error.AdminRouteNotAdminGated;
+            }
+            continue;
+        }
+        // EVERY OTHER API ROUTE: gated, unless it is on the public list with a stated reason.
+        if (std.mem.startsWith(u8, path, "/api/v1/") and g == .none) {
+            var allowed = false;
+            for (PUBLIC_ROUTES) |p| {
+                if (std.mem.eql(u8, p.path, path)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (!allowed) {
+                std.debug.print("\nroute {s} -> {s} has NO auth gate and is not in PUBLIC_ROUTES\n", .{ path, handler });
+                return error.UngatedRoute;
+            }
+        }
+    }
+    // The table is big; if this ever collapses, the loop above stopped parsing rather than passing.
+    try std.testing.expect(checked >= 70);
+    try std.testing.expect(gated >= 60);
+}
+
+test "the public list stays honest: every entry is a real, still-ungated route" {
+    // A path that gains a gate, or disappears, must leave this list — otherwise the list slowly
+    // becomes a place where exceptions go to be forgotten.
+    for (PUBLIC_ROUTES) |p| {
+        try std.testing.expect(p.why.len > 20); // a reason, not a shrug
+        var found = false;
+        var it = std.mem.splitScalar(u8, MAIN_SRC, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, "router.") == null) continue;
+            var qb: [128]u8 = undefined;
+            const quoted = std.fmt.bufPrint(&qb, "\"{s}\"", .{p.path}) catch continue;
+            if (std.mem.indexOf(u8, line, quoted) != null) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std.debug.print("\nPUBLIC_ROUTES lists {s}, which no route registers any more\n", .{p.path});
+            return error.StalePublicRoute;
+        }
+    }
+}
