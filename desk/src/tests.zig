@@ -13,6 +13,7 @@ test {
     _ = @import("httpc.zig");
     _ = @import("llm.zig");
     _ = @import("log.zig");
+    _ = @import("main.zig"); // the pure helpers under the drawing: formatters + index wrap
     _ = @import("mdutil.zig");
     _ = @import("netcli.zig");
     _ = @import("poller.zig"); // the server-reply parsers: user text can't imitate a field

@@ -5865,7 +5865,13 @@ fn drawFiles(store: *Store, r: t.Rect) void {
 fn fmtSize(sz: u64) [:0]const u8 {
     if (sz < 1024) return t.z("{d}b", .{sz});
     if (sz < 1024 * 1024) return t.z("{d}k", .{sz / 1024});
-    return t.z("{d}.{d}M", .{ sz / (1024 * 1024), (sz % (1024 * 1024)) / (105 * 1024) });
+    // Tenths by MULTIPLYING first, not by dividing with an approximated tenth-of-a-MiB. The old
+    // divisor was `105 * 1024` = 107520 where a tenth of a MiB is 104857.6 — 2.5% high, so the
+    // fraction always read LOW and 1.5 MiB rendered as "1.4M" (54 of the tenth-steps under 10 MiB
+    // were off by one). The obvious repair, `/ (1024 * 1024 / 10)`, is wrong the other way: integer
+    // division gives 104857, and a remainder of 1048575 then yields 10 — "1.10M". `rem * 10 / MiB`
+    // is exact and cannot leave [0,9], since rem is always < MiB.
+    return t.z("{d}.{d}M", .{ sz / (1024 * 1024), (sz % (1024 * 1024)) * 10 / (1024 * 1024) });
 }
 
 /// The Chat FILES inner tab — a two-pane viewer for the files THIS conversation built (its {conv}/work dir),
@@ -7927,4 +7933,77 @@ fn drawToasts(store: *Store) void {
         t.textClip(tn.titleStr(), @intFromFloat(r.x + 16), @intFromFloat(r.y + 10), 13, t.fg, @intFromFloat(w - 28));
         t.textClip(tn.bodyStr(), @intFromFloat(r.x + 16), @intFromFloat(r.y + 31), 11, t.fg_dim, @intFromFloat(w - 28));
     }
+}
+
+// ---------------------------------------------------------------------------
+// tests — the FIRST for this file (7.9k lines, zero until now). Most of it genuinely needs a window,
+// but the small pure helpers underneath the drawing do not, and they are exactly where quiet bugs
+// live: modular index arithmetic, byte/count formatting, and a clock formatter that already had one
+// signed-rendering bug fixed in it. See harness/TESTING.md.
+// ---------------------------------------------------------------------------
+
+test "fmtSize: the tenths digit is exact, not an approximated divisor" {
+    // The bug this pins: the divisor was `105 * 1024` (107520) where a tenth of a MiB is 104857.6,
+    // so every fraction read one low and 1.5 MiB showed as "1.4M".
+    try std.testing.expectEqualStrings("0b", fmtSize(0));
+    try std.testing.expectEqualStrings("512b", fmtSize(512));
+    try std.testing.expectEqualStrings("1k", fmtSize(1024));
+    try std.testing.expectEqualStrings("1023k", fmtSize(1024 * 1024 - 1024));
+    try std.testing.expectEqualStrings("1.0M", fmtSize(1024 * 1024));
+    try std.testing.expectEqualStrings("1.5M", fmtSize(1024 * 1024 * 3 / 2)); // was "1.4M"
+    try std.testing.expectEqualStrings("2.5M", fmtSize(1024 * 1024 * 5 / 2));
+
+    // The tenths digit stays a SINGLE digit at every boundary — the failure mode of the obvious
+    // repair (`/ (1024*1024/10)`), which renders "1.10M" just below 2 MiB.
+    var sz: u64 = 1024 * 1024;
+    while (sz < 4 * 1024 * 1024) : (sz += 9973) { // a prime-ish stride, so boundaries are not skipped
+        const s = fmtSize(sz);
+        const dot = std.mem.indexOfScalar(u8, s, '.') orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), s.len - dot - 2); // exactly one digit before 'M'
+    }
+}
+
+test "fmtCount: k/M thresholds and the single fraction digit" {
+    var b: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("0", fmtCount(0, &b));
+    try std.testing.expectEqualStrings("999", fmtCount(999, &b));
+    try std.testing.expectEqualStrings("1.0k", fmtCount(1000, &b));
+    try std.testing.expectEqualStrings("1.5k", fmtCount(1500, &b));
+    try std.testing.expectEqualStrings("999.9k", fmtCount(999_999, &b));
+    try std.testing.expectEqualStrings("1.0M", fmtCount(1_000_000, &b));
+    try std.testing.expectEqualStrings("12.3M", fmtCount(12_345_678, &b));
+    // A buffer too small degrades to "?" rather than writing past it or panicking.
+    var tiny: [2]u8 = undefined;
+    try std.testing.expectEqualStrings("?", fmtCount(12_345_678, &tiny));
+}
+
+test "wrap: cycling an index forward and back, including both edges" {
+    try std.testing.expectEqual(@as(usize, 1), wrap(0, 1, 3));
+    try std.testing.expectEqual(@as(usize, 2), wrap(1, 1, 3));
+    try std.testing.expectEqual(@as(usize, 0), wrap(2, 1, 3)); // past the end -> first
+    try std.testing.expectEqual(@as(usize, 2), wrap(0, -1, 3)); // before the start -> last
+    try std.testing.expectEqual(@as(usize, 0), wrap(1, -1, 3));
+    // NOTE for a future caller: `n` must be non-zero. The only call site passes a comptime 3-element
+    // array, so this is not reachable today — but `wrap(0, -1, 0)` would evaluate `n - 1` and
+    // underflow. If this helper ever takes a runtime-sized list, guard n == 0 at the call or here.
+}
+
+test "fmtConvWhen: today is a clock, this week is a weekday, older is a date" {
+    // Clock-anchored: `now_s` and `tz` are parameters, so this cannot drift with the wall clock or
+    // the machine's timezone (harness/TESTING.md).
+    var b: [32]u8 = undefined;
+    const day0 = 19_000 * 86400; // an arbitrary epoch day, UTC midnight
+    const now = day0 + 12 * 3600; // midday
+
+    try std.testing.expectEqualStrings("", fmtConvWhen(0, now, 0, &b)); // never-written
+    // Same day -> HH:MM, zero-padded and UNSIGNED. A signed render here produced "+8:+0" once.
+    try std.testing.expectEqualStrings("08:05", fmtConvWhen(day0 + 8 * 3600 + 5 * 60, now, 0, &b));
+    try std.testing.expectEqualStrings("00:00", fmtConvWhen(day0, now, 0, &b));
+    // Earlier in the week -> weekday name. Epoch day 0 was a Thursday, so (day + 4) % 7 indexes Sun=0.
+    const wd = fmtConvWhen(day0 - 2 * 86400, now, 0, &b);
+    try std.testing.expectEqual(@as(usize, 3), wd.len);
+    // A tz offset shifts which local day it lands on, so the answer must move with it.
+    const utc_late = day0 + 23 * 3600; // 23:00 UTC
+    try std.testing.expectEqualStrings("23:00", fmtConvWhen(utc_late, utc_late, 0, &b));
+    try std.testing.expectEqualStrings("01:00", fmtConvWhen(utc_late, utc_late, 2 * 3600, &b));
 }
