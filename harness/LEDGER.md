@@ -15,7 +15,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | H14b | OWNER | The STRINGS now tell the truth (0048), which was the part that could be fixed without a decision. The decision itself is still open: leave the GitHub PAT plaintext-local (current, defensible for a local login-gated app) or restore sealing at rest (`secrets.zig` says "we never seal again" — a deliberate past choice, and DPAPI is Windows-only so it would not be uniform). Nothing is lying to a user in the meantime. |
 | H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **5 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `browser/{broker,host,session}`, `desk/{main,tray}` (`plan/billing_seam` covered 0054). Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
-| H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). PATTERN SET 0053: count, never time — `Neuron.exec` carries an `is_test`-gated `spawn_probe` and `client.zig` pins reading N records at exactly N+1 spawns. A wall-clock budget on a dev box measures Defender and gets muted. Engine hot paths still unpriced; find each one's choke point first. |
+| H8-DONE | closed 0065 | "Faster" is no longer an unverifiable claim: every cost claim in the tree that HAS a choke point is now pinned, counted and never timed (a wall-clock budget on a dev box measures Defender, flakes, and gets muted). Pinned: `Neuron.exec` spawns — reading N records = N+1 (0053); `Mem.run` spawns — `observeBatch` = 1 for N facts vs N for the loop it replaced (0063); `buildTurnTools` — POINTER identity for "zero allocation", BYTE identity for the chat prompt prefix (0056); run.zig's swarm system prompt — the stable-prefix SHAPE, guarding a measured 21.6%→81.1% cache-hit gap (0064). The row previously also named "context rebuilds" and "tool round-trips per turn": both re-derived and neither is real work. context.zig is pure, 13 tests, makes no cost claim; `MAX_ITERS = 24` is a safety CEILING with a documented rationale, not an optimization, and asserting a constant equals itself is tautology. REOPEN only on a NEW claim with a real choke point — do not manufacture gates to fill this row. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11-DONE | closed 0060 | In-repo stand-in gateway now exists at `src/worker/fakehttp.zig` — and it mostly already did: `config/local_models.zig` had a well-built canned loopback server, private and named for one caller, so nobody could reach it. Shared rather than re-built (a second copy is what 0055 spent an entry undoing), and `llm.chat()` is now driven through the REAL path against it: loopback plain-http skips the curl child, so `httpc.request` dials the fake in-process and `completeBody` parses a genuine provider-shaped response. NEXT if wanted: the server drains and discards the request, so nothing yet asserts the REQUEST body (trio routing per role, the tools array, temperature quirks) — capturing it is the natural extension and would let the trio-routing claims be checked end to end rather than by source audit. |
 | H12-DONE | closed 0059 | Marker debt was never 23, and is not 12 either — it is effectively ZERO. Both oracles' `[markers]` signal matched `XXX` unbounded, so ten `\uXXXX` doc-comment mentions (JSON escape notation) counted as debt; word-bounding drops the class. The 2 that remain are the same comment mirrored in the httpc twins, describing a TODO in **Zig's own stdlib** (`netConnectIpWindows`), not ours. Nothing to pay down. The real defect was the signal: one that always reports phantom work is one a worker learns to skip, which costs more than the debt would have. |
@@ -1574,3 +1574,29 @@ edit, confirm it applied, then run.
   trips it learns the cost rather than just the rule.
 - next: H8's remaining unpriced paths are context rebuilds and tool round-trips per turn. Frontier
   5 src + 2 desk. H10, H14b, H26, H28 are the owner's.
+
+## 0065 — 2026-07-25 — H8 CLOSED, and the half of it that was never real
+- did: closed H8 by finishing the real half and DELETING the imaginary half rather than building
+  gates to fill it. Everything in the tree that makes a cost claim AND has a single choke point is
+  now pinned, counted rather than timed: spawns on both neuron-db seams (`Neuron.exec` N+1 per N
+  records, 0053; `Mem.run` 1 vs N for observeBatch, 0063), pointer identity for buildTurnTools'
+  zero-allocation path and byte identity for the chat prompt prefix (0056), and the SHAPE of the
+  swarm system prompt that protects a measured 21.6%→81.1% cache-hit gap (0064).
+- did: the row's other two named items were re-derived and are not work. `context.zig` is pure
+  helpers with 13 tests and makes no cost claim at all — "context rebuilds" named a thing that does
+  not exist. "Tool round-trips per turn" is `MAX_ITERS = 24`, a safety CEILING with a documented
+  rationale, not an optimization; a test asserting a constant equals itself would be pure theater.
+  Both removed from the row with the reasoning, and the row now says REOPEN ONLY ON A NEW CLAIM.
+- learned: the pull to write those two gates anyway was real — they were named in an open item, the
+  session had momentum, and two more green tests would have looked like progress. But a gate that
+  pins a constant to itself does not protect anything; it adds a file to maintain, a line to the
+  suite, and a false sense that the area is covered. Deleting a phantom item is worth more than
+  satisfying it, and is harder to do because it produces no artifact. That is the FOURTH row this
+  sitting that was wrong about its own subject (H4 count, H12 phantom debt, H11 framing, now H8's
+  back half) — the open-items table has been the least reliable document in the harness, which is
+  why 0060 put "re-derive the row before you act on it" into the skill's PICK step.
+- verified: full oracle green; scan 0 signals.
+- ratchet: none new — this increment REMOVED work rather than adding a mechanism, which is the
+  ratchet the HORIZON principle "if a harness piece isn't earning its keep, prune it" asks for.
+- next: no priced-cost work remains without a new claim. Frontier is 5 src + 2 desk, genuinely
+  device/UI-bound. H13 is a watch item. H10, H14b, H26, H28 are the owner's decisions.
