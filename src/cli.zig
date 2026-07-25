@@ -1212,7 +1212,20 @@ fn flagVal(args: []const []const u8, i: *usize, a: []const u8, flag: []const u8)
     return null;
 }
 
-fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) void {
+/// The ONE JSON string escaper for the CLI — `cli/hub.zig` and `cli/chat.zig` call this instead of
+/// keeping their own. There were three hand-rolled copies of these nine lines and TWO were missing
+/// the `c < 0x20` arm below, which is exactly why this bug keeps returning: fixing one copy leaves
+/// the others. (hub's broadcast died on a pasted CRLF; desk/main.jesc emitted raw control bytes;
+/// this copy silently killed tool results.)
+///
+/// Bytes under 0x20 are not legal inside a JSON string. `postToolResult` puts a delegated tool's
+/// arbitrary OUTPUT through here — compiler colour, a form feed, a stray NUL — so unescaped, the
+/// body is malformed, the server's parser rejects it, and the blocked turn never receives its
+/// result: a stall with nothing printed to explain it.
+///
+/// `gateway/http.jstr` stays separate on purpose — it returns an error union rather than swallowing,
+/// and pulling the gateway into the CLI path to save nine lines would be the worse trade.
+pub fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8) void {
     list.append(gpa, '"') catch return;
     for (s) |c| switch (c) {
         '"' => list.appendSlice(gpa, "\\\"") catch return,
@@ -1220,7 +1233,10 @@ fn jstr(gpa: std.mem.Allocator, list: *std.ArrayListUnmanaged(u8), s: []const u8
         '\n' => list.appendSlice(gpa, "\\n") catch return,
         '\r' => list.appendSlice(gpa, "\\r") catch return,
         '\t' => list.appendSlice(gpa, "\\t") catch return,
-        else => list.append(gpa, c) catch return,
+        else => if (c < 0x20) {
+            var b: [6]u8 = undefined;
+            list.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch "") catch return;
+        } else list.append(gpa, c) catch return,
     };
     list.append(gpa, '"') catch return;
 }
@@ -1466,4 +1482,27 @@ test "flagVal reads space and equals forms" {
     try std.testing.expectEqualStrings("5", flagVal(&args, &i, args[0], "--minutes").?);
     i = 2;
     try std.testing.expectEqualStrings("quick", flagVal(&args, &i, args[2], "--name").?);
+}
+
+test "a tool result carrying a control byte still forms valid JSON" {
+    // postToolResult sends a delegated tool's OUTPUT back to a blocked server turn. That output is
+    // arbitrary program text — compiler colour, a form feed, a stray NUL — and bytes below 0x20 are
+    // not legal inside a JSON string. Unescaped, the body is malformed, the server's parser rejects
+    // it, and the turn never receives its result: a stall with nothing printed to explain it.
+    const gpa = std.testing.allocator;
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(gpa);
+
+    const result = "build \x1b[31mfailed\x1b[0m\x0cpage2\x01";
+    try body.appendSlice(gpa, "{\"id\":");
+    jstr(gpa, &body, "call_7");
+    try body.appendSlice(gpa, ",\"result\":");
+    jstr(gpa, &body, result);
+    try body.append(gpa, '}');
+
+    // The real check: the server's parser must accept it, and the bytes must survive intact.
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(result, parsed.value.object.get("result").?.string);
+    try std.testing.expectEqualStrings("call_7", parsed.value.object.get("id").?.string);
 }

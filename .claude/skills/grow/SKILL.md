@@ -43,6 +43,16 @@ Run the loop:
    signal, a tightened gate, a stale doc corrected, a sharper hard rule, a better sentence in this
    file. This step is not optional. It is the mechanism by which the harness is grown, not built.
 
+   **Match the ratchet to the defect's shape.** A test pins the case you just fixed; a `-Scan`
+   signal pins the PROPERTY everywhere, including in files that do not exist yet. If the same defect
+   has appeared more than once, a test on this instance is the wrong ratchet — the next copy lands
+   where your test is not looking. In 0055 a JSON escaper missing its control-byte arm had already
+   been fixed twice in two modules; a careful hand sweep "confirmed" the remaining ten were clean,
+   and the `[jsonesc]` signal written minutes later immediately found a fifth broken copy the sweep
+   had filtered out, because I searched for the shape I had just been staring at instead of for the
+   property. When a defect recurs, do not write a better grep. Write the check that runs without
+   you, and let it disagree with you.
+
 ## Ledger entry template
 
 ```

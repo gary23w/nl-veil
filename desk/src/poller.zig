@@ -1165,6 +1165,16 @@ fn parseSchedTask(obj: []const u8, row: *store_mod.SchedRow) void {
     }
 }
 
+/// Escape one JSON string for a control-bus body. The `\r` drop and the `\t`-to-space are deliberate
+/// normalisation (the operator's text is pasted into a single-line field), and both are safe because
+/// they emit legal JSON.
+///
+/// The `else` arm was not: every byte under 0x20 went out RAW, and those are illegal inside a JSON
+/// string, so a steer or goal pasted with a control byte in it built a body the reader rejects --
+/// the control message just never lands. `text` and `goal` here are operator-supplied, and pasting
+/// terminal output (colour is ESC, 0x1B) is the ordinary way to hit it. Fifth instance of this same
+/// escaper bug in the tree; check.ps1 -Scan now has a [jsonesc] signal that found THIS one after the
+/// other four had been fixed by hand (0055).
 fn appendEsc(jb: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const u8) void {
     for (s) |c| {
         switch (c) {
@@ -1173,7 +1183,10 @@ fn appendEsc(jb: *std.ArrayListUnmanaged(u8), gpa: std.mem.Allocator, s: []const
             '\n' => jb.appendSlice(gpa, "\\n") catch {},
             '\r' => {},
             '\t' => jb.appendSlice(gpa, " ") catch {},
-            else => jb.append(gpa, c) catch {},
+            else => if (c < 0x20) {
+                var b: [6]u8 = undefined;
+                jb.appendSlice(gpa, std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch "") catch {};
+            } else jb.append(gpa, c) catch {},
         }
     }
 }
@@ -1328,4 +1341,33 @@ test "valueForKey: escapes, a missing key, and the buffer ceiling" {
     // pointed at Cloudflare's own replies and scan.nextJsonPair handles user-authored text.
     const malformed = "{\"note\":\"raw \"account_id\":\"stolen\" quote\",\"account_id\":\"real\"}";
     try std.testing.expectEqualStrings("stolen", valueForKey(malformed, "account_id", &buf));
+}
+
+test "a steer pasted with a control byte still builds a control body the reader accepts" {
+    // appendEsc feeds writeControl, whose body is parsed downstream. Bytes under 0x20 are illegal
+    // inside a JSON string, so before the fix an operator pasting terminal output (colour is ESC,
+    // 0x1B) built a body that was rejected and a steer that simply never landed.
+    const gpa = std.testing.allocator;
+    var jb: std.ArrayListUnmanaged(u8) = .empty;
+    defer jb.deinit(gpa);
+
+    const steer = "stop \x1b[31mnow\x1b[0m\x01 please";
+    try jb.appendSlice(gpa, "{\"op\":\"steer\",\"text\":\"");
+    appendEsc(&jb, gpa, steer);
+    try jb.appendSlice(gpa, "\"}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, jb.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(steer, parsed.value.object.get("text").?.string);
+
+    // The two DELIBERATE normalisations survive the fix: \r is dropped and \t becomes a space, both
+    // of which stay legal JSON. Asserted so a later "just escape everything" edit is a visible
+    // choice rather than an accident.
+    jb.clearRetainingCapacity();
+    try jb.appendSlice(gpa, "{\"text\":\"");
+    appendEsc(&jb, gpa, "a\r\nb\tc");
+    try jb.appendSlice(gpa, "\"}");
+    const p2 = try std.json.parseFromSlice(std.json.Value, gpa, jb.items, .{});
+    defer p2.deinit();
+    try std.testing.expectEqualStrings("a\nb c", p2.value.object.get("text").?.string);
 }

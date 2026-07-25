@@ -1260,3 +1260,36 @@ edit, confirm it applied, then run.
   src/tests.zig (0029's rule — transitive reachability is not collection).
 - next: coverage frontier is 5 src + 2 desk, and the rest really are device/UI-bound. H8's engine hot
   paths still unpriced. H10, H14b, H26 remain the owner's.
+
+## 0055 — 2026-07-25 — one JSON escaper for the CLI, and the signal that found the fifth copy
+- did: `veil chat` escaped the user's line with a private `appendJsonStr` that stopped at `\t` and
+  let every other control byte through raw. Bytes under 0x20 are illegal inside a JSON string, so
+  the body is malformed and the server's parser rejects the turn — the message never sends, with
+  nothing shown. Reachable by the most ordinary thing a CLI user does: paste terminal output to ask
+  about it (colour is ESC, 0x1B; no newline or quote involved, so no handled case fires).
+- found while fixing it: `cli.zig` had its OWN private `jstr`, also missing the arm, and it is the
+  worse one. It feeds `postToolResult`, which sends a delegated tool's arbitrary OUTPUT back to a
+  blocked server turn. Compiler colour, a form feed, a stray NUL — any of them makes the body
+  invalid, the server rejects it, and the turn never receives its result: a stall with nothing
+  printed. (Same SYMPTOM class as the lost-tool-result hang chased before; an independent mechanism,
+  not a claim they are the same incident.) It also escapes `veil cast --goal` and sched prompts.
+- did: four hand-rolled copies of nine lines, two broken. The two under `src/cli/` are now one
+  `pub fn cli.jstr` beside the `jsonStr`/`jsonNum` helpers both modules already share.
+  `gateway/http.jstr` stays separate: it returns an error union rather than swallowing, and dragging
+  the gateway into the CLI path to save nine lines is the worse trade.
+- ratchet, and the part worth copying: a per-module test cannot catch the NEXT copy, so
+  `check.ps1 -Scan` gained a `[jsonesc]` signal — find the escape table anywhere in src/ or
+  desk/src/, require an `0x20` branch near it. I had already swept the tree BY HAND and concluded
+  the other ten escapers were fine. The signal immediately found an ELEVENTH my grep had missed:
+  `desk/src/poller.zig:appendEsc`, differently shaped (it drops `\r`, maps `\t` to a space) so my
+  pattern skipped it, and it escapes operator-typed steer text and swarm goals into a control-bus
+  body. Fixed, keeping both deliberate normalisations, with a test that pins them so a later "just
+  escape everything" edit is a visible choice.
+- verified: test-first on both — the cli test failed at `parseFromSlice` before the fix, and the
+  desk counterfactual (`c < 0x00`) fails the named test, so it runs and it bites. Scan clean, 0
+  signals. Full oracle green.
+- learned: my hand sweep was confident and wrong, and the mechanised check found the case my eyes
+  filtered out — I searched for the shape I had just been looking at, not for the property. When a
+  defect has recurred three times, the fix is not a better manual pass; it is a check that runs
+  without me. Also: five copies means the recurrence was never really a bug, it was duplication.
+- next: H8 engine hot paths still unpriced. Frontier 5 src + 2 desk. H10, H14b, H26, H28 owner's.
