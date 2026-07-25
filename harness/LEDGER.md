@@ -424,3 +424,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: `harness/TESTING.md` (0019) was handed to the vault agent as a three-line pointer
   instead of a dictated prompt — the lore is now the repo's, not the driver's.
 - next: fold the key-vault lane when it reports; coverage frontier continues.
+
+## 0021 — 2026-07-24 — one plan spelling table; a typo can no longer downgrade a customer
+- did: The plan-name coercion `if eql("max") .max else if eql("pro") .pro else .free` was written
+  out twice — in `deploy/service.zig` adminBilling (ADMIN INPUT) and in `auth_core.zig` when
+  loading a stored user row. In the admin path it meant `POST /admin/billing {"plan":"Pro"}`
+  answered ok while quietly putting a paying customer on free, with no signal to the admin. Added
+  `ent.parsePlan` (trims, case-insensitive, null for unknown) next to `Plan`, and split the two
+  callers' intents explicitly: the admin endpoint now REJECTS an unknown name with a 400, while
+  the storage path keeps its deliberate fall-back to least privilege on a corrupt row. Both now
+  share one spelling table. The test is exhaustive over the enum, so a future tier that gets no
+  spelling fails the build rather than becoming unreachable through the API.
+- verified: first run RED — I added `const std = @import("std")` at the top of entitlements.zig
+  without noticing the file already declares it below its prose block (Zig top-level decls are
+  order-independent, so the existing one was already in scope). Removed mine; second run ALL
+  GREEN, exit 0.
+- learned: BEHAVIOR CHANGE worth flagging to the owner — an admin call that previously "succeeded"
+  with a mistyped plan now returns 400. That is the point (silence was the bug), but it is a
+  visible API change, not just an internal fix.
+- ratchet: none this sitting; 0019's TESTING.md carried the load (the exhaustive-over-the-enum
+  pattern came straight from it).
+- next: fold the key-vault lane; then the frontier is mostly HTTP handlers needing a request
+  harness, so the honest next lane may be H10 (SELF) rather than more unit tests.
