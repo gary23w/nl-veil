@@ -659,3 +659,27 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - next: if that link flake recurs, the fix is a narrow retry or a raylib link-warning allowance in
   check.sh — not a code change. Otherwise unchanged: H24's remaining handlers, the 4 desk modules,
   H14 and H10 for the owner.
+
+## 0031 — 2026-07-25 — the god-mode routes, swept and kept swept
+- did: `admin/admin_service.zig` — 14 routes that ban, delete, force-kill swarms, read anyone's
+  activity and rewrite the server's defaults, none of them tested. Three test blocks:
+  (1) a SWEEP running every route twice, once as a stranger and once as an ordinary logged-in
+  account — the second case is the sharp one, since a bug that admits any authenticated user is
+  invisible to an anonymous-only test — asserting 401 both times, that the ordinary account really
+  is non-admin (or the sweep would pass vacuously), and that nothing the sweep touched took effect;
+  (2) an EXHAUSTIVENESS GUARD that reads the module's own source via `@embedFile` and fails on any
+  `pub fn admin*` missing from the sweep table, so a 15th route cannot ship unswept — the same
+  source-audit posture as `chat/trio_routing_test.zig`; (3) moderation semantics: a ban bites (the
+  banned account cannot log back in), an admin cannot ban themselves even with different casing,
+  an unknown verb is refused rather than guessed, a missing user is 404 not silent success, and the
+  act is attributed in the audit log with the chain still verifying — while a refused act leaves no
+  audit entry.
+- verified: full oracle ALL GREEN, exit 0, first try. Needs no store (Auth's in-memory maps + its
+  fail-open write), so it runs on a clean checkout — the 0030 lesson applied rather than relearned.
+- learned: the interesting half of an auth test is the AUTHENTICATED non-privileged caller. Every
+  handler test before this one only proved anonymous callers bounce, which would not catch
+  requireAdmin degrading into requireUser.
+- ratchet: the exhaustiveness guard — coverage that maintains itself, since the failure mode it
+  guards (a new ungated route) is exactly the one a hand-written list would otherwise miss.
+- next: deploy/service, chat/service and fanout close out H24; 4 desk modules remain; H14 and H10
+  are still the owner's.
