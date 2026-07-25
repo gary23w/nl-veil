@@ -1782,3 +1782,29 @@ edit, confirm it applied, then run.
 - next: audit yield is falling — four sweeps this stretch (result enums, fixed-size memcpy, security
   claim strings, constant-degrading bufPrint) found no bugs; the fifth (swallowed writes, 0070)
   found a diagnostic gap. The tree is in genuinely good shape. H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0072 — 2026-07-25 — the comment that says "must match", now enforced
+- did: applied 0071's lens — pin the RELATIONSHIP, not just the facts — to the instance the code
+  flags itself. `desk/src/chat.zig` declares `cast_conv: [64]u8` with the note "(must match
+  sc_conv[64]: startServerCastWatch copies sc_conv here, and a >40-byte conv id would otherwise
+  silently no-op the server-cast display)". That is a comment asking a human to keep two array sizes
+  in different declarations equal — the same class as 0057's `CHAT_SCHEMA` "keep them in sync" and
+  0058's `isCommand`/`dispatch`.
+- the failure mode is the one this repo keeps producing, not a crash: the copy IS guarded
+  (`conv.len > cast_conv.len` returns early), so shrinking `cast_conv` is memory-safe. It just means
+  a conv id that fits `sc_conv` and not `cast_conv` makes the guard fire and the server-cast display
+  SILENTLY stops watching. Nothing errors, nothing logs, the panel never updates. The comment's own
+  author saw this — "would otherwise silently no-op" — and wrote a note instead of a check.
+- did: one test asserting the two lengths are equal, plus a floor (>= 64) so shrinking BOTH together
+  is caught too. Reading `.len` of a fixed-size array is comptime, so `const c: Chat = undefined`
+  touches no memory — the type is the whole subject.
+- verified: desk suite exit 0; counterfactual with the injection printed (cast_conv 64 → 32) fails
+  the named test. Full oracle green.
+- learned: three "keep X in sync" comments have now been converted to checks in this ledger (0057,
+  0058, 0072), and all three were written by someone who had ALREADY reasoned out the failure — the
+  comments describe the exact bug that would result. The knowledge was never missing; only its
+  enforcement was. A comment that predicts a specific failure is a test that has not been written
+  yet, and it is worth grepping for that phrasing on purpose rather than waiting to trip over it.
+- ratchet: the size-equality test.
+- next: audit yield has fallen to near zero on fresh sweeps; the productive vein is now converting
+  the tree's own "must match" notes into checks. H13 watch; H10, H14b, H26, H28 owner's.

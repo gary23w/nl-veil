@@ -14231,3 +14231,22 @@ test "jInt refuses an over-long literal instead of trapping (the desk builds Rel
     try std.testing.expectEqual(@as(?i64, null), jInt("{\"ms\":-99999999999999999999999}", "ms"));
     try std.testing.expectEqual(@as(?i64, null), jInt("{\"other\":1}", "ms"));
 }
+
+test "cast_conv and sc_conv are the SAME size — the comment that says so, enforced" {
+    // chat.zig declares `cast_conv: [64]u8` with the note "(must match sc_conv[64])", and that is a
+    // comment asking a human to maintain a relationship between two array sizes in different places.
+    // The copy between them (startServerCastWatch) is guarded — `conv.len > cast_conv.len` returns
+    // early — so shrinking cast_conv is not a memory-safety bug. It is worse in the way this repo
+    // keeps finding: a conv id that fits sc_conv but not cast_conv makes that guard fire and the
+    // server-cast display SILENTLY stops watching, which is exactly what the comment warns about.
+    // Nothing failed, nothing logged, the panel just never updates.
+    //
+    // Each size is obvious on its own; only their EQUALITY is load-bearing, and it was unpinned
+    // (ledger 0071's lens: pin the relationship, not just the facts).
+    const c: Chat = undefined; // reading `.len` of a fixed-size array is comptime — no memory is touched
+    try std.testing.expectEqual(c.sc_conv.len, c.cast_conv.len);
+
+    // Both must also still hold a real conv id. 64 is the working assumption everywhere that copies
+    // one; a shrink below that would start silently dropping ids rather than erroring.
+    try std.testing.expect(c.cast_conv.len >= 64);
+}
