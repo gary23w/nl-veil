@@ -71,7 +71,10 @@ if [ "${1:-}" = "--scan" ]; then
   vm=$(sed -n 's/.*VERSION = "\([^"]*\)".*/\1/p' src/main.zig | head -1)
   if [ "$vz" = "$vm" ]; then echo "[version] $vz (zon matches main.zig)"; else echo "[version] zon=$vz main.zig=$vm -- stamp both (scripts/bump-version.ps1)"; fi
   grep -q "$vz" bin/MANIFEST.txt || echo "[version] bin/MANIFEST.txt carries no '$vz' stamp"
-  echo "[markers] $(grep -rE 'TODO|FIXME|HACK|XXX' src desk/src --include='*.zig' | wc -l | tr -d ' ') TODO/FIXME/HACK/XXX across src + desk/src"
+  # Word-bounded on purpose: without \b this counted ten `\uXXXX` doc-comment hits as debt, and a
+  # signal that always reports phantom work is one you learn to skip. Keep IDENTICAL to check.ps1's
+  # pattern -- the oracle-parity signal compares GATES only, so scan drift is caught by nothing.
+  echo "[markers] $(grep -rE '\bTODO\b|\bFIXME\b|\bHACK\b|\bXXX\b' src desk/src --include='*.zig' | wc -l | tr -d ' ') TODO/FIXME/HACK/XXX across src + desk/src"
   exit 0
 fi
 

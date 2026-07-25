@@ -194,6 +194,13 @@ commands are unreachable" (0058). Before reporting what a one-off script found, 
 number a second way** — brace-match instead of regex, count from the other side, spot-check one hit
 by hand. When the two methods disagree, the disagreement is the finding.
 
+**A counterfactual has two halves: inject, then observe. Assert the injection landed.** Breaking the
+code to prove a guard fails is the strongest verification here — and it silently inverts if the
+break never applied. In 0059 a `sed` with over-escaped backslashes changed nothing, the guard
+correctly stayed quiet, and the quiet read as "my new guard is worthless" — one step from deleting a
+working check. Print the proof: `sed -i ... && echo "INJECTED: $(grep -c <marker> file)"`, then run.
+No injection count, no counterfactual — you tested the unmodified code and learned nothing.
+
 Two local quirks worth knowing:
 
 - Windows Defender can kill the build runner's test IPC: the failure names no test, just
