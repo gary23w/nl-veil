@@ -1861,3 +1861,24 @@ edit, confirm it applied, then run.
   applies to entries, not just the open-items table).
 - verified: full oracle green (ledger-only change, run for the discipline rather than the risk).
 - next: nothing outstanding in this vein. H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0075 — 2026-07-25 — the ratchet 0074 earned
+- did: 0074 corrected a false `next:` claim, and the interesting part was WHY that line was wrong
+  while the rest of the entry was right. Every other line in a ledger entry describes work just done
+  and verified; `next:` describes work NOT started, written at the end of an increment when the
+  author is finished and least inclined to check anything. It is structurally the least-verified
+  sentence in the record — and the one most likely to be acted on, because the next worker reads it
+  as a finding rather than a guess.
+- did: put that in the skill's RECORD step, where it will be read before the line is written rather
+  than after: verify a `next:` claim, or mark it as unverified ("looks like", "worth checking").
+  Also stated the correction protocol explicitly — a wrong entry is fixed by a LATER entry saying so,
+  never by editing history, because a ledger that quietly rewrites itself is not a record.
+- learned: this is the second harness rule this sitting to come from a mistake I made rather than a
+  defect in the code (the first: 0059's "no injection count, no counterfactual"). Both were invisible
+  while things were going well and obvious the moment something went wrong — which is the argument
+  for writing the rule at the moment of the failure, while the reason is still concrete, instead of
+  as general advice later.
+- verified: full oracle green.
+- ratchet: this IS the ratchet.
+- next (verified, per the rule above): nothing outstanding — open items are H13 (watch), and H10,
+  H14b, H26, H28 (owner's). The frontier's remainder is documented as deliberately uncovered in H4.

@@ -45,7 +45,15 @@ Run the loop:
 
 6. **RECORD** — Append a ledger entry (template below) at the BOTTOM of `harness/LEDGER.md`.
    Close your open item; add any new items you discovered. Entries are append-only — never rewrite
-   or renumber history.
+   or renumber history. Wrong entries get CORRECTED by a later entry that says so plainly (0074);
+   a ledger that quietly edits itself is not a record.
+
+   **`next:` is the least reliable line you will write.** Everything else in an entry describes work
+   you just did and verified; `next:` describes work you have NOT started, written when you are
+   finished and least inclined to check. In 0073 it named an "unfinished" coupling that was already
+   covered by a test whose own name said so — found only because the following session happened to
+   follow up on it. So: either verify a `next:` claim before writing it, or mark it as unverified
+   ("looks like", "worth checking"). The next worker will read it as a finding.
 
 7. **RATCHET** — Before finishing, make one small improvement to the harness itself: a new `-Scan`
    signal, a tightened gate, a stale doc corrected, a sharper hard rule, a better sentence in this
