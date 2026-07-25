@@ -7667,7 +7667,8 @@ pub const Chat = struct {
         self.stream.deinit(self.gpa); // now safe — name/raw_args are owned copies
 
         // VERSION CONTROL runs entirely DESK-SIDE (never a server round-trip): the GitHub PAT stays in this
-        // process, sealed at rest, and is used by gitvc without ever crossing the wire or the transcript. Git
+        // process (plaintext-local at rest — see secrets.zig and gitvc's header; the two other comments in
+        // this file already say so) and is used by gitvc without ever crossing the wire or the transcript. Git
         // operates in this conversation's own build dir. Handled here and returned — it never reaches the shared
         // tool endpoint.
         if (isGitToolName(name)) {
