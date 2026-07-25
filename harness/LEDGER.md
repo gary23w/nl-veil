@@ -11,7 +11,8 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 |-----|-----|------|
 | H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
 | H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
-| H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
+| H14b | OWNER | The STRINGS now tell the truth (0048), which was the part that could be fixed without a decision. The decision itself is still open: leave the GitHub PAT plaintext-local (current, defensible for a local login-gated app) or restore sealing at rest (`secrets.zig` says "we never seal again" — a deliberate past choice, and DPAPI is Windows-only so it would not be uniform). Nothing is lying to a user in the meantime. |
+| H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). |
 | H10 | horizon | SELF lane: let `veil cast` target this repo with acceptance rows that run the real oracle, under a standing `lineage: nl-veil-self` id; retrospectives append here (Ring 2). |
@@ -1047,6 +1048,29 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: signal 6b, the palette mirror. Four drift-guards now (twins, rate table, oracles, theme)
   plus the docs mirror and catalog sync — six things that must agree, six things that now say so.
 - next: H13 (forensic); base64 helpers are the last named family; H14, H26, H10 are the owner's.
+
+## 0048 — 2026-07-25 — the app stops telling users something untrue; the last family audits clean
+- did: TWO things, one of which is a null result worth writing down.
+  (1) H14's fixable half. `secrets.zig` stores the GitHub PAT as PLAINTEXT on every OS (DPAPI
+  survives only to unseal legacy files once), and `chat.zig` says so correctly in two comments —
+  while `gitvc.zig`'s header AND a message shown to the user both claimed it was "sealed at rest".
+  Whichever posture the owner eventually picks, a false security claim is wrong in every version of
+  the answer, so the strings now say what the code does: kept in a local file readable by your
+  account, never written to the transcript, never sent over the wire — which are the properties
+  gitvc genuinely enforces (no argv, no `.git/config`, no transcript). No "sealed at rest" claim
+  survives anywhere in the tree.
+  (2) The base64 family, last on 0045's list. Every helper uses `std.base64.standard`, so no
+  alphabet disagreement is possible; the only divergence risk was ERROR HANDLING, which is exactly
+  where `deriveServerKey`'s bug lived. Audited all five decode sites: each either `try`s (propagates
+  every error) or `catch return null` (fails closed). CLEAN — nothing to fix, and that is the
+  finding rather than an excuse to change something.
+- verified: full oracle ALL GREEN, exit 0.
+- learned: a family audit that finds nothing is still worth the increment and worth recording — the
+  next worker should not have to re-derive that base64 is fine, and "I looked and it was clean" is
+  a different statement from "nobody has looked".
+- ratchet: none new.
+- next: H26 and H14b need the OWNER; H13 is a watch item, not work; H10 is the horizon and I am not
+  building self-modification of this repo without an explicit go-ahead.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,

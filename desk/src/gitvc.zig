@@ -3,8 +3,10 @@
 //! `gh` CLI (any of which are blocked or absent in restricted regions) — just a Personal Access Token over
 //! HTTPS, which works anywhere `git` + `curl` do.
 //!
-//! Keeping the token out of any readable surface is the whole point. The PAT here:
-//!   * is stored sealed via secrets.zig (DPAPI on Windows), never in settings.json or any repo-tracked file;
+//! Keeping the token out of any TRANSMITTED or SHARED surface is the whole point. The PAT here:
+//!   * is stored by secrets.zig as PLAINTEXT in the local data dir — this is a local, login-gated app and
+//!     nothing is sealed any more (DPAPI survives there only to unseal legacy files one last time). It is
+//!     never in settings.json and never in a repo-tracked file, but anyone with the account can read it;
 //!   * NEVER rides on an argv (visible in the process list) — repo creation puts it in a curl `-K` config file
 //!     (the exact trick llm.zig uses for the model key), deleted immediately after the call;
 //!   * NEVER lands in `.git/config`'s remote URL or the transcript — push authenticates through a one-shot
@@ -159,7 +161,11 @@ pub fn sanitizeRepoName(in: []const u8, out: []u8) []const u8 {
 /// NEVER on the argv — the file is written under `sidecar_dir`, used, and deleted immediately. Returns the parsed
 /// repo info (clone/html url) or an error message. `name` is used verbatim (caller sanitizes).
 pub fn repoCreate(gpa: std.mem.Allocator, io: Io, sidecar_dir: []const u8, pat: []const u8, name: []const u8, private: bool) Res {
-    if (pat.len == 0) return res(gpa, false, "no GitHub token configured — set one with `::pat <token>` (or the Settings pane) first. It is sealed at rest and never written to the transcript.", .{});
+    // The claim in this message is the one thing here a user cannot check for themselves, so it says
+    // what secrets.zig actually does: a plaintext file under the local data dir. What IS guaranteed —
+    // never on an argv, never in the transcript, never over the wire — is stated instead, because
+    // those are the properties gitvc genuinely enforces.
+    if (pat.len == 0) return res(gpa, false, "no GitHub token configured — set one with `::pat <token>` (or the Settings pane) first. It is kept in a local file readable by your account, never written to the transcript and never sent over the wire.", .{});
     if (name.len == 0) return res(gpa, false, "a repository name is required.", .{});
     // curl config: the auth header (with the PAT) lives here, off the argv. Deleted in defer.
     const cfg_path = std.fmt.allocPrint(gpa, "{s}/.ghcurlcfg", .{sidecar_dir}) catch return res(gpa, false, "oom", .{});
