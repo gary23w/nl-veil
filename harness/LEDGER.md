@@ -984,6 +984,29 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: this entry IS the ratchet — the harness now checks its own halves against each other.
 - next: H13 (forensic) is the last low item; H14, H26, H10 are the owner's.
 
+## 0045 — 2026-07-25 — eleven JSON escapers, two of them wrong, one reachably
+- did: Applied 0044's lens deliberately — went looking for another family that is supposed to agree
+  — and found the biggest one in the tree: ELEVEN hand-rolled JSON string escapers. Three complete
+  (gateway/http.jstr, worker/llm.jstr, audit_log.jesc). Two deliberately lossy but VALID
+  (desk/chat.escJson maps control bytes to a space; recipes/chat-tools escape properly). Two
+  emitted control bytes RAW, which is invalid JSON:
+  * `cli/hub.jstr` — the reachable one. `veil hub all "<text>"` feeds operator-typed text straight
+    in, and it escaped only `"`, `\` and `\n`. Paste anything copied on Windows and the CR goes in
+    raw: the server's parser rejects the body, the broadcast never reaches the swarms, and nothing
+    on screen says why. A tab did the same. Now matches http.jstr exactly, with a test that feeds a
+    CRLF paste, a tab, quotes, a backslash and NUL/BEL/VT and asserts each round-trips byte-for-byte
+    through a real parser with the enclosing object still closing.
+  * `desk/main.jesc` — passed everything below 0x20 through untouched. Its `\r`-drop and tab→space
+    ARE deliberate (single-line UI fields), so those stayed; only the raw-emit became `\uXXXX`.
+- verified: full oracle ALL GREEN, exit 0, first try.
+- learned: no single-escaper test would have found this. Each of the eleven looks reasonable read on
+  its own; the defect only exists relative to the others. That is the third time in three increments
+  that comparing supposed-identical things beat inspecting any one of them, and the first time it
+  turned up a bug a user could hit today rather than a latent one.
+- ratchet: none new — 0044's lens IS the ratchet, and this entry is it paying out.
+- next: H13 (forensic); H14, H26, H10 are the owner's. Remaining families worth the same treatment
+  if anyone wants one: the several base64 helpers, and the two workdir-path sanitisers.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

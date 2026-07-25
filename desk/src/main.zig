@@ -5420,6 +5420,13 @@ fn boolStr(v: bool) []const u8 {
     return if (v) "true" else "false";
 }
 
+/// Escape one JSON string body (the caller writes the surrounding quotes).
+///
+/// Dropping `\r` and flattening a tab to a space are deliberate — this feeds single-line UI fields,
+/// not a lossless channel. Passing every OTHER control byte through untouched was not: a raw byte
+/// below 0x20 inside a JSON string is invalid, so one stray character in a pasted field made the
+/// whole document unparseable at the far end. Those now become `\uXXXX`, which keeps the output
+/// valid without changing what the deliberate cases do.
 fn jesc(w: *std.Io.Writer, s: []const u8) void {
     for (s) |c| {
         switch (c) {
@@ -5428,7 +5435,10 @@ fn jesc(w: *std.Io.Writer, s: []const u8) void {
             '\n' => w.writeAll("\\n") catch {},
             '\r' => {},
             '\t' => w.writeAll(" ") catch {},
-            else => w.writeByte(c) catch {},
+            else => if (c < 0x20) {
+                var b: [6]u8 = undefined;
+                w.writeAll(std.fmt.bufPrint(&b, "\\u{x:0>4}", .{c}) catch "") catch {};
+            } else w.writeByte(c) catch {},
         }
     }
 }

@@ -10,6 +10,7 @@ test {
     _ = @import("auth/auth_core.zig"); // tool_grants persistence + the admin-email predicate
     _ = @import("auth/login_guard.zig"); // per-IP fail window, lockout expiry, per-address isolation
     _ = @import("cli.zig");
+    _ = @import("cli/hub.zig"); // broadcast body escaping: a pasted CRLF must not break the JSON
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/key_vault.zig"); // registered DIRECTLY: reaching the root through another
     // module is not proof of collection — lazy analysis silently dropped desk/assets.zig's tests
