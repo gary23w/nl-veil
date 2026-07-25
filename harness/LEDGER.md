@@ -1833,3 +1833,31 @@ edit, confirm it applied, then run.
   for the next worker (0072 converted one, this converted another; `run.zig:9829`'s saturating-op
   pair is the next candidate and is NOT yet done).
 - next: H13 watch; H10, H14b, H26, H28 owner's.
+
+## 0074 — 2026-07-25 — CORRECTION to 0073, and the "must match" vein is mined out
+- correction: 0073's `next:` line says `run.zig:9829`'s saturating-op pair "is the next candidate and
+  is NOT yet done". That is WRONG, and it shipped. Line 9829 sits INSIDE a test — `test
+  "neuronsForCfModel agrees with the control plane's rate table on every row (the copies must not
+  drift)"` — which walks every rate row and then asserts both implementations agree at
+  `maxInt(u64)` on each side, which is exactly the saturation case the comment describes. The
+  coupling was fully enforced before I named it as outstanding. I grepped for the PHRASE and wrote
+  down the hit without reading what surrounded it — the same shortcut that produced the phantom
+  "four broken CLI commands" in 0058 and the phantom marker debt in 0059.
+- swept the rest of the vein properly this time, reading each hit's context:
+  * ALREADY ENFORCED: `neuronsForCfModel` (above); `chat/sync.zig`'s `safeSyncPath` ("the shared
+    checker every side applies" — already one function, and tested); `engine.zig:460`'s "the gate and
+    the schema must agree" (inside the turn-tools test); `neuron/client.zig`'s "the listing must stay
+    clean" (0042 + 0053); `locs/atlas.zig:911` (inside a test).
+  * NOT COUPLINGS: `http.zig:65` (an OAuth redirect matching something registered with the PROVIDER —
+    external, unenforceable here), `main.zig:221` (console-subsystem, a link setting),
+    `context.zig:4` and `engine.zig:5681` (design statements, not two things that must agree).
+  * CONVERTED: 0072 (`cast_conv`/`sc_conv` sizes), 0073 (`hasScore`, four copies → one).
+  So the vein yielded two real conversions out of eleven candidates, and is now exhausted.
+- learned: I found this while following up on my own "next" line — which is the only reason it
+  surfaced. A ledger entry's forward-looking claims get acted on by someone who trusts them, and
+  they are written at the point of LEAST verification: the end of an increment, about work not yet
+  started. Everything else in an entry describes something just done and checked. Treat `next:` as
+  the least reliable line in any entry, mine included, and re-derive before acting (0060's PICK rule
+  applies to entries, not just the open-items table).
+- verified: full oracle green (ledger-only change, run for the discipline rather than the risk).
+- next: nothing outstanding in this vein. H13 watch; H10, H14b, H26, H28 owner's.
