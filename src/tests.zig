@@ -32,6 +32,7 @@ test {
     _ = @import("worker/chat/trio_routing_test.zig"); // label->role routing guard (reads engine.zig as source)
     _ = @import("plan/entitlements.zig"); // the plan -> caps wall
     _ = @import("plan/neurons.zig"); // the metered-AI spend ledger
+    _ = @import("worker/control/fanout.zig"); // whose events you may read, and the poll cursor clients get
     _ = @import("worker/control/supervisor.zig");
     _ = @import("worker/control/writer.zig"); // control-bus wire shape; escaping blocks op smuggling
     _ = @import("worker/commons.zig"); // swarm bus + task board (bus delivery, board fold, escape traps)

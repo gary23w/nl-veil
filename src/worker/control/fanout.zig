@@ -182,3 +182,195 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
         ticks += 1;
     }
 }
+
+// ---------------------------------------------------------------------------
+// tests — see harness/TESTING.md (Handlers). A swarm's events.jsonl is the whole run: its prompts,
+// its outputs, every tool call. So the property under test is WHOSE events you can read, followed
+// by the byte-cursor contract these endpoints publish (worker/evcursor.zig owns its unit tests;
+// here it is exercised through the handler that clients actually call).
+// ---------------------------------------------------------------------------
+
+const Swarm = @import("supervisor.zig").Swarm;
+
+/// TEST ONLY. Register a swarm owned by `uid` without launching anything (Supervisor.spawn starts a
+/// real process). Caller frees via `dropTestSwarm`.
+fn addTestSwarm(sup: *Supervisor, gpa: std.mem.Allocator, id: []const u8, uid: u64, run_dir: []const u8) !void {
+    const sw = try gpa.create(Swarm);
+    sw.* = .{
+        .id = try gpa.dupe(u8, id),
+        .uid = uid,
+        .name = try gpa.dupe(u8, "test swarm"),
+        .run_dir = try gpa.dupe(u8, run_dir),
+        .model = try gpa.dupe(u8, "mock"),
+        .minds = 1,
+        .created = 0,
+        .state = .running,
+    };
+    try sup.swarms.put(gpa, sw.id, sw);
+}
+
+fn dropTestSwarms(sup: *Supervisor, gpa: std.mem.Allocator) void {
+    var it = sup.swarms.iterator();
+    while (it.next()) |e| {
+        const sw = e.value_ptr.*;
+        gpa.free(sw.id); // also the map key — one allocation, freed once
+        gpa.free(sw.name);
+        gpa.free(sw.run_dir);
+        gpa.free(sw.model);
+        gpa.destroy(sw);
+    }
+    sup.swarms.deinit(gpa);
+    sup.swarms = .empty;
+}
+
+test "a swarm's event stream is readable by its owner and nobody else" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-fanout-tmp");
+    defer ta.deinit();
+    defer dropTestSwarms(ta.app.sup, gpa);
+
+    // Two accounts; uid 1 is admin by default, but ownership here is by uid, not by privilege —
+    // which is the point: even the admin's own routes go through the same uid check.
+    ta.auth.register("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    ta.auth.register("two@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok_one = ta.auth.login("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok_one);
+    const tok_two = ta.auth.login("two@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok_two);
+    const cookie_one = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok_one});
+    defer gpa.free(cookie_one);
+    const cookie_two = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok_two});
+    defer gpa.free(cookie_two);
+    const uid_one = (ta.auth.whoami(tok_one) orelse return error.TestUnexpectedResult).id;
+
+    // A swarm owned by account one, with a real events file behind it.
+    const run_dir = "zig-fanout-tmp/run-one";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const EVENTS = "{\"t\":\"started\"}\n{\"t\":\"round\",\"n\":1}\n{\"t\":\"stopped\"}\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/events.jsonl", .data = EVENTS });
+    try addTestSwarm(ta.app.sup, gpa, "sw-one", uid_one, run_dir);
+
+    // a stranger
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.param("id", "sw-one");
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+    // the OTHER account, properly logged in — the leak this check exists to prevent
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_two);
+        web.param("id", "sw-one");
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+        try std.testing.expect(std.mem.indexOf(u8, web.res.body, "round") == null); // no bytes leaked
+    }
+    // …and the SSE endpoint gates identically, before it ever takes over the socket
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_two);
+        web.param("id", "sw-one");
+        try swarmStream(&ta.app, web.req, web.res);
+        try web.expectStatus(401);
+    }
+    // an id nobody owns is 404, not 401 — a client can tell "gone" from "not yours"
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_one);
+        web.param("id", "sw-nope");
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(404);
+    }
+    // no id at all is a bad request
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_one);
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(400);
+    }
+    // the owner reads the whole log, and is told where to resume
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie_one);
+        web.param("id", "sw-one");
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expectEqualStrings(EVENTS, web.res.body);
+        var nb: [24]u8 = undefined;
+        try web.expectHeader("X-Next-Offset", try std.fmt.bufPrint(&nb, "{d}", .{EVENTS.len}));
+    }
+}
+
+test "the poll cursor a client is handed: caught-up is empty, and the probe answers a length" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-fanout-cursor-tmp");
+    defer ta.deinit();
+    defer dropTestSwarms(ta.app.sup, gpa);
+
+    ta.auth.register("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    const tok = ta.auth.login("one@example.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(tok);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{tok});
+    defer gpa.free(cookie);
+    const uid = (ta.auth.whoami(tok) orelse return error.TestUnexpectedResult).id;
+
+    const run_dir = "zig-fanout-cursor-tmp/run";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, run_dir, .default_dir) catch {};
+    const EVENTS = "{\"t\":\"a\"}\n{\"t\":\"b\"}\n";
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = run_dir ++ "/events.jsonl", .data = EVENTS });
+    try addTestSwarm(ta.app.sup, gpa, "sw", uid, run_dir);
+
+    var offbuf: [24]u8 = undefined;
+    const at_end = try std.fmt.bufPrint(&offbuf, "{d}", .{EVENTS.len});
+
+    // caught up: nothing to send, cursor unchanged — the quiet poll that must not re-deliver
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "sw");
+        web.query("from", at_end);
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expectEqualStrings("", web.res.body);
+        try web.expectHeader("X-Next-Offset", at_end);
+    }
+    // a cursor from the middle delivers only the remainder
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "sw");
+        web.query("from", "10");
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        try std.testing.expectEqualStrings(EVENTS[10..], web.res.body);
+    }
+    // the size probe: a length, not a backlog — how a watcher baselines at the tail
+    {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "sw");
+        var pb: [32]u8 = undefined;
+        web.query("from", try std.fmt.bufPrint(&pb, "{d}", .{evcursor.PROBE}));
+        try swarmEvents(&ta.app, web.req, web.res);
+        try web.expectStatus(200);
+        const body = (try web.getJson()).object;
+        try std.testing.expect(body.get("ok").?.bool);
+        try std.testing.expectEqual(@as(i64, EVENTS.len), body.get("len").?.integer);
+    }
+}
