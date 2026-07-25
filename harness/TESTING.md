@@ -79,9 +79,18 @@ try myHandler(&ta.app, web.req, web.res);
 try web.expectStatus(400);
 ```
 
-`keys`, `ledger` and `plugs` start null — set them if the handler needs one. Registering a real
-user needs the neuron binary, so prefer the unauthenticated and rejection paths (they are the
-security-relevant ones anyway) and skip honestly for the rest. (Extraction is still right when the
+**Build the io with `http.testEnviron()`**, not `.{}` — `testApp`'s vault, key store and user store
+all reach the neuron binary, and an empty environment makes those calls fail. The symptom is
+misleading: Auth fails OPEN (register and login appear to succeed off its in-memory maps) while the
+vault propagates, so a handler that should answer 201 answers 400 and nothing says why.
+
+```zig
+var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+```
+
+`keys`, `ledger` and `plugs` start null — set them if the handler needs one. An authenticated test
+can `auth.register` then `auth.login` for a session token and pass it as the `nl_sess` cookie; skip
+honestly if either fails, since that means no usable store on this box. (Extraction is still right when the
 LOGIC deserves to be its own tested unit — evcursor, parsePlan — just not as a testing workaround.)
 
 ## Proving a property instead of a spelling

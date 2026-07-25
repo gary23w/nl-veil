@@ -4,6 +4,7 @@
 
 test {
     _ = @import("auth/api_keys.zig"); // nlk_ key minting, hash-only retention, exact-match verify, revoke
+    _ = @import("auth/auth_api.zig"); // the front door: closed registration, login throttle, gated key routes
     _ = @import("auth/auth_core.zig"); // tool_grants persistence + the admin-email predicate
     _ = @import("auth/login_guard.zig"); // per-IP fail window, lockout expiry, per-address isolation
     _ = @import("cli.zig");

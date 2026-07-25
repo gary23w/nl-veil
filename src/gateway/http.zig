@@ -1,6 +1,7 @@
 //! HTTP layer shared context — the `App` wiring struct plus the auth / JSON / error helpers every handler uses.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpz = @import("httpz");
 const auth_core = @import("../auth/auth_core.zig");
 // The recipe-tool registry (admin-authored data recipes). Imported for its type only — http.zig holds the
@@ -244,10 +245,32 @@ pub fn authErr(res: *httpz.Response, e: anyerror) !void {
 // It is HEAP-allocated on purpose: App holds pointers INTO this struct, so it must not move.
 // ---------------------------------------------------------------------------
 
+/// TEST ONLY. The environment block a test's `std.Io.Threaded` must be built with whenever
+/// anything it drives can reach a child process — which for `testApp` means anything touching the
+/// vault, the key store or the user store, since those go through the neuron binary.
+///
+/// `std.Io.Threaded.init(gpa, .{})` hands children an EMPTY environment: under `zig build test`
+/// the binary then comes up with no TEMP and no SystemRoot and every call fails. Auth FAILS OPEN on
+/// that (its in-memory maps still work, so register and login appear to succeed) while the vault
+/// propagates the error — which surfaces as a mystifying 400 from a handler that should have
+/// answered 201. Use this instead of `.{}`:
+///
+///     var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+pub fn testEnviron() std.process.Environ {
+    return if (builtin.os.tag == .windows)
+        .{ .block = .global }
+    else
+        .{ .block = .{ .slice = std.mem.span(std.c.environ) } };
+}
+
 pub const TestApp = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     root: []u8,
+    /// The neuron db PATH, owned here because `Neuron` stores it by reference — freeing it at the
+    /// end of `testApp` left every store call reading freed memory, which surfaced as handlers
+    /// answering 400 where they should have answered 201.
+    db: []u8,
     auth: Auth,
     sup: Supervisor,
     audit: AuditLog,
@@ -264,7 +287,9 @@ pub const TestApp = struct {
         self.reg.deinit();
         self.vault.deinit();
         self.guard.deinit();
+        self.auth.deinit(); // users + sessions, so authenticated tests are leak-free
         gpa.free(self.audit.path); // AuditLog.init allocPrints its path and has no deinit
+        gpa.free(self.db);
         gpa.destroy(self);
         std.Io.Dir.cwd().deleteTree(io, root) catch {};
         gpa.free(root);
@@ -285,10 +310,10 @@ pub fn testApp(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !*TestApp {
     self.gpa = gpa;
     self.io = io;
     self.root = try gpa.dupe(u8, root);
+    errdefer gpa.free(self.root);
 
-    const db = try std.fmt.allocPrint(gpa, "{s}/test.db", .{root});
-    defer gpa.free(db);
-    const nb = Neuron.init(gpa, io, "bin/neuron.exe", db);
+    self.db = try std.fmt.allocPrint(gpa, "{s}/test.db", .{root});
+    const nb = Neuron.init(gpa, io, if (builtin.os.tag == .windows) "bin/neuron.exe" else "bin/neuron", self.db);
 
     self.auth = Auth.init(gpa, nb);
     self.sup = Supervisor.init(gpa, io, "bin/neuron.exe");

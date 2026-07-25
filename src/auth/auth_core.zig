@@ -44,6 +44,37 @@ pub const Auth = struct {
         return .{ .gpa = gpa, .nb = nb };
     }
 
+    /// Free both maps and everything they own. In main.zig the Auth is a process-lifetime
+    /// singleton, so this exists for tests and any future scoped instance — without it an
+    /// authenticated handler test cannot run leak-free under std.testing.allocator.
+    ///
+    /// NOTE the aliasing: `users` is keyed on the User's OWN email slice (`users.put(gpa, u.email,
+    /// u)`), so the key and `u.email` are one allocation and must be freed exactly once — hence
+    /// iterating values here, never keys.
+    pub fn deinit(self: *Auth) void {
+        var sit = self.sessions.iterator();
+        while (sit.next()) |e| {
+            self.gpa.free(e.key_ptr.*); // the token
+            self.gpa.free(e.value_ptr.*); // its email dupe
+        }
+        self.sessions.deinit(self.gpa);
+
+        var uit = self.users.valueIterator();
+        while (uit.next()) |u| {
+            self.gpa.free(u.email); // ALSO the map key — one allocation, freed once
+            self.gpa.free(u.pwhash);
+            freeGrants(self.gpa, u.tool_grants); // the &.{} sentinel frees as a no-op
+        }
+        self.users.deinit(self.gpa);
+
+        if (self.admin_email) |e| self.gpa.free(e);
+        if (self.dummy) |d| self.gpa.free(d);
+        self.users = .empty;
+        self.sessions = .empty;
+        self.admin_email = null;
+        self.dummy = null;
+    }
+
     pub fn setAdminEmail(self: *Auth, email: ?[]const u8) void {
         const e = email orelse DEFAULT_ADMIN_EMAIL;
         self.admin_email = self.gpa.dupe(u8, e) catch null;
