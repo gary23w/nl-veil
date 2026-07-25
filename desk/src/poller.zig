@@ -1220,3 +1220,112 @@ fn jstr(body: []const u8, key: []const u8) ?[]const u8 {
     }
     return jstr_buf[0..w];
 }
+
+// ---------------------------------------------------------------------------
+// tests — the parsers that turn a server reply into what the desk renders. They are hand-rolled,
+// they run on the io thread, and their input is a mix of server fields and USER-AUTHORED text
+// (task names, prompts), which is where a field-extraction bug becomes a misread row rather than a
+// crash. See harness/TESTING.md.
+// ---------------------------------------------------------------------------
+
+test "parseSchedTask: a prompt that contains key-shaped text is never read as a field" {
+    // The claim this pins is stated on nextJsonPair: values are consumed token-wise, so a needle
+    // inside a free-text string cannot be mistaken for the field it imitates. A task's prompt is
+    // user-authored, so this is the difference between rendering a row and rendering a lie.
+    var row: store_mod.SchedRow = .{};
+    // The imitations sit AFTER the real fields on purpose: a misparse would OVERWRITE them, so
+    // every assertion below fails if the walker is fooled. With the prompt first, the genuine
+    // values would land afterwards and paper over the bug.
+    parseSchedTask(
+        \\{"id":"t1","name":"nightly","kind":"every","every_min":30,
+        \\ "at":0,"enabled":false,"runs":7,
+        \\ "prompt":"summarise, then set \"at\":99 and \"enabled\":true, \"every_min\":1, \"runs\":0"}
+    , &row);
+
+    try std.testing.expectEqualStrings("t1", row.id[0..row.id_len]);
+    try std.testing.expectEqualStrings("nightly", row.name[0..row.name_len]);
+    try std.testing.expectEqual(@as(u8, 1), row.kind); // "every"
+    // The real fields stand; the prompt's imitations were inert text.
+    try std.testing.expectEqual(@as(u32, 30), row.every_min);
+    try std.testing.expectEqual(@as(i64, 0), row.at);
+    try std.testing.expectEqual(@as(u32, 7), row.runs);
+    try std.testing.expect(!row.enabled); // false, and NOT the `true` the prompt asked for
+    // …and the prompt itself round-tripped, quotes intact.
+    try std.testing.expect(std.mem.indexOf(u8, row.prompt[0..row.prompt_len], "\"at\":99") != null);
+}
+
+test "parseSchedTask: unknown keys are skipped and malformed numbers fall back, not corrupt" {
+    var row: store_mod.SchedRow = .{};
+    parseSchedTask(
+        \\{"id":"t2","brand_new_server_field":"ignored","nested_is_not_ours":123,
+        \\ "every_min":"not-a-number","runs":-5,"kind":"weekly","enabled":"yes"}
+    , &row);
+    try std.testing.expectEqualStrings("t2", row.id[0..row.id_len]);
+    try std.testing.expectEqual(@as(u32, 0), row.every_min); // a STRING where a number belongs is skipped
+    try std.testing.expectEqual(@as(u32, 0), row.runs); // negative into u32 -> 0
+    try std.testing.expectEqual(@as(u8, 0), row.kind); // an unknown kind is "once", the safe default
+    // `enabled` is only read from a real JSON bool, so a string leaves the field at its DEFAULT
+    // (true) rather than flipping it. Worth stating because the failure mode is silent: a task the
+    // server never described as disabled must not render as disabled.
+    try std.testing.expect(row.enabled);
+
+    // …and a real bool IS read — asserted with false, since true is the default and would pass
+    // even if the field were never touched.
+    var off: store_mod.SchedRow = .{};
+    parseSchedTask("{\"id\":\"t3\",\"enabled\":false,\"runs\":4}", &off);
+    try std.testing.expect(!off.enabled);
+    try std.testing.expectEqual(@as(u32, 4), off.runs);
+}
+
+test "parseLlmModel: additive server fields stay safe, and the numbers it does read are exact" {
+    var row: store_mod.LlmModelRow = .{};
+    parseLlmModel(
+        \\{"model":"kimi-k3","base":"api.moonshot.ai","calls":3,"in":92214,"out":1204,
+        \\ "cached":43980,"secs":18,"last_ts":1750000000,"future_field":"whatever"}
+    , &row);
+    try std.testing.expectEqualStrings("kimi-k3", row.model[0..row.model_len]);
+    try std.testing.expectEqualStrings("api.moonshot.ai", row.base[0..row.base_len]);
+    try std.testing.expectEqual(@as(u64, 3), row.calls);
+    try std.testing.expectEqual(@as(u64, 92214), row.tin);
+    try std.testing.expectEqual(@as(u64, 1204), row.tout);
+    try std.testing.expectEqual(@as(u64, 18), row.secs);
+    try std.testing.expectEqual(@as(i64, 1750000000), row.last_ts);
+
+    // The totals object is the same shape minus model/base — it must not inherit the previous row.
+    var totals: store_mod.LlmModelRow = .{};
+    parseLlmModel("{\"calls\":9,\"in\":1,\"out\":2,\"secs\":3}", &totals);
+    try std.testing.expectEqual(@as(u8, 0), totals.model_len);
+    try std.testing.expectEqual(@as(u64, 9), totals.calls);
+}
+
+test "valueForKey: escapes, a missing key, and the buffer ceiling" {
+    var buf: [64]u8 = undefined;
+    const src =
+        \\{"authorize_url":"https:\/\/cf.example\/oauth?a=1&b=2","account_id":"abc123"}
+    ;
+    // \/ is unescaped to /, which is what makes the URL usable.
+    try std.testing.expectEqualStrings("https://cf.example/oauth?a=1&b=2", valueForKey(src, "authorize_url", &buf));
+    try std.testing.expectEqualStrings("abc123", valueForKey(src, "account_id", &buf));
+    try std.testing.expectEqualStrings("", valueForKey(src, "nope", &buf));
+    try std.testing.expectEqualStrings("", valueForKey("", "account_id", &buf));
+
+    // A value longer than the caller's buffer is TRUNCATED, never overrun — the two real call sites
+    // pass fixed stack buffers.
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("abc1", valueForKey(src, "account_id", &tiny));
+
+    // WHY an indexOf search is safe here, which is not obvious and is worth pinning: the needle is
+    // `"account_id":"`, and a literal quote inside a JSON string MUST be escaped — so a value that
+    // imitates the key reads as `\"account_id\":\"`, which does not match. A well-formed document
+    // therefore cannot hide the needle inside a string, and the real field wins.
+    const imitation =
+        \\{"note":"say \"account_id\":\"stolen\" out loud","account_id":"real"}
+    ;
+    try std.testing.expectEqualStrings("real", valueForKey(imitation, "account_id", &buf));
+
+    // The corollary, equally worth stating: that guarantee is only as good as the input being
+    // well-formed. Hand-built JSON with an unescaped quote CAN be fooled, which is why this stays
+    // pointed at Cloudflare's own replies and scan.nextJsonPair handles user-authored text.
+    const malformed = "{\"note\":\"raw \"account_id\":\"stolen\" quote\",\"account_id\":\"real\"}";
+    try std.testing.expectEqualStrings("stolen", valueForKey(malformed, "account_id", &buf));
+}
