@@ -50,8 +50,14 @@ fn dupe(gpa: std.mem.Allocator, s: []const u8) []u8 {
     return gpa.dupe(u8, s) catch @constCast("");
 }
 
+/// The message is STRINGIFIED, not interpolated: every caller passes a literal today, but the
+/// moment one passes a spawn error, a command, or a Windows path, a raw `"{s}"` emits invalid JSON
+/// (`C:\Users` alone is a bad escape) — and this value is handed to the model as a tool result.
+/// Same idiom the tool name already uses below.
 fn errJson(gpa: std.mem.Allocator, msg: []const u8) []u8 {
-    return std.fmt.allocPrint(gpa, "{{\"ok\":false,\"error\":\"{s}\"}}", .{msg}) catch dupe(gpa, "{\"ok\":false}");
+    const quoted = std.json.Stringify.valueAlloc(gpa, msg, .{}) catch return dupe(gpa, "{\"ok\":false}");
+    defer gpa.free(quoted);
+    return std.fmt.allocPrint(gpa, "{{\"ok\":false,\"error\":{s}}}", .{quoted}) catch dupe(gpa, "{\"ok\":false}");
 }
 
 /// List a stdio server's tools: returns the `result` of tools/list (gpa-owned JSON), or a JSON error.
@@ -175,5 +181,91 @@ fn recvResult(gpa: std.mem.Allocator, r: *std.Io.Reader, id: i64) ?[]u8 {
         }
         const res = obj.get("result") orelse std.json.Value{ .null = {} };
         return std.json.Stringify.valueAlloc(gpa, res, .{}) catch null;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests — the demultiplexer, over a fixed buffer (same idiom as worker/httpc.zig).
+// A foreign process writes this stream, so every one of these is a case the server
+// on the other end can produce, deliberately or by accident.
+// ---------------------------------------------------------------------------
+
+test "recvResult returns the reply whose id matches, re-stringified" {
+    const gpa = std.testing.allocator;
+    var r = std.Io.Reader.fixed(
+        \\{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"a"}]}}
+        ++ "\n");
+    const got = recvResult(gpa, &r, 7) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("{\"tools\":[{\"name\":\"a\"}]}", got);
+}
+
+test "recvResult walks past notifications, other ids, blank lines and non-JSON noise" {
+    const gpa = std.testing.allocator;
+    // Everything before the real reply is what a live MCP server actually interleaves: log chatter
+    // on stdout, progress notifications with no id, and replies belonging to other in-flight calls.
+    var r = std.Io.Reader.fixed(
+        \\
+        \\starting server...
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"pct":10}}
+        \\{"jsonrpc":"2.0","id":6,"result":"belongs to an earlier call"}
+        \\{"jsonrpc":"2.0","id":"7","result":"a STRING id is not our integer id"}
+        \\not json at all
+        \\{"jsonrpc":"2.0","id":7,"result":{"ok":true}}
+        \\
+    );
+    const got = recvResult(gpa, &r, 7) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    // The one that matters: it must be OUR reply, never id 6's — a tool bridge handing back
+    // another call's output would be silent cross-talk between tools.
+    try std.testing.expectEqualStrings("{\"ok\":true}", got);
+}
+
+test "recvResult: a JSON-RPC error and a closed stream both come back as null, not as a result" {
+    const gpa = std.testing.allocator;
+    var err = std.Io.Reader.fixed(
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"method not found"}}
+        ++ "\n");
+    try std.testing.expect(recvResult(gpa, &err, 3) == null);
+
+    // Stream ends before our id ever arrives (server crashed, or answered nothing).
+    var closed = std.Io.Reader.fixed(
+        \\{"jsonrpc":"2.0","id":1,"result":"someone else's"}
+        ++ "\n");
+    try std.testing.expect(recvResult(gpa, &closed, 3) == null);
+
+    var empty = std.Io.Reader.fixed("");
+    try std.testing.expect(recvResult(gpa, &empty, 3) == null);
+}
+
+test "recvResult: a reply with no result field yields JSON null rather than failing" {
+    const gpa = std.testing.allocator;
+    var r = std.Io.Reader.fixed(
+        \\{"jsonrpc":"2.0","id":9}
+        ++ "\n");
+    const got = recvResult(gpa, &r, 9) orelse return error.TestUnexpectedResult;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("null", got);
+}
+
+test "errJson stays parseable even when the message carries quotes, backslashes or newlines" {
+    const gpa = std.testing.allocator;
+    // Every caller passes a literal today, so this is the landmine rather than a live failure:
+    // interpolating a message raw made `C:\Users\...` an invalid escape and a quoted binary name a
+    // broken string — in a value handed straight to the model as a tool result.
+    const msgs = [_][]const u8{
+        "oom",
+        "spawn failed: \"npx\" not found",
+        "could not launch C:\\Users\\me\\node_modules\\.bin\\server.cmd",
+        "stderr said:\nline two",
+    };
+    for (msgs) |m| {
+        const e = errJson(gpa, m);
+        defer gpa.free(e);
+        const P = struct { ok: bool = true, @"error": []const u8 = "" };
+        const parsed = try std.json.parseFromSlice(P, gpa, e, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.ok);
+        try std.testing.expectEqualStrings(m, parsed.value.@"error"); // byte-for-byte, not mangled
     }
 }

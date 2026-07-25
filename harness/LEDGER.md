@@ -403,3 +403,24 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: this entry IS the ratchet — the harness now teaches its own test conventions instead of
   depending on whoever is driving.
 - next: coverage frontier (deploy/service, chat/tools); H10 SELF lane; H14 the owner's call.
+
+## 0020 — 2026-07-24 — the MCP demultiplexer, and an escaping landmine one line from the cure
+- did: `worker/mcp/client.zig` — 5 test blocks over `recvResult`, the JSON-RPC demultiplexer that
+  reads a FOREIGN process's stdout (so every case is one a live server can produce): it returns the
+  reply whose id matches, walks past log chatter, id-less notifications, another in-flight call's
+  reply and a string-typed id, and maps a JSON-RPC error, a closed stream and an empty stream to
+  null rather than to a result. The one that matters: never hand back id 6's payload when asked for
+  id 7 — silent cross-talk between tools. Built on `Io.Reader.fixed`, the same idiom httpc's tests
+  use. Fixed a latent bug the test exposed: `errJson` interpolated its message raw into
+  `"error":"{s}"`, so a quoted binary name or a Windows path (`C:\Users` is an invalid JSON escape)
+  produced unparseable JSON — in a value handed to the model as a tool result. Now stringified via
+  `std.json.Stringify.valueAlloc`, the idiom the same file already used 13 lines below for the tool
+  name. Not reachable today (every caller passes a literal), which is exactly when it is cheap.
+- verified: Full oracle ALL GREEN, exit 0, first try.
+- learned: the cure was already in the file — the module safely stringified the tool NAME while
+  interpolating the error MESSAGE raw. When a file has both a safe and an unsafe idiom for the
+  same job, the unsafe one is a bug waiting for its first dynamic input; grep a module for its own
+  good pattern before writing a new one.
+- ratchet: `harness/TESTING.md` (0019) was handed to the vault agent as a three-line pointer
+  instead of a dictated prompt — the lore is now the repo's, not the driver's.
+- next: fold the key-vault lane when it reports; coverage frontier continues.
