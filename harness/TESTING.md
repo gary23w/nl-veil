@@ -83,6 +83,16 @@ every machine, and can be pinned EXACTLY rather than with a slack factor that hi
 point every call already passes through; if there isn't one, that is worth knowing before you
 optimise anything.
 
+A count is not the only exact measure. Two more, both used by `engine.zig`'s `buildTurnTools` test:
+
+- **Pointer identity = zero allocation.** The no-grants path promises it returns the static tools
+  block itself, not a copy. `got.ptr == TURN_TOOLS_FULL.ptr` proves that; a length or content check
+  would pass just as happily against a fresh allocation on every turn.
+- **Byte identity = a cache hit.** The prompt prefix must be identical across a turn's inferences or
+  the provider re-bills the whole prefill. Build it twice and `expectEqualStrings`. This is the one
+  cost regression with no local symptom at all — everything still works, it just costs more — so it
+  will never be caught by noticing. Assert it or don't claim it.
+
 ## raylib in a desk test
 
 raylib logs every decode to **stdout**, which under `zig build test` is the runner's `--listen=-`

@@ -481,6 +481,80 @@ test "turn tools: both caps variants are valid JSON arrays, and the sandboxed on
     try std.testing.expect(TURN_TOOLS_SANDBOXED.len < TURN_TOOLS_FULL.len);
 }
 
+test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
+    // WHY THIS TEST EXISTS: buildTurnTools' header promises the tools block is "turn-stable and
+    // byte-identical across every inference of the turn, so it never re-bills the prompt-prefix
+    // cache". Nothing asserted it. When a prefix stops matching, the provider re-bills the WHOLE
+    // prefill, so the regression is invisible in dev and shows up only as a larger bill — H8's
+    // "faster is an unverifiable claim", in its most expensive form. Checked EXACTLY here (byte
+    // identity and pointer identity), never with a stopwatch, per harness/TESTING.md.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var counters = [_]u32{0} ** 5;
+    var fmtx: std.Io.Mutex = .init;
+
+    var ctx = tools.ToolCtx{
+        .gpa = gpa,
+        .io = io,
+        .environ = &env,
+        .run_dir = ".",
+        .workdir = ".",
+        .scope = "t",
+        .mind = "t",
+        .round = 0,
+        .mem = osc.Mem.init(gpa, io, "", ""),
+        .files_written = &counters[0],
+        .observed = &counters[1],
+        .skills_saved = &counters[2],
+        .directives_set = &counters[3],
+        .tools_made = &counters[4],
+        .fmtx = &fmtx,
+    };
+
+    // The common case — no grants. The static base comes back BY POINTER: zero allocation, and
+    // `owned` stays null so the caller frees nothing. A cost claim, counted rather than timed.
+    {
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, &owned);
+        try std.testing.expect(owned == null);
+        try std.testing.expect(got.ptr == TURN_TOOLS_FULL.ptr);
+    }
+    // caps, and nothing else, picks the base.
+    {
+        ctx.caps = .sandboxed;
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, &owned);
+        try std.testing.expect(owned == null);
+        try std.testing.expect(got.ptr == TURN_TOOLS_SANDBOXED.ptr);
+        ctx.caps = .full;
+    }
+
+    // With grants the block is allocated — and the static base must still LEAD it, unchanged. That
+    // is the entire prefix-cache property: an appended schema extends the prompt, it never rewrites
+    // the part the provider already holds cached.
+    const r = recipes.Recipe{ .name = "research_brief", .description = "a granted recipe", .owner_uid = 1, .params = &.{}, .steps = &.{}, .output = "" };
+    const grants = [_]*const recipes.Recipe{&r};
+    ctx.grants = &grants;
+
+    var owned1: ?[]u8 = null;
+    const a = buildTurnTools(gpa, &ctx, &owned1);
+    defer if (owned1) |o| gpa.free(o);
+    try std.testing.expect(owned1 != null); // now the caller DOES own it — the free contract flips
+    try std.testing.expect(std.mem.startsWith(u8, a, TURN_TOOLS_FULL));
+    try std.testing.expect(a.len > TURN_TOOLS_FULL.len);
+
+    // Same grants twice ⇒ the same bytes. Any nondeterminism — map iteration order, a pointer or a
+    // timestamp reaching the schema — would miss the cache on every inference after the first.
+    var owned2: ?[]u8 = null;
+    const b = buildTurnTools(gpa, &ctx, &owned2);
+    defer if (owned2) |o| gpa.free(o);
+    try std.testing.expectEqualStrings(a, b);
+}
+
 test "schedTaskOf: extracts the task id from a run conv, null for ordinary convs" {
     try std.testing.expectEqualStrings("news-0715174857", schedTaskOf("scheduled_news-0715174857_07151753").?);
     try std.testing.expectEqualStrings("daily-report-0301070500", schedTaskOf("scheduled_daily-report-0301070500_03010705").?);
