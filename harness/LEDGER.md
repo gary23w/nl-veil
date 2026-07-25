@@ -1509,3 +1509,40 @@ edit, confirm it applied, then run.
 - ratchet: none new — this WAS the ratchet (the harness's own orientation docs made true).
 - next: H8's remaining engine paths. Frontier 5 src + 2 desk, genuinely device/UI-bound. H10, H14b,
   H26, H28 are the owner's.
+
+## 0063 — 2026-07-25 — Mem.observe returned 0 for every successful write
+- did: went after H8's remaining half — the engine's hot paths — and picked the hottest: hive memory.
+  `Mem.run` is the single `std.process.run` in oscillation.zig (its header even says "one seam for
+  all memory traffic, the place to instrument"), so it takes an `is_test` spawn probe exactly like
+  `Neuron.exec` (0053). `observeBatch` claims "ONE neuron subprocess instead of one spawn per fact",
+  because a 40-tool storm used to pay ~40 serialized launches on the turn's tail. Nothing priced it,
+  so folding it back into a loop of `observe()` — the obvious simplification, which still passes
+  every behavioural test since the facts land either way — would silently restore the whole cost.
+  Now pinned: 5 notes = 1 spawn, the loop it replaced = 5, single-note path = 1.
+- FOUND because the first counterfactual PASSED. Folding the batch into a loop should have failed
+  the new test; it did not, which meant the test was not running. Cause: its liveness probe was
+  `if (m.observe(...) == 0) return error.SkipZigTest`, and **`Mem.observe` returns 0 for every
+  successful write**. It parses stdout with `parseInt`, and neuron prints PROSE — `stored 1 fact(s)`
+  — which never parses. Fixed with `--json` + `jsonUint("wrote")`.
+- the sharp part: this is the SAME bug already found and fixed one screen below, in `observeBatch`,
+  whose comment reads "--json is load-bearing: the non-json summary prints to STDERR ... parsing it
+  from stdout always yielded 0, under-reporting every batch". Somebody hit this exact symptom, wrote
+  it down, fixed their function, and the sibling kept the bug. A fix applied to one instance and a
+  note explaining it is not the same as fixing the class — the note only helps whoever reads THAT
+  function.
+- impact, stated honestly: LOW. The only consumer of the return value is run.zig's MOCK path, which
+  reads `if (facts > 0) facts else round` — the fallback made the always-0 invisible, and the live
+  path counts `observed` separately. It broke a test's liveness probe, not a user's data.
+- verified: src suite exit 0. Counterfactual now fails the named test with the injection printed
+  first (0059's rule) — so the test runs, which is the thing the first attempt could not claim.
+  `--json observe` confirmed against the real binary before relying on it; observeBatch already
+  depends on `--json import`, so the flag is not a new assumption.
+- learned: I wrote 0053's "a SKIP is a test reporting it did not run" rule and then shipped a test
+  that skipped, in the same sitting. Reading the rule is not applying it. What caught it was the
+  counterfactual, not vigilance — which is the argument for running one EVERY time rather than when
+  a test feels risky. A test whose liveness probe depends on a return value nobody checks is a test
+  that will quietly stop running the moment that value goes wrong.
+- ratchet: the spawn probe on the second neuron-db seam, and TESTING.md's cost section now names
+  both probes.
+- next: H8's remaining paths (context rebuilds, tool round-trips per turn). Frontier 5 src + 2 desk.
+  H10, H14b, H26, H28 are the owner's.

@@ -78,10 +78,14 @@ flakes, it gets muted, and the muting becomes the habit — worse than no gate a
 **count** instead: process spawns, allocations, round trips. Those are deterministic, identical on
 every machine, and can be pinned EXACTLY rather than with a slack factor that hides drift.
 
-`Neuron.exec` carries a `builtin.is_test`-gated `spawn_probe` counter for exactly this, and
-`client.zig` asserts that reading N records costs N+1 spawns. Put the counter at the one choke
-point every call already passes through; if there isn't one, that is worth knowing before you
-optimise anything.
+Both neuron-db seams carry a `builtin.is_test`-gated `spawn_probe` at their one choke point:
+`Neuron.exec` (`client.zig` pins reading N records at N+1 spawns) and `Mem.run` (`oscillation.zig`
+pins `observeBatch` at 1 spawn for N facts, against the 5 the loop it replaced costs). Put the
+counter where every call already passes through; if there is no such point, that is worth knowing
+before you optimise anything.
+
+Price the alternative in the same test. "1 spawn" means nothing on its own — measuring that the
+loop it replaced costs N, right beside it, is what makes the number a claim instead of a constant.
 
 A count is not the only exact measure. Two more, both used by `engine.zig`'s `buildTurnTools` test:
 
