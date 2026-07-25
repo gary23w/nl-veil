@@ -779,6 +779,30 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   silent fix fail the build, leaving the judgment call to a human without leaving it unguarded.
 - next: 4 desk modules remain; H14, H26 and H10 are the owner's calls.
 
+## 0036 — 2026-07-25 — the router audit: the half the handler sweeps could not see
+- did: Six modules now prove their handlers REFUSE an unauthorised caller — and not one of them
+  proves the ROUTER points at the handler anyone believes it does. An admin path wired to a
+  merely-authenticated handler, or a new endpoint registered without a gate, is invisible to every
+  sweep written so far and silently undoes all of them. `src/main.zig` now reads its own route table
+  as text and re-derives the gate for all 74 routes, resolving each handler through `@embedFile` of
+  its owning module (13 of them) and following ONE hop through a local helper — which is not
+  academic: `sched.zig` wraps requireUser in `gate()`, so a naive body scan reads its five
+  task-scheduling routes as wide open, and I saw exactly that false alarm while prototyping.
+  Two assertions: every `/api/v1/admin*` route resolves to a handler calling requireAdmin (15/15),
+  and every other `/api/v1/*` route is gated unless it is in PUBLIC_ROUTES with a written reason
+  (8 entries: health, health/deps, fleet, themes, the four auth endpoints, the OAuth callback). A
+  second test keeps that list honest — an entry that gains a gate or stops being registered fails,
+  so the exception list cannot become where exceptions go to be forgotten.
+- verified: full oracle ALL GREEN, exit 0, first try. Current state: 74 routes, 62 gated, 0 admin
+  routes ungated.
+- learned: I prototyped the audit as a throwaway python script BEFORE writing it in Zig, which is
+  what surfaced the `gate()` indirection cheaply — a compile-run cycle per iteration would have
+  made that discovery cost ten minutes instead of ten seconds. Worth repeating for source-audit
+  tests, where the logic is all string handling and the language is incidental.
+- ratchet: the audit itself — it is the only test in the repo that can catch a MISWIRED route, and
+  it grows automatically with the table.
+- next: 4 desk modules (main, poller, runner, tray); H14, H26, H10 remain the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both
