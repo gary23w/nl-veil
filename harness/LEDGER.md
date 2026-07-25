@@ -1882,3 +1882,31 @@ edit, confirm it applied, then run.
 - ratchet: this IS the ratchet.
 - next (verified, per the rule above): nothing outstanding — open items are H13 (watch), and H10,
   H14b, H26, H28 (owner's). The frontier's remainder is documented as deliberately uncovered in H4.
+
+## 0076 — 2026-07-25 — nothing was parsing the web UI, and a stale note survived 0062
+- did: went looking in territory no increment had touched — `web/public/`. `app.js` is 4,393 lines
+  and 213 KB, `@embedFile`'d VERBATIM into the binary. Nothing compiles it, nothing parses it, no
+  test loads it. A syntax error or a truncated write ships a DEAD web UI behind a fully green
+  oracle — the silent-failure shape this repo keeps producing, on the one artifact a user actually
+  loads. `styles.css` had a palette-mirror signal; `app.js` and `index.html` had nothing at all.
+- did: a new gate in BOTH oracles, `node --check web/public/app.js`. Verified it passes today and
+  that it CATCHES a break (injected `function broken( {`, exit 1, names the line) before wiring it
+  in — a gate never proven to fail is not a gate. Script dialect deliberately: the file carries no
+  import/export, and `--check` rejects a plain script if asked to parse it as a module. Node is
+  optional here (Zig + Python are the real toolchain), so an absent node SKIPS LOUDLY rather than
+  failing the build or passing quietly. Gate names kept byte-identical across the twins; the
+  `[oracles]` parity signal now reports 6 shared gates instead of 5.
+- FOUND while editing: check.ps1's desk-gate note still carried the stale text 0062 corrected in
+  CLAUDE.md — "needs a live server on :8787 ... treat the earlier tests as the verdict", citing an
+  item ledger 0006 had CLOSED. I fixed the constitution and missed the copy, and this copy is the
+  WORSE one: it prints at the exact moment the desk gate is red, when a worker is deciding whether
+  a hang is expected. Corrected to say the suite is hermetic and a hang is real.
+- learned: 0062 fixed "the docs", and I treated CLAUDE.md as the whole of the docs. Operator-facing
+  prose also lives in gate notes, log strings and error messages, and those are read at the moment
+  of failure — the moment they matter most and the moment nobody re-reads them. When correcting a
+  claim, grep the CLAIM across the tree, not the file you found it in. (Same shape as 0055's fifth
+  escaper and 0073's four copies: fixing the instance, not the class.)
+- verified: gate green in both oracles; scan parity 6/6, 0 signals; full oracle ALL GREEN.
+- ratchet: the gate itself, plus the corrected note.
+- next (verified): `index.html` and `styles.css` still have no structural check — a gutted or
+  truncated one would ship the same way. Named as a real remaining gap, not as work I started.

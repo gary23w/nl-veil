@@ -404,9 +404,27 @@ function Confirm-Gate($r) {
 
 $ok = $true
 $ok = (Confirm-Gate (Invoke-Gate "catalog sync (models.yaml vs web/public/models.json)" $python @("scripts/gen-models-json.py", "--check") $repo 60 "")) -and $ok
+# web/public/app.js is @embedFile'd VERBATIM into the binary -- nothing compiles or parses it, so a
+# syntax error or a truncated write ships a dead web UI behind a fully green build. That is the
+# silent-failure shape this repo keeps producing, on the one artifact a user actually loads. Script
+# dialect on purpose: the file carries no import/export, and --check would reject a plain script if
+# asked to parse it as a module. Node is OPTIONAL (Zig + Python are the real toolchain), so an
+# absent node SKIPS LOUDLY -- never a quiet pass. Keep this gate's NAME identical to check.sh's:
+# the [oracles] scan signal compares gate names, and a rename would read as drift.
+$node = (Get-Command node -ErrorAction SilentlyContinue)
+if ($node) {
+    $ok = (Confirm-Gate (Invoke-Gate "web assets parse (node --check app.js)" $node.Source @("--check", "web/public/app.js") $repo 60 "")) -and $ok
+} else {
+    Write-Host ">> web assets parse (node --check app.js)"
+    Write-Host "   SKIPPED: node not on PATH -- web/public/app.js was NOT parsed" -ForegroundColor Yellow
+}
 $ok = (Confirm-Gate (Invoke-Gate "zig build server-only (-Dapp=false)" $zig @("build", "-Dapp=false", "--cache-dir", $cache, "--prefix", $prefix) $repo $TimeoutSec "")) -and $ok
 $ok = (Confirm-Gate (Invoke-ZigTests "src suite" $repo $TimeoutSec "")) -and $ok
-$ok = (Confirm-Gate (Invoke-ZigTests "desk suite" (Join-Path $repo "desk") 300 "Known: the desk suite's final net test needs a live server on :8787. If everything before it passed, treat that as the verdict and see the hermetic-desk-tests ledger item.")) -and $ok
+# The note here used to say the desk suite's net test "needs a live server on :8787" and to "treat
+# the earlier tests as the verdict" -- citing an item ledger 0006 had already CLOSED. 0062 corrected
+# that in CLAUDE.md and MISSED this copy, which is the worse of the two: it prints at the exact
+# moment the desk gate is red, when someone is deciding whether a hang is expected. It is not.
+$ok = (Confirm-Gate (Invoke-ZigTests "desk suite" (Join-Path $repo "desk") 300 "The desk suite is HERMETIC (ledger 0006): netcli early-returns without ../data/.desktop_key and every call is timeout-bounded, so a hang here is a REAL failure, not the known one. If a server happens to be running, that test casts a 1-minute mock swarm at it.")) -and $ok
 if ($Full) {
     $ok = (Confirm-Gate (Invoke-Gate "zig build default (GUI merged in)" $zig @("build", "--cache-dir", $cache, "--prefix", $prefix) $repo $TimeoutSec "")) -and $ok
 }
