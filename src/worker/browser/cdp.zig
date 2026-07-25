@@ -269,3 +269,410 @@ pub const Cdp = struct {
         w.flush() catch return error.Send;
     }
 };
+
+// =====================================================================================================
+// tests — the WIRE, not the browser.
+//
+// matchReply, readMessage, sendText, sendPong and nextBytes read only `gpa`, `prng`, `msg` and the two
+// stream *interfaces*; not one of them touches `io` or `stream`. So a Cdp wired to a fixed reader over a
+// canned frame stream and a fixed writer over a plain buffer drives the REAL demultiplexer and the REAL
+// RFC-6455 framing with no socket, no port and no Chrome. Such a value is deliberately never deinit()'d:
+// its socket fields stay undefined because nothing under test may read them, and that is the claim.
+//
+// Every frame below is one a live Chromium can put on this socket — or, for the malformed cases, one a
+// broken or hostile peer can. connect()/handshake() are the only parts that genuinely need a listener and
+// are therefore not covered here.
+// =====================================================================================================
+
+const testing = std.testing;
+
+fn readerOver(bytes: []const u8) Io.net.Stream.Reader {
+    var r: Io.net.Stream.Reader = undefined;
+    r.interface = Io.Reader.fixed(bytes);
+    return r;
+}
+
+fn writerOver(buf: []u8) Io.net.Stream.Writer {
+    var w: Io.net.Stream.Writer = undefined;
+    w.interface = Io.Writer.fixed(buf); // Writer.fixed's flush is a no-op, so the frame stays in `buf`
+    return w;
+}
+
+fn wireCdp(rd: *Io.net.Stream.Reader, wr: *Io.net.Stream.Writer) Cdp {
+    var c: Cdp = undefined;
+    c.gpa = testing.allocator;
+    c.rd = rd;
+    c.wr = wr;
+    c.msg = .empty;
+    c.next_id = 1;
+    c.prng = 0;
+    return c;
+}
+
+/// Append one SERVER→client frame to `out`. Servers never mask, so this is the unmasked shape the read
+/// path meets in production — and it is written independently of sendText, so the two cannot drift into
+/// agreeing on a wrong encoding.
+fn pushFrame(out: *std.ArrayListUnmanaged(u8), fin: bool, opcode: u8, payload: []const u8) !void {
+    const gpa = testing.allocator;
+    try out.append(gpa, (if (fin) @as(u8, 0x80) else @as(u8, 0)) | opcode);
+    if (payload.len < 126) {
+        try out.append(gpa, @intCast(payload.len));
+    } else if (payload.len <= 0xFFFF) {
+        try out.append(gpa, 126);
+        var b: [2]u8 = undefined;
+        std.mem.writeInt(u16, &b, @intCast(payload.len), .big);
+        try out.appendSlice(gpa, &b);
+    } else {
+        try out.append(gpa, 127);
+        var b: [8]u8 = undefined;
+        std.mem.writeInt(u64, &b, payload.len, .big);
+        try out.appendSlice(gpa, &b);
+    }
+    try out.appendSlice(gpa, payload);
+}
+
+fn expectMiss(c: *Cdp, frame: []const u8, id: u32) !void {
+    switch (c.matchReply(frame, id)) {
+        .miss => {},
+        .err => return error.WantedMissGotCdpError,
+        .ok => |s| {
+            testing.allocator.free(s);
+            return error.WantedMissGotAResult;
+        },
+    }
+}
+
+/// Read one message back out of bytes the CLIENT wrote — the mask/unmask round trip.
+fn readBackOwned(sent: []const u8) ![]u8 {
+    const gpa = testing.allocator;
+    var rd = readerOver(sent);
+    var scratch: [256]u8 = undefined;
+    var wr = writerOver(&scratch);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+    return gpa.dupe(u8, try c.readMessage());
+}
+
+test "matchReply hands back the result of the reply carrying OUR id, re-stringified" {
+    const gpa = testing.allocator;
+    var c: Cdp = undefined;
+    c.gpa = gpa; // matchReply reads nothing else — that is the property this whole section rests on
+    switch (c.matchReply("{\"id\":4,\"result\":{\"frameId\":\"A7\",\"loaderId\":\"L1\"}}", 4)) {
+        .ok => |s| {
+            defer gpa.free(s);
+            try testing.expectEqualStrings("{\"frameId\":\"A7\",\"loaderId\":\"L1\"}", s);
+        },
+        else => return error.ExpectedResult,
+    }
+}
+
+test "matchReply never hands back another call's reply: event frames and any non-matching id are misses" {
+    const gpa = testing.allocator;
+    var c: Cdp = undefined;
+    c.gpa = gpa;
+    // Exactly what a live CDP socket interleaves between our command and its reply. If ANY of these were
+    // accepted, callTimeout would return one call's output as another's — silent cross-talk between two
+    // browser commands, the single worst failure this demultiplexer can have.
+    const not_ours = [_][]const u8{
+        "{\"method\":\"Network.requestWillBeSent\",\"params\":{\"requestId\":\"1\"}}", // event: no id at all
+        "{\"method\":\"Target.attachedToTarget\",\"sessionId\":\"S1\",\"params\":{}}",
+        "{\"id\":3,\"result\":{\"stolen\":\"an earlier call's reply\"}}",
+        "{\"id\":5,\"result\":{\"stolen\":\"a later call's reply\"}}",
+        "{\"id\":\"4\",\"result\":{\"string id\":true}}", // a STRING id is not our integer id
+        "{\"id\":4.0,\"result\":{\"float id\":true}}", // nor is a float
+        "{\"id\":null,\"result\":{}}",
+        "{\"error\":{\"code\":-32700,\"message\":\"an error with no id is nobody's\"}}",
+    };
+    for (not_ours) |f| try expectMiss(&c, f, 4);
+
+    // ...and the genuine reply, arriving on the same connection, still matches.
+    switch (c.matchReply("{\"id\":4,\"result\":{\"mine\":true}}", 4)) {
+        .ok => |s| {
+            defer gpa.free(s);
+            try testing.expectEqualStrings("{\"mine\":true}", s);
+        },
+        else => return error.ExpectedResult,
+    }
+}
+
+test "matchReply maps a JSON-RPC error object to .err — never to a result carrying the error payload" {
+    const gpa = testing.allocator;
+    var c: Cdp = undefined;
+    c.gpa = gpa;
+    // A CDP error reply often ALSO carries no result; the danger is answering .ok with the error text,
+    // which the caller would hand to a model as if the command had succeeded.
+    try testing.expect(c.matchReply("{\"id\":2,\"error\":{\"code\":-32000,\"message\":\"Cannot find context\"}}", 2) == .err);
+    // error wins even when a result field sits beside it
+    try testing.expect(c.matchReply("{\"id\":2,\"error\":{\"code\":-1},\"result\":{\"looks\":\"fine\"}}", 2) == .err);
+    // ...but only for OUR id: another call's failure must not fail our call.
+    try expectMiss(&c, "{\"id\":9,\"error\":{\"code\":-32000,\"message\":\"someone else's\"}}", 2);
+}
+
+test "matchReply: malformed and non-object frames are misses, so a garbled frame never becomes a result" {
+    const gpa = testing.allocator;
+    var c: Cdp = undefined;
+    c.gpa = gpa;
+    const garbage = [_][]const u8{
+        "",
+        "   ",
+        "not json at all",
+        "{\"id\":4,\"result\":", // truncated mid-object
+        "[{\"id\":4,\"result\":{}}]", // an array, not an object
+        "\"just a string\"",
+        "4",
+        "null",
+        "{\"id\":4,\"result\":{}}trailing", // trailing junk after a valid object
+    };
+    for (garbage) |f| try expectMiss(&c, f, 4);
+}
+
+test "matchReply: a reply with no result field yields JSON null rather than failing the call" {
+    const gpa = testing.allocator;
+    var c: Cdp = undefined;
+    c.gpa = gpa;
+    // Several CDP commands (Page.enable, Input.dispatchKeyEvent) answer with a bare acknowledgement.
+    switch (c.matchReply("{\"id\":6}", 6)) {
+        .ok => |s| {
+            defer gpa.free(s);
+            try testing.expectEqualStrings("null", s);
+        },
+        else => return error.ExpectedResult,
+    }
+}
+
+test "callTimeout walks the frame stream past events, other ids and noise and returns OUR reply" {
+    const gpa = testing.allocator;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try pushFrame(&frames, true, 0x1, "{\"method\":\"Network.requestWillBeSent\",\"params\":{}}");
+    try pushFrame(&frames, true, 0x1, "{\"id\":9,\"result\":{\"belongs\":\"to another call\"}}");
+    try pushFrame(&frames, true, 0x1, "garbage that is not json");
+    try pushFrame(&frames, true, 0x1, "{\"id\":1,\"result\":{\"value\":42}}");
+
+    var rd = readerOver(frames.items);
+    var wbuf: [4096]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+
+    const res = try c.callTimeout("Runtime.evaluate", "{\"expression\":\"1+1\"}", null, 0);
+    defer gpa.free(res);
+    try testing.expectEqualStrings("{\"value\":42}", res);
+    try testing.expectEqual(@as(u32, 2), c.next_id); // one id consumed, so the next call cannot collide
+}
+
+test "callTimeout sends ONE masked text frame carrying its id, method and params — read back off the wire" {
+    const gpa = testing.allocator;
+    var empty: std.ArrayListUnmanaged(u8) = .empty;
+    defer empty.deinit(gpa);
+    try pushFrame(&empty, true, 0x1, "{\"id\":1,\"result\":{}}");
+
+    var rd = readerOver(empty.items);
+    var wbuf: [1024]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+    // blank params must become "{}": "params": with nothing after it is not JSON, and Chromium would
+    // drop the connection rather than answer.
+    const res = try c.callTimeout("Page.enable", "   ", "SESSION-7", 0);
+    defer gpa.free(res);
+
+    const sent = wr.interface.buffered();
+    try testing.expectEqual(@as(u8, 0x81), sent[0]); // FIN + text
+    try testing.expect((sent[1] & 0x80) != 0); // client frames MUST be masked (RFC-6455 5.3)
+
+    const req = try readBackOwned(sent);
+    defer gpa.free(req);
+    const P = struct { id: i64 = 0, method: []const u8 = "", sessionId: []const u8 = "", params: std.json.Value = .null };
+    const parsed = try std.json.parseFromSlice(P, gpa, req, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 1), parsed.value.id);
+    try testing.expectEqualStrings("Page.enable", parsed.value.method);
+    try testing.expectEqualStrings("SESSION-7", parsed.value.sessionId);
+    try testing.expect(parsed.value.params == .object and parsed.value.params.object.count() == 0);
+}
+
+test "callTimeout maps a CDP error reply for our id to error.CdpError, and a dead stream to error.Closed" {
+    const gpa = testing.allocator;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try pushFrame(&frames, true, 0x1, "{\"method\":\"Page.loadEventFired\",\"params\":{}}");
+    try pushFrame(&frames, true, 0x1, "{\"id\":1,\"error\":{\"code\":-32000,\"message\":\"Cannot find context with specified id\"}}");
+    var rd = readerOver(frames.items);
+    var wbuf: [1024]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+    try testing.expectError(error.CdpError, c.callTimeout("Runtime.evaluate", "{}", null, 0));
+
+    // The browser died (or answered nothing) — the loop must end, not spin or invent a result.
+    var only_events: std.ArrayListUnmanaged(u8) = .empty;
+    defer only_events.deinit(gpa);
+    try pushFrame(&only_events, true, 0x1, "{\"method\":\"Page.loadEventFired\",\"params\":{}}");
+    var rd2 = readerOver(only_events.items);
+    var wbuf2: [1024]u8 = undefined;
+    var wr2 = writerOver(&wbuf2);
+    var c2 = wireCdp(&rd2, &wr2);
+    defer c2.msg.deinit(gpa);
+    try testing.expectError(error.Closed, c2.callTimeout("Runtime.evaluate", "{}", null, 0));
+}
+
+test "sendText header arithmetic: 125 keeps the 7-bit length, 126 and 65535 take 16 bits, 65536 takes 64" {
+    const gpa = testing.allocator;
+    // The three RFC-6455 length forms and both hinges between them. An off-by-one here writes a header
+    // Chromium reads as a different length, and every later frame on the connection is misaligned.
+    for ([_]usize{ 0, 1, 125, 126, 0xFFFF, 0x1_0000 }) |n| {
+        const payload = try gpa.alloc(u8, n);
+        defer gpa.free(payload);
+        for (payload, 0..) |*b, i| b.* = @intCast((i *% 31 +% 7) & 0xff);
+
+        const wbuf = try gpa.alloc(u8, n + 64);
+        defer gpa.free(wbuf);
+        var rd = readerOver("");
+        var wr = writerOver(wbuf);
+        var c = wireCdp(&rd, &wr);
+        defer c.msg.deinit(gpa);
+        try c.sendText(payload);
+
+        const f = wr.interface.buffered();
+        try testing.expectEqual(@as(u8, 0x81), f[0]);
+        try testing.expect((f[1] & 0x80) != 0);
+        const hn: usize = if (n < 126) blk: {
+            try testing.expectEqual(@as(u8, @intCast(n)), f[1] & 0x7f);
+            break :blk 2;
+        } else if (n <= 0xFFFF) blk: {
+            try testing.expectEqual(@as(u8, 126), f[1] & 0x7f);
+            try testing.expectEqual(@as(u16, @intCast(n)), std.mem.readInt(u16, f[2..4], .big));
+            break :blk 4;
+        } else blk: {
+            try testing.expectEqual(@as(u8, 127), f[1] & 0x7f);
+            try testing.expectEqual(@as(u64, n), std.mem.readInt(u64, f[2..10], .big));
+            break :blk 10;
+        };
+        // nothing over- or under-written: header + 4-byte mask key + payload, exactly
+        try testing.expectEqual(hn + 4 + n, f.len);
+
+        // and the mask is applied over the WHOLE payload, across the 2048-byte chunk seam
+        const key = f[hn..][0..4];
+        for (f[hn + 4 ..], 0..) |b, i| try testing.expectEqual(payload[i], b ^ key[i & 3]);
+
+        // finally: our own reader recovers the payload byte for byte (mask and unmask agree)
+        const back = try readBackOwned(f);
+        defer gpa.free(back);
+        try testing.expectEqualSlices(u8, payload, back);
+    }
+}
+
+test "readMessage reassembles a fragmented message, and a ping between fragments does not corrupt it" {
+    const gpa = testing.allocator;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try pushFrame(&frames, false, 0x1, "{\"id\":1,\"resu"); // text, FIN=0
+    try pushFrame(&frames, true, 0x9, "hb"); // a ping interleaved between fragments (RFC-6455 5.4)
+    try pushFrame(&frames, false, 0x0, "lt\":{\"big\":"); // continuation
+    try pushFrame(&frames, true, 0xA, "unsolicited pong"); // must be drained, not appended
+    try pushFrame(&frames, true, 0x0, "true}}"); // continuation, FIN=1
+
+    var rd = readerOver(frames.items);
+    var wbuf: [256]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+
+    const msg = try c.readMessage();
+    try testing.expectEqualStrings("{\"id\":1,\"result\":{\"big\":true}}", msg);
+
+    // the ping was answered with a masked pong echoing its payload — Chromium drops a peer that ignores pings
+    const pong = wr.interface.buffered();
+    try testing.expectEqual(@as(u8, 0x8A), pong[0]);
+    try testing.expect((pong[1] & 0x80) != 0);
+    try testing.expectEqual(@as(u8, 2), pong[1] & 0x7f);
+    const key = pong[2..6];
+    try testing.expectEqual(@as(u8, 'h'), pong[6] ^ key[0]);
+    try testing.expectEqual(@as(u8, 'b'), pong[7] ^ key[1]);
+    try testing.expectEqual(@as(usize, 8), pong.len); // and nothing else was written
+}
+
+test "readMessage: a close frame, a truncated header and a truncated payload all surface as error.Closed" {
+    const gpa = testing.allocator;
+    var closed: std.ArrayListUnmanaged(u8) = .empty;
+    defer closed.deinit(gpa);
+    try pushFrame(&closed, true, 0x8, "\x03\xe8"); // 1000 = normal closure
+    {
+        var rd = readerOver(closed.items);
+        var wbuf: [64]u8 = undefined;
+        var wr = writerOver(&wbuf);
+        var c = wireCdp(&rd, &wr);
+        defer c.msg.deinit(gpa);
+        try testing.expectError(error.Closed, c.readMessage());
+    }
+    // header says 200 bytes, only 3 arrive: a browser killed mid-frame must not hang or read past the end
+    {
+        var rd = readerOver(&[_]u8{ 0x81, 200, 'a', 'b', 'c' });
+        var wbuf: [64]u8 = undefined;
+        var wr = writerOver(&wbuf);
+        var c = wireCdp(&rd, &wr);
+        defer c.msg.deinit(gpa);
+        try testing.expectError(error.Closed, c.readMessage());
+    }
+    // and a stream that ends between the two header bytes
+    {
+        var rd = readerOver(&[_]u8{0x81});
+        var wbuf: [64]u8 = undefined;
+        var wr = writerOver(&wbuf);
+        var c = wireCdp(&rd, &wr);
+        defer c.msg.deinit(gpa);
+        try testing.expectError(error.Closed, c.readMessage());
+    }
+}
+
+test "readMessage: consecutive messages come back one at a time, each complete" {
+    const gpa = testing.allocator;
+    var frames: std.ArrayListUnmanaged(u8) = .empty;
+    defer frames.deinit(gpa);
+    try pushFrame(&frames, true, 0x1, "{\"first\":1}");
+    try pushFrame(&frames, true, 0x2, "{\"second\":2}"); // binary opcode is treated as message data too
+    var rd = readerOver(frames.items);
+    var wbuf: [64]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(gpa);
+    // The reused reassembly buffer must not leak the previous message into the next one.
+    try testing.expectEqualStrings("{\"first\":1}", try c.readMessage());
+    try testing.expectEqualStrings("{\"second\":2}", try c.readMessage());
+    try testing.expectError(error.Closed, c.readMessage());
+}
+
+test "nextBytes fills any length and never repeats the previous mask key" {
+    var rd = readerOver("");
+    var wbuf: [16]u8 = undefined;
+    var wr = writerOver(&wbuf);
+    var c = wireCdp(&rd, &wr);
+    defer c.msg.deinit(testing.allocator);
+
+    // zero length is a no-op, not a hang
+    var none: [0]u8 = undefined;
+    c.nextBytes(&none);
+
+    // a non-multiple of the 8-byte splitmix64 word is filled to the last byte
+    var a: [13]u8 = .{0} ** 13;
+    c.nextBytes(&a);
+    try testing.expect(!std.mem.allEqual(u8, &a, 0));
+
+    // successive draws differ — RFC-6455 wants a fresh key per frame, and a stuck key would make every
+    // frame's mask identical
+    var k1: [4]u8 = undefined;
+    var k2: [4]u8 = undefined;
+    c.nextBytes(&k1);
+    c.nextBytes(&k2);
+    try testing.expect(!std.mem.eql(u8, &k1, &k2));
+
+    // pure function of the state: same seed, same stream (this is what makes the frames above reproducible)
+    var rd2 = readerOver("");
+    var wr2 = writerOver(&wbuf);
+    var c2 = wireCdp(&rd2, &wr2);
+    defer c2.msg.deinit(testing.allocator);
+    var b: [13]u8 = .{0} ** 13;
+    c2.nextBytes(&b);
+    try testing.expectEqualSlices(u8, &a, &b);
+}
