@@ -866,6 +866,25 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new this sitting.
 - next: 3 desk modules (main, runner, tray) and 12 src; H14, H26, H10 remain the owner's.
 
+## 0039 — 2026-07-25 — dispatch fidelity: nine wrappers, nine slots, proven
+- did: `desk/src/runner.zig` — the engine's only door to the outside world, shaped as a nine-entry
+  vtable behind nine hand-written forwarding wrappers. That shape is where a copy-paste slip is
+  invisible: every type checks, nothing crashes, and the engine just makes the WRONG request
+  (chatConv fetching the whole list, chatDelete hitting control). Same failure class as the model
+  trio's argument lists, same remedy — prove the mapping. A recording fake vtable stands in for the
+  server, so the tests need no network and no io of their own; each verb is called with a DISTINCT
+  conv and body, so forwarding into a neighbouring slot, or swapping conv and body (both
+  `[]const u8`, so the compiler is no help), fails rather than passes. The chatConv/chatConvs
+  near-miss gets its own assertion. Second test: `portToken` reads the CURRENT port and token under
+  the lock — a later change is visible to the next call, which is the property that makes caching
+  wrong — and truncates into a short buffer instead of overrunning it.
+- verified: full oracle ALL GREEN, exit 0, first try.
+- learned: an indirection layer deserves a test of its WIRING, not of its behaviour — there is no
+  logic here to get wrong, only nine chances to point at the wrong thing. Cheap to write, and the
+  only thing that would catch the bug it is built for.
+- ratchet: none new.
+- next: 2 desk modules (main, tray) and 12 src; H14, H26, H10 remain the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

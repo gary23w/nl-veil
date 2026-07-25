@@ -151,3 +151,175 @@ fn localChatToolResult(ctx: *anyopaque, io: Io, gpa: std.mem.Allocator, conv: []
     const pt = portToken(store, &tokb);
     return netcli.chatToolResult(io, gpa, pt.port, pt.tok, conv, body_json);
 }
+
+// ---------------------------------------------------------------------------
+// tests — nine hand-written wrappers forwarding into a nine-entry vtable is the shape where a
+// copy-paste slip is invisible: every type still checks, nothing crashes, and the engine simply
+// makes the WRONG request (chatConv fetching the whole list, chatDelete hitting control). It is
+// the same failure class chat/trio_routing_test.zig guards for the model trio, and the same fix —
+// prove the mapping rather than trusting it. A recording fake stands in for the server, so these
+// need no io of their own. See harness/TESTING.md.
+// ---------------------------------------------------------------------------
+
+const Rec = struct {
+    called: []const u8 = "",
+    conv: []const u8 = "",
+    body: []const u8 = "",
+    from: usize = 0,
+};
+
+fn rec(ctx: *anyopaque) *Rec {
+    return @ptrCast(@alignCast(ctx));
+}
+
+fn fRunTool(ctx: *anyopaque, _: Io, _: std.mem.Allocator, body: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "runTool";
+    r.body = body;
+    return null;
+}
+fn fCast(ctx: *anyopaque, _: Io, _: std.mem.Allocator, body: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "cast";
+    r.body = body;
+    return null;
+}
+fn fChatSend(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8, body: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatSend";
+    r.conv = conv;
+    r.body = body;
+    return null;
+}
+fn fChatEvents(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8, from: usize) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatEvents";
+    r.conv = conv;
+    r.from = from;
+    return null;
+}
+fn fChatControl(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8, body: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatControl";
+    r.conv = conv;
+    r.body = body;
+    return null;
+}
+fn fChatConvs(ctx: *anyopaque, _: Io, _: std.mem.Allocator) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatConvs";
+    return null;
+}
+fn fChatConv(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatConv";
+    r.conv = conv;
+    return null;
+}
+fn fChatDelete(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatDelete";
+    r.conv = conv;
+    return null;
+}
+fn fChatToolResult(ctx: *anyopaque, _: Io, _: std.mem.Allocator, conv: []const u8, body: []const u8) ?Resp {
+    const r = rec(ctx);
+    r.called = "chatToolResult";
+    r.conv = conv;
+    r.body = body;
+    return null;
+}
+
+const fake_vtable = Runner.VTable{
+    .runTool = fRunTool,
+    .cast = fCast,
+    .chatSend = fChatSend,
+    .chatEvents = fChatEvents,
+    .chatControl = fChatControl,
+    .chatConvs = fChatConvs,
+    .chatConv = fChatConv,
+    .chatDelete = fChatDelete,
+    .chatToolResult = fChatToolResult,
+};
+
+test "every Runner verb reaches its OWN vtable slot, with its arguments intact" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var r: Rec = .{};
+    const run = Runner{ .ctx = @ptrCast(&r), .vt = &fake_vtable };
+
+    // Each call carries a DISTINCT conv and body, so a wrapper that forwards into a neighbouring
+    // slot — or swaps conv and body — shows up as a mismatch rather than as a passing test.
+    _ = run.runTool(io, gpa, "{\"tool\":\"t\"}");
+    try std.testing.expectEqualStrings("runTool", r.called);
+    try std.testing.expectEqualStrings("{\"tool\":\"t\"}", r.body);
+
+    _ = run.cast(io, gpa, "{\"goal\":\"g\"}");
+    try std.testing.expectEqualStrings("cast", r.called);
+    try std.testing.expectEqualStrings("{\"goal\":\"g\"}", r.body);
+
+    _ = run.chatSend(io, gpa, "conv-send", "{\"m\":1}");
+    try std.testing.expectEqualStrings("chatSend", r.called);
+    try std.testing.expectEqualStrings("conv-send", r.conv);
+    try std.testing.expectEqualStrings("{\"m\":1}", r.body);
+
+    _ = run.chatEvents(io, gpa, "conv-events", 4242);
+    try std.testing.expectEqualStrings("chatEvents", r.called);
+    try std.testing.expectEqualStrings("conv-events", r.conv);
+    try std.testing.expectEqual(@as(usize, 4242), r.from); // the byte cursor, not silently zeroed
+
+    _ = run.chatControl(io, gpa, "conv-ctl", "{\"op\":\"stop\"}");
+    try std.testing.expectEqualStrings("chatControl", r.called);
+    try std.testing.expectEqualStrings("conv-ctl", r.conv);
+    try std.testing.expectEqualStrings("{\"op\":\"stop\"}", r.body);
+
+    _ = run.chatConvs(io, gpa);
+    try std.testing.expectEqualStrings("chatConvs", r.called);
+
+    _ = run.chatConv(io, gpa, "conv-one");
+    try std.testing.expectEqualStrings("chatConv", r.called); // NOT chatConvs — the near-miss pair
+    try std.testing.expectEqualStrings("conv-one", r.conv);
+
+    _ = run.chatDelete(io, gpa, "conv-del");
+    try std.testing.expectEqualStrings("chatDelete", r.called);
+    try std.testing.expectEqualStrings("conv-del", r.conv);
+
+    _ = run.chatToolResult(io, gpa, "conv-res", "{\"result\":\"ok\"}");
+    try std.testing.expectEqualStrings("chatToolResult", r.called);
+    try std.testing.expectEqualStrings("conv-res", r.conv);
+    try std.testing.expectEqualStrings("{\"result\":\"ok\"}", r.body);
+}
+
+test "the local runner reads the CURRENT port and token, and never overruns the caller's buffer" {
+    // Settings change at runtime (a user retypes the port, the server mints a new key), which is
+    // why the local vtable re-reads the store on every call instead of caching — portToken is that
+    // read, under the lock.
+    const gpa = std.testing.allocator;
+    var store = try gpa.create(store_mod.Store);
+    defer gpa.destroy(store);
+    store.* = .{};
+
+    const tok = "nlk_a_test_bearer_token";
+    @memcpy(store.settings.token[0..tok.len], tok);
+    store.settings.token_len = @intCast(tok.len);
+    store.settings.port = 9317;
+
+    var tokb: [128]u8 = undefined;
+    const pt = portToken(store, &tokb);
+    try std.testing.expectEqual(@as(u16, 9317), pt.port);
+    try std.testing.expectEqualStrings(tok, pt.tok);
+
+    // A later change is seen by the next call — the property that makes caching wrong.
+    store.settings.port = 8787;
+    const pt2 = portToken(store, &tokb);
+    try std.testing.expectEqual(@as(u16, 8787), pt2.port);
+
+    // And a buffer smaller than the token truncates instead of overrunning.
+    var tiny: [8]u8 = undefined;
+    const pt3 = portToken(store, &tiny);
+    try std.testing.expectEqual(@as(usize, 8), pt3.tok.len);
+    try std.testing.expectEqualStrings(tok[0..8], pt3.tok);
+}
