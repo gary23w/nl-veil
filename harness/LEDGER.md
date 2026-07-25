@@ -705,3 +705,26 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new; the pattern (assert the body, not just the status, when testing a refusal) is
   worth copying and is stated in the test's comments.
 - next: deploy/service and chat/service close out H24.
+
+## 0033 — 2026-07-25 — the swarm surface: 14 routes, someone else's run, and paths that climb
+- did: `worker/deploy/service.zig` (944 lines, the largest untested module) — the auth sweep plus
+  its `@embedFile` exhaustiveness guard, now filtering on the HANDLER SIGNATURE rather than on
+  `pub fn`: `deploySwarm`/`castSwarm` read as routes by name but take an already-authenticated User
+  and return a DeployOutcome, so the router never reaches them. Then the two properties with teeth:
+  every per-swarm route (file read, file write, listing, bundle, archive, CF deploy, delete) tried
+  as the WRONG logged-in account — 401 each, with the deliverable's contents asserted absent from
+  the body, and the swarm still alive afterwards; and `swarmFile`'s path guard against `../`,
+  `../../etc/passwd`, an embedded `work/../..`, an absolute path and a Windows separator, each
+  refused 400 while an honest relative path still returns its file (so the guard is not just
+  refusing everything). Finally adminBilling end-to-end: an ordinary account cannot change plans,
+  a mistyped plan is refused rather than silently applied as free (0021's fix, now covered from
+  the outside), and "PRO" still works case-insensitively.
+- verified: one red first — I listed the two inner functions as routes and the compiler rejected
+  the signature mismatch, which is precisely what the guard's `*httpz.Request` filter exists to
+  express. Corrected; full oracle ALL GREEN, exit 0.
+- learned: two process slips worth not repeating — I started an oracle BEFORE applying the fix
+  (wasting a full run on a known-bad tree), and I edited a file with `sed` and then tried to Edit
+  it, which correctly refused the stale write. Read-then-edit applies to my own shell edits too.
+- ratchet: the sweep pattern now has a second instance and a sharper rule (filter by signature, not
+  by name), which is the version worth copying to chat/service.
+- next: chat/service is the last H24 module; then 4 desk modules. H14 and H10 remain the owner's.

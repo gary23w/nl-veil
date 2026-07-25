@@ -193,8 +193,9 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
 const Swarm = @import("supervisor.zig").Swarm;
 
 /// TEST ONLY. Register a swarm owned by `uid` without launching anything (Supervisor.spawn starts a
-/// real process). Caller frees via `dropTestSwarm`.
-fn addTestSwarm(sup: *Supervisor, gpa: std.mem.Allocator, id: []const u8, uid: u64, run_dir: []const u8) !void {
+/// real process). Caller frees via `dropTestSwarms`. Shared with deploy/service.zig's tests, which
+/// need the same fixture to check that one account cannot reach another's run.
+pub fn addTestSwarm(sup: *Supervisor, gpa: std.mem.Allocator, id: []const u8, uid: u64, run_dir: []const u8) !void {
     const sw = try gpa.create(Swarm);
     sw.* = .{
         .id = try gpa.dupe(u8, id),
@@ -209,7 +210,7 @@ fn addTestSwarm(sup: *Supervisor, gpa: std.mem.Allocator, id: []const u8, uid: u
     try sup.swarms.put(gpa, sw.id, sw);
 }
 
-fn dropTestSwarms(sup: *Supervisor, gpa: std.mem.Allocator) void {
+pub fn dropTestSwarms(sup: *Supervisor, gpa: std.mem.Allocator) void {
     var it = sup.swarms.iterator();
     while (it.next()) |e| {
         const sw = e.value_ptr.*;
