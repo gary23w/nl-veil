@@ -55,7 +55,10 @@ fn sanitizeLine(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Sanitize an explicit doc_id, or derive a stable one from the URL host + a hash when none is given. Owned.
+/// Sanitize an explicit doc_id, or derive a stable one from the URL host + a hash when none is given. Owned —
+/// EVERY caller frees it, so the out-of-memory fallback must be the zero-length slice (Allocator.free returns
+/// early on len 0). A non-empty literal here is not an allocation, and freeing it is an invalid free handed
+/// straight to the allocator — the same contract dupe() above already keeps.
 fn resolveDocId(gpa: std.mem.Allocator, doc_id: []const u8, url: []const u8) []u8 {
     const t = std.mem.trim(u8, doc_id, " \r\n\t");
     if (t.len > 0 and t.len <= 48) {
@@ -66,7 +69,7 @@ fn resolveDocId(gpa: std.mem.Allocator, doc_id: []const u8, url: []const u8) []u
                 break;
             }
         }
-        if (ok) return gpa.dupe(u8, t) catch @constCast("doc");
+        if (ok) return gpa.dupe(u8, t) catch @constCast("");
     }
     // derive: host (alnum only) + short hash of the full url
     var host = url;
@@ -79,7 +82,7 @@ fn resolveDocId(gpa: std.mem.Allocator, doc_id: []const u8, url: []const u8) []u
         if (hb.items.len >= 24) break;
     }
     const h = std.hash.Wyhash.hash(0, url);
-    return std.fmt.allocPrint(gpa, "{s}-{x}", .{ if (hb.items.len > 0) hb.items else "page", h & 0xffffff }) catch @constCast("doc");
+    return std.fmt.allocPrint(gpa, "{s}-{x}", .{ if (hb.items.len > 0) hb.items else "page", h & 0xffffff }) catch @constCast("");
 }
 
 /// Render `url`, tile it, and index each tile's band-text into neuron-db. Returns a JSON summary.
@@ -405,4 +408,444 @@ pub fn search(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, query: []
         results.append(gpa, .{ .doc_id = h.doc, .tile = h.tile, .image = h.image, .score = h.score, .excerpt = h.excerpt }) catch break;
     }
     return std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .count = results.items.len, .results = results.items }, .{}) catch dupe(gpa, "oom");
+}
+
+// =====================================================================================================
+// tests — the ingest→index→retrieve spine, with no browser, no OCR engine and no datastore.
+//
+// What is covered: the doc-id derivation (it becomes a DIRECTORY name, so it is also a path-safety
+// boundary), the fact sanitizer, indexOne's tile→manifest-line record, and search()'s query→tile
+// mapping. What is not: ingest/ingestImage/capture, whose first act is to render or OCR — they need a
+// live Chromium or an OS OCR engine, and there is nothing honest to assert about them here.
+//
+// indexOne also calls mem.observe(), which shells out to the neuron binary. These tests point Mem at a
+// path that does not exist, so observe() returns 0 — and that is not a hidden dependency being faked
+// away: search() reads the per-run `.pixelrag/index.jsonl` manifest, never neuron-db, so the retrieval
+// half is genuinely independent of the store. The manifest is what is asserted throughout.
+// =====================================================================================================
+
+const testing = std.testing;
+
+/// Index `texts` as tiles 0..n-1 of `doc` exactly the way ingest()'s tile loop does, then flush the
+/// manifest — so the retrieval assertions run against records the REAL writer produced, not hand-rolled
+/// JSON that could agree with a broken reader.
+fn seedTiles(io: std.Io, root: []const u8, mem: Mem, doc: []const u8, texts: []const []const u8) !u32 {
+    const gpa = testing.allocator;
+    const dir = try std.fmt.allocPrint(gpa, "{s}/.pixelrag/{s}", .{ root, doc });
+    defer gpa.free(dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, .default_dir) catch {};
+    var add: std.ArrayListUnmanaged(u8) = .empty;
+    defer add.deinit(gpa);
+    var indexed: u32 = 0;
+    for (texts, 0..) |t, i| _ = indexOne(gpa, io, root, mem, doc, @intCast(i), "\x89PNG\r\n fake tile bytes", t, &add, &indexed);
+    if (add.items.len > 0) appendManifest(gpa, io, root, add.items);
+    return indexed;
+}
+
+const SearchRes = struct { doc_id: []const u8 = "", tile: i64 = 0, image: []const u8 = "", score: u32 = 0, excerpt: []const u8 = "" };
+const SearchOut = struct { ok: bool = false, count: usize = 0, results: []const SearchRes = &.{}, note: []const u8 = "" };
+
+fn runSearch(io: std.Io, root: []const u8, query: []const u8, k: u32) !std.json.Parsed(SearchOut) {
+    const gpa = testing.allocator;
+    const raw = search(gpa, io, root, query, k);
+    defer gpa.free(raw);
+    // .alloc_always: the default lets unescaped strings borrow `raw`, which dies at this return.
+    return std.json.parseFromSlice(SearchOut, gpa, raw, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+fn isDocIdSafe(id: []const u8) bool {
+    if (id.len == 0) return false;
+    for (id) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_')) return false;
+    }
+    return true;
+}
+
+test "sanitizeLine keeps a tile's fact on ONE line: control bytes become spaces and runs collapse" {
+    const gpa = testing.allocator;
+    // neuron-db's store is newline-delimited, so a single raw newline in a tile's band text would shred
+    // one tile into a row of meaningless fragments (the failure that motivated cleanFactInto upstream).
+    const got = try sanitizeLine(gpa, "  Buy\tnow\r\nfor  $5\n\n\nToday  ");
+    defer gpa.free(got);
+    for (got) |c| try testing.expect(c >= 0x20);
+    try testing.expect(std.mem.indexOf(u8, got, "  ") == null);
+    try testing.expectEqualStrings(" Buy now for $5 Today ", got); // words survive, in order
+
+    const empty = try sanitizeLine(gpa, "");
+    defer gpa.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+
+    const all_control = try sanitizeLine(gpa, "\n\r\n\t\x00\x1f");
+    defer gpa.free(all_control);
+    try testing.expectEqualStrings(" ", all_control); // a whole run of control bytes collapses to one space
+}
+
+test "resolveDocId keeps a caller's id only while it stays a safe file name" {
+    const gpa = testing.allocator;
+    const url = "https://example.com/a/b?q=1";
+    // The id is interpolated straight into `{run_dir}/.pixelrag/{doc}` and into the img path recorded in
+    // the manifest, so anything that is not [A-Za-z0-9_-] must be refused rather than sanitized halfway.
+    for ([_][]const u8{ "doc", "My-Doc_9", "  padded  " }) |ok| {
+        const got = resolveDocId(gpa, ok, url);
+        defer gpa.free(got);
+        try testing.expectEqualStrings(std.mem.trim(u8, ok, " \r\n\t"), got);
+    }
+
+    const derived = resolveDocId(gpa, "", url);
+    defer gpa.free(derived);
+
+    var long: [49]u8 = @splat('a');
+    const refused = [_][]const u8{
+        "../../etc/passwd", "a/b",   "..",        "a b",    "a.b",
+        "tile\n0",          "héllo", "C:\\evil",  "q?x",    "",
+        "   ",              &long, // 49 chars: one past the 48-byte ceiling
+    };
+    for (refused) |bad| {
+        const got = resolveDocId(gpa, bad, url);
+        defer gpa.free(got);
+        try testing.expect(isDocIdSafe(got));
+        try testing.expectEqualStrings(derived, got); // fell through to the url-derived id, every time
+    }
+
+    // ...and 48 is accepted: the ceiling is a limit, not an off-by-one.
+    const at_limit: [48]u8 = @splat('a');
+    const kept = resolveDocId(gpa, &at_limit, url);
+    defer gpa.free(kept);
+    try testing.expectEqualStrings(&at_limit, kept);
+}
+
+test "resolveDocId derives a stable id per url, distinct for two pages on the SAME host" {
+    const gpa = testing.allocator;
+    // Stability is what lets a re-ingest of the same page reuse its doc instead of piling duplicates
+    // into the index; distinctness is what stops two pages of one site from collapsing into one doc.
+    const a1 = resolveDocId(gpa, "", "https://example.com/pricing");
+    defer gpa.free(a1);
+    const a2 = resolveDocId(gpa, "", "https://example.com/pricing");
+    defer gpa.free(a2);
+    const b = resolveDocId(gpa, "", "https://example.com/docs");
+    defer gpa.free(b);
+    try testing.expectEqualStrings(a1, a2);
+    try testing.expect(!std.mem.eql(u8, a1, b));
+    try testing.expect(std.mem.startsWith(u8, a1, "examplecom-") and std.mem.startsWith(u8, b, "examplecom-"));
+
+    // the host contributes at most 24 alnum bytes, and the hash tail at most 6 (h & 0xffffff)
+    const long_host = resolveDocId(gpa, "", "https://aaaa-bbbb.cccc-dddd.eeee-ffff.gggg.example.com/x");
+    defer gpa.free(long_host);
+    const dash = std.mem.lastIndexOfScalar(u8, long_host, '-').?;
+    try testing.expectEqual(@as(usize, 24), dash);
+    try testing.expect(long_host.len - dash - 1 <= 6);
+    try testing.expect(isDocIdSafe(long_host));
+
+    // a url with no alnum host at all still yields a usable directory name
+    const no_host = resolveDocId(gpa, "", "file:///c:/tmp/page.html");
+    defer gpa.free(no_host);
+    try testing.expect(std.mem.startsWith(u8, no_host, "page-"));
+    try testing.expect(isDocIdSafe(no_host));
+}
+
+test "the OOM fallbacks return a slice the caller can free — every caller frees the doc id" {
+    // ingest, ingestImage and capture all `defer gpa.free(doc_id)`. An out-of-memory fallback that is a
+    // NON-EMPTY string literal is not an allocation, so freeing it is an invalid free handed straight to
+    // the allocator. Allocator.free returns early on a zero-length slice, which is exactly why dupe()'s
+    // fallback is "" — resolveDocId has to hold the same contract.
+    const fa = testing.failing_allocator;
+    try testing.expectEqual(@as(usize, 0), dupe(fa, "anything").len);
+    try testing.expectEqual(@as(usize, 0), resolveDocId(fa, "already-safe", "https://example.com/").len);
+    try testing.expectEqual(@as(usize, 0), resolveDocId(fa, "", "https://example.com/").len);
+}
+
+test "indexOne records the tile at exactly the path it wrote the PNG to" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-index-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag/shop", .default_dir) catch {};
+
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+    var add: std.ArrayListUnmanaged(u8) = .empty;
+    defer add.deinit(gpa);
+    var indexed: u32 = 0;
+    const png = "\x89PNG\r\n\x1a\n fake tile bytes";
+    const text = "Order total\n42 dollars";
+    try testing.expectEqual(text.len, indexOne(gpa, io, root, mem, "shop", 3, png, text, &add, &indexed));
+    try testing.expectEqual(@as(u32, 1), indexed);
+
+    const parsed = try std.json.parseFromSlice(Entry, gpa, std.mem.trim(u8, add.items, " \r\n"), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("shop", parsed.value.doc);
+    try testing.expectEqual(@as(i64, 3), parsed.value.tile);
+    try testing.expectEqualStrings(".pixelrag/shop/tile_3.png", parsed.value.img);
+    try testing.expectEqualStrings("Order total 42 dollars", parsed.value.text); // sanitized, one line
+
+    // the recorded path is the path the bytes are actually at — this is the whole key derivation, and a
+    // search hit that names a file nobody wrote is a dead result in the model's hands.
+    const abs = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, parsed.value.img });
+    defer gpa.free(abs);
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, abs, gpa, .limited(1 << 20));
+    defer gpa.free(on_disk);
+    try testing.expectEqualSlices(u8, png, on_disk);
+}
+
+test "indexOne on a text-free tile still writes the image but adds no fact and no manifest line" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-blank-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag/img", .default_dir) catch {};
+
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+    var add: std.ArrayListUnmanaged(u8) = .empty;
+    defer add.deinit(gpa);
+    var indexed: u32 = 0;
+    // A screenshot with no readable text (a chart, a photo) is the documented image-only tile: the PNG
+    // must still land on disk so the tile is present, while the index gains nothing to retrieve.
+    try testing.expectEqual(@as(usize, 0), indexOne(gpa, io, root, mem, "img", 0, "PNGBYTES", "  \r\n\t ", &add, &indexed));
+    try testing.expectEqual(@as(u32, 0), indexed);
+    try testing.expectEqual(@as(usize, 0), add.items.len);
+    const on_disk = try std.Io.Dir.cwd().readFileAlloc(io, root ++ "/.pixelrag/img/tile_0.png", gpa, .limited(1 << 20));
+    defer gpa.free(on_disk);
+    try testing.expectEqualStrings("PNGBYTES", on_disk);
+
+    // one printable byte is enough to make it a retrievable tile
+    try testing.expectEqual(@as(usize, 1), indexOne(gpa, io, root, mem, "img", 1, "PNGBYTES", " x ", &add, &indexed));
+    try testing.expectEqual(@as(u32, 1), indexed);
+}
+
+test "search maps a query to the tiles whose band text carries it, ranked by DISTINCT stem hits" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-search-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+
+    try testing.expectEqual(@as(u32, 3), try seedTiles(io, root, mem, "shop", &.{
+        "Header nav Home About Contact", // tile 0 — no query stem
+        "Checkout button under the price table", // tile 1 — checkout, button, price
+        "The price list only", // tile 2 — price
+    }));
+
+    // "price" appears twice and once capitalised: the score is DISTINCT stems present, so it counts once.
+    // "of" is under the 3-byte floor and is not a stem at all.
+    var out = try runSearch(io, root, "PRICE of checkout button price", 0);
+    defer out.deinit();
+    try testing.expect(out.value.ok);
+    try testing.expectEqual(@as(usize, 2), out.value.count); // the header tile matched nothing and is absent
+    try testing.expectEqual(@as(usize, 2), out.value.results.len);
+    try testing.expectEqual(@as(u32, 3), out.value.results[0].score);
+    try testing.expectEqual(@as(i64, 1), out.value.results[0].tile);
+    try testing.expectEqualStrings(".pixelrag/shop/tile_1.png", out.value.results[0].image);
+    try testing.expectEqualStrings("shop", out.value.results[0].doc_id);
+    try testing.expectEqual(@as(u32, 1), out.value.results[1].score); // ranked below, not dropped
+    try testing.expectEqual(@as(i64, 2), out.value.results[1].tile);
+}
+
+test "search: a query of only sub-3-byte tokens matches NOTHING rather than everything" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-shorttok-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+    _ = try seedTiles(io, root, mem, "doc", &.{ "alpha beta", "gamma delta" });
+
+    // Zero stems must score zero on every tile. The dangerous alternative — an empty stem set matching
+    // every line — would answer any junk query with the whole corpus.
+    var none = try runSearch(io, root, "a is of to", 0);
+    defer none.deinit();
+    try testing.expect(none.value.ok);
+    try testing.expectEqual(@as(usize, 0), none.value.count);
+
+    var punct = try runSearch(io, root, "...,;:!?()[]{}\"'/\\-_", 0);
+    defer punct.deinit();
+    try testing.expectEqual(@as(usize, 0), punct.value.count);
+}
+
+test "search: a 40-byte token is the widest stem the buffer holds, and only 24 stems are ever weighed" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-stemcap-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+
+    const w40: [40]u8 = @splat('w'); // exactly fills one [40]u8 stem slot — one more would smash the next
+    const w41: [41]u8 = @splat('v');
+    const tile = try std.fmt.allocPrint(gpa, "prefix {s} middle {s} suffix", .{ &w40, &w41 });
+    defer gpa.free(tile);
+    _ = try seedTiles(io, root, mem, "cap", &.{tile});
+
+    var wide = try runSearch(io, root, &w40, 0);
+    defer wide.deinit();
+    try testing.expectEqual(@as(usize, 1), wide.value.count);
+    try testing.expectEqual(@as(u32, 1), wide.value.results[0].score);
+
+    var too_wide = try runSearch(io, root, &w41, 0);
+    defer too_wide.deinit();
+    try testing.expectEqual(@as(usize, 0), too_wide.value.count); // dropped as a stem, so it can never hit
+
+    // the 25th distinct stem is past the bounded stem table and is never weighed
+    var q: std.ArrayListUnmanaged(u8) = .empty;
+    defer q.deinit(gpa);
+    for (0..24) |i| try q.print(gpa, "absentword{d} ", .{i});
+    try q.appendSlice(gpa, "prefix");
+    var capped = try runSearch(io, root, q.items, 0);
+    defer capped.deinit();
+    try testing.expectEqual(@as(usize, 0), capped.value.count);
+}
+
+test "search: k=0 falls back to the module's page size, and k caps the list without reordering it" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-topk-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+    _ = try seedTiles(io, root, mem, "many", &.{
+        "widget one", "widget two", "widget three", "widget four", "widget five", "widget six",
+    });
+
+    var dflt = try runSearch(io, root, "widget", 0);
+    defer dflt.deinit();
+    try testing.expectEqual(@as(usize, 4), dflt.value.count); // six match; the default page is four
+
+    var two = try runSearch(io, root, "widget", 2);
+    defer two.deinit();
+    try testing.expectEqual(@as(usize, 2), two.value.count);
+    try testing.expectEqual(dflt.value.results[0].tile, two.value.results[0].tile);
+
+    var all = try runSearch(io, root, "widget", 100);
+    defer all.deinit();
+    try testing.expectEqual(@as(usize, 6), all.value.count); // k past the hit count is not padded
+}
+
+test "search before anything is ingested is an ok, empty answer that names the tool to call" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-empty-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+
+    // No manifest at all: the model must get a parseable empty result, not an error string it will
+    // mistake for a hit and not a crash.
+    var out = try runSearch(io, root, "anything at all", 0);
+    defer out.deinit();
+    try testing.expect(out.value.ok);
+    try testing.expectEqual(@as(usize, 0), out.value.count);
+    try testing.expect(std.mem.indexOf(u8, out.value.note, "pixel_ingest") != null);
+}
+
+test "a tile past MAX_TEXT is clipped mid-character yet stays retrievable, and its excerpt is bounded" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-clip-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+
+    // "zebras " is 7 bytes and each 'é' is 2, so byte MAX_TEXT lands INSIDE a character — the boundary
+    // where a naive clip produces a manifest line the reader cannot parse and the tile vanishes.
+    var long: std.ArrayListUnmanaged(u8) = .empty;
+    defer long.deinit(gpa);
+    try long.appendSlice(gpa, "zebras ");
+    while (long.items.len < MAX_TEXT + 200) try long.appendSlice(gpa, "é");
+    try long.appendSlice(gpa, " omegaword");
+    try testing.expect((MAX_TEXT - 7) % 2 == 1); // the clip really is mid-character
+
+    const big_dir = try std.fmt.allocPrint(gpa, "{s}/.pixelrag/big", .{root});
+    defer gpa.free(big_dir);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, big_dir, .default_dir) catch {};
+    var add: std.ArrayListUnmanaged(u8) = .empty;
+    defer add.deinit(gpa);
+    var indexed: u32 = 0;
+    // the FULL length is reported even though only MAX_TEXT bytes are stored
+    try testing.expectEqual(long.items.len, indexOne(gpa, io, root, mem, "big", 0, "PNG", long.items, &add, &indexed));
+    try testing.expectEqual(@as(u32, 1), indexed);
+    appendManifest(gpa, io, root, add.items);
+
+    const stored = try std.json.parseFromSlice(Entry, gpa, std.mem.trim(u8, add.items, " \r\n"), .{});
+    defer stored.deinit();
+    try testing.expect(stored.value.text.len <= MAX_TEXT);
+
+    var head = try runSearch(io, root, "zebras", 0);
+    defer head.deinit();
+    try testing.expectEqual(@as(usize, 1), head.value.count); // survived the clip point
+    try testing.expectEqual(@as(usize, 240), head.value.results[0].excerpt.len);
+
+    var tail = try runSearch(io, root, "omegaword", 0);
+    defer tail.deinit();
+    try testing.expectEqual(@as(usize, 0), tail.value.count); // and everything past MAX_TEXT is gone
+}
+
+test "appendManifest grows the index: a second document never clobbers the first" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-pixelrag-append-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root ++ "/.pixelrag", .default_dir) catch {};
+    const mem = Mem.init(gpa, io, root ++ "/no-neuron-binary-here", root ++ "/pixels.db");
+
+    _ = try seedTiles(io, root, mem, "first", &.{"shared keyword alpha"});
+    _ = try seedTiles(io, root, mem, "second", &.{"shared keyword beta"});
+
+    var out = try runSearch(io, root, "keyword", 0);
+    defer out.deinit();
+    try testing.expectEqual(@as(usize, 2), out.value.count);
+    var seen_first = false;
+    var seen_second = false;
+    for (out.value.results) |r| {
+        if (std.mem.eql(u8, r.doc_id, "first")) seen_first = true;
+        if (std.mem.eql(u8, r.doc_id, "second")) seen_second = true;
+    }
+    try testing.expect(seen_first and seen_second);
+}
+
+test "captureDocId: two snapshots of the same page get different ids so a stale one cannot shadow a fresh one" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    const url = "https://app.example.com/dashboard?tab=2";
+    const one = captureDocId(gpa, io, &b1, "", url);
+    const two = captureDocId(gpa, io, &b2, "", url);
+    try testing.expect(!std.mem.eql(u8, one, two));
+    try testing.expect(isDocIdSafe(one) and isDocIdSafe(two));
+    // base + "-s" + 4 hex of generation: both derive from the same page, so they share everything but the tail
+    try testing.expect(std.mem.startsWith(u8, one, "appexamplecom-"));
+    try testing.expectEqualStrings(one[0 .. one.len - 4], two[0 .. two.len - 4]);
+    try testing.expect(one.len <= b1.len);
+    for (one[one.len - 4 ..]) |c| try testing.expect(std.ascii.isHex(c));
+
+    // an explicit id is honoured verbatim — a caller naming its doc wants successive captures to MERGE
+    var b3: [64]u8 = undefined;
+    try testing.expectEqualStrings("my-run", captureDocId(gpa, io, &b3, "my-run", url));
 }

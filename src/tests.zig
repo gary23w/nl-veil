@@ -18,11 +18,15 @@ test {
     _ = @import("config/keys_api.zig"); // every vault route is gated (handler tests via http.testApp)
     _ = @import("config/server_config.zig");
     _ = @import("config/lan.zig");
+    _ = @import("config/local_models.zig"); // NOT collected before this line: main.zig imports it, lazy analysis never reached it
+    _ = @import("worker/ocr.zig"); // OCR shim write-once + degradation; the PS1 flag/source agreement audit
     _ = @import("gateway/http.zig"); // jstr escaping (no forged structure) + appendFile's monotonic growth
     _ = @import("obs/audit_log.zig"); // tamper-evidence: hash chain verify, escaping round trip, doctored-file detection
     _ = @import("worker/agi.zig");
     _ = @import("worker/hashline.zig"); // hash-anchored atomic line edits (tag dialect of edit_file)
+    _ = @import("worker/browser/cdp.zig"); // JSON-RPC demux + RFC-6455 framing, no socket needed
     _ = @import("worker/browser/manager.zig");
+    _ = @import("worker/pixelrag.zig"); // doc-id safety, fact sanitising, query→tile scoring
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/chat/context.zig");
     _ = @import("worker/chat/engine.zig");
