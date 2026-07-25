@@ -159,3 +159,154 @@ pub fn findBin(gpa: std.mem.Allocator, io: Io) []const u8 {
     }
     return "";
 }
+
+// ---- tests ---------------------------------------------------------------------------------------------
+//
+// The contract this file exists for is FAIL-OPEN: with the binary or the db missing, unreadable or broken,
+// the chat must behave EXACTLY as it did before neuron-db existed. Each test below is one way of asking
+// "can the caller tell that the store failed?" — the answer has to be no, in every direction.
+//
+// std.testing.allocator is the second assertion in all of them: run() builds an argv and takes ownership of
+// a stdout buffer on every call, so a degraded path that forgot to free shows up here as a leak instead of
+// as slow growth over a long chat session.
+
+const TMP_ROOT = "zig-neuron-tmp";
+
+test "a bridge with no binary and no db is a silent no-op in every direction" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const db = Db{ .gpa = std.testing.allocator, .io = threaded.io() };
+    try std.testing.expect(!db.enabled());
+    var out: [256]u8 = undefined;
+    // reads degrade to "nothing recalled" — not an error the chat has to handle, not a partial answer
+    try std.testing.expectEqual(@as(usize, 0), db.recall("chat:1", "a real query", &out).len);
+    try std.testing.expectEqual(@as(usize, 0), db.chain("chat:1", "start", "causes", &out).len);
+    try std.testing.expect(db.dump("chat:1") == null);
+    try std.testing.expect(db.statsScope("chat:1") == null);
+    // and writes return normally, having done nothing
+    db.observe("chat:1", "a fact long enough to clear the guard");
+    db.reinforce("chat:1", "a topic", "useful");
+    db.strengthen("chat:1", "a fact long enough to clear the guard");
+    db.forget("chat:1", "a match key");
+    db.forgetAll("chat:1");
+}
+
+test "an unreachable store degrades exactly like a disabled one — the caller never sees the failure" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("llm.zig").osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteTree(io, TMP_ROOT) catch {}; // a previous crash may have left it behind
+    defer Io.Dir.cwd().deleteTree(io, TMP_ROOT) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, TMP_ROOT, .default_dir) catch {};
+    // enabled() says YES here — both paths are configured — but the spawn cannot succeed. This is the live
+    // failure mode: neuron.exe deleted, moved by an install, or (this repo has form) Defender-quarantined
+    // mid-session. The bridge must not turn that into a chat that errors or stops answering.
+    const db = Db{
+        .gpa = gpa,
+        .io = io,
+        .bin = TMP_ROOT ++ "/no-such-neuron.exe",
+        .db = TMP_ROOT ++ "/mem.sqlite",
+    };
+    try std.testing.expect(db.enabled());
+    var out: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), db.recall("chat:1", "a real query", &out).len);
+    try std.testing.expectEqual(@as(usize, 0), db.chain("chat:1", "start", "causes", &out).len);
+    try std.testing.expect(db.dump("chat:1") == null);
+    try std.testing.expect(db.statsScope("chat:1") == null);
+    db.observe("chat:1", "a fact long enough to clear the guard");
+    db.reinforce("chat:1", "a topic", "useful");
+    db.strengthen("chat:1", "a fact long enough to clear the guard");
+    db.forget("chat:1", "a match key");
+    db.forgetAll("chat:1");
+}
+
+test "a key too short to identify a fact never becomes a query" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("llm.zig").osEnviron() });
+    defer threaded.deinit();
+    const db = Db{ .gpa = gpa, .io = threaded.io(), .bin = "no-such-neuron.exe", .db = "no-such.sqlite" };
+    var out: [64]u8 = undefined;
+    // a stopword-length key would match half the scope, so the readers refuse it before it is a query…
+    const short = db.recall("chat:1", "ab", &out);
+    try std.testing.expectEqual(@as(usize, 0), short.len);
+    // …and the empty answer is a slice OF the caller's buffer, so `out[0..n]` stays valid for the caller
+    try std.testing.expectEqual(@as([*]const u8, &out), short.ptr);
+    try std.testing.expectEqual(@as(usize, 0), db.recall("chat:1", "   \r\n ", &out).len);
+    // a chain needs both ends: half a traversal is not a shorter traversal, it is no traversal
+    try std.testing.expectEqual(@as(usize, 0), db.chain("chat:1", "", "causes", &out).len);
+    try std.testing.expectEqual(@as(usize, 0), db.chain("chat:1", "start", "", &out).len);
+    // an empty scope is never a wildcard
+    try std.testing.expect(db.dump("") == null);
+    try std.testing.expect(db.statsScope("") == null);
+    db.forgetAll("");
+}
+
+test "findBin hands back a slice the caller owns, found or not, and never names a path that is not there" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bin = findBin(gpa, io);
+    defer gpa.free(bin); // "" is a zero-length free (a no-op), so callers never have to branch on the miss
+    if (bin.len > 0) {
+        // the probe is a real statFile, not a guess about the layout — whatever it named must be there
+        _ = Io.Dir.cwd().statFile(io, bin, .{}) catch return error.TestUnexpectedResult;
+    }
+}
+
+test "a real store round-trips, and the blank-match guard holds against its own counterfactual" {
+    const gpa = std.testing.allocator;
+    // The desk's own Io carries the process environ (main.zig), and so must this one: a child spawned into
+    // an empty environment on Windows comes up with no SystemRoot/TEMP and fails INSIDE a `catch {}`, which
+    // would leave this test asserting against a store that was never written (TESTING.md, 0015).
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = @import("llm.zig").osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const bin = findBin(gpa, io);
+    defer gpa.free(bin);
+    if (bin.len == 0) return error.SkipZigTest; // no neuron CLI in this checkout — a skip is honest
+
+    Io.Dir.cwd().deleteTree(io, TMP_ROOT) catch {};
+    defer Io.Dir.cwd().deleteTree(io, TMP_ROOT) catch {};
+    _ = Io.Dir.cwd().createDirPathStatus(io, TMP_ROOT, .default_dir) catch {};
+    const db = Db{ .gpa = gpa, .io = io, .bin = bin, .db = TMP_ROOT ++ "/mem.sqlite" };
+    const scope = "desk_neuron_bridge_test";
+
+    // Probe with a call that only the SPAWN can fail: a CLI that ran always prints its counters, so a null
+    // here means the binary could not execute at all. That separates "the dependency is unusable on this
+    // machine" (skip) from "the bridge broke its contract" (fail) — everything below is the latter.
+    if (db.statsScope(scope) == null) return error.SkipZigTest;
+
+    const fact = "the desk neuron bridge round trip fact about zigzagbadger telemetry";
+    db.observe(scope, fact);
+    {   // observe → the fact is IN the store: a write that silently did nothing looks identical from the
+        // caller's side, so the only honest probe is reading it back out.
+        const dumped = db.dump(scope) orelse return error.TestUnexpectedResult;
+        defer gpa.free(dumped);
+        try std.testing.expect(std.mem.indexOf(u8, dumped, "zigzagbadger") != null);
+    }
+    const st = db.statsScope(scope) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(st.facts >= 1);
+    try std.testing.expect(st.created_ms > 0 and st.updated_ms >= st.created_ms);
+
+    var out: [4096]u8 = undefined;
+    const recalled = db.recall(scope, "zigzagbadger telemetry", &out);
+    try std.testing.expect(std.mem.indexOf(u8, recalled, "zigzagbadger") != null);
+
+    // THE GUARD, against its own counterfactual. forget() with a blank match must never reach the CLI,
+    // because `forget <scope>` with no match drops the WHOLE scope — which is exactly what the deliberate
+    // forgetAll() does four lines down, on the same binary, the same db and the same scope.
+    db.forget(scope, "  \n\t ");
+    {
+        const after_blank = db.dump(scope) orelse return error.TestUnexpectedResult;
+        defer gpa.free(after_blank);
+        try std.testing.expect(std.mem.indexOf(u8, after_blank, "zigzagbadger") != null);
+    }
+    db.forgetAll(scope);
+    {
+        const after_wipe = db.dump(scope) orelse return error.TestUnexpectedResult;
+        defer gpa.free(after_wipe);
+        try std.testing.expect(std.mem.indexOf(u8, after_wipe, "zigzagbadger") == null);
+    }
+}
