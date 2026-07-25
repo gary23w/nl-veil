@@ -36,6 +36,7 @@ test {
     _ = @import("worker/lineage.zig"); // cross-run persistent swarm memory (stable neuron-db identity)
     _ = @import("worker/llm.zig");
     _ = @import("worker/locs/atlas.zig");
+    _ = @import("worker/mcp/client.zig"); // JSON-RPC demux: right id only, errors/close -> null
     _ = @import("worker/mcp/discovery.zig");
     _ = @import("worker/metrics.zig");
     _ = @import("modelcfg"); // its own module now (see build.zig); a path import would double-own the file
