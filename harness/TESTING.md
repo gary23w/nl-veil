@@ -184,6 +184,16 @@ and silence looks like whichever answer you were expecting. Capture the exit cod
 "EXIT=$?"`), or redirect to a file and grep the file. Never let `| grep | head` be the last word on
 whether something passed.
 
+**A throwaway extractor is a hypothesis, not a measurement.** Scripts written to survey the tree —
+"which escapers lack the arm", "which verbs does dispatch handle" — get trusted like tests, and
+they have not been reviewed by anyone. Three misled a single sitting: a hand grep that missed a
+fifth JSON escaper because it matched the shape already in view rather than the property (0055);
+the pipe above (0054); and a regex that bounded a function body at the next `pub fn`, ran past it
+into a private helper reusing the same local name, and produced a confident, wrong "four CLI
+commands are unreachable" (0058). Before reporting what a one-off script found, **re-derive the
+number a second way** — brace-match instead of regex, count from the other side, spot-check one hit
+by hand. When the two methods disagree, the disagreement is the finding.
+
 Two local quirks worth knowing:
 
 - Windows Defender can kill the build runner's test IPC: the failure names no test, just
