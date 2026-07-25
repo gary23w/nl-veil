@@ -10,6 +10,7 @@ test {
     _ = @import("config/cf_oauth.zig");
     _ = @import("config/server_config.zig");
     _ = @import("config/lan.zig");
+    _ = @import("gateway/http.zig"); // jstr escaping (no forged structure) + appendFile's monotonic growth
     _ = @import("obs/audit_log.zig"); // tamper-evidence: hash chain verify, escaping round trip, doctored-file detection
     _ = @import("worker/agi.zig");
     _ = @import("worker/hashline.zig"); // hash-anchored atomic line edits (tag dialect of edit_file)
