@@ -9,6 +9,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
+| H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
@@ -749,6 +750,34 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   pair in this codebase pinned this way (httpc bodies, the neuron rate table, and now safeSeg).
 - next: 4 desk modules (main, poller, runner, tray) are the remaining coverage frontier; H14 and
   H10 are the owner's calls.
+
+## 0035 — 2026-07-25 — the tool endpoint's capability gate, and an overlap it exposed
+- did: `worker/chat/tools.zig` — ONE HTTP surface documented as serving "any external client", where
+  the only thing between a hosted non-admin tenant and `run_python` / `host_command` /
+  `patch_system` is chatTool's admin check. Tests drive that gate from the REAL `ADMIN_TOOLS` array
+  rather than a copied fixture, so a tool added there is covered automatically: all 22 refused to a
+  non-admin with 403; unknown names refused 400 even for an ADMIN (admin-ness lifts the gate, it
+  does not invent tools); a missing name and a malformed body both readable 400s; and a stranger
+  refused 401 while sending a well-formed `host_command`, so only the auth gate can be what stops it.
+- FOUND (H26, owner's call): `pixel_search` is in ADMIN_TOOLS here AND in the engine's
+  SANDBOX_TOOLS, so a non-admin is refused it on this endpoint but may run it inside a sandboxed
+  chat turn. Not a hole — chatTool takes the stricter reading — but the two surfaces are documented
+  as sharing one registry, and `toolSafe` says it delegates to the engine's predicate precisely "so
+  the two surfaces cannot drift". Resolving it is a capability decision (pixel_search reads stored
+  tiles; pixel_capture/pixel_ingest touch the host screen), so it is pinned, not silently picked:
+  `KNOWN_CAP_OVERLAP` fails the build on a NEW overlap and also on fixing this one without updating
+  the list.
+- verified: two reds first, both mine-ish. The partition assertion was the real finding above. The
+  other was a bad test: I fed `" run_python"` expecting padding to make it unknown, but the name is
+  TRIMMED before matching, so as an admin the test actually EXECUTED run_python and got 500 from
+  the failed spawn. Removed — a test must not fire a host-touching tool to make a point — and the
+  reason is written beside the cases that remain. Third run ALL GREEN.
+- learned: when two lists describe one registry from different surfaces, test the RELATIONSHIP
+  between them, not just each side. The overlap had been sitting there in plain sight; nothing that
+  tested either list alone would ever have reported it.
+- ratchet: the known-exception pattern — pin a current inconsistency so that BOTH new drift and a
+  silent fix fail the build, leaving the judgment call to a human without leaving it unguarded.
+- next: 4 desk modules remain; H14, H26 and H10 are the owner's calls.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
