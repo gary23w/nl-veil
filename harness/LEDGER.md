@@ -364,3 +364,23 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   the throttle would never act on again") rather than as a threshold, so a future tuning change
   has to restate the invariant instead of silently widening it.
 - next: H19/H20 are low; the honest next lane is either H10 (SELF cast) or more coverage.
+
+## 0018 — 2026-07-24 — both ends of the events pipeline now hold their contract
+- did: `gateway/http.zig` was untested despite holding the two primitives everything else builds
+  on. Added 4 test blocks: `jstr` escapes exactly what JSON requires (control bytes to \u, never
+  dropped, >=0x20 passing through raw); hostile inputs — `","op":"stop","x":"`, `}\n{"op":"stop"}`,
+  a NUL, embedded CRLF+`{"seq":999}` — round-trip through a REAL parser byte-for-byte with a
+  trailing field intact and no bare newline in the escaped form, so a user string cannot forge
+  structure in any of the hand-rolled JSON lines (control bus, audit log, event logs);
+  `appendFile` creates at offset 0, concatenates in order, and NEVER shrinks; `appendStripe` maps
+  a path to a stable lock and actually spreads across the array.
+- verified: Full oracle ALL GREEN, exit 0, first try.
+- learned: the appendFile test states the exact property `worker/evcursor.zig` documents as its
+  assumption ("the file only grows, so `from` stays valid"). The writer that guarantees monotonic
+  growth and the reader that depends on it are now pinned from both ends — the events pipeline's
+  contract is no longer an unwritten agreement between two modules.
+- ratchet: proving escaping by ROUND-TRIPPING through std.json (rather than string-comparing the
+  escaped form) is the pattern to copy — it tests the property that matters (no forged structure)
+  instead of one particular spelling of the escape.
+- next: coverage frontier continues (deploy/service's unknown-plan coercion, chat/tools); H10 SELF
+  lane remains the horizon; H14 is the owner's call.

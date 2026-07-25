@@ -223,3 +223,118 @@ pub fn authErr(res: *httpz.Response, e: anyerror) !void {
     };
     try res.json(.{ .ok = false, .err = @errorName(e) }, .{});
 }
+
+// ---------------------------------------------------------------------------
+// tests — the two primitives the rest of the server builds its guarantees on:
+// jstr (every hand-rolled JSON line in this repo escapes through it) and appendFile
+// (every append-log the byte-cursor readers poll). The handler helpers need an httpz
+// Request/Response and are left to the endpoints' own coverage.
+// ---------------------------------------------------------------------------
+
+/// Escape `s` through jstr and hand back the quoted result (caller frees).
+fn jstrAlloc(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    var list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try jstr(gpa, &list, s);
+    return list.toOwnedSlice(gpa);
+}
+
+test "jstr: the escapes are exactly the ones JSON requires, and control bytes go to \\u" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { in: []const u8, want: []const u8 }{
+        .{ .in = "", .want = "\"\"" },
+        .{ .in = "plain", .want = "\"plain\"" },
+        .{ .in = "say \"hi\"", .want = "\"say \\\"hi\\\"\"" },
+        .{ .in = "back\\slash", .want = "\"back\\\\slash\"" },
+        .{ .in = "two\nlines", .want = "\"two\\nlines\"" },
+        .{ .in = "cr\rtab\t", .want = "\"cr\\rtab\\t\"" },
+        .{ .in = "\x01\x1f", .want = "\"\\u0001\\u001f\"" }, // other control bytes, never dropped
+        .{ .in = "unicode ☃ stays raw", .want = "\"unicode ☃ stays raw\"" }, // >= 0x20 passes through
+    };
+    for (cases) |c| {
+        const got = try jstrAlloc(gpa, c.in);
+        defer gpa.free(got);
+        try std.testing.expectEqualStrings(c.want, got);
+    }
+}
+
+test "jstr: hostile input round-trips through a real JSON parser instead of forging structure" {
+    const gpa = std.testing.allocator;
+    // Each of these is an attempt to break OUT of the string and add fields or records of its own —
+    // the swarm control bus, the audit log and the chat event logs are all hand-rolled JSON lines,
+    // so this escape is the only thing standing between a user-supplied string and forged structure.
+    const hostile = [_][]const u8{
+        "\",\"op\":\"stop\",\"x\":\"",
+        "}\n{\"op\":\"stop\"}",
+        "\\\",\"admin\":true,\"_\":\"",
+        "line1\nline2\r\n{\"seq\":999}",
+        "\x00\x07 bel and nul",
+    };
+    for (hostile) |s| {
+        const escaped = try jstrAlloc(gpa, s);
+        defer gpa.free(escaped);
+        // it must still be ONE json string token...
+        const doc = try std.fmt.allocPrint(gpa, "{{\"text\":{s},\"after\":1}}", .{escaped});
+        defer gpa.free(doc);
+        const P = struct { text: []const u8 = "", after: i64 = 0 };
+        const parsed = try std.json.parseFromSlice(P, gpa, doc, .{});
+        defer parsed.deinit();
+        // ...whose value is byte-for-byte what went in, with the trailing field intact
+        try std.testing.expectEqualStrings(s, parsed.value.text);
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.after);
+        // and the escaped form never contains a bare newline that would split the line in two
+        try std.testing.expect(std.mem.indexOfScalar(u8, escaped, '\n') == null);
+    }
+}
+
+test "appendFile: the log only grows, in order, and a byte cursor never has to rewind" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const root = "zig-http-append-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const path = root ++ "/events.jsonl";
+
+    // A missing file is created at offset 0 — the only case allowed to start from nothing.
+    try appendFile(io, gpa, path, "{\"i\":0}\n");
+    // Every later append lands at end-of-file, so earlier frames survive verbatim.
+    try appendFile(io, gpa, path, "{\"i\":1}\n");
+    try appendFile(io, gpa, path, "{\"i\":2}\n");
+
+    const all = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(all);
+    try std.testing.expectEqualStrings("{\"i\":0}\n{\"i\":1}\n{\"i\":2}\n", all);
+
+    // The property worker/evcursor.zig is written against: size is monotonic, so a reader's byte
+    // cursor stays valid and the bytes after it are exactly what was appended since.
+    const before = (try std.Io.Dir.cwd().statFile(io, path, .{})).size;
+    try appendFile(io, gpa, path, "{\"i\":3}\n");
+    const after = (try std.Io.Dir.cwd().statFile(io, path, .{})).size;
+    try std.testing.expect(after > before);
+    const tail = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(tail);
+    try std.testing.expectEqualStrings("{\"i\":3}\n", tail[@intCast(before)..]);
+}
+
+test "appendStripe: a path always maps to its own lock, and the stripe is in range" {
+    // Same path -> same mutex is the whole correctness argument for striping (two appends to one
+    // file must exclude each other); different paths merely MAY share one, which only coarsens it.
+    const a = appendStripe("data/u1/events.jsonl");
+    try std.testing.expectEqual(a, appendStripe("data/u1/events.jsonl"));
+    try std.testing.expectEqual(a, appendStripe("data/u1/events.jsonl"));
+
+    var seen_distinct = false;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        var buf: [64]u8 = undefined;
+        const p = try std.fmt.bufPrint(&buf, "data/u{d}/control.jsonl", .{i});
+        const s = appendStripe(p);
+        const idx = (@intFromPtr(s) - @intFromPtr(&append_mtxs[0])) / @sizeOf(std.Io.Mutex);
+        try std.testing.expect(idx < append_mtxs.len); // never off the end of the stripe array
+        if (s != a) seen_distinct = true;
+    }
+    try std.testing.expect(seen_distinct); // it really does spread, rather than funnelling into one
+}
