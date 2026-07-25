@@ -17,12 +17,20 @@ Today the engine's rich runtime ledgers (per-model LLM metrics, tool timings, sc
 ledger, fitness blocks) describe *deliverable runs*, all under gitignored `data/`. Ring 1 turns
 those inward and outward:
 
-- A `veil doctor --growth` style report that folds runtime signals (error streaks, slow tools,
-  failing schedules, model fail-rates) into worker-readable health — so SENSE reads the *running
-  app*, not just the source tree.
-- More `-Scan` signals as they earn their keep: bench regressions on engine hot paths, hermetic
-  desk tests, docs-mirror drift, version-stamp drift (the seed already checks the last two).
-- A tiny benchmark harness for the engine's own hot paths, so "faster" is a verifiable claim.
+- **LIVE** — `veil doctor --growth` folds runtime signals (toolperf digest, schedule fail-streaks,
+  per-model usage) into worker-readable health, reading `data/` directly so it works with the server
+  down. SENSE reads the *running app*, not just the source tree.
+- **LIVE** — the `-Scan` signal set has grown to nine as each earned its keep: in-flight files, test
+  registration (direct vs merely reachable), httpc twin drift, version stamps, docs mirror, marker
+  debt, allocPrint leaks, theme palette mirror, oracle parity, and JSON escapers missing the
+  control-byte arm. Hermetic desk tests turned out to be already true (ledger 0006).
+- **PARTLY** — "faster" as a verifiable claim (H8). The pattern is settled and proven twice: measure
+  COST, never wall-clock. A stopwatch on a dev box measures Defender and background load, flakes,
+  and gets muted. Counted instead: `Neuron.exec` carries an `is_test` spawn probe and reading N
+  records is pinned at N+1 spawns (0053); the turn-tools block is pinned by POINTER identity for
+  "zero allocation" and BYTE identity for "the prompt prefix still hits the provider cache" (0056).
+  Remaining: the engine's other hot paths — tool round-trips per turn, context rebuilds — are still
+  unpriced. Find each one's single choke point first; if it has none, that is the finding.
 
 ## Ring 2 — self-hosting: the app is its own deliverable
 
