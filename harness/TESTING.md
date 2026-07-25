@@ -166,6 +166,14 @@ LOGIC deserves to be its own tested unit — evcursor, parsePlan — just not as
 looks like a pass — this nearly put a false ALL GREEN in the ledger (0037). Run it bare and read
 the exit code, or grep the output for the literal `NOT GREEN`.
 
+**This is not specific to the oracle — it applies to every verification you run.** In 0054 a
+counterfactual run as `zig build test 2>&1 | grep -E ... | head -4` printed *nothing*, and nothing
+was one step from being read as "the injected bug did not fail the test, so the new guard is
+worthless" — the exact opposite of the truth. A pipeline can return silence instead of a verdict,
+and silence looks like whichever answer you were expecting. Capture the exit code (`; echo
+"EXIT=$?"`), or redirect to a file and grep the file. Never let `| grep | head` be the last word on
+whether something passed.
+
 Two local quirks worth knowing:
 
 - Windows Defender can kill the build runner's test IPC: the failure names no test, just

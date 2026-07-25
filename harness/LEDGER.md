@@ -9,11 +9,12 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
+| H28 | low | OWNER'S CALL — product copy, deliberately NOT changed by me (0054). `POST /billing/checkout` presents `workers_ai` as part of what upgrading to Pro gets you, but `entitlements()` grants `workers_ai = true` on EVERY tier including free — entitlements.zig's own test says so outright: this flag "is NOT what keeps a free user off hosted inference. What meters them is the neuron ledger." The one flag a paid plan actually turns on is `cloudflare_deploy`. So the pitch lists a capability the reader already has, and the `note` string ("hosted Workers AI inference (no BYOK)") leans on it. This is now factually accurate to the code (0054 made the field read from the pro row), so nothing is LYING — the question is whether advertising a non-differentiator is what you want, and that is a copy decision, not a defect I should quietly rewrite. |
 | H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
 | H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H14b | OWNER | The STRINGS now tell the truth (0048), which was the part that could be fixed without a decision. The decision itself is still open: leave the GitHub PAT plaintext-local (current, defensible for a local login-gated app) or restore sealing at rest (`secrets.zig` says "we never seal again" — a deliberate past choice, and DPAPI is Windows-only so it would not be uniform). Nothing is lying to a user in the meantime. |
 | H14-OLD | done 0048 | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
-| H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **6 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `plan/billing_seam`, `browser/{broker,host,session}`, `desk/{main,tray}`. Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
+| H4  | low | Coverage frontier, RECOUNTED 0053 — the old row said "31 src + 8 desk" and was ~25 modules stale; an open-items row that lies is exactly the drift this harness exists to catch, so recount before trusting any row here. Now **5 src + 2 desk**: `cli/chat`, `cli/exec_tool`, `browser/{broker,host,session}`, `desk/{main,tray}` (`plan/billing_seam` covered 0054). Read 0044 before accepting "device-bound" as the reason: four modules carrying that label turned out to be mostly testable, and one hid a real invalid-free bug. `plan/billing_seam` is the odd one out and the one to take first — neither device- nor UI-bound, and it is money. |
 | H8  | med | Engine bench harness: no perf gate on the engine's own hot paths; "faster" is currently an unverifiable claim (Ring 1, HORIZON.md). PATTERN SET 0053: count, never time — `Neuron.exec` carries an `is_test`-gated `spawn_probe` and `client.zig` pins reading N records at exactly N+1 spawns. A wall-clock budget on a dev box measures Defender and gets muted. Engine hot paths still unpriced; find each one's choke point first. |
 | H10 | OWNER | SELF lane (Ring 2). DESIGNED, NOT WIRED — see `harness/SELF-LANE.md` for the safety floor (oracle + harness + tests.zig out of reach of a self cast; branch-only, never main; green necessary not sufficient; one increment per cast; ledger append-only for the swarm too; dry-run first). Switching it on is the owner's call and I will not infer it: an agent that can edit its own acceptance criteria has none. |
 | H11 | low | In-repo mock-LLM server: keyless runs only exercise the inline `provider="mock"` moment; live routing/trio behavior needs a stand-in server to test without external deps. |
@@ -1229,3 +1230,33 @@ edit, confirm it applied, then run.
   which is good news arriving deliberately rather than as a mystery.
 - next: H8's engine hot paths are still unpriced — this establishes the counted-not-timed pattern on
   one real claim. H13 (watch); H10, H14b, H26 remain the owner's.
+
+## 0054 — 2026-07-25 — billing_seam: the pitch now reads from the plan it is selling
+- did: `plan/billing_seam.zig` was the last src module that was neither device- nor UI-bound, and it
+  is money. `POST /billing/checkout` built its upgrade pitch from TWO sources: `max_swarms`/
+  `max_minds` read from `ent.entitlements(.pro, false)`, but `workers_ai` and `cloudflare_deploy`
+  restated as hardcoded `true` beside them. They agreed — by coincidence, not by construction. Flip
+  either flag in entitlements.zig and this endpoint goes on advertising a capability the plan no
+  longer grants, which is the H14 shape (a user-facing string outliving the code behind it) pointed
+  at a paying customer. Both now read from the pro row. `price_usd` stays literal: no source of
+  truth for it exists yet, and inventing one to look consistent would be worse.
+- verified: src suite green (exit 0, checked as an EXIT CODE, see below). Counterfactual: forcing
+  `.cloudflare_deploy = false` in the handler fails the new test, so it compares against
+  entitlements rather than echoing itself. Two tests: the anonymous 401 (a pitch is behind the same
+  door as everything else, and no `upgrade` key leaks into the body), and advertised == granted.
+- learned, twice, both about my own verification rather than the code:
+  (1) My first fixture registered ONE user and asserted `plan == "free"`. It came back `pro`, and the
+  reason is real and worth knowing: with no admin email configured `isAdminEmail` falls back to
+  `next_id == 1`, so THE FIRST ACCOUNT TO REGISTER BECOMES ADMIN, and admins seed onto `.pro`. The
+  fix was not to relax the assertion — that would have made "current plan" and "advertised tier" the
+  same string and the test vacuous. It was to burn the first slot on an owner account so the test
+  exercises the case that matters: a FREE user being shown an upgrade pitch.
+  (2) I ran the counterfactual as `zig build test 2>&1 | grep ... | head -4`, got EMPTY output, and
+  was one step from reading that as "the drift did not fail the test — my guard is worthless". It
+  was the pipe eating the signal. This is the same trap the ledger already records for piping the
+  oracle, and it is NOT specific to the oracle: any verification read through `| grep | head` can
+  report silence instead of a verdict. Capture the EXIT CODE, or redirect to a file and grep that.
+- ratchet: the advertised-equals-granted test; `plan/billing_seam.zig` registered DIRECTLY in
+  src/tests.zig (0029's rule — transitive reachability is not collection).
+- next: coverage frontier is 5 src + 2 desk, and the rest really are device/UI-bound. H8's engine hot
+  paths still unpriced. H10, H14b, H26 remain the owner's.
