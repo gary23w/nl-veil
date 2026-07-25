@@ -23,6 +23,7 @@ const plugins = @import("../../plug/plugins.zig"); // user extensions: prompt/po
 const pixelrag = @import("../pixelrag.zig"); // browser-free image attachment ingest (OCR → pixel-RAG index)
 const osc = @import("../oscillation.zig");
 const llm = @import("../llm.zig");
+const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — never a path import
 const cctx = @import("context.zig");
 const cplan = @import("plan.zig");
 const cync = @import("sync.zig");
@@ -1035,6 +1036,15 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         .gw_model = think.model,
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0,
+        // TAG-ANCHORED READS on the chat surface. edit_file's schema advertises the `42:abc:def` dialect to
+        // every turn ("PREFERRED anchors"), but only run.zig (swarm minds) ever set this flag — so a chat read
+        // came back UNTAGGED and every chat edit fell through to bufedit's verbatim-text matching. On a large
+        // file that path is where edits go to die: a snippet retyped from a HEAD-CLIPPED read is "anchor not
+        // found", a short one is "matches more than one place", and the model's escape hatch is a write_file
+        // overwrite/append that reconstructs the file from what it could see — the duplicated methods and
+        // shredded files this fixes. Tags validate against the file AS IT IS NOW, the batch is atomic, and a
+        // stale tag hands back FRESH tags for an immediate retry.
+        .anchored_reads = true,
         // THE SANDBOX. A non-admin's prompts are not trusted with the host, so their turn runs the
         // restricted surface: files (already jailed to this conversation's workdir), research, and the
         // whole hive-memory surface — but no code execution, host control, engine self-modification,
@@ -4779,6 +4789,35 @@ fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8, cursor: *usi
     return out;
 }
 
+/// The completion budget for ONE chat inference, sized off the model's own context window.
+///
+/// WHY it is not a constant: a chat turn WRITES FILES — a whole page, a whole module — and it emits them as
+/// tool-call ARGUMENTS, so the output budget is the size of the largest file the turn can produce in one call.
+/// A flat 4096 therefore truncated exactly the turns carrying the most work, and only those: observed live on a
+/// 500-line-page build, five consecutive write_file calls cut mid-content, each burning a full ~75s inference
+/// (the salvage that catches them is a repair, not a substitute for room to finish).
+///
+/// The formula is the swarm's, deliberately — run.zig has sized a mind's per-turn budget off the probed window
+/// since ctx-scaling landed, and these are the same job. Sharing it means a model with a small window is still
+/// asked for proportionally less (it cannot spend 8192 anyway) and the two lanes cannot drift apart again.
+/// `NL_MAX_TOKENS` overrides both, with the same clamp.
+///
+/// The window comes from the CATALOG (modelcfg), not llm.capsSnapshot(): caps is one process-global holding
+/// whatever was probed last, so in a server also running casts a chat turn could inherit a local model's
+/// window. senseModel is keyed on this turn's own model id and always yields a non-zero ctx_k.
+///
+/// Raising this also buys the time to spend it, at no extra cost: llm.callTimeoutS derives each call's
+/// wall-clock deadline from the budget it asked for, so the deadline widens with the request.
+fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8, model: []const u8) u32 {
+    if (environ.get("NL_MAX_TOKENS")) |mts| {
+        if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| return std.math.clamp(v, 256, 32768) else |_| {}
+    }
+    const local_base = std.mem.indexOf(u8, base_url, "127.0.0.1") != null or std.mem.indexOf(u8, base_url, "localhost") != null;
+    const ctx_eff: u32 = @min(modelcfg.senseModel(model, local_base).ctx_k * 1024, 32768);
+    const scale = std.math.clamp(@as(f32, @floatFromInt(ctx_eff)) / 32768.0, 0.25, 1.0);
+    return @max(1024, @as(u32, @intFromFloat(8192.0 * scale)));
+}
+
 fn runInnerAgentic(
     app: *App,
     uid: u64,
@@ -4871,7 +4910,7 @@ fn runInnerAgentic(
         // on any streaming trouble, so a backend that can't stream still works (on_delta just never fires).
         var sctx = StreamCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = steer_cursor.* };
         var chat_cm = meterBegin(app.io);
-        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, 4096, 0.7, &sctx, streamOnDelta, streamShouldAbort);
+        var step = llm.completeStream(gpa, app.io, run_root, "chat", base_url, key, model, conv_buf.items, turn_tools, turnTokenBudget(ctx.environ, base_url, model), 0.7, &sctx, streamOnDelta, streamShouldAbort);
         defer step.deinit(gpa);
         streamFlush(&sctx); // emit the last buffered <FLUSH_CHARS chunk so the tail of the reply/reasoning isn't lost
         // AFTER streamFlush, deliberately: the desk treats a delta that follows a non-delta frame as an inference
@@ -6341,7 +6380,7 @@ test "file ledger: mutation parsing, upsert, args-path extraction, and the woven
     // "file is now" marker requirement is what rejects it)
     try std.testing.expect(parseFileMutation("write_file", "could not write file") == null);
     try std.testing.expect(parseFileMutation("write_file", "bad path \xe2\x80\x94 stay inside the workdir") == null);
-    try std.testing.expect(parseFileMutation("edit_file", "edited notes.md does not exist (or is over 1MiB) \xe2\x80\x94 edit_file only changes an EXISTING file; use write_file to create a new one.") == null);
+    try std.testing.expect(parseFileMutation("edit_file", "edited notes.md does not exist \xe2\x80\x94 edit_file only changes an EXISTING file; use write_file to create a new one.") == null);
     try std.testing.expect(parseFileMutation("web_fetch", "wrote nothing \xe2\x80\x94 file is now 5 bytes") == null);
     try std.testing.expect(parseFileMutation("read_file", "not found") == null);
 
@@ -6539,4 +6578,38 @@ test "turn limits clamp to something sane rather than trusting the environment" 
     try t.expect(turnLimits().per_user <= turnLimits().capacity);
     configureTurnLimits(64, 0); // 0 per-user = derive a share
     try t.expectEqual(@as(usize, 8), turnLimits().per_user);
+}
+
+test "the chat turn's output budget follows the model's window, not a constant" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    const HOSTED = "https://api.deepseek.com/v1";
+    const LOCALHOST = "http://127.0.0.1:11434/v1";
+
+    // A big-window model must be able to emit a whole FILE in one call. The flat cap this replaced was 4096,
+    // and every failure it caused was a turn that wanted more than that — so "more than the old constant" is
+    // the property, stated against the window the catalog actually reports rather than a remembered number.
+    const wide = turnTokenBudget(&env, HOSTED, "deepseek-v4-pro");
+    try t.expect(modelcfg.senseModel("deepseek-v4-pro", false).ctx_k * 1024 >= 32768);
+    try t.expect(wide > 4096);
+
+    // Proportional, not uniform: a model that cannot hold a big window is not asked to fill one. Derive the
+    // expectation from the same catalog reading the function uses, so a catalog change moves both together.
+    const small_id = "llama3.1:8b";
+    const small_ctx = modelcfg.senseModel(small_id, true).ctx_k * 1024;
+    const narrow = turnTokenBudget(&env, LOCALHOST, small_id);
+    if (small_ctx < 32768) try t.expect(narrow < wide);
+    try t.expect(narrow >= 1024); // ...but never below the floor: even a small model must finish a tool call
+
+    // NL_MAX_TOKENS is the one override, and it is clamped at both ends rather than trusted.
+    try env.put("NL_MAX_TOKENS", "16000");
+    try t.expectEqual(@as(u32, 16000), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try env.put("NL_MAX_TOKENS", "999999");
+    try t.expectEqual(@as(u32, 32768), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try env.put("NL_MAX_TOKENS", "1");
+    try t.expectEqual(@as(u32, 256), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+    try env.put("NL_MAX_TOKENS", "not a number"); // garbage falls back to the derived budget, never to zero
+    try t.expectEqual(wide, turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
 }

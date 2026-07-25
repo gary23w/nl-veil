@@ -123,6 +123,115 @@ pub fn isNumberedAnchor(s: []const u8) bool {
     return !a.eof and !a.bof;
 }
 
+/// The NUMBER-LESS half of a rendered tag: `abc:def`, optionally still carrying the `→line text` (or
+/// `->line text`) suffix a read prints. Models copy this constantly — a read shows `467:wcj:dwp→</body>` and
+/// the hash pair is the part that reads like the identifier, so the line number gets dropped. Shape test only
+/// (both groups exactly HASH_LEN lowercase letters, nothing else); resolveUnlined decides whether it names a
+/// real line. Multi-line input is never a tag — that is a text anchor that happens to contain an arrow.
+fn unlinedTagHashes(raw: []const u8) ?[2][HASH_LEN]u8 {
+    if (std.mem.indexOfScalar(u8, raw, '\n') != null) return null;
+    var s = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.indexOf(u8, s, "\u{2192}")) |p| s = std.mem.trimEnd(u8, s[0..p], " \t");
+    if (std.mem.indexOf(u8, s, "->")) |p| s = std.mem.trimEnd(u8, s[0..p], " \t");
+    if (s.len != HASH_LEN * 2 + 1 or s[HASH_LEN] != ':') return null;
+    var out: [2][HASH_LEN]u8 = undefined;
+    for (s[0..HASH_LEN], 0..) |c, i| {
+        if (c < 'a' or c > 'z') return null;
+        out[0][i] = c;
+    }
+    for (s[HASH_LEN + 1 ..], 0..) |c, i| {
+        if (c < 'a' or c > 'z') return null;
+        out[1][i] = c;
+    }
+    return out;
+}
+
+/// True when `raw` has the number-less tag SHAPE — regardless of whether it still names a line. Lets a caller
+/// tell "you dropped the line number and the line has since changed" (fresh tags needed) apart from "this was
+/// never a tag", instead of reporting a stale tag as a missing text snippet.
+pub fn looksLikeUnlinedTag(raw: []const u8) bool {
+    return unlinedTagHashes(raw) != null;
+}
+
+/// Resolve a number-less tag against the CURRENT lines: the hash pair names the line on its own, so scan for
+/// the ONE index where both the line hash and the chunk fingerprint match. null when the string is not that
+/// shape, matches nothing, or matches more than once — in every one of those the caller must fall back rather
+/// than guess. Requiring BOTH hashes plus uniqueness is what makes this safe to try on any anchor string: a
+/// plain text anchor would have to be exactly `aaa:bbb` AND hash-match a real line to be taken for a tag.
+pub fn resolveUnlined(lines: []const []const u8, raw: []const u8) ?usize {
+    const want = unlinedTagHashes(raw) orelse return null;
+    var found: ?usize = null;
+    var count: usize = 0;
+    for (lines, 0..) |ln, i| {
+        var loc: [HASH_LEN]u8 = undefined;
+        encode(lineHash(ln), &loc);
+        if (!std.mem.eql(u8, &loc, &want[0])) continue;
+        var cx: [HASH_LEN]u8 = undefined;
+        encode(chunkFp(lines, i), &cx);
+        if (!std.mem.eql(u8, &cx, &want[1])) continue;
+        count += 1;
+        found = i;
+    }
+    return if (count == 1) found else null;
+}
+
+/// An op's anchor string resolved against the current file, accepting BOTH tag dialects: the full
+/// `N:abc:def` a read renders, and the number-less `abc:def` half a model produces by copying only the part
+/// that looks like an identifier. null = not a tag anchor at all; the caller falls back to text matching.
+pub fn resolveAnchor(lines: []const []const u8, raw: []const u8) ?Anchor {
+    if (parseAnchor(raw)) |a| return a;
+    const idx = resolveUnlined(lines, raw) orelse return null;
+    var a = Anchor{ .line = @intCast(idx + 1), .has_ctx = true };
+    encode(lineHash(lines[idx]), &a.local);
+    encode(chunkFp(lines, idx), &a.ctx);
+    return a;
+}
+
+/// Dispatch test: does this anchor address a LINE, in either dialect? `EOF`/`0:` alone don't count (plain
+/// code contains "EOF"), mirroring isNumberedAnchor — a batch routes to the anchor engine only when at least
+/// one op genuinely points at a line.
+pub fn isTagAnchor(lines: []const []const u8, raw: []const u8) bool {
+    const a = resolveAnchor(lines, raw) orelse return false;
+    return !a.eof and !a.bof;
+}
+
+/// True when `body` looks like a READ VIEW pasted back as file content — most of its lines still carry the
+/// `N:abc:def→` prefix renderRead adds. Anchors exist so the model never retypes a line; the failure mode that
+/// buys is the model handing a whole tagged view to write_file (or into an edit's replacement text), which
+/// would commit the addressing scheme INTO the file. No real source file looks like this, so the test is a
+/// majority vote over the first lines rather than anything fuzzy: 3+ tagged lines AND over half of them.
+/// True when ANY line of `body` OPENS with an anchor tag (`42:abc:def→…`). Stricter than taggedBody's majority
+/// vote and used where the majority vote is too blunt: an edit's replacement TEXT is often only a line or two,
+/// and a single tag-prefixed line in it is never legitimate — the tag addresses the line, it is not part of it.
+pub fn hasTaggedLine(body: []const u8) bool {
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trimEnd(u8, raw, " \r\t");
+        const arrow = std.mem.indexOf(u8, ln, "\u{2192}") orelse continue;
+        if (arrow == 0 or arrow > 24) continue;
+        const a = parseAnchor(ln[0..arrow]) orelse continue;
+        if (!a.eof and !a.bof) return true;
+    }
+    return false;
+}
+
+pub fn taggedBody(body: []const u8) bool {
+    var tagged: usize = 0;
+    var seen: usize = 0;
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const ln = std.mem.trimEnd(u8, raw, " \r\t");
+        if (ln.len == 0) continue;
+        seen += 1;
+        if (seen > 40) break;
+        const arrow = std.mem.indexOf(u8, ln, "\u{2192}") orelse continue;
+        if (arrow == 0 or arrow > 24) continue;
+        const a = parseAnchor(ln[0..arrow]) orelse continue;
+        if (!a.eof and !a.bof) tagged += 1;
+    }
+    return tagged >= 3 and tagged * 2 > seen;
+}
+
 pub fn renderAnchor(lines: []const []const u8, idx: usize, buf: *[24]u8) []const u8 {
     var loc: [HASH_LEN]u8 = undefined;
     encode(lineHash(lines[idx]), &loc);
@@ -146,6 +255,46 @@ pub fn renderRead(gpa: std.mem.Allocator, content: []const u8) []u8 {
         b.append(gpa, '\n') catch break;
     }
     return gpa.dupe(u8, b.items) catch gpa.dupe(u8, content) catch @constCast(content);
+}
+
+/// Bytes a single windowed read may return before it is clipped. A window exists to be COPIED FROM, so the
+/// budget is the model's attention, not the file's size — past this it stops being a place to take an anchor.
+pub const WINDOW_MAX_BYTES: usize = 32000;
+
+/// The anchored rendering of ONE line window (1-indexed, inclusive), headed `[lines A-B of N]`. Tags are
+/// absolute — line number plus the file's own 8-line chunk fingerprint — so an anchor copied from a window is
+/// byte-identical to the one a whole-file read would have given, and the two are freely mixable in a batch.
+///
+/// This is the read that makes a genuinely large file workable: it splits the file (a slice array, no copy)
+/// but hashes only the window, so the cost scales with what was ASKED FOR rather than with the file. Returns
+/// null when the range starts past the last line — the caller says so rather than returning an empty view that
+/// reads like an empty file. Owned bytes.
+pub fn renderReadWindow(gpa: std.mem.Allocator, content: []const u8, start_in: usize, end_in: usize) ?[]u8 {
+    var lines = splitLines(gpa, content) catch return null;
+    defer lines.deinit(gpa);
+    const total = lines.items.len;
+    if (total == 0) return null;
+    const s: usize = if (start_in == 0) 1 else start_in;
+    var e: usize = if (end_in == 0) total else end_in;
+    if (e > total) e = total;
+    if (s > total or s > e) return null;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(gpa);
+    var hb: [72]u8 = undefined;
+    b.appendSlice(gpa, std.fmt.bufPrint(&hb, "[lines {d}-{d} of {d}]\n", .{ s, e, total }) catch "") catch {};
+    var ab: [24]u8 = undefined;
+    var i = s - 1;
+    while (i < e) : (i += 1) {
+        b.appendSlice(gpa, renderAnchor(lines.items, i, &ab)) catch break;
+        b.appendSlice(gpa, "\u{2192}") catch break;
+        b.appendSlice(gpa, lines.items[i]) catch break;
+        b.append(gpa, '\n') catch break;
+        if (b.items.len > WINDOW_MAX_BYTES) {
+            b.appendSlice(gpa, std.fmt.bufPrint(&hb, "[...window clipped at line {d} — narrow your range]\n", .{i + 1}) catch "") catch {};
+            break;
+        }
+    }
+    return gpa.dupe(u8, b.items) catch null;
 }
 
 /// Split into lines, dropping the synthetic empty tail a trailing '\n' produces — line N in an anchor is
@@ -378,6 +527,52 @@ fn oom(gpa: std.mem.Allocator) Result {
 // ------------------------------------------------------------------------------------------- tests
 
 const t = std.testing;
+
+test "taggedBody: a pasted-back read view is caught; ordinary code and prose are not" {
+    try t.expect(taggedBody("1:abc:def\u{2192}const a = 1;\n2:bcd:def\u{2192}const b = 2;\n3:cde:def\u{2192}run();\n"));
+    try t.expect(!taggedBody("const a = 1;\nconst b = 2;\nrun();\n"));
+    try t.expect(!taggedBody("")); // nothing to vote on
+    // one quoted anchor inside otherwise-real content is a comment or a doc, not a pasted view
+    try t.expect(!taggedBody("// see 42:abc:def\u{2192}load(path)\nfn main() void {}\nreturn;\n"));
+}
+
+test "a tag copied without its line number still names the line — uniquely or not at all" {
+    const gpa = t.allocator;
+    // The live failure: a read rendered `467:wcj:dwp→</body>`, the model sent back only `wcj:dwp→</body>`,
+    // and the edit fell through to text matching — where nothing in an HTML file looks like a tag.
+    const src = "<footer>\n</footer>\n\n</body>\n</html>\n";
+    var lines = try splitLines(gpa, src);
+    defer lines.deinit(gpa);
+    var ab: [24]u8 = undefined;
+    const full = renderAnchor(lines.items, 3, &ab); // the `</body>` line
+    const half = full[std.mem.indexOfScalar(u8, full, ':').? + 1 ..]; // drop `N:` — what the model actually sent
+    try t.expect(looksLikeUnlinedTag(half));
+    try t.expectEqual(@as(?usize, 3), resolveUnlined(lines.items, half));
+    { // the `→content` suffix a read prints comes along for the ride, exactly as pasted
+        const pasted = try std.fmt.allocPrint(gpa, "{s}\u{2192}</body>", .{half});
+        defer gpa.free(pasted);
+        try t.expectEqual(@as(?usize, 3), resolveUnlined(lines.items, pasted));
+        const a = resolveAnchor(lines.items, pasted) orelse return error.NoResolve;
+        try t.expectEqual(@as(u32, 4), a.line); // 1-based, and carrying fresh hashes
+        try t.expectEqual(Verdict.valid, validate(lines.items, a));
+        try t.expect(isTagAnchor(lines.items, pasted));
+    }
+    { // the line changed since the read: the hashes name nothing, so it resolves to null rather than guessing
+        var moved = try splitLines(gpa, "<footer>\n</footer>\n\n</BODY>\n</html>\n");
+        defer moved.deinit(gpa);
+        try t.expectEqual(@as(?usize, null), resolveUnlined(moved.items, half));
+        try t.expect(looksLikeUnlinedTag(half)); // still tag-SHAPED — that is what lets the caller say "stale"
+    }
+    // ordinary text anchors are never mistaken for tags: wrong length, wrong charset, or multi-line
+    try t.expect(!looksLikeUnlinedTag("</body>"));
+    try t.expect(!looksLikeUnlinedTag("color: red"));
+    try t.expect(!looksLikeUnlinedTag("ABC:def"));
+    try t.expect(!looksLikeUnlinedTag("abcd:efg"));
+    try t.expect(!looksLikeUnlinedTag("abc:def\nghi:jkl"));
+    // and a 7-char `aaa:bbb` that IS tag-shaped still resolves to nothing unless it hash-matches a real line
+    try t.expectEqual(@as(?usize, null), resolveUnlined(lines.items, "aaa:bbb"));
+    try t.expect(resolveAnchor(lines.items, "aaa:bbb") == null);
+}
 
 test "line hash is whitespace-stable and token-sensitive" {
     var a: [HASH_LEN]u8 = undefined;

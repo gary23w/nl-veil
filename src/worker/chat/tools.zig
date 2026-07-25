@@ -394,6 +394,11 @@ fn runMindTool(app: *App, u: http.User, tool: []const u8, args: []const u8, conv
         .internet = true,
         .fmtx = &chat_vcs_mtx,
         .vcs_enabled = conv.len > 0, // route edit_file through the swarm's micro-VCS on a real per-conversation build
+        // Same tag-anchored reads the server drive loop runs (engine.zig) — this endpoint IS the desk/CLI's
+        // file surface, so a read here must hand back the same `42:abc:def` anchors edit_file's schema tells
+        // the model to copy. Untagged, every edit degrades to verbatim-snippet matching and large files
+        // become unfixable.
+        .anchored_reads = true,
         .roam = roam, // admin-on-localhost: this runs on the user's own machine (browser/pixel/mcp authorize on roam)
         // Defence in depth: the handler already refused anything outside the allowlist before reaching
         // here, so this should never be the thing that stops a call. It is set anyway because "the

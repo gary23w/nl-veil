@@ -4,6 +4,16 @@
 const std = @import("std");
 const bufedit = @import("bufedit.zig");
 
+/// The largest file a commit will load IN-LOCK. It must never be SMALLER than editFile's own read cap
+/// (tools.EDIT_MAX_BYTES aliases this constant): a file the caller could read but this path cannot would fail
+/// its HEAD read forever and answer "transient lock? — re-issue the edit" to an edit that can never land.
+pub const MAX_FILE_BYTES: usize = 20 << 20;
+
+/// Above this, a commit keeps the ref + log but stores NO content snapshot. History is a convenience; the work
+/// file is what matters, and it has already landed atomically by then. Snapshotting every commit of a 20 MB
+/// file would write 20 MB of history per edit — the edit path's own cost, spent on a rollback nobody asked for.
+const MAX_SNAPSHOT_BYTES: usize = 2 << 20;
+
 const Hash = [16]u8;
 
 fn hash16(bytes: []const u8) Hash {
@@ -130,11 +140,12 @@ pub fn commitEdit(
     defer fmtx.unlock(io);
 
     // HEAD = the file on disk, read IN-LOCK (authoritative; also catches an external --embed edit). Cap matches
-    // editFile's own read cap so nothing over 1 MiB reaches this path. A FAILED read is not an empty file:
+    // editFile's own read cap (MAX_FILE_BYTES) so nothing it accepted can be unreadable here. A FAILED read is
+    // not an empty file:
     // the caller proved the file exists (its own unlocked read succeeded), so treating a transient
     // sharing-violation as "" would merge the ops against nothing and REPLACE the whole file with a fragment.
     var head_unreadable = false;
-    const cur = std.Io.Dir.cwd().readFileAlloc(io, full_workpath, gpa, .limited(1 << 20)) catch blk: {
+    const cur = std.Io.Dir.cwd().readFileAlloc(io, full_workpath, gpa, .limited(MAX_FILE_BYTES)) catch blk: {
         head_unreadable = true;
         break :blk @constCast("");
     };
@@ -158,7 +169,7 @@ pub fn commitEdit(
             const rk = hex32(hash16(npath));
             const h = hash16(w.bytes);
             const seq = readSeq(io, gpa, vcs_dir, &rk) + 1;
-            writeObject(io, gpa, vcs_dir, h, w.bytes);
+            if (w.bytes.len <= MAX_SNAPSHOT_BYTES) writeObject(io, gpa, vcs_dir, h, w.bytes);
             writeRef(io, gpa, vcs_dir, &rk, h, seq, npath);
             const logp = std.fmt.allocPrint(gpa, "{s}/log/{s}.log", .{ vcs_dir, &rk }) catch "";
             defer if (logp.len > 0) gpa.free(logp);
