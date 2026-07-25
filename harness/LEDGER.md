@@ -10,7 +10,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | id  | pri | item |
 |-----|-----|------|
 | H21 | med | No HTTP-handler test harness, which is why every increment so far had to extract a pure helper first (evcursor, controlLine, parsePlan, jstrAlloc) to get anything under test. SCOPED: `vendor/httpz/src/testing.zig` already provides what's needed on the request/response side (`testing.init(config)`, `.param()`, `.header()`, `.json()`, `.expectStatus()`, `.getJson()`). The blocker is `App`: handlers need `*Auth` (neuron-db-backed — `warm()` spawns the neuron binary), `*Supervisor`, `*AuditLog`, `*LoginGuard`, `*KeyVault`, `*ServerConfig`, `*recipes.Registry`. Two candidate shapes — a `testApp()` builder that stubs the neuron-backed pieces and skips honestly when the binary is absent, or narrowing handler signatures to the fields they actually use. Would unlock admin_service, auth_api, keys_api, deploy/service, chat/service and fanout at once. |
-| H22 | med | A BYOK key containing INVALID UTF-8 is accepted and sealed (`cleanValue` admits any byte >= 0x20, including raw 0x80-0xFF), but `resolve()` reads the record back through `std.json`, which rejects invalid UTF-8 with SyntaxError — so the key is stored, answered 201, and is then permanently unresolvable, with the miss cached as "no key here". Valid multi-byte UTF-8 round-trips fine (pinned by a test). Either reject at the door or store bytes the reader can recover. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
@@ -476,3 +475,21 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   house patterns unprompted (skip-honestly, counterfactual, deinit-not-drain-helper, exhaustive
   boundaries) — 0019 paying for itself one lane later.
 - next: H22/H23 from this lane; H21 (handler harness) is now scoped; H10 SELF remains the horizon.
+
+## 0023 — 2026-07-24 — H22: the vault stops accepting keys it can never read back
+- did: `cleanValue` guarded quotes, backslashes and control bytes — everything that would break OUT
+  of the JSON string — but not UTF-8 validity, while `resolve()` reads the record back through
+  `std.json`, which refuses invalid UTF-8 outright. So a pasted key with one stray high byte was
+  accepted, sealed, stored and answered 201 Created, and then every read of it failed forever,
+  with the miss cached as "no key here" — the user sees "key saved" and the app insists there is
+  no key. Now `std.unicode.utf8ValidateSlice` is part of the check, and keys_api's 400 message
+  says so. Test covers a lone continuation byte, truncated 2- and 3-byte sequences, a raw 0xFF and
+  a stray high byte mid-key, each with the COUNTERFACTUAL that the record it would have produced
+  fails to parse with SyntaxError; ASCII and real multi-byte UTF-8 (accents, 日本語, an emoji) stay
+  accepted.
+- verified: Full oracle ALL GREEN, exit 0, first try.
+- learned: a validator has to admit exactly what its READER can recover. This one was written
+  against the JSON *writer* (what breaks the string) and never re-checked against the parser, so
+  the gap sat between two correct-looking halves.
+- ratchet: none this sitting.
+- next: H21 (App test-constructor) is the last big unlock; desk package coverage in parallel.
