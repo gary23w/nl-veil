@@ -885,6 +885,26 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new.
 - next: 2 desk modules (main, tray) and 12 src; H14, H26, H10 remain the owner's.
 
+## 0040 — 2026-07-25 — the oracle says what broke, instead of making you find it
+- did: A harness increment rather than a coverage one, chosen because it has cost me time on nearly
+  every red this session. When a gate fails, both oracles now extract and highlight the lines a
+  human actually needs — Zig's `error: '<test>' failed:` header, a `file.zig:LINE:COL: error:`
+  compile error, and the build runner's own summary — before (ps1) or after (sh, where a CI log is
+  read from) the raw tail. The noise this cuts through is real and permanent: the desk suite dumps
+  a full stack trace for every CONNECTION_REFUSED, and several of its tests hit a dead port ON
+  PURPOSE, so std's unexpectedStatus tracing in Debug buries the one line that matters under dozens
+  that do not. `check.sh` had to start capturing each gate's output to do this; it still echoes
+  everything, so nothing is hidden — the summary is additive.
+- verified: by counterfactual, which is the only way to test an error path — appended a
+  deliberately failing test to evcursor.zig, ran check.sh, and the summary named
+  `worker.evcursor.test.DELIBERATE FAILURE …` immediately instead of leaving it under the refused
+  connections; restored the file (git diff clean) and re-ran the full oracle ALL GREEN.
+- learned: I had been treating the noise as environmental and grepping past it by hand every time —
+  four or five diagnoses this session. The fix took one increment and pays out on every future red,
+  for every worker. Friction you have normalised is worth an increment of its own.
+- ratchet: this entry IS the ratchet.
+- next: 2 desk modules (main, tray), 12 src; H14, H26, H10 remain the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both

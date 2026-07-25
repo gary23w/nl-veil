@@ -50,6 +50,19 @@ function Invoke-Gate([string]$name, [string]$exe, [string[]]$argv, [string]$work
     if ($p.ExitCode -ne 0) {
         $script:results += [pscustomobject]@{ gate = $name; status = "FAIL ($($p.ExitCode))"; log = $err }
         Write-Host "   FAIL exit=$($p.ExitCode)" -ForegroundColor Red
+        # WHAT ACTUALLY BROKE, first. A failing desk run buries its one real assertion under dozens
+        # of CONNECTION_REFUSED stack dumps from tests that hit a dead port ON PURPOSE (std prints a
+        # trace for every unexpectedStatus in Debug), and a compile error can sit above a page of
+        # linker chatter. These three patterns are the lines a human actually needs: Zig's test
+        # failure header, a compile error with its file:line, and the build runner's own summary.
+        $signal = Get-Content $err -ErrorAction SilentlyContinue |
+            Select-String -Pattern "^error: '.*' failed:|^.*\.zig:\d+:\d+: error:|^error: the following|tests passed|tests failed" |
+            Select-Object -Last 8
+        if ($signal) {
+            Write-Host "   -- what failed --" -ForegroundColor Red
+            $signal | ForEach-Object { Write-Host "   > $($_.Line)" -ForegroundColor Red }
+            Write-Host "   -- tail --" -ForegroundColor DarkGray
+        }
         # Print via Write-Host, NOT the pipeline: pipeline output becomes the function's return
         # value, which turns a failed gate truthy and makes the verdict lie ALL GREEN.
         Get-Content $err -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "   | $_" }
