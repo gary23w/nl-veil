@@ -8,6 +8,7 @@ test {
     _ = @import("auth/login_guard.zig"); // per-IP fail window, lockout expiry, per-address isolation
     _ = @import("cli.zig");
     _ = @import("config/cf_oauth.zig");
+    _ = @import("config/keys_api.zig"); // every vault route is gated (handler tests via http.testApp)
     _ = @import("config/server_config.zig");
     _ = @import("config/lan.zig");
     _ = @import("gateway/http.zig"); // jstr escaping (no forged structure) + appendFile's monotonic growth
