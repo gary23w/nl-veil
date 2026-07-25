@@ -113,13 +113,25 @@ pub const ApiKeys = struct {
         return info.uid;
     }
 
+    /// The caller owns everything returned, allocated from `gpa` — the slice AND the strings.
+    ///
+    /// They used to be borrowed straight out of the map (`e.key_ptr.*`, `.prefix`, `.name`), which
+    /// revoke() frees: any list -> revoke -> read-an-earlier-view sequence was a use-after-free on
+    /// all three fields. Unreachable as the HTTP routes stand (keyList serialises into res.arena
+    /// before returning, and revoke is a separate request), but it is a landmine for the next
+    /// caller — outliving the lock is the only sane contract for data handed out from under it.
     pub fn list(self: *ApiKeys, gpa: std.mem.Allocator, uid: u64) ![]View {
         self.mu.lockUncancelable(self.nb.io);
         defer self.mu.unlock(self.nb.io);
         var out: std.ArrayListUnmanaged(View) = .empty;
         var it = self.keys.iterator();
         while (it.next()) |e| if (e.value_ptr.uid == uid)
-            try out.append(gpa, .{ .id = e.key_ptr.*, .prefix = e.value_ptr.prefix, .name = e.value_ptr.name, .created = e.value_ptr.created });
+            try out.append(gpa, .{
+                .id = try gpa.dupe(u8, e.key_ptr.*),
+                .prefix = try gpa.dupe(u8, e.value_ptr.prefix),
+                .name = try gpa.dupe(u8, e.value_ptr.name),
+                .created = e.value_ptr.created,
+            });
         return out.toOwnedSlice(gpa);
     }
 
@@ -300,11 +312,20 @@ test "revoke: ends acceptance for that key only, needs the owning uid, and does 
     defer gpa.free(theirs);
 
     const views = try ks.list(gpa, 7);
-    defer gpa.free(views);
+    defer {
+        // The views own their strings now (see list()'s contract), so the test frees them.
+        for (views) |v| {
+            gpa.free(v.id);
+            gpa.free(v.prefix);
+            gpa.free(v.name);
+        }
+        gpa.free(views);
+    }
     try std.testing.expectEqual(@as(usize, 2), views.len); // uid 8's key is not in uid 7's list
     for (views) |v| try std.testing.expect(std.mem.indexOf(u8, v.id, mine_a[PREFIX.len..]) == null); // ids are hashes
 
-    // list() hands back ids that BORROW the map's own keys and revoke frees them, so re-derive instead.
+    // The views OWN their strings now, so they survive a revoke that frees the map's copies — the
+    // use-after-free this test used to have to dodge. Re-derived anyway: it proves the id IS the hash.
     var id_a: [64]u8 = undefined;
     _ = ApiKeys.hashHex(mine_a, &id_a);
 
@@ -318,6 +339,10 @@ test "revoke: ends acceptance for that key only, needs the owning uid, and does 
     try std.testing.expectEqual(@as(?u64, 8), ks.verify(theirs));
 
     try std.testing.expect(!ks.revoke(7, &id_a)); // already gone: false, and no double free
+
+    // The point of the ownership change: a view read AFTER its key was revoked is still valid
+    // memory. Under the old borrowing contract this line read freed heap.
+    for (views) |v| try std.testing.expectEqual(@as(usize, 64), v.id.len);
 }
 
 test "live neuron-db: the stored record holds no plaintext, warm() restores by hash, a revoked key stays dead" {

@@ -7,6 +7,15 @@ const WINDOW_SECS: i64 = 300;
 const MAX_FAILS: u32 = 5;
 const LOCK_SECS: i64 = 300;
 
+// EVICTION. fail() is the only path that grows the map, and success() was the only path that ever
+// shrank it — so a guesser walking source addresses (or plain background noise from the internet)
+// left one heap-allocated key per address FOREVER, whether or not that address was ever locked.
+// A record is dead once its window has passed AND its lock has expired: it carries no state the
+// throttle would act on, so dropping it is invisible to the outside. Swept on a cadence, plus
+// immediately once the map is large enough that a flood is clearly underway.
+const SWEEP_EVERY_SECS: i64 = WINDOW_SECS;
+const SWEEP_AT_ENTRIES: usize = 4096;
+
 const Rec = struct { fails: u32 = 0, window_start: i64 = 0, locked_until: i64 = 0 };
 
 pub const LoginGuard = struct {
@@ -14,9 +23,35 @@ pub const LoginGuard = struct {
     io: std.Io,
     mu: std.Io.Mutex = .init,
     by_ip: std.StringHashMapUnmanaged(Rec) = .empty,
+    last_sweep: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) LoginGuard {
         return .{ .gpa = gpa, .io = io };
+    }
+
+    /// Free every duped key and the map itself. In main.zig the guard is a process-lifetime
+    /// singleton, so this is for tests and for any future scoped instance.
+    pub fn deinit(self: *LoginGuard) void {
+        var it = self.by_ip.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.by_ip.deinit(self.gpa);
+        self.by_ip = .empty;
+    }
+
+    /// Drop records that are neither inside their window nor still locked. Caller holds the lock.
+    /// Two passes because removing during iteration invalidates it; the key slice is the map's own
+    /// duped memory, so it is freed on the way out.
+    fn sweepLocked(self: *LoginGuard, t: i64) void {
+        self.last_sweep = t;
+        var dead: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer dead.deinit(self.gpa);
+        var it = self.by_ip.iterator();
+        while (it.next()) |e| {
+            const r = e.value_ptr.*;
+            if (t - r.window_start > WINDOW_SECS and t >= r.locked_until)
+                dead.append(self.gpa, e.key_ptr.*) catch break; // OOM: a partial sweep is still progress
+        }
+        for (dead.items) |k| if (self.by_ip.fetchRemove(k)) |kv| self.gpa.free(kv.key);
     }
 
     fn ipKey(addr: IpAddress, out: *[16]u8) []const u8 {
@@ -51,6 +86,13 @@ pub const LoginGuard = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const t = self.now();
+        // Before inserting, retire anything already dead — so the map tracks live attackers, not
+        // every address that ever mistyped a password.
+        // The size trigger is rate-limited to once a second: without that, a flood holding the map
+        // at the threshold with LIVE records would make every single failed login pay a full O(n)
+        // sweep that frees nothing — turning the defence into its own amplifier.
+        if (t - self.last_sweep >= SWEEP_EVERY_SECS or
+            (self.by_ip.count() >= SWEEP_AT_ENTRIES and t != self.last_sweep)) self.sweepLocked(t);
         const gop = self.by_ip.getOrPut(self.gpa, k) catch return;
         if (!gop.found_existing) {
             gop.key_ptr.* = self.gpa.dupe(u8, k) catch {
@@ -83,13 +125,10 @@ pub const LoginGuard = struct {
 // clearing effect of a real login. Nothing here sleeps — a 300 s lock is not a unit test, and the expiry
 // rules are plain arithmetic over a stored timestamp, so the stamps are moved instead of the clock.
 
-/// TEST ONLY. LoginGuard dupes every IP key it tracks and has no deinit — in main.zig it is a
-/// process-lifetime singleton, and success() is what normally frees an entry. Tests run on
-/// std.testing.allocator, which counts, so they hand the map back themselves.
+/// TEST ONLY alias for `deinit`, kept so the tests below read as "hand the map back". LoginGuard
+/// dupes every IP key it tracks; tests run on std.testing.allocator, which counts.
 fn drainGuardForTest(self: *LoginGuard) void {
-    var it = self.by_ip.keyIterator();
-    while (it.next()) |k| self.gpa.free(k.*);
-    self.by_ip.deinit(self.gpa);
+    self.deinit();
 }
 
 /// TEST ONLY. The documentation-range addresses (RFC 5737) these tests attack from.
@@ -263,4 +302,75 @@ test "the window slides: fails older than WINDOW_SECS start a fresh count instea
     g.fail(ip);
     try std.testing.expect(!g.allowed(ip));
     try std.testing.expectEqual(MAX_FAILS, g.by_ip.get(k).?.fails);
+}
+
+test "sweep retires only records the throttle would never act on again" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var g = LoginGuard.init(gpa, io);
+    defer drainGuardForTest(&g);
+
+    // sweepLocked takes `t`, so the stamps move instead of the clock — but `allowed()` reads the
+    // REAL clock, so `t` has to be anchored to it or a "still locked" record reads as ancient
+    // history. Margins are wide enough that a second passing mid-test cannot flip either verdict.
+    const t: i64 = std.Io.Timestamp.now(io, .real).toSeconds();
+    var kb: [16]u8 = undefined;
+
+    const dead = ip4ForTest(203, 0, 113, 20, 40000); // window long past, never locked
+    const in_window = ip4ForTest(203, 0, 113, 21, 40000); // still accumulating fails
+    const still_locked = ip4ForTest(203, 0, 113, 22, 40000); // window past BUT serving a lock
+    const just_expired = ip4ForTest(203, 0, 113, 23, 40000); // lock ended exactly now
+    for ([_]IpAddress{ dead, in_window, still_locked, just_expired }) |a| g.fail(a);
+    try std.testing.expectEqual(@as(usize, 4), g.by_ip.count());
+
+    g.by_ip.getPtr(LoginGuard.ipKey(dead, &kb)).?.* = .{ .fails = 2, .window_start = t - WINDOW_SECS - 1, .locked_until = 0 };
+    g.by_ip.getPtr(LoginGuard.ipKey(in_window, &kb)).?.* = .{ .fails = 2, .window_start = t - WINDOW_SECS, .locked_until = 0 };
+    g.by_ip.getPtr(LoginGuard.ipKey(still_locked, &kb)).?.* = .{ .fails = MAX_FAILS, .window_start = t - WINDOW_SECS - 1, .locked_until = t + 3600 };
+    g.by_ip.getPtr(LoginGuard.ipKey(just_expired, &kb)).?.* = .{ .fails = MAX_FAILS, .window_start = t - WINDOW_SECS - 1, .locked_until = t };
+
+    g.mu.lockUncancelable(io);
+    g.sweepLocked(t);
+    g.mu.unlock(io);
+
+    // Gone: nothing about it could change a future verdict.
+    try std.testing.expect(g.by_ip.get(LoginGuard.ipKey(dead, &kb)) == null);
+    // Kept: its window is still open (the boundary is `>`, so exactly WINDOW_SECS old survives), so
+    // its banked fails still count toward a lock.
+    try std.testing.expect(g.by_ip.get(LoginGuard.ipKey(in_window, &kb)) != null);
+    // Kept: dropping a record mid-lock would HAND THE ATTACKER a clean slate — the one eviction bug
+    // that would matter.
+    try std.testing.expect(g.by_ip.get(LoginGuard.ipKey(still_locked, &kb)) != null);
+    try std.testing.expect(!g.allowed(still_locked));
+    // Gone: `allowed` is `now >= locked_until`, so a lock ending exactly now is already lifted.
+    try std.testing.expect(g.by_ip.get(LoginGuard.ipKey(just_expired, &kb)) == null);
+    // four went in, the two retired ones are gone, and nothing else was touched
+    try std.testing.expectEqual(@as(usize, 2), g.by_ip.count());
+}
+
+test "the map stops growing: a walk across addresses is retired on the sweep cadence" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var g = LoginGuard.init(gpa, io);
+    defer drainGuardForTest(&g);
+
+    // 300 addresses each mistyping a password once — the shape of internet background noise, and of
+    // a distributed guesser spreading its attempts thin enough never to trip a per-IP lock.
+    var i: u16 = 0;
+    while (i < 300) : (i += 1) g.fail(ip4ForTest(198, 51, 100, @intCast(i % 256), 40000 + i));
+    const walked = g.by_ip.count();
+    try std.testing.expect(walked > 100); // they really are separate buckets
+
+    // Age every one of them past its window, then let the cadence fire on the next failure.
+    var it = g.by_ip.valueIterator();
+    while (it.next()) |r| r.window_start -= WINDOW_SECS + 1;
+    g.last_sweep = 0; // force the cadence branch (t - 0 >= SWEEP_EVERY_SECS)
+    g.fail(ip4ForTest(203, 0, 113, 99, 40000));
+
+    // Before this fix the count only ever climbed; now the walk is retired and only the live
+    // attempt remains.
+    try std.testing.expectEqual(@as(usize, 1), g.by_ip.count());
 }
