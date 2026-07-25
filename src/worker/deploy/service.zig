@@ -11,6 +11,7 @@ const crypto = @import("../../config/key_vault.zig");
 const cf_oauth = @import("../../config/cf_oauth.zig");
 const modelcfg = @import("modelcfg"); // a MODULE (src/worker/modelcfg.zig) — shared with the compiled-in desk
 const tail_fanout = @import("../control/fanout.zig");
+const wtools = @import("../tools.zig"); // for safeRel — ONE definition of "inside the workspace"
 const cpaths = @import("../chat/paths.zig"); // conv → build-tree mapping (scheduled runs → _sched/{task}/runs/)
 const App = http.App;
 const requireUser = http.requireUser;
@@ -683,8 +684,11 @@ pub fn swarmFile(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (sw.uid != u.id) return unauth(res);
     const q = try req.query();
     const rel = q.get("path") orelse return badReq(res, "no path");
-    if (rel.len == 0 or rel[0] == '/' or rel[0] == '\\' or std.mem.indexOf(u8, rel, "..") != null)
-        return badReq(res, "bad path");
+    // ONE definition of "inside the workspace" (worker/tools.zig safeRel) instead of a literal check
+    // that drifts: the hand-rolled version here missed a leading `~` and, more to the point, ANY
+    // colon — a Windows drive path or an NTFS alternate-data-stream suffix read as "relative" on
+    // this route while the tools surface and the chat file route both refused it.
+    if (!wtools.safeRel(rel)) return badReq(res, "bad path");
     const full = try std.fmt.allocPrint(res.arena, "{s}/work/{s}", .{ sw.run_dir, rel });
     const data = std.Io.Dir.cwd().readFileAlloc(app.io, full, res.arena, .limited(2 << 20)) catch return notFound(res);
     res.content_type = .TEXT;
@@ -698,8 +702,11 @@ pub fn swarmFilePut(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     if (sw.uid != u.id) return unauth(res);
     const q = try req.query();
     const rel = q.get("path") orelse return badReq(res, "no path");
-    if (rel.len == 0 or rel[0] == '/' or rel[0] == '\\' or std.mem.indexOf(u8, rel, "..") != null)
-        return badReq(res, "bad path");
+    // ONE definition of "inside the workspace" (worker/tools.zig safeRel) instead of a literal check
+    // that drifts: the hand-rolled version here missed a leading `~` and, more to the point, ANY
+    // colon — a Windows drive path or an NTFS alternate-data-stream suffix read as "relative" on
+    // this route while the tools surface and the chat file route both refused it.
+    if (!wtools.safeRel(rel)) return badReq(res, "bad path");
     const full = try std.fmt.allocPrint(res.arena, "{s}/work/{s}", .{ sw.run_dir, rel });
     if (std.fs.path.dirname(full)) |dir| _ = std.Io.Dir.cwd().createDirPathStatus(app.io, dir, .default_dir) catch {};
     const body = req.body() orelse "";
@@ -873,7 +880,7 @@ pub fn swarmSite(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (!std.mem.startsWith(u8, rest, marker)) return badReq(res, "bad path");
     var rel = rest[marker.len..];
     if (rel.len == 0) rel = "index.html";
-    if (rel[0] == '/' or rel[0] == '\\' or std.mem.indexOf(u8, rel, "..") != null) return badReq(res, "bad path");
+    if (!wtools.safeRel(rel)) return badReq(res, "bad path");
     const sw = app.sup.get(id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
     const full = try std.fmt.allocPrint(res.arena, "{s}/work/{s}", .{ sw.run_dir, rel });
@@ -1104,6 +1111,11 @@ test "a swarm file path cannot climb out of that swarm's work directory" {
         "/etc/passwd",
         "\\windows\\win.ini",
         "",
+        // These three passed the route's old hand-rolled check — no leading separator, no "..".
+        // safeRel refuses them, as the tools surface and the chat file route always did.
+        "C:/Windows/win.ini", // a Windows drive path is not workdir-relative
+        "ok.txt:$DATA", // an NTFS alternate-data-stream suffix on a legitimate name
+        "~/.ssh/id_rsa", // a home-relative path
     };
     for (BAD) |p| {
         var web = httpz.testing.init(.{});

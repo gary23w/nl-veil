@@ -1007,6 +1007,27 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - next: H13 (forensic); H14, H26, H10 are the owner's. Remaining families worth the same treatment
   if anyone wants one: the several base64 helpers, and the two workdir-path sanitisers.
 
+## 0046 — 2026-07-25 — the path guard the codebase had already diagnosed and left
+- did: Took the next family from 0045's list — the workdir-path sanitisers — and found the repo had
+  ALREADY worked this out and stopped halfway. `chat/service.zig` carries the comment: "The SAME
+  rule the tools use, deliberately: no absolute path, no drive letter, no '..'. The swarm route
+  hand-rolls a weaker literal check; reusing tools.safeRel means one definition of 'inside the
+  workspace' rather than two that can drift apart." Somebody saw the divergence, wrote it down,
+  fixed their own side, and moved on. Three deploy routes (swarmFile, swarmFilePut, swarmSite) were
+  still on the weak version, which misses a leading `~` and — the one that matters — ANY colon, so
+  `C:/Windows/win.ini` and `ok.txt:$DATA` read as "relative" there while the tools surface and the
+  chat file route refused them. All three now call `wtools.safeRel`; the traversal test from 0033
+  grew the three inputs the old check let through.
+- verified: full oracle ALL GREEN, exit 0, first try.
+- learned: a comment describing a known divergence is an open item that nobody filed. This one sat
+  in the source, correct and specific, next to the code that had been fixed — while the code it
+  described stayed unfixed. Worth grepping the tree for that shape ("hand-rolls", "weaker", "should
+  use", "drift") as its own increment.
+  Also: the earlier deploy sweep paid for itself here — the traversal fixture already existed, so
+  covering the new cases cost three lines instead of a new test.
+- ratchet: none new; 0044's lens continues to be the thing doing the work.
+- next: H13 (forensic); the base64 family is the last one named; H14, H26, H10 are the owner's.
+
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
 once because the Edit was rejected for a stale read after I had changed the file with `sed`). Both
