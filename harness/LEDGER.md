@@ -9,7 +9,6 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 
 | id  | pri | item |
 |-----|-----|------|
-| H25 | med | `Auth` has no `deinit` (users map + sessions map + each User's duped email/pwhash/tool_grants), so an AUTHENTICATED handler test leaks under std.testing.allocator — which currently caps handler coverage at the unauthenticated paths. Give it one (per TESTING.md: a real deinit, not a test-only drain helper) and call it from `TestApp.deinit`; that unlocks register→login→session→handler tests for the whole H24 list. |
 | H24 | med | The handler harness exists now (`http.testApp`) — USE it: admin_service, auth_api, keys_api, deploy/service, chat/service and fanout are all still untested, and their auth gates, status codes and error mappings are now reachable from a test. Registering a real user needs the neuron binary, so cover the unauthenticated/rejection paths first and skip honestly for the rest. |
 | H23 | low | `KeyVault.list()` builds `.provider = alloc.dupe(...) catch continue` inside a struct literal, so an allocation failure mid-entry leaks the dupes already made for that entry. OOM path only. |
 | H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
@@ -531,3 +530,78 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new; 0024's harness and TESTING.md section carried it.
 - next: H25 (Auth.deinit) is the gate on everything else — authenticated handler tests leak until
   it exists.
+
+## 0026 — 2026-07-24 — H25: Auth.deinit, and the whole authenticated path opens
+- did: `Auth.deinit` frees both maps and everything they own, wired into `TestApp.deinit`. The trap
+  it had to respect: `users` is keyed on the User's OWN email slice (`users.put(gpa, u.email, u)`),
+  so the key and `u.email` are ONE allocation — iterate values, never keys, or it double-frees.
+  With that, `config/keys_api.zig` gains the full authenticated round trip through the real
+  handlers: register -> login -> session cookie -> a bad provider rejected on ITS message (not the
+  key's) -> stored 201 echoing only last4 + fingerprint -> listed as metadata -> deleted, with the
+  secret asserted absent from every response body and the vault agreeing at the end.
+- verified: three reds before green, all mine, all in the new test or the new harness. (1)
+  `res.body` is `[]const u8`, not optional — my `.?`/`orelse`. (2) a 400 where 201 was due, from
+  the empty-environment trap. (3) STILL 400: a use-after-free in the harness itself — `testApp`
+  allocated the neuron db path with `defer gpa.free(db)`, but `Neuron` stores that path BY
+  REFERENCE, so every store call afterwards read freed memory. The db string is owned by TestApp
+  now and freed in deinit.
+- learned: (2) is the one that matters. It was the EMPTY-ENVIRONMENT trap — documented in
+  harness/TESTING.md, which I wrote two hours earlier — and I walked straight into it, because the
+  rule lived under "spawning a subprocess" while I was writing a handler test and never connected
+  the two. The symptom actively misleads: Auth FAILS OPEN on a dead store (register and login
+  succeed off in-memory maps) while the vault propagates, so the failure surfaces as an
+  inexplicable 400 three steps later.
+- ratchet: prose wasn't enough, so the knowledge moved into the API — `http.testEnviron()` is now
+  the thing you pass, its doc comment names the misleading symptom, and TESTING.md's Handlers
+  section repeats it where a handler-test author is actually standing. The general lesson: when a
+  documented rule still gets broken, move it from prose into the surface the caller must touch.
+  Second: BOTH remaining failures presented as the same wrong status code from a handler, while the
+  causes were an empty child environment and a dangling pointer three layers down — when a store
+  fails, this codebase's fail-open habit turns the symptom into a lie about WHERE the fault is. The
+  fix that generalises is the one already in the harness: own every string a subsystem holds by
+  reference, and never hand one a `defer`-freed buffer.
+- next: H24's remaining modules (auth_api, admin_service, deploy/service, chat/service, fanout) are
+  now fully open — unauthenticated gates AND authenticated paths.
+
+## 0027 — 2026-07-24 — the front door under test
+- did: `auth/auth_api.zig` — 5 test blocks over the routes that decide who gets in. A private
+  instance stays private: registration is refused with 403 AND no account exists afterwards (the
+  refusal is checked by trying to log in as the address, not by trusting the status code). The
+  login throttle answers 429 after MAX_FAILS from one address, and — the property that actually
+  bounds a guessing run — it answers 429 to a request carrying NO BODY AT ALL, proving the guard
+  runs before parsing, so a locked-out address never reaches auth_core. `me` tells an anonymous
+  caller nothing beyond the public shape (no email, plan, entitlements or admin flag). The three
+  API-key routes are gated for both an anonymous caller and a cookie naming no session, and since
+  `app.keys` is null in the harness, a gate bypass would surface as a 500 rather than passing
+  quietly. Plus `keyNameFromBody`, which hand-scans the raw body: absent, unparseable, empty and
+  over-length names all fall back instead of failing.
+- verified: covered by the same oracle run as 0028 (below).
+- learned: the harness turned "handlers are untestable here" into ordinary work — this entry took
+  one read of the module and no new tooling, three lanes after the tooling landed.
+- ratchet: none new; 0024/0026's harness carried it.
+- next: admin_service, deploy/service, chat/service and fanout remain on H24.
+
+## 0028 — 2026-07-24 — the desk package stops being a blind spot
+- did: A parallel lane covered four untested desk modules with 23 tests, purely additive
+  (+539/-0, no production code changed): `log` (9) pins the ring buffer's real invariants — drain
+  is oldest-first and resumes exactly where a partial flush stopped, the ring keeps the newest CAP
+  lines and a behind flusher skips the lost oldest, snapshot is non-consuming so the F12 overlay
+  cannot steal the flusher's lines, an over-long line is truncated without harming its neighbour,
+  silencing the trace firehose never silences an error, and every level tag is the same width so
+  the file and the overlay stay column-aligned; `catalog` (6) that resolveBase degrades to the
+  sentinel rather than emit a half-written endpoint, that no shipped provider resolves to a base
+  still carrying the placeholder, that the whole catalog fits the 256-byte scratch its call sites
+  declare, and that the desk reads the SAME catalog the server does rather than a second list;
+  `neuron` (5) the fail-open contract stated exactly — an unreachable store degrades identically to
+  a disabled one and the caller never sees the failure; `assets` (3) that the embedded art is real
+  PNG at a usable mip resolution and the embedded faces are real sfnt, not stubs. Reachability was
+  already clean, so no `desk/src/tests.zig` edit was needed.
+- verified: independently, not on the lane's say-so — `check.ps1 -Scan` (desk untested 8 -> 4,
+  reachability clean, 0 actionable) plus the shared oracle run with 0027.
+- learned: "a leak/fail-open path is untestable without the real dependency" is usually false — the
+  strongest test here asserts that the UNREACHABLE case is indistinguishable from the disabled one,
+  which needs no dependency at all.
+- ratchet: none new; this lane consumed harness/TESTING.md as its only briefing, which is the
+  outcome 0019 was written for.
+- next: desk still has 4 untested modules (main, poller, runner, tray); on the server side H24's
+  admin_service, deploy/service, chat/service and fanout remain.
