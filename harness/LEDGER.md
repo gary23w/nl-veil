@@ -10,7 +10,7 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 | id  | pri | item |
 |-----|-----|------|
 | H26 | med | OWNER'S CALL — capability inconsistency: `pixel_search` is in `chat/tools.zig`'s ADMIN_TOOLS (so the one-shot `/chat/tool` endpoint answers a non-admin 403) AND in the engine's `SANDBOX_TOOLS` (so the SAME user's sandboxed chat turn may run it). Not a hole — the endpoint takes the stricter reading — but the two surfaces are documented as sharing one registry, and `toolSafe` explicitly "delegates to the ENGINE'S sandbox predicate so the two surfaces cannot drift". Pick one: `pixel_search` only reads already-ingested tiles (so arguably sandbox-safe, and it should leave ADMIN_TOOLS), whereas `pixel_capture`/`pixel_ingest` touch the host screen and are rightly admin-only. Pinned by `KNOWN_CAP_OVERLAP` in chat/tools.zig — a NEW overlap fails the build, and so does fixing this one without updating that list. |
-| H19 | low | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
+| H19-DONE | closed 0042 | Revoked API keys never stop costing: `neuron forget` clears the value but leaves ~6 `k_`-prefixed scopes per key (plus ::var/::instr/::stance/::affect/::persona), and `warm()` spawns one `neuron export` per matching scope — startup cost grows with every key EVER created, not every live key. Correctness is fine (a revoked key stays rejected). |
 | H20 | low | Model-id matching in the neuron ledger is lowercase-only ("coder"/"qwen"), so a capitalized vendor spelling silently falls to the default row (cheaper input, dearer output) — a real billing difference. Pinned as-is by tests because every shipped id is lowercase; revisit if a vendor changes case. |
 | H14 | med | Stale security claim in user-facing strings: `desk/src/gitvc.zig`'s header and its in-code user message say the GitHub PAT is "sealed at rest" (DPAPI), and `desk/src/chat.zig` (~1476) says "seal the GitHub token" — but `desk/src/secrets.zig` stores plaintext on every OS by design (DPAPI is legacy unseal only). Either fix the strings to tell the truth or restore sealing — owner's security-posture call. (Also minor: key_vault's provider-charset error string says `a-z0-9-_` but the validator accepts A-Z too.) |
 | H4  | med | Coverage frontier: 31 src + 8 desk modules carry no test blocks at all (control/fanout, deploy/service, pixelrag, ocr, gateway, admin, obs, browser...). Pick load-bearing ones first. (writer.zig done — 0004.) |
@@ -924,6 +924,28 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
 - ratchet: none new; the lesson is the grep-the-pattern habit, recorded above.
 - next: remaining frontier is UI- and device-shaped (desk main/tray, browser session/cdp/host,
   ocr/pixelrag, cli/*). H14, H26 and H10 are still the owner's calls.
+
+## 0042 — 2026-07-25 — H19 CLOSED: 6N subprocesses at startup become N
+- did: neuron-db materialises five satellite scopes per record (`::var`, `::instr`, `::stance`,
+  `::affect`, `::persona`) the moment `forget` runs — and `put` is forget-then-observe, so EVERY
+  key-value record has them. They are not records: `export` on one returns nothing. But
+  `Neuron.scopes()` returned them, and all four callers (api_keys.warm, auth_core's user and
+  session warms, key_vault.list) then spent one `neuron export` SUBPROCESS discovering that. A
+  store with N records was paying 6N process spawns to read N values, at every startup, growing
+  with every key ever created — revoked ones included, which is the shape H19 originally described.
+  Filtered at the client, since it is the only thing in the tree that reads scope listings (the
+  hive's own memory surface goes through Mem/oscillation and never touches it).
+- verified: full oracle ALL GREEN, exit 0, first try. The test asserts BOTH halves — the filtered
+  listing contains no `::` entries, AND the raw `list` output does — so it cannot pass vacuously
+  against a store that never had satellites (the trap from 0037).
+- learned: I was wrong twice getting here, both times by measuring the wrong thing. First I ran a
+  bare `observe`, saw exactly one scope, and concluded H19's premise did not reproduce — but the
+  satellites come from `forget`, which I had not exercised. An open item nearly got closed as
+  imaginary because my probe tested the wrong operation. Reproduce the REPORTED sequence, not a
+  simplification of it.
+- ratchet: none new.
+- next: H13/H20 are the low remainder; H14, H26, H10 are the owner's; coverage frontier is
+  UI/device-shaped.
 
 PROCESS NOTE for whoever reads this next: twice this sitting I started an oracle run BEFORE the
 edit it was meant to verify had landed (once because I fired it in the same breath as the edit,
