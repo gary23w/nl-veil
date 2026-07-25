@@ -650,7 +650,12 @@ Sizing discipline: an item a session can't land verified gets split, not half-la
   they encode my desk into the gate.
 - ratchet: TESTING.md's Handlers section now says PROBE THE STORE, do not infer it from
   register/login, with the exact snippet — the third rule in that file bought by a real failure.
-- next: watch the next CI run to discriminate the second failure — a raylib/LLD link error in the
-  GUI build (`libraylib.a` archive members that are system .so files, escalated by Zig's
-  "unexpected LLD stderr"). Not reproducible on Windows; if it recurs it is real and needs a
-  Linux-side fix, if it clears it was runner-environment flake. UNATTRIBUTED until then.
+- VERDICT (CI acfb88a, green): the store probe works — the src suite passes on a runner with no
+  neuron binary. The raylib/LLD failure did NOT recur: the same `zig build default (GUI merged in)`
+  step ran and passed, so it was runner-environment flake (apt-provided libGL/X11 landing in
+  `libraylib.a` as .so members, escalated by Zig's "unexpected LLD stderr"), not my change.
+  Attributed rather than left dangling — but noted as a KNOWN FLAKE: it can redden the badge again
+  with no code change, and check.sh has no retry for it (unlike the Defender IPC flake on Windows).
+- next: if that link flake recurs, the fix is a narrow retry or a raylib link-warning allowance in
+  check.sh — not a code change. Otherwise unchanged: H24's remaining handlers, the 4 desk modules,
+  H14 and H10 for the owner.
