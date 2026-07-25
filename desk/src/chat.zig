@@ -4069,6 +4069,12 @@ pub const Chat = struct {
     /// steers, and {done} (or the silence failsafe) disarms.
     fn attachServerTurn(self: *Chat, dd: []const u8, conv: []const u8) void {
         _ = dd;
+        // The copy below fills sc_conv[64] from `conv`, so an over-long id would slice out of bounds.
+        // The one caller already checks `id.len <= sc_conv.len`, which is why this is not a live bug
+        // — but the sibling that does the same copy (startServerChat) checks INSIDE itself, and a
+        // second caller added here without the call-site check would crash the desk. One line, and
+        // the two paths now carry the same contract instead of two different ones.
+        if (conv.len == 0 or conv.len > self.sc_conv.len) return;
         // TAIL, not one capped fetch: attaching behind the tail replays the conversation's ENTIRE history of
         // tool_requests as fresh delegations (side effects re-executed). Unreachable → stay on the frozen
         // mirror; a later poll/select can attach once the server answers.

@@ -1628,3 +1628,30 @@ edit, confirm it applied, then run.
   a coverage row that does not say where to stop is an invitation to write theater.
 - next: nothing worker-actionable but H4's genuinely-thin remainder. H13 is a watch item. H10, H14b,
   H26, H28 are the owner's decisions.
+
+## 0067 — 2026-07-25 — a memory-safety sweep that found nothing, and the one footgun it left behind
+- did: with the open items exhausted and the scan at 0 signals, went looking for NEW signal rather
+  than manufacturing work (SENSE's field of candidates, minus the sources that were empty). Picked
+  the class 0066 had just tested: a fixed-size `@memcpy` whose only protection is a length check.
+  In ReleaseFast — the server's default — bounds checks are OFF, so a weak guard there is a real
+  overflow rather than a panic.
+- verified CLEAN, which is the result: 463 `@memcpy` sites, and every one with a fixed-size
+  destination is properly guarded. `cli.zig` clamps with `@min`; `tools.zig` copies between two
+  `[32]u8` whose sizes match at compile time; `audit_log` gates on `hash.len == 64`; `host.zig` on
+  the `!= 32` check pinned in 0066. Recorded so the next worker does not repeat the sweep — a clean
+  audit is only worth something if somebody can tell it happened.
+- did (small, and honestly hardening rather than a fix): `desk`'s `attachServerTurn` fills
+  `sc_conv[64]` from `conv` with NO internal length check. Not a live bug — its one caller checks
+  `id.len <= sc_conv.len` first. But the sibling doing the same copy (`startServerChat`) checks
+  INSIDE itself, so the two paths carried different contracts, and a second caller added without the
+  call-site check would slice out of bounds and crash the desk. One line, and they now agree.
+- learned: the honest output of an audit is often "nothing". The pull is to find SOMETHING to
+  justify the looking — and the nearest available something was a safe function I could describe
+  alarmingly. Naming it hardening rather than a fix, and saying plainly that the sweep found no
+  bugs, is the difference between a ledger a worker can trust and one that inflates. 0065 deleted
+  phantom work; this entry declines to invent some.
+- verified: desk suite exit 0, full oracle green.
+- ratchet: none — this is the second entry in a row whose value is subtractive (a sweep closed, an
+  item deleted). Both are legitimate; not every increment leaves a mechanism behind.
+- next: nothing worker-actionable remains. H13 is a watch item. H10, H14b, H26, H28 are decisions
+  for the owner, and H4's remainder is documented as deliberately uncovered.
