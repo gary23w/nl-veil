@@ -64,6 +64,12 @@ const EXPECTED = [_]struct { label: []const u8, role: Role }{
     .{ .label = "stuck", .role = .prompting }, // writes the afk stuck-recovery instruction
     .{ .label = "planrec", .role = .prompting }, // settle-time plan reconcile: a cheap ledger-vs-tasks verdict, not reasoning
     .{ .label = "arbiter", .role = .prompting }, // streak-3 tool arbiter: which tool next — a routing verdict, not the task's reasoning
+    // THINKING, both, and deliberately not the cheap driver. Each is a JUDGEMENT that decides what the whole
+    // turn does next: recon picks what is worth knowing before a DURABLE plan board is written against it, and
+    // the course check decides whether work already in flight is still aimed at the goal. Routing either to
+    // prompting would put the turn's two new reasoning decisions on the model chosen for cheap rewriting.
+    .{ .label = "recon", .role = .thinking }, // names the read-only probes that ground the plan in evidence
+    .{ .label = "course", .role = .thinking }, // mid-turn: is the next step still the right move?
 };
 
 /// Every public entry point in llm.zig that takes the (run_dir, tag, base_url, key, model) prefix. If a
