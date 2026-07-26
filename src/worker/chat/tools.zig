@@ -71,7 +71,8 @@ const ADMIN_TOOLS = [_][]const u8{
     "simulate_change", "stage_delivery",   "osint_scan",   "host_status",   "host_command",
     "host_explore",    "browser_navigate", "browser_read", "browser_click", "browser_type",
     "browser_eval",    "browser_close",    "pixel_ingest", "pixel_capture", "pixel_search",
-    "mcp_discover",    "mcp_call",
+    "mcp_discover",    "mcp_call",         "browser_console", "browser_network",
+    "browser_click_at", "browser_type_text", "browser_key", "browser_scroll",
 };
 
 /// Runnable by any authed user on this endpoint. Delegates to the ENGINE'S sandbox predicate so the two

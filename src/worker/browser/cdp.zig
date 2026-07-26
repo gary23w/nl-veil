@@ -32,6 +32,12 @@ pub const Cdp = struct {
     rbuf: []u8,
     wbuf: []u8,
     msg: std.ArrayListUnmanaged(u8) = .empty, // reused frame-reassembly buffer
+    // Captured EVENT frames (console, exceptions, network), one JSON object per line. This client is
+    // request/response and used to throw every event away, which is why console and network were invisible.
+    // Events are read out of the socket by whatever command happens to be waiting — the kernel buffers them
+    // in the meantime, so nothing is lost by not having a dedicated pump, it just arrives on the next call.
+    events: std.ArrayListUnmanaged(u8) = .empty,
+    events_dropped: u32 = 0, // over the byte cap; REPORTED, never silently swallowed
     next_id: u32 = 1,
     prng: u64 = 0, // splitmix64 state for ws mask keys (loopback masking is anti-proxy-cache, not a secret)
 
@@ -79,6 +85,7 @@ pub const Cdp = struct {
     pub fn deinit(self: *Cdp) void {
         self.stream.close(self.io);
         self.msg.deinit(self.gpa);
+        self.events.deinit(self.gpa);
         self.gpa.free(self.rbuf);
         self.gpa.free(self.wbuf);
         self.gpa.destroy(self.rd);
@@ -143,6 +150,60 @@ pub const Cdp = struct {
 
     const Verdict = union(enum) { miss, err, ok: []u8 };
 
+    /// The event frames worth keeping: what a developer would open DevTools to see. Everything else (the
+    /// high-volume DOM/Page churn) is dropped at the door — capturing it would blow the cap and bury the
+    /// signal under noise.
+    const KEPT_EVENTS = [_][]const u8{
+        "Runtime.consoleAPICalled",
+        "Runtime.exceptionThrown",
+        "Log.entryAdded",
+        "Network.requestWillBeSent",
+        "Network.responseReceived",
+        "Network.loadingFailed",
+    };
+
+    /// Byte cap on the event buffer. A page in a redirect loop or spraying console.log can produce megabytes;
+    /// past this we stop appending and COUNT what we dropped, so the reader is told their view is partial
+    /// rather than being handed a short list that looks complete.
+    const EVENTS_CAP: usize = 512 << 10;
+
+    /// Take everything captured since the last drain. Caller owns the returned NDJSON (one event object per
+    /// line, possibly empty). `dropped` is how many events the cap discarded.
+    pub fn drainEvents(self: *Cdp) struct { ndjson: []u8, dropped: u32 } {
+        const out = self.events.toOwnedSlice(self.gpa) catch @as([]u8, @constCast(""));
+        const d = self.events_dropped;
+        self.events = .empty;
+        self.events_dropped = 0;
+        return .{ .ndjson = out, .dropped = d };
+    }
+
+    /// Append one event frame to the ring, if it is one we keep.
+    fn captureEvent(self: *Cdp, data: []const u8, obj: std.json.ObjectMap) void {
+        const m = switch (obj.get("method") orelse return) {
+            .string => |s| s,
+            else => return,
+        };
+        var keep = false;
+        for (KEPT_EVENTS) |k| {
+            if (std.mem.eql(u8, k, m)) {
+                keep = true;
+                break;
+            }
+        }
+        if (!keep) return;
+        if (self.events.items.len + data.len + 1 > EVENTS_CAP) {
+            self.events_dropped +|= 1;
+            return;
+        }
+        // Stored as the RAW frame: no reshaping here, so the formatting decision stays with the caller and a
+        // future consumer is not limited to whatever fields seemed interesting today.
+        self.events.appendSlice(self.gpa, data) catch {
+            self.events_dropped +|= 1;
+            return;
+        };
+        self.events.append(self.gpa, '\n') catch {};
+    }
+
     fn matchReply(self: *Cdp, data: []const u8, id: u32) Verdict {
         const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, data, .{}) catch return .miss;
         defer parsed.deinit();
@@ -150,7 +211,10 @@ pub const Cdp = struct {
             .object => |o| o,
             else => return .miss,
         };
-        const id_val = obj.get("id") orelse return .miss; // no id ⇒ an event frame
+        const id_val = obj.get("id") orelse { // no id ⇒ an event frame
+            self.captureEvent(data, obj);
+            return .miss;
+        };
         const got: i64 = switch (id_val) {
             .integer => |i| i,
             else => return .miss,

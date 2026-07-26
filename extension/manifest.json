@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "nl-veil browser link",
+  "version": "0.1.0",
+  "description": "Lets a local nl-veil server drive one tab in this browser, using your own profile and logins.",
+  "permissions": ["debugger", "tabs", "storage", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "nl-veil browser link"
+  },
+  "minimum_chrome_version": "116"
+}

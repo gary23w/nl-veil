@@ -13,6 +13,7 @@
 const std = @import("std");
 const session = @import("session.zig");
 const launch = @import("launch.zig");
+const ext = @import("ext.zig");
 const Session = session.Session;
 
 const log = std.log.scoped(.browser);
@@ -26,7 +27,16 @@ const Entry = struct {
     sess: Session,
     last_used: i64,
     headful: bool = false, // whether this session's browser is visible (vs headless)
+    // Captured page events, held HERE because draining the session is destructive: browser_console and
+    // browser_network are two readers of one stream, and whichever ran first would otherwise consume the
+    // other's events. Both drain into this, then read their own slice out of it.
+    events: std.ArrayListUnmanaged(u8) = .empty, // NDJSON of raw CDP event frames
+    dropped: u32 = 0, // events lost to a buffer cap, anywhere along the path
 };
+
+/// Cap on the per-session event store. Beyond this the OLDEST whole lines are discarded — a developer asking
+/// what just happened wants the most recent traffic, not the first 512KB of a page's lifetime.
+const EVENTS_KEEP: usize = 512 << 10;
 
 var g_mu: std.Io.Mutex = .init;
 var g_slots: [MAX_SESSIONS]?Entry = .{null} ** MAX_SESSIONS;
@@ -49,10 +59,35 @@ fn wantHeadful(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envir
     return p.value.headful;
 }
 
-/// Open a fresh session for `key` in the requested headful/headless mode. The profile (+ its live
-/// DevToolsActivePort file) MUST live on local disk, never OneDrive (sync locks/delays it → PortTimeout),
-/// keyed by a hash of run_dir for per-run isolation.
+/// Is the browser EXTENSION the transport for this session? True when a live, un-paused extension is polling
+/// and the operator hasn't opted out with NL_BROWSER_EXT=0.
+///
+/// This is the fallback seam the whole feature hangs on: when the user's browser is there, drive it (their
+/// logins, their profile, a human present to answer a verification prompt); when it isn't — a headless server,
+/// a swarm run, the browser closed — nothing changes and we launch our own as before.
+fn useExt(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) bool {
+    if (env.get("NL_BROWSER_EXT")) |v| {
+        if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "false")) return false;
+    }
+    return ext.available(gpa, io, env);
+}
+
+/// Open a fresh session for `key`. Prefers the user's own browser via the extension; otherwise launches one in
+/// the requested headful/headless mode. The launched profile (+ its live DevToolsActivePort file) MUST live on
+/// local disk, never OneDrive (sync locks/delays it → PortTimeout), keyed by a hash of run_dir for per-run
+/// isolation. An extension session needs none of that — there is no profile of ours involved.
 fn openSession(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, headful: bool) Error!Session {
+    if (useExt(gpa, io, env)) {
+        if (Session.openExt(gpa, io, env)) |s| {
+            log.info("browser: session for {s} is driving the user's own browser (extension)", .{key});
+            return s;
+        } else |e| {
+            // The extension said it was there and then failed to open a tab (worker evicted mid-request, a
+            // chrome:// page in the way, debugger already attached by DevTools). Falling through to our own
+            // browser is strictly better than failing the tool call.
+            log.warn("browser: extension present but could not open a tab ({s}) — falling back to a launched browser", .{@errorName(e)});
+        }
+    }
     const tmp_base = env.get("TEMP") orelse env.get("TMP") orelse env.get("TMPDIR");
     const profile = if (tmp_base) |tb|
         std.fmt.allocPrint(gpa, "{s}/nl-veil-cdp/{x}", .{ tb, std.hash.Wyhash.hash(0, key) }) catch return error.OutOfMemory
@@ -66,6 +101,13 @@ fn openSession(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envir
 /// longer matches the current client selection, it is closed and reopened so the toggle takes effect. Returns
 /// a pointer into the fixed slot array (stable while the slot is occupied).
 fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8) Error!*Session {
+    const e = try ensureEntry(gpa, io, env, key);
+    return &e.sess;
+}
+
+/// As `ensure`, but hands back the whole registry entry — the console/network tools need its event store,
+/// not just the session.
+fn ensureEntry(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8) Error!*Entry {
     const now = std.Io.Timestamp.now(io, .real).toSeconds();
     const headful = wantHeadful(gpa, io, env);
     var free_i: ?usize = null;
@@ -74,14 +116,19 @@ fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
     for (&g_slots, 0..) |*slot, i| {
         if (slot.*) |*e| {
             if (std.mem.eql(u8, e.key, key)) {
-                if (e.headful != headful) { // client toggled visibility → reopen in the new mode
-                    log.info("browser: reopening session for {s} (headful={})", .{ key, headful });
+                // An EXTENSION session has no visibility mode to toggle — it is a tab in a window the user
+                // already has open — so the headful check must not churn it. It IS reopened when the
+                // extension goes away (browser closed mid-session), which is what makes the fallback live
+                // rather than a one-shot decision made when the session first opened.
+                const stale_ext = e.sess.isExt() and !useExt(gpa, io, env);
+                if (stale_ext or (!e.sess.isExt() and e.headful != headful)) {
+                    log.info("browser: reopening session for {s} (headful={}, ext_gone={})", .{ key, headful, stale_ext });
                     e.sess.close();
                     e.sess = try openSession(gpa, io, env, key, headful);
                     e.headful = headful;
                 }
                 e.last_used = now;
-                return &e.sess;
+                return e;
             }
             if (e.last_used < lru_ts) {
                 lru_ts = e.last_used;
@@ -96,6 +143,7 @@ fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
         if (g_slots[lru_i]) |*e| {
             log.info("browser: evicting LRU session for {s}", .{e.key});
             e.sess.close();
+            e.events.deinit(gpa);
             gpa.free(e.key);
             g_slots[lru_i] = null;
         }
@@ -106,7 +154,208 @@ fn ensure(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Ma
     const sess = try openSession(gpa, io, env, key, headful);
     g_slots[idx] = .{ .key = key_dup, .sess = sess, .last_used = now, .headful = headful };
     log.info("browser: opened session for {s} (headful={})", .{ key, headful });
-    return &g_slots[idx].?.sess;
+    return &g_slots[idx].?;
+}
+
+// ------------------------------------------------------------------------------ console + network capture
+//
+// What a developer opens DevTools for, minus the DevTools. Both tools read ONE captured stream: pull whatever
+// the session has buffered into the entry's store, then return the slice each cares about. The store is what
+// makes them independent — `browser_console` must not eat the events `browser_network` is about to be asked
+// for, and a drain is destructive.
+//
+// Every path here reports what it could NOT see. A silently-truncated console is worse than no console: it
+// reads as "your page is fine" when the answer is "I stopped looking".
+
+/// Pull anything new out of the session into `e.events`, trimming the store from the FRONT (oldest whole
+/// lines) when it outgrows the cap. Caller holds g_mu.
+fn pumpEvents(gpa: std.mem.Allocator, e: *Entry) void {
+    const d = e.sess.drainEvents() catch return;
+    defer gpa.free(d.ndjson);
+    e.dropped +|= d.dropped;
+    if (d.ndjson.len == 0) return;
+    e.events.appendSlice(gpa, d.ndjson) catch {
+        e.dropped +|= 1;
+        return;
+    };
+    if (e.events.items.len <= EVENTS_KEEP) return;
+    // Drop from the front, on a line boundary, so the store stays parseable NDJSON rather than starting
+    // mid-object. Counting these as `dropped` is the honesty the header describes.
+    const overflow = e.events.items.len - EVENTS_KEEP;
+    const cut = (std.mem.indexOfScalarPos(u8, e.events.items, overflow, '\n') orelse (e.events.items.len - 1)) + 1;
+    for (e.events.items[0..cut]) |c| {
+        if (c == '\n') e.dropped +|= 1;
+    }
+    std.mem.copyForwards(u8, e.events.items, e.events.items[cut..]);
+    e.events.items.len -= cut;
+}
+
+/// One captured line, decoded far enough to classify and format it. Fields not present in a given event kind
+/// are simply empty — no per-event struct zoo for what is ultimately a log line.
+const Ev = struct {
+    method: []const u8 = "",
+    params: std.json.Value = .null,
+};
+
+fn evParam(v: std.json.Value, key: []const u8) ?std.json.Value {
+    return switch (v) {
+        .object => |o| o.get(key),
+        else => null,
+    };
+}
+
+fn evStr(v: std.json.Value, key: []const u8) []const u8 {
+    return switch (evParam(v, key) orelse return "") {
+        .string => |s| s,
+        else => "",
+    };
+}
+
+fn evNum(v: std.json.Value, key: []const u8) i64 {
+    return switch (evParam(v, key) orelse return 0) {
+        .integer => |i| i,
+        .float => |f| @intFromFloat(f),
+        else => 0,
+    };
+}
+
+/// Flatten a Runtime.consoleAPICalled `args` array into the text a human would have seen in the console.
+fn consoleText(gpa: std.mem.Allocator, params: std.json.Value) []u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    const args = switch (evParam(params, "args") orelse std.json.Value{ .null = {} }) {
+        .array => |a| a,
+        else => return out.toOwnedSlice(gpa) catch @constCast(""),
+    };
+    for (args.items) |a| {
+        if (out.items.len > 0) out.append(gpa, ' ') catch break;
+        // `value` for primitives, `description` for objects/errors (which is where a stack trace lives).
+        const v = evParam(a, "value");
+        const piece: []const u8 = if (v) |vv| switch (vv) {
+            .string => |s| s,
+            else => std.json.Stringify.valueAlloc(gpa, vv, .{}) catch "",
+        } else evStr(a, "description");
+        if (piece.len > 0) out.appendSlice(gpa, piece) catch break;
+        if (v) |vv| switch (vv) {
+            .string => {},
+            else => gpa.free(@constCast(piece)),
+        };
+    }
+    return out.toOwnedSlice(gpa) catch @constCast("");
+}
+
+/// The console side of the capture: console.* calls, uncaught exceptions, and browser log entries.
+pub fn console(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, max: usize) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const e = try ensureEntry(gpa, io, env, key);
+    pumpEvents(gpa, e);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"ok\":true,\"entries\":[") catch return error.OutOfMemory;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, e.events.items, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or n >= max) continue;
+        const p = std.json.parseFromSlice(Ev, gpa, line, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        const m = p.value.method;
+        var level: []const u8 = "";
+        var text: []u8 = @constCast("");
+        var owned = false;
+        if (std.mem.eql(u8, m, "Runtime.consoleAPICalled")) {
+            level = evStr(p.value.params, "type"); // log | warn | error | info | debug
+            text = consoleText(gpa, p.value.params);
+            owned = true;
+        } else if (std.mem.eql(u8, m, "Runtime.exceptionThrown")) {
+            level = "exception";
+            const det = evParam(p.value.params, "exceptionDetails") orelse std.json.Value{ .null = {} };
+            const desc = evStr(evParam(det, "exception") orelse std.json.Value{ .null = {} }, "description");
+            text = gpa.dupe(u8, if (desc.len > 0) desc else evStr(det, "text")) catch continue;
+            owned = true;
+        } else if (std.mem.eql(u8, m, "Log.entryAdded")) {
+            const entry = evParam(p.value.params, "entry") orelse std.json.Value{ .null = {} };
+            level = evStr(entry, "level");
+            text = gpa.dupe(u8, evStr(entry, "text")) catch continue;
+            owned = true;
+        } else continue;
+        defer if (owned) gpa.free(text);
+        if (text.len == 0 and level.len == 0) continue;
+        const tj = std.json.Stringify.valueAlloc(gpa, text, .{}) catch continue;
+        defer gpa.free(tj);
+        const seg = std.fmt.allocPrint(gpa, "{s}{{\"level\":\"{s}\",\"text\":{s}}}", .{ if (n > 0) "," else "", level, tj }) catch continue;
+        defer gpa.free(seg);
+        out.appendSlice(gpa, seg) catch continue;
+        n += 1;
+    }
+    const tail = std.fmt.allocPrint(gpa, "],\"count\":{d},\"dropped\":{d}{s}}}", .{
+        n,
+        e.dropped,
+        if (e.dropped > 0) ",\"note\":\"some events were dropped over the capture cap — this view is partial\"" else "",
+    }) catch return error.OutOfMemory;
+    defer gpa.free(tail);
+    out.appendSlice(gpa, tail) catch return error.OutOfMemory;
+    return out.toOwnedSlice(gpa) catch error.OutOfMemory;
+}
+
+/// The network side: requests issued, responses received, and — the ones that matter most for debugging —
+/// requests that FAILED.
+pub fn network(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, max: usize, failures_only: bool) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const e = try ensureEntry(gpa, io, env, key);
+    pumpEvents(gpa, e);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"ok\":true,\"requests\":[") catch return error.OutOfMemory;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, e.events.items, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or n >= max) continue;
+        const p = std.json.parseFromSlice(Ev, gpa, line, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        const m = p.value.method;
+
+        var kind: []const u8 = "";
+        var url: []const u8 = "";
+        var method_s: []const u8 = "";
+        var stat: i64 = 0;
+        var err_text: []const u8 = "";
+        if (std.mem.eql(u8, m, "Network.requestWillBeSent")) {
+            if (failures_only) continue;
+            kind = "request";
+            const rq = evParam(p.value.params, "request") orelse std.json.Value{ .null = {} };
+            url = evStr(rq, "url");
+            method_s = evStr(rq, "method");
+        } else if (std.mem.eql(u8, m, "Network.responseReceived")) {
+            const rs = evParam(p.value.params, "response") orelse std.json.Value{ .null = {} };
+            stat = evNum(rs, "status");
+            if (failures_only and stat < 400) continue;
+            kind = "response";
+            url = evStr(rs, "url");
+        } else if (std.mem.eql(u8, m, "Network.loadingFailed")) {
+            kind = "failed";
+            err_text = evStr(p.value.params, "errorText");
+        } else continue;
+
+        const uj = std.json.Stringify.valueAlloc(gpa, url, .{}) catch continue;
+        defer gpa.free(uj);
+        const ej = std.json.Stringify.valueAlloc(gpa, err_text, .{}) catch continue;
+        defer gpa.free(ej);
+        const seg = std.fmt.allocPrint(gpa, "{s}{{\"kind\":\"{s}\",\"method\":\"{s}\",\"url\":{s},\"status\":{d},\"error\":{s}}}", .{ if (n > 0) "," else "", kind, method_s, uj, stat, ej }) catch continue;
+        defer gpa.free(seg);
+        out.appendSlice(gpa, seg) catch continue;
+        n += 1;
+    }
+    const tail = std.fmt.allocPrint(gpa, "],\"count\":{d},\"dropped\":{d}{s}}}", .{
+        n,
+        e.dropped,
+        if (e.dropped > 0) ",\"note\":\"some events were dropped over the capture cap — this view is partial\"" else "",
+    }) catch return error.OutOfMemory;
+    defer gpa.free(tail);
+    out.appendSlice(gpa, tail) catch return error.OutOfMemory;
+    return out.toOwnedSlice(gpa) catch error.OutOfMemory;
 }
 
 /// Navigate the session for `key` to `url`; returns {"ok":true,"url":..,"title":..}.
@@ -119,7 +368,15 @@ pub fn navigate(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
     const title = s.evaluate("document.title") catch (gpa.dupe(u8, "") catch return error.OutOfMemory);
     defer gpa.free(title);
     log.info("browser: navigated {s} -> {s}", .{ key, final });
-    return std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .url = final, .title = title }, .{}) catch error.OutOfMemory;
+    // `transport` is reported on purpose: "extension" means this ran in the user's own signed-in browser and
+    // they can see it happening, "launched" means a private throwaway profile that is logged out of
+    // everything. That difference explains most of what a model would otherwise find baffling about a page.
+    return std.json.Stringify.valueAlloc(gpa, .{
+        .ok = true,
+        .url = final,
+        .title = title,
+        .transport = if (s.isExt()) "extension" else "launched",
+    }, .{}) catch error.OutOfMemory;
 }
 
 /// Snapshot the interactive elements (refs) plus a clipped page-text excerpt — and, deterministically (so a
@@ -346,6 +603,38 @@ pub fn typeText(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
     return s.typeRef(ref, text, submit);
 }
 
+/// Coordinate-native input — no element lookup, nothing written into the page. See session.zig's DOM-FREE
+/// block for why these exist alongside the ref verbs.
+pub fn clickAt(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, x: i64, y: i64) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+    log.info("browser: click at ({d},{d}) on {s}", .{ x, y, key });
+    return s.clickAt(x, y);
+}
+
+pub fn typeFocused(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, text: []const u8, clear: bool, submit: bool) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+    return s.typeFocused(text, clear, submit);
+}
+
+pub fn pressKey(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, name: []const u8) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+    try s.key(name);
+    return std.json.Stringify.valueAlloc(gpa, .{ .ok = true, .key = name }, .{}) catch error.OutOfMemory;
+}
+
+pub fn scrollAt(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, x: i64, y: i64, dy: i64) Error![]u8 {
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    const s = try ensure(gpa, io, env, key);
+    return s.scrollAt(x, y, dy);
+}
+
 pub fn eval(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, key: []const u8, js: []const u8) Error![]u8 {
     g_mu.lockUncancelable(io);
     defer g_mu.unlock(io);
@@ -468,6 +757,7 @@ pub fn closeKey(gpa: std.mem.Allocator, io: std.Io, key: []const u8) []u8 {
     for (&g_slots) |*slot| {
         if (slot.*) |*e| if (std.mem.eql(u8, e.key, key)) {
             e.sess.close();
+            e.events.deinit(gpa);
             gpa.free(e.key);
             slot.* = null;
             log.info("browser: closed session for {s}", .{key});
@@ -485,6 +775,7 @@ pub fn closeAll(gpa: std.mem.Allocator, io: std.Io) void {
     for (&g_slots) |*slot| {
         if (slot.*) |*e| {
             e.sess.close();
+            e.events.deinit(gpa);
             gpa.free(e.key);
             slot.* = null;
         }
@@ -532,6 +823,7 @@ pub fn sweepIdle(gpa: std.mem.Allocator, io: std.Io, max_idle_s: i64) usize {
             if (now - e.last_used > max_idle_s) {
                 log.info("browser: closing idle session for {s} ({d}s unused)", .{ e.key, now - e.last_used });
                 e.sess.close();
+                e.events.deinit(gpa);
                 gpa.free(e.key);
                 slot.* = null;
             } else live += 1;
@@ -581,6 +873,25 @@ pub fn dispatch(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Envi
     } else if (std.mem.eql(u8, action, "eval")) {
         const js = pStr(p, "js") orelse return errJson(gpa, "need js");
         return eval(gpa, io, env, key, js) catch |e| errJson(gpa, launch.errText(e));
+    } else if (std.mem.eql(u8, action, "click_at")) {
+        const x = pInt(p, "x") orelse return errJson(gpa, "need x");
+        const y = pInt(p, "y") orelse return errJson(gpa, "need y");
+        return clickAt(gpa, io, env, key, x, y) catch |e| errJson(gpa, launch.errText(e));
+    } else if (std.mem.eql(u8, action, "type_text")) {
+        const clear = if (pHas(p, "clear")) pBool(p, "clear") else true;
+        return typeFocused(gpa, io, env, key, pStr(p, "text") orelse "", clear, pBool(p, "submit")) catch |e| errJson(gpa, launch.errText(e));
+    } else if (std.mem.eql(u8, action, "key")) {
+        const name = pStr(p, "key") orelse return errJson(gpa, "need key");
+        return pressKey(gpa, io, env, key, name) catch errJson(gpa, "unknown key — use Enter, Tab, Escape, Backspace, Delete, ArrowUp/Down/Left/Right, Home, End, PageUp or PageDown");
+    } else if (std.mem.eql(u8, action, "scroll")) {
+        const dy: i64 = pInt(p, "dy") orelse 600;
+        return scrollAt(gpa, io, env, key, pInt(p, "x") orelse 400, pInt(p, "y") orelse 300, dy) catch |e| errJson(gpa, launch.errText(e));
+    } else if (std.mem.eql(u8, action, "console")) {
+        const max: usize = if (pInt(p, "max")) |m| @intCast(@max(1, @min(500, m))) else 100;
+        return console(gpa, io, env, key, max) catch |e| errJson(gpa, launch.errText(e));
+    } else if (std.mem.eql(u8, action, "network")) {
+        const max: usize = if (pInt(p, "max")) |m| @intCast(@max(1, @min(500, m))) else 100;
+        return network(gpa, io, env, key, max, pBool(p, "failures_only")) catch |e| errJson(gpa, launch.errText(e));
     } else if (std.mem.eql(u8, action, "close")) {
         return closeKey(gpa, io, key);
     } else if (std.mem.eql(u8, action, "rendertiles")) {
@@ -676,6 +987,15 @@ fn pBool(v: std.json.Value, key: []const u8) bool {
             .bool => |b| b,
             else => false,
         },
+        else => false,
+    };
+}
+
+/// Whether the caller SUPPLIED a key at all — distinct from pBool's "false or missing". Needed where the
+/// default is true (`clear`), so an explicit `clear:false` is not indistinguishable from silence.
+fn pHas(v: std.json.Value, key: []const u8) bool {
+    return switch (v) {
+        .object => |o| o.get(key) != null,
         else => false,
     };
 }

@@ -27,6 +27,8 @@ test {
     _ = @import("worker/browser/cdp.zig"); // JSON-RPC demux + RFC-6455 framing, no socket needed
     _ = @import("worker/browser/host.zig"); // the discovery file: where a tool call finds the browser daemon
     _ = @import("worker/browser/manager.zig");
+    _ = @import("worker/browser/ext.zig"); // the extension relay: command lifecycle + honest liveness
+    _ = @import("worker/browser/ext_api.zig"); // who may pair, who may relay
     _ = @import("worker/pixelrag.zig"); // doc-id safety, fact sanitising, query→tile scoring
     _ = @import("worker/bufedit.zig");
     _ = @import("worker/chat/context.zig");

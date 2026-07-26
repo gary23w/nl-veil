@@ -21,6 +21,7 @@ const deploy_service = @import("worker/deploy/service.zig");
 const tail_fanout = @import("worker/control/fanout.zig");
 const control_writer = @import("worker/control/writer.zig");
 const chat_tools = @import("worker/chat/tools.zig");
+const browser_ext_api = @import("worker/browser/ext_api.zig");
 const chat_service = @import("worker/chat/service.zig");
 const sched = @import("worker/sched.zig");
 const metrics = @import("worker/metrics.zig");
@@ -686,6 +687,18 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/swarms/:id/deploy/cloudflare", deploy_service.swarmDeployCf, .{});
     router.post("/api/v1/swarms/:id/control", control_writer.swarmControl, .{});
     router.post("/api/v1/chat/tool", chat_tools.chatTool, .{});
+    // The browser extension's relay. `hello` is unauthenticated (it is how the extension finds this server at
+    // all) and `pair` is loopback-only; the rest carry the pairing token. See worker/browser/ext_api.zig.
+    router.get("/api/v1/browser/ext/hello", browser_ext_api.hello, .{});
+    router.post("/api/v1/browser/ext/pair", browser_ext_api.pair, .{});
+    router.get("/api/v1/browser/ext/poll", browser_ext_api.poll, .{});
+    router.post("/api/v1/browser/ext/result", browser_ext_api.result, .{});
+    router.post("/api/v1/browser/ext/bye", browser_ext_api.bye, .{});
+    router.get("/api/v1/browser/ext/status", browser_ext_api.status, .{});
+    // The cross-process relay: the desk runs each browser tool in a `veil exec-tool` subprocess that forwards
+    // to the local-host daemon, and the extension is attached HERE. These let those processes reach it.
+    router.post("/api/v1/browser/ext/live", browser_ext_api.live, .{});
+    router.post("/api/v1/browser/ext/relay", browser_ext_api.relay, .{});
     router.get("/api/v1/chat/convs", chat_service.listConvs, .{});
     router.get("/api/v1/chat/convs/:id", chat_service.getConv, .{});
     // What a conversation has BUILT. The desk browses the build tree straight off disk; a browser
@@ -724,6 +737,11 @@ pub fn main(init: std.process.Init) !void {
     router.get("/api/v1/admin/swarms", admin_service.adminSwarms, .{});
     router.delete("/api/v1/admin/swarms/:id", admin_service.adminKill, .{});
     router.get("/api/v1/admin/audit", admin_service.adminAudit, .{});
+
+    // Publish the browser-extension relay to local temp, now that the port is settled. This is what lets a
+    // `veil exec-tool` subprocess and the local-host daemon drive the user's own browser instead of quietly
+    // launching their own — they attach to no extension themselves, and this is how they find the one here.
+    browser_ext_api.becomeHost(gpa, io, init.environ_map, port);
 
     // Print what it is ACTUALLY reachable at. The banner used to say 127.0.0.1 unconditionally, which was
     // merely misleading on a loopback bind and actively wrong now that binding every interface is the
@@ -1326,6 +1344,7 @@ const ROUTE_MODS = [_]struct { alias: []const u8, src: []const u8 }{
     .{ .alias = "keys_api", .src = @embedFile("config/keys_api.zig") },
     .{ .alias = "local_models", .src = @embedFile("config/local_models.zig") },
     .{ .alias = "cf_oauth", .src = @embedFile("config/cf_oauth.zig") },
+    .{ .alias = "browser_ext_api", .src = @embedFile("worker/browser/ext_api.zig") },
 };
 
 /// Routes that are deliberately reachable without a session. Each needs a REASON, because the only
@@ -1340,9 +1359,14 @@ const PUBLIC_ROUTES = [_]struct { path: []const u8, why: []const u8 }{
     .{ .path = "/api/v1/auth/logout", .why = "clearing a cookie must work even with a dead session" },
     .{ .path = "/api/v1/auth/me", .why = "answers authed:false to a stranger — that IS its job" },
     .{ .path = "/api/v1/oauth/cloudflare/callback", .why = "the IdP redirects the browser here" },
+    .{ .path = "/api/v1/browser/ext/hello", .why = "the extension's discovery probe: it must answer before any credential exists. Reports the app name and protocol version, nothing else" },
+    .{ .path = "/api/v1/browser/ext/pair", .why = "mints the extension's relay token; gated on the SOCKET being loopback instead of on a session, because the browser offering itself has no account" },
 };
 
-const Gate = enum { admin, user, none, missing };
+/// `ext` is the browser extension's own credential (the loopback-issued relay token, checked by
+/// ext_api.requireExt) rather than a user session. It is a real gate — it just is not this app's user gate,
+/// and calling it `.none` would either fail the audit or, worse, push these routes onto the public list.
+const Gate = enum { admin, user, ext, none, missing };
 
 /// The body of `fn name(` / `pub fn name(` in `src`, up to the next top-level fn.
 fn fnBodyIn(src: []const u8, name: []const u8) ?[]const u8 {
@@ -1368,6 +1392,7 @@ fn gateOfFn(src: []const u8, name: []const u8, depth: u8) Gate {
     const body = fnBodyIn(src, name) orelse return .missing;
     if (std.mem.indexOf(u8, body, "requireAdmin") != null) return .admin;
     if (std.mem.indexOf(u8, body, "requireUser") != null) return .user;
+    if (std.mem.indexOf(u8, body, "requireExt") != null) return .ext;
     if (depth == 0) {
         // one hop: a local helper taking (app, req, res) — sched.zig's `gate()` is the real case
         var i: usize = 0;
