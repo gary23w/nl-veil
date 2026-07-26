@@ -212,6 +212,70 @@ fn cmdDoctor(ctx: *Ctx, args: []const []const u8) u8 {
     return rc;
 }
 
+/// One bucket of `u*/_metrics/llm.jsonl` rows, keyed either by model or by call label.
+const MetricStat = struct {
+    name: [64]u8 = [_]u8{0} ** 64,
+    nlen: usize = 0,
+    turns: u64 = 0,
+    calls: u64 = 0,
+    tin: u64 = 0,
+    tout: u64 = 0,
+    tcached: u64 = 0,
+    ms: u64 = 0,
+};
+
+/// Both foldings of the same rows: per MODEL (what it costs) and per LABEL (which call spends it).
+pub const MetricAgg = struct {
+    models: [24]MetricStat = [_]MetricStat{.{}} ** 24,
+    nmodels: usize = 0,
+    roles: [24]MetricStat = [_]MetricStat{.{}} ** 24,
+    nroles: usize = 0,
+};
+
+fn bucketFor(list: []MetricStat, n: *usize, key: []const u8) ?*MetricStat {
+    if (key.len == 0 or key.len > 64) return null;
+    for (list[0..n.*]) |*cand| {
+        if (std.mem.eql(u8, cand.name[0..cand.nlen], key)) return cand;
+    }
+    if (n.* >= list.len) return null; // more distinct keys than buckets: fold what fits, drop the tail
+    list[n.*].nlen = key.len;
+    @memcpy(list[n.*].name[0..key.len], key);
+    defer n.* += 1;
+    return &list[n.*];
+}
+
+/// PURE fold of an llm.jsonl body into `agg` (row shape documented in worker/metrics.zig). Split out of
+/// growthReport so it can be TESTED: the report writes to stdout, so while this lived inline nothing
+/// could assert a single number it printed and an arithmetic regression would have been invisible to the
+/// oracle. 0079 shipped it verified-but-unguarded and named this as the follow-up (0080). Malformed rows
+/// are SKIPPED, not fatal — one corrupt line must not blank the whole report.
+fn foldMetricsJsonl(gpa: std.mem.Allocator, body: []const u8, agg: *MetricAgg) void {
+    var lit = std.mem.splitScalar(u8, body, '\n');
+    while (lit.next()) |raw_ln| {
+        const ln = std.mem.trim(u8, raw_ln, " \r\t");
+        if (ln.len == 0) continue;
+        const R = struct { model: []const u8 = "", role: []const u8 = "", calls: u64 = 0, in: u64 = 0, out: u64 = 0, cached: u64 = 0, ms: u64 = 0 };
+        const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
+        defer p.deinit();
+        if (bucketFor(&agg.models, &agg.nmodels, p.value.model)) |st| {
+            st.turns += 1;
+            st.calls += p.value.calls;
+            st.tin += p.value.in;
+            st.tout += p.value.out;
+            st.tcached += p.value.cached;
+            st.ms += p.value.ms;
+        }
+        if (bucketFor(&agg.roles, &agg.nroles, p.value.role)) |rt| {
+            rt.turns += 1;
+            rt.calls += p.value.calls;
+            rt.tin += p.value.in;
+            rt.tout += p.value.out;
+            rt.tcached += p.value.cached;
+            rt.ms += p.value.ms;
+        }
+    }
+}
+
 /// `doctor --growth` — the app's own runtime ledgers folded into one worker-readable health view:
 /// the engine's LEARNED tool behavior (toolperf digest), schedule fail-streaks (the outcome ledger
 /// on each task file), and a per-model LLM usage rollup. Reads {data} directly on purpose — the
@@ -264,9 +328,7 @@ fn growthReport(ctx: *Ctx) void {
     if (streaks == 0) out("  sched    : {d} task(s), no fail streaks\n", .{tasks});
 
     // Models: fold u*/_metrics/llm.jsonl (shape documented in worker/metrics.zig) per model.
-    const Stat = struct { name: [64]u8 = [_]u8{0} ** 64, nlen: usize = 0, turns: u64 = 0, calls: u64 = 0, tin: u64 = 0, tout: u64 = 0, tcached: u64 = 0, ms: u64 = 0 };
-    var stats = [_]Stat{.{}} ** 24;
-    var nstats: usize = 0;
+    var agg: MetricAgg = .{};
     // The SAME rows also carry `role` (the call's label: chat, plan, summary, arbiter, ...) and
     // `cached`. Both were parsed away here, which left the two questions you actually ask when a bill
     // looks wrong unanswerable from the report: WHICH call is spending it, and is the provider's
@@ -275,8 +337,7 @@ fn growthReport(ctx: *Ctx) void {
     // reached disk and stopped one layer short of a reader. A chat turn fires one `chat` stream plus
     // up to a dozen auxiliary calls (plan, recon, arbiter, stuck, reflect, ctxsum, compact...), so a
     // per-model total cannot tell you that, say, `plan` is a third of the spend. (Ledger 0079.)
-    var roles = [_]Stat{.{}} ** 24;
-    var nroles: usize = 0;
+
     var it2 = root.iterate();
     while (it2.next(ctx.io) catch null) |ent| {
         if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
@@ -284,68 +345,13 @@ fn growthReport(ctx: *Ctx) void {
         const mp = std.fmt.bufPrint(&pb, "{s}/{s}/_metrics/llm.jsonl", .{ ctx.data, ent.name }) catch continue;
         const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, mp, gpa, .limited(16 << 20)) catch continue;
         defer gpa.free(data);
-        var lit = std.mem.splitScalar(u8, data, '\n');
-        while (lit.next()) |raw_ln| {
-            const ln = std.mem.trim(u8, raw_ln, " \r\t");
-            if (ln.len == 0) continue;
-            const R = struct { model: []const u8 = "", role: []const u8 = "", calls: u64 = 0, in: u64 = 0, out: u64 = 0, cached: u64 = 0, ms: u64 = 0 };
-            const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
-            defer p.deinit();
-            const m = p.value.model;
-            if (m.len == 0 or m.len > 64) continue;
-            var s: ?*Stat = null;
-            for (stats[0..nstats]) |*cand| {
-                if (std.mem.eql(u8, cand.name[0..cand.nlen], m)) {
-                    s = cand;
-                    break;
-                }
-            }
-            if (s == null) {
-                if (nstats >= stats.len) continue;
-                stats[nstats].nlen = m.len;
-                @memcpy(stats[nstats].name[0..m.len], m);
-                s = &stats[nstats];
-                nstats += 1;
-            }
-            const st = s.?;
-            st.turns += 1;
-            st.calls += p.value.calls;
-            st.tin += p.value.in;
-            st.tout += p.value.out;
-            st.tcached += p.value.cached;
-            st.ms += p.value.ms;
-
-            // ...and the same row folded by LABEL, so the expensive call is nameable.
-            const rl = p.value.role;
-            if (rl.len == 0 or rl.len > 64) continue;
-            var r: ?*Stat = null;
-            for (roles[0..nroles]) |*cand| {
-                if (std.mem.eql(u8, cand.name[0..cand.nlen], rl)) {
-                    r = cand;
-                    break;
-                }
-            }
-            if (r == null) {
-                if (nroles >= roles.len) continue;
-                roles[nroles].nlen = rl.len;
-                @memcpy(roles[nroles].name[0..rl.len], rl);
-                r = &roles[nroles];
-                nroles += 1;
-            }
-            const rt = r.?;
-            rt.turns += 1;
-            rt.calls += p.value.calls;
-            rt.tin += p.value.in;
-            rt.tout += p.value.out;
-            rt.tcached += p.value.cached;
-            rt.ms += p.value.ms;
-        }
+        foldMetricsJsonl(gpa, data, &agg);
     }
-    if (nstats == 0) {
+    if (agg.nmodels == 0) {
         out("  models   : no llm.jsonl yet (served chat turns write it)\n", .{});
         return;
     }
-    for (stats[0..nstats]) |*st| {
+    for (agg.models[0..agg.nmodels]) |*st| {
         // cache% is the share of INPUT tokens the provider served from its prompt cache. Near zero on
         // a hosted model means the prompt is being re-prefilled every call — the exact failure the
         // stable-prefix contracts in engine.zig and run.zig exist to prevent, and until now it was
@@ -362,19 +368,19 @@ fn growthReport(ctx: *Ctx) void {
     // place to look for a cheap pre-gate (planWorthwhile is the pattern — an inference-free predicate
     // that skips the round-trip entirely).
     var total_in: u64 = 0;
-    for (roles[0..nroles]) |*r| total_in += r.tin;
+    for (agg.roles[0..agg.nroles]) |*r| total_in += r.tin;
     var shown: usize = 0;
-    while (shown < nroles and shown < 8) : (shown += 1) {
+    while (shown < agg.nroles and shown < 8) : (shown += 1) {
         var best: usize = shown;
-        for (roles[shown..nroles], shown..) |*cand, idx| {
-            if (cand.tin + cand.tout > roles[best].tin + roles[best].tout) best = idx;
+        for (agg.roles[shown..agg.nroles], shown..) |*cand, idx| {
+            if (cand.tin + cand.tout > agg.roles[best].tin + agg.roles[best].tout) best = idx;
         }
         if (best != shown) {
-            const tmp = roles[shown];
-            roles[shown] = roles[best];
-            roles[best] = tmp;
+            const tmp = agg.roles[shown];
+            agg.roles[shown] = agg.roles[best];
+            agg.roles[best] = tmp;
         }
-        const r = &roles[shown];
+        const r = &agg.roles[shown];
         const share: u64 = if (total_in > 0) r.tin * 100 / total_in else 0;
         const rc: u64 = if (r.tin > 0) r.tcached * 100 / r.tin else 0;
         out("  call     : {s} — {d} calls, {d}k in / {d}k out, {d}% of input, {d}% cached\n", .{
@@ -1609,4 +1615,70 @@ test "isCommand lists every verb dispatch handles - or the verb boots the daemon
     // Not vacuous: if the scan found nothing (dispatch refactored, needle changed), every assertion above
     // passed without testing anything - which is how this guard would rot silently.
     try std.testing.expect(found >= 25);
+}
+
+test "foldMetricsJsonl: both foldings of the same rows, and a corrupt line does not blank the report" {
+    const gpa = std.testing.allocator;
+    var agg: MetricAgg = .{};
+
+    // Two turns of the same model: a `chat` stream that is mostly cache-served, plus two auxiliary
+    // calls that are not. This is the shape the per-label view exists to expose.
+    const body =
+        \\{"ts":1,"role":"chat","model":"m1","base":"h","calls":3,"in":30000,"out":900,"cached":24000,"ms":3000}
+        \\{"ts":1,"role":"plan","model":"m1","base":"h","calls":1,"in":12000,"out":300,"cached":0,"ms":900}
+        \\
+        \\{ this line is not json at all
+        \\{"ts":2,"role":"chat","model":"m1","base":"h","calls":2,"in":20000,"out":600,"cached":16000,"ms":2000}
+        \\{"ts":2,"role":"arbiter","model":"m2","base":"h","calls":1,"in":8000,"out":100,"cached":0,"ms":400}
+    ;
+    foldMetricsJsonl(gpa, body, &agg);
+
+    // MODELS: m1 got 3 rows, m2 got 1. The corrupt line was skipped, not fatal.
+    try std.testing.expectEqual(@as(usize, 2), agg.nmodels);
+    const m1 = &agg.models[0];
+    try std.testing.expectEqualStrings("m1", m1.name[0..m1.nlen]);
+    try std.testing.expectEqual(@as(u64, 3), m1.turns);
+    try std.testing.expectEqual(@as(u64, 6), m1.calls); // 3 + 1 + 2
+    try std.testing.expectEqual(@as(u64, 62000), m1.tin); // 30000 + 12000 + 20000
+    try std.testing.expectEqual(@as(u64, 40000), m1.tcached); // only the chat rows are cache-served
+
+    // LABELS: the same rows folded the other way — this is the view that names the expensive call.
+    try std.testing.expectEqual(@as(usize, 3), agg.nroles); // chat, plan, arbiter
+    const chat = &agg.roles[0];
+    try std.testing.expectEqualStrings("chat", chat.name[0..chat.nlen]);
+    try std.testing.expectEqual(@as(u64, 50000), chat.tin);
+    try std.testing.expectEqual(@as(u64, 40000), chat.tcached);
+    // ...and the cache rate the report prints is derived from exactly these two numbers.
+    try std.testing.expectEqual(@as(u64, 80), chat.tcached * 100 / chat.tin);
+    const plan = &agg.roles[1];
+    try std.testing.expectEqual(@as(u64, 0), plan.tcached); // 0% cached — the signal worth seeing
+
+    // A row folds into BOTH views, so the two totals must reconcile. If they ever diverge, one of the
+    // folds is dropping rows and every percentage printed from it is wrong.
+    var model_in: u64 = 0;
+    for (agg.models[0..agg.nmodels]) |*s| model_in += s.tin;
+    var role_in: u64 = 0;
+    for (agg.roles[0..agg.nroles]) |*s| role_in += s.tin;
+    try std.testing.expectEqual(model_in, role_in);
+}
+
+test "foldMetricsJsonl: a row missing model or role folds into the view it can, and neither bucket overflows" {
+    const gpa = std.testing.allocator;
+    var agg: MetricAgg = .{};
+    // metrics.zig writes an "other" reconciliation row; a future writer could omit a key entirely.
+    // Neither should be counted twice nor abort the fold.
+    foldMetricsJsonl(gpa, "{\"role\":\"chat\",\"in\":100}\n{\"model\":\"m1\",\"in\":200}\n", &agg);
+    try std.testing.expectEqual(@as(usize, 1), agg.nmodels);
+    try std.testing.expectEqual(@as(usize, 1), agg.nroles);
+    try std.testing.expectEqual(@as(u64, 200), agg.models[0].tin);
+    try std.testing.expectEqual(@as(u64, 100), agg.roles[0].tin);
+
+    // More distinct keys than buckets: fold what fits and stop, rather than writing past the array.
+    var many: MetricAgg = .{};
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(gpa);
+    for (0..40) |i| try buf.print(gpa, "{{\"role\":\"r{d}\",\"model\":\"m{d}\",\"in\":1}}\n", .{ i, i });
+    foldMetricsJsonl(gpa, buf.items, &many);
+    try std.testing.expectEqual(@as(usize, 24), many.nroles);
+    try std.testing.expectEqual(@as(usize, 24), many.nmodels);
 }
