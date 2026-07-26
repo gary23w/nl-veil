@@ -1,17 +1,26 @@
-//! One headless browser session: process + CDP connection + an attached page, plus the high-level surface
-//! everything above uses. Pixel RAG calls screenshotBase64() to tile a page; the RSI browser tools call
-//! navigate/snapshot/clickRef/typeRef/evaluate. Build ONE of these per feature-run — see
-//! PIXEL_BROWSER_BLUEPRINT.md (the shared-infrastructure flag) — and close() it on teardown.
+//! One browser session: an attached page plus the high-level surface everything above uses. Pixel RAG calls
+//! screenshotBase64() to tile a page; the RSI browser tools call navigate/snapshot/clickRef/typeRef/evaluate.
+//! Build ONE of these per feature-run — see PIXEL_BROWSER_BLUEPRINT.md (the shared-infrastructure flag) — and
+//! close() it on teardown.
 //!
 //! The page is driven at the DOM level (JS via Runtime.evaluate) rather than by synthetic input coordinates:
 //! it is simpler and more robust for headless automation, and it gives every interactive element a stable
 //! `data-nlref` id that snapshot() returns and clickRef()/typeRef() act on — the same ref model the app's own
 //! browser tooling exposes.
+//!
+//! TWO TRANSPORTS, ONE SESSION. Every command below goes out through `callT`, which speaks CDP down one of:
+//!   .local — a browser we spawned ourselves on a throwaway profile, over our own ws client (cdp.zig).
+//!   .ext   — a tab in the user's OWN Chrome/Edge, relayed by the veil extension (ext.zig).
+//! Nothing between here and `callT` knows which: the ref model, the trusted Input events, HARDEN_JS and the
+//! snapshot script are identical, because chrome.debugger IS the same protocol. The extension is preferred
+//! when one is connected (the user's real profile means real logins and a human present for verification
+//! prompts); .local remains the fallback for a server with nobody at the keyboard.
 
 const std = @import("std");
 const launch = @import("launch.zig");
 const cdpm = @import("cdp.zig");
 const util = @import("util.zig");
+const ext = @import("ext.zig");
 const Cdp = cdpm.Cdp;
 
 const log = std.log.scoped(.browser);
@@ -33,13 +42,43 @@ pub const OpenOpts = struct {
     height: u32 = 2000,
 };
 
+/// Where a session's commands actually go. `.local` owns a browser process and a websocket; `.ext` owns
+/// nothing — the connection state is process-global in ext.zig and the tab is identified by session_id alone.
+pub const Conn = union(enum) {
+    local: struct {
+        child: std.process.Child,
+        cdp: Cdp,
+    },
+    ext,
+};
+
 pub const Session = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    child: std.process.Child,
-    cdp: Cdp,
-    session_id: []u8, // flattened page-target session (gpa-owned)
-    user_data_dir: []u8, // gpa-owned copy
+    /// Needed by the .ext transport to find the server's relay when this process is not the server. Held by
+    /// pointer: every caller's environ map is process-lifetime (the server's `init.environ_map`, exec-tool's
+    /// own), so it outlives any session.
+    env: *const std.process.Environ.Map,
+    conn: Conn,
+    session_id: []u8, // .local: the flattened page-target sessionId. .ext: the extension's tab handle. (gpa-owned)
+    user_data_dir: []u8, // gpa-owned copy; empty for .ext (it is the user's own profile, not ours to name)
+
+    /// Is this session driving the user's own browser through the extension?
+    pub fn isExt(self: *const Session) bool {
+        return self.conn == .ext;
+    }
+
+    /// The one place a CDP command leaves this module. Both transports return the command's `result` object as
+    /// a gpa-owned JSON string, so every caller below is transport-blind.
+    fn callT(self: *Session, method: []const u8, params_json: []const u8, timeout_ms: u32) Error![]u8 {
+        switch (self.conn) {
+            .local => |*l| return l.cdp.callTimeout(method, params_json, self.session_id, timeout_ms) catch error.Protocol,
+            .ext => return ext.call(self.gpa, self.io, self.env, method, params_json, self.session_id, timeout_ms) catch |e| switch (e) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Protocol,
+            },
+        }
+    }
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, opts: OpenOpts) Error!Session {
         const bin = launch.discover(gpa, io, env) catch return error.NoBrowserFound;
@@ -81,25 +120,60 @@ pub const Session = struct {
 
         _ = cdp.call("Page.enable", "{}", sid) catch {};
         _ = cdp.call("Runtime.enable", "{}", sid) catch {};
+        // Console + network capture. Best-effort: a browser that refuses these is still fully drivable, and
+        // drainEvents will simply have nothing to report rather than failing the session.
+        _ = cdp.call("Log.enable", "{}", sid) catch {};
+        _ = cdp.call("Network.enable", "{}", sid) catch {};
         // Clear the navigator.webdriver automation fingerprint at PARSE time (before any page script), so the
         // user's own assistive session isn't pre-emptively refused/degraded by a naive webdriver sniff. Persists
         // across navigations (unlike HARDEN_JS, which runs post-load and re-arms per document). Deliberately
         // scoped to this ONE property — this is not, and must not become, CAPTCHA/anti-bot evasion.
         _ = cdp.call("Page.addScriptToEvaluateOnNewDocument", "{\"source\":\"try{Object.defineProperty(navigator,'webdriver',{get:()=>false});}catch(e){}\"}", sid) catch {};
 
-        var s: Session = .{ .gpa = gpa, .io = io, .child = child, .cdp = cdp, .session_id = sid, .user_data_dir = udd };
+        var s: Session = .{ .gpa = gpa, .io = io, .env = env, .conn = .{ .local = .{ .child = child, .cdp = cdp } }, .session_id = sid, .user_data_dir = udd };
         s.harden(); // arm dialog/popup neutralization before the first navigate (see harden()'s note)
         return s;
     }
 
+    /// Open a session in the user's OWN browser via the connected extension. The extension opens a background
+    /// tab of its own (never commandeering the tab the user is reading), attaches chrome.debugger, enables the
+    /// Page/Runtime domains and turns on focus emulation so the page behaves as focused while backgrounded.
+    ///
+    /// Two things `open` does are deliberately NOT done here. `Page.addScriptToEvaluateOnNewDocument` to hide
+    /// `navigator.webdriver` is pointless — attaching chrome.debugger never sets it, so there is nothing to
+    /// scrub, and adding the shim anyway would be pure anti-detection with no assistive purpose. And there is
+    /// no profile to seed or sync popup to suppress: it is the user's real, already-signed-in browser.
+    pub fn openExt(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) Error!Session {
+        if (!ext.available(gpa, io, env)) return error.NoBrowserFound;
+        const created = ext.call(gpa, io, env, "Ext.openTab", "{}", null, 30_000) catch return error.Connect;
+        defer gpa.free(created);
+        const sid = getStr(gpa, created, "sessionId") orelse return error.Protocol;
+        errdefer gpa.free(sid);
+        const udd = gpa.dupe(u8, "") catch return error.OutOfMemory;
+
+        var s: Session = .{ .gpa = gpa, .io = io, .env = env, .conn = .ext, .session_id = sid, .user_data_dir = udd };
+        s.harden();
+        return s;
+    }
+
     pub fn close(self: *Session) void {
-        // Browser.close shuts down the WHOLE browser cleanly — the reliable kill, since headless Edge
-        // daemonizes (the process we spawned exits immediately, handing off to detached children that our
-        // Child handle no longer refers to). Then tear down the ws and reap the (already-dead) launch handle.
-        const bye = self.cdp.call("Browser.close", "{}", null) catch "";
-        if (bye.len > 0) self.gpa.free(bye);
-        self.cdp.deinit();
-        self.child.kill(self.io);
+        switch (self.conn) {
+            .local => |*l| {
+                // Browser.close shuts down the WHOLE browser cleanly — the reliable kill, since headless Edge
+                // daemonizes (the process we spawned exits immediately, handing off to detached children that
+                // our Child handle no longer refers to). Then tear down the ws and reap the launch handle.
+                const bye = l.cdp.call("Browser.close", "{}", null) catch "";
+                if (bye.len > 0) self.gpa.free(bye);
+                l.cdp.deinit();
+                l.child.kill(self.io);
+            },
+            // NEVER Browser.close here: that browser is the user's, with their other tabs in it. Closing the
+            // session means detaching the debugger and closing the ONE tab we opened, nothing more.
+            .ext => {
+                const bye = ext.call(self.gpa, self.io, self.env, "Ext.closeTab", "{}", self.session_id, 5_000) catch "";
+                if (bye.len > 0) self.gpa.free(bye);
+            },
+        }
         self.gpa.free(self.session_id);
         self.gpa.free(self.user_data_dir);
     }
@@ -108,7 +182,7 @@ pub const Session = struct {
     pub fn navigate(self: *Session, url: []const u8) Error![]u8 {
         const params = jsonObj(self.gpa, .{ .url = url }) catch return error.OutOfMemory;
         defer self.gpa.free(params);
-        const res = self.cdp.callTimeout("Page.navigate", params, self.session_id, 30_000) catch return error.Protocol;
+        const res = try self.callT("Page.navigate", params, 30_000);
         self.gpa.free(res);
         self.waitReady(20_000);
         self.harden(); // re-arm on the freshly loaded document (each navigation is a fresh JS context)
@@ -145,7 +219,7 @@ pub const Session = struct {
     pub fn evaluate(self: *Session, expr: []const u8) Error![]u8 {
         const params = jsonObj(self.gpa, .{ .expression = expr, .returnByValue = true, .awaitPromise = true }) catch return error.OutOfMemory;
         defer self.gpa.free(params);
-        const res = self.cdp.callTimeout("Runtime.evaluate", params, self.session_id, 30_000) catch return error.EvalFailed;
+        const res = self.callT("Runtime.evaluate", params, 30_000) catch return error.EvalFailed;
         defer self.gpa.free(res);
 
         const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, res, .{}) catch return error.EvalFailed;
@@ -175,7 +249,7 @@ pub const Session = struct {
     /// bytes are never decoded server-side — Pixel RAG persists this base64 as-is and hands it to a vision
     /// model verbatim.
     pub fn screenshotBase64(self: *Session) Error![]u8 {
-        const res = self.cdp.callTimeout("Page.captureScreenshot", "{\"format\":\"png\",\"captureBeyondViewport\":true}", self.session_id, 30_000) catch return error.Protocol;
+        const res = try self.callT("Page.captureScreenshot", "{\"format\":\"png\",\"captureBeyondViewport\":true}", 30_000);
         defer self.gpa.free(res);
         return getStr(self.gpa, res, "data") orelse error.Protocol;
     }
@@ -184,6 +258,34 @@ pub const Session = struct {
     /// {url,title,count,elements:[{ref,tag,type,name,text}]}. clickRef/typeRef act on those ref ids.
     pub fn snapshot(self: *Session) Error![]u8 {
         return self.evaluate(SNAPSHOT_JS);
+    }
+
+    /// Everything the page has reported since the last drain — console output, uncaught exceptions, and
+    /// network requests/responses/failures — as NDJSON of raw CDP event frames, plus how many were dropped
+    /// over the buffer cap. Transport-blind: `.local` reads the frames its own ws client captured while
+    /// waiting on commands, `.ext` asks the extension for the ones chrome.debugger handed it. Caller frees.
+    ///
+    /// DRAINING IS DESTRUCTIVE, which is why manager.zig — not this — owns the per-session store the console
+    /// and network tools read from. Two tools cannot both drain the same events.
+    pub fn drainEvents(self: *Session) Error!struct { ndjson: []u8, dropped: u32 } {
+        switch (self.conn) {
+            .local => |*l| {
+                const d = l.cdp.drainEvents();
+                return .{ .ndjson = d.ndjson, .dropped = d.dropped };
+            },
+            .ext => {
+                const raw = try self.callT("Ext.events", "{}", 10_000);
+                defer self.gpa.free(raw);
+                const P = struct { ndjson: []const u8 = "", dropped: u32 = 0 };
+                const p = std.json.parseFromSlice(P, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch
+                    return .{ .ndjson = self.gpa.dupe(u8, "") catch return error.OutOfMemory, .dropped = 0 };
+                defer p.deinit();
+                return .{
+                    .ndjson = self.gpa.dupe(u8, p.value.ndjson) catch return error.OutOfMemory,
+                    .dropped = p.value.dropped,
+                };
+            },
+        }
     }
 
     /// Full document pixel size {w,h} (for Pixel RAG tiling). Returns a gpa-owned JSON string.
@@ -200,7 +302,7 @@ pub const Session = struct {
             .clip = .{ .x = x, .y = y, .width = wd, .height = ht, .scale = 1 },
         }) catch return error.OutOfMemory;
         defer self.gpa.free(params);
-        const res = self.cdp.callTimeout("Page.captureScreenshot", params, self.session_id, 30_000) catch return error.Protocol;
+        const res = try self.callT("Page.captureScreenshot", params, 30_000);
         defer self.gpa.free(res);
         return getStr(self.gpa, res, "data") orelse error.Protocol;
     }
@@ -221,14 +323,119 @@ pub const Session = struct {
     fn dispatchMouse(self: *Session, kind: []const u8, x: i64, y: i64, button: []const u8, buttons: u8, clicks: u8) Error!void {
         const p = std.fmt.allocPrint(self.gpa, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":{d},\"clickCount\":{d},\"pointerType\":\"mouse\"}}", .{ kind, x, y, button, buttons, clicks }) catch return error.OutOfMemory;
         defer self.gpa.free(p);
-        const r = self.cdp.callTimeout("Input.dispatchMouseEvent", p, self.session_id, 5_000) catch return error.Protocol;
+        const r = try self.callT("Input.dispatchMouseEvent", p, 5_000);
         self.gpa.free(r);
     }
 
     /// Dispatch one Input.dispatchKeyEvent (raw params JSON) to the page session — a real, trusted keystroke.
     fn dispatchKey(self: *Session, params_json: []const u8) Error!void {
-        const r = self.cdp.callTimeout("Input.dispatchKeyEvent", params_json, self.session_id, 5_000) catch return error.Protocol;
+        const r = try self.callT("Input.dispatchKeyEvent", params_json, 5_000);
         self.gpa.free(r);
+    }
+
+    // ------------------------------------------------------------------ DOM-FREE input
+    //
+    // Everything below targets the page the way a human does — a point in the viewport, a keystroke into
+    // whatever has focus — and touches the DOM at NO stage. That matters because the ref-based path does:
+    // `snapshot` writes `data-nlref` attributes into the page, and a framework re-render wipes them, so a ref
+    // resolved by browser_read can be gone by the time browser_click runs. These verbs have nothing to go
+    // stale. They are the fallback when a ref won't resolve, and the primary path on any app that re-renders.
+
+    /// Trusted left click at a viewport point. `x`/`y` are CSS pixels from the top-left of the visible
+    /// viewport — the same space a screenshot shows and `getBoundingClientRect` reports. No devicePixelRatio.
+    pub fn clickAt(self: *Session, x: i64, y: i64) Error![]u8 {
+        const before = self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory);
+        defer self.gpa.free(before);
+        self.dispatchMouse("mouseMoved", x, y, "none", 0, 0) catch {};
+        self.dispatchMouse("mousePressed", x, y, "left", 1, 1) catch {};
+        util.sleepMs(40); // a real press→release gap; some UIs debounce a zero-duration press
+        self.dispatchMouse("mouseReleased", x, y, "left", 0, 1) catch {};
+        const navigated = self.settleAfterClick(before);
+        if (navigated) self.harden();
+        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
+        defer self.gpa.free(url);
+        return jsonObj(self.gpa, .{ .ok = true, .x = x, .y = y, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+    }
+
+    /// Type into WHATEVER CURRENTLY HAS FOCUS. No element lookup at all — click the field first (by ref or by
+    /// coordinate), then call this. `clear` selects the existing contents with a real ctrl/cmd+A first, so the
+    /// insert replaces rather than appends; that is deliberately NOT `el.value=''`, which bypasses the setter
+    /// a controlled React/Vue input listens on and leaves the framework's state out of sync with the field.
+    pub fn typeFocused(self: *Session, text: []const u8, clear: bool, submit: bool) Error![]u8 {
+        const before = if (submit) (self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory)) else "";
+        defer if (submit) self.gpa.free(before);
+
+        if (clear) {
+            // ctrl+A (cmd+A on mac) as REAL key events: modifiers=2 is Ctrl, 4 is Meta.
+            const mod: u8 = if (@import("builtin").os.tag == .macos) 4 else 2;
+            const dn = std.fmt.allocPrint(self.gpa, "{{\"type\":\"keyDown\",\"key\":\"a\",\"code\":\"KeyA\",\"windowsVirtualKeyCode\":65,\"nativeVirtualKeyCode\":65,\"modifiers\":{d}}}", .{mod}) catch return error.OutOfMemory;
+            defer self.gpa.free(dn);
+            const up = std.fmt.allocPrint(self.gpa, "{{\"type\":\"keyUp\",\"key\":\"a\",\"code\":\"KeyA\",\"windowsVirtualKeyCode\":65,\"nativeVirtualKeyCode\":65,\"modifiers\":{d}}}", .{mod}) catch return error.OutOfMemory;
+            defer self.gpa.free(up);
+            self.dispatchKey(dn) catch {};
+            self.dispatchKey(up) catch {};
+        }
+        if (text.len > 0) {
+            const tp = jsonObj(self.gpa, .{ .text = text }) catch return error.OutOfMemory;
+            defer self.gpa.free(tp);
+            const ir = try self.callT("Input.insertText", tp, 10_000);
+            self.gpa.free(ir);
+        }
+        if (!submit) return jsonObj(self.gpa, .{ .ok = true, .typed = text.len }) catch error.OutOfMemory;
+        try self.key("Enter");
+        const navigated = self.settleAfterClick(before);
+        if (navigated) self.harden();
+        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
+        defer self.gpa.free(url);
+        return jsonObj(self.gpa, .{ .ok = true, .typed = text.len, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+    }
+
+    /// One named key as a real down/up pair. A site that ignores a synthetic keydown still honours these,
+    /// and Tab in particular is a locate-free way to move between fields on a hostile page.
+    pub fn key(self: *Session, name: []const u8) Error!void {
+        const K = struct { name: []const u8, code: []const u8, vk: u16, text: []const u8 };
+        const table = [_]K{
+            .{ .name = "Enter", .code = "Enter", .vk = 13, .text = "\\r" },
+            .{ .name = "Tab", .code = "Tab", .vk = 9, .text = "\\t" },
+            .{ .name = "Escape", .code = "Escape", .vk = 27, .text = "" },
+            .{ .name = "Backspace", .code = "Backspace", .vk = 8, .text = "" },
+            .{ .name = "Delete", .code = "Delete", .vk = 46, .text = "" },
+            .{ .name = "ArrowUp", .code = "ArrowUp", .vk = 38, .text = "" },
+            .{ .name = "ArrowDown", .code = "ArrowDown", .vk = 40, .text = "" },
+            .{ .name = "ArrowLeft", .code = "ArrowLeft", .vk = 37, .text = "" },
+            .{ .name = "ArrowRight", .code = "ArrowRight", .vk = 39, .text = "" },
+            .{ .name = "Home", .code = "Home", .vk = 36, .text = "" },
+            .{ .name = "End", .code = "End", .vk = 35, .text = "" },
+            .{ .name = "PageDown", .code = "PageDown", .vk = 34, .text = "" },
+            .{ .name = "PageUp", .code = "PageUp", .vk = 33, .text = "" },
+        };
+        for (table) |k| {
+            if (!std.ascii.eqlIgnoreCase(k.name, name)) continue;
+            // windowsVirtualKeyCode + code + key together: a site checking any one of them still sees a real
+            // key. Omitting the virtual key code is the classic reason a dispatched Enter does nothing.
+            const dn = std.fmt.allocPrint(self.gpa, "{{\"type\":\"{s}\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}{s}{s}{s}}}", .{
+                if (k.text.len > 0) "keyDown" else "rawKeyDown", k.name, k.code, k.vk, k.vk,
+                if (k.text.len > 0) ",\"text\":\"" else "",                 k.text, if (k.text.len > 0) "\"" else "",
+            }) catch return error.OutOfMemory;
+            defer self.gpa.free(dn);
+            const up = std.fmt.allocPrint(self.gpa, "{{\"type\":\"keyUp\",\"key\":\"{s}\",\"code\":\"{s}\",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}}}", .{ k.name, k.code, k.vk, k.vk }) catch return error.OutOfMemory;
+            defer self.gpa.free(up);
+            self.dispatchKey(dn) catch {};
+            util.sleepMs(20);
+            self.dispatchKey(up) catch {};
+            return;
+        }
+        return error.Protocol;
+    }
+
+    /// Trusted wheel scroll at a viewport point — reaches inner scroll containers a window.scrollBy misses.
+    pub fn scrollAt(self: *Session, x: i64, y: i64, dy: i64) Error![]u8 {
+        const p = std.fmt.allocPrint(self.gpa, "{{\"type\":\"mouseWheel\",\"x\":{d},\"y\":{d},\"deltaX\":0,\"deltaY\":{d},\"button\":\"none\",\"buttons\":0,\"pointerType\":\"mouse\"}}", .{ x, y, dy }) catch return error.OutOfMemory;
+        defer self.gpa.free(p);
+        const r = try self.callT("Input.dispatchMouseEvent", p, 5_000);
+        self.gpa.free(r);
+        util.sleepMs(120); // let smooth-scroll / lazy-load settle before the caller reads
+        return jsonObj(self.gpa, .{ .ok = true, .x = x, .y = y, .deltaY = dy }) catch error.OutOfMemory;
     }
 
     /// Trusted left click on the element tagged `ref`: scroll it into view, resolve its viewport-center point,
@@ -334,17 +541,10 @@ pub const Session = struct {
             util.sleepMs(30);
             self.dispatchMouse("mouseReleased", x, y, "left", 0, 1) catch {};
         }
-        if (text.len > 0) {
-            const tp = jsonObj(self.gpa, .{ .text = text }) catch return error.OutOfMemory; // {"text":"..."} escaped
-            defer self.gpa.free(tp);
-            const ir = self.cdp.callTimeout("Input.insertText", tp, self.session_id, 10_000) catch return error.Protocol;
-            self.gpa.free(ir);
-        }
-        if (submit) {
-            self.dispatchKey("{\"type\":\"keyDown\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13,\"text\":\"\\r\"}") catch {};
-            util.sleepMs(20);
-            self.dispatchKey("{\"type\":\"keyUp\",\"key\":\"Enter\",\"code\":\"Enter\",\"windowsVirtualKeyCode\":13,\"nativeVirtualKeyCode\":13}") catch {};
-        }
+        // Clear + insert + optional Enter, all as REAL input, sharing one implementation with the
+        // coordinate-native path so the two can never drift.
+        const typed = try self.typeFocused(text, true, submit);
+        defer self.gpa.free(typed);
 
         if (!submit) return jsonObj(self.gpa, .{ .ok = true, .tag = tag }) catch error.OutOfMemory;
         const navigated = self.settleAfterClick(before);
@@ -384,10 +584,13 @@ const RESOLVE_CLICK_JS =
     \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});try{{if(el.tagName==='A'&&el.target&&el.target!=='_self')el.target='_self';}}catch(e){{}}el.scrollIntoView({{block:'center',inline:'center'}});var r=el.getBoundingClientRect();var vw=window.innerWidth||1,vh=window.innerHeight||1;var x=Math.min(Math.max(r.left+r.width/2,1),vw-1);var y=Math.min(Math.max(r.top+r.height/2,1),vh-1);var _tp=document.elementFromPoint(x,y);var hit=(r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw&&!!_tp&&(_tp===el||el.contains(_tp)));return JSON.stringify({{ok:true,x:Math.round(x),y:Math.round(y),hit:hit,tag:el.tagName.toLowerCase()}});}})()
 ;
 
-// Like RESOLVE_CLICK_JS but for typing: also focuses the element and clears any existing value (so insertText
-// replaces rather than appends). Returns the same {ok,x,y,hit,tag} shape.
+// Like RESOLVE_CLICK_JS but for typing: also focuses the element. It deliberately does NOT clear the field by
+// assigning `el.value=''` — on a controlled React/Vue input that bypasses the setter the framework listens on,
+// so its state desyncs from what is displayed and the typed text does not stick. Clearing is done instead with
+// a REAL ctrl/cmd+A select-all in typeRef, which the framework sees exactly as it would a human's.
+// Returns the same {ok,x,y,hit,tag} shape.
 const RESOLVE_TYPE_JS =
-    \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});el.scrollIntoView({{block:'center',inline:'center'}});try{{el.focus();}}catch(e){{}}try{{if('value' in el)el.value='';}}catch(e){{}}var r=el.getBoundingClientRect();var vw=window.innerWidth||1,vh=window.innerHeight||1;var x=Math.min(Math.max(r.left+r.width/2,1),vw-1);var y=Math.min(Math.max(r.top+r.height/2,1),vh-1);var _tp=document.elementFromPoint(x,y);var hit=(r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw&&!!_tp&&(_tp===el||el.contains(_tp)));return JSON.stringify({{ok:true,x:Math.round(x),y:Math.round(y),hit:hit,tag:el.tagName.toLowerCase()}});}})()
+    \\(function(){{var el=document.querySelector('[data-nlref="{d}"]');if(!el)return JSON.stringify({{ok:false,error:'ref not found'}});el.scrollIntoView({{block:'center',inline:'center'}});try{{el.focus();}}catch(e){{}}var r=el.getBoundingClientRect();var vw=window.innerWidth||1,vh=window.innerHeight||1;var x=Math.min(Math.max(r.left+r.width/2,1),vw-1);var y=Math.min(Math.max(r.top+r.height/2,1),vh-1);var _tp=document.elementFromPoint(x,y);var hit=(r.width>0&&r.height>0&&r.bottom>0&&r.top<vh&&r.right>0&&r.left<vw&&!!_tp&&(_tp===el||el.contains(_tp)));return JSON.stringify({{ok:true,x:Math.round(x),y:Math.round(y),hit:hit,tag:el.tagName.toLowerCase()}});}})()
 ;
 
 // Injected after every navigation (and at open). Makes headless click-through robust: modal dialogs become
