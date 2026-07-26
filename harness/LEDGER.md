@@ -2061,3 +2061,39 @@ edit, confirm it applied, then run.
 - next (verified): two more findings survived refutation and are NOT yet done — schedLearn's unbounded
   lesson prompt (engine.zig:2073) and the fitness block's one-round smoke skew (run.zig:1424). Both
   carry the skeptic's corrected magnitude; see 0082.
+
+## 0082 — 2026-07-25 — the lesson call paid a full prefill for one sentence
+- did: second finding from 0081's audit, verified myself before touching it. `schedLearn` appended its
+  question to `conv_buf` and passed the WHOLE buffer to the "lesson" completion — the only auxiliary
+  completion in engine.zig with no `msgTail` bound. So the end of every scheduled run paid a full
+  prefill of its entire assembled context (system prompt + memory blocks + the working span, which
+  compaction holds near 32 KB and lets reach 48 KB) to produce ONE sentence capped at 256 tokens.
+- uncached twice over, which is why it costs full price: the request is TOOLLESS, so it cannot reuse
+  the provider's tools-bearing cached prefix, and it runs on the THINKING provider while the turn's
+  chat calls run on CODING — there is not even a same-endpoint prefix to hit. The skeptic corrected
+  the claimant's arithmetic here (~10-18k tokens, not 17-31k, because a scheduled run mints a fresh
+  conv so the recency window and rolling summary are empty at assembly) and I kept the corrected
+  figure; the mechanism was unaffected either way.
+- did: mirrored `summarizeTurn`, which does the same job correctly one screen away —
+  `msgTail(conv_buf.items, SUMMARY_CTX_BYTES)` into a LOCAL message list. That also retires the
+  save/shrink pair: the question cannot leak into durable context if it never touches conv_buf.
+  Tradeoff accepted, the same one summarizeTurn accepts: the lesson sees the run's tail, not its
+  whole arc.
+- ratchet — the part that outlives this fix: NOTHING said an auxiliary call may not send the whole
+  transcript, which is how this shipped and how the drive picker shipped the same way before it (its
+  fix note is still in the file). Now a source audit requires every `llm.complete` in engine.zig to
+  bound its prompt, with a floor (>= 8 calls scanned) so a rename fails loudly instead of passing on
+  zero, and an assertion that the STREAMED turn still sends the whole conversation — so the rule
+  cannot be satisfied by crippling the actual chat.
+- verified: src suite exit 0; counterfactual (injection printed) re-unbinding the lesson prompt fails
+  the new audit by name. Full oracle green.
+- learned: two instances of one mistake, years apart in the same file, each fixed locally with a
+  careful note beside it — and the note never generalised. This is the third time this sitting the
+  answer was "make the rule mechanical rather than written" (0055's one escaper, 0073's one
+  predicate, now this). The tell is a comment that explains a fix: it means someone understood the
+  class and had no way to enforce it.
+- next (verified): one finding from the audit remains unimplemented — the fitness block's one-round
+  smoke skew (run.zig:1424), where buildFitnessBlock folds in the PREVIOUS round's smoke verdict. The
+  skeptic confirmed the order and narrowed the harm to flip-rounds with a green bench. It needs a
+  reorder inside the swarm round loop, which I cannot exercise without a live swarm — left for a
+  session that can, with the analysis in this ledger.
