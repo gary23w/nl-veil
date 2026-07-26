@@ -10608,3 +10608,46 @@ test "BenchResult.hasScore: the one predicate the promote gate and the curve mus
     // so it must not read as a score no matter what totals came back with it.
     try std.testing.expect(!(BenchResult{ .status = .err, .total = 9, .passed = 9, .harness = true }).hasScore());
 }
+
+test "buildFitnessBlock: a green score never reads all-green while the runtime gate is red" {
+    // This block is the line every mind optimises, so what it says IS the swarm's objective. It had no
+    // test at all. The property below is why the runtime fold-in was added (a cast ran 35/35 rounds with
+    // a red smoke gate while FITNESS read "all green", and the minds trusted the score over the separate
+    // RUNTIME block): a green scoreline must never claim all-green while the gate is red.
+    const gpa = std.testing.allocator;
+    const cov: Coverage = .{};
+
+    // Green bench + red runtime ⇒ the gate is folded into FAILING, and the advice points at it.
+    {
+        const b = BenchResult{ .status = .ok, .passed = 5, .total = 5, .pct = 100 };
+        const s = buildFitnessBlock(gpa, b, false, false, 0, 0, cov, "", "server exited 1 on boot");
+        defer gpa.free(@constCast(s));
+        try std.testing.expect(std.mem.indexOf(u8, s, "all green") == null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "runtime gate is RED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "server exited 1 on boot") != null);
+    }
+    // Green bench + green runtime ⇒ the ordinary all-green line, with no phantom failure invented.
+    {
+        const b = BenchResult{ .status = .ok, .passed = 5, .total = 5, .pct = 100 };
+        const s = buildFitnessBlock(gpa, b, false, false, 0, 0, cov, "", "");
+        defer gpa.free(@constCast(s));
+        try std.testing.expect(std.mem.indexOf(u8, s, "(none — all green)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "runtime gate is RED") == null);
+    }
+    // REAL bench failures take precedence over the runtime note — a mind must see the checks that
+    // actually failed, not a gate verdict standing in for them.
+    {
+        const b = BenchResult{ .status = .ok, .passed = 2, .total = 5, .pct = 40, .failures = @constCast("test_login FAILED: assert 401 == 200") };
+        const s = buildFitnessBlock(gpa, b, false, false, 0, 0, cov, "", "server exited 1 on boot");
+        defer gpa.free(@constCast(s));
+        try std.testing.expect(std.mem.indexOf(u8, s, "test_login FAILED") != null);
+        try std.testing.expect(std.mem.indexOf(u8, s, "runtime gate is RED") == null);
+    }
+    // KNOWN, and the reason this test exists as groundwork rather than a fix: at the single call site
+    // (run.zig, the round loop) `runtime_fail` carries the PREVIOUS round's smoke verdict, because
+    // smokeTest runs AFTER buildFitnessBlock in the same iteration. On a round where the verdict flips
+    // and the bench is green, the folded clause disagrees with the RUNTIME line printed below it, for one
+    // round. The fix is to hoist smokeTest above runBenchmark; it is NOT done here because that reorders
+    // a live swarm loop no test in this repo exercises. Whoever does it: these assertions pin the shape
+    // the fold-in must keep, so a reorder that breaks the contract fails here instead of in a cast.
+}
