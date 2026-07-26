@@ -264,9 +264,19 @@ fn growthReport(ctx: *Ctx) void {
     if (streaks == 0) out("  sched    : {d} task(s), no fail streaks\n", .{tasks});
 
     // Models: fold u*/_metrics/llm.jsonl (shape documented in worker/metrics.zig) per model.
-    const Stat = struct { name: [64]u8 = [_]u8{0} ** 64, nlen: usize = 0, turns: u64 = 0, calls: u64 = 0, tin: u64 = 0, tout: u64 = 0, ms: u64 = 0 };
+    const Stat = struct { name: [64]u8 = [_]u8{0} ** 64, nlen: usize = 0, turns: u64 = 0, calls: u64 = 0, tin: u64 = 0, tout: u64 = 0, tcached: u64 = 0, ms: u64 = 0 };
     var stats = [_]Stat{.{}} ** 24;
     var nstats: usize = 0;
+    // The SAME rows also carry `role` (the call's label: chat, plan, summary, arbiter, ...) and
+    // `cached`. Both were parsed away here, which left the two questions you actually ask when a bill
+    // looks wrong unanswerable from the report: WHICH call is spending it, and is the provider's
+    // prompt cache working at all. metrics.zig writes `cached` precisely so the second one can be
+    // answered "from our own meters", and llm.zig folds three provider dialects to get it — the data
+    // reached disk and stopped one layer short of a reader. A chat turn fires one `chat` stream plus
+    // up to a dozen auxiliary calls (plan, recon, arbiter, stuck, reflect, ctxsum, compact...), so a
+    // per-model total cannot tell you that, say, `plan` is a third of the spend. (Ledger 0079.)
+    var roles = [_]Stat{.{}} ** 24;
+    var nroles: usize = 0;
     var it2 = root.iterate();
     while (it2.next(ctx.io) catch null) |ent| {
         if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
@@ -278,7 +288,7 @@ fn growthReport(ctx: *Ctx) void {
         while (lit.next()) |raw_ln| {
             const ln = std.mem.trim(u8, raw_ln, " \r\t");
             if (ln.len == 0) continue;
-            const R = struct { model: []const u8 = "", calls: u64 = 0, in: u64 = 0, out: u64 = 0, ms: u64 = 0 };
+            const R = struct { model: []const u8 = "", role: []const u8 = "", calls: u64 = 0, in: u64 = 0, out: u64 = 0, cached: u64 = 0, ms: u64 = 0 };
             const p = std.json.parseFromSlice(R, gpa, ln, .{ .ignore_unknown_fields = true }) catch continue;
             defer p.deinit();
             const m = p.value.model;
@@ -302,7 +312,33 @@ fn growthReport(ctx: *Ctx) void {
             st.calls += p.value.calls;
             st.tin += p.value.in;
             st.tout += p.value.out;
+            st.tcached += p.value.cached;
             st.ms += p.value.ms;
+
+            // ...and the same row folded by LABEL, so the expensive call is nameable.
+            const rl = p.value.role;
+            if (rl.len == 0 or rl.len > 64) continue;
+            var r: ?*Stat = null;
+            for (roles[0..nroles]) |*cand| {
+                if (std.mem.eql(u8, cand.name[0..cand.nlen], rl)) {
+                    r = cand;
+                    break;
+                }
+            }
+            if (r == null) {
+                if (nroles >= roles.len) continue;
+                roles[nroles].nlen = rl.len;
+                @memcpy(roles[nroles].name[0..rl.len], rl);
+                r = &roles[nroles];
+                nroles += 1;
+            }
+            const rt = r.?;
+            rt.turns += 1;
+            rt.calls += p.value.calls;
+            rt.tin += p.value.in;
+            rt.tout += p.value.out;
+            rt.tcached += p.value.cached;
+            rt.ms += p.value.ms;
         }
     }
     if (nstats == 0) {
@@ -310,9 +346,39 @@ fn growthReport(ctx: *Ctx) void {
         return;
     }
     for (stats[0..nstats]) |*st| {
-        out("  model    : {s} — {d} turn-rows, {d} calls, {d}k in / {d}k out, avg {d}ms/row\n", .{
-            st.name[0..st.nlen], st.turns, st.calls, st.tin / 1000, st.tout / 1000,
+        // cache% is the share of INPUT tokens the provider served from its prompt cache. Near zero on
+        // a hosted model means the prompt is being re-prefilled every call — the exact failure the
+        // stable-prefix contracts in engine.zig and run.zig exist to prevent, and until now it was
+        // measured, written to disk, and never shown to anyone.
+        const cache_pct: u64 = if (st.tin > 0) st.tcached * 100 / st.tin else 0;
+        out("  model    : {s} — {d} turn-rows, {d} calls, {d}k in / {d}k out, {d}% cached, avg {d}ms/row\n", .{
+            st.name[0..st.nlen], st.turns, st.calls, st.tin / 1000, st.tout / 1000, cache_pct,
             if (st.turns > 0) st.ms / st.turns else 0,
+        });
+    }
+
+    // Per-label spend, biggest first: the actionable view. `chat` is the answer the user waited for;
+    // everything else is the engine deciding, and an auxiliary call that rivals `chat` is the first
+    // place to look for a cheap pre-gate (planWorthwhile is the pattern — an inference-free predicate
+    // that skips the round-trip entirely).
+    var total_in: u64 = 0;
+    for (roles[0..nroles]) |*r| total_in += r.tin;
+    var shown: usize = 0;
+    while (shown < nroles and shown < 8) : (shown += 1) {
+        var best: usize = shown;
+        for (roles[shown..nroles], shown..) |*cand, idx| {
+            if (cand.tin + cand.tout > roles[best].tin + roles[best].tout) best = idx;
+        }
+        if (best != shown) {
+            const tmp = roles[shown];
+            roles[shown] = roles[best];
+            roles[best] = tmp;
+        }
+        const r = &roles[shown];
+        const share: u64 = if (total_in > 0) r.tin * 100 / total_in else 0;
+        const rc: u64 = if (r.tin > 0) r.tcached * 100 / r.tin else 0;
+        out("  call     : {s} — {d} calls, {d}k in / {d}k out, {d}% of input, {d}% cached\n", .{
+            r.name[0..r.nlen], r.calls, r.tin / 1000, r.tout / 1000, share, rc,
         });
     }
 }
