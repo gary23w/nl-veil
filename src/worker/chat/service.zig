@@ -397,6 +397,11 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // PNG bytes of an image the user attached this turn. Absent/"" ⇒ no attachment. The engine OCRs it to
         // text (vision-as-text; no vision model sees pixels) and injects that as grounded context.
         image_b64: []const u8 = "",
+        // FAST MODE: skip the advanced-reasoning passes (recon-before-plan, mid-turn course check) for a
+        // quicker, cheaper turn. ABSENT = false = ADVANCED, and that default is the point — every existing
+        // client, and every API caller who has never heard of this field, gets the better reasoning without
+        // changing anything. Opting OUT is the deliberate act, which is the right way round for a quality knob.
+        fast: bool = false,
     };
     const b = (try req.json(Body)) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
@@ -492,7 +497,7 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // live via /events instead of blocking its poll until the whole (possibly multi-step) turn finishes. The turn
     // writes frames to events.jsonl as it runs. spawnTurn owns releasing the per-conv slot (via turnThread / its
     // inline paths) on every completion path.
-    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64);
+    chat_engine.spawnTurn(app, u.id, seg, trio, text, loop_mode, b.tool_client, b.image_b64, b.fast);
 
     res.status = 202;
     const events_url = try std.fmt.allocPrint(res.arena, "/api/v1/chat/convs/{s}/events?from=0", .{seg});

@@ -1572,6 +1572,14 @@ pub const Chat = struct {
             break :blk_lm if (self.store.chat_loop_afk) @as(u8, 2) else if (self.store.chat_loop) @as(u8, 1) else @as(u8, 0);
         };
 
+        // REASONING MODE, read per send so Settings takes effect on the very next message. Advanced (the
+        // default) is the veil looking before it plans and checking course mid-task; fast skips both.
+        const fast_reasoning: bool = blk_fr: {
+            self.store.lock();
+            defer self.store.unlock();
+            break :blk_fr self.store.settings.fast_reasoning;
+        };
+
         // IMAGE ATTACHMENT (v1, single image): read the raw PNG the UI captured and base64-encode it (STANDARD
         // alphabet, no "data:" prefix) into the body's "image_b64" field. File-read + encode happen HERE, on the
         // chat worker thread (never a raylib texture op). Any failure just omits the attachment — the text still
@@ -1623,6 +1631,9 @@ pub const Chat = struct {
             // THIS machine (via `veil exec-tool`) so the veil acts in the user's environment, not the server's box.
             w.writeAll("\",\"tool_client\":true,\"loop\":") catch break :blk false;
             w.writeByte('0' + loop_mode) catch break :blk false; // 0|1|2 — the desk's live auto-loop tier
+            // Only sent when TRUE: the server default is advanced, so an absent field and a false one mean
+            // the same thing, and saying nothing is the smaller wire contract.
+            if (fast_reasoning) w.writeAll(",\"fast\":true") catch break :blk false;
             // Optional single-image attachment. base64's alphabet ([A-Za-z0-9+/=]) needs no JSON escaping.
             if (image_b64.len > 0) {
                 w.writeAll(",\"image_b64\":\"") catch break :blk false;
@@ -4672,6 +4683,7 @@ pub const Chat = struct {
         var font_bold = false;
         var narrator = false;
         var browser_headful = false;
+        var fast_reasoning = false;
         var leftw: u16 = 230;
         var rightw: u16 = 320;
         var cfa: [64]u8 = undefined;
@@ -4704,6 +4716,7 @@ pub const Chat = struct {
             font_bold = s.font_bold;
             narrator = s.narrator;
             browser_headful = s.browser_headful;
+            fast_reasoning = s.fast_reasoning;
             leftw = s.chat_left_w;
             rightw = s.chat_right_w;
             unified = s.chat_unified;
@@ -4741,7 +4754,7 @@ pub const Chat = struct {
         // BROKEN toggle wrote `local_brain:true` on every idle frame (it read the checkbox's click flag as
         // the new value), so every install with that build got silently pinned local and could never turn
         // server mode on. A fresh key on each break keeps a bad persisted state from surviving it.
-        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"leftw\":{d},\"rightw\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, leftw, rightw }) catch return;
+        jb.print(self.gpa, "\",\"left\":{},\"right\":{},\"shell_allow\":{},\"speed\":{},\"srv_brain\":{},\"dyslexia\":{},\"font_scale\":{d},\"font_bold\":{},\"narrator\":{},\"browser_headful\":{},\"fast_reasoning\":{},\"leftw\":{d},\"rightw\":{d}", .{ lopen, ropen, shell_allow, speed, server_chat, dyslexia, font_scale, font_bold, narrator, browser_headful, fast_reasoning, leftw, rightw }) catch return;
         // MODEL TRIO: the "use one model for all three" flag + the thinking/prompting role overrides. Role keys
         // are NOT written here — they live in the OS secret store (secrets.zig), keyed by provider slug.
         jb.print(self.gpa, ",\"unified\":{}", .{unified}) catch return;
@@ -4840,6 +4853,9 @@ pub const Chat = struct {
         s.font_bold = std.mem.indexOf(u8, data, "\"font_bold\":true") != null;
         s.narrator = std.mem.indexOf(u8, data, "\"narrator\":true") != null;
         s.browser_headful = std.mem.indexOf(u8, data, "\"browser_headful\":true") != null;
+        // ABSENT in a settings file written before fast mode existed → false → ADVANCED. An upgrade must
+        // never silently downgrade someone's reasoning, so the missing key has to mean the better default.
+        s.fast_reasoning = std.mem.indexOf(u8, data, "\"fast_reasoning\":true") != null;
         self.syncBrowserPref(s.browser_headful); // reflect the persisted choice to the daemon prefs file at startup
         if (jInt(data, "font_scale")) |v| {
             if (v >= 80 and v <= 140) s.font_scale = @intCast(v); // out-of-range hand-edit → keep the 100 default
