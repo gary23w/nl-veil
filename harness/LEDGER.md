@@ -2001,3 +2001,30 @@ edit, confirm it applied, then run.
 - next (verified): with per-label numbers visible, the actual optimisation becomes measurable —
   an auxiliary call rivalling `chat` is the first candidate for a cheap inference-free pre-gate
   (`planWorthwhile` is the existing pattern). That needs REAL usage data, which only the owner has.
+
+## 0080 — 2026-07-25 — closing the gap 0079 admitted
+- did: 0079 shipped the per-label token report "verified but NOT regression-guarded" and named the
+  follow-up: the aggregation lived inline in `growthReport`, which writes to stdout, so nothing could
+  assert a number it printed and an arithmetic regression would have been invisible to the oracle.
+  Done now — `foldMetricsJsonl` + `MetricAgg` are file-scope and pure, and growthReport is a renderer
+  over them. Behaviour preserved: the same synthetic data through the rebuilt binary prints output
+  byte-identical to the pre-refactor run.
+- did: tests the report's own arithmetic. Both foldings of the same rows (per model, per label) with
+  hand-computed totals; the cache rate the report prints derived from exactly the two numbers it
+  divides; a corrupt line SKIPPED rather than blanking the report; a row missing `model` or `role`
+  folding into the view it can and not the other; and 40 distinct keys into 24 buckets stopping at 24
+  rather than writing past the array.
+- the assertion worth copying: the two views fold the SAME rows, so their input totals must
+  reconcile. If they ever diverge, one fold is dropping rows and every percentage printed from it is
+  wrong — a cross-check that no single-view test could make. The counterfactual proves it bites:
+  zeroing the per-label cache fold fails that test.
+- learned: writing "verified but not guarded" in 0079 is what made this get done. The honest limit
+  was a to-do with a name attached; had the entry claimed the increment was complete, nobody would
+  have come back. Admitting the gap in the record is not bookkeeping, it is the mechanism — and it
+  cost one sentence.
+- verified: src suite exit 0; end-to-end output identical to 0079's; counterfactual (injection
+  printed) fails the named test. Full oracle green.
+- ratchet: the extracted pure fold — the report's arithmetic is now inside the oracle instead of
+  outside it.
+- next (verified): the per-label numbers are only as useful as the data behind them, which needs real
+  usage the owner has and I do not.
