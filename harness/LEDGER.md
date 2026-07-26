@@ -1967,3 +1967,37 @@ edit, confirm it applied, then run.
 - ratchet: none — this entry is a recorded negative result plus a handoff, which 0067 established is
   worth writing down rather than dressing up as work.
 - next (verified): nothing worker-actionable. The four owner decisions are the only open work.
+
+## 0079 — 2026-07-25 — you cannot optimise token spend you cannot attribute
+- did: took "optimize token spend" as a measurement problem first. A chat turn is not one call: it is
+  one `chat` stream plus up to a dozen auxiliary round-trips (plan, recon, course, planrec, summary,
+  arbiter, searchq, stuck, reflect, ctxsum, compact, lesson, loop), each with its own prompt. The
+  static schema alone is ~2.9k tokens of CHAT_SCHEMA + ~2.3k of ORCH_TOOLS on every inference.
+- FOUND: the engine already measures all of this per call — `logCall` records
+  `{ts, role(label), model, base, ms, in, cached, out}`, metrics.zig writes every field to
+  `u*/_metrics/llm.jsonl`, and llm.zig folds three provider dialects to get `cached` specifically so
+  that "is provider prompt caching actually working?" is answerable from our own meters. Then
+  `doctor --growth` parsed the rows with a struct containing only `{model, calls, in, out, ms}` —
+  DISCARDING the label and the cache field. The data reached disk and stopped one layer short of a
+  reader. Two questions you actually ask when a bill looks wrong were unanswerable from the report:
+  which call is spending it, and is the prefix cache working.
+- did: report both. Per-model rows gain `cached%`; a new per-label section lists the biggest spenders
+  first with each one's share of input and its own cache rate. No new plumbing — every number was
+  already on disk.
+- verified END TO END against the real binary, not just a compile: built server-only, pointed
+  `NEURON_LOOPS_DATA` at a synthetic `llm.jsonl` with hand-computable numbers, and checked every
+  figure (70k in = 30+12+20+8; 57% cached = 40/70; chat = 71% of input; ordering by in+out). The
+  output also demonstrates the point immediately: `chat` reads 80% cached while `plan` and `arbiter`
+  read 0% — the diagnostic that was invisible before. Full oracle green.
+- HONEST LIMIT: this is verified but NOT regression-guarded. The aggregation is inline in
+  `growthReport`, which writes to stdout, so no test covers it and the oracle would not catch a
+  future break. Extracting a pure fold + testing it is the obvious follow-up and I did not do it —
+  saying so rather than implying the increment is fully ratcheted.
+- learned: "optimize X" starts as an observability question surprisingly often. The costly calls were
+  already instrumented to the field level; nobody could SEE them, so nobody could rank them. The gap
+  was not in the engine's measurement, it was one struct literal in a reader that quietly dropped two
+  fields — the same silent-truncation shape as everything else this sitting, wearing a parser's
+  clothes.
+- next (verified): with per-label numbers visible, the actual optimisation becomes measurable —
+  an auxiliary call rivalling `chat` is the first candidate for a cheap inference-free pre-gate
+  (`planWorthwhile` is the existing pattern). That needs REAL usage data, which only the owner has.
