@@ -7017,6 +7017,7 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     const bold_now = store.settings.font_bold;
     const narr_on = store.settings.narrator; // snapshot under THIS lock (these two were read unlocked below)
     const bh_on = store.settings.browser_headful;
+    const fast_on = store.settings.fast_reasoning;
     const online = store.server_online;
     const chat_kind = store.settings.chat_kind;
     const chat_byok = store.settings.chat_byok;
@@ -7183,6 +7184,17 @@ fn drawSettings(store: *Store, body: t.Rect) void {
     if (settingRow(x, y, tog_w, if (bh_on) t.z("browser window: SHOWN", .{}) else t.z("browser window: HIDDEN", .{}), bh_on, t.z("when the AI drives a web browser here, show it on screen instead of running it hidden.", .{}))) {
         store.lock();
         store.settings.browser_headful = !store.settings.browser_headful;
+        store.unlock();
+        store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
+    }
+    y += ROW;
+    // REASONING MODE. ADVANCED is the default and the recommendation: the veil looks at what is actually
+    // there before it commits to a plan, and checks mid-task that the work is still aimed at the goal.
+    // FAST reverts to the older, cheaper behaviour — plan straight from the request, never re-examine.
+    // Worded as ADVANCED/FAST rather than on/off so neither reads as the broken one.
+    if (settingRow(x, y, tog_w, if (fast_on) t.z("reasoning: FAST", .{}) else t.z("reasoning: ADVANCED", .{}), !fast_on, t.z("advanced: look before planning, and re-check course mid-task. costs an extra model call per turn. fast: skip both.", .{}))) {
+        store.lock();
+        store.settings.fast_reasoning = !store.settings.fast_reasoning;
         store.unlock();
         store.pushChatCmd(store_mod.mkChatCmd(.save_settings, "", ""));
     }

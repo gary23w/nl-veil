@@ -160,6 +160,11 @@ pub const Settings = struct {
     // browser window instead of running it hidden. Persisted, and mirrored to a small prefs file the local
     // browser daemon reads so the next browser session opens in the chosen mode without a restart.
     browser_headful: bool = false,
+    // FAST MODE (default OFF = advanced reasoning). Advanced is the veil looking before it plans — a
+    // recon pass that grounds the plan in what is actually on disk — and checking mid-task whether the
+    // work is still aimed at the goal. Both cost an extra model call. Fast mode skips them for a quicker,
+    // cheaper turn, and is sent per-message so it can be flipped without restarting anything.
+    fast_reasoning: bool = false,
 
     pub fn dataDir(s: *const Settings) []const u8 {
         return s.data_dir[0..s.data_dir_len];

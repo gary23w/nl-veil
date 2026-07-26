@@ -943,7 +943,7 @@ fn renderLlmFrame(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), labe
 
 /// Run one full agentic turn for `conv` (already safeSeg'd, non-empty). Blocks the calling httpz worker thread
 /// to completion (casts/deploys block the same way); on return the whole turn is durable in messages/events.jsonl.
-pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8) void {
+pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text: []const u8, loop: u8, tool_client_req: bool, image_b64: []const u8, fast: bool) void {
     const gpa = app.gpa;
 
     // TOOL DELEGATION IS ADMIN-ONLY, and the check belongs HERE rather than at the delegation branch.
@@ -1387,7 +1387,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             var ground: std.ArrayListUnmanaged(u8) = .empty;
             defer ground.deinit(gpa);
             ledgerBlock(gpa, &file_ledger, &ground);
-            const evidence = if (envDisabled(environ, "NL_CHAT_RECON"))
+            // Rung 2 is what FAST MODE gives up: the probe inference plus its tool calls, which is where
+            // the latency lives. Rung 1 (the ledger block above) stays in BOTH modes — it is already in
+            // hand and costs nothing, and a planner that cannot see the workdir is not "fast", just wrong.
+            const evidence = if (fast or envDisabled(environ, "NL_CHAT_RECON"))
                 null
             else
                 reconFindings(app, llm_dir, think, &ctx, user_text, ground.items);
@@ -1507,7 +1510,11 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // MID-TURN COURSE CHECK, on for the runs where drift is expensive: an armed loop (up to 30 steps, or
     // unbounded in afk) or a plan walking its board. A plain 6-step turn is short enough that the user is
     // still watching and is the correction, so it does not pay for a reviewer. NL_CHAT_COURSE=0 disables.
-    const course_on = (armed or has_plan) and !envDisabled(environ, "NL_CHAT_COURSE");
+    //
+    // THREE WAYS OFF, in descending scope: the operator's NL_CHAT_COURSE=0 (this build, every user), the
+    // user's own fast mode (this turn, their choice), and the gate itself (this turn is too short to be
+    // worth a reviewer).
+    const course_on = (armed or has_plan) and !fast and !envDisabled(environ, "NL_CHAT_COURSE");
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
     var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
@@ -3233,12 +3240,15 @@ pub const TurnArgs = struct {
     loop: u8,
     tool_client: bool,
     image_b64: []const u8,
+    /// FAST MODE: this turn opted out of the advanced-reasoning passes (see the Body field in chat/service.zig).
+    /// False = the default = advanced.
+    fast: bool,
 };
 
 /// Detached-thread entry: run the whole turn, then free the owned args. Any failure inside runTurn is already
 /// caught + surfaced as an event, so this thread returns cleanly (never propagates an error that could abort it).
 fn turnThread(args: *TurnArgs) void {
-    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64);
+    runTurn(args.app, args.uid, args.conv, args.trio, args.text, args.loop, args.tool_client, args.image_b64, args.fast);
     endTurn(args.app.io, args.conv); // release the per-conv turn lock (before freeing the blob `conv` points into)
     if (llm.isLocal(args.trio.coding.base_url)) releaseLocal(args.app.io); // release the machine-sized local slot (admission keys on the coding/base model)
     const gpa = args.app.gpa;
@@ -3251,7 +3261,7 @@ fn turnThread(args: *TurnArgs) void {
 /// block the client's /events poll for the whole turn). On an
 /// allocation or thread-spawn failure it runs the turn INLINE (blocking the caller) rather than drop it — the
 /// caller's arg slices are still valid at that point. The turn writes its frames to events.jsonl either way.
-pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8) void {
+pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: []const u8, loop: u8, tool_client: bool, image_b64: []const u8, fast: bool) void {
     const gpa = app.gpa;
     const c = trio.coding;
     const t = trio.thinking;
@@ -3266,14 +3276,14 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
     // must release it. The detached/inline turnThread paths release in turnThread; the two alloc-failure inline
     // paths run the turn directly, so they release explicitly. Local-slot release keys on the coding/base model.
     const args = gpa.create(TurnArgs) catch {
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast);
         endTurn(app.io, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
     };
     const blob = gpa.alloc(u8, total) catch {
         gpa.destroy(args);
-        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64);
+        runTurn(app, uid, conv, trio, text, loop, tool_client, image_b64, fast);
         endTurn(app.io, conv);
         if (llm.isLocal(c.base_url)) releaseLocal(app.io);
         return;
@@ -3288,7 +3298,7 @@ pub fn spawnTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, text: [
         .thinking = .{ .base_url = dupInto(blob, &o, t.base_url), .key = dupInto(blob, &o, t.key), .model = dupInto(blob, &o, t.model) },
         .prompting = .{ .base_url = dupInto(blob, &o, p.base_url), .key = dupInto(blob, &o, p.key), .model = dupInto(blob, &o, p.model) },
     };
-    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib };
+    args.* = .{ .app = app, .uid = uid, .blob = blob, .conv = cv, .trio = owned, .text = tx, .loop = loop, .tool_client = tool_client, .image_b64 = ib, .fast = fast };
     if (std.Thread.spawn(.{}, turnThread, .{args})) |th| {
         th.detach();
     } else |_| {
@@ -4157,7 +4167,10 @@ fn openSubchatTool(app: *App, uid: u64, conv: []const u8, conv_dir: []const u8, 
         endTurn(app.io, bid);
         return orchErr(gpa, "the local model has no free concurrency for a parallel sub-chat turn — work the idea inline, or switch to a hosted model for parallel branches");
     }
-    spawnTurn(app, uid, bid, trio, goal, 0, false, "");
+    // A sub-chat runs on the DEFAULTS, exactly as this call site already does for loop and tool_client:
+    // it works unattended on a branch nobody is watching, which is precisely where advanced reasoning
+    // earns its cost. The parent's fast-mode choice was about the parent's own latency.
+    spawnTurn(app, uid, bid, trio, goal, 0, false, "", false);
     return std.fmt.allocPrint(gpa, "{{\"ok\":true,\"tool\":\"open_subchat\",\"sub\":\"s{d}\",\"conv\":\"{s}\",\"note\":\"sub-chat s{d} opened and its first turn is RUNNING server-side on that goal. It shares this chat's workspace and memory — its findings become recallable here (recall) as it works. Tell the user it opened as tab s{d}; check its progress later via recall or by switching to the tab.\"}}", .{ free_n, bid, free_n, free_n }) catch emptyRes();
 }
 
