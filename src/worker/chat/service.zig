@@ -403,7 +403,13 @@ pub fn postMessage(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         // changing anything. Opting OUT is the deliberate act, which is the right way round for a quality knob.
         fast: bool = false,
     };
-    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    // TWO different failures, both the CALLER's: `orelse` catches an absent/empty body, and the `catch`
+    // catches a body that parsed as JSON but had a field of the wrong TYPE ({"loop":"x"}, {"fast":"yes"}).
+    // Only the first was handled, so the far more common second one propagated the parse error out of the
+    // handler and httpz rendered it as a 500 — telling the caller the server broke when their request was
+    // simply wrong, and putting their typo into this server's error rate. chat/tools.zig already had this
+    // shape; every req.json site in the tree now does.
+    const b = (req.json(Body) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const text = std.mem.trim(u8, b.text, " \r\n\t");
     if (text.len == 0) return badReq(res, "text is required");
     const loop_mode: u8 = switch (b.loop) {
@@ -515,7 +521,7 @@ pub fn toolResult(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const seg = safeSeg(id);
     if (seg.len == 0) return notFound(res);
     const Body = struct { id: []const u8 = "", result: []const u8 = "", ack: bool = false };
-    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    const b = (req.json(Body) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (b.id.len == 0) return badReq(res, "tool call id required");
     const dir = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_chat/convs/{s}", .{ app.data, u.id, seg });
     const path = try std.fmt.allocPrint(res.arena, "{s}/tool_results.jsonl", .{dir});
@@ -586,7 +592,7 @@ pub fn chatControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     if (seg.len == 0) return notFound(res);
 
     const Body = struct { op: []const u8 = "", text: []const u8 = "" };
-    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    const b = (req.json(Body) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const op = std.mem.trim(u8, b.op, " \r\n\t");
     if (op.len == 0) return badReq(res, "op is required");
 
@@ -938,4 +944,61 @@ test "safeSeg's twin in chat/tools.zig has not drifted from this one" {
         "a" ** 64, "a" ** 65, "tab\there", "semi;colon",
     };
     for (CASES) |c| try std.testing.expectEqualStrings(safeSeg(c), tools_safeSeg(c));
+}
+
+// ---------------------------------------------------------------------------
+// tests — MALFORMED IS THE CALLER'S FAULT, and the status code has to say so. A wrong-typed field is the
+// single most common way a client gets a body wrong, and it used to answer 500: the caller is told the
+// server broke, retries the same broken request because a 5xx reads as transient, and their typo lands in
+// this server's error rate. These pin 400 on the shapes that actually occur, and — the load-bearing half —
+// that a rejected body starts NO TURN. A handler that answered 400 after already spawning work would look
+// correct here and be worse than the bug.
+// ---------------------------------------------------------------------------
+
+test "a malformed message body is 400, not 500, and never starts a turn" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{ .environ = http.testEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var ta = try http.testApp(gpa, io, "zig-chatsvc-badbody-tmp");
+    defer ta.deinit();
+
+    ta.auth.register("bad@body.test", "correct horse battery") catch return error.SkipZigTest;
+    const token = ta.auth.login("bad@body.test", "correct horse battery") catch return error.SkipZigTest;
+    defer gpa.free(token);
+    const cookie = try std.fmt.allocPrint(gpa, http.COOKIE ++ "={s}", .{token});
+    defer gpa.free(cookie);
+
+    // Every one of these is a CLIENT mistake. None is a server fault, so none may be a 5xx.
+    const bad = [_][]const u8{
+        "", // no body at all
+        "not json",
+        "[1,2,3]", // valid JSON, wrong shape
+        "{\"text\":\"hello there, a real message\",\"loop\":\"x\"}", // wrong type, u8 field
+        "{\"text\":\"hello there, a real message\",\"tool_client\":\"x\"}", // wrong type, bool field
+        "{\"text\":\"hello there, a real message\",\"fast\":\"yes\"}", // wrong type, the newest bool field
+        "{\"text\":123}", // wrong type, the required field itself
+        "{\"text\":\"hello there, a real message\"", // truncated mid-object
+    };
+    for (bad) |b| {
+        var web = httpz.testing.init(.{});
+        defer web.deinit();
+        web.header("cookie", cookie);
+        web.param("id", "badbody");
+        if (b.len > 0) web.body(b);
+        try postMessage(&ta.app, web.req, web.res);
+        // 400 specifically. A 501 (backend disabled) would also be "not 500" and would silently hollow
+        // this test out, so assert the exact code rather than a range.
+        if (web.res.status != 400) {
+            std.debug.print("\nmalformed body {s} answered {d}, not 400\n", .{ b, web.res.status });
+            return error.MalformedBodyNot400;
+        }
+    }
+
+    // AND NOTHING RAN. A rejected body must not leave a claimed turn slot behind — if it did, the
+    // conversation would answer 409 "already running" forever after one bad request.
+    switch (chat_engine.beginTurn(io, "badbody", 1)) {
+        .ok => chat_engine.endTurn(io, "badbody"), // free: no turn was ever claimed, which is the point
+        else => return error.MalformedBodyClaimedATurn,
+    }
 }

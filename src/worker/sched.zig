@@ -963,7 +963,7 @@ pub fn createTask(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         prompt_model: []const u8 = "",
         prompt_api_key: []const u8 = "",
     };
-    const b = (try req.json(Body)) orelse return badReq(res, "bad body");
+    const b = (req.json(Body) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     // ONE create path: the same createFromSpec the chat veil's schedule_task tool calls — identical
     // validation, id minting (with the same-second collision suffix), and persisted shape.
     switch (createFromSpec(app, res.arena, u.id, .{

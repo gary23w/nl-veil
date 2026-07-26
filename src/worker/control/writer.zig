@@ -40,7 +40,7 @@ pub fn swarmControl(app: *App, req: *httpz.Request, res: *httpz.Response) !void 
     const id = req.param("id") orelse return badReq(res, "no id");
     const sw = app.sup.get(id) orelse return notFound(res);
     if (sw.uid != u.id) return unauth(res);
-    const body = (try req.json(ControlReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(ControlReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
 
     if (std.mem.eql(u8, body.op, "stop")) {
         app.sup.stop(id);
