@@ -2097,3 +2097,31 @@ edit, confirm it applied, then run.
   skeptic confirmed the order and narrowed the harm to flip-rounds with a green bench. It needs a
   reorder inside the swarm round loop, which I cannot exercise without a live swarm — left for a
   session that can, with the analysis in this ledger.
+
+## 0083 — 2026-07-25 — groundwork for the third finding, and why I did not "fix" it
+- did: the audit's third surviving finding is real — at the round loop's single call site,
+  `buildFitnessBlock`'s `runtime_fail` argument carries the PREVIOUS round's smoke verdict, because
+  `smokeTest` runs AFTER it in the same iteration. The skeptic verified the order, the single writer,
+  and that nothing recomputes the block afterwards, then narrowed the harm honestly: a one-round
+  contradiction at each FLIP of the smoke verdict, and only when the bench is otherwise green (a real
+  failure list always wins over the folded note).
+- did NOT apply the proposed fix (hoist `smokeTest` above `runBenchmark`). Reason, stated plainly:
+  it reorders a live swarm round loop that NO test in this repo exercises, and I could not rule out
+  the obvious hazard by reading — if the benchmark path installs dependencies or otherwise prepares
+  the tree that the smoke harness boots, running smoke first would produce a FALSE RED every round,
+  which is far worse than a one-round stale note. "No green, no done" has to mean something when the
+  green available does not cover the thing being changed.
+- did instead, and it is not a consolation prize: `buildFitnessBlock` had ZERO tests, and it is the
+  line every mind optimises — what it says IS the swarm's objective function. Now pinned: a green
+  bench with a red gate never reads "all green" and names the gate; a green bench with a green gate
+  reads all-green and invents no phantom failure; and REAL bench failures take precedence over the
+  folded note, so a mind sees the checks that actually failed. Counterfactual (injection printed):
+  dropping the fold-in fails the first assertion.
+- learned: an audit finding has two separable parts — is it REAL, and can I land it VERIFIED. The
+  skeptic settled the first; the second is mine and the answer was no. Splitting them let me take the
+  safe half (contract now pinned, so a future reorder that breaks it fails in the suite instead of in
+  a live cast) and hand over the risky half with the analysis attached, rather than either shipping an
+  unverifiable reorder or dropping a confirmed defect on the floor.
+- verified: src suite exit 0; counterfactual fails the named test. Full oracle green.
+- next (verified): the hoist itself, for a session that can run a live swarm. The test added here pins
+  the shape the fold-in must keep, so the reorder can be checked against something.
