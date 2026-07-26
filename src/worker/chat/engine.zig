@@ -362,11 +362,21 @@ const TURN_TOOLS_FULL = TURN_TOOLS ++ ",\n" ++ EXTRA_TOOLS;
 /// mcp_discover, mcp_call, stage_file, get_credential, run_python, run_tests — ~8 KB of schema that was being
 /// advertised to every non-admin and re-sent on every inference of their turn, inviting calls that could only
 /// come back as a refusal. pixel_search outlives its two PIXEL_SCHEMA neighbours because it is sandbox-safe
-/// (local retrieval over the caller's own attachments); the removal is per-tool, not per-block. ORCH_TOOLS is
-/// deliberately NOT filtered — orchTool dispatches the orchestration verbs BEFORE the sandbox gate, so they do
-/// run for a sandboxed caller and dropping them would remove working capability.
+/// (local retrieval over the caller's own attachments); the removal is per-tool, not per-block.
+///
+/// ORCH_TOOLS goes through the SAME filter. This line used to say it deliberately did not, on the grounds
+/// that "orchTool dispatches the orchestration verbs BEFORE the sandbox gate, so they do run for a
+/// sandboxed caller and dropping them would remove working capability". That argues against dropping the
+/// block WHOLESALE — which is not what sandboxSchema does. It is allowlist-derived and per-tool, and
+/// SANDBOX_TOOLS already carries the three orchestration verbs that genuinely work for a sandboxed caller
+/// (tools.zig: "read-only swarm observation" — swarm_status, swarm_asks, stop_swarm). The other nine are
+/// refused by orchTool's own FIRST statement, before any dispatch (cast, steer_swarm, answer_swarm,
+/// sync_dir, open_subchat, schedule_*), so advertising them did precisely what the paragraph above
+/// condemns: invited calls that could only come back as a refusal — and each one costs a whole agentic
+/// round-trip, not just the schema bytes. Filtering keeps every verb that works and drops only those that
+/// cannot. (Ledger 0081.)
 const TURN_TOOLS_SANDBOXED = blk: {
-    var out: []const u8 = tools.sandboxSchema(tools.CHAT_SCHEMA) ++ "," ++ ORCH_TOOLS;
+    var out: []const u8 = tools.sandboxSchema(tools.CHAT_SCHEMA) ++ "," ++ tools.sandboxSchema(ORCH_TOOLS);
     const extra = tools.sandboxSchema(EXTRA_TOOLS);
     if (extra.len > 0) out = out ++ ",\n" ++ extra; // empty ⇒ no trailing comma into the tools array
     break :blk out;
@@ -543,11 +553,31 @@ test "turn tools: both caps variants are valid JSON arrays, and the sandboxed on
         // OpenAI tool shape: {"type":"function","function":{"name":…}} — the name is nested, which is also why
         // sandboxSchema scans for the `"name":"` key rather than assuming a top-level field.
         const name = def.object.get("function").?.object.get("name").?.string;
-        // ORCH_TOOLS rides along unfiltered on purpose: orchTool dispatches those verbs BEFORE the sandbox
-        // gate, so they genuinely run for a sandboxed caller (see the note on TURN_TOOLS_SANDBOXED).
-        if (std.mem.indexOf(u8, ORCH_TOOLS, name) != null) continue;
+        // NO EXEMPTION. This loop used to `continue` past every ORCH_TOOLS name, because the block rode
+        // along unfiltered — which meant the test could not see the nine orchestration verbs that
+        // orchTool refuses outright for a sandboxed caller. Now that ORCH_TOOLS goes through the same
+        // allowlist filter, EVERY name in the sandboxed array must be one the gate actually permits, and
+        // the exemption that hid the gap is gone (0081).
         try std.testing.expect(tools.sandboxAllowed(name));
     }
+    // The three orchestration verbs that DO work for a sandboxed caller survive the filter — the point is
+    // to drop the refused ones, not the block. SANDBOX_TOOLS calls these "read-only swarm observation".
+    for ([_][]const u8{ "swarm_status", "swarm_asks", "stop_swarm" }) |keep| {
+        if (std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, keep) == null) {
+            std.debug.print("\nsandboxed turn tools lost '{s}' — the filter is dropping working capability, which is what the old exemption feared\n", .{keep});
+            return error.SandboxDroppedWorkingVerb;
+        }
+    }
+    // ...and the escalating ones are gone. Each of these was advertised to a sandboxed model that would be
+    // refused by orchTool before dispatch, burning an agentic round-trip per attempt.
+    for ([_][]const u8{ "\"cast\"", "\"steer_swarm\"", "\"answer_swarm\"", "\"sync_dir\"", "\"open_subchat\"", "\"schedule_task\"" }) |gone| {
+        if (std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, gone) != null) {
+            std.debug.print("\nsandboxed turn tools still advertise {s} — orchTool refuses it before dispatch, so every call is a wasted round-trip\n", .{gone});
+            return error.SandboxAdvertisesRefusedVerb;
+        }
+    }
+    // Still present for an ADMIN turn: the filter must not have removed them from the full variant.
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_FULL, "\"cast\"") != null);
     // pixel_search is the reason the removal is per-tool rather than per-block — it is sandbox-safe while both
     // of its PIXEL_SCHEMA neighbours are not.
     try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_SANDBOXED, "\"pixel_search\"") != null);
