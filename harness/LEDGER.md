@@ -2028,3 +2028,36 @@ edit, confirm it applied, then run.
   outside it.
 - next (verified): the per-label numbers are only as useful as the data behind them, which needs real
   usage the owner has and I do not.
+
+## 0081 — 2026-07-25 — a sandboxed chat advertised nine tools it would always be refused
+- did: ran a 15-agent audit (5 subsystem surveys → an independent skeptic per finding, briefed that
+  this codebase is unusually well-guarded and to FIND THE GUARD). 10 candidates, **7 refuted** — by
+  an existing test, a documented deliberate exclusion, a guard the claimant missed, or a premise that
+  was simply false about the code. That ratio is the useful output of the shape: the refuters earned
+  their tokens by deleting plausible work, and it matches my own 4-false-findings record this sitting.
+- FIX (survived, verified myself before touching anything): `TURN_TOOLS_SANDBOXED` filtered
+  CHAT_SCHEMA and EXTRA_TOOLS through `tools.sandboxSchema` but concatenated **ORCH_TOOLS raw**.
+  `orchTool`'s FIRST statement — before any dispatch — refuses nine of its twelve verbs for a
+  sandboxed caller (cast, steer_swarm, answer_swarm, sync_dir, open_subchat, schedule_*). So every
+  non-admin turn advertised nine tools whose only possible outcome was a refusal: the exact harm the
+  paragraph directly above that line condemns for the browser/pixel verbs it does filter.
+- the reason it survived so long is the interesting part. The header said ORCH_TOOLS is "deliberately
+  NOT filtered ... dropping them would remove working capability" — a correct argument about dropping
+  the block WHOLESALE, and simply not about `sandboxSchema`, which is allowlist-derived and PER-TOOL.
+  SANDBOX_TOOLS already lists the three verbs that genuinely work ("read-only swarm observation":
+  swarm_status, swarm_asks, stop_swarm), so the filter keeps exactly those and drops the nine. A true
+  sentence guarding the wrong operation — which reads as a decision and stops the next reader cold.
+- cost, measured not estimated: 8,099 bytes (~2,024 tokens) of schema leaves every sandboxed turn's
+  tools array, keeping 1,051 bytes of working verbs. The bytes are the smaller half — the skeptic
+  correctly noted the tools array is prefix-cached, so the real saving is the AGENTIC ROUND-TRIPS a
+  model spends calling a tool that can only answer "not available in this workspace".
+- ratchet, and the part I'd keep: the existing test had to `continue` past every ORCH_TOOLS name
+  ("rides along unfiltered on purpose"), which is exactly why it never saw this. That exemption is
+  GONE — every name in the sandboxed array must now be `sandboxAllowed` — plus explicit assertions
+  that the three observation verbs survive and the escalating ones do not. An exemption written to
+  accommodate a design is a blind spot the moment the design is wrong.
+- verified: src suite exit 0; counterfactual (injection printed) reverting the filter fails the named
+  test. Full oracle green.
+- next (verified): two more findings survived refutation and are NOT yet done — schedLearn's unbounded
+  lesson prompt (engine.zig:2073) and the fitness block's one-round smoke skew (run.zig:1424). Both
+  carry the skeptic's corrected magnitude; see 0082.

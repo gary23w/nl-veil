@@ -87,6 +87,18 @@ before you optimise anything.
 Price the alternative in the same test. "1 spawn" means nothing on its own — measuring that the
 loop it replaced costs N, right beside it, is what makes the number a claim instead of a constant.
 
+## Two derivations of one source must reconcile
+
+When code folds the same input two ways — per model and per label, per user and per tenant, a total
+and its parts — assert the two agree. `foldMetricsJsonl` builds both views from one row set, so
+`sum(models.tin) == sum(roles.tin)`; if they diverge, one fold is silently dropping rows and every
+percentage computed from it is wrong (0080). No single-view test can catch that: each view looks
+entirely self-consistent while disagreeing with the other.
+
+The general form: a derived number is only as trustworthy as the thing it can be checked against.
+Prefer an assertion that relates two independently-computed values over one that restates a
+constant — the second passes forever, including when the code is wrong.
+
 A count is not the only exact measure. Two more, both used by `engine.zig`'s `buildTurnTools` test:
 
 - **Pointer identity = zero allocation.** The no-grants path promises it returns the static tools
