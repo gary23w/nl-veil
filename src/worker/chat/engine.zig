@@ -151,6 +151,81 @@ const PLAN_PROMPT =
     "\"hive|research|inline\",\"done_when\":\"…\",\"tool_hint\":\"…\"}, …]}. If the request is a simple question, " ++
     "a greeting, or a single trivial step that needs no plan, reply exactly {\"plan\":[]}.";
 
+// ---------------------------------------------------------------------------------------- RECON BEFORE PLAN
+//
+// THE PROBLEM. PLAN_PROMPT decomposes the user's WORDS. Nothing has run yet, so the subtask list, the routes
+// and every `done_when` are written against an IMAGINED project — and the board is DURABLE, so a
+// decomposition built on a wrong picture is what every later "continue" resumes. The failure is quiet: the
+// plan reads as perfectly reasonable, it just describes a different codebase than the one on disk.
+//
+// THE FIX. Look, then plan. Two rungs, cheapest first:
+//   Rung 1 (FREE) — the engine already surveys the workdir into the file ledger. That block now goes into the
+//     plan prompt; until now it reached only the chat inference, which made the planner the one participant
+//     in the turn that could not see what already existed.
+//   Rung 2 (one inference + up to RECON_MAX_PROBES read-only tool calls) — the model names what it needs to
+//     FIND OUT, the engine runs those probes, and the findings enter the plan prompt as evidence.
+//
+// WHY THIS IS AFFORDABLE. It fires only when shouldPlan has already committed to a decomposition round trip,
+// so ordinary Q&A latency is untouched. And the probe list is enforced against RECON_TOOLS BY THE ENGINE, not
+// by the prompt: a model that asks for write_file or run_python has it dropped, because a recon pass must not
+// be able to change the thing it exists to observe.
+const RECON_MAX_PROBES: usize = 3;
+
+/// Read-only, checked here rather than trusted from the prompt. Nothing that writes, executes, spawns or
+/// spends is on this list, by construction.
+const RECON_TOOLS = [_][]const u8{ "list_dir", "read_file", "read_doc", "recall_hive", "recall", "web_search", "read_url" };
+
+/// Bound on the evidence block handed to the planner. Big enough for a directory listing plus a couple of file
+/// heads; small enough that it cannot crowd out the request it is supposed to inform.
+const RECON_BLOCK_MAX: usize = 4000;
+
+const RECON_SYSTEM =
+    "You are about to plan a task, but you have not looked at anything yet. Before planning, name the few " ++
+    "things you most need to FIND OUT: what the working directory already contains, what a key file actually " ++
+    "says, what this project already is, an unfamiliar API you are about to build against. Prefer looking at " ++
+    "what already exists over searching the web. You are gathering evidence, not doing the work.";
+
+const RECON_QUESTION =
+    "List at most 3 read-only probes to run first. Reply with ONLY compact JSON: " ++
+    "{\"probes\":[{\"tool\":\"list_dir|read_file|read_doc|recall_hive|recall|web_search|read_url\",\"args\":{…}}, …]} " ++
+    "— args are that tool's own arguments (list_dir {\"path\":\".\"}, read_file {\"path\":\"…\"}, " ++
+    "recall_hive {\"query\":\"…\"}, web_search {\"query\":\"…\"}, read_url {\"url\":\"…\"}). " ++
+    "If the request needs no looking — it is self-contained, or purely conversational — reply exactly {\"probes\":[]}.";
+
+// ------------------------------------------------------------------------------------ MID-TURN COURSE CHECK
+//
+// THE PROBLEM. This turn's one evaluative faculty (the post-answer critique below) runs AFTER the user already
+// has the answer, is gated to the FIRST step of the turn, and is append-only by design. So on drive step 7 of
+// 30 — mid-build, precisely where a wrong approach compounds into more work — nothing is watching. The drive
+// picker chooses the next step, but it is a CONTINUATION writer: its question is "what next", never "is this
+// still right".
+//
+// THE FIX. Between the picker naming a step and that step being committed, one bounded reviewer reads the
+// goal, the acceptance contract and the recent tail, and either abstains or REPLACES the next step with a
+// correction. It changes only what has not happened yet — the same safety property the post-answer critique
+// has, moved to where it can still alter the outcome.
+//
+// ABSTAIN IS THE DESIGNED COMMON CASE, exactly as for the post-answer critique. A reviewer that always finds
+// something is a reviewer that is inventing, and it would drag every drive step sideways in the name of
+// improving it. Silence is the correct output for a loop that is working.
+const COURSE_ABSTAIN = "OK";
+const COURSE_MIN: usize = 40;
+
+const COURSE_SYSTEM =
+    "You are reviewing an autonomous work loop MID-TASK, between steps. You can see the goal, what counts as " ++
+    "done, and the recent work. Judge ONE thing: is the next step about to be taken the right move toward the " ++
+    "goal? Answer with the single word OK unless something is genuinely wrong — the work has drifted off the " ++
+    "goal, it is solving a problem it invented rather than the one that was asked, it is about to build on " ++
+    "something already known to be broken, it is repeating an approach that already failed, or it is about to " ++
+    "claim progress the evidence does not support. Being able to imagine a marginally better step is NOT a " ++
+    "reason to intervene. Do not call tools. Do not explain yourself.";
+
+const COURSE_QUESTION_HEAD = "The next step is about to be:\n";
+const COURSE_QUESTION_TAIL =
+    "\n\nReply with exactly OK if that step should proceed. Otherwise reply with ONLY the corrected " ++
+    "instruction — 2 to 4 sentences, addressed to the worker as a command, naming the concrete thing that is " ++
+    "wrong and what to do instead.";
+
 const REFLECT_MIN: usize = 240;
 /// The reply that means "nothing worth saying", and the shortest note that is worth appending. ABSTAIN IS THE
 /// DESIGNED COMMON CASE: an always-on footer is noise the user learns to skip past, and it bills output tokens on
@@ -1305,7 +1380,25 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // tasks still plan + coordinate; chat stays fast. This persistPlan only overwrites a completed/absent plan,
         // so no in-progress work is lost.
         if (shouldPlan(user_text)) {
-            const fresh = planTask(app, llm_dir, think.base_url, think.key, think.model, user_text, &brief);
+            // LOOK BEFORE PLANNING. Rung 1 is free — the workdir survey the engine already holds, which until
+            // now reached only the chat inference. Rung 2 spends one inference plus up to three READ-ONLY
+            // probes so the decomposition is written against the project that exists. Both degrade to nothing:
+            // no ledger and no probes just means planning from the request, exactly as before.
+            var ground: std.ArrayListUnmanaged(u8) = .empty;
+            defer ground.deinit(gpa);
+            ledgerBlock(gpa, &file_ledger, &ground);
+            const evidence = if (envDisabled(environ, "NL_CHAT_RECON"))
+                null
+            else
+                reconFindings(app, llm_dir, think, &ctx, user_text, ground.items);
+            defer if (evidence) |e| gpa.free(e);
+
+            var ev: std.ArrayListUnmanaged(u8) = .empty;
+            defer ev.deinit(gpa);
+            if (ground.items.len > 0) ev.appendSlice(gpa, ground.items) catch {};
+            if (evidence) |e| ev.appendSlice(gpa, e) catch {};
+
+            const fresh = planTask(app, llm_dir, think.base_url, think.key, think.model, user_text, ev.items, &brief);
             if (fresh.len > 0) {
                 persistPlan(app, conv_dir, fresh);
                 persistBrief(app, conv_dir, brief);
@@ -1411,6 +1504,10 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // free-form turn drives DRIVE_MAX off, LOOP_MAX_STEPS armed-on, effectively-unbounded in afk (Stop is the exit).
     const armed = loop >= LOOP_ON;
     const afk = loop >= LOOP_AFK;
+    // MID-TURN COURSE CHECK, on for the runs where drift is expensive: an armed loop (up to 30 steps, or
+    // unbounded in afk) or a plan walking its board. A plain 6-step turn is short enough that the user is
+    // still watching and is the correction, so it does not pay for a reviewer. NL_CHAT_COURSE=0 disables.
+    const course_on = (armed or has_plan) and !envDisabled(environ, "NL_CHAT_COURSE");
     // afk OUTRANKS the plan cap: an afk turn whose message decomposed into a plan must still run until Stop (it
     // walks the plan, then keeps driving free-form) — not halt at PLAN_STEPS_PER_TURN, which would violate afk.
     var max_steps: usize = if (afk) AFK_MAX_STEPS else if (has_plan) PLAN_STEPS_PER_TURN else if (armed) LOOP_MAX_STEPS else DRIVE_MAX;
@@ -1792,6 +1889,9 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // template. Freed at the end of the iteration, which is past every use of next_step below.
         var stuck_written: []u8 = &[_]u8{};
         defer if (stuck_written.len > 0) gpa.free(stuck_written);
+        // Same lifetime discipline for a mid-turn course correction (see the check below the DONE/repeat block).
+        var course_written: ?[]u8 = null;
+        defer if (course_written) |c| gpa.free(c);
         if (is_done) {
             // files_written counts only SERVER-executed writes; delegated client-mode writes register in the
             // ledger (parsed from their result strings). Without the ledger arm, a desk-client build accepted
@@ -1849,6 +1949,23 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
                 } else break :outer;
             } else {
                 break :outer; // off: a no-progress repeat ends the loop
+            }
+        }
+        // MID-TURN COURSE CHECK: the last moment a wrong direction is still cheap. The step is chosen but not
+        // yet committed, so a correction here costs one inference; the same realisation ten steps later costs
+        // everything built on top of it.
+        //
+        // DELIBERATELY NOT RUN ON THE ENGINE'S OWN STEERING. verify_prompt, afk_msg, the stuck instruction and
+        // the swarm messages are the engine asserting policy, not the model choosing a direction — reviewing
+        // them would let a model argue its way out of the terminal build-verify, which is the one check that
+        // exists precisely because models talk themselves past it.
+        if (course_on and !is_done and !is_repeat and next_step.ptr == trimmed.ptr) {
+            if (courseCheck(app, llm_dir, think, user_text, &brief, next_step, conv_buf.items)) |corrected| {
+                course_written = corrected;
+                next_step = corrected;
+                // The user SEES the redirect. A silent correction is the worst version of this feature: the
+                // loop would change direction for reasons nobody watching could reconstruct.
+                emitKV(app, conv_dir, "status", "text", "course-correcting");
             }
         }
         // FINE-NEEDLE WEAVE: every synthetic drive step re-enters with the engine's file ledger + per-step
@@ -3369,10 +3486,170 @@ fn shouldPlan(user_text: []const u8) bool {
     return false; // ambiguous / conversational → fast direct answer (no decomposition round-trip)
 }
 
+/// RECON pass (see RECON_SYSTEM): ask what needs finding out, run those read-only probes, and return a bounded
+/// evidence block for the planner — or null when the model wanted nothing (the designed answer for a
+/// self-contained request). gpa-owned.
+///
+/// The whitelist check is the load-bearing line. `tools.execute` is the full tool surface, so a probe list
+/// taken at face value would let a PLANNING pass write files and run code before the user has seen a plan.
+///
+/// KNOWN LIMIT: probes run SERVER-side (tools.execute) even on a client-delegated turn, which the main loop
+/// would route through delegateTool. For the desk that is the same machine and the same workdir, so
+/// list_dir/read_file answer identically; for a hosted server with a remote client they would describe the
+/// server's tree, not the user's. Delegating recon would put a client round trip ahead of time-to-first-token
+/// on every planned turn — deliberately not paid until a remote-client case actually needs it.
+fn reconFindings(app: *App, run_root: []const u8, p: Provider, ctx: *tools.ToolCtx, user_text: []const u8, ground: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, RECON_SYSTEM) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"user\",\"content\":") catch return null;
+    var uc: std.ArrayListUnmanaged(u8) = .empty;
+    defer uc.deinit(gpa);
+    uc.appendSlice(gpa, "USER REQUEST:\n") catch return null;
+    uc.appendSlice(gpa, clipBytes(user_text, 6000)) catch return null;
+    if (ground.len > 0) {
+        uc.appendSlice(gpa, "\n\n") catch return null;
+        uc.appendSlice(gpa, ground) catch return null;
+    }
+    uc.appendSlice(gpa, "\n\n") catch return null;
+    uc.appendSlice(gpa, RECON_QUESTION) catch return null;
+    http.jstr(gpa, &msgs, uc.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+
+    const cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, run_root, "recon", p.base_url, p.key, p.model, msgs.items, "", 512, 0.2);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "recon", .thinking, p.model, step.ok);
+    if (!step.ok) return null;
+
+    const obj = extractJsonObject(step.content);
+    const P = struct {
+        probes: []const struct {
+            tool: []const u8 = "",
+            args: std.json.Value = .null,
+        } = &.{},
+    };
+    const parsed = std.json.parseFromSlice(P, gpa, obj, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    if (parsed.value.probes.len == 0) return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var ran: usize = 0;
+    for (parsed.value.probes) |pr| {
+        if (ran >= RECON_MAX_PROBES or out.items.len > RECON_BLOCK_MAX) break;
+        var allowed = false;
+        for (RECON_TOOLS) |t| {
+            if (std.mem.eql(u8, t, pr.tool)) {
+                allowed = true;
+                break;
+            }
+        }
+        // Silently dropped, not failed: a model naming write_file here is a formatting miss, and the recon
+        // pass degrading to fewer probes is strictly better than aborting a turn over it. The whitelist is
+        // the security property; that it is enforced at all is what matters, not that anyone is told.
+        if (!allowed) continue;
+        const args = std.json.Stringify.valueAlloc(gpa, pr.args, .{}) catch continue;
+        defer gpa.free(args);
+        const res = tools.execute(ctx, pr.tool, if (std.mem.eql(u8, args, "null")) "{}" else args);
+        defer gpa.free(res);
+        if (ran == 0) out.appendSlice(gpa, "\n\nWHAT YOU FOUND WHEN YOU LOOKED (evidence — plan from THIS, not from assumption):") catch break;
+        const seg = std.fmt.allocPrint(gpa, "\n\n$ {s} {s}\n{s}", .{ pr.tool, clipBytes(args, 200), clipBytes(res, 1200) }) catch break;
+        defer gpa.free(seg);
+        out.appendSlice(gpa, seg) catch break;
+        ran += 1;
+    }
+    if (ran == 0) {
+        out.deinit(gpa);
+        return null;
+    }
+    return out.toOwnedSlice(gpa) catch null;
+}
+
+/// MID-TURN COURSE CHECK (see COURSE_SYSTEM). Returns a replacement instruction when the next step is going
+/// the wrong way, or null to let it proceed — null being the overwhelmingly common answer. gpa-owned.
+///
+/// It never sees the tools and never runs one: this is a judgement about direction, and a reviewer that could
+/// act would just become a second worker racing the first.
+fn courseCheck(app: *App, run_root: []const u8, p: Provider, goal: []const u8, brief: *const cplan.Brief, next_step: []const u8, conv_items: []const u8) ?[]u8 {
+    const gpa = app.gpa;
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return null;
+    http.jstr(gpa, &msgs, COURSE_SYSTEM) catch return null;
+    msgs.appendSlice(gpa, "},{\"role\":\"system\",\"content\":") catch return null;
+
+    // The goal and the acceptance contract, so "drifted off the goal" is checkable rather than a vibe.
+    var gl: std.ArrayListUnmanaged(u8) = .empty;
+    defer gl.deinit(gpa);
+    gl.appendSlice(gpa, "THE GOAL: ") catch return null;
+    gl.appendSlice(gpa, clipBytes(goal, 1400)) catch return null;
+    if (!brief.isEmpty()) {
+        gl.appendSlice(gpa, "\nDONE MEANS:") catch return null;
+        for (brief.done_when) |c| {
+            if (gl.items.len > 2600) break;
+            gl.appendSlice(gpa, "\n- ") catch break;
+            gl.appendSlice(gpa, clipBytes(c, 300)) catch break;
+        }
+    }
+    http.jstr(gpa, &msgs, gl.items) catch return null;
+    msgs.appendSlice(gpa, "},") catch return null;
+    msgs.appendSlice(gpa, msgTail(conv_items, LOOP_CTX_BYTES)) catch return null;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":") catch return null;
+    var q: std.ArrayListUnmanaged(u8) = .empty;
+    defer q.deinit(gpa);
+    q.appendSlice(gpa, COURSE_QUESTION_HEAD) catch return null;
+    q.appendSlice(gpa, clipBytes(next_step, 1200)) catch return null;
+    q.appendSlice(gpa, COURSE_QUESTION_TAIL) catch return null;
+    http.jstr(gpa, &msgs, q.items) catch return null;
+    msgs.append(gpa, '}') catch return null;
+
+    const cm = meterBegin(app.io);
+    var step = llm.complete(gpa, app.io, run_root, "course", p.base_url, p.key, p.model, msgs.items, "", 384, 0.2);
+    defer step.deinit(gpa);
+    meterEnd(app, cm, "course", .thinking, p.model, step.ok);
+    if (!step.ok) return null;
+
+    const verdict = courseVerdict(step.content) orelse return null;
+    return gpa.dupe(u8, verdict) catch null;
+}
+
+/// Does this reviewer reply actually redirect the loop? Pure, so the ABSTAIN DISCIPLINE is testable without a
+/// model — and it is the property worth pinning: every ambiguous reply must read as silence, because the cost
+/// of a false correction (a working loop dragged sideways) is paid on every step, while the cost of a missed
+/// one is just the status quo. Returns a slice INTO `content`, or null for "let the step proceed".
+fn courseVerdict(content: []const u8) ?[]const u8 {
+    // DECORATION only — quotes, backticks, asterisks, whitespace. Sentence punctuation is deliberately NOT
+    // trimmed here: a correction is handed to the worker verbatim as its next instruction, and silently
+    // eating the final period is the sort of quiet mangling that turns a reviewed sentence into a truncated
+    // one. The abstain check below does its own stricter trim instead.
+    const t = std.mem.trim(u8, content, " \r\n\t`*\"'");
+    // Abstain, in every shape a model writes it: "OK", "ok.", "OK!".
+    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " .!"), COURSE_ABSTAIN)) return null;
+    // Too short to name a concrete thing to do instead — the vague nudge ("try something else"), which is
+    // worse than silence because it swaps a specific next step for an unspecific one.
+    if (t.len < COURSE_MIN) return null;
+    // A HEDGED abstain — "OK, but you could also…" — is silence too. The reviewer was asked for exactly OK or
+    // exactly a correction; a reply that opens by approving the step has approved it, and letting the trailing
+    // suggestion through is how a loop gets nudged off a working path by a reviewer that had no objection.
+    if (t.len > COURSE_ABSTAIN.len and std.ascii.startsWithIgnoreCase(t, COURSE_ABSTAIN)) {
+        const after = t[COURSE_ABSTAIN.len];
+        if (after == ',' or after == ' ' or after == '-' or after == ';' or after == ':') return null;
+    }
+    if (cctx.looksLikeToolMarkup(t)) return null; // a reviewer that tried to ACT — discard, never execute
+    return t;
+}
+
 /// DECOMPOSITION inference: ask the model to break the request into routed subtasks. Returns owned tasks (empty =
 /// no plan needed → a normal single-step turn) and fills `out_brief` with the turn's acceptance contract (empty
 /// when the model omitted it). No tools; deterministic (low temp). Any failure → empty tasks + empty brief.
-fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, out_brief: *cplan.Brief) []cplan.Task {
+///
+/// `evidence` is what recon actually saw (empty when it looked at nothing). It goes in BEFORE the instruction
+/// so the decomposition is written against the real project rather than an imagined one — the whole point of
+/// the recon rung above.
+fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const u8, model: []const u8, user_text: []const u8, evidence: []const u8, out_brief: *cplan.Brief) []cplan.Task {
     const gpa = app.gpa;
     const empty: []cplan.Task = &.{};
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
@@ -3384,6 +3661,7 @@ fn planTask(app: *App, run_root: []const u8, base_url: []const u8, key: []const 
     defer uc.deinit(gpa);
     uc.appendSlice(gpa, "USER REQUEST:\n") catch return empty;
     uc.appendSlice(gpa, clipBytes(user_text, 8000)) catch return empty;
+    if (evidence.len > 0) uc.appendSlice(gpa, clipBytes(evidence, RECON_BLOCK_MAX)) catch return empty;
     uc.appendSlice(gpa, "\n\n") catch return empty;
     uc.appendSlice(gpa, PLAN_PROMPT) catch return empty;
     http.jstr(gpa, &msgs, uc.items) catch return empty;
@@ -4808,6 +5086,14 @@ fn scanToolChannel(app: *App, conv_dir: []const u8, id: []const u8, cursor: *usi
 ///
 /// Raising this also buys the time to spend it, at no extra cost: llm.callTimeoutS derives each call's
 /// wall-clock deadline from the budget it asked for, so the deadline widens with the request.
+/// An operator kill switch that DEFAULTS ON: only an explicit "0"/"false" turns the feature off. An unset
+/// variable must never read as disabled — that is how a reasoning upgrade silently fails to ship.
+fn envDisabled(environ: *const std.process.Environ.Map, name: []const u8) bool {
+    const v = environ.get(name) orelse return false;
+    const t = std.mem.trim(u8, v, " \t\r\n");
+    return std.mem.eql(u8, t, "0") or std.ascii.eqlIgnoreCase(t, "false");
+}
+
 fn turnTokenBudget(environ: *const std.process.Environ.Map, base_url: []const u8, model: []const u8) u32 {
     if (environ.get("NL_MAX_TOKENS")) |mts| {
         if (std.fmt.parseInt(u32, std.mem.trim(u8, mts, " \t\r\n"), 10)) |v| return std.math.clamp(v, 256, 32768) else |_| {}
@@ -6612,4 +6898,97 @@ test "the chat turn's output budget follows the model's window, not a constant" 
     try t.expectEqual(@as(u32, 256), turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
     try env.put("NL_MAX_TOKENS", "not a number"); // garbage falls back to the derived budget, never to zero
     try t.expectEqual(wide, turnTokenBudget(&env, HOSTED, "deepseek-v4-pro"));
+}
+
+// ---------------------------------------------------------------------------
+// tests — the two REASONING upgrades (recon-before-plan, mid-turn course check). Both add a model call, and
+// a model call cannot be asserted here; what CAN be asserted is the part that must hold no matter what the
+// model says. For recon that is the whitelist — a planning pass must not be able to change the project it
+// exists to observe. For the course check it is the abstain discipline — silence must be the default, because
+// a false correction is paid on every step of a working loop while a missed one merely leaves things as they
+// were. Both features also default ON, and an unset kill switch reading as "off" would ship nothing at all.
+// ---------------------------------------------------------------------------
+
+test "recon can only LOOK: no probe on the whitelist can change anything" {
+    const t = std.testing;
+    // The engine hands each probe straight to tools.execute, which is the FULL tool surface. So the
+    // whitelist is the only thing standing between "plan this task" and a planning pass writing files
+    // before the user has even seen a plan. Every one of these must be absent.
+    const mutating = [_][]const u8{
+        "write_file",    "edit_file",   "delete_file", "run_python",   "run_tests",
+        "host_command",  "make_tool",   "patch_system", "cast",        "stop_swarm",
+        "browser_click", "browser_type", "browser_navigate", "observe", "share",
+        "get_credential", "stage_delivery", "propose_change", "open_subchat", "send_message",
+    };
+    for (RECON_TOOLS) |probe| {
+        for (mutating) |bad| {
+            if (std.mem.eql(u8, probe, bad)) {
+                std.debug.print("\nRECON_TOOLS contains the mutating tool '{s}'\n", .{probe});
+                return error.ReconToolMutates;
+            }
+        }
+    }
+    // And the list is non-empty in the first place — an empty whitelist would silently disable the feature
+    // while every test above still passed.
+    try t.expect(RECON_TOOLS.len > 0);
+    try t.expect(RECON_MAX_PROBES > 0 and RECON_MAX_PROBES <= 5); // bounded: recon is a look, not the work
+}
+
+test "course check: silence is the default, and only a concrete correction redirects the loop" {
+    const t = std.testing;
+
+    // ABSTAIN, in every shape a model actually produces it.
+    try t.expect(courseVerdict("OK") == null);
+    try t.expect(courseVerdict("ok") == null);
+    try t.expect(courseVerdict("  OK.  ") == null);
+    try t.expect(courseVerdict("`OK`") == null);
+    try t.expect(courseVerdict("\"OK\"") == null);
+    try t.expect(courseVerdict("") == null);
+
+    // A HEDGED abstain is still an abstain. The reviewer approved the step; the trailing musing is exactly
+    // how a working loop gets dragged sideways by a reviewer that had no actual objection.
+    try t.expect(courseVerdict("OK, though you could also consider refactoring the parser while you are here") == null);
+    try t.expect(courseVerdict("OK - but it might be nicer to extract that into its own helper function first") == null);
+
+    // TOO SHORT to act on. "Try something else" names nothing, and swapping a concrete next step for a vague
+    // one makes the loop strictly worse.
+    try t.expect(courseVerdict("try something else") == null);
+    try t.expect(courseVerdict("wrong approach") == null);
+
+    // A reviewer that tried to ACT gets discarded rather than executed — it was told not to call tools, and
+    // its markup must never reach the worker as an instruction.
+    try t.expect(courseVerdict("<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"x\"}}</tool_call> and then fix the parser properly") == null);
+
+    // A REAL correction survives, trimmed, and comes back as a slice of the input.
+    const real = "You are about to write tests for the old ref-based click path, but that path was replaced two steps ago. Read session.zig first, then test the coordinate path instead.";
+    const got = courseVerdict(real) orelse return error.CorrectionSwallowed;
+    try t.expectEqualStrings(real, got);
+    // Decoration around a real correction does not disqualify it.
+    const decorated = try std.fmt.allocPrint(t.allocator, "  \"{s}\"  ", .{real});
+    defer t.allocator.free(decorated);
+    const got2 = courseVerdict(decorated) orelse return error.CorrectionSwallowed;
+    try t.expectEqualStrings(real, got2);
+}
+
+test "both upgrades default ON: only an explicit 0/false disables them" {
+    const t = std.testing;
+    var env = std.process.Environ.Map.init(t.allocator);
+    defer env.deinit();
+
+    // UNSET is the state on every machine that has not been told otherwise. If this read as disabled, the
+    // whole feature would ship dark and nobody would know.
+    try t.expect(!envDisabled(&env, "NL_CHAT_RECON"));
+    try t.expect(!envDisabled(&env, "NL_CHAT_COURSE"));
+
+    // The kill switches work, in the spellings an operator actually types.
+    for ([_][]const u8{ "0", "false", "FALSE", " 0 ", "False\n" }) |off| {
+        try env.put("NL_CHAT_RECON", off);
+        try t.expect(envDisabled(&env, "NL_CHAT_RECON"));
+    }
+    // Anything else is ON — including an empty string and a typo'd value. A misconfigured variable must
+    // not silently turn reasoning off; the only way off is to mean it.
+    for ([_][]const u8{ "1", "true", "yes", "", "no", "off" }) |on| {
+        try env.put("NL_CHAT_RECON", on);
+        try t.expect(!envDisabled(&env, "NL_CHAT_RECON"));
+    }
 }
