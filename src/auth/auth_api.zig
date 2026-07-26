@@ -18,7 +18,7 @@ pub fn register(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         res.status = 403;
         return res.json(.{ .ok = false, .err = "registration is closed — neuron-loops is in private beta" }, .{});
     }
-    const body = (try req.json(Creds)) orelse return badReq(res, "missing email/password");
+    const body = (req.json(Creds) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "missing email/password");
     app.auth.register(body.email, body.password) catch |e| return authErr(res, e);
     res.status = 201;
     try res.json(.{ .ok = true }, .{});
@@ -29,7 +29,7 @@ pub fn login(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         res.status = 429;
         return res.json(.{ .ok = false, .err = "too many failed attempts — try again later" }, .{});
     }
-    const body = (try req.json(Creds)) orelse return badReq(res, "missing email/password");
+    const body = (req.json(Creds) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "missing email/password");
     const token = app.auth.login(body.email, body.password) catch |e| {
         app.login_guard.fail(req.address);
         return authErr(res, e);

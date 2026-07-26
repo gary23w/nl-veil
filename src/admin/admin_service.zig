@@ -51,7 +51,7 @@ pub fn adminSetRecipeGrant(app: *App, req: *httpz.Request, res: *httpz.Response)
     const uid = std.fmt.parseInt(u64, uid_s, 10) catch return badReq(res, "uid must be a number");
     const name = req.param("name") orelse return badReq(res, "no recipe name");
     const target = app.auth.userById(uid) orelse return notFound(res);
-    const body = (try req.json(RecipeGrantReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(RecipeGrantReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (body.granted) _ = app.recipes.get(name) orelse return notFound(res);
     _ = app.auth.setToolGrant(target.email, name, body.granted);
     // Record WHO the grant was for — the log could not previously answer "who holds this recipe?", which
@@ -83,7 +83,7 @@ const ServerKeyReq = struct { provider: []const u8, key: []const u8, base_url: [
 /// shared key is the last resort in resolveRole, never an override.
 pub fn adminPutKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
-    const body = (try req.json(ServerKeyReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(ServerKeyReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     app.vault.put(chat_service.SERVER_KEY_UID, body.provider, body.key, body.base_url) catch |e| return badReq(res, switch (e) {
         error.BadProvider => "invalid provider (use a-z0-9-_ , <=32 chars)",
         error.BadKey => "invalid key (1..512 chars, no quotes/backslashes/control chars)",
@@ -159,7 +159,7 @@ fn configJson(sd: server_config.ServerConfig.Defaults) struct {
 /// the only way to go back to "everyone picks their own" and so is deliberately expressible.
 pub fn adminSetConfig(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
-    const body = (try req.json(ConfigReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(ConfigReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     app.cfg.setAll(body.default_model, body.default_base_url, body.think_model, body.think_base_url, body.prompt_model, body.prompt_base_url) catch |e| return switch (e) {
         error.TooLong => badReq(res, "that model id or base URL is too long"),
         error.BadInput => badReq(res, "model id and base URL must not contain quotes or control characters"),
@@ -180,7 +180,7 @@ const NewUserReq = struct { email: []const u8, password: []const u8 };
 /// path with its own rules to drift out of step.
 pub fn adminCreateUser(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
-    const body = (try req.json(NewUserReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(NewUserReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     app.auth.register(body.email, body.password) catch |e| return switch (e) {
         error.EmailTaken => badReq(res, "that email already has an account"),
         error.BadEmail => badReq(res, "that is not a valid email address"),
@@ -249,7 +249,7 @@ pub fn adminUserActivity(app: *App, req: *httpz.Request, res: *httpz.Response) !
 const ModReq = struct { email: []const u8, action: []const u8 };
 pub fn adminModerate(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const admin = requireAdmin(app, req, res) orelse return;
-    const body = (try req.json(ModReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(ModReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (std.ascii.eqlIgnoreCase(body.email, admin.email)) return badReq(res, "cannot moderate your own admin account");
     var ok = false;
     if (std.mem.eql(u8, body.action, "ban")) {

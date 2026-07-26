@@ -12,7 +12,7 @@ const KeyReq = struct { provider: []const u8, key: []const u8, base_url: []const
 
 pub fn putKey(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const body = (try req.json(KeyReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(KeyReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     app.vault.put(u.id, body.provider, body.key, body.base_url) catch |e| return badReq(res, switch (e) {
         error.BadProvider => "invalid provider (use a-z0-9-_ , <=32 chars)",
         error.BadKey => "invalid key (1..512 chars, valid UTF-8, no quotes/backslashes/control chars)",

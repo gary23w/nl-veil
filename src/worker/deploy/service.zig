@@ -93,7 +93,7 @@ fn sendFail(res: *httpz.Response, f: anytype) !void {
 
 pub fn deploy(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const body = (try req.json(DeployReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(DeployReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     // A raw /deploy request never picks its own run_dir — that would be a path-traversal hole. Only the cast
     // path (below) supplies a server-sanitized build dir so a chat cast lands in the chat's conversation folder.
     switch (deploySwarm(app, res.arena, u, body, "")) {
@@ -392,7 +392,7 @@ const RunReq = struct {
 
 pub fn run(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const rq = (try req.json(RunReq)) orelse return badReq(res, "bad body");
+    const rq = (req.json(RunReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     if (std.mem.trim(u8, rq.goal, " \r\n\t").len == 0) return badReq(res, "a goal is required, e.g. {\"goal\":\"build a CLI todo app\"}");
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
     var n: usize = if (rq.minds == 0) 1 else rq.minds;
@@ -502,7 +502,7 @@ fn safeConv(arena: std.mem.Allocator, raw: []const u8) []const u8 {
 
 pub fn cast(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const rq = (try req.json(CastReq)) orelse return badReq(res, "bad body");
+    const rq = (req.json(CastReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     switch (castSwarm(app, res.arena, u, rq)) {
         .ok => |sp| {
             res.status = 201;
@@ -608,7 +608,7 @@ const ResolveReq = struct { provider: []const u8 = "mock", model: []const u8 = "
 
 pub fn resolve(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = requireUser(app, req, res) orelse return;
-    const body = (try req.json(ResolveReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(ResolveReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const e = ent.entitlements(u.plan, app.auth.isAdmin(u));
     const live = app.sup.liveMindsForUser(u.id);
     const active = app.sup.activeSwarmsForUser(u.id);
@@ -911,7 +911,7 @@ const BillingReq = struct { email: []const u8, plan: []const u8 = "", topup: u64
 
 pub fn adminBilling(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     _ = http.requireAdmin(app, req, res) orelse return;
-    const body = (try req.json(BillingReq)) orelse return badReq(res, "bad body");
+    const body = (req.json(BillingReq) catch return badReq(res, "malformed JSON body")) orelse return badReq(res, "bad body");
     const want_plan = body.plan.len > 0;
     const want_topup = body.topup > 0;
     var plan_set = false;
