@@ -2096,11 +2096,23 @@ fn schedLearn(app: *App, ctx: *tools.ToolCtx, mem_scope: []const u8, uid: u64, t
     var sb2: [180]u8 = undefined;
     _ = sched.recordRunOutcome(app, uid, tid, true, std.fmt.bufPrint(&sb2, "ok: {d} file(s) written, {d} observation(s) stored", .{ ctx.files_written.*, ctx.observed.* }) catch "ok");
 
-    const saved = conv_buf.items.len;
-    defer conv_buf.shrinkRetainingCapacity(saved); // the lesson question never rides into durable context
-    conv_buf.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
+    // BOUNDED, like every other auxiliary completion in this file. This one used to append the question to
+    // conv_buf and send the WHOLE buffer — the only aux call here with no msgTail bound — so a run paid a
+    // full uncached prefill of its entire assembled context (system prompt + memory blocks + the working
+    // span, which compaction holds near 32 KB and lets reach 48 KB) to produce ONE sentence capped at 256
+    // tokens. Uncached twice over: the request is toolless, so it cannot reuse the provider's tools-bearing
+    // prefix, and it runs on the THINKING provider while the turn's chat calls run on CODING — there is not
+    // even a same-endpoint prefix to hit. The identical mistake was already fixed on the drive picker (see
+    // the note at the "loop" call) and the shape to copy is summarizeTurn's. A local buffer also retires the
+    // save/shrink pair: the question cannot leak into durable context if it never touches conv_buf.
+    // The tradeoff, the same one summarizeTurn accepts: the lesson sees the run's tail, not its whole arc.
+    // (Ledger 0082.)
+    var msgs: std.ArrayListUnmanaged(u8) = .empty;
+    defer msgs.deinit(gpa);
+    msgs.appendSlice(gpa, msgTail(conv_buf.items, SUMMARY_CTX_BYTES)) catch return;
+    msgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"This scheduled task will run again. In ONE or TWO sentences, state the single most useful lesson from THIS run for the next run — a faster path, a source that worked, a pitfall to skip, or an assumption to keep. Reply with ONLY the lesson.\"}") catch return;
     const lesson_cm = meterBegin(app.io);
-    var next = llm.complete(gpa, app.io, run_root, "lesson", base_url, key, model, conv_buf.items, "", 256, 0.3);
+    var next = llm.complete(gpa, app.io, run_root, "lesson", base_url, key, model, msgs.items, "", 256, 0.3);
     defer next.deinit(gpa);
     meterEnd(app, lesson_cm, "lesson", .thinking, model, next.ok);
     if (!next.ok) return;
@@ -7034,4 +7046,43 @@ test "both upgrades default ON: only an explicit 0/false disables them" {
         try env.put("NL_CHAT_RECON", on);
         try t.expect(!envDisabled(&env, "NL_CHAT_RECON"));
     }
+}
+
+test "every AUXILIARY completion bounds its prompt — only the real turn sends the whole transcript" {
+    // A chat turn fires one streamed `chat` call plus a dozen auxiliary completions (loop, lesson,
+    // recon, course, plan, planrec, summary, arbiter, searchq, stuck, reflect, ctxsum, compact). The
+    // streamed one legitimately carries the whole conversation — that IS the turn. Every auxiliary one
+    // is a small distillation job and must send a BOUNDED slice, because it is billed as fresh prefill:
+    // toolless requests cannot reuse the provider's tools-bearing cached prefix, and several run on the
+    // thinking provider while the turn runs on coding, so there is no same-endpoint prefix either.
+    //
+    // Two have now been fixed for exactly this (the drive picker, then `lesson` in 0082), each found
+    // long after it shipped because nothing said "an aux call may not send conv_buf". This is that rule.
+    const SRC = @embedFile("engine.zig");
+    const needle = "llm" ++ ".complete(";
+    var i: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, SRC, i, needle)) |at| {
+        // The call's arguments run to the end of that source line — long enough to hold the messages arg.
+        const eol = std.mem.indexOfScalarPos(u8, SRC, at, '\n') orelse SRC.len;
+        const call = SRC[at..eol];
+        i = at + needle.len;
+        checked += 1;
+        if (std.mem.indexOf(u8, call, "conv_buf.items") != null) {
+            std.debug.print(
+                "\nan auxiliary llm.complete sends the WHOLE conv_buf:\n  {s}\n" ++
+                    "Bound it like summarizeTurn does — msgTail(conv_buf.items, SUMMARY_CTX_BYTES) into a local\n" ++
+                    "message list — or this pays a full uncached prefill for a few hundred tokens of output.\n",
+                .{call},
+            );
+            return error.UnboundedAuxiliaryPrompt;
+        }
+    }
+    // Not vacuous: the auxiliary calls really are there. If a refactor renames the call or moves these
+    // elsewhere, fail loudly rather than passing on zero matches.
+    try std.testing.expect(checked >= 8);
+
+    // ...and the streamed turn DOES still send the whole transcript. If this ever stops being true the
+    // rule above has been satisfied by crippling the actual conversation, which is not the intent.
+    try std.testing.expect(std.mem.indexOf(u8, SRC, "completeStream(" ) != null);
 }
