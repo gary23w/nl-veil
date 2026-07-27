@@ -466,10 +466,21 @@ pub fn applyBatch(gpa: std.mem.Allocator, original: []const u8, ops: []const Op)
         }
     }
 
-    // splice bottom-up (ties: later op first, so equal-position inserts land in op order)
+    // Splice bottom-up. At the SAME position a CONSUMING edit (len > 0) goes before a zero-width
+    // insert; only then do ties fall back to later-op-first, so equal-position inserts still land in
+    // op order.
+    //
+    // The kind tie-break is not cosmetic. Tying on op index ALONE made the outcome depend on the order
+    // the model happened to LIST its edits: `insert_before X` then `replace X` worked (the replace,
+    // being the later op, spliced first), while `replace X` then `insert_before X` spliced the insert
+    // first and the replace then ate it — the inserted text vanished, the original target survived,
+    // and the batch reported a clean success. The overlap check above cannot catch it either: an
+    // insert has len 0, so `disjoint = a_end <= c.pos or c_end <= a.pos` holds at equal pos.
+    // bufedit.zig carried the mirror of this in the opposite op order (ledger 0091).
     std.mem.sort(Resolved, resolved.items, {}, struct {
         fn lt(_: void, x: Resolved, y: Resolved) bool {
             if (x.pos != y.pos) return x.pos > y.pos;
+            if ((x.len == 0) != (y.len == 0)) return x.len > y.len; // consuming before insert
             return x.op > y.op;
         }
     }.lt);
@@ -726,6 +737,45 @@ test "overlapping ranges reject atomically; empty file accepts only inserts" {
         .err => |e| {
             defer gpa.free(e);
             return error.TestUnexpectedResult;
+        },
+    }
+}
+
+test "tag dialect: replace listed BEFORE insert_before on the same line does not eat the insert" {
+    // The MIRROR of bufedit's same-line bug (ledger 0091), in the engine the schema calls PREFERRED.
+    // Ties used to fall back to op index alone, so the outcome depended on the order the model happened
+    // to list its edits: insert-then-replace worked, replace-then-insert spliced the insert first and
+    // the replace consumed it — inserted text gone, original target surviving, reported as success.
+    // The overlap check cannot see it: an insert has len 0, so the disjoint test holds at equal pos.
+    const gpa = std.testing.allocator;
+    const src = "<body>\n  <main>\n  </main>\n</body>\n";
+    var lines = splitLines(gpa, src) catch unreachable;
+    defer lines.deinit(gpa);
+
+    var b1: [24]u8 = undefined;
+    var b2: [24]u8 = undefined;
+    const at_main_a = parseAnchor(renderAnchor(lines.items, 1, &b1)).?;
+    const at_main_b = parseAnchor(renderAnchor(lines.items, 1, &b2)).?;
+
+    // The order that corrupted: replace FIRST, insert second.
+    const ops = [_]Op{
+        .{ .kind = .replace, .anchor = at_main_a, .text = "  <main class=\"wide\">", .raw_anchor = "r" },
+        .{ .kind = .insert_before, .anchor = at_main_b, .text = "  <header>hi</header>", .raw_anchor = "i" },
+    };
+    switch (applyBatch(gpa, src, ops[0..])) {
+        .ok => |ap| {
+            defer gpa.free(ap.content);
+            defer gpa.free(ap.summary);
+            try std.testing.expect(std.mem.indexOf(u8, ap.content, "<header>hi</header>") != null); // was DROPPED
+            try std.testing.expect(std.mem.indexOf(u8, ap.content, "<main class=\"wide\">") != null);
+            try std.testing.expect(std.mem.indexOf(u8, ap.content, "\n  <main>\n") == null); // target left behind
+            const h = std.mem.indexOf(u8, ap.content, "<header>").?;
+            const m = std.mem.indexOf(u8, ap.content, "<main class").?;
+            try std.testing.expect(h < m); // insert_before means ABOVE
+        },
+        .err => |e| {
+            defer gpa.free(e);
+            return error.BatchRejectedUnexpectedly;
         },
     }
 }
