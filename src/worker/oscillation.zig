@@ -417,6 +417,21 @@ pub const Mem = struct {
         _ = self.observe(scope, fact);
     }
 
+    /// Drop ONLY the facts in `scope` that contain `match`, leaving the rest alone — the CLI's
+    /// `forget <scope> [match...]`. `replace` above drops the WHOLE scope and is for single-value scopes
+    /// (plan, state); this is the per-entry edit a growing scope needs in order to improve an entry
+    /// instead of only ever appending beside it.
+    ///
+    /// An empty `match` is refused rather than forwarded: to the CLI it reads as "no match given", which
+    /// forgets the entire scope. The one call that must never happen by accident is the one whose key
+    /// went missing, so it is checked here rather than trusted to every call site.
+    pub fn forgetMatch(self: Mem, scope: []const u8, match: []const u8) void {
+        if (std.mem.trim(u8, match, " \t\r\n").len == 0) return;
+        self.lockW();
+        defer self.unlockW();
+        if (self.run(&.{ "forget", scope, match })) |o| self.gpa.free(o);
+    }
+
     /// Single best fact (RecallOne) as a text block. Caller frees. Empty when recall abstains (no match).
     pub fn recall(self: Mem, scope: []const u8, query: []const u8) []u8 {
         const out = self.run(&.{ "recall", scope, query }) orelse return self.gpa.dupe(u8, "") catch @constCast("");

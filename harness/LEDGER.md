@@ -2724,3 +2724,34 @@ edit, confirm it applied, then run.
 - next (verified): 23 `mem.list(` sites remain unexamined. Most feed logic, not prompts; the ones worth
   reading are those whose result reaches an allocPrint with a clip — rsi.zig's lessons/skills blocks
   (451, 453, 556) are the closest neighbours of the two already found.
+
+## 0103 — 2026-07-26 — the reviewers were told to improve a lesson; storage could only append
+- both reviewer prompts carry the instruction "prefer PATCHING an existing lesson into a more general
+  form — output the full patched text". Nothing could honour it. `observe` appends and there is no
+  per-entry update, so a generalised restatement reached reviewFork's dedup, matched on its 28-char
+  head, and hit `continue`. The patch the model was explicitly ASKED for was discarded every time.
+- so the swarm's lessons could only ever accumulate, never improve: whatever phrasing landed first was
+  the permanent one, and a hundred rounds of review could not make a single lesson better. That is a
+  ceiling on learning quality that no amount of running longer can lift — the RSI loop could add, but
+  it could not revise.
+- did: `Mem.forgetMatch` (the CLI has had `forget <scope> [match...]` all along; nothing wrapped it),
+  and reviewFork now supersedes instead of dropping — forget the stored line, observe the fuller one.
+- the key is the STORED line, not the proposal: `observe` atomizes, so the proposal's own text is not
+  reliably a substring of what is on disk. Matching on the proposal would have deleted nothing and
+  minted a duplicate beside the original — a patch path that appears to work and quietly doubles the
+  scope. This is why `supersededEntry` returns the line it found rather than a boolean.
+- two safety decisions, because this is the ONLY path in the engine that deletes memory:
+  - `forgetMatch` refuses an empty key AT THE WRAPPER. To the CLI a missing match means "forget the
+    whole scope", so the empty key is not a no-op — it is the destructive call, and it is exactly what
+    arrives when a caller's key went missing. Guarded once, where it cannot be forgotten, not at each
+    call site. Its audit checks the guard PRECEDES the forget call: a check below it is decoration.
+  - superseding fires only when the new text is strictly LONGER. A genuinely shorter generalisation is
+    still skipped, and that is the correct side to be wrong on: the alternative is a reworded,
+    equally-narrow line churning the scope every round it recurs in the trace. Stated as a limitation
+    rather than hidden — a better rule would compare meaning, and this one compares length.
+- verified: suite exit 0, 0 compile errors. CF-A accept a shorter/equal restatement -> the supersede
+  test fails by name. CF-B remove the empty-key guard -> the wrapper audit fails and names the whole-
+  scope wipe. All three files byte-identical to pre-CF after restore. Full oracle green.
+- next (verified): runJudge carries the same instruction into QUARANTINE scopes and has the same
+  no-update limitation, but its proposals are promoted by a human in the desk, so the patch belongs in
+  that promotion path rather than here — and promotion is a reviewed boundary I will not automate.
