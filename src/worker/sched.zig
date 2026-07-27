@@ -297,9 +297,20 @@ pub fn mintTaskId(buf: *[64]u8, name: []const u8, local_secs: i64) []const u8 {
 /// Mint the conversation id for one run: "scheduled_" ++ clipped task id ++ "_MMDDHHMM" (local time, so the
 /// conv name in the desk list matches the user's clock). The task id is clipped so the whole id stays <= 64
 /// bytes — the safeSeg ceiling every conv route enforces. Digits + the id's own safe charset → safeSeg-clean.
+/// The conv-id prefix every scheduled run is minted under, and the clip its task id gets. Shared because a
+/// SECOND place rebuilds this exact prefix: the one-run-per-task guard on the manual-run route greps live
+/// turns for "scheduled_{id}_" and refuses to start a duplicate. That guard hardcoded the clip as a bare
+/// `45` while convIdFor derived it from `64 - prefix.len - 9` — the same number written two ways, hundreds
+/// of lines apart. Widen the prefix or the stamp and convIdFor adapts, the guard does not, it stops
+/// matching, and the protection it exists to give ("double the tokens for the same deliverable", per its
+/// own comment) lapses silently. Derived once, used by both (ledger 0085).
+pub const CONV_PREFIX = "scheduled_";
+pub const CONV_STAMP_BYTES = 9; // "_MMDDHHMM"
+pub const CONV_TASK_CLIP: usize = 64 - CONV_PREFIX.len - CONV_STAMP_BYTES;
+
 pub fn convIdFor(buf: *[64]u8, task_id: []const u8, local_secs: i64) []const u8 {
-    const prefix = "scheduled_";
-    const keep = @min(task_id.len, 64 - prefix.len - 9); // "_MMDDHHMM" = 9 bytes
+    const prefix = CONV_PREFIX;
+    const keep = @min(task_id.len, CONV_TASK_CLIP);
     @memcpy(buf[0..prefix.len], prefix);
     @memcpy(buf[prefix.len..][0..keep], task_id[0..keep]);
     const head = prefix.len + keep;
@@ -1106,7 +1117,7 @@ pub fn runTaskNow(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     // the tokens for the same deliverable. Refuse with the RUNNING conv id so the client opens that instead.
     {
         var pb: [64]u8 = undefined;
-        const prefix = std.fmt.bufPrint(&pb, "scheduled_{s}_", .{t.id[0..@min(t.id.len, 45)]}) catch "";
+        const prefix = std.fmt.bufPrint(&pb, CONV_PREFIX ++ "{s}_", .{t.id[0..@min(t.id.len, CONV_TASK_CLIP)]}) catch "";
         var cb: [64]u8 = undefined;
         if (prefix.len > 0) {
             if (chat_engine.liveTurnWithPrefix(app.io, prefix, &cb)) |running| {
@@ -1351,5 +1362,35 @@ test "buildRunMessage: prompt + details + run context (id, run number, cadence, 
         defer gpa.free(msg);
         try std.testing.expect(std.mem.indexOf(u8, msg, "WORKDIR (permanent): this run's files land in \"u1/_sched/digest-0301070500/runs/07171400/work\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, msg, "timestamped folder under \"u1/_sched/digest-0301070500/runs/\"") != null);
+    }
+}
+
+test "the one-run-per-task guard's prefix actually matches a minted conv id" {
+    // Two derivations of one rule. convIdFor MINTS "scheduled_{id clipped}_MMDDHHMM"; the manual-run
+    // route REBUILDS "scheduled_{id clipped}_" to grep live turns and refuse a duplicate run. If the two
+    // clips ever disagree the guard silently stops matching and the task runs twice — its own comment
+    // calls that "double the tokens for the same deliverable". Asserting both use the same constant would
+    // be weaker than this: what actually matters is that the rebuilt prefix IS a prefix of the minted id,
+    // which stays true through any refactor that keeps them consistent (harness/TESTING.md: prefer an
+    // assertion relating two independently-computed values).
+    const stamp: i64 = 1_752_000_000;
+    const ids = [_][]const u8{
+        "short-task",
+        "a" ** (CONV_TASK_CLIP - 1),
+        "b" ** CONV_TASK_CLIP, // exactly at the clip
+        "c" ** (CONV_TASK_CLIP + 1), // one past — the id the guard must still find
+        "d" ** 64, // the safeSeg ceiling
+    };
+    for (ids) |id| {
+        var cb: [64]u8 = undefined;
+        const conv = convIdFor(&cb, id, stamp);
+        // What the guard builds, using the same shared clip the route now uses.
+        var pb: [64]u8 = undefined;
+        const guard = try std.fmt.bufPrint(&pb, CONV_PREFIX ++ "{s}_", .{id[0..@min(id.len, CONV_TASK_CLIP)]});
+        if (!std.mem.startsWith(u8, conv, guard)) {
+            std.debug.print("\nguard prefix '{s}' does not match minted conv '{s}' — a second run would start\n", .{ guard, conv });
+            return error.GuardPrefixMissesMintedConv;
+        }
+        try std.testing.expect(conv.len <= 64); // the safeSeg ceiling every conv route enforces
     }
 }
