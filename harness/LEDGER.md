@@ -2381,3 +2381,32 @@ edit, confirm it applied, then run.
   the least conspicuous line in either — was the whole defect. Also: a refuter that RUNS the code
   outranks one that reads it, and this is the first audit where one did. Worth asking for explicitly.
 - next (verified): audit 3's remaining findings are unread — this one was large enough to take alone.
+
+## 0092 — 2026-07-26 — the meters missed the call the provider actually billed
+- did: `streamAttempt` has NINE exits that `return null` so the caller falls back to `complete()`, and
+  only its two SUCCESS paths called `meterStream`. So a streamed attempt that could not be used — tool
+  calls it could not reconstruct, an error line, an empty body — had its tokens dropped from every
+  meter, while the fallback that re-sent the same prompt WAS counted. The provider billed two calls;
+  the meters recorded one.
+- why it matters more than its size: the per-label spend view added in 0079/0080 reads STRAIGHT off
+  these meters. I spent two increments making token spend attributable and the source data had a hole
+  in it the whole time. An observability fix inherits every defect of the thing it observes, and I did
+  not check the meter before publishing what it said.
+- did: one `defer` that meters on any exit which did not already, plus a `reported` flag the two
+  explicit sites set. Double counting is impossible by construction, and `meterStream` is a no-op
+  unless the provider actually reported usage (`st.metered`), so the paths where nothing was billed
+  stay silent.
+- HONEST LIMIT, and the reason the ratchet is structural: this path needs a live SSE provider, so no
+  behavioural test here reaches it — my first counterfactual (delete the defer) passed, which is the
+  proof. The guard is therefore a source audit: exactly one deferred meter, and every explicit
+  meterStream marks itself. Both halves counterfactualled — removing the defer reports "0 deferred
+  meters", removing a flag reports "will meter it a SECOND time" — each by name, zero compile errors.
+- learned: I introduced an indentation mismatch while wiring the flag (`reported = true;` at 8 spaces
+  under a 12-space call) and stopped to check whether it had landed outside its block. It had not —
+  Zig reads braces, not columns — but the check was right to make: the same edit in Python would have
+  silently changed control flow. Verify the shape of your own edit before trusting the green build.
+- verified: src suite exit 0; both counterfactuals by name; full oracle green.
+- next (verified): audit 3 has six standing findings not yet acted on — writer.zig's ratio and
+  provenance pair, run.zig's PROBE newline delimiter, crawl.zig's unreachable prune gate and its
+  first-chunk max_bytes exemption, and metrics.zig's 16 MB all-zero read (the same reader-cap shape as
+  0084). Each still needs its own re-derivation per 0090.
