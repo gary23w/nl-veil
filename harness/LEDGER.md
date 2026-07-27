@@ -2591,3 +2591,53 @@ edit, confirm it applied, then run.
   0 compile errors, injection confirmed present by grep first. Tree byte-identical to pre-CF after
   restore. Full oracle green.
 - next (verified): one audit-3 finding left — writer.zig's seedSources provenance.
+
+## 0099 — 2026-07-26 — CORRECTION: two filters I added to save tokens were rejecting good input
+- context: the owner reported the harness "appears less intelligent than before" after this sitting's
+  token-spend work. Went back over every change from 0079-0098 that removes information, capability or
+  input, and MEASURED rather than reasoned wherever measuring was possible.
+- CLEARED, with evidence, not argument:
+  - 0093 + 0094 (crawl byte budget, boilerplate scoring): built the pre-change and post-change
+    crawl.zig side by side as two modules and ran BOTH over one realistic article page. Every content
+    marker survives identically — body, all headings, the list, the closing paragraph. The
+    social-share block is now pruned. `fitToQuery` returns BYTE-IDENTICAL output at both the 360 and
+    the 4000 budget. 1196 -> 1089 bytes, and the entire delta is chrome plus three junk reference
+    lines. The clip I worried about never fires on well-formed markdown, which is multi-chunk.
+  - 0081 (nine tools dropped from sandboxed turns): the schema filter keys on `ctx.caps == .sandboxed`
+    and orchTool's refusal keys on `ctx.caps == .sandboxed`. The same condition, so nothing that could
+    have worked was taken away.
+  - 0089 (declining to grade a will across a unit change): fires only on the single transition when
+    the first bench lands, not run after run.
+- FOUND — two, both mine, both the same shape: a filter added to reject bad input that also rejects
+  good input.
+  1. `isDecline` vetoed any rule whose FIRST WORD is "no". A prohibition is the most natural way to
+     write a rule, so "No secrets in logs", "No hardcoded use cases", "No retry without a backoff"
+     were all silently discarded as polite refusals. The self-authored playbook — the mechanism by
+     which minds get better across rounds — was being thinned at every retrospective. Fixed: a decline
+     is short, and when it opens with "no" the next word names the RETROSPECTIVE ("no changes", "no
+     lesson"), never the WORK.
+  2. `parseDoneList` stopped at the first non-numeric token and "." is not a delimiter — so
+     "done: 1, 2, 3." yielded {1,2}, and so did "done: 1, 2 and 3". The engine re-ran work it had
+     already finished, every round. I had written that truncation up as a deliberate trade and the
+     reasoning holds for PROSE; a trailing period and the word "and" are not prose. The guard is
+     unchanged — "(took 3 tries)" and "Subtask 3 is still in progress" still end the list, asserted.
+- the pattern, and it is the point of this entry: BOTH defects were introduced by fixes that were
+  RIGHT about the failure they targeted. 0086 was right that a refusal must not become a rule; 0087
+  was right that prose must not mark work done. Each then drew its boundary with the cheapest
+  available signal — a first word, a token class — and the cheapest signal caught legitimate input
+  too. A filter's PRECISION is a separate claim from its MOTIVATION, and being sure of the motivation
+  is exactly what stops you testing the precision.
+- learned: both times my test corpus was built out of the failure I was fixing, so it could not see
+  what I was newly rejecting. isDecline's corpus even had a negatives list — Note, Never, Not,
+  Northbound, nominate — every n-word EXCEPT the bare "No" that people actually write rules with.
+  When adding a filter that REJECTS, write the negative corpus first and draw it from how people
+  really write, not from the bug in front of you.
+- open, and deliberately NOT changed here: 0097 made the publish gate correct per-round, but
+  PUBLISH_MAX_SEED_DEP_PCT = 85 was tuned while the counter was cumulative and the gate effectively
+  never bound. A round now needs ~3 independent fetches against 12 seeds to publish an edition. That
+  is a policy calibration, not a bug, and it is the owner's to make.
+- NOT MINE, untouched and unstaged: desk/src/{chat,main,store}.zig carry an in-flight per-message uid
+  feature, modified seconds before this commit. A desk-gate red belongs to that work, not this.
+- verified: suite exit 0, 0 compile errors. CF-A restore the bare "no" veto -> the isDecline test
+  fails by name. CF-B revert the token handling -> the parseDoneList test fails by name. Both files
+  byte-identical to pre-counterfactual after restore.

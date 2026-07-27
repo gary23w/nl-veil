@@ -949,20 +949,36 @@ pub fn planCast(w: *Worker, minds: []MindState, goal: []const u8) void {
     w.act("orchestrator", 0, "cast_plan", if (plan_ev.items.len > 0) plan_ev.items else "team assigned", std.fmt.allocPrint(w.a(), "cast team: {d} scout(s) across {d} minds", .{ scouts, minds.len }) catch "cast team planned");
 }
 
-/// Does this reply DECLINE to give a rule? Keyed on the first word only: a decline announces itself
-/// there ("None needed.", "Nothing to change."), while a real directive almost never opens with one of
-/// these. Deliberately narrow — a false positive silently drops a genuine lesson, which is worse than
-/// letting one weak rule through, so this matches whole words and nothing fuzzier.
+/// A refusal is short; a rule is a sentence. Nothing a retrospective declines with runs past this, and
+/// treating anything longer as a decline throws away the lessons the retrospective exists to collect.
+const DECLINE_MAX_LEN = 40;
+
+/// What a decline's second word names when it opens with "no": the retrospective itself, never the work.
+const DECLINE_SUBJECTS = [_][]const u8{ "changes", "change", "lesson", "lessons", "rule", "rules", "note", "notes", "comment", "comments", "new", "update", "updates", "action", "actions", "feedback", "issues" };
+
+/// Does this reply DECLINE to give a rule? A decline announces itself in the first word ("None needed.",
+/// "Nothing to change.") and is over in a few. A false positive here silently drops a genuine lesson,
+/// which is worse than letting a weak rule through — see the "no" branch, which cost real rules once.
 fn isDecline(rule: []const u8) bool {
+    const t = std.mem.trim(u8, rule, " \t\r\n");
+    if (t.len == 0) return true;
+    if (t.len > DECLINE_MAX_LEN) return false;
     var end: usize = 0;
-    while (end < rule.len and std.ascii.isAlphabetic(rule[end])) end += 1;
-    const first = rule[0..end];
+    while (end < t.len and std.ascii.isAlphabetic(t[end])) end += 1;
+    const first = t[0..end];
     for ([_][]const u8{ "none", "nothing", "n", "na" }) |d| {
         if (std.ascii.eqlIgnoreCase(first, d)) return true;
     }
-    // "no" alone declines ("no changes", "no lesson"); "not"/"note"/"never" are real rule openers, and
-    // the whole-word match above already keeps them out of this branch.
-    if (std.ascii.eqlIgnoreCase(first, "no")) return true;
+    if (!std.ascii.eqlIgnoreCase(first, "no")) return false;
+    // "no" opens a refusal AND the most natural form of a real rule — a prohibition. Keying on the word
+    // alone silently ate "No secrets in logs", "No hardcoded use cases", and every other rule written
+    // the way people actually write rules. Decline only when what FOLLOWS names the retrospective
+    // ("no changes", "no lesson"); when it names the WORK, that is the lesson, not a refusal to give one.
+    const rest = std.mem.trimStart(u8, t[end..], " \t,.;:-");
+    var w: usize = 0;
+    while (w < rest.len and std.ascii.isAlphabetic(rest[w])) w += 1;
+    if (w == 0) return true; // bare "no"
+    for (DECLINE_SUBJECTS) |d| if (std.ascii.eqlIgnoreCase(rest[0..w], d)) return true;
     return false;
 }
 
@@ -987,6 +1003,14 @@ test "isDecline: polite refusals are not operating rules, real directives still 
         "Read the failure output before editing; the root cause is named in it.",
         "Northbound API calls need the retry wrapper.",
         "nominate one mind per file to avoid write collisions",
+        // THE GAP THAT SHIPPED. The corpus above covers Note/Never/Not/Northbound/nominate — every
+        // n-word except the one that matters, because a prohibition is the most natural way to write
+        // a rule and it opens with the bare word "No". Every one of these was silently discarded.
+        "No secrets in logs.",
+        "No hardcoded use cases.",
+        "No file may be written by two minds.",
+        "No changes to the schema without a migration.",
+        "No retry without a backoff.",
     }) |real| try std.testing.expect(!isDecline(real));
 }
 
