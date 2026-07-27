@@ -2839,3 +2839,36 @@ edit, confirm it applied, then run.
   host_command surface, and making "kill what this turn started" a chat-level action is a permissions
   decision. (2) steer during a poll — the new check point makes it reachable, but the loop only breaks on
   stop today.
+
+## 0106 — 2026-07-27 — the two halves of "let me out of this watch"
+- owner asked for both open items from 0105: kill what a turn started, and let a steer land mid-poll.
+- STEER. 0105 gave poll a Stop check; a steer still waited for the watch to end, which is the same
+  complaint with a politer name — the user is typing and nobody is listening. `Cancel` now answers WHY
+  (`none`/`stopped`/`steered`) rather than whether. One bool for both would have ended the turn on a
+  steer, which is the opposite of what typing into a running turn asks for.
+  The steer is NOT consumed in the tool: poll only stops sitting on the thread, and the turn's existing
+  between-tools drain folds and persists it. One reader, one writer, no second place to keep in sync.
+- KILL. `stop_process` — a pid and its child TREE. Ending a turn never reaped what a script spawned:
+  run_python kills its own child on a deadline, but the server or fuzzer that child launched outlives
+  all of it, holding its port until someone finds the pid by hand.
+- why NOT the adjudicated host_command surface, which is the part worth arguing: this is not new power.
+  Anything that can call stop_process can already call run_python, and run_python can already os.kill.
+  What was missing was a FIRST-CLASS way to do it, so "stop the thing you started" is one obvious call
+  instead of a script the model has to think to write. It carries run_python's gate for exactly that
+  reason — same power, same door — and a sandboxed caller has neither and gets neither.
+- two guards inside it: it refuses veil's own pid (the model reads pids out of ps-style output and veil
+  is in that list — killing it takes the conversation down with the fuzzer), and it kills the TREE,
+  because leaving a launcher's worker behind is the failure the tool exists to prevent.
+- the codebase caught my incomplete change, twice, which is the best outcome available: CHAT_SCHEMA must
+  be a VERBATIM subset of SCHEMA and I had added the tool to one; isBuiltinTool must know every name
+  execute() dispatches and I had added a dispatch without the name. Both are the "two things that must
+  agree" shape this file is full of. The schema line is now COPIED from CHAT_SCHEMA into SCHEMA rather
+  than retyped, so the subset check compares identical bytes instead of my transcription.
+- learned: `zig build test` reported exit 1 with NO summary, no failing test name, nothing at all —
+  the dead-runner signature. Before 0095 I would have had no way to tell that from a real failure; the
+  oracle reran the binary standalone and printed both real names. The guard I built two hours ago paid
+  for itself on my own change.
+- learned (again): a `\` Zig multiline marker written through a python heredoc arrived as `\` and
+  broke the schema string. Same escaping trap as always. Fixed with the Edit tool, then avoided
+  entirely by copying the existing line instead of authoring a second one.
+- verified: full oracle ALL GREEN.

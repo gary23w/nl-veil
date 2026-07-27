@@ -284,10 +284,15 @@ pub fn sandboxSchema(comptime block: []const u8) []const u8 {
 /// A function pointer rather than a bool because the answer lives in the conversation's control.jsonl, which
 /// tools.zig cannot see. Null everywhere it is not set — swarm minds, the CLI — so those keep today's exact
 /// behaviour, and a tool that ignores it is no worse off than before.
+/// WHY a blocking tool should come back. Stop and steer both mean "the user is talking to you and you are
+/// not listening", but they want opposite things next: a stop ends the turn, a steer wants the watch
+/// reconsidered in light of what was just said. One bool for both would make every steer end the turn.
+pub const CancelReason = enum { none, stopped, steered };
+
 pub const Cancel = struct {
-    fn_ptr: *const fn (*anyopaque) bool,
+    fn_ptr: *const fn (*anyopaque) CancelReason,
     ctx: *anyopaque,
-    pub fn requested(self: Cancel) bool {
+    pub fn check(self: Cancel) CancelReason {
         return self.fn_ptr(self.ctx);
     }
 };
@@ -474,19 +479,23 @@ pub fn convLocalFact(fact: []const u8) bool {
     return factNamesLineNumber(fact) or factNamesProjectFile(fact);
 }
 
-test "Cancel: a blocking tool can ask the turn whether the user hit Stop" {
+test "Cancel: a blocking tool learns WHY it should come back, not just that it should" {
     const Probe = struct {
-        stop: bool = false,
-        fn ask(cx: *anyopaque) bool {
+        reason: CancelReason = .none,
+        fn ask(cx: *anyopaque) CancelReason {
             const s: *@This() = @ptrCast(@alignCast(cx));
-            return s.stop;
+            return s.reason;
         }
     };
     var p = Probe{};
     const c = Cancel{ .fn_ptr = Probe.ask, .ctx = &p };
-    try std.testing.expect(!c.requested());
-    p.stop = true;
-    try std.testing.expect(c.requested());
+    try std.testing.expectEqual(CancelReason.none, c.check());
+    // Stop and steer must stay distinguishable all the way to the tool: collapsing them to one bool
+    // would end the turn on a steer, which is the opposite of what the user asked for by typing.
+    p.reason = .stopped;
+    try std.testing.expectEqual(CancelReason.stopped, c.check());
+    p.reason = .steered;
+    try std.testing.expectEqual(CancelReason.steered, c.check());
 }
 
 test "poll asks about Stop at every sample, not only when its whole budget runs out" {
@@ -850,6 +859,7 @@ pub const MAX_TOOL_PARAMS = 4 * 1024;
 /// The OpenAI `tools` array contents (comma-separated function defs, no outer brackets).
 pub const SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file (relative path) from the build workdir. Each line comes prefixed with its anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. For a big file, pass start_line/end_line (1-indexed, inclusive) to read just that window.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
@@ -952,6 +962,7 @@ pub const MCP_SCHEMA =
 /// copy is caught, while an intentional adaptation has to be written down.
 pub const CHAT_SCHEMA =
     \\{"type":"function","function":{"name":"run_python","description":"Run a short Python script (no GUI) in the build workdir and get its stdout/stderr. Use it to compute, transform data, or generate files. API keys are NOT available to the script.","parameters":{"type":"object","properties":{"code":{"type":"string","description":"the Python source to execute"}},"required":["code"]}}},
+    \\{"type":"function","function":{"name":"stop_process","description":"KILL a process YOU started (and its children) by pid — the background server, fuzzer, watcher or build you launched with run_python and no longer want. Ending a turn does NOT reap what a script spawned, so a run left behind keeps holding the machine and its ports. Use it when the user says stop, when you are done watching something, or before relaunching a service on the same port.","parameters":{"type":"object","properties":{"pid":{"type":"integer","description":"the process id to terminate, together with its child tree"}},"required":["pid"]}}},
     \\{"type":"function","function":{"name":"write_file","description":"Write a UTF-8 text file at a relative path inside the build workdir (creates parent dirs). To GROW a long document (e.g. add the next scene to a chapter) pass mode:\"append\" with ONLY the new text — it is concatenated onto the existing file, so you never resend (or truncate) prior content. mode:\"overwrite\" (default) replaces the file. To CHANGE an existing file, prefer edit_file (never re-emit a large file).","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"mode":{"type":"string","enum":["overwrite","append"]}},"required":["path","content"]}}},
     \\{"type":"function","function":{"name":"edit_file","description":"Make a SURGICAL edit to an EXISTING file WITHOUT resending the whole file — use this (NOT write_file) to change a file that already exists, especially a large one (write_file re-emits the whole file and truncates big ones). PREFERRED anchors: reads prefix every line with a tag like 42:abc:def — copy that tag as the op's anchor (add end = the range's LAST-line tag to cover several lines). Tags are verified against the CURRENT file and the batch is ATOMIC: all ops apply or none do, and a stale-tag error hands you FRESH tags — retry the whole batch with those (no re-read needed). Plain text anchors (a snippet copied VERBATIM, unique in the file) also work. op is: replace (swap the anchored line/range for text), insert_before / insert_after (add text around the anchor; anchor 0: = file start, EOF = file end), delete (remove the anchored lines).","parameters":{"type":"object","properties":{"path":{"type":"string"},"ops":{"type":"array","items":{"type":"object","properties":{"op":{"type":"string","enum":["replace","insert_before","insert_after","delete"]},"anchor":{"type":"string"},"end":{"type":"string"},"text":{"type":"string"}},"required":["op","anchor"]}}},"required":["path","ops"]}}},
     \\{"type":"function","function":{"name":"read_file","description":"Read a text file from the build workdir (relative path), OR — because this tool runs on the USER'S machine — any file the user points you at by ABSOLUTE path (C:/data/report.csv) or ~/file. Workdir lines come prefixed with their anchor tag (42:abc:def→) — copy a line's tag as an edit_file anchor. A whole-file read is CLIPPED to its head, so for a big file pass start_line/end_line (1-indexed, inclusive) and read the window you are about to edit: never edit from a clipped view, and never rewrite a file just because the view ended.","parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}},"required":["path"]}}},
@@ -1366,6 +1377,7 @@ pub fn execute(ctx: *ToolCtx, name: []const u8, args_json: []const u8) []u8 {
             return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d}]\n{s}\n[more — continue with read_doc {{\"scope\":\"{s}\",\"from\":{d}}}]", .{ scope, from, next - 1, total, body_txt, scope, next }) catch dupe(gpa, body_txt);
         return std.fmt.allocPrint(gpa, "[{s} facts {d}..{d} of {d} — END]\n{s}", .{ scope, from, next - 1, total, body_txt }) catch dupe(gpa, body_txt);
     }
+    if (std.mem.eql(u8, name, "stop_process")) return stopProcessTool(ctx, args_json);
     if (std.mem.eql(u8, name, "poll")) return pollTool(ctx, args_json);
     if (std.mem.eql(u8, name, "probe")) {
         if (ctx.space.len == 0) return dupe(gpa, "this swarm has no spatial grid (the task isn't spatial) — there is nothing to probe");
@@ -1903,7 +1915,7 @@ pub fn isBuiltinTool(n: []const u8) bool {
     // families were listed only as their exact verbs, so "mcp_lookup" or "browser_summary" slipped through
     // as well. Keep this in sync with the dispatch chain in execute(); the test below reads execute()'s
     // source and fails if the two ever disagree again.
-    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
+    const builtins = [_][]const u8{ "run_python", "write_file", "edit_file", "read_file", "absorb", "stage_file", "patch_system", "list_dir", "run_tests", "delete_file", "web_fetch", "web_search", "fetch_json", "read_url", "osint_scan", "deep_crawl", "observe", "recall", "recall_hive", "read_doc", "poll", "stop_process", "share", "probe", "note_stance", "save_skill", "journal", "set_directive", "send_message", "add_task", "complete_task", "stage_delivery", "make_tool", "propose_change", "simulate_change", "propose_plan_change", "ask_veil", "host_status", "host_command", "host_explore", "get_credential" };
     for (builtins) |b| if (std.mem.eql(u8, b, n)) return true;
     // PREFIX families: execute() routes these with startsWith, so every suffix is reserved, not just the
     // verbs that happen to exist today.
@@ -3315,6 +3327,55 @@ test "lexRelevant: shared vocabulary keeps a line, one incidental stem does not"
 const pollsleep = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn Sleep(ms: u32) callconv(.c) void;
 } else struct {};
+/// stop_process — kill a process this workspace started, WITH ITS CHILDREN.
+///
+/// Ending a turn does not reap what a script spawned: `run_python` kills its own child on its deadline, but
+/// a server or fuzzer that child launched outlives all of it, holding its port and its CPU until someone
+/// finds the pid by hand. That is the gap this closes — a turn could start a long-running thing and had no
+/// way to end one.
+///
+/// NOT a new power, which is why it is not on the adjudicated host_command surface: any caller that can
+/// reach this can already call run_python, and run_python can already `os.kill`. What was missing was a
+/// FIRST-CLASS way to do it, so "stop the thing you started" is one obvious call rather than a script the
+/// model has to think to write. It carries run_python's gate for exactly that reason — same power, same
+/// door — and a sandboxed caller, which has neither, gets neither.
+///
+/// The tree matters more than the process. Killing a launcher and leaving its worker behind is the failure
+/// this exists to prevent, so Windows gets /T and POSIX gets the process group before the bare pid.
+fn stopProcessTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
+    const gpa = ctx.gpa;
+    if (ctx.caps == .sandboxed) return dupe(gpa, "stop_process is not available in this workspace");
+    const A = struct { pid: i64 = 0 };
+    const p = std.json.parseFromSlice(A, gpa, args_json, .{ .ignore_unknown_fields = true }) catch return dupe(gpa, "bad args");
+    defer p.deinit();
+    const pid = p.value.pid;
+    if (pid <= 0) return dupe(gpa, "stop_process: 'pid' must be a positive process id");
+    // Refusing our own pid is not paranoia: the engine hands the model pids from ps-style output, and the
+    // veil process is in that list. Killing it takes the conversation down with the fuzzer.
+    const self_pid: i64 = if (builtin.os.tag == .windows)
+        @intCast(std.os.windows.GetCurrentProcessId())
+    else
+        @intCast(std.c.getpid()); // libc, not os.linux — ports to macOS (mirrors run.zig)
+    if (pid == self_pid) return dupe(gpa, "stop_process: that is veil's own process");
+    var buf: [24]u8 = undefined;
+    const pid_s = std.fmt.bufPrint(&buf, "{d}", .{pid}) catch return dupe(gpa, "stop_process: bad pid");
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "taskkill", "/PID", pid_s, "/T", "/F" }
+    else
+        &.{ "kill", "-TERM", "--", pid_s };
+    const r = std.process.run(gpa, ctx.io, .{ .argv = argv, .stdout_limit = .limited(2048) }) catch
+        return std.fmt.allocPrint(gpa, "stop_process: could not run the killer for pid {d}", .{pid}) catch dupe(gpa, "stop_process: failed");
+    defer gpa.free(r.stdout);
+    defer gpa.free(r.stderr);
+    const ok = switch (r.term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    if (ok) return std.fmt.allocPrint(gpa, "stopped pid {d} and its children", .{pid}) catch dupe(gpa, "stopped");
+    const why = std.mem.trim(u8, if (r.stderr.len > 0) r.stderr else r.stdout, " \r\n\t");
+    return std.fmt.allocPrint(gpa, "stop_process: pid {d} was not stopped — {s}", .{ pid, if (why.len > 0) why[0..@min(why.len, 240)] else "no such process, or it is not yours to kill" }) catch dupe(gpa, "stop_process: failed");
+}
+
 fn pollSleepMs(io: std.Io, ms: u64) void {
     if (builtin.os.tag == .windows) {
         pollsleep.Sleep(@intCast(@min(ms, 60_000)));
@@ -3371,9 +3432,18 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
         // control channel is only read before the next tool, so a chained watch answers Stop every few
         // minutes at best — the user presses it, nothing happens, and the thread stays held. Checked first
         // so a stop that arrived during the previous sleep ends the call before doing more work.
-        if (ctx.cancel) |c| if (c.requested()) {
-            verdict = "stopped";
-            break;
+        if (ctx.cancel) |c| switch (c.check()) {
+            .none => {},
+            .stopped => {
+                verdict = "stopped";
+                break;
+            },
+            // The steer is NOT consumed here — the turn's own drain folds it in as a user message between
+            // tools. Poll only has to stop sitting on the thread so that drain can happen.
+            .steered => {
+                verdict = "interrupted";
+                break;
+            },
         };
         const elapsed: u64 = @intCast(@max(0, std.Io.Timestamp.now(ctx.io, .real).toSeconds() - t0));
         switch (k) {
@@ -3504,6 +3574,8 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
     }
     const guidance = if (std.mem.eql(u8, verdict, "stopped"))
         " — the USER stopped this watch. Do not start another poll; say what the log shows and wait for them."
+    else if (std.mem.eql(u8, verdict, "interrupted"))
+        " — the USER said something while you were watching. Read it and answer THAT first; resume polling only if they still want the wait."
     else if (std.mem.eql(u8, verdict, "timeout"))
         " — still not there; call poll again to keep waiting, or act on what the log shows"
     else
