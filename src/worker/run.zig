@@ -2388,6 +2388,36 @@ pub fn proposalBody(text: []const u8) []const u8 {
     return std.mem.trim(u8, text[0..cut], " \t");
 }
 
+/// The stored entry a proposal SUPERSEDES, or null to mint/skip normally.
+///
+/// Both reviewer prompts tell the model to "prefer PATCHING an existing lesson into a more general form —
+/// output the full patched text". Storage could not express that: the mint path only appends, and the
+/// same-head dedup `continue`d, so the generalization the model was explicitly asked to produce went on the
+/// floor every round. Lessons could accumulate and never improve, which caps how good the swarm's learning
+/// can get no matter how long it runs.
+///
+/// A patch is therefore forget-the-old + observe-the-new, and the key returned here is the STORED line —
+/// not the proposal — because observe atomizes, so only the stored text is a match key that hits.
+///
+/// Conservative on purpose, because this is the one path that DELETES memory: it supersedes only when the
+/// new text is strictly LONGER than the entry it replaces. A genuine generalization that is also shorter
+/// still gets skipped, and that is the side to be wrong on — the alternative is letting a reworded,
+/// equally-narrow line churn the scope every round it recurs in the trace.
+pub fn supersededEntry(existing: []const u8, clean: []const u8, head_n: usize) ?[]const u8 {
+    if (existing.len == 0 or clean.len == 0) return null;
+    const head = clean[0..@min(clean.len, head_n)];
+    var it = std.mem.splitScalar(u8, existing, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len < 24) continue; // too short to be a safe substring key for forget
+        if (std.mem.indexOf(u8, line, head) == null) continue;
+        if (std.mem.eql(u8, line, clean)) return null; // identical: nothing to patch
+        if (clean.len <= line.len) return null; // not more said: leave the stored one alone
+        return line;
+    }
+    return null;
+}
+
 /// Between-rounds lesson pairing (single-threaded by design): pair this moment's clean executions against
 /// the swarm's stashed failure — ANY mind's later similar success closes ANY mind's earlier failure (one
 /// hive mind) — then stash this moment's newest unpaired failure for the rounds ahead. In-moment pairs
@@ -10779,6 +10809,29 @@ test "the playbook keeps every rule while it fits, then survives by relevance ra
     try std.testing.expect(std.mem.indexOf(u8, by_rel, "most relevant") != null);
     try std.testing.expect(std.mem.indexOf(u8, by_rel, "least relevant") == null);
     try std.testing.expect(by_rel.len <= budget);
+}
+
+test "a fuller restatement supersedes the lesson it generalizes; anything else is left alone" {
+    const stored = "retry a failed fetch once before treating the host as down";
+    const scope = "unrelated other lesson about file ownership\n" ++ stored ++ "\nanother unrelated lesson entirely\n";
+
+    // The case the prompt asks for and the code used to drop: same opening, but it says MORE.
+    const fuller = "retry a failed fetch once before treating the host as down, and log the status code";
+    const target = run_supersede_check: {
+        break :run_supersede_check supersededEntry(scope, fuller, 28);
+    };
+    try std.testing.expect(target != null);
+    try std.testing.expectEqualStrings(stored, target.?); // the STORED line, since observe atomizes
+
+    // Identical text is not a patch.
+    try std.testing.expect(supersededEntry(scope, stored, 28) == null);
+    // Shorter is not accepted: this path DELETES, so it only fires when the new entry says more.
+    try std.testing.expect(supersededEntry(scope, "retry a failed fetch once before", 28) == null);
+    // A genuinely new lesson never supersedes anything — it must fall through to a normal mint.
+    try std.testing.expect(supersededEntry(scope, "prefer a named constant over a repeated literal in build scripts", 28) == null);
+    // Nothing stored yet, and an empty proposal, both decline rather than returning a key.
+    try std.testing.expect(supersededEntry("", fuller, 28) == null);
+    try std.testing.expect(supersededEntry(scope, "", 28) == null);
 }
 
 test "the final report's team notes go through memoryView too" {

@@ -501,7 +501,19 @@ pub fn reviewFork(w: *Worker, goal: []const u8, round: u32, round_trace: []const
         const existing = if (pr.kind == 1) skills else lessons;
         // dedup: skip if the head of this entry is already present in its live scope (prevents re-minting
         // the same lesson every round it recurs in the trace — the desk's playbook-pollution failure class)
-        if (existing.len > 0 and std.mem.indexOf(u8, existing, clean[0..@min(clean.len, 28)]) != null) continue;
+        if (existing.len > 0 and std.mem.indexOf(u8, existing, clean[0..@min(clean.len, 28)]) != null) {
+            // ...unless this is the PATCH the prompt above asked for. "prefer PATCHING an existing lesson
+            // into a more general form — output the full patched text" was impossible to honour, because
+            // storage only appends: a fuller restatement of a known lesson arrived here and was dropped
+            // every time. The swarm could add lessons forever and improve none of them.
+            const target = run.supersededEntry(existing, clean, 28) orelse continue;
+            var pb: [640]u8 = undefined;
+            w.mem.forgetMatch(scope, target);
+            _ = w.mem.observe(scope, run.atomizeForObserve(&pb, clean));
+            w.act("review", round, if (pr.kind == 1) "skill" else "lesson", "patched", clean);
+            minted += 1;
+            continue;
+        }
         var ab: [640]u8 = undefined;
         _ = w.mem.observe(scope, run.atomizeForObserve(&ab, clean));
         w.act("review", round, if (pr.kind == 1) "skill" else "lesson", "", clean);
