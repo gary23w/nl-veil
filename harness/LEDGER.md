@@ -2696,3 +2696,31 @@ edit, confirm it applied, then run.
   byte-identical to pre-CF after restore. Full oracle green.
 - next (verified): the same question is worth asking of every other `mem.list(` feeding a prompt — this
   one was found by reading three adjacent lines and noticing one of them did not match its neighbours.
+
+## 0102 — 2026-07-26 — the final report the user reads was grounded in the team's OLDEST notes
+- found by acting on 0101's next-item: ask the same question of every other `mem.list(` feeding a
+  prompt. 25 call sites; the one that matters most was `castSynthesize`, whose own system prompt ends
+  "This report is exactly what the user receives."
+- it pasted `clip(hive, 1500)` — and `clip` keeps the HEAD while a scope list is stored oldest-first.
+  So the final report's TEAM NOTES section was the first ~1500 bytes the hive ever recorded, and a run
+  that learned anything after its opening notes reported as though it had not. The single output that
+  leaves the machine was the one grounded in the least of what the run knew.
+- the pair is the point. The playbook kept only its NEWEST rules and lost its foundations (0101); the
+  report kept only its OLDEST notes and lost everything it discovered. Opposite symptoms, one mistake:
+  deciding what survives a byte budget by POSITION when position carries no information about worth.
+  Neither looked wrong locally — `clip` and `clipTail` are both perfectly reasonable calls.
+- did: one shared selector rather than a second copy — `playbookView` generalised to `memoryView`, now
+  used by both, with the ranking query firing only on overflow so short runs pay nothing and behave
+  exactly as before.
+- ratchet: a wiring audit PER PROMPT SITE, not one for the function. A correct selector says nothing
+  about what any given prompt actually pastes, and these two sites are 6,000 lines apart — the kind of
+  distance that lets one of them quietly revert. Each fails by name, naming its own symptom.
+- learned: the survey was worth more than the fix. 0101 came from noticing one line did not match its
+  two neighbours; 0102 came from asking where else that mismatch lived, and the answer was the user's
+  report. When a defect is a SHAPE rather than a bug, grep for the shape before moving on — the second
+  instance is usually worse than the first, because nobody went looking for it.
+- verified: suite exit 0, 0 compile errors. CF revert the synthesis site to `clip` -> the new audit
+  fails by name and names the cause. run.zig byte-identical to pre-CF after restore. Full oracle green.
+- next (verified): 23 `mem.list(` sites remain unexamined. Most feed logic, not prompts; the ones worth
+  reading are those whose result reaches an allocPrint with a clip — rsi.zig's lessons/skills blocks
+  (451, 453, 556) are the closest neighbours of the two already found.

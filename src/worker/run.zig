@@ -3464,6 +3464,10 @@ fn buildEngineVerification(w: *Worker, goal: []const u8) []u8 {
     return out.toOwnedSlice(gpa) catch &.{};
 }
 
+/// Byte budget for the hive notes in the final report. Named so the overflow selector and the ranking
+/// query below cannot be given different numbers.
+const HIVE_BUDGET: usize = 1500;
+
 fn castSynthesize(w: *Worker, goal: []const u8) void {
     const gpa = w.gpa;
     const retrieved = gatherCastFindings(w, 6000); // what the scouts pulled from the web THIS run (events)
@@ -3472,6 +3476,14 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
     defer gpa.free(built);
     const hive = w.mem.list(tools.KNOWLEDGE_SCOPE);
     defer gpa.free(hive);
+    // This report is exactly what the user receives, and its team notes were `clip`ped — the OLDEST
+    // 1500 bytes. A run that learned anything after its first few notes reported as though it had not.
+    // Rank against the goal when the hive overflows, the same way the per-mind blocks do.
+    const hive_ranked: []const u8 = if (hive.len > HIVE_BUDGET)
+        w.mem.assoc(tools.KNOWLEDGE_SCOPE, if (goal.len > 0) goal else "findings", 1, 12)
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(@constCast(hive_ranked));
     const has_web = std.mem.trim(u8, retrieved, " \r\n\t").len >= 20;
     const has_built = std.mem.trim(u8, built, " \r\n\t").len > 0;
     if (!has_web and !has_built and std.mem.trim(u8, hive, " \r\n\t").len < 20) {
@@ -3484,7 +3496,7 @@ fn castSynthesize(w: *Worker, goal: []const u8) void {
     const verif = buildEngineVerification(w, goal);
     defer gpa.free(verif);
     const sys = "You are the LEAD of a strike team reporting the FINAL result of this run to the user. Ground your report ONLY in the material below: the FILES YOUR TEAM ACTUALLY BUILT (their real contents are shown), plus anything the scouts retrieved and the team notes. The ENGINE VERIFICATION block is MEASURED ground truth — file excerpts below may be CLIPPED VIEWS, so NEVER judge a file complete or truncated from where its excerpt ends; completeness comes from the ENGINE VERIFICATION alone. Report WHAT WAS DELIVERED — describe each built file by what the code ACTUALLY does (you can SEE the code, so state it plainly — never hedge with 'likely'/'should'), how to run it, and HONESTLY name anything the ENGINE VERIFICATION lists as missing or failing. NEVER claim a file exists that is not in the list, and NEVER offer to 'provide code' or 'example snippets' — the code is already built and shown above. If the run was research-only (no files), report the findings + name the sources instead. This report is exactly what the user receives.";
-    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n{s}\n=== FILES YOUR TEAM BUILT (actual contents) ===\n{s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above: describe what was built; completeness verdicts come from the ENGINE VERIFICATION block only.", .{ clip(goal, 300), verif, if (has_built) built else "(no files were built this run — this was research-only)", if (has_web) retrieved else "(fetches returned nothing usable)", clip(hive, 1500) }) catch return;
+    const user = std.fmt.allocPrint(gpa, "Goal: {s}\n\n{s}\n=== FILES YOUR TEAM BUILT (actual contents) ===\n{s}\n\n=== WHAT THE SCOUTS RETRIEVED (web search + fetched content) ===\n{s}\n\n=== TEAM NOTES (hive memory) ===\n{s}\n\nWrite the final report now, grounded only in the above: describe what was built; completeness verdicts come from the ENGINE VERIFICATION block only.", .{ clip(goal, 300), verif, if (has_built) built else "(no files were built this run — this was research-only)", if (has_web) retrieved else "(fetches returned nothing usable)", memoryView(hive, hive_ranked, HIVE_BUDGET) }) catch return;
     defer gpa.free(user);
     const reply = llm.chat(gpa, w.io, w.run_dir, "synthesis", w.base_url, w.key, w.model, sys, user, 2048);
     defer gpa.free(reply.content);
@@ -3729,7 +3741,7 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
         (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(@constCast(pb_ranked));
     const pb_part = if (playbook.len > 0)
-        std.fmt.allocPrint(gpa, " YOUR SWARM'S OPERATING PLAYBOOK — process rules your swarm authored for ITSELF; treat them as binding and FOLLOW them:\n{s}\n", .{playbookView(playbook, pb_ranked, PB_BUDGET)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, " YOUR SWARM'S OPERATING PLAYBOOK — process rules your swarm authored for ITSELF; treat them as binding and FOLLOW them:\n{s}\n", .{memoryView(playbook, pb_ranked, PB_BUDGET)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(pb_part);
@@ -5729,21 +5741,24 @@ pub fn clip(s: []const u8, n: usize) []const u8 {
     return if (s.len > n) s[0..n] else s;
 }
 
-/// How much of the swarm's self-authored playbook reaches a mind, and WHICH part when it cannot all fit.
+/// How much of a memory scope reaches a prompt, and WHICH part of it when the whole will not fit.
 ///
-/// The playbook is binding, so while it fits every rule goes in — that case is untouched. What changed is
-/// the overflow. The block was `clipTail`'d, so the rules that survived were simply the most RECENT, and
-/// age is not importance: at roughly 150 bytes a rule the window held about eight, so from the ninth round
-/// on the swarm's earliest and most fundamental directive was invisible to every mind — while
-/// roundRetrospective's dedup, which reads the FULL scope, still refused to re-mint it. Dropped from the
-/// prompt and unrecoverable at the same time; the longer a run went, the more of its own learning it
-/// carried around without being able to use.
+/// While it fits, everything goes in — that case is untouched everywhere this is used. What this changes is
+/// the OVERFLOW, which used to be decided by position: `clipTail` kept the most recent, `clip` kept the
+/// oldest, and neither has anything to do with what the prompt is actually for.
 ///
-/// Overflow now degrades by RELEVANCE instead, which is what the skills and knowledge blocks built beside
-/// it already do. Pulled out as a pure function because the part worth pinning is the DIRECTION: `assoc`
-/// returns best-first and must keep its HEAD, while the raw scope list is oldest-first and keeps its TAIL.
-/// Getting that backwards hands over precisely the least relevant rules and still looks like it works.
-fn playbookView(raw: []const u8, ranked: []const u8, budget: usize) []const u8 {
+/// The playbook showed how much that costs. It is binding and it was `clipTail`'d to ~1200 bytes — about
+/// eight rules at ~150 bytes each — so from the ninth round on the swarm's earliest and most fundamental
+/// directive was invisible to every mind, while roundRetrospective's dedup, which reads the FULL scope,
+/// still refused to re-mint it: out of the prompt and unrecoverable at the same time. The final synthesis
+/// had the mirror image, `clip`ping the hive to its OLDEST notes, so the report the user actually receives
+/// was grounded in what the team learned first and blind to everything after.
+///
+/// Overflow degrades by RELEVANCE instead, which is what the skills and knowledge blocks have always done.
+/// Pure, because the part worth pinning is the DIRECTION: `assoc` returns best-first and must keep its
+/// HEAD, while a raw scope list is oldest-first and keeps its TAIL. Getting that backwards hands over
+/// precisely the least relevant material and still looks like it works.
+fn memoryView(raw: []const u8, ranked: []const u8, budget: usize) []const u8 {
     if (raw.len <= budget) return raw;
     if (ranked.len > 0) return clip(ranked, budget);
     return clipTail(raw, budget); // nothing ranked came back: recency, as before
@@ -10744,15 +10759,15 @@ test "the playbook keeps every rule while it fits, then survives by relevance ra
 
     // While it fits, a BINDING playbook is not selected from at all.
     const small = "rule one\nrule two\n";
-    try std.testing.expectEqualStrings(small, playbookView(small, "", budget));
-    try std.testing.expectEqualStrings(small, playbookView(small, "ranked would be ignored\n", budget));
+    try std.testing.expectEqualStrings(small, memoryView(small, "", budget));
+    try std.testing.expectEqualStrings(small, memoryView(small, "ranked would be ignored\n", budget));
 
     const big = "oldest rule aaaaaaaaaaaaaaaaaaaa\nmiddle rule bbbbbbbbbbbbbbbbbb\nnewest rule cccccccccccccccccc\n";
     try std.testing.expect(big.len > budget); // the premise, not an assumption
 
     // Overflowing with nothing ranked: recency, exactly as before — and this is the loss being fixed.
     // The swarm's FIRST rule is the one that disappears, every time, on nothing but its age.
-    const by_age = playbookView(big, "", budget);
+    const by_age = memoryView(big, "", budget);
     try std.testing.expect(std.mem.indexOf(u8, by_age, "newest") != null);
     try std.testing.expect(std.mem.indexOf(u8, by_age, "oldest") == null);
 
@@ -10760,13 +10775,27 @@ test "the playbook keeps every rule while it fits, then survives by relevance ra
     // best-first. Clipping this from the tail would compile, pass a size check, and hand the mind the
     // least relevant rules it has.
     const ranked = "most relevant rule\nless relevant rule\nleast relevant rule\n";
-    const by_rel = playbookView(big, ranked, budget);
+    const by_rel = memoryView(big, ranked, budget);
     try std.testing.expect(std.mem.indexOf(u8, by_rel, "most relevant") != null);
     try std.testing.expect(std.mem.indexOf(u8, by_rel, "least relevant") == null);
     try std.testing.expect(by_rel.len <= budget);
 }
 
-test "the prompt block actually CALLS playbookView — a unit test alone would not notice" {
+test "the final report's team notes go through memoryView too" {
+    // The report the USER receives. Its hive block was `clip`ped, so it was grounded in the team's oldest
+    // notes and blind to everything learned after them — the mirror of the playbook's recency window, and
+    // on the one output that leaves the machine. Needle split so this cannot match its own source.
+    const src = @embedFile("run.zig");
+    const marker = "=== TEAM NOTES (hive " ++ "memory) ===";
+    const at = std.mem.indexOf(u8, src, marker) orelse return error.SynthesisNotesBlockMissing;
+    const around = src[at..@min(src.len, at + 700)];
+    if (std.mem.indexOf(u8, around, "memoryView") == null) {
+        std.log.warn("run.zig: the final report's hive block no longer calls memoryView — it is back to reporting the OLDEST notes", .{});
+        return error.SynthesisSelectorNotWired;
+    }
+}
+
+test "the prompt block actually CALLS memoryView — a unit test alone would not notice" {
     // 0086's lesson, and it lands exactly here: the selector above can be perfect while the prompt still
     // pastes `clipTail(playbook, ...)` straight in, and every unit assertion keeps passing. The needle is
     // split so this test cannot match its own source.
@@ -10774,8 +10803,8 @@ test "the prompt block actually CALLS playbookView — a unit test alone would n
     const marker = "YOUR SWARM'S OPERATING " ++ "PLAYBOOK";
     const at = std.mem.indexOf(u8, src, marker) orelse return error.PlaybookPromptBlockMissing;
     const around = src[at -| 700 .. @min(src.len, at + 400)];
-    if (std.mem.indexOf(u8, around, "playbookView") == null) {
-        std.log.warn("run.zig: the playbook prompt block no longer calls playbookView — its overflow is back to dropping rules by age", .{});
+    if (std.mem.indexOf(u8, around, "memoryView") == null) {
+        std.log.warn("run.zig: the playbook prompt block no longer calls memoryView — its overflow is back to dropping rules by age", .{});
         return error.PlaybookSelectorNotWired;
     }
 }
