@@ -2258,3 +2258,33 @@ edit, confirm it applied, then run.
 - next (verified): three findings from wf_8f5e3c7c-ed1 remain (agi's percent-vs-count comparison, the
   unreachable has_plan disjunct, the tick path's missing one-run guard), each needing re-derivation
   per 0085.
+
+## 0088 — 2026-07-25 — a scheduled task could run itself in parallel, forever
+- did: `launchRun`'s only duplicate protection was `tryBeginTurn(conv)`, and its own comment states
+  the limit precisely — a false there means "a same-named run from this MINUTE is still going". A
+  conv id is stamped to the minute, so the guard cannot see the case that actually piles up: an
+  every-N-minute task whose run OUTLIVES N. The next tick mints a different stamp, claims a different
+  conv cleanly, and starts a second run of the same task beside the first. The tick after that starts
+  a third. Nothing errors; the task just multiplies.
+- the asymmetry is the point. The MANUAL run route has guarded this for a while, via
+  `liveTurnWithPrefix`, and names the cost outright: "double the tokens for the same deliverable". A
+  human clicking twice is rare and self-limiting. A scheduler firing every five minutes against a
+  twelve-minute run is neither. The path that needed the guard most had it least — and the guard was
+  already written, one file over, unused by the caller that needed it.
+- did: the same prefix check in `launchRun`, placed BEFORE the run-dir creation and message build so
+  a duplicate costs nothing at all. Skipping without bookkeeping is the established shape here:
+  `next_due` is untouched, so the task fires on a later tick once the run finishes.
+- ratchet: a test that reproduces the exact hole — two conv ids for one task ten minutes apart, the
+  conv-id claim succeeding for BOTH (that is the pile-up), and the prefix guard refusing the second
+  because it matches the task rather than the minute. Plus an assertion that a DIFFERENT task is
+  still free to run, so the guard is not a global lock. Plus a wiring audit (0086).
+- verified: src suite exit 0. Counterfactual clean on the first attempt this time — injection
+  printed, exit 1, the NAMED test failed with its message, and zero compile errors in the log. That
+  last check is 0087's lesson made routine: exit 1 is not evidence until you know WHICH test produced
+  it. Full oracle green.
+- learned: three of this sitting's fixes were "the guard exists, the caller does not use it"
+  (ORCH_TOOLS unfiltered, isDecline unwired after extraction, now this). That is a different shape
+  from a missing guard and it hides better, because a reader who greps for the protection FINDS it
+  and stops looking. Worth asking of any safety mechanism: who calls this, and is that everyone?
+- next (verified): two findings from wf_8f5e3c7c-ed1 remain — agi's percent-vs-count comparison and
+  the unreachable has_plan disjunct. Both need re-derivation first (0085).
