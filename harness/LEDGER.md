@@ -2228,3 +2228,33 @@ edit, confirm it applied, then run.
 - verified: src suite exit 0; both counterfactuals (unit and wiring) fail by name; full oracle green.
 - next (verified): four findings from wf_8f5e3c7c-ed1 remain, each needing its own re-derivation
   first — 0085 records why the confirmations are not trustworthy on their own.
+
+## 0087 — 2026-07-25 — prose after the answer could mark a subtask complete
+- did: `planReconcile` asks a model which subtasks are already done and parsed the reply by taking
+  EVERYTHING from "done:" to the end, tokenizing on `, \r\n\t`, and marking DONE any token that
+  parsed as an in-range integer. So a model that answered and then explained itself —
+  "done: 1, 2\nSubtask 3 is still in progress", "done: 2 (took 3 tries)" — silently marked work
+  complete that was not. The old comment said "'none' and stray prose just skip": true of
+  non-numeric tokens, and exactly wrong about a numeral INSIDE prose, which is the case that occurs.
+- consequence, which is why this is worth more than its size: a subtask wrongly DONE is never
+  revisited. The turn stops working on it and the deliverable ships short, with the plan board
+  reporting success. Nothing errors.
+- did: `parseDoneList`, bounded twice — stop at the end of the answer LINE, and stop at the first
+  token that is not a number. Both fail SAFE, and the second is a deliberate trade: "done: 1 and 2"
+  now yields only 1. A subtask left PENDING is re-examined by the next reconcile pass and the work
+  continues; a subtask wrongly DONE is unrecoverable. When two failure directions are not symmetric,
+  bound toward the recoverable one — and assert the truncation in the test so it reads as a decision
+  rather than a bug someone later "fixes".
+- ratchet: the parser's tests plus a WIRING audit (0086's lesson, applied in the same sitting it was
+  learned) — `planReconcile` must call `parseDoneList`, or an extraction becomes the hiding place.
+- verified, and the counterfactual took THREE attempts, which is the entry's real lesson:
+  * #1 never injected — my Python escaping of `'\n'` did not match the file, so exit 0 meant nothing.
+  * #2 injected but failed to COMPILE ("local variable is never mutated"), so exit 1 also meant
+    nothing — a red for a reason unrelated to the claim.
+  * #3 kept the variable mutated and removed only the bound; the NAMED test failed. That is the
+    only one of the three that proved anything.
+  Two of three counterfactual runs produced a verdict that looked usable and was not. Checking WHICH
+  test fired — not merely that the exit code moved — is the whole discipline. Full oracle green.
+- next (verified): three findings from wf_8f5e3c7c-ed1 remain (agi's percent-vs-count comparison, the
+  unreachable has_plan disjunct, the tick path's missing one-run guard), each needing re-derivation
+  per 0085.

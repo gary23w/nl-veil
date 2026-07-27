@@ -3857,12 +3857,9 @@ fn planReconcile(app: *App, llm_dir: []const u8, conv_dir: []const u8, trio: Mod
     defer step.deinit(gpa);
     meterEnd(app, cm, "planrec", .prompting, pr.model, step.ok);
     if (!step.ok or step.content.len == 0) return;
-    const at = std.mem.indexOf(u8, step.content, "done:") orelse return;
-    var it = std.mem.tokenizeAny(u8, step.content[at + 5 ..], ", \r\n\t");
+    var idx_buf: [32]usize = undefined;
     var advanced: usize = 0;
-    while (it.next()) |tok| {
-        const n = std.fmt.parseInt(usize, tok, 10) catch continue; // 'none' and stray prose just skip
-        if (n == 0 or n > plan.len) continue;
+    for (parseDoneList(step.content, plan.len, &idx_buf)) |n| {
         if (!std.mem.eql(u8, plan[n - 1].status, cplan.STATUS_PENDING)) continue;
         cplan.setStatus(gpa, &plan[n - 1], cplan.STATUS_DONE);
         advanced += 1;
@@ -7085,4 +7082,66 @@ test "every AUXILIARY completion bounds its prompt — only the real turn sends 
     // ...and the streamed turn DOES still send the whole transcript. If this ever stops being true the
     // rule above has been satisfied by crippling the actual conversation, which is not the intent.
     try std.testing.expect(std.mem.indexOf(u8, SRC, "completeStream(" ) != null);
+}
+
+/// The subtask numbers a planrec reply marks complete, from "done: 1, 2". Returns a slice of `out`.
+///
+/// BOUNDED TWICE, and both bounds fail SAFE. This used to tokenize everything from "done:" to the end of
+/// the reply and mark DONE any token that parsed as an in-range integer — so a model that answered the
+/// question and then explained itself ("done: 1, 2\nSubtask 3 is still in progress", "done: 2 (took 3
+/// tries)") silently marked work complete that was not. The old comment said "'none' and stray prose just
+/// skip", which is true of non-numeric tokens and exactly wrong about a numeral INSIDE prose — the case
+/// that occurs.
+///
+/// So: stop at the end of the ANSWER LINE, and stop at the first token that is not a number. The second
+/// bound can truncate a legitimate list ("done: 1 and 2" yields only 1), and that is the deliberate
+/// trade: a subtask left PENDING is re-examined by the next reconcile pass and the work continues, while
+/// a subtask wrongly marked DONE is never revisited and ships incomplete. When the two failures are not
+/// symmetric, bound toward the recoverable one. (Ledger 0087.)
+fn parseDoneList(content: []const u8, plan_len: usize, out: []usize) []const usize {
+    const at = std.mem.indexOf(u8, content, "done:") orelse return out[0..0];
+    var rest = content[at + 5 ..];
+    if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| rest = rest[0..nl]; // the answer is one line
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, rest, ", \t\r");
+    while (it.next()) |tok| {
+        const v = std.fmt.parseInt(usize, tok, 10) catch break; // first non-number ends the list
+        if (v == 0 or v > plan_len) continue; // out of range: skip, but keep reading the list
+        if (n >= out.len) break;
+        out[n] = v;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "parseDoneList: prose after the answer can no longer mark a subtask complete" {
+    var buf: [32]usize = undefined;
+    // The shape that motivated this: the model answers, then explains. "3" is a token in that prose.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, parseDoneList("done: 1, 2\nSubtask 3 is still in progress", 5, &buf));
+    // Same failure on one line, via a parenthetical count.
+    try std.testing.expectEqualSlices(usize, &.{2}, parseDoneList("done: 2 (took 3 tries)", 5, &buf));
+    // The ordinary answers still work.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, parseDoneList("done: 1, 2, 3", 5, &buf));
+    try std.testing.expectEqualSlices(usize, &.{2}, parseDoneList("done:2", 5, &buf));
+    // A decline marks nothing, and so does a missing header.
+    try std.testing.expectEqual(@as(usize, 0), parseDoneList("done: none", 5, &buf).len);
+    try std.testing.expectEqual(@as(usize, 0), parseDoneList("nothing to report", 5, &buf).len);
+    // Out of range is skipped without ending the list — a hallucinated index must not eat the real ones.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, parseDoneList("done: 1, 9, 2", 5, &buf));
+    // The deliberate truncation, asserted so it is a decision on the record rather than a surprise:
+    // a subtask left pending is recoverable, one wrongly marked done is not.
+    try std.testing.expectEqualSlices(usize, &.{1}, parseDoneList("done: 1 and 2", 5, &buf));
+}
+
+test "planReconcile actually CALLS parseDoneList — the extraction must not become the hiding place" {
+    // 0086's lesson, applied the same session it was learned: a unit test proves the parser is right and
+    // says nothing about whether the reconciler uses it. Without this, reverting the call site to the old
+    // unbounded tokenizer leaves the suite green.
+    const SRC = @embedFile("engine.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn planReconcile") orelse return error.PlanReconcileMissing;
+    const body = SRC[at..@min(at + 4000, SRC.len)];
+    if (std.mem.indexOf(u8, body, "parseDoneList(") == null) {
+        std.debug.print("\nplanReconcile no longer calls parseDoneList — prose digits can mark subtasks complete again\n", .{});
+        return error.DoneListParserNotWired;
+    }
 }
