@@ -6196,7 +6196,10 @@ fn parseDeclaredChecks(gpa: std.mem.Allocator, goal: []const u8) DeclaredChecks 
             'p' => {
                 var u = body;
                 if (std.mem.startsWith(u8, u, "GET ")) u = std.mem.trimStart(u8, u[4..], " \t");
-                if (std.mem.indexOfAny(u8, u, " \t")) |sp| u = u[0..sp];
+                // Newline counts as whitespace here, and not only for tidiness: `probes` is joined BY
+                // newline, so one left inside a token does not merely dirty it — it splits into two
+                // probe entries, and the bogus second one fails a deliverable that is really serving.
+                if (std.mem.indexOfAny(u8, u, " \t\r\n")) |sp| u = u[0..sp];
                 if (std.mem.startsWith(u8, u, "http://") or std.mem.startsWith(u8, u, "https://")) {
                     if (probes.items.len > 0) probes.append(gpa, '\n') catch {};
                     probes.appendSlice(gpa, u) catch {};
@@ -6221,6 +6224,19 @@ test "parseDeclaredChecks: a one-line goal composes VERIFY rows, one SMOKE, and 
     try std.testing.expectEqualStrings("cargo build\ncargo test -- --test-threads=1", dc.checks);
     try std.testing.expectEqualStrings("cargo run", dc.smoke);
     try std.testing.expectEqualStrings("http://127.0.0.1:8047/api/stats\nhttp://127.0.0.1:8047/", dc.probes);
+}
+
+test "parseDeclaredChecks: a PROBE url ends at a newline, so a multi-line goal yields ONE probe" {
+    const gpa = std.testing.allocator;
+    // The doc says a PROBE is one whitespace-delimited token, but the split was on space and tab only.
+    // Goals are written by people and are not always one line; since probes are joined BY newline, the
+    // leftover newline turned a single url into two entries — the real one, plus a fragment of the
+    // next sentence that can never answer 2xx and so holds a deliverable that is actually up.
+    const dc = parseDeclaredChecks(gpa, "Build it.\nPROBE: http://127.0.0.1:8047/api/stats\nthen some trailing prose.");
+    defer if (dc.checks.len > 0) gpa.free(@constCast(dc.checks));
+    defer if (dc.smoke.len > 0) gpa.free(@constCast(dc.smoke));
+    defer if (dc.probes.len > 0) gpa.free(@constCast(dc.probes));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8047/api/stats", dc.probes);
 }
 
 test "parseDeclaredChecks: goals without markers declare nothing; non-http probes and empty bodies drop" {

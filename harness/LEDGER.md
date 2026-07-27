@@ -2568,3 +2568,26 @@ edit, confirm it applied, then run.
   test fails. Full oracle green.
 - next (verified): two audit-3 findings left — writer.zig's seedSources provenance, and run.zig's
   PROBE url newline delimiter.
+
+## 0098 — 2026-07-26 — a PROBE url split in two at a newline and failed a deliverable that was up
+- did: the declared-acceptance parser documents a PROBE as "exactly one whitespace-delimited url
+  token", but the token ended at a space or a tab only — never a newline. Goals are written by people
+  and are not always one line.
+- why that is not cosmetic: `probes_str` is JOINED BY NEWLINE. A newline left inside a token does not
+  merely dirty the url, it splits it into TWO probe entries — the real one, plus a fragment of the
+  next sentence. That fragment can never answer 2xx, so the acceptance oracle holds a deliverable that
+  is genuinely serving, and the run cannot complete. A delimiter collision between the token grammar
+  and the storage encoding.
+- did: one character class. Checked whether VERIFY rows have the same shape — they do split on
+  interior newlines, but there each line is a separate shell command, which is defensible. Left it,
+  rather than widening a fix into a place where the behaviour is arguably correct.
+- learned, and this one nearly cost the increment: the first counterfactual reported CF_EXIT=0 with
+  CF_INJECTIONS=0. Bash had eaten the `\t` in my python one-liner and turned it into a real tab, so
+  the replacement matched nothing and I "verified" an unmodified tree. Green from a counterfactual
+  that never injected is the same lie as green from one that never compiled (0087) — which is exactly
+  why the injection COUNT is printed. Redone through the Edit tool, which passes text literally, and
+  confirmed the injected line by grep before believing the run.
+- verified: suite exit 0, 0 compile errors. CF restore the space/tab-only split -> named test fails,
+  0 compile errors, injection confirmed present by grep first. Tree byte-identical to pre-CF after
+  restore. Full oracle green.
+- next (verified): one audit-3 finding left — writer.zig's seedSources provenance.
