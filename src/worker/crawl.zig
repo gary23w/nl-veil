@@ -248,6 +248,9 @@ fn classIdWeight(node: *const Node) f64 {
     return s;
 }
 
+/// chars of text at which the length signal is fully earned; past this, longer stops meaning better
+const LEN_SATURATION: f64 = 1000;
+
 fn compositeScore(node: *const Node, m: Metrics) f64 {
     var score: f64 = 0;
     var total: f64 = 0;
@@ -260,9 +263,15 @@ fn compositeScore(node: *const Node, m: Metrics) f64 {
     total += 0.2;
     score += 0.2 * tagWeight(node.tag);
     total += 0.2;
-    score += 0.1 * @max(0, classIdWeight(node));
+    // classIdWeight only ever returns 0, -0.5 or -1.0, so clamping it at 0 discarded it entirely:
+    // the one signal that says "this block is chrome" was computed and thrown away on every node.
+    score += 0.1 * classIdWeight(node);
     total += 0.1;
-    score += 0.1 * @log(tl + 1);
+    // Every other term is a ratio in [0,1], which is the only thing that makes `score / total` a
+    // weighted average. This one was a raw logarithm: an ordinary 150-char paragraph scored 1.28 out
+    // of a possible 1.0, and the inflation carried boilerplate above THRESHOLD however much chrome it
+    // was. Same "longer is more contentful" shape, now bounded like its siblings.
+    score += 0.1 * @min(1.0, @log(tl + 1) / @log(LEN_SATURATION + 1));
     total += 0.1;
     return if (total > 0) score / total else 0;
 }
@@ -902,6 +911,45 @@ pub fn extractLinks(gpa: std.mem.Allocator, html: []const u8, base_url: []const 
 
 // Unit tests for the pure crawl/search surface. std.testing.allocator is leak-checking, so these guard the
 // search hot path against allocation leaks.
+
+test "compositeScore stays inside the weighted average it divides by" {
+    // `score / total` is only a weighted average if every term lands in [0,1]. The length term was a
+    // raw logarithm, so this returned 1.284 for an ordinary paragraph -- above the maximum the
+    // divisor allows for. Anything over 1.0 means a term outgrew its weight again.
+    const node = Node{ .tag = "p" };
+    for ([_]usize{ 0, 1, 40, 150, 1000, 100_000 }) |tl| {
+        const m = Metrics{ .text_len = tl, .tag_len = tl + 7, .link_text_len = 0 };
+        const s = compositeScore(&node, m);
+        try std.testing.expect(s <= 1.0);
+        try std.testing.expect(s >= 0.0);
+    }
+}
+
+test "a negative class actually lowers the score instead of being clamped away" {
+    // classIdWeight returns 0, -0.5 or -1.0, so @max(0, ...) meant chrome and content scored alike.
+    const plain = Node{ .tag = "div" };
+    const chrome = Node{ .tag = "div", .class = "sidebar-ads" };
+    const m = Metrics{ .text_len = 150, .tag_len = 400, .link_text_len = 150 };
+    try std.testing.expect(compositeScore(&chrome, m) < compositeScore(&plain, m));
+}
+
+test "extract drops negative-class chrome and keeps the article" {
+    const gpa = std.testing.allocator;
+    // class="nav"/"footer" on a plain div, not a <nav> tag: the tag path was already excluded, the
+    // class path is the one the discarded penalty was supposed to catch.
+    const html = "<html><head><title>T</title></head><body>" ++
+        "<div class=\"nav\"><a href=\"/a\">Home</a><a href=\"/b\">About</a><a href=\"/c\">Contact</a></div>" ++
+        "<article><p>The composite score decides which blocks survive pruning, and a paragraph of " ++
+        "genuine prose like this one must always outrank the chrome around it.</p></article>" ++
+        "<div class=\"footer\"><a href=\"/p\">Privacy</a><a href=\"/t\">Terms</a></div>" ++
+        "</body></html>";
+    const r = extract(gpa, html, "https://example.com");
+    defer gpa.free(@constCast(r.markdown));
+    defer gpa.free(@constCast(r.title));
+    try std.testing.expect(std.mem.indexOf(u8, r.markdown, "genuine prose") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.markdown, "About") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.markdown, "Privacy") == null);
+}
 
 test "hostOf extracts the host (or empty when there's no scheme)" {
     try std.testing.expectEqualStrings("www.example.com", hostOf("https://www.example.com/path?q=1"));

@@ -2439,3 +2439,40 @@ edit, confirm it applied, then run.
 - next (verified): audit 3 has five standing findings left — writer.zig's per-round/run-cumulative ratio
   and its seedSources provenance, run.zig's PROBE url newline delimiter, crawl.zig's unreachable
   boilerplate gate, metrics.zig's all-zero answer past 16 MB (the 0084 reader-cap shape again).
+
+## 0094 — 2026-07-26 — the content scorer threw away the only signal that said "boilerplate"
+- did: `compositeScore` blends five signals and returns `score / total`, where `total` is the sum of the
+  weights — arithmetic that is a weighted average ONLY if every term lands in [0,1]. Two of the five
+  were broken, and they reinforced each other.
+  - `0.1 * @max(0, classIdWeight(node))`: classIdWeight returns 0, -0.5 or -1.0 and nothing else, so
+    the clamp made the term identically zero. The one signal that says "this block is nav / footer /
+    sidebar / ads" was computed on every node and then discarded.
+  - `0.1 * @log(tl + 1)`: a raw logarithm sitting among four ratios. Unbounded.
+- the measurement, not the impression: an ordinary 150-char paragraph scored 1.284 out of a possible
+  1.0 — the divisor's own definition says that cannot happen. The same inflation lifted a pure-nav
+  block (150 chars, all of it link text) to 0.752, well clear of the 0.48 prune threshold. So both
+  boilerplate gates in pruneTree were dead in practice: chrome could not score low enough to trip them
+  however much chrome it was.
+- what it cost: nav bars, footers, cookie banners and share widgets survived pruning into the markdown
+  that every web tool hands the model — on every crawled page, in every prompt. Widest blast radius of
+  any token-spend defect found so far.
+- did: apply the penalty (bounded, {0, -0.05, -0.1}) and normalise the length term to [0,1] against a
+  1000-char saturation, same "longer is more contentful" shape. Worked on paper BEFORE editing:
+  nav div 0.752 -> 0.273 (pruned), short nav span 0.315 -> 0.127 (pruned), article paragraph
+  1.284 -> 0.855 (kept), h2 heading -> 0.666 (kept).
+- pruneTree and compositeScore had ZERO tests before this. Three now: the invariant (a score never
+  exceeds the average it divides by), the penalty's direction, and an end-to-end extract that keeps the
+  article and drops class="nav" / class="footer".
+- learned: `zig build test` printed EXIT=0 while its own log ended at "failed command:" with no Build
+  Summary — a network test had died on CONNECTION_REFUSED, unrelated to this change. Running the cached
+  test.exe directly gave the truth: 543/543. The ledger already knew this harness lies; what is new is
+  that it lied GREEN, which is the dangerous direction. Prefer the binary when the summary is missing.
+- learned: I nearly took the audit's word that these gates were "unreachable". They are not literally
+  unreachable — they fire for tiny nodes. Doing the arithmetic turned a vague claim into a specific
+  one, and only the specific one justified touching a heuristic that decides what every crawl keeps.
+- verified: 543/543 direct, exit 0. CF-A restore the clamp -> "a negative class actually lowers the
+  score" fails, 0 compile errors. CF-B restore the raw log -> "compositeScore stays inside the weighted
+  average" fails, 0 compile errors. Full oracle green.
+- next (verified): four audit-3 findings left — writer.zig's per-round/run-cumulative ratio and its
+  seedSources provenance, run.zig's PROBE url newline delimiter, metrics.zig's all-zero answer past
+  16 MB (the 0084 reader-cap shape).
