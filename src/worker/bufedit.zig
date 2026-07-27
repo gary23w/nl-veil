@@ -257,9 +257,24 @@ pub fn apply(gpa: std.mem.Allocator, original: []const u8, ops: []const EditOp) 
         }
     }
 
+    // Bottom-up — and at the SAME line the CONSUMING span (replace/delete) must splice before a
+    // zero-width insert. Without that tie-break this silently corrupted files. `insert_before X` is
+    // span {lo=i, hi=i}; `replace X` is {lo=i, hi=i+1}; the overlap loop above rejects NEITHER
+    // (overlap needs `b.lo < a.hi` — i < i; a_pt_in_b needs `a.lo > b.lo` — i > i). std.mem.sort is
+    // STABLE, so equal `lo` kept append order, the insert spliced FIRST, and the replace's [i, i+1)
+    // window then landed on the freshly inserted line, ate it, and left the original target sitting
+    // untouched below. The caller was told "2 op(s) applied" while one op's content had vanished and
+    // the other's target had not changed.
+    //
+    // Ordering the consuming span first yields what the ops plainly mean — new text above the
+    // replacement — rather than rejecting a batch whose intent is unambiguous. Two spans of the SAME
+    // kind still compare equal, so the stable sort keeps their relative order and nothing else moves.
+    // hashline.zig tied on op INDEX and carried the mirror of this bug in the opposite op order;
+    // both now tie on span KIND. (Ledger 0091.)
     std.mem.sort(Span, spans.items, {}, struct {
         fn lt(_: void, x: Span, y: Span) bool {
-            return x.lo > y.lo;
+            if (x.lo != y.lo) return x.lo > y.lo;
+            return !x.insert and y.insert;
         }
     }.lt);
 
@@ -672,4 +687,65 @@ test "parseNarrated reads multiple SEARCH/REPLACE blocks with a multi-line ancho
     try std.testing.expectEqualStrings("const a = 10;\nconst b = 20;", n.ops[0].text);
     try std.testing.expectEqualStrings("foo();", n.ops[1].anchor);
     try std.testing.expectEqualStrings("bar();", n.ops[1].text);
+}
+
+test "an insert and a replace on the SAME line: the insert is not eaten, in either op order" {
+    // SILENT CORRUPTION, found by audit and reproduced here. `insert_before X` is a zero-width span
+    // at line i; `replace X` is [i, i+1). The overlap loop rejects neither, and a STABLE sort with no
+    // tie-break spliced the insert first — so the replace's window landed on the just-inserted line,
+    // consumed it, and left the original target untouched below. apply() returned ok, and the tool
+    // told the model "2 op(s) applied", while one op's content had vanished and the other's target
+    // had not changed. The file types this hits silently are the delimiter-BALANCED ones — HTML,
+    // JSX, CSS, markdown, YAML — because the syntax backstop in tools.zig only catches the rest.
+    const gpa = std.testing.allocator;
+    const src = "<body>\n  <main>\n  </main>\n</body>\n";
+
+    // Order A: insert listed first (the order that corrupted).
+    {
+        const ops = [_]EditOp{
+            .{ .kind = .insert_before, .anchor = "  <main>", .text = "  <header>hi</header>" },
+            .{ .kind = .replace, .anchor = "  <main>", .text = "  <main class=\"wide\">" },
+        };
+        const r = apply(gpa, src, &ops);
+        defer gpa.free(r.bytes);
+        defer gpa.free(r.reject);
+        defer gpa.free(r.loci);
+        try std.testing.expect(r.ok);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<header>hi</header>") != null); // was DROPPED
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<main class=\"wide\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "\n  <main>\n") == null); // the target was left behind
+        // ...and the insert lands ABOVE the replacement, which is what insert_before means.
+        const h = std.mem.indexOf(u8, r.bytes, "<header>").?;
+        const m = std.mem.indexOf(u8, r.bytes, "<main class").?;
+        try std.testing.expect(h < m);
+    }
+    // Order B: replace listed first — worked before, must keep working.
+    {
+        const ops = [_]EditOp{
+            .{ .kind = .replace, .anchor = "  <main>", .text = "  <main class=\"wide\">" },
+            .{ .kind = .insert_before, .anchor = "  <main>", .text = "  <header>hi</header>" },
+        };
+        const r = apply(gpa, src, &ops);
+        defer gpa.free(r.bytes);
+        defer gpa.free(r.reject);
+        defer gpa.free(r.loci);
+        try std.testing.expect(r.ok);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<header>hi</header>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<main class=\"wide\">") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "\n  <main>\n") == null);
+    }
+    // insert_after + replace on the same anchor: the same shape one line down.
+    {
+        const ops = [_]EditOp{
+            .{ .kind = .insert_after, .anchor = "  <main>", .text = "  <p>x</p>" },
+            .{ .kind = .replace, .anchor = "  </main>", .text = "  </main><!--end-->" },
+        };
+        const r = apply(gpa, src, &ops);
+        defer gpa.free(r.bytes);
+        defer gpa.free(r.reject);
+        defer gpa.free(r.loci);
+        try std.testing.expect(r.ok);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<p>x</p>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.bytes, "<!--end-->") != null);
+    }
 }
