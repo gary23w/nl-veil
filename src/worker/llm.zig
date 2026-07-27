@@ -1963,6 +1963,20 @@ fn streamAttempt(
         }
     }
 
+    // ACCOUNT FOR WHAT THE PROVIDER ALREADY BILLED, on every exit from here down. Nine paths below
+    // `return null` so the caller falls back to complete(), and only the two SUCCESS paths metered — so
+    // a streamed attempt that could not be used (tool calls it could not reconstruct, an error line, an
+    // empty body) had its tokens dropped from every meter, while the fallback that re-sends the same
+    // prompt WAS counted. The bill showed one call; the meters showed the other. That silently
+    // under-reports real spend and misattributes what remains — and the per-label view added in 0079
+    // reads straight off these meters, so the numbers a human optimises from inherited the gap.
+    //
+    // meterStream is a no-op unless the provider actually reported usage (`st.metered`), so this is
+    // harmless on paths where nothing was billed. Double counting is impossible by construction: the
+    // two sites that meter explicitly set `reported` first. (Ledger 0092.)
+    var reported = false;
+    defer if (!reported) meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
+
     // ABORTED mid-stream (chat Stop): return whatever already streamed as a partial Step — do NOT fall back to
     // complete() (that re-runs the whole inference, defeating the abort) and do NOT take the empty→null path
     // below. ok=true with partial (possibly empty) content; the caller's next stop check commits this.
@@ -1994,6 +2008,7 @@ fn streamAttempt(
                 return null;
             };
             meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
+            reported = true;
             return .{ .content = c_owned, .reasoning = r_owned, .calls = calls, .ok = true, .truncated = st.truncated };
         }
         freeCalls(gpa, calls); // couldn't reconstruct (native miss, or hosted fragments with no usable name) → complete()
@@ -2008,6 +2023,7 @@ fn streamAttempt(
         return null;
     };
     meterStream(&st, local, streamAttrib(io, tag, model, base_url, call_t0));
+    reported = true;
     return .{ .content = c_owned, .reasoning = r_owned, .calls = &.{}, .ok = true, .truncated = st.truncated };
 }
 
@@ -2692,4 +2708,52 @@ test "chat() sends what it claims to: the path, the model, and both message role
     try std.testing.expect(sys < usr);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"user\"") != null);
+}
+
+test "every exit from streamAttempt accounts for what the provider billed" {
+    // This path cannot be exercised without a live SSE provider, so the guard is structural. The bug
+    // it protects: nine of streamAttempt's exits `return null` to fall back on complete(), and only
+    // the two SUCCESS paths metered — so a streamed attempt that could not be used had its tokens
+    // dropped from every meter while the fallback that re-sent the same prompt WAS counted. The
+    // per-label spend view reads straight off these meters, so the numbers a human optimises from
+    // inherited the gap (ledger 0092).
+    //
+    // The invariant, and why it is checkable without running anything: ONE `defer` meters on any exit
+    // that did not already, and EVERY explicit meterStream sets `reported` so the defer cannot
+    // double-count. Delete either half and the accounting breaks in a way no behavioural test here
+    // would notice.
+    const SRC = @embedFile("llm.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn streamAttempt") orelse return error.StreamAttemptMissing;
+    const rest = SRC[at..];
+    const stop = blk: {
+        const a = std.mem.indexOf(u8, rest, "\nfn ");
+        const b = std.mem.indexOf(u8, rest, "\npub fn ");
+        break :blk if (a != null and b != null) @min(a.?, b.?) else (a orelse b orelse rest.len);
+    };
+    const body = rest[0..stop];
+
+    // Exactly one deferred meter — two would double-count, none would drop the fallback paths.
+    var defers: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, body, i, "defer if (!reported) meterStream")) |d| : (i = d + 8) defers += 1;
+    if (defers != 1) {
+        std.debug.print("\nstreamAttempt has {d} deferred meters (want exactly 1) — a fallback exit will drop the provider's bill\n", .{defers});
+        return error.StreamMeterGuardMissing;
+    }
+
+    // ...and every explicit meterStream marks itself, so the defer stays a backstop rather than a
+    // second count. Scan the 120 bytes after each call for the flag.
+    var j: usize = 0;
+    var explicit: usize = 0;
+    while (std.mem.indexOfPos(u8, body, j, "meterStream(&st")) |m| : (j = m + 10) {
+        const line_start = if (std.mem.lastIndexOfScalar(u8, body[0..m], '\n')) |n| n + 1 else 0;
+        if (std.mem.indexOf(u8, body[line_start..m], "defer") != null) continue; // the defer itself
+        explicit += 1;
+        const tail = body[m..@min(m + 120, body.len)];
+        if (std.mem.indexOf(u8, tail, "reported = true") == null) {
+            std.debug.print("\na meterStream in streamAttempt does not set `reported` — the defer will meter it a SECOND time\n", .{});
+            return error.StreamMeterDoubleCount;
+        }
+    }
+    try std.testing.expect(explicit >= 2); // not vacuous: the success paths are still there
 }
