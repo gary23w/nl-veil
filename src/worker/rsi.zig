@@ -411,7 +411,15 @@ pub fn roundRetrospective(w: *Worker, goal: []const u8, round: u32, summaries: [
     var rule = std.mem.trim(u8, reply.content, " \r\n\t\"'`");
     while (rule.len > 0 and (rule[0] == '-' or rule[0] == '*' or rule[0] == '.' or (rule[0] >= '0' and rule[0] <= '9'))) rule = std.mem.trim(u8, rule[1..], " \r\n\t.)\"'`");
     if (rule.len < 8) return;
-    if (std.ascii.eqlIgnoreCase(rule, "none")) return;
+    // A DECLINE IS NOT A RULE. The prompt invites "none" when the round taught nothing, and this used to
+    // test for it with an exact whole-reply match — which can only fire on the bare word, and the bare
+    // word is already caught by the length gate above (4 < 8). So the check was dead for the case it was
+    // written for and blind to every case that actually happens: models decline POLITELY. "None needed.",
+    // "No changes required.", "Nothing to change this round." all clear 8 characters and none equals
+    // "none", so each was minted into PLAYBOOK_SCOPE and injected into every mind's prompt as a binding
+    // operating rule — a sentence instructing nobody to do anything, crowding real directives out of a
+    // clipTail'd window. Match the FIRST WORD, which is where a decline announces itself. (Ledger 0086.)
+    if (isDecline(rule)) return;
     if (rule.len > 200) rule = rule[0..200];
     if (playbook.len > 0 and std.mem.indexOf(u8, playbook, rule[0..@min(rule.len, 24)]) != null) {
         w.act("retro", round, "playbook", "no change", "(playbook already covers it)");
@@ -940,3 +948,66 @@ pub fn planCast(w: *Worker, minds: []MindState, goal: []const u8) void {
     }
     w.act("orchestrator", 0, "cast_plan", if (plan_ev.items.len > 0) plan_ev.items else "team assigned", std.fmt.allocPrint(w.a(), "cast team: {d} scout(s) across {d} minds", .{ scouts, minds.len }) catch "cast team planned");
 }
+
+/// Does this reply DECLINE to give a rule? Keyed on the first word only: a decline announces itself
+/// there ("None needed.", "Nothing to change."), while a real directive almost never opens with one of
+/// these. Deliberately narrow — a false positive silently drops a genuine lesson, which is worse than
+/// letting one weak rule through, so this matches whole words and nothing fuzzier.
+fn isDecline(rule: []const u8) bool {
+    var end: usize = 0;
+    while (end < rule.len and std.ascii.isAlphabetic(rule[end])) end += 1;
+    const first = rule[0..end];
+    for ([_][]const u8{ "none", "nothing", "n", "na" }) |d| {
+        if (std.ascii.eqlIgnoreCase(first, d)) return true;
+    }
+    // "no" alone declines ("no changes", "no lesson"); "not"/"note"/"never" are real rule openers, and
+    // the whole-word match above already keeps them out of this branch.
+    if (std.ascii.eqlIgnoreCase(first, "no")) return true;
+    return false;
+}
+
+test "isDecline: polite refusals are not operating rules, real directives still are" {
+    // The shapes that actually shipped into PLAYBOOK_SCOPE, each >= 8 chars and none equal to "none",
+    // which is why the old exact-match test never saw them.
+    for ([_][]const u8{
+        "None needed.",
+        "None — the run went well.",
+        "no changes required this round",
+        "Nothing to change this round.",
+        "N/A for this round",
+        "NONE, the swarm is on track",
+    }) |decline| try std.testing.expect(isDecline(decline));
+
+    // ...and the rule shapes a retrospective is FOR must still get through. A false positive here is
+    // worse than a weak rule: it silently drops a real lesson and nothing reports the loss.
+    for ([_][]const u8{
+        "Note the failing test's name before rewriting the file.",
+        "Never write a file another mind already owns.",
+        "Not every recall needs a hive query — check your own scope first.",
+        "Read the failure output before editing; the root cause is named in it.",
+        "Northbound API calls need the retry wrapper.",
+        "nominate one mind per file to avoid write collisions",
+    }) |real| try std.testing.expect(!isDecline(real));
+}
+
+test "the retrospective actually CALLS isDecline — a unit test alone would not notice" {
+    // Caught by my own counterfactual: reverting the call site to the old exact-match left isDecline
+    // defined, correct and TESTED, so the suite stayed green while the fix was gone. A unit test proves a
+    // function works; it says nothing about whether anything uses it. Same shape as the sandbox test that
+    // exempted ORCH_TOOLS and the live store test that silently skipped — green for a reason unrelated to
+    // the thing being claimed.
+    const SRC = @embedFile("rsi.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn roundRetrospective") orelse return error.RetroFnMissing;
+    const rest = SRC[at..];
+    const stop = std.mem.indexOf(u8, rest, nl_marker ++ "fn ") orelse rest.len;
+    const body = rest[0..stop];
+    if (std.mem.indexOf(u8, body, "isDecline(") == null) {
+        std.debug.print("\nroundRetrospective no longer calls isDecline — a polite refusal becomes a playbook rule again\n", .{});
+        return error.DeclineGateNotWired;
+    }
+    // ...and the dead exact-match it replaced must not creep back: it can only ever fire on the bare word,
+    // which the length gate already rejects, so its presence means someone restored the blind spot.
+    try std.testing.expect(std.mem.indexOf(u8, body, "eqlIgnoreCase(rule, \"none\")") == null);
+}
+
+const nl_marker = "\n";

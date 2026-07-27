@@ -2199,3 +2199,32 @@ edit, confirm it applied, then run.
   "the thing I claimed would fail, failed" — check WHICH test fired, every time.
 - next (verified): five findings from wf_8f5e3c7c-ed1 remain unimplemented and now carry a health
   warning — re-derive each against the code before acting, the confirmations are not reliable.
+
+## 0086 — 2026-07-25 — a polite refusal became a binding rule for every mind
+- did: the retrospective asks the model for ONE operating rule per round and invites "none" when the
+  round taught nothing. It tested for that with an exact whole-reply match — which can only fire on
+  the bare word, and the bare word is already rejected by the `rule.len < 8` gate one line above. So
+  the check was DEAD for the case it was written for and blind to every case that occurs: models
+  decline politely. "None needed.", "No changes required.", "Nothing to change this round." each
+  clear 8 characters and none equals "none", so each was minted into PLAYBOOK_SCOPE and injected into
+  every mind's prompt as a binding operating rule — a sentence instructing nobody to do anything,
+  crowding real directives out of a clipTail'd 1200-byte window.
+- did: `isDecline` keyed on the FIRST WORD, which is where a decline announces itself, deliberately
+  narrow — a false positive silently drops a genuine lesson, which is worse than one weak rule
+  getting through. The test carries both halves: the refusal shapes that actually shipped, and the
+  rule shapes that must still pass ("Note the failing test's name...", "Never write a file another
+  mind owns", "Northbound API calls...") — all of which a sloppier prefix match would eat.
+- MY OWN COUNTERFACTUAL CAUGHT MY OWN GAP, and this is the part worth keeping. Reverting the call
+  site to the old exact match left the suite GREEN: my test exercised `isDecline` directly, so
+  removing the CALL left the function defined, correct, and unused. A unit test proves a function
+  works and says nothing about whether anything uses it. That is the third distinct instance of this
+  shape in the ledger — the sandbox test that exempted ORCH_TOOLS, the live store test that skipped,
+  now this — all green for a reason unrelated to the claim.
+- ratchet: a wiring audit. `roundRetrospective`'s body must call `isDecline`, and the dead
+  exact-match must not creep back. Counterfactual now fails by name and prints the consequence.
+- learned: "is it correct" and "is it reachable" are separate questions and I keep collapsing them.
+  Every unit test of an extracted predicate needs a companion assertion that the predicate is WIRED,
+  or the extraction itself becomes the hiding place.
+- verified: src suite exit 0; both counterfactuals (unit and wiring) fail by name; full oracle green.
+- next (verified): four findings from wf_8f5e3c7c-ed1 remain, each needing its own re-derivation
+  first — 0085 records why the confirmations are not trustworthy on their own.
