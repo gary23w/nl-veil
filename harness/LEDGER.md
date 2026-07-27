@@ -2476,3 +2476,33 @@ edit, confirm it applied, then run.
 - next (verified): four audit-3 findings left — writer.zig's per-round/run-cumulative ratio and its
   seedSources provenance, run.zig's PROBE url newline delimiter, metrics.zig's all-zero answer past
   16 MB (the 0084 reader-cap shape).
+
+## 0095 — 2026-07-26 — the oracle said ALL GREEN over two test binaries that never reported
+- found while closing 0094: `zig build test` printed EXIT=0 while its own log ended at
+  `failed command: "...test.exe" ... --listen=-` with no Build Summary and no results. Running that
+  exact binary standalone gave 543/543. So the tests were fine — but the ORACLE had no way to know
+  that, and said so anyway.
+- the actual damage, from the log of the run that shipped 0094: gate "zig build test (src suite)"
+  printed PASS with the crash signature inside its own output, and so did "zig build test (desk
+  suite)". BOTH test gates of an ALL GREEN run had learned nothing about the tests. Every green this
+  session is weaker than I reported it, and I only caught it because a crash happened to be loud.
+- why both twins missed it: check.ps1 ALREADY knew this signature and self-heals — but only after a
+  NON-ZERO exit. The case that matters exits ZERO, so the gate passed and the fallback never ran.
+  check.sh did not know the signature at all, and its header said the flake was Windows-only.
+- did: a `zig_tests` wrapper in check.sh that scans the runner's output for the signature and, when it
+  finds it, reruns the exact exe the runner named and takes ITS verdict — refusing to pass if that exe
+  is gone. check.ps1 now decides on the signature instead of the exit status, and records the stderr
+  log so a PASSED gate can be inspected at all (it only kept stdout before).
+- deliberately not suppression: a red that always fires on this machine would train me to ignore it,
+  so the fix goes and GETS the evidence rather than hiding the absence of it.
+- verified: a gate that prints the signature and exits 0 -> FAIL (97), NOT GREEN. And in that same
+  run the desk gate hit the REAL flake and self-healed, printing genuine test output before PASS —
+  the synthetic case and the live one both exercised, in one run. check.ps1 parses clean (PS 5.1
+  ParseFile, 0 errors); check.sh passes `sh -n`. Full oracle green.
+- learned: the harness's own guard was one conjunct away from working, which is the same shape as
+  0090's `has_plan` and 0086's dead `eqlIgnoreCase` — a guard that exists, is correct about WHAT to
+  look for, and is wired to the wrong trigger. Worth grepping for others: "we handle that" is a claim
+  about the trigger, not the handler.
+- next (verified): four audit-3 findings remain — writer.zig's per-round/run-cumulative ratio and its
+  seedSources provenance, run.zig's PROBE url newline delimiter, metrics.zig's all-zero answer past
+  16 MB.

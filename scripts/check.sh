@@ -5,8 +5,9 @@
 # the cheap signals only.
 #
 # Never touches a running app and never installs over zig-out/ (artifacts go to a throwaway
-# prefix). No Defender self-heal here: the test-runner IPC flake is a Windows phenomenon; on
-# Windows use check.ps1.
+# prefix). The test-runner IPC flake self-heals here too (see zig_tests, and its twin in check.ps1):
+# the build runner can exit 0 after the test binary died without reporting, and neither twin may
+# report green on a gate that produced no test verdict at all.
 #
 #   sh scripts/check.sh            gates: catalog sync, server build, src tests, desk tests
 #   sh scripts/check.sh --full     also build the default GUI target (needs GL/X11 deps)
@@ -92,9 +93,29 @@ gate_webjs() {
 }
 gate "web assets parse (node --check app.js)" gate_webjs
 gate "zig build server-only (-Dapp=false)" "$ZIG" build -Dapp=false $CACHE_ARGS --prefix "$PREFIX"
-gate "zig build test (src suite)" "$ZIG" build test $CACHE_ARGS
+# `zig build test` can EXIT 0 after its test binary died without reporting a single result: the build
+# runner prints `failed command: "...test.exe" ... --listen=-` and returns success anyway. Taking that
+# as green means calling the suite passed while knowing nothing whatever about it -- the worst thing an
+# acceptance oracle can do, and it happened on BOTH test gates of a run that printed ALL GREEN. On this
+# machine Defender kills the test IPC and the very same binary passes standalone, so the honest move is
+# not to suppress it but to go get the evidence: rerun the exact exe the runner named and take ITS
+# verdict. A compile error names zig.exe, never a test.exe, so a real red cannot reach this path.
+zig_tests() { # zig_tests <cmd...> -- forwards output, returns a verdict backed by an actual test run
+  raw="${TMPDIR:-/tmp}/nlveil-zt.$$.log"
+  "$@" >"$raw" 2>&1
+  rc=$?
+  cat "$raw"
+  exe=$(sed -n 's/^failed command: "\([^"]*test\.exe\)".*/\1/p' "$raw" | head -1 | sed 's/\\\\/\\/g')
+  rm -f "$raw"
+  [ -n "$exe" ] || return "$rc"
+  echo "   build runner died without naming a test (IPC flake) -- rerunning it standalone:"
+  echo "   $exe"
+  [ -f "$exe" ] || { echo "   that exe is gone -- refusing to call this green"; return 97; }
+  "$exe"
+}
+gate "zig build test (src suite)" zig_tests "$ZIG" build test $CACHE_ARGS
 [ -d desk ] || { echo "no desk/ package"; exit 1; }
-gate_desk() { ( cd desk && "$ZIG" build test $CACHE_ARGS ); }
+gate_desk() { ( cd desk && zig_tests "$ZIG" build test $CACHE_ARGS ); }
 gate "zig build test (desk suite)" gate_desk
 if [ "${1:-}" = "--full" ]; then
   gate "zig build default (GUI merged in)" "$ZIG" build $CACHE_ARGS --prefix "$PREFIX"
