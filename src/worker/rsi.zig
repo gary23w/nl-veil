@@ -513,7 +513,7 @@ pub fn reviewFork(w: *Worker, goal: []const u8, round: u32, round_trace: []const
 /// self-report. Silent no-op when the trace is thin or the model unreachable.
 pub fn runJudge(w: *Worker) void {
     const gpa = w.gpa;
-    const ev = std.Io.Dir.cwd().readFileAlloc(w.io, w.ev_path, gpa, .limited(1 << 20)) catch return;
+    const ev = std.Io.Dir.cwd().readFileAlloc(w.io, w.ev_path, gpa, .limited(run.EVENT_LOG_CAP)) catch return;
     defer gpa.free(ev);
     var lines: std.ArrayListUnmanaged([]const u8) = .empty;
     defer lines.deinit(gpa);

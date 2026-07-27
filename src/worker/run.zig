@@ -3339,7 +3339,7 @@ fn gatherCastFindings(w: *Worker, cap: usize) []u8 {
     const gpa = w.gpa;
     const ev_path = std.fmt.allocPrint(gpa, "{s}/events.jsonl", .{w.run_dir}) catch return &.{};
     defer gpa.free(ev_path);
-    const data = std.Io.Dir.cwd().readFileAlloc(w.io, ev_path, gpa, .limited(8 << 20)) catch return &.{};
+    const data = std.Io.Dir.cwd().readFileAlloc(w.io, ev_path, gpa, .limited(EVENT_LOG_CAP)) catch return &.{};
     defer gpa.free(data);
     var out: std.ArrayListUnmanaged(u8) = .empty;
     const cues = [_][]const u8{ "\"tool\":\"web_search\"", "\"tool\":\"web_fetch\"", "\"tool\":\"deep_crawl\"", "\"tool\":\"scout_learn\"", "\"tool\":\"scout_search\"", "\"tool\":\"observe\"", "\"tool\":\"read_url\"" };
@@ -9845,7 +9845,15 @@ test "neuronsForCfModel agrees with the control plane's rate table on every row 
     try std.testing.expectEqual(ledger.neuronsForModel("unknown", max64, max64), neuronsForCfModel("unknown", max64, max64));
 }
 
-const EVENT_LOG_CAP: usize = 8 << 20;
+/// The event log's ceiling, enforced by `appendFile` below (a self-trimming ring — whole lines drop off
+/// the head to hold the file at this size). PUBLIC because it is half of a CONTRACT: every reader of
+/// events.jsonl must admit at least this much, or it silently sees nothing on a large run.
+/// `readFileAlloc`'s limit ERRORS with StreamTooLong at the limit, it does not truncate — so a reader
+/// that undershoots and swallows the error reads the file as if it were empty. rsi.zig's end-of-run
+/// judge did exactly that with a hardcoded 1 MiB against this 8 MiB writer, and its `catch return` is
+/// the function's first statement, so any run whose log passed 1 MiB went unjudged and left no trace of
+/// the skip. Readers now reference THIS constant instead of restating the number (ledger 0084).
+pub const EVENT_LOG_CAP: usize = 8 << 20;
 fn appendFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, data: []const u8) void {
     const dir = std.Io.Dir.cwd();
     const orig = dir.readFileAlloc(io, path, gpa, .limited(64 << 20)) catch &[_]u8{};
@@ -10650,4 +10658,44 @@ test "buildFitnessBlock: a green score never reads all-green while the runtime g
     // round. The fix is to hoist smokeTest above runBenchmark; it is NOT done here because that reorders
     // a live swarm loop no test in this repo exercises. Whoever does it: these assertions pin the shape
     // the fold-in must keep, so a reorder that breaks the contract fails here instead of in a cast.
+}
+
+test "every events.jsonl reader admits as much as the writer emits" {
+    // HALF A CONTRACT, and the half nobody was checking. appendFile holds the log at EVENT_LOG_CAP;
+    // readFileAlloc's limit ERRORS with StreamTooLong at the limit rather than truncating. So a reader
+    // that undershoots the writer reads a large log as if it were EMPTY — and rsi.zig's end-of-run
+    // judge did exactly that, with a hardcoded 1 MiB against this 8 MiB writer and a `catch return` as
+    // its first statement. Any run whose log passed 1 MiB went unjudged, silently, with no judge_done
+    // row to show it had been skipped (0084).
+    //
+    // The number is now referenced, not restated, so the three run-scoped readers cannot drift from
+    // the writer. This audit catches the OTHER way it comes back: someone writing a fresh literal.
+    const FILES = [_][]const u8{
+        @embedFile("run.zig"),
+        @embedFile("rsi.zig"),
+        @embedFile("control/fanout.zig"),
+    };
+    var readers: usize = 0;
+    for (FILES) |src| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, src, i, "ev_path")) |at| {
+            const bol = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |n| n + 1 else 0;
+            const eol = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+            const line = src[bol..eol];
+            i = at + 7;
+            if (std.mem.indexOf(u8, line, "readFileAlloc") == null) continue;
+            readers += 1;
+            if (std.mem.indexOf(u8, line, "EVENT_LOG_CAP") == null) {
+                std.debug.print(
+                    "\nan events.jsonl reader does not use EVENT_LOG_CAP:\n  {s}\n" ++
+                        "readFileAlloc ERRORS at its limit — a reader under the writer's cap sees a large log as empty.\n",
+                    .{std.mem.trim(u8, line, " \t\r")},
+                );
+                return error.EventLogReaderUnderWriterCap;
+            }
+        }
+    }
+    // Not vacuous: the readers are really there. A refactor that moves or renames them fails here
+    // rather than passing on zero matches.
+    try std.testing.expect(readers >= 3);
 }
