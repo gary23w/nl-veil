@@ -2165,3 +2165,37 @@ edit, confirm it applied, then run.
   the unreachable has_plan disjunct, sched's 45-byte task-id ledger no-op, and the tick path's
   missing one-run-per-task guard. Each has a skeptic's corrected severity attached in this run's
   journal (wf_8f5e3c7c-ed1).
+
+## 0085 — 2026-07-25 — the audit was wrong, and there was a real bug next to it
+- CORRECTION FIRST: the audit filed "the outcome ledger silently no-ops for any task whose id exceeds
+  45 bytes — fail_streak/backoff dead", and its skeptic let it through. I checked the path myself and
+  it is FALSE. `recordRunOutcome` → `safeSeg` (bounds at 64, not 45) → `loadTask`, which builds its
+  path with `allocPrint` — heap, unbounded, no truncation anywhere. There is no 45-byte clip in the
+  outcome-ledger path at all. Filed severity: a dead self-healing ledger. Actual: nothing.
+- but the 45 was real, one function away. `convIdFor` clips the task id to `64 - prefix.len - 9` = 45
+  when minting a run's conv id. The one-run-per-task guard on the manual-run route REBUILDS that
+  prefix to grep live turns and refuse a duplicate — and it hardcoded a bare `45`, hundreds of lines
+  from the expression that derives it. Widen the prefix or the stamp and convIdFor adapts, the guard
+  does not, it stops matching, and the protection lapses silently. Its own comment states the cost:
+  "double the tokens for the same deliverable".
+- did: `CONV_PREFIX`, `CONV_STAMP_BYTES` and `CONV_TASK_CLIP` are derived once and used by both.
+- ratchet, and the assertion is the point: NOT "both use the same constant" — that restates the fix.
+  The test rebuilds the guard's prefix and requires it to be an actual PREFIX OF A MINTED CONV ID,
+  across five id lengths (short, clip-1, exactly clip, clip+1, the 64-byte ceiling). That is the
+  property the feature depends on, and it survives any refactor that keeps the two consistent
+  (TESTING.md's "two derivations of one source must reconcile", 0080).
+- verified, and the first counterfactual was WRONG so I redid it: widening the stamp tripped a
+  DIFFERENT pre-existing test before reaching mine, because both sides now derive from one constant —
+  changing it keeps them consistent, which is the fix working, not the test firing. Making them
+  DISAGREE (guard clipped to 40, mint left at 45) fails my test by name and prints
+  `guard prefix 'scheduled_a…a_' does not match minted conv 'scheduled_a…a_07081840' — a second run
+  would start`. Full oracle green.
+- learned: a refuted-vs-confirmed verdict is not a substitute for reading the code. Seven of nine
+  survived this audit versus three of ten in the last, and I took that as evidence the finders had
+  improved — some of it was the skeptics being softer. The finding I picked to implement was
+  confirmed, well-argued, and wrong about its own mechanism. What saved it was verifying the path
+  myself BEFORE editing, which also happened to walk me past the real defect.
+- also learned: my own counterfactual can pass for the wrong reason. "Something failed" is not
+  "the thing I claimed would fail, failed" — check WHICH test fired, every time.
+- next (verified): five findings from wf_8f5e3c7c-ed1 remain unimplemented and now carry a health
+  warning — re-derive each against the code before acting, the confirmations are not reliable.
