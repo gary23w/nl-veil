@@ -762,6 +762,23 @@ fn launchRun(app: *App, alloc: std.mem.Allocator, uid: u64, t: *Task, now: i64) 
     var cb: [64]u8 = undefined;
     const conv = convIdFor(&cb, t.id, now + localOffsetSecs());
 
+    // ONE RUN PER TASK, on the UNATTENDED path too. `tryBeginTurn` below dedupes by conv id, and a conv id
+    // carries a MINUTE stamp — its own comment says a false there means "a same-named run from this MINUTE
+    // is still going". So it never covered the case that actually piles up: an every-N-minute task whose run
+    // OUTLIVES N. The next tick mints a different stamp, claims a different conv, and starts a second run of
+    // the same task beside the first; the tick after that starts a third. The manual-run route has guarded
+    // this for a while and names the cost outright — "double the tokens for the same deliverable" — but a
+    // human clicking twice is rare while a scheduler firing forever is not, so the automated path needed the
+    // guard more and had it less. Skipping WITHOUT bookkeeping is the established shape here: next_due is
+    // untouched, so the task simply fires on a later tick once the run finishes. (Ledger 0088.)
+    {
+        var pb: [64]u8 = undefined;
+        if (std.fmt.bufPrint(&pb, CONV_PREFIX ++ "{s}_", .{t.id[0..@min(t.id.len, CONV_TASK_CLIP)]})) |prefix| {
+            var rb2: [64]u8 = undefined;
+            if (chat_engine.liveTurnWithPrefix(app.io, prefix, &rb2) != null) return null;
+        } else |_| {}
+    }
+
     // The run's PERMANENT working directory: every resolver maps this conv into the task's own tree
     // ({data}/u{uid}/_sched/{task}/runs/{stamp} — paths.zig), so create it now and tell the run about it.
     // Creation failure is non-fatal: the engine's own createDirPathStatus retries on first tool use.
@@ -1392,5 +1409,58 @@ test "the one-run-per-task guard's prefix actually matches a minted conv id" {
             return error.GuardPrefixMissesMintedConv;
         }
         try std.testing.expect(conv.len <= 64); // the safeSeg ceiling every conv route enforces
+    }
+}
+
+test "a task whose run outlives its interval does not start a second run" {
+    // The pile-up this prevents: an every-N-minute task whose run takes longer than N. tryBeginTurn
+    // dedupes by conv id and a conv id is stamped to the MINUTE, so the next tick mints a DIFFERENT
+    // conv, claims it cleanly, and runs the same task twice in parallel — then three times, and so on.
+    // This asserts the prefix guard sees a live run from an EARLIER minute, which is exactly the case
+    // the conv-id claim cannot see.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const task_id = "nightly-report-0715123456";
+    var b1: [64]u8 = undefined;
+    var b2: [64]u8 = undefined;
+    const first = convIdFor(&b1, task_id, 1_752_000_000); // some minute
+    const later = convIdFor(&b2, task_id, 1_752_000_000 + 600); // ten minutes on
+    try std.testing.expect(!std.mem.eql(u8, first, later)); // different stamps — the whole problem
+
+    try std.testing.expect(chat_engine.tryBeginTurn(io, first)); // the long run is under way
+    defer chat_engine.endTurn(io, first);
+
+    // The conv-id claim would succeed for the later minute — that is the pile-up.
+    try std.testing.expect(chat_engine.tryBeginTurn(io, later));
+    chat_engine.endTurn(io, later);
+
+    // The prefix guard does NOT: it matches the task, not the minute.
+    var pb: [64]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&pb, CONV_PREFIX ++ "{s}_", .{task_id[0..@min(task_id.len, CONV_TASK_CLIP)]});
+    var rb: [64]u8 = undefined;
+    const running = chat_engine.liveTurnWithPrefix(io, prefix, &rb) orelse return error.GuardMissedTheLiveRun;
+    try std.testing.expectEqualStrings(first, running);
+
+    // A DIFFERENT task must still be free to run — the guard is per task, not a global lock.
+    var ob: [64]u8 = undefined;
+    const other = convIdFor(&ob, "other-task-0715123456", 1_752_000_000 + 600);
+    var op: [64]u8 = undefined;
+    const other_prefix = try std.fmt.bufPrint(&op, CONV_PREFIX ++ "{s}_", .{"other-task-0715123456"});
+    var orb: [64]u8 = undefined;
+    try std.testing.expect(chat_engine.liveTurnWithPrefix(io, other_prefix, &orb) == null);
+    _ = other;
+}
+
+test "launchRun actually CONSULTS the live-run guard" {
+    // Wiring, per 0086: the test above proves the guard SEES the live run; it says nothing about
+    // launchRun asking it. Without this, deleting the check leaves the suite green.
+    const SRC = @embedFile("sched.zig");
+    const at = std.mem.indexOf(u8, SRC, "fn launchRun") orelse return error.LaunchRunMissing;
+    const body = SRC[at..@min(at + 2500, SRC.len)];
+    if (std.mem.indexOf(u8, body, "liveTurnWithPrefix(") == null) {
+        std.debug.print("\nlaunchRun no longer consults liveTurnWithPrefix — an overrunning task will pile up parallel runs again\n", .{});
+        return error.LiveRunGuardNotWired;
     }
 }
