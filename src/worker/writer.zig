@@ -133,6 +133,10 @@ fn addDomainFromUrl(set: *std.BufSet, url: []const u8) bool {
     return true;
 }
 
+/// How many sources one seeding fetches. Named because the publish gate's seed-dependency bound is derived from
+/// it: change this and that bound moves with it, instead of the two silently disagreeing (see run.zig).
+pub const SEED_SOURCE_TARGET: u32 = 12;
+
 /// ENGINE-SEEDED RETRIEVAL — the engine retrieves real sources for the topic ITSELF (a weak model can't be relied on
 /// to search) via the shared web-search chain (our crawler first, then the self-healing registry; NO google-news),
 /// returned with URLs INTACT straight to the writer. Tracks per-round seed/diversity for the publish gates.
@@ -142,7 +146,7 @@ fn seedSources(w: *Worker, topic: []const u8, round: u32) []const u8 {
     const environ = w.mem.environ orelse return (gpa.dupe(u8, "") catch @constCast(""));
     const wd = std.fmt.allocPrint(gpa, "{s}/work", .{w.run_dir}) catch return (gpa.dupe(u8, "") catch @constCast(""));
     defer gpa.free(wd);
-    const body = tools.searchWeb(w.io, gpa, environ, w.run_dir, wd, "seed", "web", q, 12);
+    const body = tools.searchWeb(w.io, gpa, environ, w.run_dir, wd, "seed", "web", q, SEED_SOURCE_TARGET);
     defer gpa.free(@constCast(body));
     const out = std.mem.trim(u8, body, " \r\n\t");
     if (out.len < 20) return (gpa.dupe(u8, "") catch @constCast(""));
