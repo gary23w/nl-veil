@@ -5257,6 +5257,7 @@ pub const Chat = struct {
                 @memcpy(m.img[0..in], ip[0..in]);
                 m.img_len = @intCast(in);
             }
+            m.uid = self.store.nextMsgUid();
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
         }
@@ -5500,6 +5501,7 @@ pub const Chat = struct {
             const in = @min(img.len, m.img.len);
             @memcpy(m.img[0..in], img[0..in]);
             m.img_len = @intCast(in);
+            m.uid = self.store.nextMsgUid();
             self.store.msgs[self.store.msg_count] = m;
             self.store.msg_count += 1;
         }
@@ -5559,6 +5561,7 @@ pub const Chat = struct {
             const tn = @min(text.len, m.text.len);
             @memcpy(m.text[0..tn], text[0..tn]);
             m.text_len = @intCast(tn);
+            m.uid = self.store.msgs[idx].uid; // same row, revised text — keep its identity so the UI's expand survives
             self.store.msgs[idx] = m;
         }
         if (idn == 0) return;
@@ -5591,6 +5594,7 @@ pub const Chat = struct {
             const tn = @min(text.len, m.text.len);
             @memcpy(m.text[0..tn], text[0..tn]);
             m.text_len = @intCast(tn);
+            m.uid = self.store.nextMsgUid();
             self.store.msgs[idx] = m;
             self.store.msg_count += 1;
             if (self.reflect_msg_idx) |mi| if (mi >= idx) {
@@ -11967,6 +11971,71 @@ test "the 64-message eviction pins the conversation's original goal (slot 0 stay
         try std.testing.expect(store.msg_count == store_mod.MAX_CHAT_MSGS);
         try std.testing.expect(store.msgs[0].role == .user);
         try std.testing.expect(std.mem.startsWith(u8, store.msgs[0].textStr(), "GOAL: build the neuronet"));
+    }
+}
+
+test "a message's uid is its identity: an insert above it and a ring eviction move its INDEX, never its uid" {
+    // The chat UI keys expand/collapse (the reasoning trace the user is reading) by uid precisely because the
+    // index is not stable: a trace is inserted ABOVE the answer it produced, and the ring evicts from the front.
+    // Both renumber every row after the edit. Keyed by index, the open block snapped shut mid-turn and whatever
+    // row inherited the index opened in its place.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .environ = llm.osEnviron() });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dd = "zig-uid-tmp";
+    _ = Io.Dir.cwd().createDirPathStatus(io, dd ++ "/.veil-desk/chats", .default_dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dd) catch {};
+    var store = std.testing.allocator.create(Store) catch unreachable;
+    defer std.testing.allocator.destroy(store);
+    store.* = .{};
+    @memcpy(store.settings.data_dir[0..dd.len], dd);
+    store.settings.data_dir_len = dd.len;
+    var chat = std.testing.allocator.create(Chat) catch unreachable;
+    defer std.testing.allocator.destroy(chat);
+    chat.* = .{ .io = io, .gpa = std.testing.allocator, .store = store };
+    chat.cmdNewConv(dd);
+
+    chat.appendMsgFull(dd, .user, "GOAL: read the reasoning", false, "");
+    chat.appendMsgFull(dd, .veil, "the answer", false, "");
+    const answer_uid = blk: {
+        store.lock();
+        defer store.unlock();
+        break :blk store.msgs[1].uid;
+    };
+    try std.testing.expect(answer_uid != 0);
+
+    // INSERT ABOVE: the reasoning trace lands before the answer. The answer's index moves 1→2; its uid must not.
+    chat.insertMsgBefore(dd, 1, .thought, "first I checked the feed");
+    {
+        store.lock();
+        defer store.unlock();
+        try std.testing.expect(store.msg_count == 3);
+        try std.testing.expect(store.msgs[1].role == .thought);
+        try std.testing.expectEqual(answer_uid, store.msgs[2].uid);
+        try std.testing.expect(store.msgs[1].uid != answer_uid); // the trace is its own row, not the answer's slot
+    }
+
+    // EVICTION: fill the ring, mark a row, then push one more so slot 0 stays pinned and everything else shifts.
+    while (store.msg_count < store_mod.MAX_CHAT_MSGS) { // single-threaded here: no worker is racing msg_count
+        chat.appendMsgFull(dd, .cast_note, "[tool:web_fetch]\nfetched", false, "");
+    }
+    const marked_uid = blk: {
+        store.lock();
+        defer store.unlock();
+        break :blk store.msgs[5].uid;
+    };
+    chat.appendMsgFull(dd, .veil, "one more", false, "");
+    {
+        store.lock();
+        defer store.unlock();
+        try std.testing.expect(store.msg_count == store_mod.MAX_CHAT_MSGS);
+        try std.testing.expectEqual(marked_uid, store.msgs[4].uid); // same message, one index lower
+        try std.testing.expect(store.msgs[5].uid != marked_uid); // index 5 is now a DIFFERENT message
+        // and a uid names exactly one live row — otherwise "which row is open" is ambiguous
+        for (store.msgs[0..store.msg_count], 0..) |*m, a| {
+            try std.testing.expect(m.uid != 0);
+            for (store.msgs[a + 1 .. store.msg_count]) |*n| try std.testing.expect(m.uid != n.uid);
+        }
     }
 }
 

@@ -351,14 +351,20 @@ pub const OllamaModel = struct {
     }
 };
 
-/// .thought is the veil's reasoning trace — rendered collapsed in the UI and EXCLUDED from the prompt
-/// history (the model must never re-read its own prior reasoning as answer text). Persisted as "r":3.
+/// .thought is the veil's reasoning trace — rendered EXPANDED when it arrives (collapsible per row, and the
+/// collapse sticks) and EXCLUDED from the prompt history (the model must never re-read its own prior reasoning
+/// as answer text). Persisted as "r":3.
 pub const ChatRole = enum(u8) { user, veil, cast_note, thought };
 
 /// One chat message of the ACTIVE conversation. Fixed-size like everything else in the Store; the chat
 /// thread owns the full history on disk, this is the render copy.
 pub const ChatMsg = struct {
     role: ChatRole = .user,
+    // STABLE IDENTITY for UI state that must outlive a row's POSITION. The message array shifts under the UI:
+    // a reasoning trace is inserted BEFORE the answer it produced (insertMsgBefore) and the 64-slot ring evicts
+    // from the front — both renumber every row after the edit. Expand/collapse keyed by index therefore snapped
+    // shut (or jumped to a different block) mid-turn; keyed by uid it survives. 0 = no identity assigned.
+    uid: u32 = 0,
     text: [12288]u8 = [_]u8{0} ** 12288, // 12K: long LLM answers (reasoning + tables/code) need the headroom
     text_len: u16 = 0,
     img: [512]u8 = [_]u8{0} ** 512, // SOURCE path of an image attached to this message (user bubble); persisted so it re-renders on load
@@ -744,6 +750,7 @@ pub const Store = struct {
     conv_active_len: u8 = 0,
     msgs: [MAX_CHAT_MSGS]ChatMsg = undefined,
     msg_count: usize = 0,
+    msg_uid_next: u32 = 1, // monotonic ChatMsg.uid source (see ChatMsg.uid); never hands out 0
     stream_text: [STREAM_CAP]u8 = undefined, // the in-flight assistant reply, grown as deltas land (16K: don't clip long answers)
     stream_len: usize = 0,
     stream_reason: [4096]u8 = undefined, // the in-flight reasoning (thinking), shown live line-by-line
@@ -869,6 +876,14 @@ pub const Store = struct {
     }
     pub fn unlock(s: *Store) void {
         s.mu.unlock();
+    }
+
+    /// Hand out the next ChatMsg.uid. CALLER MUST HOLD THE LOCK (every call site already writes msgs under it).
+    /// Wraps past 0, which is the "no identity" sentinel a default-initialized ChatMsg carries.
+    pub fn nextMsgUid(s: *Store) u32 {
+        const id = s.msg_uid_next;
+        s.msg_uid_next = if (id == std.math.maxInt(u32)) 1 else id + 1;
+        return id;
     }
 
     /// Set the persisted active-theme id. CALLER MUST HOLD THE LOCK (the SpinLock is non-reentrant) — the
