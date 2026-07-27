@@ -129,7 +129,18 @@ const Ui = struct {
     // it chunk-pause-chunk. This spreads each batch over a window slightly longer than the poll cadence, so the
     // reveal is still flowing when the next batch lands — continuous, at the model's real pace.
     stream_reveal: f64 = 0,
-    tool_open: ?usize = null, // which tool-call message is expanded (else all collapsed to a one-line chip)
+    // EXPANDED ROWS (tool calls + reasoning traces), keyed by the stable ChatMsg.uid rather than by row index.
+    // Index keying was wrong twice over: the message array shifts under the UI (a reasoning trace is INSERTED
+    // before the answer it produced; the 64-slot ring evicts from the front), so an open block popped shut and
+    // whatever row inherited the index opened in its place. And it was ONE slot, so expanding a tool chip
+    // slammed shut the reasoning the user was mid-read of. This is a set: what you open stays open.
+    open_uids: [store_mod.MAX_CHAT_MSGS]u32 = [_]u32{0} ** store_mod.MAX_CHAT_MSGS,
+    open_n: usize = 0,
+    // A newly-arrived reasoning trace AUTO-EXPANDS: the thinking streams live as a blockquote, and folding it
+    // into a one-line chip the instant it commits yanks away what the user is reading. Traces at or below this
+    // watermark are history — those stay collapsed until the user asks for them.
+    thought_uid_hi: u32 = 0,
+    open_conv_key: u64 = 0, // which conversation the open set belongs to (switch → drop it, don't re-open by uid)
     chat: Field = .{},
     // Chat tab
     c_input: Field = .{},
@@ -3663,6 +3674,37 @@ fn roleColor(role: store_mod.ChatRole) t.Color {
     };
 }
 
+/// Is this row expanded? Keyed by the message's stable uid (see Ui.open_uids); uid 0 means a row with no
+/// identity — an old in-memory message from before uids — which simply never opens.
+fn rowOpen(uid: u32) bool {
+    if (uid == 0) return false;
+    for (ui.open_uids[0..ui.open_n]) |u| {
+        if (u == uid) return true;
+    }
+    return false;
+}
+
+/// Expand (`open`) or collapse one row. The set is capped at the message ring's size; at capacity the oldest
+/// entry drops — by then its row has aged off the top of the transcript anyway.
+fn rowSetOpen(uid: u32, open: bool) void {
+    if (uid == 0) return;
+    var i: usize = 0;
+    while (i < ui.open_n) : (i += 1) {
+        if (ui.open_uids[i] != uid) continue;
+        if (open) return; // already open
+        std.mem.copyForwards(u32, ui.open_uids[i .. ui.open_n - 1], ui.open_uids[i + 1 .. ui.open_n]);
+        ui.open_n -= 1;
+        return;
+    }
+    if (!open) return;
+    if (ui.open_n == ui.open_uids.len) {
+        std.mem.copyForwards(u32, ui.open_uids[0 .. ui.open_n - 1], ui.open_uids[1..ui.open_n]);
+        ui.open_n -= 1;
+    }
+    ui.open_uids[ui.open_n] = uid;
+    ui.open_n += 1;
+}
+
 /// The collapsed reasoning-trace line — same shape as toolChip but labeled as the veil's own thinking. Shows
 /// an inline preview of the first line of the thinking so the user sees WHAT is being reasoned without expanding
 /// every trace. Click to expand the full text. Returns true on click (expand/collapse).
@@ -4020,11 +4062,36 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
     const fsz: i32 = 14;
     const cols = monoCols(view.width - 28, fsz);
 
+    // EXPAND STATE belongs to ONE conversation: uids are per-Store and a switch renumbers every row, so a uid
+    // held over from the previous chat would open an unrelated block here. Drop the set and treat everything
+    // the switch loaded as already-seen history (no auto-expand on a chat you just opened).
+    var conv_key: u64 = 0xcbf29ce484222325;
+    for (active) |c| conv_key = (conv_key ^ c) *% 0x100000001b3;
+    if (ui.open_conv_key != conv_key) {
+        ui.open_conv_key = conv_key;
+        ui.open_n = 0;
+        ui.thought_uid_hi = 0;
+        for (msgs) |*m| ui.thought_uid_hi = @max(ui.thought_uid_hi, m.uid);
+    }
+    // A reasoning trace the user has not seen yet opens BY ITSELF — it was just streaming live as a blockquote,
+    // and folding it to a one-line chip the moment it commits takes away mid-read what the user was following.
+    // Compared against the OLD watermark, committed after the pass: a trace is INSERTED above the answer it
+    // produced, so array order is not uid order.
+    {
+        var hi = ui.thought_uid_hi;
+        for (msgs) |*m| {
+            if (m.uid <= ui.thought_uid_hi) continue;
+            if (m.role == .thought) rowSetOpen(m.uid, true);
+            hi = @max(hi, m.uid);
+        }
+        ui.thought_uid_hi = hi;
+    }
+
     // total content height — from the per-message height CACHE (renderMsg word-wrap is expensive on long
     // chats). Rebuild the cache only when the message set or wrap width actually changed; otherwise reuse.
     var fp: u64 = 0;
     for (msgs) |*m| fp = fp *% 1000003 +% m.text_len +% (@as(u64, @intFromEnum(m.role)) << 56);
-    fp +%= @as(u64, ui.tool_open orelse 0xffff) << 40; // expand/collapse changes a tool message's height
+    for (ui.open_uids[0..ui.open_n]) |u| fp = fp *% 31 +% u; // expand/collapse changes a row's height
     // message set / wrap width changed → drop a stale selection — but NOT mid-drag, or a background message commit
     // (a cast_note row, the finalized veil answer) during an active drag would silently kill the in-progress select.
     if ((ui.mh_fp != fp or ui.mh_cols != cols) and !ui.sel_dragging) ui.sel_msg = null;
@@ -4033,9 +4100,12 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // by the per-row fp, so `wipe` (below) forces every cached height stale.
         const wipe = ui.mh_cols != cols; // wrap width changed → every cached height is stale
         for (msgs, 0..) |*m, i| {
-            const mfp: u64 = @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (ui.tool_open == i) @as(u64, 1) << 48 else 0) ^ (if (m.img_len > 0) @as(u64, 1) << 47 else 0); // img presence changes the row height (THUMB_H block)
+            const open = rowOpen(m.uid);
+            // uid is folded in (spread across the word by the golden-ratio multiply) so a row that SHIFTED into
+            // this index — the insert/evict case — always re-measures instead of inheriting the old row's height.
+            const mfp: u64 = (@as(u64, m.uid) *% 0x9E3779B97F4A7C15) ^ @as(u64, m.text_len) ^ (@as(u64, @intFromEnum(m.role)) << 56) ^ (if (open) @as(u64, 1) << 48 else 0) ^ (if (m.img_len > 0) @as(u64, 1) << 47 else 0); // img presence changes the row height (THUMB_H block)
             if (!wipe and i < ui.mh_count and ui.mh_mfp[i] == mfp) continue; // unchanged row — keep its height
-            ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and ui.tool_open != i)
+            ui.mh[i] = if ((m.role == .thought or toolName(m.textStr()) != null) and !open)
                 TOOL_CHIP_H // collapsed tool call / reasoning trace = a one-line chip
             else
                 renderMsg(view, 0, m.role, m.textStr(), fsz, false, false, m.imgStr());
@@ -4093,9 +4163,10 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
         // This is the big win on long scrollback (render ~a screenful, not the whole history, every frame).
         if (yy < vtop or y0 > vbot) continue;
         if (m.role == .thought) {
-            // The reasoning trace renders collapsed (a dim one-line chip); click to read the full thinking that
-            // led to the answer below it. Excluded from the model's history, so expanding costs nothing.
-            if (ui.tool_open == i) {
+            // The reasoning trace stays OPEN once it is open — a fresh one auto-expands (it was just streaming
+            // live) and nothing but the user's own click on the header collapses it. Excluded from the model's
+            // history, so leaving it open costs nothing but screen.
+            if (rowOpen(m.uid)) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // copy chip: flush RIGHT and only while the row is hovered (a reasoning block has no token-cost
                 // label to its right, so a mid-row chip would read as floating).
@@ -4106,16 +4177,17 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                     }
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
-                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowSetOpen(m.uid, false);
             } else if (thoughtChip(view, y0, false, m.textStr())) {
-                ui.tool_open = i;
+                rowSetOpen(m.uid, true);
             }
             continue;
         }
         if (toolName(m.textStr())) |tn| {
             // Tool calls render as a compact chip (raw JSON/result hidden). Click to expand/collapse; the full
-            // text is untouched in the message, so the model still receives it and copy still grabs it.
-            if (ui.tool_open == i) {
+            // text is untouched in the message, so the model still receives it and copy still grabs it. Each
+            // chip is independent — opening one no longer closes whatever else the user left open.
+            if (rowOpen(m.uid)) {
                 _ = renderMsg(view, y0, m.role, m.textStr(), fsz, true, false, m.imgStr());
                 // the token cost lives in the expanded dropdown (top-right), not the collapsed line
                 t.text(t.z("~{d} tok", .{tokCostOf(m.textStr())}), @intFromFloat(view.x + view.width - 76), @intFromFloat(y0 + 6), 11, t.comment);
@@ -4125,9 +4197,9 @@ fn drawChatCenter(store: *Store, r: t.Rect, msgs: []const store_mod.ChatMsg, str
                     markCopied();
                 }
                 const hdr = t.Rect{ .x = view.x + 2, .y = y0, .width = view.width - 132, .height = 20 };
-                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) ui.tool_open = null;
+                if (t.hovering(hdr) and t.hovering(view) and rl.isMouseButtonPressed(.left)) rowSetOpen(m.uid, false);
             } else if (toolChip(view, y0, tn, false)) {
-                ui.tool_open = i;
+                rowSetOpen(m.uid, true);
             }
             continue;
         }
