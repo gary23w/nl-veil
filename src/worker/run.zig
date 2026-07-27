@@ -310,7 +310,6 @@ pub const Worker = struct {
     editions: u32 = 0,
     round_seed_sources: u32 = 0,
     round_independent_sources: u32 = 0,
-    round_seed_dependency_pct: u32 = 100,
     round_source_diversity: u32 = 0,
     tg_token: []const u8 = "",
     best_snapshot: bool = false,
@@ -1199,6 +1198,14 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     while (true) {
         round += 1;
         _ = w.scratch.reset(.retain_capacity);
+        // Everything named round_ is scoped to THIS round -- but only round_seed_sources ever was.
+        // The other two only accumulated, so the publish gate's "at least one INDEPENDENT source"
+        // test stayed satisfied by fetches from earlier rounds, and its seed-dependency ratio put a
+        // per-round numerator over a run-cumulative denominator and decayed toward 0. Both gates
+        // stopped discriminating exactly as a run got long enough for that to matter.
+        w.round_seed_sources = 0;
+        w.round_independent_sources = 0;
+        w.round_source_diversity = 0;
         if (live) netProbe(&w, round, probe_url);
         {
             const ns = formatNow(gpa, w.nowSecs());
@@ -7029,6 +7036,16 @@ const PUBLISH_MIN_SOURCES: u32 = 2;
 const PUBLISH_MIN_INDEPENDENT: u32 = 1;
 const PUBLISH_MAX_SEED_DEP_PCT: u32 = 85;
 
+/// Share of this round's sources that came from the engine's seed rather than the mind's own fetching.
+/// DERIVED at the gate, never stored: the stored copy was written only when seeding ran, so on a round that
+/// composed without re-seeding the gate read a number computed for a different round and could not tell.
+/// No sources at all reads as fully seed-dependent — an edition with nothing fetched must not publish.
+fn seedDepPct(seed: u32, independent: u32) u32 {
+    const total = @as(u64, seed) + @as(u64, independent);
+    if (total == 0) return 100;
+    return @intCast(@as(u64, seed) * 100 / total);
+}
+
 const CONSTITUTION_SCREEN = "You are a strict publication-safety reviewer enforcing a CONSTITUTION for a PUBLIC post. The post MAY state facts and may name real people, organizations, governments, or events ONLY to factually report what verifiably happened, with attribution. It MUST NOT: take a partisan or political side; editorialize or push an opinion; demean, attack, praise, or advocate for/against any real person, party, group, government, company, or religion; present rumor or unverified claims as fact; or contain anything hateful, harassing, private, or that could endanger a real individual. It must read as neutral, fair, and respectful of everyone. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
 const CONSTITUTION_SCREEN2 = "You are an entity & partisanship detector for a PUBLIC post. Answer ok=false if the post takes ANY partisan or political side, frames a real person/party/group/government/company/religion favorably or unfavorably, demeans/attacks/praises anyone, presents rumor or unverified claims as fact, or pushes an opinion. Answer ok=true ONLY if it states what verifiably happened, neutrally and with attribution, naming real entities only to report facts. Reply with ONLY compact JSON: {\"ok\":<true|false>,\"reason\":\"<short>\"}.";
 
@@ -7149,11 +7166,11 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
     const paa = pa.allocator();
     const enough_grounded = grounded >= PUBLISH_MIN_SOURCES;
     const enough_independent = w.round_independent_sources >= PUBLISH_MIN_INDEPENDENT;
-    const seed_ok = w.round_seed_dependency_pct <= PUBLISH_MAX_SEED_DEP_PCT;
+    const seed_ok = seedDepPct(w.round_seed_sources, w.round_independent_sources) <= PUBLISH_MAX_SEED_DEP_PCT;
     if (!(enough_grounded and enough_independent and seed_ok)) {
         const reason = if (!enough_grounded) "ungrounded" else if (!enough_independent) "seed_only" else "seed_dependency";
-        w.act("engine", round, "edition", "held", std.fmt.allocPrint(paa, "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, w.round_seed_dependency_pct, PUBLISH_MAX_SEED_DEP_PCT }) catch "held");
-        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"{s}\",\"grounded\":{d},\"cited\":{d},\"independent_sources\":{d},\"seed_sources\":{d},\"seed_dependency_pct\":{d},\"source_diversity\":{d}", .{ round, reason, grounded, cited, w.round_independent_sources, w.round_seed_sources, w.round_seed_dependency_pct, w.round_source_diversity }) catch ",\"round\":0");
+        w.act("engine", round, "edition", "held", std.fmt.allocPrint(paa, "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, seedDepPct(w.round_seed_sources, w.round_independent_sources), PUBLISH_MAX_SEED_DEP_PCT }) catch "held");
+        w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"{s}\",\"grounded\":{d},\"cited\":{d},\"independent_sources\":{d},\"seed_sources\":{d},\"seed_dependency_pct\":{d},\"source_diversity\":{d}", .{ round, reason, grounded, cited, w.round_independent_sources, w.round_seed_sources, seedDepPct(w.round_seed_sources, w.round_independent_sources), w.round_source_diversity }) catch ",\"round\":0");
         return;
     }
     const suser = std.fmt.allocPrint(gpa, "Review this PUBLIC post for publication:\n\n{s}", .{clip(md, 3500)}) catch return;
@@ -10667,6 +10684,29 @@ test "buildFitnessBlock: a green score never reads all-green while the runtime g
     // round. The fix is to hoist smokeTest above runBenchmark; it is NOT done here because that reorders
     // a live swarm loop no test in this repo exercises. Whoever does it: these assertions pin the shape
     // the fold-in must keep, so a reorder that breaks the contract fails here instead of in a cast.
+}
+
+test "seed dependency is a ratio of THIS round, and every round_ counter is cleared to make it one" {
+    // 12 seed sources is a normal seeding. ONE independent fetch does not earn publication at 85%;
+    // three does. That distinction is the whole point of the gate, and a run-cumulative denominator
+    // erased it: by round five the same 12 seeds read as ~37% and everything passed.
+    try std.testing.expectEqual(@as(u32, 100), seedDepPct(0, 0)); // nothing fetched: fully dependent
+    try std.testing.expectEqual(@as(u32, 0), seedDepPct(0, 5)); // all its own work
+    try std.testing.expectEqual(@as(u32, 100), seedDepPct(9, 0)); // seed only
+    try std.testing.expect(seedDepPct(12, 1) > PUBLISH_MAX_SEED_DEP_PCT); // 92% -- held
+    try std.testing.expect(seedDepPct(12, 3) <= PUBLISH_MAX_SEED_DEP_PCT); // 80% -- publishable
+
+    // The ratio is per-round only because the counters are. That is the half that was broken: both
+    // fields kept their run-cumulative values and nothing in the loop said otherwise.
+    const src = @embedFile("run.zig");
+    const loop = std.mem.indexOf(u8, src, "round += 1;") orelse return error.RoundLoopNotFound;
+    const body = src[loop..@min(src.len, loop + 900)];
+    for ([_][]const u8{ "round_seed_sources = 0", "round_independent_sources = 0", "round_source_diversity = 0" }) |field| {
+        if (std.mem.indexOf(u8, body, field) == null) {
+            std.log.warn("run.zig: the round loop does not clear {s} — earlier rounds will count toward this one's publish gate", .{field});
+            return error.RoundCounterNotCleared;
+        }
+    }
 }
 
 test "every events.jsonl reader admits as much as the writer emits" {

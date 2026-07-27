@@ -159,10 +159,6 @@ fn seedSources(w: *Worker, topic: []const u8, round: u32) []const u8 {
     }
     w.round_seed_sources = seeded;
     if (diversity > w.round_source_diversity) w.round_source_diversity = diversity;
-    if (w.round_seed_sources + w.round_independent_sources > 0)
-        w.round_seed_dependency_pct = (w.round_seed_sources * 100) / (w.round_seed_sources + w.round_independent_sources)
-    else
-        w.round_seed_dependency_pct = 100;
     w.act("engine", round, "seed", "retrieved live sources for the desk (crawler + registry)", clip(out, 300));
     return gpa.dupe(u8, clip(out, 6000)) catch (gpa.dupe(u8, "") catch @constCast(""));
 }
