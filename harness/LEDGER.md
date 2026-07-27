@@ -2410,3 +2410,32 @@ edit, confirm it applied, then run.
   provenance pair, run.zig's PROBE newline delimiter, crawl.zig's unreachable prune gate and its
   first-chunk max_bytes exemption, and metrics.zig's 16 MB all-zero read (the same reader-cap shape as
   0084). Each still needs its own re-derivation per 0090.
+
+## 0093 — 2026-07-26 — a 360-byte budget could return the whole page
+- did: `fitToQuery` BM25-ranks a page's chunks and returns the best ones "capped near max_bytes". The
+  size check read `if (used + clen > max_bytes and picked.items.len > 0) break;` — the second conjunct
+  exempted the FIRST chunk, so the top-scoring chunk went in whatever its size.
+- why that is not the small overshoot it looks like: `chunkMarkdown` splits on BLANK LINES ONLY. A page
+  without one — dense converted HTML, a single long paragraph — is ONE chunk the size of the whole
+  document. `tools.zig:5088` fetches up to 512 KB, asks for a 360-byte snippet, and could put all
+  512 KB into the prompt; `run.zig:8510` asks for 4000 and had the same hole. The cap was honoured on
+  every path EXCEPT the one that runs on every successful query.
+- did: kept the exemption's intent (never return empty), dropped the unbounded part — when the top
+  chunk alone overruns, return its clipped head. Still the most relevant text, now inside the budget
+  the caller actually named.
+- second defect, found by USING the function: `chunkMarkdown` never freed its own scratch buffer. It is
+  arena-only by accident of how it happens to be called, but its signature takes any allocator, so
+  nothing warned anyone. My test leaked. The fix belonged in the function, not the test.
+- learned (the real one): my first instinct was to make the test work AROUND the leak by passing an
+  arena. That would have gone green and left the trap armed for the next caller. Calling it with the
+  testing allocator instead turns the leak detector into a permanent guard. A test that avoids a defect
+  documents nothing; a test that walks into it is a ratchet.
+- learned (again, cheaply): a build of mine printed `EXIT=0` under `zig: command not found` — `$?` was
+  `tail`'s. The ledger already says never pipe the oracle; I re-learned it on a plain build. Capture the
+  status of the thing you ran.
+- verified: 549 tests, 0 leaks, exit 0. CF-A restore the exemption -> named test fails on the length
+  assertion, 0 compile errors. CF-B drop the scratch free -> named test fails "leaked 1 allocations",
+  0 compile errors. Full oracle green.
+- next (verified): audit 3 has five standing findings left — writer.zig's per-round/run-cumulative ratio
+  and its seedSources provenance, run.zig's PROBE url newline delimiter, crawl.zig's unreachable
+  boilerplate gate, metrics.zig's all-zero answer past 16 MB (the 0084 reader-cap shape again).

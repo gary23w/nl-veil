@@ -706,6 +706,8 @@ fn tokenize(a: std.mem.Allocator, s: []const u8, out: *std.ArrayListUnmanaged([]
 /// Split markdown into paragraph-ish chunks on blank lines (a heading or a list-block is its own chunk). Owned by `a`.
 pub fn chunkMarkdown(a: std.mem.Allocator, md: []const u8, out: *std.ArrayListUnmanaged([]const u8)) void {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(a); // scratch, not handed out: without this the signature invites a leak from
+    // any caller who passes something other than an arena, which is how I first hit it.
     var it = std.mem.splitScalar(u8, md, '\n');
     while (it.next()) |line| {
         const t = std.mem.trim(u8, line, " \t\r");
@@ -790,7 +792,15 @@ pub fn fitToQuery(gpa: std.mem.Allocator, md: []const u8, query: []const u8, max
     for (scored) |sc| {
         if (sc.score <= 0) break;
         const clen = chunks.items[sc.idx].len + 2;
-        if (used + clen > max_bytes and picked.items.len > 0) break;
+        if (used + clen > max_bytes) {
+            if (picked.items.len > 0) break;
+            // Nothing picked yet and the top chunk alone overruns the budget. Exempting it was
+            // meant to avoid returning empty -- but chunkMarkdown splits on blank lines only, so a
+            // page without one is a SINGLE chunk the size of the document, and a caller asking for
+            // 360 bytes got the whole page in its prompt. Hand back the best chunk's head instead:
+            // still the most relevant text, now within the budget the caller actually named.
+            return gpa.dupe(u8, clipText(chunks.items[sc.idx], max_bytes)) catch @constCast("");
+        }
         picked.append(a, sc.idx) catch {};
         used += clen;
         if (used >= max_bytes) break;
@@ -947,6 +957,28 @@ test "fitToQuery returns the query-relevant chunk" {
     const md = "The cat sat quietly on the warm mat by the door for hours.\n\nQuantum chromodynamics is the theory describing the strong nuclear interaction between quarks and gluons.";
     const fit = fitToQuery(gpa, md, "quantum quarks gluons interaction", 200);
     defer gpa.free(@constCast(fit));
+    try std.testing.expect(std.mem.indexOf(u8, fit, "chromodynamics") != null);
+}
+
+test "fitToQuery honours the byte budget even when the top chunk alone overruns it" {
+    const gpa = std.testing.allocator;
+    // chunkMarkdown splits on blank lines only, so a page without one is a SINGLE chunk the size of
+    // the whole document -- the shape that let a caller asking for 360 bytes receive a whole page.
+    var md: std.ArrayListUnmanaged(u8) = .empty;
+    defer md.deinit(gpa);
+    try md.appendSlice(gpa, "quantum chromodynamics binds quarks and gluons\n");
+    while (md.items.len < 4000) try md.appendSlice(gpa, "filler prose concerning unrelated matters\n");
+    // Deliberately a plain allocator, not an arena: this also holds chunkMarkdown to freeing its own
+    // scratch buffer, which it did not, and the leak detector is the only thing that would say so.
+    var one: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer one.deinit(gpa);
+    chunkMarkdown(gpa, md.items, &one);
+    defer for (one.items) |c| gpa.free(@constCast(c));
+    try std.testing.expectEqual(@as(usize, 1), one.items.len); // the premise, not an assumption
+
+    const fit = fitToQuery(gpa, md.items, "quantum quarks gluons", 360);
+    defer gpa.free(@constCast(fit));
+    try std.testing.expect(fit.len <= 360);
     try std.testing.expect(std.mem.indexOf(u8, fit, "chromodynamics") != null);
 }
 
