@@ -7093,18 +7093,25 @@ test "every AUXILIARY completion bounds its prompt — only the real turn sends 
 /// skip", which is true of non-numeric tokens and exactly wrong about a numeral INSIDE prose — the case
 /// that occurs.
 ///
-/// So: stop at the end of the ANSWER LINE, and stop at the first token that is not a number. The second
-/// bound can truncate a legitimate list ("done: 1 and 2" yields only 1), and that is the deliberate
-/// trade: a subtask left PENDING is re-examined by the next reconcile pass and the work continues, while
-/// a subtask wrongly marked DONE is never revisited and ships incomplete. When the two failures are not
-/// symmetric, bound toward the recoverable one. (Ledger 0087.)
+/// So: stop at the end of the ANSWER LINE, and stop at the first token that is not a number. Where the
+/// two failures are not symmetric, bound toward the recoverable one — a subtask left PENDING is
+/// re-examined by the next reconcile pass and the work continues, while one wrongly marked DONE is never
+/// revisited and ships incomplete. (Ledger 0087.)
+///
+/// That bound was first written to stop at sentence punctuation and at "and" as well, which was not
+/// caution but a bug wearing its clothes: "done: 1, 2, 3." and "done: 1, 2 and 3" are how people write
+/// lists, and dropping their last item made the engine rerun finished work every round. Neither shape is
+/// ambiguous with prose, so skipping them costs the guard above nothing. (Ledger 0099.)
 fn parseDoneList(content: []const u8, plan_len: usize, out: []usize) []const usize {
     const at = std.mem.indexOf(u8, content, "done:") orelse return out[0..0];
     var rest = content[at + 5 ..];
     if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| rest = rest[0..nl]; // the answer is one line
     var n: usize = 0;
     var it = std.mem.tokenizeAny(u8, rest, ", \t\r");
-    while (it.next()) |tok| {
+    while (it.next()) |raw| {
+        const tok = std.mem.trim(u8, raw, ".;:()[]");
+        if (tok.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(tok, "and") or std.mem.eql(u8, tok, "&")) continue;
         const v = std.fmt.parseInt(usize, tok, 10) catch break; // first non-number ends the list
         if (v == 0 or v > plan_len) continue; // out of range: skip, but keep reading the list
         if (n >= out.len) break;
@@ -7128,9 +7135,13 @@ test "parseDoneList: prose after the answer can no longer mark a subtask complet
     try std.testing.expectEqual(@as(usize, 0), parseDoneList("nothing to report", 5, &buf).len);
     // Out of range is skipped without ending the list — a hallucinated index must not eat the real ones.
     try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, parseDoneList("done: 1, 9, 2", 5, &buf));
-    // The deliberate truncation, asserted so it is a decision on the record rather than a surprise:
-    // a subtask left pending is recoverable, one wrongly marked done is not.
-    try std.testing.expectEqualSlices(usize, &.{1}, parseDoneList("done: 1 and 2", 5, &buf));
+    // These four were the cost of that truncation, and it was too high: every one is an ordinary way to
+    // answer, and dropping the last item made the engine rerun work it had already finished. The prose
+    // guard above is unchanged — "(took" and "Subtask" still end the list, as the cases above assert.
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, parseDoneList("done: 1 and 2", 5, &buf));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, parseDoneList("done: 1, 2, 3.", 5, &buf));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, parseDoneList("done: 1, 2 and 3", 5, &buf));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, parseDoneList("done: (1), (2)", 5, &buf));
 }
 
 test "planReconcile actually CALLS parseDoneList — the extraction must not become the hiding place" {
