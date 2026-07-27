@@ -2800,3 +2800,42 @@ edit, confirm it applied, then run.
   before a turn finalises — is designed but NOT built: it adds per-turn latency and cost, needs a
   firing gate, and should no-op entirely when `independentReviewer()` is null rather than pay for
   self-agreement. That is an owner call, not a default.
+
+## 0105 — 2026-07-27 — Stop could not reach a tool that blocks, which is the only kind worth stopping
+- reported as "veil randomly crashed while sitting idle". It did not crash: Windows logged an APPLICATION
+  HANG at 12:49:00 and killed it. No desk-panic.log, and desk-exit-reason.txt still read 07:43's
+  ui.close_req, so that instance never reached its own exit path.
+- NOT a regression from this sitting, checked before anything else: 554 "server wedged/slow" warnings in
+  the desk log with the first long before today's binary, and twelve prior veil hangs in the Windows
+  event log going back to 17 Jul. Today's build (12:24) does contain my commits, so I read the chat path
+  specifically — my additions there are pure functions; the assoc/forgetMatch work is swarm-side and the
+  metrics rotation is a statFile that returns early at 117 KB against a 16 MiB bound.
+- the screenshot was the actual diagnosis: a `poll` watching a fuzzer the model itself estimated at ~84
+  minutes, with the user typing into a turn that could not hear them. One poll is bounded at 180s, and
+  the tool is DESIGNED to be chained — so an 84-minute watch is ~28 chained calls holding a server
+  thread the whole time, which is what starves the desk's own polls into the hang.
+- the actual defect: the turn drains its control channel "between drive steps and before each tool".
+  That is fine for a tool that returns promptly and useless for one that does not. Streaming has had a
+  mid-flight abort hook for a while (streamShouldAbort, ~40ms); tools had none. So Stop was read at best
+  every few minutes, and pollTool's own doc claimed the chain was something "the engine can always
+  interrupt" — true only at the seams between calls, which is not what the word means to whoever pressed
+  the button.
+- did: `tools.Cancel` — a predicate a blocking tool can ask — set by the chat turn from the SAME
+  stopRequestedSince the streaming abort uses, and null everywhere else so swarm minds and the CLI keep
+  today's behaviour exactly. pollTool asks at each sample boundary, so Stop lands within interval_s
+  (default 3s) instead of up to 180s.
+- the second half, and it would have silently undone the first: a stopped poll needed its own VERDICT.
+  Reusing "timeout" hands the model guidance that says "call poll again to keep waiting" — it would have
+  chained a fresh poll and the Stop would appear to do nothing, which is the bug wearing a new hat.
+- learned, and this is the third time this sitting: my source audit matched its OWN text. The test sits
+  above pollTool in the file, so an unsplit "fn pollTool(" needle found the literal in the test and then
+  asserted ordering about the test rather than the function. I had already written the split-needle trick
+  for the metrics audit and did not apply it here. A source audit reads a file that CONTAINS the audit —
+  split the needles by default, not after it bites.
+- verified: suite exit 0. CF remove the check -> named test fails, warn says Stop waits out the full
+  budget, 0 compile errors. tools.zig byte-identical after restore. Full oracle green.
+- NOT done, and both are the owner's call: (1) killing the SERVICE a poll watches — the fuzzer is its own
+  process and ending the turn does not reap it; `kill_proc` exists only behind the adjudicated
+  host_command surface, and making "kill what this turn started" a chat-level action is a permissions
+  decision. (2) steer during a poll — the new check point makes it reachable, but the loop only breaks on
+  stop today.

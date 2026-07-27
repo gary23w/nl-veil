@@ -1092,9 +1092,12 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var durable_pb: [700]u8 = undefined; // backs ctx.durable_path for the turn (same lifetime pattern as db)
 
     var counters = [_]u32{0} ** 5;
+    // Lives for the whole turn: `ctx.cancel` borrows it, and a tool may consult it minutes from here.
+    var tool_stop = ToolStopCtx{ .app = app, .conv_dir = conv_dir, .ctrl_cursor = ctrl_cursor };
     var ctx = tools.ToolCtx{
         .gpa = gpa,
         .io = app.io,
+        .cancel = .{ .fn_ptr = toolShouldStop, .ctx = &tool_stop },
         .environ = environ,
         .run_dir = run_root,
         .workdir = workdir,
@@ -3482,6 +3485,19 @@ const StreamCtx = struct {
     rsn: [256]u8 = undefined,
     rsn_len: usize = 0,
 };
+
+/// The same Stop predicate, handed to blocking TOOLS (tools.Cancel).
+///
+/// Streaming has been interruptible mid-flight for a while; tools have not, and the gap shows worst exactly
+/// where it hurts. `poll` is bounded at 180s and MEANT to be chained, so a long watch reaches the between-tool
+/// check only every few minutes: the user presses Stop, nothing appears to happen, and the turn keeps its
+/// thread. This lets a tool that blocks in a loop notice at its own sample boundaries instead.
+const ToolStopCtx = struct { app: *App, conv_dir: []const u8, ctrl_cursor: usize };
+
+fn toolShouldStop(cx: *anyopaque) bool {
+    const tc: *ToolStopCtx = @ptrCast(@alignCast(cx));
+    return stopRequestedSince(tc.app, tc.conv_dir, tc.ctrl_cursor);
+}
 
 /// completeStream's cooperative-abort hook: fires (~every 40ms) during a streaming reply so a chat Stop kills the
 /// in-flight generation promptly instead of waiting out the whole ~15s inference. Reads control.jsonl from the

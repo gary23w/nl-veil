@@ -273,9 +273,30 @@ pub fn sandboxSchema(comptime block: []const u8) []const u8 {
     return out;
 }
 
+/// Cooperative cancellation for tools that BLOCK for a long time.
+///
+/// The chat turn already drains its control channel — Stop, and mid-turn steer — but only "between drive steps
+/// and before each tool". That is fine for a tool that returns promptly and useless for one that does not:
+/// `poll` is bounded at 180s per call and is DESIGNED to be chained, so a long watch offers a read point only
+/// every few minutes. Stop looks like it did nothing, a steer sits unread, and the turn holds its thread
+/// throughout. The LLM streaming path has had a mid-flight abort check for a while; the tool path had none.
+///
+/// A function pointer rather than a bool because the answer lives in the conversation's control.jsonl, which
+/// tools.zig cannot see. Null everywhere it is not set — swarm minds, the CLI — so those keep today's exact
+/// behaviour, and a tool that ignores it is no worse off than before.
+pub const Cancel = struct {
+    fn_ptr: *const fn (*anyopaque) bool,
+    ctx: *anyopaque,
+    pub fn requested(self: Cancel) bool {
+        return self.fn_ptr(self.ctx);
+    }
+};
+
 pub const ToolCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// Set by the chat turn so a long-blocking tool can notice Stop between its own samples. See Cancel.
+    cancel: ?Cancel = null,
     environ: *const std.process.Environ.Map,
     run_dir: []const u8,
     workdir: []const u8,
@@ -451,6 +472,49 @@ pub fn convLocalFact(fact: []const u8) bool {
         if (std.ascii.findIgnoreCase(fact, p) != null) return true;
     }
     return factNamesLineNumber(fact) or factNamesProjectFile(fact);
+}
+
+test "Cancel: a blocking tool can ask the turn whether the user hit Stop" {
+    const Probe = struct {
+        stop: bool = false,
+        fn ask(cx: *anyopaque) bool {
+            const s: *@This() = @ptrCast(@alignCast(cx));
+            return s.stop;
+        }
+    };
+    var p = Probe{};
+    const c = Cancel{ .fn_ptr = Probe.ask, .ctx = &p };
+    try std.testing.expect(!c.requested());
+    p.stop = true;
+    try std.testing.expect(c.requested());
+}
+
+test "poll asks about Stop at every sample, not only when its whole budget runs out" {
+    // A poll is bounded at 180s and is DESIGNED to be chained, so the turn's between-tool Stop check can be
+    // minutes away: the user presses Stop, nothing happens, and the thread stays held for the whole watch.
+    // Position is the property here — inside the loop, and BEFORE the sleep. A check after the sleep answers
+    // an interval late; a check outside the loop answers once, which is what it did before.
+    const src = @embedFile("tools.zig");
+    // Needles split so this test cannot match its OWN source: it sits above pollTool in the file, so an
+    // unsplit literal finds itself first and then asserts ordering about the test instead of the function.
+    const at = std.mem.indexOf(u8, src, "fn poll" ++ "Tool(") orelse return error.PollToolMissing;
+    const body = src[at..@min(src.len, at + 16000)];
+    const loop = std.mem.indexOf(u8, body, "while (true) {") orelse return error.PollLoopMissing;
+    const sleep = std.mem.indexOf(u8, body, "pollSleep" ++ "Ms(") orelse return error.PollSleepMissing;
+    const check = std.mem.indexOf(u8, body, "ctx." ++ "cancel") orelse {
+        std.log.warn("tools.zig: pollTool no longer consults ctx.cancel — Stop waits out the full 180s budget", .{});
+        return error.PollIgnoresCancel;
+    };
+    try std.testing.expect(check > loop);
+    try std.testing.expect(check < sleep);
+
+    // ...and a stopped watch must not read to the model like a timeout, whose documented answer is "call poll
+    // again to keep waiting". That would chain a fresh poll and undo the Stop the user just pressed.
+    const stopped = std.mem.indexOf(u8, body, "\"stop" ++ "ped\"") orelse {
+        std.log.warn("tools.zig: poll has no distinct stopped verdict — a Stop reads as a timeout and gets re-polled", .{});
+        return error.PollStopVerdictMissing;
+    };
+    _ = stopped;
 }
 
 test "convLocalFact pins files/lines/workdir, passes general knowledge" {
@@ -3303,6 +3367,14 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
         }
     };
     while (true) {
+        // Stop, noticed at a SAMPLE boundary rather than at the end of the call. Without this the turn's
+        // control channel is only read before the next tool, so a chained watch answers Stop every few
+        // minutes at best — the user presses it, nothing happens, and the thread stays held. Checked first
+        // so a stop that arrived during the previous sleep ends the call before doing more work.
+        if (ctx.cancel) |c| if (c.requested()) {
+            verdict = "stopped";
+            break;
+        };
         const elapsed: u64 = @intCast(@max(0, std.Io.Timestamp.now(ctx.io, .real).toSeconds() - t0));
         switch (k) {
             .file => {
@@ -3430,7 +3502,9 @@ fn pollTool(ctx: *ToolCtx, args_json: []const u8) []u8 {
         if (now + interval > timeout) break;
         pollSleepMs(ctx.io, interval * 1000);
     }
-    const guidance = if (std.mem.eql(u8, verdict, "timeout"))
+    const guidance = if (std.mem.eql(u8, verdict, "stopped"))
+        " — the USER stopped this watch. Do not start another poll; say what the log shows and wait for them."
+    else if (std.mem.eql(u8, verdict, "timeout"))
         " — still not there; call poll again to keep waiting, or act on what the log shows"
     else
         "";
