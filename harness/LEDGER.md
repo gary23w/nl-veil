@@ -2318,3 +2318,33 @@ edit, confirm it applied, then run.
 - verified: src suite exit 0; counterfactual by name with no compile error; full oracle green.
 - next (verified): one audit-2 finding remains (the unreachable has_plan disjunct, engine.zig:1547).
   Audit 3 (edit primitives, grounding, ingestion, metering, acceptance) is still running.
+
+## 0090 — 2026-07-25 — how often the audit's "confirmed" findings are wrong: about a third
+- did: no code change. Two record corrections and a bounded class, which 0067/0078 established is
+  worth an entry of its own rather than being dressed up as work.
+- CORRECTION: audit 2 filed "the mid-turn course check's `has_plan` disjunct is unreachable — a plan
+  walking its board never gets a course check", and a skeptic confirmed it. FALSE. `plan` is
+  populated at engine.zig:1395 (the block breaks with a real plan or with `&.{}`), `has_plan` is set
+  from it at 1448, and NOTHING reassigns it before its use at 1547 — the only reassignment is at
+  1669, inside the loop that runs after. The disjunct is live; an unarmed turn with a plan does get
+  the course check.
+- so the running tally, and it is the useful output: of audit 2's SEVEN "confirmed" findings I have
+  now independently re-derived five before acting. Two were false — the sched 45-byte outcome-ledger
+  claim (0085, a truncation in a path that truncates nothing) and this one. Three were real and are
+  fixed (0084 event-log cap, 0086 decline-as-rule, 0087 done-list scavenging), plus two more from the
+  same run (0088 pile-up, 0089 unit error). **About a third of confirmed findings did not survive a
+  careful read.** Audit 1's ratio was the mirror image: 7 of 10 refuted BEFORE reaching me. Taken
+  together: the refutation stage is worth its tokens and is not a substitute for reading the code.
+- also: swept the class 0089 opened — a function returning ONE type with TWO meanings, which no type
+  system can catch when both are `u32`. Checked every numeric-returning function in src/ with
+  divergent return expressions (26 of them). All are the ordinary "0 means absent" idiom;
+  `selfMetric` was the only genuine unit switch. The class is bounded at one instance, recorded so
+  nobody re-derives the sweep.
+- learned: I set audit 3's refuters a harder brief because of 0085 — "your FIRST job is not is there
+  a guard, it is IS THE MECHANISM REAL: open the file, read the expression, trace the value to the
+  line that imposes the bound; if you cannot find that line, refute" — and added a separate
+  `mechanism_verified` flag so a confirmation without it lands in its own bucket rather than among
+  the confirmed. That change came from this exact failure mode, one run too late to help audits 1-2.
+- verified: full oracle green (record-only change, run for the discipline).
+- next (verified): audit 3 is still running. Its findings should be treated as ~2/3 reliable until
+  each is re-derived, same as these.
