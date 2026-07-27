@@ -2538,3 +2538,33 @@ edit, confirm it applied, then run.
   0 compile errors. Full oracle green.
 - next (verified): three audit-3 findings left — writer.zig's per-round/run-cumulative ratio and its
   seedSources provenance, run.zig's PROBE url newline delimiter.
+
+## 0097 — 2026-07-26 — the publish gate graded every edition on evidence from earlier rounds
+- did: four fields are named `round_*`. ONLY ONE of them was per-round. `round_seed_sources` is assigned
+  each seeding; `round_independent_sources` and `round_source_diversity` only ever increment, and
+  nothing anywhere resets them — there is no round-boundary reset in the file at all.
+- so both source-quality publish gates decay into no-ops:
+  - `enough_independent = round_independent_sources >= 1` — once a run has EVER fetched one independent
+    source, every later round passes it, including a round that fetched nothing.
+  - `seed_dependency_pct` — a per-round numerator over a run-cumulative denominator. 12 seed sources
+    with 1 independent fetch is 92% and is correctly held; by round five the same 12 seeds read as
+    ~37% and publish freely. The gate stops discriminating exactly when a long run makes it matter.
+  The function's own doc says "post only if ... at least one was independently retrieved" — present
+  tense, about THIS edition. The code agreed with that sentence only in round one.
+- nearly got this wrong: my first move was to reset the stored percentage to its declared default of
+  100 each round. That would have HELD every edition on a round that did not re-seed, because seeding
+  is conditional on `ground` while publishing is not. A derived value should not be stored and then
+  reset to a guess — it should not be stored. `seedDepPct(seed, independent)` is computed at the gate
+  from the two counters, so it cannot be stale and has no default to get wrong.
+- did: reset the three raw counters at the top of the round loop; deleted the stored field; three call
+  sites now derive. This makes the gate STRICTER — editions that used to coast on old evidence will be
+  held — which is the documented intent, not a regression.
+- learned: a name is not a scope. Three fields carried a `round_` prefix for however long, and the
+  prefix was doing all the work of convincing readers (me included, on first pass) that something
+  cleared them. The audit half of the test asserts the loop clears each one BY NAME, because the next
+  person to add a `round_` field will believe the prefix too.
+- verified: suite exit 0, 0 compile errors. CF-A drop one reset -> named test fails, warn names
+  `round_independent_sources`. CF-B make an empty round read as 0% dependent instead of 100 -> named
+  test fails. Full oracle green.
+- next (verified): two audit-3 findings left — writer.zig's seedSources provenance, and run.zig's
+  PROBE url newline delimiter.
