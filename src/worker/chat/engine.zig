@@ -3494,9 +3494,15 @@ const StreamCtx = struct {
 /// thread. This lets a tool that blocks in a loop notice at its own sample boundaries instead.
 const ToolStopCtx = struct { app: *App, conv_dir: []const u8, ctrl_cursor: usize };
 
-fn toolShouldStop(cx: *anyopaque) bool {
+fn toolShouldStop(cx: *anyopaque) tools.CancelReason {
     const tc: *ToolStopCtx = @ptrCast(@alignCast(cx));
-    return stopRequestedSince(tc.app, tc.conv_dir, tc.ctrl_cursor);
+    if (stopRequestedSince(tc.app, tc.conv_dir, tc.ctrl_cursor)) return .stopped;
+    // A steer is just as much "stop sitting on the thread" as a stop is — the user is mid-watch and being
+    // ignored. The difference is what happens after: this only makes the tool RETURN, and the turn's own
+    // between-tools drain then folds the text in as a user message. Deliberately not consumed here, so
+    // there is exactly one place that reads a steer and one place that persists it.
+    if (steerPendingSince(tc.app, tc.conv_dir, tc.ctrl_cursor)) return .steered;
+    return .none;
 }
 
 /// completeStream's cooperative-abort hook: fires (~every 40ms) during a streaming reply so a chat Stop kills the
@@ -6152,6 +6158,14 @@ fn readControlTail(app: *App, conv_dir: []const u8, cursor: usize) ?[]u8 {
 
 /// True if control.jsonl carries a `"op":"stop"` in the bytes appended AFTER `cursor` (i.e. since the turn began).
 /// Best-effort: any read error means "no stop" (never block the turn on a control-file hiccup).
+/// Is a mid-turn steer waiting? The same tail read stopRequestedSince does, for the ops the drain folds in.
+/// Peeks only: draining, folding and persisting stay in the one drain that already does all three.
+fn steerPendingSince(app: *App, conv_dir: []const u8, cursor: usize) bool {
+    const tail = readControlTail(app, conv_dir, cursor) orelse return false;
+    defer app.gpa.free(tail);
+    return std.mem.indexOf(u8, tail, "\"op\":\"steer\"") != null or std.mem.indexOf(u8, tail, "\"op\":\"say\"") != null;
+}
+
 fn stopRequestedSince(app: *App, conv_dir: []const u8, cursor: usize) bool {
     const tail = readControlTail(app, conv_dir, cursor) orelse return false;
     defer app.gpa.free(tail);
