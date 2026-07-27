@@ -191,6 +191,15 @@ pub const Worker = struct {
     dream_str: []const u8 = "",
     pending_will: []const u8 = "",
     pending_will_baseline: u32 = 0,
+    /// WHICH UNIT the baseline above was captured in. `selfMetric` returns a benchmark PERCENT when a
+    /// bench scored, and a raw FACT COUNT when none did — two different quantities out of one
+    /// function, switched by `last_bench.status`. The will is graded by comparing a later reading
+    /// against that baseline, so if the status flips in between — which is exactly what happens the
+    /// first time a deliverable acquires runnable tests, a normal build event rather than an edge
+    /// case — the comparison crosses units: a 200-fact baseline against a 65% reading reads MISS
+    /// forever, an 80% baseline against a 250-fact reading reads HIT for nothing. Recording the unit
+    /// lets scoreWill decline to grade a bet whose yardstick changed underneath it (ledger 0089).
+    pending_will_bench: bool = false,
     pending_will_round: u32 = 0,
     will_hits: u32 = 0,
     will_misses: u32 = 0,

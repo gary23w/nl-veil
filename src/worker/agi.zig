@@ -534,6 +534,16 @@ pub fn loadSelf(w: *Worker) void {
 /// reflection is forced to confront. This is the anti-narration discipline: the self answers to outcomes, not eloquence.
 fn scoreWill(w: *Worker, round: u32) void {
     if (w.pending_will.len == 0 or round <= w.pending_will_round) return;
+    // The yardstick must not have changed. selfMetric answers in a benchmark PERCENT once a bench has
+    // scored and in a raw FACT COUNT before that, so a will staged before the deliverable had runnable
+    // tests would otherwise be graded against a number in a different unit — MISS forever, or HIT for
+    // nothing, and either way the calibration rate and the self-model text built from it are noise.
+    // Decline to grade rather than record a verdict the comparison cannot support (ledger 0089).
+    if ((w.last_bench.status == .ok) != w.pending_will_bench) {
+        w.gpa.free(@constCast(w.pending_will));
+        w.pending_will = "";
+        return;
+    }
     const now = selfMetric(w);
     const hit = now > w.pending_will_baseline;
     if (hit) w.will_hits += 1 else w.will_misses += 1;
@@ -559,6 +569,7 @@ fn recordWill(w: *Worker, round: u32) void {
     if (w.pending_will.len > 0) w.gpa.free(@constCast(w.pending_will));
     w.pending_will = w.gpa.dupe(u8, clip(will, 280)) catch "";
     w.pending_will_baseline = selfMetric(w);
+    w.pending_will_bench = (w.last_bench.status == .ok); // remember the UNIT, not just the number
     w.pending_will_round = round;
 }
 
@@ -783,4 +794,41 @@ test "willOf extracts the MY WILL directive (the prediction the self is held to)
     try std.testing.expectEqualStrings("a hive learning Rust", labelLine(self, "I AM"));
     try std.testing.expectEqualStrings("", willOf("I AM: no will line here\nI KNOW: things"));
     try std.testing.expectEqualStrings("ship it", willOf("**MY WILL:** ship it\n"));
+}
+
+test "selfMetric answers in TWO different units, and scoreWill refuses to compare across them" {
+    // The defect this pins: selfMetric returns a benchmark PERCENT once a bench has scored and a raw
+    // FACT COUNT before that. A will staged in one regime and graded in the other compares numbers
+    // that measure different things — a 200-fact baseline against a 65% reading reads MISS forever;
+    // an 80% baseline against a 250-fact reading reads HIT for nothing. The flip is not exotic: it is
+    // what happens the first time a deliverable acquires runnable tests.
+    var w: Worker = undefined;
+
+    // The bench branch is pure — it reads last_bench and nothing else, so it needs no store.
+    w.last_bench = .{ .status = .ok, .passed = 7, .total = 10, .pct = 70 };
+    try std.testing.expectEqual(@as(u32, 70), selfMetric(&w)); // a PERCENT
+    w.last_bench = .{ .status = .ok, .passed = 0, .total = 4, .pct = 0 };
+    try std.testing.expectEqual(@as(u32, 0), selfMetric(&w)); // 0% is a real score, not "no score"
+
+    // The other branch sums fact counts and needs a live store, so it is not exercised here — what
+    // matters for the bug is that the two branches return DIFFERENT KINDS of number, which the
+    // source of selfMetric shows plainly and the guard below is written against.
+    const SRC = @embedFile("agi.zig");
+    const sm = std.mem.indexOf(u8, SRC, "fn selfMetric") orelse return error.SelfMetricMissing;
+    const sm_body = SRC[sm..@min(sm + 400, SRC.len)];
+    try std.testing.expect(std.mem.indexOf(u8, sm_body, "last_bench.pct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, sm_body, "factCount") != null);
+
+    // WIRING (0086): scoreWill must compare the recorded unit before grading, and recordWill must
+    // record it. Without both, the staged bet is graded against whatever yardstick happens to be in
+    // force at scoring time.
+    const sw = std.mem.indexOf(u8, SRC, "fn scoreWill") orelse return error.ScoreWillMissing;
+    const sw_body = SRC[sw..@min(sw + 1600, SRC.len)];
+    if (std.mem.indexOf(u8, sw_body, "pending_will_bench") == null) {
+        std.debug.print("\nscoreWill no longer checks the baseline's unit — a will staged before the first test run will be graded against a percentage\n", .{});
+        return error.WillUnitGuardNotWired;
+    }
+    const rw = std.mem.indexOf(u8, SRC, "fn recordWill") orelse return error.RecordWillMissing;
+    const rw_body = SRC[rw..@min(rw + 700, SRC.len)];
+    try std.testing.expect(std.mem.indexOf(u8, rw_body, "pending_will_bench") != null);
 }

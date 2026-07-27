@@ -2288,3 +2288,33 @@ edit, confirm it applied, then run.
   and stops looking. Worth asking of any safety mechanism: who calls this, and is that everyone?
 - next (verified): two findings from wf_8f5e3c7c-ed1 remain — agi's percent-vs-count comparison and
   the unreachable has_plan disjunct. Both need re-derivation first (0085).
+
+## 0089 — 2026-07-25 — the Veil graded its own predictions against a changing yardstick
+- did: `selfMetric` returns TWO different quantities out of one function —
+  `if (last_bench.status == .ok) last_bench.pct else (factCount(KNOWLEDGE) + factCount(SKILL))` — a
+  benchmark PERCENT (0..100) or a raw FACT COUNT (unbounded), switched by bench status. `recordWill`
+  stages a will with `baseline = selfMetric(w)`; `scoreWill` later grades it with `now > baseline`.
+  Nothing recorded WHICH unit the baseline was in.
+- the flip is ordinary, not exotic: it happens the first time a deliverable acquires runnable tests,
+  which is the normal arc of a build. A will staged before that (baseline = 200 facts) is then graded
+  against a percentage (65) and reads MISS forever; the reverse (baseline 80%, now 250 facts) reads
+  HIT for nothing. Everything downstream inherits it — `will_hits`/`will_misses`, the calibration
+  RATE, the `.veil_self_model` text the Veil is shown ("the direction I will into being has actually
+  moved the needle N% of the time"), and the metacog event. A self-model built on a unit error is
+  worse than none: it is confidently wrong about which of its own judgements are working.
+- did: the baseline now carries its unit (`pending_will_bench`), and `scoreWill` DECLINES to grade
+  when the yardstick changed under it — clearing the pending will without recording a verdict, rather
+  than inventing one the comparison cannot support. Refusing to answer is the correct output when the
+  measurement is incommensurable; a HIT/MISS either way would be noise entering a durable record.
+- ratchet: the bench branch of selfMetric is pure, so its PERCENT answer is pinned directly (including
+  0% as a real score rather than "no score"); the count branch needs a live store and is not
+  exercised, which the test says plainly. A source assertion pins that the two branches really do
+  return different kinds of number, and a wiring audit (0086) requires recordWill to record the unit
+  and scoreWill to check it. Counterfactual: bypassing the guard fails by name, zero compile errors.
+- learned: this is a UNIT error, which is a category the other audits never looked for — every prior
+  finding was a missing bound, a stale value, or an unwired guard. A function that answers in
+  different units depending on hidden state is a type error the type system cannot see, because both
+  answers are `u32`. Worth a sweep of its own: which other functions return one type and two meanings?
+- verified: src suite exit 0; counterfactual by name with no compile error; full oracle green.
+- next (verified): one audit-2 finding remains (the unreachable has_plan disjunct, engine.zig:1547).
+  Audit 3 (edit primitives, grounding, ingestion, metering, acceptance) is still running.
