@@ -338,12 +338,19 @@ fn growthReport(ctx: *Ctx) void {
     // up to a dozen auxiliary calls (plan, recon, arbiter, stuck, reflect, ctxsum, compact...), so a
     // per-model total cannot tell you that, say, `plan` is a third of the spend. (Ledger 0079.)
 
+    const metrics = @import("worker/metrics.zig"); // owns the rotation bound AND the read limit; they pair
     var it2 = root.iterate();
     while (it2.next(ctx.io) catch null) |ent| {
         if (ent.kind != .directory or ent.name.len < 2 or ent.name[0] != 'u') continue;
         var pb: [700]u8 = undefined;
         const mp = std.fmt.bufPrint(&pb, "{s}/{s}/_metrics/llm.jsonl", .{ ctx.data, ent.name }) catch continue;
-        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, mp, gpa, .limited(16 << 20)) catch continue;
+        // Only a MISSING ledger is silent. Any other error means this user's spend is absent from the
+        // totals below, and a quiet `continue` would print them as though they were complete — worse,
+        // if every user failed the report would claim "no llm.jsonl yet" about files that DO exist.
+        const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, mp, gpa, .limited(metrics.LLM_READ_LIMIT)) catch |e| {
+            if (e != error.FileNotFound) out("  models   : {s}/_metrics/llm.jsonl unreadable ({t}) — EXCLUDED from the totals below\n", .{ ent.name, e });
+            continue;
+        };
         defer gpa.free(data);
         foldMetricsJsonl(gpa, data, &agg);
     }

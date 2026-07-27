@@ -2506,3 +2506,35 @@ edit, confirm it applied, then run.
 - next (verified): four audit-3 findings remain — writer.zig's per-round/run-cumulative ratio and its
   seedSources provenance, run.zig's PROBE url newline delimiter, metrics.zig's all-zero answer past
   16 MB.
+
+## 0096 — 2026-07-26 — the Dashboard would have reported zero spend, forever
+- did: `GET /api/v1/metrics/llm` read the usage ledger with `.limited(16 << 20) catch ""`. Per 0084,
+  `readFileAlloc`'s limit ERRORS with StreamTooLong rather than truncating — so past 16 MiB the
+  endpoint answers 200 with all-zero usage, indistinguishable from a fresh install that has genuinely
+  spent nothing. The worst kind of wrong: a plausible answer.
+- why certain rather than theoretical: calls.jsonl rotates at CALLS_MAX; llm.jsonl — the file the
+  Dashboard actually aggregates — had NO rotation at all. The file's own header said two contradictory
+  things: line 21 "Bounded like the old one", and line 30 "reaches the 16MB read cap after ~100k turns;
+  rotation can land when anyone gets a tenth of the way there". Rotation was a deliberate deferral, and
+  I am landing it as the author planned. The SILENT ZERO is the part nobody signed up for.
+- third site, and it is mine: cli.zig's growth report (0079) used the same literal with `catch
+  continue`, so past the cap it prints "no llm.jsonl yet (served chat turns write it)" about a file
+  that exists and is 20 MB. I added a reader in 0079 and inherited a bug I had not read.
+- did: landed rotation as a `rotateIfBig` SHARED by both logs, paired LLM_MAX with an explicit
+  LLM_READ_LIMIT strictly above it, and stopped both readers fabricating — the endpoint returns the
+  error for anything but FileNotFound, the CLI names the user it excluded instead of dropping it.
+- the guard is the WIRING, not the constants. A bound and a limit can agree perfectly while a reader
+  passes its own literal and goes to zero on its own schedule; a limit can be right while nothing
+  enforces the bound. So the audit does both halves: every `readFileAlloc(` on this file names
+  LLM_READ_LIMIT, and every appendFile to a log is preceded by rotateIfBig.
+- learned: the guard's first version failed on my own doc comment — it matched the WORD readFileAlloc,
+  not a call. A source audit is a parser with no grammar: anchor it on syntax only code has (the open
+  paren), and build the needle by concatenation so the test cannot match its own source.
+- learned (again, 0087 exactly): CF-A first exited 1 because removing the constant left `metrics`
+  unused — a COMPILE error. Exit 1 from a build that never compiled proves nothing. Redone keeping the
+  import alive; that is what the compile-error count in every counterfactual here is for.
+- verified: suite exit 0. CF-A CLI back to its own literal -> named test fails, warn names cli.zig,
+  0 compile errors. CF-B drop the llm.jsonl rotation -> named test fails "that log grows forever",
+  0 compile errors. Full oracle green.
+- next (verified): three audit-3 findings left — writer.zig's per-round/run-cumulative ratio and its
+  seedSources provenance, run.zig's PROBE url newline delimiter.

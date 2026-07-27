@@ -18,7 +18,7 @@
 //! (llm.roleCosts); this file drains and writes it. See llm.zig's PER-ROLE COST ATTRIBUTION section.
 //!
 //! Two files, because they answer different questions at different sizes:
-//!   llm.jsonl   — per (role, model) per TURN. What the Dashboard aggregates. Bounded like the old one.
+//!   llm.jsonl   — per (role, model) per TURN. What the Dashboard aggregates. Rotates at LLM_MAX.
 //!   calls.jsonl — per CALL: role, model, base, latency, tokens. The durable flight recorder, the thing that
 //!                 answers "which model served THAT call, and why did it take 40s". Rotates at CALLS_MAX.
 //!
@@ -27,8 +27,9 @@
 //! usage choke-point (engine.emitUsage) needs no extra parameters threaded through its eleven call sites.
 //!
 //! Hive/cast minds are NOT metered here yet — they burn tokens on their own threads outside runTurn;
-//! per-mind metering is a later lane. At ~150 bytes/row the aggregate file reaches the 16MB read cap after
-//! ~100k turns; rotation can land when anyone gets a tenth of the way there.
+//! per-mind metering is a later lane. At ~150 bytes/row the aggregate file used to reach its read cap after
+//! ~100k turns and then read as EMPTY, because readFileAlloc errors on overflow instead of truncating — so the
+//! Dashboard would have reported no spend at all rather than an error. It rotates at LLM_MAX now.
 
 const std = @import("std");
 const httpz = @import("httpz");
@@ -103,6 +104,14 @@ pub fn hostOf(base_url: []const u8) []const u8 {
 /// previous window stays inspectable and the flight recorder can never eat the disk.
 const CALLS_MAX: u64 = 32 << 20;
 
+/// Same for llm.jsonl. This one is not just about disk: `readFileAlloc`'s limit ERRORS with StreamTooLong
+/// rather than truncating, so an unrotated ledger does not degrade — every reader of it goes to zero at once.
+const LLM_MAX: u64 = 16 << 20;
+
+/// What readers of llm.jsonl must pass to readFileAlloc. Strictly above LLM_MAX, so a file sitting at the
+/// rotation bound plus one more turn's rows still reads. The two are a pair: raise one, raise the other.
+pub const LLM_READ_LIMIT: usize = 64 << 20;
+
 /// Append this turn's usage (called from engine.emitUsage with the turn's token deltas). Writes one line per
 /// (role, model) the turn actually used, plus the buffered per-call flight lines. Quietly does nothing when the
 /// thread has no armed context or the turn moved zero tokens. Each file gets ONE http.appendFile — the same
@@ -162,6 +171,7 @@ fn flush(app: *App, d_in: u64, d_out: u64, d_cached: u64, now_s: i64) void {
     if (rows.items.len > 0) {
         const path = std.fmt.allocPrint(gpa, "{s}/llm.jsonl", .{dir}) catch return;
         defer gpa.free(path);
+        rotateIfBig(app, gpa, path, LLM_MAX);
         http.appendFile(app.io, gpa, path, rows.items) catch {};
     }
     if (calls_log.len > 0) writeCallLog(app, gpa, dir, calls_log);
@@ -184,19 +194,25 @@ fn appendRow(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), ts: i64, 
     try out.print(gpa, ",\"calls\":{d},\"in\":{d},\"out\":{d},\"cached\":{d},\"ms\":{d},\"s\":{d},\"sched\":{d}}}\n", .{ calls, t_in, t_out, t_cached, ms, @divTrunc(ms, 1000), @as(u8, if (cur.is_sched) 1 else 0) });
 }
 
+/// Rotate `<name>.jsonl` to `<name>.prev.jsonl` once it passes `max`, replacing any older rotation, so exactly
+/// one previous window stays inspectable. Shared by both logs on purpose: "bounded like the other one" was a
+/// comment for a while, and a comment is not a mechanism.
+fn rotateIfBig(app: *App, gpa: std.mem.Allocator, path: []const u8, max: u64) void {
+    const st = std.Io.Dir.cwd().statFile(app.io, path, .{}) catch return; // no file yet: nothing to rotate
+    if (st.size <= max) return;
+    const stem = if (std.mem.endsWith(u8, path, ".jsonl")) path[0 .. path.len - ".jsonl".len] else path;
+    const prev = std.fmt.allocPrint(gpa, "{s}.prev.jsonl", .{stem}) catch return;
+    defer gpa.free(prev);
+    std.Io.Dir.cwd().deleteFile(app.io, prev) catch {};
+    std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), prev, app.io) catch {};
+}
+
 /// Append the buffered flight lines, rotating first if the log has grown past CALLS_MAX. Lines arrive
 /// pre-rendered from llm.zig (fixed-buffer, no allocator on the call path) so this just moves bytes.
 fn writeCallLog(app: *App, gpa: std.mem.Allocator, dir: []const u8, lines: []const u8) void {
     const path = std.fmt.allocPrint(gpa, "{s}/calls.jsonl", .{dir}) catch return;
     defer gpa.free(path);
-    if (std.Io.Dir.cwd().statFile(app.io, path, .{})) |st| {
-        if (st.size > CALLS_MAX) {
-            const prev = std.fmt.allocPrint(gpa, "{s}/calls.prev.jsonl", .{dir}) catch return;
-            defer gpa.free(prev);
-            std.Io.Dir.cwd().deleteFile(app.io, prev) catch {};
-            std.Io.Dir.cwd().rename(path, std.Io.Dir.cwd(), prev, app.io) catch {};
-        }
-    } else |_| {}
+    rotateIfBig(app, gpa, path, CALLS_MAX);
     http.appendFile(app.io, gpa, path, lines) catch {};
     // A dropped flight line means the log undercounts CALLS; the token totals in llm.jsonl are still whole.
     const dropped = llm.callLogDropped();
@@ -271,7 +287,14 @@ const DayAgg = struct { in: u64 = 0, out: u64 = 0, calls: u64 = 0 };
 pub fn getLlm(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const u = http.requireUser(app, req, res) orelse return;
     const path = try std.fmt.allocPrint(res.arena, "{s}/u{d}/_metrics/llm.jsonl", .{ app.data, u.id });
-    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, path, res.arena, .limited(16 << 20)) catch "";
+    const raw = std.Io.Dir.cwd().readFileAlloc(app.io, path, res.arena, .limited(LLM_READ_LIMIT)) catch |e| switch (e) {
+        // A fresh install has a Dashboard too: no file means no usage, and empty IS the true answer.
+        error.FileNotFound => "",
+        // Anything else means the ledger could not be read. Answering 200 with all-zero aggregates would
+        // report "you have spent nothing" — the one answer guaranteed to be wrong, and indistinguishable
+        // from the truthful empty above. Fail the request instead; the client can tell those apart.
+        else => return e,
+    };
 
     var models: [MODELS_MAX]ModelAgg = @splat(.{});
     var mn: usize = 0;
@@ -389,6 +412,55 @@ fn bump(m: *ModelAgg, r: Row) void {
 }
 
 // ---- tests ---------------------------------------------------------------------------------------------------
+
+test "every llm.jsonl reader admits more than the writer's rotation bound lets the file reach" {
+    // The pair, first: a read limit at or below the rotation bound means a file that is legally sized
+    // still fails to read, and readFileAlloc signals that by ERRORING, not by truncating.
+    try std.testing.expect(LLM_MAX < LLM_READ_LIMIT);
+
+    // The wiring, second. This is the half that was actually broken: the bound and the limit can agree
+    // perfectly while a reader passes its own literal and goes to zero on its own schedule. Two readers
+    // exist — this file's endpoint and the CLI growth report — and both must name the shared constant.
+    const sources = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "worker/metrics.zig", .src = @embedFile("metrics.zig") },
+        .{ .name = "cli.zig", .src = @embedFile("../cli.zig") },
+    };
+    // Split so the needle's own bytes never appear in this file: the scan reads its own source, and a
+    // literal would match itself. The trailing paren is what separates a CALL from prose about one --
+    // the first cut of this test flagged its own doc comment.
+    const call = "readFileAlloc" ++ "(";
+    var readers: usize = 0;
+    for (sources) |s| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, s.src, i, call)) |at| : (i = at + 1) {
+            const lo = at -| 700;
+            const hi = @min(s.src.len, at + 700);
+            if (std.mem.indexOf(u8, s.src[lo..hi], "llm.jsonl") == null) continue;
+            readers += 1;
+            if (std.mem.indexOf(u8, s.src[at..hi], "LLM_READ_LIMIT") == null) {
+                std.log.warn("{s}: a readFileAlloc on llm.jsonl does not use LLM_READ_LIMIT — it will read empty on its own bound", .{s.name});
+                return error.ReaderIgnoresSharedLimit;
+            }
+        }
+    }
+    try std.testing.expect(readers >= 2); // vacuity floor: a renamed file must not silently pass this
+
+    // And the writer half. A read limit that agrees with a bound nothing enforces is still unbounded:
+    // llm.jsonl grew forever precisely because the rotation lived in ONE log's append path and the
+    // other's header merely claimed it. Every append to a log here rotates first, or this fails.
+    const append = "http.appendFile" ++ "(";
+    const src = @embedFile("metrics.zig");
+    var appends: usize = 0;
+    var j: usize = 0;
+    while (std.mem.indexOfPos(u8, src, j, append)) |at| : (j = at + 1) {
+        appends += 1;
+        if (std.mem.indexOf(u8, src[at -| 300 .. at], "rotateIfBig") == null) {
+            std.log.warn("metrics.zig: an appendFile to a log is not preceded by rotateIfBig — that log grows forever", .{});
+            return error.LogAppendedWithoutRotation;
+        }
+    }
+    try std.testing.expect(appends >= 2); // both logs, not just whichever one someone remembered
+}
 
 test "hostOf strips scheme + path, keeps host:port, tolerates bare hosts" {
     try std.testing.expectEqualStrings("api.deepseek.com", hostOf("https://api.deepseek.com/v1"));
