@@ -7050,7 +7050,16 @@ pub fn jsonSlice(s: []const u8) []const u8 {
 
 const PUBLISH_MIN_SOURCES: u32 = 2;
 const PUBLISH_MIN_INDEPENDENT: u32 = 1;
-const PUBLISH_MAX_SEED_DEP_PCT: u32 = 85;
+/// The seed-dependency ceiling, DERIVED from the bar PUBLISH_MIN_INDEPENDENT already sets rather than picked.
+///
+/// These two are one policy stated twice, and while the counter was run-cumulative (ledger 0097) the ratio never
+/// actually bound, so nobody noticed they disagreed: MIN_INDEPENDENT=1 says one independent fetch is enough,
+/// while a hand-set 85% against a 12-source seeding silently demanded three. Deriving it means a change to the
+/// seeding size or to the minimum moves the ceiling with it — the two cannot drift apart again, and the test
+/// below fails if they ever do. Proportionality is still enforced; it is just enforced at the stated bar.
+fn maxSeedDepPct(seed: u32) u32 {
+    return seedDepPct(seed, PUBLISH_MIN_INDEPENDENT);
+}
 
 /// Share of this round's sources that came from the engine's seed rather than the mind's own fetching.
 /// DERIVED at the gate, never stored: the stored copy was written only when seeding ran, so on a round that
@@ -7182,10 +7191,10 @@ fn publishArtifact(w: *Worker, round: u32, md: []const u8, grounded: u32, cited:
     const paa = pa.allocator();
     const enough_grounded = grounded >= PUBLISH_MIN_SOURCES;
     const enough_independent = w.round_independent_sources >= PUBLISH_MIN_INDEPENDENT;
-    const seed_ok = seedDepPct(w.round_seed_sources, w.round_independent_sources) <= PUBLISH_MAX_SEED_DEP_PCT;
+    const seed_ok = seedDepPct(w.round_seed_sources, w.round_independent_sources) <= maxSeedDepPct(w.round_seed_sources);
     if (!(enough_grounded and enough_independent and seed_ok)) {
         const reason = if (!enough_grounded) "ungrounded" else if (!enough_independent) "seed_only" else "seed_dependency";
-        w.act("engine", round, "edition", "held", std.fmt.allocPrint(paa, "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, seedDepPct(w.round_seed_sources, w.round_independent_sources), PUBLISH_MAX_SEED_DEP_PCT }) catch "held");
+        w.act("engine", round, "edition", "held", std.fmt.allocPrint(paa, "holding edition ({s}): grounded {d}/{d} (need {d}), independent sources {d} (need {d}), seed dependency {d}% (max {d}%)", .{ reason, grounded, cited, PUBLISH_MIN_SOURCES, w.round_independent_sources, PUBLISH_MIN_INDEPENDENT, seedDepPct(w.round_seed_sources, w.round_independent_sources), maxSeedDepPct(w.round_seed_sources) }) catch "held");
         w.emit("edition", std.fmt.allocPrint(paa, ",\"round\":{d},\"published\":false,\"held\":true,\"reason\":\"{s}\",\"grounded\":{d},\"cited\":{d},\"independent_sources\":{d},\"seed_sources\":{d},\"seed_dependency_pct\":{d},\"source_diversity\":{d}", .{ round, reason, grounded, cited, w.round_independent_sources, w.round_seed_sources, seedDepPct(w.round_seed_sources, w.round_independent_sources), w.round_source_diversity }) catch ",\"round\":0");
         return;
     }
@@ -10703,14 +10712,22 @@ test "buildFitnessBlock: a green score never reads all-green while the runtime g
 }
 
 test "seed dependency is a ratio of THIS round, and every round_ counter is cleared to make it one" {
-    // 12 seed sources is a normal seeding. ONE independent fetch does not earn publication at 85%;
-    // three does. That distinction is the whole point of the gate, and a run-cumulative denominator
-    // erased it: by round five the same 12 seeds read as ~37% and everything passed.
     try std.testing.expectEqual(@as(u32, 100), seedDepPct(0, 0)); // nothing fetched: fully dependent
     try std.testing.expectEqual(@as(u32, 0), seedDepPct(0, 5)); // all its own work
     try std.testing.expectEqual(@as(u32, 100), seedDepPct(9, 0)); // seed only
-    try std.testing.expect(seedDepPct(12, 1) > PUBLISH_MAX_SEED_DEP_PCT); // 92% -- held
-    try std.testing.expect(seedDepPct(12, 3) <= PUBLISH_MAX_SEED_DEP_PCT); // 80% -- publishable
+
+    // The two publish conditions are ONE policy written twice, so they must not be able to disagree.
+    // They did: MIN_INDEPENDENT=1 said one independent fetch was enough while a hand-set 85% ceiling
+    // demanded three against a 12-source seeding — and nobody saw it, because while the counter was
+    // run-cumulative the ratio never actually bound. The ceiling is derived now, and this holds it to
+    // the stated bar at ANY seeding size: change SEED_SOURCE_TARGET or the minimum and it still agrees.
+    for ([_]u32{ 1, 5, writer.SEED_SOURCE_TARGET, 40, 200 }) |seeds| {
+        try std.testing.expect(seedDepPct(seeds, PUBLISH_MIN_INDEPENDENT) <= maxSeedDepPct(seeds));
+        if (PUBLISH_MIN_INDEPENDENT > 0)
+            try std.testing.expect(seedDepPct(seeds, PUBLISH_MIN_INDEPENDENT - 1) > maxSeedDepPct(seeds));
+    }
+    // ...and the bar still means something: a round that did no fetching of its own never publishes.
+    try std.testing.expect(seedDepPct(writer.SEED_SOURCE_TARGET, 0) > maxSeedDepPct(writer.SEED_SOURCE_TARGET));
 
     // The ratio is per-round only because the counters are. That is the half that was broken: both
     // fields kept their run-cumulative values and nothing in the loop said otherwise.

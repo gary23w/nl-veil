@@ -2641,3 +2641,26 @@ edit, confirm it applied, then run.
 - verified: suite exit 0, 0 compile errors. CF-A restore the bare "no" veto -> the isDecline test
   fails by name. CF-B revert the token handling -> the parseDoneList test fails by name. Both files
   byte-identical to pre-counterfactual after restore.
+
+## 0100 — 2026-07-26 — the publish gate's two conditions were one policy that disagreed with itself
+- owner decision, from 0099's open item: make the two agree, with PUBLISH_MIN_INDEPENDENT as the knob.
+- the disagreement, stated plainly: `PUBLISH_MIN_INDEPENDENT = 1` says one independent fetch earns
+  publication. `PUBLISH_MAX_SEED_DEP_PCT = 85` against a 12-source seeding demanded THREE. Two
+  constants, one policy, opposite answers — and nobody noticed for as long as they have both existed,
+  because while the counter was run-cumulative (0097) the ratio never actually bound. Fixing the
+  counter is what made the contradiction start mattering; it did not create it.
+- did: the ceiling is DERIVED — `maxSeedDepPct(seed) = seedDepPct(seed, PUBLISH_MIN_INDEPENDENT)`. A
+  hand-picked 92 would have agreed with the bar at today's seeding size and silently disagreed again
+  the moment that size changed, which is precisely how 85 got out of step. Named the seeding size too
+  (`writer.SEED_SOURCE_TARGET`), since a bound derived from a magic literal is still a magic literal.
+- proportionality is NOT abandoned, only stated at the declared bar: a round that fetched nothing of
+  its own still cannot publish at any seed count, asserted.
+- the ratchet is an invariant rather than an example: for seedings of 1, 5, 12, 40 and 200, the bar
+  passes and one fetch below the bar fails. Change SEED_SOURCE_TARGET or the minimum and the two must
+  still agree or the test fails — which is the guard the original pair of constants never had.
+- learned: this is the same shape as 0072/0073 ("must match" enforced), 0095 (the guard wired to the
+  wrong trigger) and 0097 (a name doing a mechanism's work) — a relationship between two values that
+  is real, load-bearing, and written nowhere the compiler can see. The recurring answer this sitting
+  has been to make the relationship mechanical. Here that meant deleting one of the two values.
+- verified: suite exit 0, 0 compile errors. CF restore the hand-picked 85 ceiling -> the named test
+  fails, 0 compile errors. run.zig byte-identical to pre-CF after restore. Full oracle green.
