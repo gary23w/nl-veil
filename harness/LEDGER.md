@@ -2664,3 +2664,35 @@ edit, confirm it applied, then run.
   has been to make the relationship mechanical. Here that meant deleting one of the two values.
 - verified: suite exit 0, 0 compile errors. CF restore the hand-picked 85 ceiling -> the named test
   fails, 0 compile errors. run.zig byte-identical to pre-CF after restore. Full oracle green.
+
+## 0101 — 2026-07-26 — the swarm could not hold more than about eight of its own rules
+- asked to grow toward making the AI smarter, so this one adds capability rather than removing a defect
+  — but the capability was already half-built, and the missing half was costing the swarm its learning.
+- the shape, which is what makes it worth an entry: three memory blocks are assembled side by side for
+  every mind, every round.
+    skills    = mem.assoc(SKILL_SCOPE,     goal, 3, 5)   <- relevance-ranked
+    knowledge = mem.assoc(KNOWLEDGE_SCOPE, goal, 1, 6)   <- relevance-ranked
+    playbook  = mem.list(PLAYBOOK_SCOPE)                 <- everything, unranked
+  The one block with NO retrieval was the swarm's own operating rules — the thing it authors expressly
+  to get better at its job. It reached the prompt as `clipTail(playbook, 1200)`: the most RECENT ~1200
+  bytes, about eight rules at ~150 bytes each.
+- so from roughly the ninth round on, the earliest and most fundamental directive was invisible to every
+  mind, dropped on nothing but its age. Worse than truncation, because roundRetrospective's dedup reads
+  the FULL scope: a rule that falls out of the window can never be re-minted either. Out of the prompt
+  and unrecoverable at once — the longer a run went, the more of its own learning it carried around
+  without being able to use. A hard ceiling on how much process knowledge a swarm could ever hold.
+- did: overflow degrades by RELEVANCE now, the way its two neighbours always have. While the playbook
+  fits, every rule still goes in untouched — a binding rulebook must not be sampled from — and the
+  ranking query only runs when it actually overflows, so a short run pays nothing.
+- the part worth pinning, and the reason it is a pure function: DIRECTION. `assoc` returns best-first
+  and must keep its HEAD; the raw scope list is oldest-first and keeps its TAIL. Swapping them compiles,
+  passes any size check, and hands the mind the LEAST relevant rules it owns — a failure that looks
+  exactly like success. The test asserts both ends.
+- ratchet: plus a wiring audit, because 0086 taught that a perfect selector proves nothing about what
+  the prompt actually pastes. Reverting the call site to `clipTail` is precisely how the old behaviour
+  returns, and it now fails by name.
+- verified: suite exit 0, 0 compile errors. CF-A clip the ranked list from the wrong end -> named test
+  fails. CF-B revert the call site to raw recency -> the wiring audit fails and names the cause. run.zig
+  byte-identical to pre-CF after restore. Full oracle green.
+- next (verified): the same question is worth asking of every other `mem.list(` feeding a prompt — this
+  one was found by reading three adjacent lines and noticing one of them did not match its neighbours.

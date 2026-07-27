@@ -3720,8 +3720,16 @@ fn doMoment(w: *Worker, mi: *MindState, goal: []const u8, round: u32, live: bool
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(scout_clause);
+    // Rank only when the playbook actually overflows: a short run pays nothing and behaves exactly as
+    // before, and the extra memory query costs one spawn on the same path that already makes two.
+    const PB_BUDGET = scaledClip(w, 1200);
+    const pb_ranked: []const u8 = if (playbook.len > PB_BUDGET)
+        w.mem.assoc(tools.PLAYBOOK_SCOPE, if (goal.len > 0) goal else "process rules", 1, 10)
+    else
+        (gpa.dupe(u8, "") catch @constCast(""));
+    defer gpa.free(@constCast(pb_ranked));
     const pb_part = if (playbook.len > 0)
-        std.fmt.allocPrint(gpa, " YOUR SWARM'S OPERATING PLAYBOOK — process rules your swarm authored for ITSELF; treat them as binding and FOLLOW them:\n{s}\n", .{clipTail(playbook, 1200)}) catch (gpa.dupe(u8, "") catch @constCast(""))
+        std.fmt.allocPrint(gpa, " YOUR SWARM'S OPERATING PLAYBOOK — process rules your swarm authored for ITSELF; treat them as binding and FOLLOW them:\n{s}\n", .{playbookView(playbook, pb_ranked, PB_BUDGET)}) catch (gpa.dupe(u8, "") catch @constCast(""))
     else
         gpa.dupe(u8, "") catch @constCast("");
     defer gpa.free(pb_part);
@@ -5719,6 +5727,26 @@ fn extractFact(gpa: std.mem.Allocator, monologue: []const u8, goal: []const u8, 
 
 pub fn clip(s: []const u8, n: usize) []const u8 {
     return if (s.len > n) s[0..n] else s;
+}
+
+/// How much of the swarm's self-authored playbook reaches a mind, and WHICH part when it cannot all fit.
+///
+/// The playbook is binding, so while it fits every rule goes in — that case is untouched. What changed is
+/// the overflow. The block was `clipTail`'d, so the rules that survived were simply the most RECENT, and
+/// age is not importance: at roughly 150 bytes a rule the window held about eight, so from the ninth round
+/// on the swarm's earliest and most fundamental directive was invisible to every mind — while
+/// roundRetrospective's dedup, which reads the FULL scope, still refused to re-mint it. Dropped from the
+/// prompt and unrecoverable at the same time; the longer a run went, the more of its own learning it
+/// carried around without being able to use.
+///
+/// Overflow now degrades by RELEVANCE instead, which is what the skills and knowledge blocks built beside
+/// it already do. Pulled out as a pure function because the part worth pinning is the DIRECTION: `assoc`
+/// returns best-first and must keep its HEAD, while the raw scope list is oldest-first and keeps its TAIL.
+/// Getting that backwards hands over precisely the least relevant rules and still looks like it works.
+fn playbookView(raw: []const u8, ranked: []const u8, budget: usize) []const u8 {
+    if (raw.len <= budget) return raw;
+    if (ranked.len > 0) return clip(ranked, budget);
+    return clipTail(raw, budget); // nothing ranked came back: recency, as before
 }
 
 /// Scale a prompt-section byte budget to the probed context window: 1.0 on a full 32k window (identical to
@@ -10709,6 +10737,47 @@ test "buildFitnessBlock: a green score never reads all-green while the runtime g
     // round. The fix is to hoist smokeTest above runBenchmark; it is NOT done here because that reorders
     // a live swarm loop no test in this repo exercises. Whoever does it: these assertions pin the shape
     // the fold-in must keep, so a reorder that breaks the contract fails here instead of in a cast.
+}
+
+test "the playbook keeps every rule while it fits, then survives by relevance rather than by age" {
+    const budget = 40;
+
+    // While it fits, a BINDING playbook is not selected from at all.
+    const small = "rule one\nrule two\n";
+    try std.testing.expectEqualStrings(small, playbookView(small, "", budget));
+    try std.testing.expectEqualStrings(small, playbookView(small, "ranked would be ignored\n", budget));
+
+    const big = "oldest rule aaaaaaaaaaaaaaaaaaaa\nmiddle rule bbbbbbbbbbbbbbbbbb\nnewest rule cccccccccccccccccc\n";
+    try std.testing.expect(big.len > budget); // the premise, not an assumption
+
+    // Overflowing with nothing ranked: recency, exactly as before — and this is the loss being fixed.
+    // The swarm's FIRST rule is the one that disappears, every time, on nothing but its age.
+    const by_age = playbookView(big, "", budget);
+    try std.testing.expect(std.mem.indexOf(u8, by_age, "newest") != null);
+    try std.testing.expect(std.mem.indexOf(u8, by_age, "oldest") == null);
+
+    // Overflowing WITH ranking: the relevant rules win, read from the head because assoc returns
+    // best-first. Clipping this from the tail would compile, pass a size check, and hand the mind the
+    // least relevant rules it has.
+    const ranked = "most relevant rule\nless relevant rule\nleast relevant rule\n";
+    const by_rel = playbookView(big, ranked, budget);
+    try std.testing.expect(std.mem.indexOf(u8, by_rel, "most relevant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, by_rel, "least relevant") == null);
+    try std.testing.expect(by_rel.len <= budget);
+}
+
+test "the prompt block actually CALLS playbookView — a unit test alone would not notice" {
+    // 0086's lesson, and it lands exactly here: the selector above can be perfect while the prompt still
+    // pastes `clipTail(playbook, ...)` straight in, and every unit assertion keeps passing. The needle is
+    // split so this test cannot match its own source.
+    const src = @embedFile("run.zig");
+    const marker = "YOUR SWARM'S OPERATING " ++ "PLAYBOOK";
+    const at = std.mem.indexOf(u8, src, marker) orelse return error.PlaybookPromptBlockMissing;
+    const around = src[at -| 700 .. @min(src.len, at + 400)];
+    if (std.mem.indexOf(u8, around, "playbookView") == null) {
+        std.log.warn("run.zig: the playbook prompt block no longer calls playbookView — its overflow is back to dropping rules by age", .{});
+        return error.PlaybookSelectorNotWired;
+    }
 }
 
 test "seed dependency is a ratio of THIS round, and every round_ counter is cleared to make it one" {
