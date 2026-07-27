@@ -48,7 +48,14 @@ const Role = engine.Role;
 /// THE FULL KNOWN LABEL SET. Every label the chat engine may tag an LLM call with, and the role that
 /// label must run on. A new labeled call site is a deliberate routing decision — it belongs here, and
 /// the test refuses to pass until someone makes that decision explicitly.
-const EXPECTED = [_]struct { label: []const u8, role: Role }{
+///
+/// `review_gated` marks the one shape this static resolver cannot answer: a call whose provider is chosen
+/// at RUNTIME by `ModelTrio.independentReviewer()` — a different model when the trio has one, null when it
+/// does not. Its role is genuinely not fixed, so resolving it here would mean inventing an answer. It is
+/// NOT exempted: the check moves to "review-gated routing keeps its single-model fallback" below, which is
+/// stricter than this one because it pins both branches by name. `role` stays the FALLBACK role, which is
+/// what a single-model setup still runs on and must keep running on.
+const EXPECTED = [_]struct { label: []const u8, role: Role, review_gated: bool = false }{
     .{ .label = "chat", .role = .coding }, // the main agentic answer stream
     .{ .label = "loop", .role = .prompting }, // the auto-loop self-prompt-back drive
     .{ .label = "plan", .role = .thinking },
@@ -69,7 +76,9 @@ const EXPECTED = [_]struct { label: []const u8, role: Role }{
     // the course check decides whether work already in flight is still aimed at the goal. Routing either to
     // prompting would put the turn's two new reasoning decisions on the model chosen for cheap rewriting.
     .{ .label = "recon", .role = .thinking }, // names the read-only probes that ground the plan in evidence
-    .{ .label = "course", .role = .thinking }, // mid-turn: is the next step still the right move?
+    // A REVIEW of the direction the coding model just chose, so it prefers a model that can disagree;
+    // .thinking remains the fallback a single-model setup runs on. See review_gated above.
+    .{ .label = "course", .role = .thinking, .review_gated = true },
 };
 
 /// Every public entry point in llm.zig that takes the (run_dir, tag, base_url, key, model) prefix. If a
@@ -619,6 +628,9 @@ test "trio routing: every labeled LLM call in the chat engine reaches its role's
             total += 1;
 
             const span = spanAt(spans.items, at) orelse return error.ParseFailed;
+            // Chosen at runtime by independentReviewer(): no single role to resolve to. Counted as seen so
+            // the coverage check below still demands it exist, then checked properly by its own test.
+            if (e.review_gated) continue;
             const got = resolve(src, spans.items, span, abuf[ARG_BASE], abuf[ARG_KEY], abuf[ARG_MODEL], 0) catch |err| {
                 std.debug.print(
                     "trio routing: label \"{s}\" (llm.{s}, in fn `{s}`) — {t}\n" ++
@@ -655,6 +667,66 @@ test "trio routing: every labeled LLM call in the chat engine reaches its role's
     // pick is genuinely the engine's routing primitive and not an unused decl.
     try std.testing.expect(std.mem.indexOf(u8, src, "trio.pick(.thinking)") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "trio.pick(.prompting)") != null);
+}
+
+test "review-gated routing keeps its single-model fallback" {
+    // The narrower check that replaces the static resolve for `review_gated` labels — narrower because it
+    // pins BOTH branches by name, where the resolver could only ever have pinned one.
+    //
+    // The half that matters most is the fallback. A user running one model everywhere must keep the exact
+    // behaviour they have today: the reviewer is something a configured trio ADDS, never something its
+    // absence takes away, and a course check must not go missing because nobody set a second model. It
+    // would be very easy for a later edit to "simplify" this into skipping the call when there is no
+    // independent reviewer — that reads as tidy and silently removes a check from every single-model user.
+    for (EXPECTED) |e| {
+        if (!e.review_gated) continue;
+        const at = std.mem.indexOf(u8, ENGINE_SRC, "courseCheck(app,") orelse return error.ParseFailed;
+        const around = ENGINE_SRC[at -| 900 .. at];
+        // the reviewer is asked for...
+        if (std.mem.indexOf(u8, around, "independentReviewer()") == null) {
+            std.debug.print("review-gated label \"{s}\": call site no longer consults independentReviewer()\n", .{e.label});
+            return error.Unresolvable;
+        }
+        // ...and its ABSENCE falls back rather than skipping. Checked as a property, not a spelling: the
+        // first cut of this grepped for the literal `else think`, which would have rejected an identical
+        // `else trio.pick(.thinking)` and — far worse — happily passed a version that kept the binding and
+        // guarded the CALL instead. Both branches of that mistake are covered now.
+        const bind = std.mem.indexOf(u8, around, "independentReviewer()") orelse return error.ParseFailed;
+        const tail = around[bind..];
+        const els = std.mem.indexOf(u8, tail, "else ") orelse {
+            std.debug.print(
+                "review-gated label \"{s}\": the provider binding has no else branch — a single-model setup\n" ++
+                    "  would lose this check entirely instead of running it on the coding model.\n",
+                .{e.label},
+            );
+            return error.Unresolvable;
+        };
+        for ([_][]const u8{ "else return", "else null", "else unreachable", "else break", "else continue" }) |bail| {
+            if (std.mem.indexOf(u8, tail, bail) != null) {
+                std.debug.print("review-gated label \"{s}\": falls back to `{s}` — that is skipping, not falling back\n", .{ e.label, bail });
+                return error.Unresolvable;
+            }
+        }
+        _ = els;
+        // ...and the call itself is not conditioned on having a reviewer, which is the same loss wearing a
+        // different shape: binding kept, call quietly guarded. Only the GUARD spellings count — `if (rev)
+        // |r| ... else ...` is an optional unwrap WITH a fallback, which is the correct code, and the first
+        // cut of this check rejected exactly that. A guard that fires on the shape it is meant to protect
+        // teaches people to delete it.
+        for ([_][]const u8{ "if (rev != null)", "if (rev == null)", "if (rev) |_|" }) |guard| {
+            if (std.mem.indexOf(u8, around, guard) != null) {
+                std.debug.print("review-gated label \"{s}\": call gated on `{s}` — single-model setups lose the check\n", .{ e.label, guard });
+                return error.Unresolvable;
+            }
+        }
+        // ...and the meter follows the provider, or per-label spend reports the wrong model.
+        const fn_at = std.mem.indexOf(u8, ENGINE_SRC, "fn courseCheck(") orelse return error.ParseFailed;
+        const body = ENGINE_SRC[fn_at..@min(ENGINE_SRC.len, fn_at + 3000)];
+        if (std.mem.indexOf(u8, body, "meterEnd(app, cm, \"course\", role,") == null) {
+            std.debug.print("review-gated label \"{s}\": meter is not keyed by the role actually used\n", .{e.label});
+            return error.Unresolvable;
+        }
+    }
 }
 
 test "trio routing: no chat sibling file makes an unrouted LLM call" {

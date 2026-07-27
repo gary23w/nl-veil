@@ -1997,7 +1997,18 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
         // them would let a model argue its way out of the terminal build-verify, which is the one check that
         // exists precisely because models talk themselves past it.
         if (course_on and !is_done and !is_repeat and next_step.ptr == trimmed.ptr) {
-            if (courseCheck(app, llm_dir, think, user_text, &brief, next_step, conv_buf.items)) |corrected| {
+            // A course check REVIEWS the direction the coding model just chose, so it wants a reviewer that
+            // is able to disagree. `pick(.thinking)` resolves to the coding model itself whenever thinking
+            // is unset — the author grading their own next step, at full price, agreeing with itself.
+            // When the trio has a genuinely different model, review runs there instead.
+            //
+            // The fallback is deliberately KEPT: one model configured everywhere must keep working exactly
+            // as before. An independent reviewer is something a trio ADDS, never something its absence
+            // removes — so this degrades to today's provider rather than skipping the check.
+            const rev = trio.independentReviewer();
+            const course_p = if (rev) |r| r.provider else think;
+            const course_role: Role = if (rev) |r| r.role else .thinking;
+            if (courseCheck(app, llm_dir, course_p, course_role, user_text, &brief, next_step, conv_buf.items)) |corrected| {
                 course_written = corrected;
                 next_step = corrected;
                 // The user SEES the redirect. A silent correction is the worst version of this feature: the
@@ -3064,9 +3075,14 @@ pub const Provider = struct {
 };
 
 /// Which model a given LLM call runs on. The engine's labeled call sites map onto these: coding = the main
-/// agentic build/answer stream ("chat"); thinking = planning + every context-housekeeping call
-/// ("plan"/"reflect"/"summary"/"ctxsum"/"compact"/"lesson"); prompting = the auto-loop self-prompt-back
-/// drive ("loop"). A user can point each at a different model — a strong coder, a mid planner, a cheap driver.
+/// agentic build/answer stream ("chat"); thinking = planning, grounding and every context-housekeeping call
+/// ("plan"/"recon"/"course"/"reflect"/"summary"/"ctxsum"/"compact"/"lesson"); prompting = the short VERDICT
+/// calls that route the turn rather than reason through it ("loop"/"searchq"/"stuck"/"planrec"/"arbiter").
+/// chat/trio_routing_test.zig is the authority on that table; this comment drifted behind it once already,
+/// having claimed prompting served "loop" alone long after four more labels moved onto it.
+///
+/// A user can point each at a different model — a strong coder, a mid planner, a cheap driver. Doing so buys
+/// more than cost control: it is the only way `independentReviewer` below can return anything at all.
 pub const Role = enum { coding, thinking, prompting };
 
 /// The three models one turn may run on. `coding` is the base/default triple every caller always sends;
@@ -3085,7 +3101,86 @@ pub const ModelTrio = struct {
             .prompting => if (self.prompting.isSet()) self.prompting else self.coding,
         };
     }
+
+    /// A provider that can REVIEW what the coding model produced — or null, meaning nobody here can.
+    ///
+    /// `pick` resolves an unset role back to `coding`, which is exactly right for getting work done and
+    /// exactly wrong for review: it silently turns a critique into the author grading their own output.
+    /// That is not a cheaper review, it is a more expensive nothing — a full prefill spent to receive
+    /// confident agreement that carries no information, while looking from the outside like a second
+    /// opinion was obtained. A reviewer that cannot disagree is not a reviewer.
+    ///
+    /// So review asks a different question than `pick` does, and answers with an honest null rather than
+    /// a fallback. `prompting` is preferred because it is the lightest-loaded slot, which makes pointing
+    /// it at a different model family the cheapest independence a user can buy.
+    ///
+    /// Independence is judged on the MODEL ID alone, not the endpoint. A mirror, a proxy, a second key or
+    /// a different region serves the same weights, and the same weights agree with themselves just as
+    /// readily however they were reached. Requiring both to match would have called a mirrored endpoint an
+    /// independent reviewer — which is the exact failure this function exists to name.
+    /// The provider AND the slot it came from. The role travels with it because the meter is keyed by role:
+    /// moving a call to a different model while still booking it to the old one would make the per-label
+    /// spend view lie, which is the defect ledger 0079/0092 already paid for once.
+    pub const Reviewer = struct { provider: Provider, role: Role };
+
+    pub fn independentReviewer(self: ModelTrio) ?Reviewer {
+        const order = [_]Reviewer{
+            .{ .provider = self.prompting, .role = .prompting },
+            .{ .provider = self.thinking, .role = .thinking },
+        };
+        for (order) |cand| {
+            if (!cand.provider.isSet()) continue;
+            if (std.mem.eql(u8, cand.provider.model, self.coding.model)) continue;
+            return cand;
+        }
+        return null;
+    }
 };
+
+test "independentReviewer: a model never reviews itself, however the trio is wired" {
+    const coder: Provider = .{ .base_url = "https://c/v1", .key = "kc", .model = "coder" };
+
+    // The default single-model client. pick() hands every role back the coding model, so anything that
+    // called itself a review here was the author agreeing with the author — at full prefill price, and
+    // indistinguishable from a real second opinion at the call site. Say so instead.
+    const solo: ModelTrio = .{ .coding = coder };
+    try std.testing.expect(solo.independentReviewer() == null);
+    // ...and the single-model default is UNTOUCHED by any of this. `pick` still answers for every role,
+    // so a user running one model everywhere keeps exactly the behaviour they have today; the reviewer is
+    // something the trio ADDS when it exists, never something its absence takes away.
+    try std.testing.expectEqualStrings("coder", solo.pick(.thinking).model);
+    try std.testing.expectEqualStrings("coder", solo.pick(.prompting).model);
+
+    // The same model id at a different endpoint is NOT independence — a mirror, a proxy, a second key.
+    const mirrored: ModelTrio = .{ .coding = coder, .prompting = .{ .base_url = "https://mirror/v1", .key = "k2", .model = "coder" } };
+    try std.testing.expect(mirrored.independentReviewer() == null);
+    try std.testing.expectEqualStrings("coder", mirrored.pick(.prompting).model); // still usable for work
+
+    // prompting is preferred: it is the lightest-loaded slot, so it is the cheapest one to point at
+    // another family purely to get a reviewer. The ROLE comes back with it so the meter stays honest.
+    const both: ModelTrio = .{
+        .coding = coder,
+        .thinking = .{ .base_url = "https://t/v1", .key = "kt", .model = "planner" },
+        .prompting = .{ .base_url = "https://p/v1", .key = "kp", .model = "driver" },
+    };
+    try std.testing.expectEqualStrings("driver", both.independentReviewer().?.provider.model);
+    try std.testing.expectEqual(Role.prompting, both.independentReviewer().?.role);
+
+    // ...but thinking still answers when prompting is unset, or is only a mirror of the coder.
+    const think_only: ModelTrio = .{ .coding = coder, .thinking = .{ .base_url = "https://t/v1", .key = "kt", .model = "planner" } };
+    try std.testing.expectEqualStrings("planner", think_only.independentReviewer().?.provider.model);
+    try std.testing.expectEqual(Role.thinking, think_only.independentReviewer().?.role);
+    const prompting_is_mirror: ModelTrio = .{
+        .coding = coder,
+        .thinking = .{ .base_url = "https://t/v1", .key = "kt", .model = "planner" },
+        .prompting = .{ .base_url = "https://c/v1", .key = "kc", .model = "coder" },
+    };
+    try std.testing.expectEqualStrings("planner", prompting_is_mirror.independentReviewer().?.provider.model);
+
+    // A half-configured slot is not a reviewer either — isSet() requires a real endpoint AND model.
+    const half: ModelTrio = .{ .coding = coder, .prompting = .{ .base_url = "https://p/v1", .key = "kp" } };
+    try std.testing.expect(half.independentReviewer() == null);
+}
 
 test "ModelTrio.pick: unset thinking/prompting fall back to coding; configured roles win" {
     const coding: Provider = .{ .base_url = "https://c/v1", .key = "kc", .model = "coder" };
@@ -3625,7 +3720,7 @@ fn reconFindings(app: *App, run_root: []const u8, p: Provider, ctx: *tools.ToolC
 ///
 /// It never sees the tools and never runs one: this is a judgement about direction, and a reviewer that could
 /// act would just become a second worker racing the first.
-fn courseCheck(app: *App, run_root: []const u8, p: Provider, goal: []const u8, brief: *const cplan.Brief, next_step: []const u8, conv_items: []const u8) ?[]u8 {
+fn courseCheck(app: *App, run_root: []const u8, p: Provider, role: Role, goal: []const u8, brief: *const cplan.Brief, next_step: []const u8, conv_items: []const u8) ?[]u8 {
     const gpa = app.gpa;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
@@ -3661,7 +3756,7 @@ fn courseCheck(app: *App, run_root: []const u8, p: Provider, goal: []const u8, b
     const cm = meterBegin(app.io);
     var step = llm.complete(gpa, app.io, run_root, "course", p.base_url, p.key, p.model, msgs.items, "", 384, 0.2);
     defer step.deinit(gpa);
-    meterEnd(app, cm, "course", .thinking, p.model, step.ok);
+    meterEnd(app, cm, "course", role, p.model, step.ok);
     if (!step.ok) return null;
 
     const verdict = courseVerdict(step.content) orelse return null;

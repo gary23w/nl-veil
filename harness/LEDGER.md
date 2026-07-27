@@ -2755,3 +2755,48 @@ edit, confirm it applied, then run.
 - next (verified): runJudge carries the same instruction into QUARANTINE scopes and has the same
   no-update limitation, but its proposals are promoted by a human in the desk, so the patch belongs in
   that promotion path rather than here — and promotion is a reviewed boundary I will not automate.
+
+## 0104 — 2026-07-26 — a reviewer that cannot disagree is not a reviewer
+- owner request, prompted by a thread making the point plainly: a model reviewing its own output is
+  "asking the guy who wrote it 'did you do good?'". Asked to give the trio's PROMPTING slot reviewer
+  duties. Owner constraint, stated explicitly mid-work and honoured throughout: the single-model
+  fallback stays — review/think initialise only when the trio actually has a second model.
+- what was already true: reviewFork and runJudge run on the gateway model, separate from the minds'
+  primary. What was NOT: `course` — the mid-turn "is the next step still the right move?" review —
+  runs on `pick(.thinking)`, and `pick` resolves an unset role back to CODING. So in the single-model
+  configuration the docs explicitly support, the model judging whether its own next step is right IS
+  the model that chose it, and nothing anywhere said so.
+- did: `ModelTrio.independentReviewer()`, which asks a DIFFERENT question from `pick` and answers with
+  a null instead of a fallback. Same-model review is not a cheaper review, it is a more expensive
+  nothing: a full prefill spent to receive confident agreement that carries no information, while
+  reading from the call site exactly like a second opinion was obtained.
+- independence is judged on the MODEL ID alone. My first cut required model AND base_url to match
+  before rejecting, which would have called a mirrored endpoint an independent reviewer — the precise
+  failure the function exists to name. My own test caught it: the doc and the test agreed, the code
+  did not.
+- the Reviewer carries its ROLE, not just its provider. Moving a call to another model while still
+  booking it to `.thinking` would make the per-label spend view lie — the defect 0079/0092 already
+  paid for. The routing audit now requires the meter be keyed by the role actually used.
+- FALLBACK, kept and now enforced: `pick` is untouched, so one model everywhere behaves exactly as
+  before and the course check still runs. A reviewer is something a trio ADDS, never something its
+  absence removes. The test asserts both halves — solo yields no reviewer AND `pick` still returns the
+  coding model for every role.
+- the audit had to move rather than bend. `course` genuinely has no single static role now, so the
+  resolver would be inventing an answer; but an exemption is the blind spot 0081 warned about. So the
+  check RELOCATED to a stricter one that pins both branches: reviewer consulted, fallback present and
+  not a disguised bail, call not gated on having a reviewer.
+- learned, twice, from my own guard: (1) it first grepped the literal `else think`, which would reject
+  an identical `else trio.pick(.thinking)` and PASS a version that keeps the binding and guards the
+  call — checking a spelling, not a property. (2) Rewritten to reject `if (rev`, it then fired on the
+  correct code, because `if (rev) |r| ... else ...` is the fallback itself. A guard that fires on the
+  shape it protects teaches people to delete it, and then the real regression walks in later.
+- verified: suite exit 0. CF the skip-shape at the call site -> the audit fails by name, naming the
+  loss, 0 compile errors. Honest limit: two earlier attempts at a "remove the fallback" counterfactual
+  did not COMPILE (exit 1 proving nothing, 0087's trap), so what is demonstrated is that the audit
+  detects the skip shape — reinforced by it having fired correctly twice on real conditions, once when
+  course became unresolvable and once on its own false positive. engine.zig byte-identical after
+  restore. Full oracle green.
+- next: the bigger version of the owner's ask — a genuine reviewer pass over the coding model's OUTPUT
+  before a turn finalises — is designed but NOT built: it adds per-turn latency and cost, needs a
+  firing gate, and should no-op entirely when `independentReviewer()` is null rather than pay for
+  self-agreement. That is an owner call, not a default.
