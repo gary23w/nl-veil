@@ -42,13 +42,13 @@ function Invoke-Gate([string]$name, [string]$exe, [string[]]$argv, [string]$work
     $null = $p.Handle
     if (-not $p.WaitForExit($timeout * 1000)) {
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        $script:results += [pscustomobject]@{ gate = $name; status = "TIMEOUT ${timeout}s"; log = $out }
+        $script:results += [pscustomobject]@{ gate = $name; status = "TIMEOUT ${timeout}s"; log = $out; errlog = $err }
         Write-Host "   TIMEOUT after ${timeout}s   (log: $out)" -ForegroundColor Yellow
         if ($onTimeout) { Write-Host "   $onTimeout" -ForegroundColor Yellow }
         return $false
     }
     if ($p.ExitCode -ne 0) {
-        $script:results += [pscustomobject]@{ gate = $name; status = "FAIL ($($p.ExitCode))"; log = $err }
+        $script:results += [pscustomobject]@{ gate = $name; status = "FAIL ($($p.ExitCode))"; log = $err; errlog = $err }
         Write-Host "   FAIL exit=$($p.ExitCode)" -ForegroundColor Red
         # WHAT ACTUALLY BROKE, first. A failing desk run buries its one real assertion under dozens
         # of CONNECTION_REFUSED stack dumps from tests that hit a dead port ON PURPOSE (std prints a
@@ -68,7 +68,7 @@ function Invoke-Gate([string]$name, [string]$exe, [string[]]$argv, [string]$work
         Get-Content $err -Tail 25 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "   | $_" }
         return $false
     }
-    $script:results += [pscustomobject]@{ gate = $name; status = "PASS"; log = $out }
+    $script:results += [pscustomobject]@{ gate = $name; status = "PASS"; log = $out; errlog = $err }
     Write-Host "   PASS" -ForegroundColor Green
     return $true
 }
@@ -78,13 +78,19 @@ function Invoke-Gate([string]$name, [string]$exe, [string[]]$argv, [string]$work
 # while the same binary passes standalone. When that signature appears, rerun the exact exe the
 # runner named (fallback: newest test.exe in the cache) and take ITS verdict.
 function Invoke-ZigTests([string]$label, [string]$workdir, [int]$timeout, [string]$note) {
-    if (Invoke-Gate "zig build test ($label)" $zig @("build", "test", "--cache-dir", $cache) $workdir $timeout $note) { return $true }
+    $ok = Invoke-Gate "zig build test ($label)" $zig @("build", "test", "--cache-dir", $cache) $workdir $timeout $note
+    # NOT `if ($ok) { return $true }`. The runner can print this signature and still EXIT 0, so a gate
+    # that passed is no evidence the tests ran -- a full ALL GREEN run had it on both test gates. The
+    # signature decides whether we have a verdict, never the exit status.
     # Only the exact IPC signature qualifies: the runner's failure names the compiled test.exe.
     # A compile error names zig.exe instead -- no fallback there, that red is real (and running the
     # NEWEST cached test.exe would silently test yesterday's tree).
-    $lastLog = $script:results[-1].log
     $texe = $null
-    $m = Select-String -Path $lastLog -Pattern 'failed command: "([^"]+test\.exe)"' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $m = $script:results[-1].log, $script:results[-1].errlog |
+        Where-Object { $_ -and (Test-Path $_) } |
+        ForEach-Object { Select-String -Path $_ -Pattern 'failed command: "([^"]+test\.exe)"' -ErrorAction SilentlyContinue } |
+        Select-Object -First 1
+    if (-not $m) { return $ok }
     if ($m) { $texe = $m.Matches[0].Groups[1].Value -replace '\\\\', '\' }
     if (-not ($texe -and (Test-Path $texe))) { return $false }
     Write-Host "   build-runner failed without naming a test (IPC flake?) -- retrying standalone:" -ForegroundColor Yellow
