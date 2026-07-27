@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const httpz = @import("httpz");
 const http = @import("../../gateway/http.zig");
 const evcursor = @import("../evcursor.zig"); // the poll cursor contract, shared with chat/service convEvents
+const run = @import("../run.zig"); // EVENT_LOG_CAP: a reader must admit as much as the writer emits
 const Supervisor = @import("supervisor.zig").Supervisor;
 const App = http.App;
 const requireUser = http.requireUser;
@@ -157,7 +158,7 @@ fn streamLoop(ctx: *StreamCtx, stream: std.Io.net.Stream) void {
         const cur_size: usize = if (std.Io.Dir.cwd().statFile(ctx.io, ev_path, .{})) |st| @intCast(st.size) else |_| 0;
         if (cur_size < cursor) cursor = cur_size;
         if (cur_size > cursor) {
-            const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ev_path, ctx.gpa, .limited(8 << 20)) catch "";
+            const data = std.Io.Dir.cwd().readFileAlloc(ctx.io, ev_path, ctx.gpa, .limited(run.EVENT_LOG_CAP)) catch "";
             defer if (data.len > 0) ctx.gpa.free(data);
             const from = @min(cursor, data.len);
             var it = std.mem.splitScalar(u8, data[from..], '\n');

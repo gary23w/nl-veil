@@ -2125,3 +2125,43 @@ edit, confirm it applied, then run.
 - verified: src suite exit 0; counterfactual fails the named test. Full oracle green.
 - next (verified): the hoist itself, for a session that can run a live swarm. The test added here pins
   the shape the fold-in must keep, so the reorder can be checked against something.
+
+## 0084 — 2026-07-25 — the end-of-run judge read 1 MiB of an 8 MiB log and said nothing
+- did: a second 14-agent audit, this time over the subsystems that DECIDE (rsi governor/playbook,
+  agi goal origination, plan decomposition/reconciliation, rerank+recall relevance, sched
+  self-healing) — none of which the first audit touched. 9 candidates, 7 stood. That survival rate is
+  itself worth noting: the first audit's finders reported 10 and kept 3, and the only change was
+  telling this round's finders that seven of ten had been refuted, exactly how each died, and that
+  ZERO findings was a good answer. Calibrating a searcher with the previous searcher's failure rate
+  cost one paragraph and roughly doubled precision.
+- FIX (verified myself before touching it): `appendFile` holds events.jsonl at `EVENT_LOG_CAP` =
+  8 MiB, self-trimming. `readFileAlloc`'s limit ERRORS with StreamTooLong at the limit — it does not
+  truncate. rsi.zig's `runJudge` read `.limited(1 << 20)` and its `catch return` is the function's
+  FIRST statement, so on any run whose log passed 1 MiB the end-of-run judge graded nothing, emitted
+  no `judge_done`, and left no trace that it had been skipped. Two other readers (fanout.zig:160,
+  run.zig:3342) already matched the writer at 8 MiB; the judge was the one that didn't.
+- kept the skeptic's corrections, which mattered: the run still LEARNS on such a run (`reviewFork`
+  mints lessons/skills into the live hive every round and never reads events.jsonl) — what is lost is
+  the end-of-run QUARANTINE proposal pass, i.e. a missing human-review queue, not a run that learned
+  nothing. The claimant also called this "the smallest cap in the repo" (false — chat/tools.zig:310
+  uses 512 KiB, though it degrades to a visible fallback string rather than silence) and called the
+  band "routine" (unsupported — the largest events.jsonl in the data tree is 469 KB). Corrected
+  severity is what went in the ledger.
+- did: made the coupling STRUCTURAL rather than a matched literal. `EVENT_LOG_CAP` is now `pub`, its
+  doc states it is half of a contract, and all three run-scoped readers reference it instead of
+  restating 8 MiB. A reader can no longer drift from the writer by editing one number.
+- ratchet: a source audit over run.zig, rsi.zig and fanout.zig — any `readFileAlloc` line touching
+  `ev_path` must use `EVENT_LOG_CAP`, with a floor (>= 3 readers) so a rename fails loudly instead of
+  scanning nothing. Counterfactual (injection printed): putting the judge back to 1 MiB fails it by
+  name and prints the offending line.
+- learned: this is the fourth "two things that must agree" in three sittings (twin escapers, the
+  has_score predicate, cast_conv/sc_conv, now writer-cap/reader-cap) and the first where the two
+  things were a WRITER and a READER of the same file rather than two copies of one expression. Worth
+  generalising: any bound enforced on write is a claim the read side must honour, and nothing in a
+  type system connects them.
+- verified: src suite exit 0; counterfactual fails by name; full oracle green.
+- next (verified): six more findings from this audit stand and are NOT implemented — agi's
+  best_oracle carry-over, scoreWill's percent-vs-count comparison, planReconcile's digit scavenging,
+  the unreachable has_plan disjunct, sched's 45-byte task-id ledger no-op, and the tick path's
+  missing one-run-per-task guard. Each has a skeptic's corrected severity attached in this run's
+  journal (wf_8f5e3c7c-ed1).
