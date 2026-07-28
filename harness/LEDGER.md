@@ -2950,3 +2950,33 @@ edit, confirm it applied, then run.
 - next (verified): [session probe] wants the agent to OPEN and observe before declaring it cannot; and
   the flat element list still makes the model rank chrome vs content every read — a content/chrome or
   role hint is the next perception win.
+
+## 0109 — 2026-07-28 — every server restart silently orphaned the paired extension
+- owner: "now it won't connect to the extension." Screenshot showed browser_navigate failing with an
+  opaque "Protocol" error, the agent flailing toward launching its own Chrome.
+- NOT my code, checked first: the last two commits touched only session.zig's snapshot/type JS (which
+  the extension relays verbatim — the header says changing it never touches the extension) and docs.
+  ext.zig / the pairing routes were untouched. The tell was in the process table: the server (pid
+  2108) had restarted at 09:18:16, seconds before the message.
+- root cause: the pairing token is minted per-PROCESS and held only in memory (ensureToken, g_token /
+  g_token_set). A server restart — which happens on EVERY rebuild, and this user rebuilds constantly —
+  mints a fresh token, so the extension still holding the old one polls, tokenOk fails, /poll answers
+  401 "pair first", and the browser transport degrades to a Protocol error with nothing actionable.
+  pair()'s own doc literally promises "re-pairing after a restart never orphans a live extension" — a
+  promise that only held WITHIN one process. The most-restarted machine hit it most.
+- did: loadOrMintToken — load a persisted token from {data}/.veil-ext-token, or mint one and write it,
+  called ONCE at boot before the ext routes serve. A restart now keeps the token the extension already
+  holds. Consistent with the stated threat model: the token is explicitly NOT a secret (loopback-only;
+  an attacker who can read the file is already on the box), same class as host.zig's {port,token}
+  discovery file. A corrupt/short/long file falls through to a fresh mint rather than serving a
+  truncated key — readFileAlloc's over-limit ERROR (ledger 0084's shape) does that for free.
+- test simulates a restart with resetForTest (which clears g_token_set exactly as a new process would),
+  and asserts the token is identical across it; plus the corrupt-file re-mint. Counterfactual: stop
+  loading the file -> the restart test fails by name, 0 compile errors.
+- the immediate recovery is NOT automatic for the CURRENT process — it already minted an in-memory-only
+  token before this fix existed. Owner must rebuild+restart once, re-pair once; from then on the
+  persisted token survives every restart. Told them exactly that.
+- NOT done, named as follow-up: when the extension is genuinely unpaired, the browser tools surface a
+  bare "Protocol" error and the agent tries to launch Chrome instead of saying "extension disconnected,
+  ask the user to reconnect." That opacity is a separate fix from the root cause.
+- verified: suite exit 0, new test collected (the counterfactual fired by name). Full oracle running.

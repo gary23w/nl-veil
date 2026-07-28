@@ -128,6 +128,59 @@ pub fn ensureToken(io: std.Io) []const u8 {
     return &g_token;
 }
 
+fn allHex(s: []const u8) bool {
+    for (s) |c| if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'))) return false;
+    return true;
+}
+
+/// Persist the pairing token across restarts. Called ONCE at server boot with the data dir, before any
+/// pair/poll route can serve.
+///
+/// The token is per-MACHINE, but ensureToken mints it per-PROCESS. A server restart — which happens on every
+/// rebuild — therefore mints a fresh token and orphans an extension still holding the old one: it polls,
+/// tokenOk fails with 401 "pair first", and the user sees "won't connect" with nothing to act on. pair()'s
+/// own doc already promises "re-pairing after a restart never orphans a live extension"; that was only true
+/// WITHIN one process. Loading a saved token (or minting and saving one) makes it true across restarts too,
+/// so the extension the user paired once stays paired.
+///
+/// NOT a secret — see ensureToken: loopback-only, and an attacker who can read this file is already on the
+/// box, which the token was never meant to defend against. Same class as host.zig's {port,token} file.
+pub fn loadOrMintToken(io: std.Io, gpa: std.mem.Allocator, data_dir: []const u8) void {
+    const path = std.fmt.allocPrint(gpa, "{s}/.veil-ext-token", .{data_dir}) catch return;
+    defer gpa.free(path);
+
+    var tok: [TOKEN_LEN]u8 = undefined;
+    var have = false;
+    // Reuse a well-formed token from a previous run; a missing / corrupt / wrong-length file falls through
+    // to minting a fresh one. readFileAlloc errors past its limit rather than truncating, so 256 > TOKEN_LEN
+    // is safe and a bloated file reads as an error → re-mint, never a silent partial token.
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256))) |buf| {
+        defer gpa.free(buf);
+        const t = std.mem.trim(u8, buf, " \r\n\t");
+        if (t.len == TOKEN_LEN and allHex(t)) {
+            @memcpy(&tok, t[0..TOKEN_LEN]);
+            have = true;
+        }
+    } else |_| {}
+
+    if (!have) {
+        var seed: u64 = @intCast(std.Io.Timestamp.now(io, .real).nanoseconds);
+        seed ^= @intFromPtr(&g_slots[0]);
+        fillHex(&tok, &seed);
+        // Best-effort: a read-only data dir just degrades to today's per-process behaviour, no worse.
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &tok }) catch {};
+    }
+
+    // First writer wins: ensureToken may have already minted one if a pair arrived during boot. The `if`
+    // guard means this can never clobber a token an extension might already be authenticating against.
+    g_mu.lockUncancelable(io);
+    defer g_mu.unlock(io);
+    if (!g_token_set) {
+        @memcpy(&g_token, &tok);
+        g_token_set = true;
+    }
+}
+
 /// Constant-time-ish token check. Length-first so a short token can never index past the buffer.
 pub fn tokenOk(io: std.Io, tok: []const u8) bool {
     g_mu.lockUncancelable(io);
@@ -657,6 +710,44 @@ test "the pairing token is stable, and only the exact token opens the door" {
     var wrong: [TOKEN_LEN]u8 = copy;
     wrong[TOKEN_LEN - 1] = if (wrong[TOKEN_LEN - 1] == 'a') 'b' else 'a';
     try std.testing.expect(!tokenOk(io, &wrong)); // one byte off is off
+}
+
+test "the pairing token survives a restart, so a paired extension is not orphaned" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-ext-token-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    // Process 1: no file yet → mint and persist. This is the token the user pairs the extension against.
+    resetForTest(io);
+    loadOrMintToken(io, gpa, root);
+    var minted: [TOKEN_LEN]u8 = undefined;
+    @memcpy(&minted, ensureToken(io));
+    try std.testing.expect(tokenOk(io, &minted));
+
+    // Process 2 — a server RESTART: resetForTest clears every process global (g_token_set included), exactly
+    // as a fresh process would start. Before this fix loadOrMintToken did not exist and ensureToken would
+    // mint a DIFFERENT token here, orphaning the extension. Now the persisted file is loaded, so the token
+    // the extension still holds keeps authenticating.
+    resetForTest(io);
+    loadOrMintToken(io, gpa, root);
+    try std.testing.expectEqualStrings(&minted, ensureToken(io));
+    try std.testing.expect(tokenOk(io, &minted));
+
+    // A corrupt / wrong-length file must NOT be adopted as the token — it falls through to a fresh mint
+    // rather than handing out a truncated key that no extension could match.
+    resetForTest(io);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/.veil-ext-token", .data = "short" });
+    loadOrMintToken(io, gpa, root);
+    try std.testing.expectEqual(@as(usize, TOKEN_LEN), ensureToken(io).len);
+    try std.testing.expect(!tokenOk(io, "short"));
+
+    resetForTest(io);
 }
 
 test "takeCommands: an idle poll returns an empty batch rather than blocking forever" {
