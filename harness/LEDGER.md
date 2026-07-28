@@ -2872,3 +2872,41 @@ edit, confirm it applied, then run.
   broke the schema string. Same escaping trap as always. Fixed with the Edit tool, then avoided
   entirely by copying the existing line instead of authoring a second one.
 - verified: full oracle ALL GREEN.
+
+## 0107 — 2026-07-27 — the browser could see the page but not the effect of its own clicks
+- owner: browser automation is flawed — "cannot see the webpage", "loops the same reasoning and gets
+  stuck", "cannot improve across situations". Dug the ground-truth trace of a live single-page-app run
+  (conv c6a689067): 63 browser calls, 39 LLM calls, 668 reasoning events for ONE task.
+- the "cannot see" claim is the one to correct: it COULD see. browser_read returned real DOM every time
+  — 73-134 elements, real text, the actual group name. What it could not see was the RESULT of a click.
+  clickRef/clickAt reported only `navigated` (did the url change), and nothing on a SPA changes the url:
+  a Join opens a modal, a Like toggles a label, a filter swaps the feed — all navigated:false. So a
+  click that opened a modal was byte-identical to a click that hit nothing.
+- THAT is the loop, in the model's own words from the trace: "ref 43 says Joined — either we're already
+  a member, or the click on ref 24 earlier actually worked. Let me check..." It could not confirm its
+  own action, so it re-read the whole page (another flat blob, refs regenerated) and re-reasoned. The
+  three symptoms are one defect: blind clicks force read-reason-guess, forever.
+- did: a cheap before/after page FINGERPRINT around every click — body-text length, interactive-control
+  count, visible-modal-dialog count, href (CLICK_SIG_JS, one round-trip, scalar). The click now reports
+  `changed` (anything moved), `dialog` (a modal opened — read it), and `dtext` (how much). A no-op is
+  now VISIBLE as changed:false, so the model retargets instead of re-reading. Tool description rewritten
+  to say exactly that: changed:false means pick a different ref, do not read-and-retry the same one.
+- the diff is a PURE function (clickEffect) so its thresholds are tested without a browser: a modal
+  (dialog count up) is changed; a true no-op is not; live-feed jitter of a few chars is not (the whole
+  point of the 8-char floor — without it every dead click looks alive, which is the failure the
+  counterfactual proves); a feed swap of hundreds of chars is; a navigation always is; a failed
+  fingerprint (t=-1) manufactures no phantom delta.
+- session.zig had ZERO registered tests (only manager.zig was in tests.zig) — so the file the whole
+  browser layer runs through was uncovered. Registered it; the counterfactual firing by NAME is the
+  proof it is now collected, not just written.
+- deliberately NOT done, and why: I did not rebuild the reader or add hierarchy to the flat element
+  list. The evidence says the failure was action FEEDBACK, not perception, and a click that reports its
+  effect is also the precondition for the OTHER ask — "improve across situations" flows through the
+  lesson-patching from 0103, and a browser lesson ("a div result with changed:false → the link is a
+  sibling") can only be WRITTEN once a click reports whether it worked.
+- verified: suite exit 0, 0 compile errors, new test collected. CF drop the jitter floor to 1 -> the
+  named session test fails, 0 compile errors. session.zig byte-identical after restore. Full oracle
+  green.
+- next (verified): the flat undifferentiated element list is a real second-order cost (the model spends
+  reasoning ranking chrome vs content on every read) — worth a `role`/`clickable` hint or a content/
+  chrome split, but it is an enhancement, not the bug, and belongs in its own increment.
