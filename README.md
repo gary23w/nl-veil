@@ -6,7 +6,7 @@
 
 <p>
   <a href="https://github.com/gary23w/nl-veil/actions/workflows/release.yml"><img alt="build" src="https://github.com/gary23w/nl-veil/actions/workflows/release.yml/badge.svg"></a>
-  <a href="https://github.com/gary23w/nl-veil/releases/latest"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0--alpha.7-A8241B"></a>
+  <a href="https://github.com/gary23w/nl-veil/releases/latest"><img alt="release" src="https://img.shields.io/badge/release-v1.0.0--alpha.8-A8241B"></a>
   <img alt="zig" src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig&logoColor=white">
   <img alt="model" src="https://img.shields.io/badge/model-gary--neuron--emergent-6E4A27">
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-31405C"></a>
