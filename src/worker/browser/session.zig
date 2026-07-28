@@ -546,8 +546,13 @@ pub const Session = struct {
     /// the resulting navigation is settled. Returns {ok,tag} or {ok,tag,navigated,url}; a missing ref returns
     /// {ok:false,error:'ref not found'} unchanged.
     pub fn typeRef(self: *Session, ref: u32, text: []const u8, submit: bool) Error![]u8 {
-        const before = if (submit) (self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory)) else "";
-        defer if (submit) self.gpa.free(before);
+        // Fingerprint the whole type the way clickAt fingerprints a click. Two things go wrong silently
+        // otherwise, both seen in a ground-truth run: a type into the WRONG element leaves the field's text
+        // unchanged (dtext ~ 0 — the text did not land), and a submit that posts a comment gives the caller
+        // no DOM signal it worked, so it falls back to an unreliable pixel search and cannot confirm. `changed`
+        // and `dtext` answer both from the page itself.
+        const before = self.clickSig();
+        defer self.gpa.free(before.href);
 
         const rjs = std.fmt.allocPrint(self.gpa, RESOLVE_TYPE_JS, .{ref}) catch return error.OutOfMemory;
         defer self.gpa.free(rjs);
@@ -582,12 +587,15 @@ pub const Session = struct {
         const typed = try self.typeFocused(text, true, submit);
         defer self.gpa.free(typed);
 
-        if (!submit) return jsonObj(self.gpa, .{ .ok = true, .tag = tag }) catch error.OutOfMemory;
-        const navigated = self.settleAfterClick(before);
+        const navigated = if (submit) self.settleAfterClick(before.href) else false;
         if (navigated) self.harden();
-        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
-        defer self.gpa.free(url);
-        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+        const after = self.clickSig();
+        defer self.gpa.free(after.href);
+        const eff = clickEffect(navigated, before, after);
+        // A non-submit type reports whether the text LANDED (changed/dtext); a submit ALSO reports navigation.
+        // Same fields as a click, so the model reads one effect vocabulary across every interaction.
+        if (!submit) return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .changed = eff.changed, .dtext = eff.dtext }) catch error.OutOfMemory;
+        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .changed = eff.changed, .dialog = eff.dialog, .dtext = eff.dtext, .url = after.href }) catch error.OutOfMemory;
     }
 };
 
@@ -650,12 +658,49 @@ const HARDEN_JS =
 // several mounted and hidden), h=href. One round-trip, scalar output, no data-nlref dependency so it is
 // valid before harden() re-tags the page.
 const CLICK_SIG_JS =
-    \\(function(){var d=0;var dl=document.querySelectorAll('[role=dialog],[aria-modal="true"],dialog[open]');for(var i=0;i<dl.length;i++){var r=dl[i].getBoundingClientRect();if(r.width>0&&r.height>0)d++;}var t=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var c=document.querySelectorAll('a,button,input,textarea,select,[role=button]').length;return JSON.stringify({t:t.length,c:c,d:d,h:location.href});})()
+    \\(function(){var d=0;var dl=document.querySelectorAll('[role=dialog],[aria-modal="true"],dialog[open]');for(var i=0;i<dl.length;i++){var r=dl[i].getBoundingClientRect();if(r.width>0&&r.height>0)d++;}var t=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var c=document.querySelectorAll('a,button,input,textarea,select,[role=button],[role=textbox],[role=searchbox],[contenteditable="true"]').length;return JSON.stringify({t:t.length,c:c,d:d,h:location.href});})()
 ;
 
 const SNAPSHOT_JS =
-    \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',text:label});}var _ft=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var vw=window.innerWidth||1,vh=window.innerHeight||1;var vis=0;var vels=document.querySelectorAll('canvas,svg,video');for(var vi=0;vi<vels.length;vi++){var vr=vels[vi].getBoundingClientRect();var iw=Math.max(0,Math.min(vr.right,vw)-Math.max(vr.left,0));var ih=Math.max(0,Math.min(vr.bottom,vh)-Math.max(vr.top,0));var f=(iw*ih)/(vw*vh);if(f>vis)vis=f;}var chSig=[];var chKind='unknown';var strong=false;var suspected=false;try{var _wq=null;if(document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile'))_wq='turnstile';else if(document.querySelector('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/api2/bframe"],iframe[src*="recaptcha/enterprise/anchor"],iframe[src*="recaptcha/enterprise/bframe"]'))_wq='recaptcha';else if(document.querySelector('iframe[src*="hcaptcha.com"],.h-captcha'))_wq='hcaptcha';if(document.querySelector('#challenge-running,#cf-please-wait,#cf-challenge-running,#challenge-stage,#challenge-form,.cf-browser-verification')){strong=true;chKind='cloudflare';chSig.push('cf-interstitial');}if(_wq){chSig.push('widget:'+_wq);if(_ft.length<200){strong=true;if(chKind==='unknown')chKind=_wq;}}}catch(e){}try{if(!strong){var _bt=_ft.slice(0,4000);if(/verify (you are|you'?re) (a )?human/i.test(_bt)||/detected unusual traffic/i.test(_bt)||/enable javascript and cookies to continue/i.test(_bt)){suspected=true;chSig.push('text');}}}catch(e){}var challenge={detected:(strong||suspected),kind:chKind,confidence:(strong?'strong':(suspected?'suspected':'none')),signals:chSig};return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:_ft.slice(0,4000),textLen:_ft.length,visualScore:Math.round(vis*100)/100,challenge:challenge});})()
+    \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[role=textbox],[role=searchbox],[role=combobox],[contenteditable=""],[contenteditable="true"],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var _role=(el.getAttribute&&el.getAttribute('role'))||'';var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||(el.getAttribute&&el.getAttribute('aria-placeholder'))||(el.getAttribute&&el.getAttribute('data-placeholder'))||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);var _edit=(el.isContentEditable||tag==='textarea'||_role==='textbox'||_role==='searchbox'||_role==='combobox'||(tag==='input'&&!/^(button|submit|reset|checkbox|radio|file|image|range|color|hidden)$/.test((el.getAttribute&&el.getAttribute('type'))||'text')));out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',edit:_edit,text:label});}var _ft=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var vw=window.innerWidth||1,vh=window.innerHeight||1;var vis=0;var vels=document.querySelectorAll('canvas,svg,video');for(var vi=0;vi<vels.length;vi++){var vr=vels[vi].getBoundingClientRect();var iw=Math.max(0,Math.min(vr.right,vw)-Math.max(vr.left,0));var ih=Math.max(0,Math.min(vr.bottom,vh)-Math.max(vr.top,0));var f=(iw*ih)/(vw*vh);if(f>vis)vis=f;}var chSig=[];var chKind='unknown';var strong=false;var suspected=false;try{var _wq=null;if(document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile'))_wq='turnstile';else if(document.querySelector('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/api2/bframe"],iframe[src*="recaptcha/enterprise/anchor"],iframe[src*="recaptcha/enterprise/bframe"]'))_wq='recaptcha';else if(document.querySelector('iframe[src*="hcaptcha.com"],.h-captcha'))_wq='hcaptcha';if(document.querySelector('#challenge-running,#cf-please-wait,#cf-challenge-running,#challenge-stage,#challenge-form,.cf-browser-verification')){strong=true;chKind='cloudflare';chSig.push('cf-interstitial');}if(_wq){chSig.push('widget:'+_wq);if(_ft.length<200){strong=true;if(chKind==='unknown')chKind=_wq;}}}catch(e){}try{if(!strong){var _bt=_ft.slice(0,4000);if(/verify (you are|you'?re) (a )?human/i.test(_bt)||/detected unusual traffic/i.test(_bt)||/enable javascript and cookies to continue/i.test(_bt)){suspected=true;chSig.push('text');}}}catch(e){}var challenge={detected:(strong||suspected),kind:chKind,confidence:(strong?'strong':(suspected?'suspected':'none')),signals:chSig};return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:_ft.slice(0,4000),textLen:_ft.length,visualScore:Math.round(vis*100)/100,challenge:challenge});})()
 ;
+
+test "the snapshot sees editable fields, not just links and buttons" {
+    // The failure this fixes, from a ground-truth run: the agent could not target a comment box, because
+    // the snapshot selector was `a,button,input,textarea,select,...[role=button]...` and NOTHING else. Every
+    // modern app builds its primary text input as a contenteditable / role=textbox div, so the one element
+    // that matters most — the place you TYPE — was invisible, and the agent fell back to pixel-guessing.
+    // The JS runs only against a live CDP page, so this is a source audit like clickEffect's siblings.
+    const src = @embedFile("session.zig");
+    const snap_at = std.mem.indexOf(u8, src, "const SNAPSHOT_" ++ "JS") orelse return error.SnapshotMissing;
+    const snap = src[snap_at..@min(src.len, snap_at + 2600)];
+    // the selector must reach the shapes real composers use...
+    for ([_][]const u8{ "[role=textbox]", "[role=searchbox]", "[role=combobox]", "[contenteditable" }) |needle| {
+        if (std.mem.indexOf(u8, snap, needle) == null) {
+            std.log.warn("session.zig: snapshot selector no longer captures {s} — composers go invisible again", .{needle});
+            return error.SnapshotDropsEditables;
+        }
+    }
+    // ...and each element must SAY it is editable, or the model reads a contenteditable div as a plain div
+    // and never tries to type into it.
+    if (std.mem.indexOf(u8, snap, "edit:_edit") == null) return error.SnapshotOmitsEditFlag;
+    if (std.mem.indexOf(u8, snap, "isContentEditable") == null) return error.EditFlagCannotSeeContenteditable;
+
+    // The click fingerprint's control count must count them too, or opening a composer looks like nothing
+    // moved (dctl stays 0) and clickEffect under-reports the change.
+    const sig_at = std.mem.indexOf(u8, src, "const CLICK_SIG_" ++ "JS") orelse return error.SigMissing;
+    const sig = src[sig_at..@min(src.len, sig_at + 400)];
+    if (std.mem.indexOf(u8, sig, "[role=textbox]") == null) return error.FingerprintIgnoresEditables;
+
+    // typeRef must fingerprint its type too, or a submit that posts a comment gives the model no DOM signal
+    // and it falls back to the pixel search that failed in the trace. Same clickEffect as a click.
+    const tr_at = std.mem.indexOf(u8, src, "pub fn type" ++ "Ref(") orelse return error.TypeRefMissing;
+    const tr = src[tr_at..@min(src.len, tr_at + 3200)]; // must span typeRef's body to its clickEffect call
+    if (std.mem.indexOf(u8, tr, "click" ++ "Effect(") == null) {
+        std.log.warn("session.zig: typeRef no longer reports a click effect — a submitted post cannot be confirmed from the DOM", .{});
+        return error.TypeRefOmitsEffect;
+    }
+}
 
 test "clickEffect: an in-page click reports what it DID, so a no-op is visible without a re-read" {
     const S = Session.ClickSig;
