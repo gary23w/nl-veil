@@ -344,17 +344,18 @@ pub const Session = struct {
     /// Trusted left click at a viewport point. `x`/`y` are CSS pixels from the top-left of the visible
     /// viewport — the same space a screenshot shows and `getBoundingClientRect` reports. No devicePixelRatio.
     pub fn clickAt(self: *Session, x: i64, y: i64) Error![]u8 {
-        const before = self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory);
-        defer self.gpa.free(before);
+        const before = self.clickSig();
+        defer self.gpa.free(before.href);
         self.dispatchMouse("mouseMoved", x, y, "none", 0, 0) catch {};
         self.dispatchMouse("mousePressed", x, y, "left", 1, 1) catch {};
         util.sleepMs(40); // a real press→release gap; some UIs debounce a zero-duration press
         self.dispatchMouse("mouseReleased", x, y, "left", 0, 1) catch {};
-        const navigated = self.settleAfterClick(before);
+        const navigated = self.settleAfterClick(before.href);
         if (navigated) self.harden();
-        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
-        defer self.gpa.free(url);
-        return jsonObj(self.gpa, .{ .ok = true, .x = x, .y = y, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+        const after = self.clickSig();
+        defer self.gpa.free(after.href);
+        const eff = clickEffect(navigated, before, after);
+        return jsonObj(self.gpa, .{ .ok = true, .x = x, .y = y, .navigated = navigated, .changed = eff.changed, .dialog = eff.dialog, .dtext = eff.dtext, .url = after.href }) catch error.OutOfMemory;
     }
 
     /// Type into WHATEVER CURRENTLY HAS FOCUS. No element lookup at all — click the field first (by ref or by
@@ -444,8 +445,8 @@ pub const Session = struct {
     /// can't be localized in the viewport. Returns {ok,tag,navigated,url}; a missing ref returns
     /// {ok:false,error:'ref not found'} unchanged.
     pub fn clickRef(self: *Session, ref: u32) Error![]u8 {
-        const before = self.evalString("location.href") catch (self.gpa.dupe(u8, "") catch return error.OutOfMemory);
-        defer self.gpa.free(before);
+        const before = self.clickSig();
+        defer self.gpa.free(before.href);
         const rjs = std.fmt.allocPrint(self.gpa, RESOLVE_CLICK_JS, .{ref}) catch return error.OutOfMemory;
         defer self.gpa.free(rjs);
         const raw = try self.evaluate(rjs);
@@ -480,11 +481,46 @@ pub const Session = struct {
             if (cr.len > 0) self.gpa.free(cr);
         }
 
-        const navigated = self.settleAfterClick(before);
+        const navigated = self.settleAfterClick(before.href);
         if (navigated) self.harden(); // the landing page is a fresh JS context — re-arm before the next click
-        const url = self.evalString("location.href") catch (self.gpa.dupe(u8, before) catch return error.OutOfMemory);
-        defer self.gpa.free(url);
-        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .url = url }) catch error.OutOfMemory;
+        const after = self.clickSig();
+        defer self.gpa.free(after.href);
+        const eff = clickEffect(navigated, before, after);
+        // changed/dialog/dtext are the whole point: a click that reports changed:false did nothing, and the
+        // model should retarget rather than re-read; dialog:true means a modal opened, read it next.
+        return jsonObj(self.gpa, .{ .ok = true, .tag = tag, .navigated = navigated, .changed = eff.changed, .dialog = eff.dialog, .dtext = eff.dtext, .url = after.href }) catch error.OutOfMemory;
+    }
+
+    /// A cheap page fingerprint taken either side of a click: body-text length, interactive-control count,
+    /// count of VISIBLE modal dialogs, and the url. The whole reason the agent used to loop on a single-page
+    /// app — click, get {navigated:false}, learn nothing, re-read the entire DOM, diff it in its own head,
+    /// guess again — was that a click reported only whether the URL changed. Almost nothing on a SPA changes the
+    /// url: a "Join" opens a modal, a "Like" toggles a label, a filter swaps the feed, all navigated:false.
+    /// This signature lets clickRef/clickAt say what actually HAPPENED, so a no-op click is visible as a
+    /// no-op instead of provoking another full read.
+    const ClickSig = struct { t: i64 = -1, c: i64 = -1, d: i64 = 0, href: []u8 = &.{} };
+
+    fn clickSig(self: *Session) ClickSig {
+        const raw = self.evaluate(CLICK_SIG_JS) catch return .{ .href = self.gpa.dupe(u8, "") catch &.{} };
+        defer self.gpa.free(raw);
+        const P = struct { t: i64 = -1, c: i64 = -1, d: i64 = 0, h: []const u8 = "" };
+        const p = std.json.parseFromSlice(P, self.gpa, raw, .{ .ignore_unknown_fields = true }) catch
+            return .{ .href = self.gpa.dupe(u8, "") catch &.{} };
+        defer p.deinit();
+        return .{ .t = p.value.t, .c = p.value.c, .d = p.value.d, .href = self.gpa.dupe(u8, p.value.h) catch &.{} };
+    }
+
+    /// The observable effect of a click, computed from the two fingerprints. Pure, so the thresholds are
+    /// tested without a browser. `dtext` gates on a small floor because a live feed jitters by a few chars
+    /// on its own ("Just now" -> "1 min"); a real content swap or an opened panel clears it by hundreds.
+    const TEXT_DELTA_MIN = 8;
+    const ClickEffect = struct { changed: bool, dialog: bool, dtext: i64, dcontrols: i64 };
+    fn clickEffect(navigated: bool, before: ClickSig, after: ClickSig) ClickEffect {
+        const dtext: i64 = if (before.t < 0 or after.t < 0) 0 else after.t - before.t;
+        const dctl: i64 = if (before.c < 0 or after.c < 0) 0 else after.c - before.c;
+        const dialog = after.d > before.d;
+        const changed = navigated or dialog or (@abs(dtext) >= TEXT_DELTA_MIN) or (dctl != 0);
+        return .{ .changed = changed, .dialog = dialog, .dtext = dtext, .dcontrols = dctl };
     }
 
     /// After a click, wait briefly for the URL to change (a navigation) and, if it does, for the new document to
@@ -609,9 +645,61 @@ const HARDEN_JS =
 // positives from page titles or HTML text merely mentioning a challenge. SUSPECTED is a narrow block-page
 // phrase (non-blocking marker). Scope: Cloudflare/Turnstile/reCAPTCHA/hCaptcha; other vendors (AWS WAF,
 // DataDome, Akamai, …) aren't fingerprinted — a miss just reads the wall as content, never a false handoff.
+// The click fingerprint (see ClickSig). t=body innerText length, c=interactive-control count, d=count of
+// VISIBLE modal dialogs (a dialog container that is present but zero-size does not count — a modern app keeps
+// several mounted and hidden), h=href. One round-trip, scalar output, no data-nlref dependency so it is
+// valid before harden() re-tags the page.
+const CLICK_SIG_JS =
+    \\(function(){var d=0;var dl=document.querySelectorAll('[role=dialog],[aria-modal="true"],dialog[open]');for(var i=0;i<dl.length;i++){var r=dl[i].getBoundingClientRect();if(r.width>0&&r.height>0)d++;}var t=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var c=document.querySelectorAll('a,button,input,textarea,select,[role=button]').length;return JSON.stringify({t:t.length,c:c,d:d,h:location.href});})()
+;
+
 const SNAPSHOT_JS =
     \\(function(){var out=[];var i=0;var nodes=document.querySelectorAll('a,button,input,textarea,select,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[onclick]');for(var k=0;k<nodes.length;k++){var el=nodes[k];var r=el.getBoundingClientRect();if(r.width===0&&r.height===0)continue;var st=getComputedStyle(el);if(st.visibility==='hidden'||st.display==='none')continue;i++;el.setAttribute('data-nlref',String(i));var tag=el.tagName.toLowerCase();var label=((el.getAttribute&&el.getAttribute('aria-label'))||el.placeholder||el.value||el.innerText||(el.getAttribute&&el.getAttribute('title'))||'').trim().slice(0,80);out.push({ref:i,tag:tag,type:(el.getAttribute&&el.getAttribute('type'))||'',name:(el.getAttribute&&el.getAttribute('name'))||'',text:label});}var _ft=(document.body?document.body.innerText:'').replace(/\s+/g,' ').trim();var vw=window.innerWidth||1,vh=window.innerHeight||1;var vis=0;var vels=document.querySelectorAll('canvas,svg,video');for(var vi=0;vi<vels.length;vi++){var vr=vels[vi].getBoundingClientRect();var iw=Math.max(0,Math.min(vr.right,vw)-Math.max(vr.left,0));var ih=Math.max(0,Math.min(vr.bottom,vh)-Math.max(vr.top,0));var f=(iw*ih)/(vw*vh);if(f>vis)vis=f;}var chSig=[];var chKind='unknown';var strong=false;var suspected=false;try{var _wq=null;if(document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile'))_wq='turnstile';else if(document.querySelector('iframe[src*="recaptcha/api2/anchor"],iframe[src*="recaptcha/api2/bframe"],iframe[src*="recaptcha/enterprise/anchor"],iframe[src*="recaptcha/enterprise/bframe"]'))_wq='recaptcha';else if(document.querySelector('iframe[src*="hcaptcha.com"],.h-captcha'))_wq='hcaptcha';if(document.querySelector('#challenge-running,#cf-please-wait,#cf-challenge-running,#challenge-stage,#challenge-form,.cf-browser-verification')){strong=true;chKind='cloudflare';chSig.push('cf-interstitial');}if(_wq){chSig.push('widget:'+_wq);if(_ft.length<200){strong=true;if(chKind==='unknown')chKind=_wq;}}}catch(e){}try{if(!strong){var _bt=_ft.slice(0,4000);if(/verify (you are|you'?re) (a )?human/i.test(_bt)||/detected unusual traffic/i.test(_bt)||/enable javascript and cookies to continue/i.test(_bt)){suspected=true;chSig.push('text');}}}catch(e){}var challenge={detected:(strong||suspected),kind:chKind,confidence:(strong?'strong':(suspected?'suspected':'none')),signals:chSig};return JSON.stringify({url:location.href,title:document.title,count:out.length,elements:out,text:_ft.slice(0,4000),textLen:_ft.length,visualScore:Math.round(vis*100)/100,challenge:challenge});})()
 ;
+
+test "clickEffect: an in-page click reports what it DID, so a no-op is visible without a re-read" {
+    const S = Session.ClickSig;
+    // The loop from the ground-truth trace: click a div, url unchanged, and the old code returned only
+    // navigated:false — indistinguishable from a click that opened a modal. These are the cases the model
+    // needed told apart.
+
+    // A modal opened: no nav, a visible dialog appeared. This is the "Join" click.
+    {
+        const e = Session.clickEffect(false, .{ .t = 4000, .c = 70, .d = 0 }, .{ .t = 4200, .c = 82, .d = 1 });
+        try std.testing.expect(e.dialog);
+        try std.testing.expect(e.changed);
+    }
+    // A true no-op: nothing moved. The model must see changed:false and RETARGET instead of re-reading.
+    {
+        const e = Session.clickEffect(false, .{ .t = 4000, .c = 70, .d = 0 }, .{ .t = 4000, .c = 70, .d = 0 });
+        try std.testing.expect(!e.changed);
+        try std.testing.expect(!e.dialog);
+    }
+    // Live-feed jitter is NOT a change: a couple of chars drift ("Just now" -> "1 min") must not read as
+    // success, or every dead click looks alive.
+    {
+        const e = Session.clickEffect(false, .{ .t = 4000, .c = 70, .d = 0 }, .{ .t = 4003, .c = 70, .d = 0 });
+        try std.testing.expect(!e.changed);
+    }
+    // A feed swap: no nav, no dialog, but the content and control count both moved a lot. Real.
+    {
+        const e = Session.clickEffect(false, .{ .t = 4000, .c = 70, .d = 0 }, .{ .t = 1800, .c = 40, .d = 0 });
+        try std.testing.expect(e.changed);
+        try std.testing.expect(e.dtext == -2200);
+    }
+    // A navigation is always a change, whatever the fingerprints say.
+    {
+        const e = Session.clickEffect(true, .{ .t = 4000, .c = 70, .d = 0 }, .{ .t = 4000, .c = 70, .d = 0 });
+        try std.testing.expect(e.changed);
+    }
+    // A failed fingerprint (t=-1) must not manufacture a huge phantom delta.
+    {
+        const e = Session.clickEffect(false, .{ .t = -1, .c = -1, .d = 0 }, .{ .t = 4000, .c = 70, .d = 0 });
+        try std.testing.expect(e.dtext == 0);
+        try std.testing.expect(!e.changed);
+    }
+    _ = S;
+}
 
 // ---------------------------------------------------------------------------------------------------- smoke
 
