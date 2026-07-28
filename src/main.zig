@@ -689,6 +689,9 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/chat/tool", chat_tools.chatTool, .{});
     // The browser extension's relay. `hello` is unauthenticated (it is how the extension finds this server at
     // all) and `pair` is loopback-only; the rest carry the pairing token. See worker/browser/ext_api.zig.
+    // Load (or mint + persist) the pairing token BEFORE these routes can serve, so a server restart keeps the
+    // token an already-paired extension is still holding instead of orphaning it. See ext.loadOrMintToken.
+    @import("worker/browser/ext.zig").loadOrMintToken(io, gpa, paths.data);
     router.get("/api/v1/browser/ext/hello", browser_ext_api.hello, .{});
     router.post("/api/v1/browser/ext/pair", browser_ext_api.pair, .{});
     router.get("/api/v1/browser/ext/poll", browser_ext_api.poll, .{});
