@@ -2910,3 +2910,43 @@ edit, confirm it applied, then run.
 - next (verified): the flat undifferentiated element list is a real second-order cost (the model spends
   reasoning ranking chrome vs content on every read) — worth a `role`/`clickable` hint or a content/
   chrome split, but it is an enhancement, not the bug, and belongs in its own increment.
+
+## 0108 — 2026-07-28 — the agent was blind to the one element that matters: the text box
+- owner re-ran the browser test with 0107's click-effect knobs. Better, but still had to guide it. Read
+  the human-visible transcript (the 16 user/assistant messages, not the mixed event log) — that IS the
+  list of places it needed a human. Three, and two share one mechanical root.
+- [comment box] the model "attempted to open the comment field, but the synthetic clicks didn't trigger
+  it", fell back to pixel coordinates, and the user had to say "the input box is ... 'comment as gary'".
+  ROOT CAUSE: the snapshot selector was `a,button,input,textarea,select,summary,label,[role=button]...`
+  and NOTHING for editables. Every modern app builds its primary text input as a contenteditable /
+  role=textbox DIV, not an <input> — comment boxes, chat composers, search bars. So the single most
+  important element on the page, the place you TYPE, was invisible, and the agent was forced onto
+  unreliable pixel clicking and could not even find it by label.
+- did: selector now captures [role=textbox],[role=searchbox],[role=combobox],[contenteditable]; each
+  element carries edit:true so the model reads a bare div as typeable; the label also reads
+  aria-placeholder/data-placeholder (where "Comment as ..." lives). The TYPING path already handled
+  contenteditable (typeFocused clicks to place the caret, then Input.insertText) — only perception was
+  broken, which is why the whole failure was "can't target it", never "can't type".
+- [confirm a post] the model typed + submitted a comment but "pixel search didn't confirm the text",
+  so the user had to confirm it posted. Same shape as 0107 one layer over: typeRef reported only
+  navigated, and posting a comment does not navigate. Extended the click fingerprint to typeRef —
+  a submit now reports changed/dtext, so a landed post is visible from the DOM without a pixel search,
+  and a non-submit type reports whether the text LANDED (dtext ~ 0 = wrong element).
+- NOT fixed, named honestly rather than hand-waved: [session probe] it declared "no credentials on
+  file" without opening a tab to look. That is reasoning/prompt behaviour, not a missing capability —
+  no clean mechanical guard, so it is a separate piece of work, not something to fake a test around.
+- tests are SOURCE AUDITS (the JS runs only against a live CDP page, the standing limit for this file):
+  the selector must reach the editable shapes, each element must emit edit:_edit, the fingerprint's
+  control count must include them, and typeRef must call clickEffect. Two counterfactuals, each by name.
+- learned, TWICE, on my own counterfactuals: (1) `const eff = clickEffect(navigated, before, after)`
+  exists in THREE functions (clickAt/clickRef/typeRef), so a replace-first hit the wrong one and did not
+  compile — INJECTIONS=3, exit 1 meaningless (0087 again). Redone against a block unique to typeRef. (2)
+  the audit window was 2200 bytes but typeRef's clickEffect call sits 2488 in — the test failed on its
+  own too-small window, not on the code. Both are the same lesson: a counterfactual/audit that fires
+  needs its reason read, never its exit code trusted.
+- verified: suite exit 0. CF strip editables from selector -> "composers go invisible again" by name.
+  CF strip typeRef's effect -> "a submitted post cannot be confirmed" by name. Both 0 compile errors,
+  1 injection. session.zig byte-identical after restore. Full oracle green.
+- next (verified): [session probe] wants the agent to OPEN and observe before declaring it cannot; and
+  the flat element list still makes the model rank chrome vs content every read — a content/chrome or
+  role hint is the next perception win.
