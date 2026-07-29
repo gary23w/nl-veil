@@ -73,6 +73,10 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addAnonymousImport("styles.css", .{ .root_source_file = b.path("web/public/styles.css") });
     exe.root_module.addAnonymousImport("models.json", .{ .root_source_file = b.path("web/public/models.json") });
     exe.root_module.addImport("modelcfg", modelcfg);
+    // The Windows FILE icon (Explorer, shortcuts, pinned taskbar entries). setWindowIcon only dresses a
+    // running window, so without this resource the shipped veil.exe sat on disk wearing the generic
+    // executable glyph. Windows-only: .rc is a Windows resource format and resinator only runs for it.
+    if (target.result.os.tag == .windows) exe.root_module.addWin32ResourceFile(.{ .file = b.path("desk/assets/veil.rc") });
 
     // ---- embedded Lua 5.4 (the plugin/theme runtime) ----
     // vendor/lua is compiled straight into the binary; src/plug/lua.zig binds it. This is what makes
