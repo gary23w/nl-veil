@@ -479,6 +479,15 @@ pub fn runApp(data_dir: ?[]const u8) !void {
     rl.setConfigFlags(.{ .window_resizable = true, .window_undecorated = true });
     rl.setTraceLogLevel(.warning);
     rl.initWindow(WIN_W, WIN_H, "veil-desk");
+    // A WINDOW IS NOT GUARANTEED. A virtual machine, a Remote Desktop session, or a box running the
+    // Microsoft Basic Display Adapter has no OpenGL 3.3, and GLFW simply fails to create one. raylib
+    // reports that through a trace log — which a DOUBLE-CLICKED veil has nowhere to print, having just
+    // relaunched itself with CREATE_NO_WINDOW (see detachOwnConsole in the server's main). The old path
+    // then fell straight through windowShouldClose() on the very first frame, returned, and the caller
+    // shut the server down and exited: the user double-clicked and saw precisely nothing happen.
+    // Report it instead, so the caller can keep the server up and say where the web UI is. Checked
+    // BEFORE the closeWindow defer is registered — there is no window to close.
+    if (!rl.isWindowReady()) return error.WindowUnavailable;
     defer rl.closeWindow();
     defer t.deinit();
     // Escape is raylib's default EXIT key, but here it's the "unfocus the input" key (handleKeys) — leaving
