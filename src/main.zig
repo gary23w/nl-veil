@@ -160,6 +160,9 @@ const winapp = if (builtin.os.tag == .windows) struct {
     /// fresh console); >=2 = a shell (cmd.exe, powershell.exe) is attached and that console is the DEV'S, not
     /// ours. 0 = the call failed / no console at all.
     extern "kernel32" fn GetConsoleProcessList(list: [*]u32, count: u32) callconv(.winapi) u32;
+    /// The only channel guaranteed to reach a double-clicked veil's user: it has no console (see
+    /// detachOwnConsole) and, in the case this is used for, no window either.
+    extern "user32" fn MessageBoxA(hWnd: ?*anyopaque, text: [*:0]const u8, caption: [*:0]const u8, uType: u32) callconv(.winapi) c_int;
     extern "kernel32" fn WaitForSingleObject(h: HANDLE, ms: u32) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;
 
@@ -814,7 +817,12 @@ pub fn main(init: std.process.Init) !void {
     // "server offline" flash on every launch. Bounded and best-effort: never block the window on the backend.
     awaitServer(gpa, io, port, 3000);
 
-    desk.runApp(paths.data) catch |e| log.err("desktop GUI exited with an error: {t}", .{e});
+    desk.runApp(paths.data) catch |e| {
+        // NO WINDOW is not a reason to take the server down with it — the server is the useful half, and
+        // the web UI is right there. Degrade instead of exiting silently (see serveWithoutDesk).
+        if (e == error.WindowUnavailable) serveWithoutDesk(io, port, paths.data);
+        log.err("desktop GUI exited with an error: {t}", .{e});
+    };
 
     // The window IS the app's lifetime (same contract the old DeskWatch enforced across the process boundary).
     log.info("desktop window closed — shutting down. Use --server-only to run the server without a GUI.", .{});
@@ -823,6 +831,34 @@ pub fn main(init: std.process.Init) !void {
     // that is still unwinding, and the job object (Windows) reaps the descendants on process exit anyway.
     threadSleepMs(io, 150);
     std.process.exit(0);
+}
+
+/// The desktop could not open a window (no OpenGL 3.3: a VM, an RDP session, a missing or stale graphics
+/// driver). The SERVER is already listening on its own thread and is the half that still works, so degrade
+/// to server-only rather than tearing it down — and, above all, TELL the user. This is the one path where
+/// no log line can reach them: a double-clicked veil relaunched itself with CREATE_NO_WINDOW, so there is
+/// no console, and now there is no window either. On Windows that leaves exactly one visible channel.
+/// Never returns: the server thread owns the port, this one just has to stay alive.
+fn serveWithoutDesk(io: std.Io, port: u16, data_dir: []const u8) noreturn {
+    log.err("the desktop could not open a window — no OpenGL 3.3 (a virtual machine, a Remote Desktop session, or a missing/stale graphics driver).", .{});
+    log.info("the server is still running: open http://127.0.0.1:{d} in a browser. Use --server-only to skip the desktop next time.", .{port});
+    // Leave the reason on disk too, beside the one the desk's own exit path writes.
+    var pb: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&pb, "{s}/desk-exit-reason.txt", .{data_dir})) |p| {
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = "the desktop could not open a window (no OpenGL 3.3) - running server-only; use the web UI" }) catch {};
+    } else |_| {}
+    if (builtin.os.tag == .windows) {
+        var mb: [512]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&mb, "The desktop window could not open on this machine.\n\n" ++
+            "That usually means OpenGL 3.3 is unavailable - a virtual machine, a Remote Desktop session, " ++
+            "or a missing/stale graphics driver.\n\n" ++
+            "The veil server IS running. Open this in your browser:\n\n" ++
+            "    http://127.0.0.1:{d}\n\n" ++
+            "Closing this message leaves the server running. Run \"veil --server-only\" to skip the desktop next time.", .{port}) catch
+            "The desktop window could not open (no OpenGL 3.3). The veil server is running - open http://127.0.0.1:8787 in your browser.";
+        _ = winapp.MessageBoxA(null, msg, "the veil", 0x0000_0030 | 0x0001_0000); // MB_ICONWARNING | MB_SETFOREGROUND
+    }
+    while (true) threadSleepMs(io, 60_000);
 }
 
 /// Runs httpz's blocking accept loop OFF the main thread so raylib can own main. Everything it touches
