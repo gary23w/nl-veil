@@ -79,6 +79,12 @@ providers:
         label: Llama 3.1 8B
       - id: hermes3:8b
         label: Hermes 3 8B
+      # Appended, per the ORDER MATTERS note at the top. No params_b/tier pinned: "12B" is in both ids
+      # and paramsTenthsFromId reads the suffix case-insensitively, so senseModel already tiers these.
+      - id: xentriom/gemma-4-12B-coder-fable5-composer2.5-v1
+        label: Gemma 4 12B Coder v1
+      - id: xentriom/gemma-4-12B-agentic-fable5-composer2.5-v2
+        label: Gemma 4 12B Agentic v2
 
   # Cloudflare Workers AI via its OpenAI-compatible endpoint. Needs BOTH an account id (in the URL) and a
   # token; blank sends the "cloudflare" sentinel so a server configured with NL_CF_ACCOUNT_ID +
