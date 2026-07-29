@@ -201,10 +201,19 @@ fi
 say "bundle scrubbed (no data/, no keys)"
 
 ( cd "$OUT"
+  rm -f "$NAME.zip" "$NAME.tar.gz"
+  # A .zip is what the download table promises and what Explorer/Finder open natively. The WINDOWS runner
+  # has no `zip` on PATH, so this silently shipped a .tar.gz there — the one platform where the notes say
+  # ".zip", where a tarball is the least openable, and where a user following the instructions finds no
+  # such file. Try the archivers that ARE present on that runner before falling back.
   if command -v zip >/dev/null 2>&1; then
-    rm -f "$NAME.zip"; zip -qr "$NAME.zip" "$NAME"; say "packaged bin/$NAME.zip"
+    zip -qr "$NAME.zip" "$NAME" && say "packaged bin/$NAME.zip"
+  elif command -v 7z >/dev/null 2>&1; then
+    7z a -tzip -bso0 -bsp0 "$NAME.zip" "$NAME" >/dev/null && say "packaged bin/$NAME.zip"
+  elif command -v powershell >/dev/null 2>&1; then
+    powershell -NoProfile -NonInteractive -Command "Compress-Archive -Path '$NAME' -DestinationPath '$NAME.zip' -Force" && say "packaged bin/$NAME.zip"
   else
-    tar -czf "$NAME.tar.gz" "$NAME"; say "packaged bin/$NAME.tar.gz"
+    tar -czf "$NAME.tar.gz" "$NAME" && say "packaged bin/$NAME.tar.gz"
   fi )
 
 # ---- 4. cross-compile the SERVER for every target ----
