@@ -981,6 +981,18 @@
       "label": "Kimi K2.6",
       "provider": "moonshot",
       "hosting": "hosted"
+    },
+    {
+      "id": "xentriom/gemma-4-12B-coder-fable5-composer2.5-v1",
+      "label": "Gemma 4 12B Coder v1",
+      "provider": "ollama",
+      "hosting": "local"
+    },
+    {
+      "id": "xentriom/gemma-4-12B-agentic-fable5-composer2.5-v2",
+      "label": "Gemma 4 12B Agentic v2",
+      "provider": "ollama",
+      "hosting": "local"
     }
   ],
   "defaults": {
