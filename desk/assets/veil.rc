@@ -1,0 +1,9 @@
+// The Windows FILE icon: what Explorer shows for veil.exe, what a shortcut (or a pinned taskbar entry)
+// inherits, and what the Alt-Tab/installer chrome picks up. Without an icon RESOURCE compiled into the
+// binary, all of those fall back to the generic default executable glyph -- setWindowIcon() only dresses
+// the window of an ALREADY-RUNNING process, so the app looked unbranded everywhere it sat on disk.
+//
+// ID 1: the shell renders the icon resource with the LOWEST id, so the app icon has to be first.
+// Generated from desk/assets/icon48x48.png (the same art makeIcon loads at runtime) at 16/24/32/48/64/
+// 128/256 so every shell context -- list view, tiles, jumbo icons, high-DPI -- has an exact size to draw.
+1 ICON "veil.ico"

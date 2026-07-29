@@ -41,6 +41,9 @@ pub fn build(b: *std.Build) void {
     exe.root_module.linkLibrary(raylib_dep.artifact("raylib"));
     // GUI subsystem on Windows release builds: no console window behind the dashboard.
     if (target.result.os.tag == .windows and optimize != .Debug) exe.subsystem = .Windows;
+    // The Windows FILE icon — same resource the merged `veil` binary embeds (see the root build.zig), so a
+    // standalone veil-desk.exe is branded identically wherever it sits on disk.
+    if (target.result.os.tag == .windows) exe.root_module.addWin32ResourceFile(.{ .file = b.path("assets/veil.rc") });
     // Per-function/data sections + --gc-sections: let the linker drop code and constants nothing reaches.
     // MEASURED on this target (x86_64-windows, ReleaseSafe): exactly 0 bytes — the COFF link already drops
     // whatever these would, so do NOT expect them to offset the embedded assets here. Kept only because
