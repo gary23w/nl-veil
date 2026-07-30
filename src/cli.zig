@@ -285,7 +285,8 @@ fn growthReport(ctx: *Ctx) void {
     out("  -- growth --\n", .{});
 
     // Tools: reuse the engine's own digest (EWMA latency + fail rates; only NOTABLE tools appear).
-    if (toolperf.digest(gpa, ctx.io, ctx.data)) |d| {
+    // null filter: the operator's growth report speaks for the whole machine, not one turn's advertised belt.
+    if (toolperf.digest(gpa, ctx.io, ctx.data, null)) |d| {
         defer gpa.free(d);
         out("  tools    : {s}\n", .{d});
     } else {

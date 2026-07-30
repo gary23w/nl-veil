@@ -679,7 +679,10 @@ test "secretiveDurable + maskSecretTokens withhold key values, pass workflow fac
 }
 
 /// Render the wall-clock date as "yyyy-mm-dd" — the provenance stamp for facts a conversation globalizes.
-fn dateStamp(io: std.Io, buf: []u8) []const u8 {
+/// pub: the chat engine grounds every turn's system prompt in it — a local model has no idea what day it is
+/// and confidently invents one (observed: a 12B date-qualifying news searches with three different wrong
+/// years in one turn), which poisons every time-sensitive query it writes.
+pub fn dateStamp(io: std.Io, buf: []u8) []const u8 {
     const secs = std.Io.Timestamp.now(io, .real).toSeconds();
     if (secs <= 0) return "undated";
     const yd = (std.time.epoch.EpochSeconds{ .secs = @intCast(secs) }).getEpochDay().calculateYearDay();

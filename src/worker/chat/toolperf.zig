@@ -198,14 +198,27 @@ pub fn merge(io: std.Io, gpa: std.mem.Allocator, data: []const u8, acc: *const A
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items }) catch {};
 }
 
+/// Is `name` advertised in the caller's tools-array JSON (the engine's `turn_tools` string)? The stats file is
+/// shared across every model and tier that ever ran on this machine, so a compact-belt turn's learned lines
+/// would otherwise name tools that turn never advertised (cast, mcp_call, browser_eval — learned from
+/// big-model runs) — the recall_hive bug class, minted fresh every turn by the machine's own history.
+/// null = no filter (callers that genuinely speak for the full surface).
+fn advertised(tools_json: ?[]const u8, name: []const u8) bool {
+    const tj = tools_json orelse return true;
+    var nb: [96]u8 = undefined;
+    const needle = std.fmt.bufPrint(&nb, "\"name\":\"{s}\"", .{name}) catch return true; // unmeasurable ⇒ keep
+    return std.mem.indexOf(u8, tj, needle) != null;
+}
+
 /// BELT DIGEST — a compact per-step line ranking the tools the model can pick, RELIABLE-FIRST, by lived
 /// OUTCOME success on this machine: succ = 1 - (failed_outcomes / calls). Unlike digest() (which warns
 /// about the notably-bad, aimed at planning), the belt is the positive half — shown at the moment of
 /// choice so the option space arrives pre-weighted by history, not alphabetical. `trust_line`, when
 /// present (the neuron-db trust floor, feature-gated), is appended verbatim so earned cross-session
-/// preference rides alongside this session's raw rate. Null when too little has been learned to rank.
+/// preference rides alongside this session's raw rate. `tools_json` (the turn's advertised tools array)
+/// filters the ranking to tools this turn can actually see. Null when too little has been learned to rank.
 /// gpa-owned; caller frees.
-pub fn belt(gpa: std.mem.Allocator, io: std.Io, data: []const u8, trust_line: []const u8) ?[]u8 {
+pub fn belt(gpa: std.mem.Allocator, io: std.Io, data: []const u8, trust_line: []const u8, tools_json: ?[]const u8) ?[]u8 {
     const path = filePath(gpa, data) orelse return null;
     defer gpa.free(path);
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(FILE_CAP)) catch return null;
@@ -218,6 +231,7 @@ pub fn belt(gpa: std.mem.Allocator, io: std.Io, data: []const u8, trust_line: []
     var ni: usize = 0;
     for (parsed.value.tools) |t| {
         if (ni >= MAX_TOOLS or t.name.len == 0 or t.n < MIN_SAMPLES) continue;
+        if (!advertised(tools_json, t.name)) continue; // never rank a tool this turn can't call by that name
         const succ: u64 = 1000 - (@as(u64, t.b) * 1000) / @max(1, t.n);
         items[ni] = .{ .name = t.name, .succ = succ, .n = t.n };
         ni += 1;
@@ -251,7 +265,8 @@ pub fn belt(gpa: std.mem.Allocator, io: std.Io, data: []const u8, trust_line: []
 /// A compact prompt line naming the NOTABLE tools (slow or flaky, with enough samples) learned on this
 /// machine — or null when nothing is worth saying. gpa-owned; caller frees. Deterministic ordering (worst
 /// first: highest fail rate, then slowest) so the line is stable across turns when the data hasn't moved.
-pub fn digest(gpa: std.mem.Allocator, io: std.Io, data: []const u8) ?[]u8 {
+/// `tools_json` filters to the turn's advertised belt, same contract as belt().
+pub fn digest(gpa: std.mem.Allocator, io: std.Io, data: []const u8, tools_json: ?[]const u8) ?[]u8 {
     const path = filePath(gpa, data) orelse return null;
     defer gpa.free(path);
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(FILE_CAP)) catch return null;
@@ -265,6 +280,7 @@ pub fn digest(gpa: std.mem.Allocator, io: std.Io, data: []const u8) ?[]u8 {
     var ni: usize = 0;
     for (parsed.value.tools) |t| {
         if (ni >= MAX_TOOLS or t.name.len == 0 or t.n < MIN_SAMPLES) continue;
+        if (!advertised(tools_json, t.name)) continue; // a warning about an uncallable tool is pure noise
         const fail_pct: u64 = if (t.n > 0) (@as(u64, t.f) * 100) / t.n else 0;
         if (t.ms < NOTABLE_SLOW_MS and fail_pct < NOTABLE_FAIL_PCT) continue;
         items[ni] = .{ .name = t.name, .n = t.n, .f = t.f, .ms = t.ms, .fail_pct = fail_pct };
@@ -363,7 +379,7 @@ test "belt ranks tools reliable-first by lived outcome success, and folds in a t
         \\{"name":"read_file","n":10,"f":0,"b":1,"ms":40}
         \\]}
     }) catch unreachable;
-    const b = belt(ag, io, dir, "trust: files > python").?;
+    const b = belt(ag, io, dir, "trust: files > python", null).?;
     // write_file (100%) ranks before read_file (90%) before run_python (40%)
     const wf = std.mem.indexOf(u8, b, "write_file").?;
     const rf = std.mem.indexOf(u8, b, "read_file").?;
@@ -371,6 +387,14 @@ test "belt ranks tools reliable-first by lived outcome success, and folds in a t
     try std.testing.expect(wf < rf and rf < rp);
     try std.testing.expect(std.mem.indexOf(u8, b, "run_python 40%") != null);
     try std.testing.expect(std.mem.indexOf(u8, b, "trust: files > python") != null);
+
+    // the advertised filter: a belt built for a turn that advertises only two of the three drops the third —
+    // the stats file spans every model that ever ran here, the ranking must not (recall_hive bug class)
+    const filtered = belt(ag, io, dir, "", "{\"name\":\"write_file\"},{\"name\":\"read_file\"}").?;
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "write_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, filtered, "run_python") == null);
+    // filtering below two ranked tools yields nothing at all (nothing to rank against)
+    try std.testing.expect(belt(ag, io, dir, "", "{\"name\":\"write_file\"}") == null);
 }
 
 test "digest names slow and flaky tools, skips fast/reliable and low-sample ones" {
