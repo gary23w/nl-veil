@@ -745,6 +745,23 @@ test "canonToolMatch: re-cased real names resolve uniquely; phantoms and ambigui
     try std.testing.expect(!toolNameEqLoose("read_file", "read_files"));
 }
 
+test "looksLikeNotFound: 404 pages flag; real content, big pages, and mid-article mentions don't" {
+    // the observed arXiv shapes — a guessed paper id and a malformed pdf URL
+    try std.testing.expect(looksLikeNotFound("Not found  ![](https://static.arxiv.org/...smileybones...) arXiv is now an independent nonprofit!"));
+    try std.testing.expect(looksLikeNotFound("| arXiv e-print repository  # No document for '2312.17986v2'  Please inform help@arxiv.org"));
+    try std.testing.expect(looksLikeNotFound("<html><title>404 Not Found</title><body>nginx</body></html>"));
+    // "not found" buried mid-article is vocabulary, not a verdict — the lead window misses it on purpose
+    try std.testing.expect(!looksLikeNotFound("The survey covers methods where a solution was not found by classical solvers, including QAOA variants and their scaling behavior on NISQ hardware in recent benchmarks and more text making this clearly an article."));
+    try std.testing.expect(!looksLikeNotFound(""));
+    // a big body is content no matter what its first bytes say
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, 20000);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    @memcpy(big[0.."Not found".len], "Not found");
+    try std.testing.expect(!looksLikeNotFound(big));
+}
+
 test "looksLikeBotChallenge: challenge stubs flag; real content and big pages don't" {
     try std.testing.expect(looksLikeBotChallenge("<html><head><title>Just a moment...</title></head></html>"));
     try std.testing.expect(looksLikeBotChallenge("<html lang=\"en\"><head><title>reuters.com</title><style>#cmsg{animation: A 1.5s;}</style>"));
@@ -1834,6 +1851,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // The successful reference run used 14 calls; 60 is generous headroom for real research.
     var tools_spent: usize = 0;
     var no_ack_streak: u32 = 0; // turn-scoped client-absence evidence — see delegateTool / CLIENT_GONE_AFTER
+    var dud_fetches: u32 = 0; // turn-scoped guessed-URL spiral evidence — see looksLikeNotFound / DUD_FETCH_STREAK
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
@@ -1946,7 +1964,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &dud_fetches, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -5207,6 +5225,30 @@ fn canonToolMatch(turn_tools: []const u8, name: []const u8) ?[]const u8 {
     return found;
 }
 
+/// Does a fetched body look like a not-found/error page rather than content? The observed spiral: a small
+/// model INVENTS a plausible URL (an arXiv id that never existed), the 404 page comes back as ordinary bytes,
+/// and it pivots to the next guessed URL — burning the turn on fabricated citations. Conservative window:
+/// "not found" must sit in the first bytes (error pages lead with it; articles don't), the explicit phrases
+/// may sit anywhere in the head, and a big body is content no matter what it contains.
+fn looksLikeNotFound(body: []const u8) bool {
+    if (body.len == 0 or body.len > 16384) return false;
+    const head = body[0..@min(body.len, 1024)];
+    // 32 bytes, not more: error pages OPEN with the verdict ("Not found …", "<title>404 Not Found"), while
+    // prose reaches "not found" mid-sentence — at 96 bytes an article's "a solution was not found by…"
+    // false-positived in the regression test, which is exactly the page this must never eat.
+    var lead: [32]u8 = undefined;
+    const n = @min(body.len, lead.len);
+    for (body[0..n], 0..) |ch, i| lead[i] = std.ascii.toLower(ch);
+    if (std.mem.indexOf(u8, lead[0..n], "not found") != null) return true;
+    const markers = [_][]const u8{ "Page not found", "404 Not Found", "No document for", "Error 404", "page you requested does not exist", "couldn't find that page" };
+    for (markers) |mk| if (std.mem.indexOf(u8, head, mk) != null) return true;
+    return false;
+}
+
+/// Consecutive dud fetches (not-found or bot-challenge pages) that prove the model is GUESSING URLs. Three in
+/// a row earns the stop-constructing-URLs instruction on the result; one good fetch resets the streak.
+const DUD_FETCH_STREAK = 3;
+
 /// Does a fetched body look like a bot-check interstitial rather than the page? Conservative on purpose: the
 /// markers are the stub pages' own words, checked only in the HEAD of a SMALL body — a real article that merely
 /// mentions Cloudflare is big and keeps its first bytes for itself. False negative = today's behavior; false
@@ -5730,6 +5772,9 @@ fn runInnerAgentic(
     // reaches CLIENT_GONE_AFTER, delegateTool answers the turn's remaining client calls instantly instead of
     // re-paying the ack timeout per call. Turn-scoped so a reconnected desk gets a fresh probe next turn.
     no_ack_streak: *u32,
+    // TURN-scoped consecutive dud fetches (not-found / bot-challenge pages) — the guessed-URL spiral counter;
+    // see DUD_FETCH_STREAK at looksLikeNotFound. Owned by runTurn so the streak survives drive steps.
+    dud_fetches: *u32,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
     tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
     // REPEAT-CALL GUARDS, both TURN-scoped (owned by the drive loop — pass-local state forgot every repeat
@@ -6109,17 +6154,34 @@ fn runInnerAgentic(
                     result = noted;
                 } else |_| {}
             }
-            // BOT-CHALLENGE HONESTY: a blocked site answers a fetch with a small interstitial ("Just a
-            // moment…", a PerimeterX/Cloudflare stub) — REAL bytes that are not the page. A frontier model
-            // shrugs; a small model reads it as content, or retries the same URL forever (observed live: a
-            // Reuters challenge stub rode into a research answer as if it were the article). Replace the stub
-            // with an honest instruction + a short head as evidence; prepended '(' deliberately keeps the
-            // challenge HTML out of the memory weave (the observe gate drops '('-leading results).
-            if (looksLikeBotChallenge(result) and (std.mem.eql(u8, name_fixed orelse c.name, "web_fetch") or std.mem.eql(u8, name_fixed orelse c.name, "read_url"))) {
-                if (std.fmt.allocPrint(gpa, "(this is a BOT-CHECK page, not the article — the site blocked automated fetching. Do NOT treat it as content and do NOT retry this URL; use web_search or a different source. First bytes, as evidence:)\n{s}", .{clipBytes(result, 400)})) |noted| {
-                    gpa.free(result);
-                    result = noted;
-                } else |_| {}
+            // BOT-CHALLENGE + NOT-FOUND HONESTY: a blocked site answers a fetch with a small interstitial
+            // ("Just a moment…", a PerimeterX/Cloudflare stub) and a guessed URL answers with a 404 page —
+            // REAL bytes that are not the page. A frontier model shrugs; a small model reads them as content,
+            // or pivots to the next INVENTED URL forever (observed live: a 12B burned a research turn on
+            // fabricated arXiv ids, each "Not found" page arriving as ordinary bytes). Replace the stub with
+            // an honest instruction; prepended '(' deliberately keeps the junk out of the memory weave (the
+            // observe gate drops '('-leading results). Three consecutive duds earn the stop-guessing order —
+            // the counter is turn-scoped and one real page resets it.
+            if (std.mem.eql(u8, name_fixed orelse c.name, "web_fetch") or std.mem.eql(u8, name_fixed orelse c.name, "read_url")) {
+                const challenge = looksLikeBotChallenge(result);
+                const notfound = !challenge and looksLikeNotFound(result);
+                if (challenge or notfound) {
+                    dud_fetches.* += 1;
+                    const why: []const u8 = if (challenge)
+                        "(this is a BOT-CHECK page, not the article — the site blocked automated fetching. Do NOT treat it as content and do NOT retry this URL; use web_search or a different source."
+                    else
+                        "(this URL answered NOT FOUND — the page does not exist. Do NOT cite it and do NOT construct another URL by pattern; a URL you didn't copy verbatim from a search result or page above is a guess.";
+                    const extra: []const u8 = if (dud_fetches.* >= DUD_FETCH_STREAK)
+                        " This is the THIRD dead fetch in a row: STOP fetching entirely until a search result above hands you a real URL — search differently, or answer from what you already have."
+                    else
+                        "";
+                    if (std.fmt.allocPrint(gpa, "{s}{s} First bytes, as evidence:)\n{s}", .{ why, extra, clipBytes(result, 400) })) |noted| {
+                        gpa.free(result);
+                        result = noted;
+                    } else |_| {}
+                } else if (result.len > 0 and result[0] != '(') {
+                    dud_fetches.* = 0; // a real page — the model is fetching URLs that exist again
+                }
             }
             if (new_query.len > 0 and result.len > 0) {
                 if (std.fmt.allocPrint(gpa, "{s}\n(engine: this searched \"{s}\" — a focused rewrite of the query you gave, aimed at the same intent.)", .{ result, new_query })) |noted| {
@@ -6149,8 +6211,20 @@ fn runInnerAgentic(
                     }
                 } else if (th == fail_streak_tool) fail_streak = 0;
                 if (outcome_bad and fail_streak == 2 and result.len > 0) {
-                    // STREAK 2 — the cheap generic nudge: name the option space, no LLM cost.
-                    const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak }) catch result;
+                    // STREAK 2 — the cheap generic nudge: name the option space, no LLM cost. TWO texts,
+                    // tier-paired with the belt like the system prompt: the full option space names poll /
+                    // recall_hive / open_subchat / cast, none of which a compact turn advertises — and this
+                    // nudge is served at the exact moment a struggling small model is hunting for ANY new
+                    // verb to try (observed live: it landed right after the dud-fetch escalation and offered
+                    // a 12B four tools its belt hides).
+                    // ADVERTISED check, not knownToolName: the latter falls back to the static full-schema
+                    // tables, which is precisely how compact turns still execute "cast" — here the question
+                    // is what this turn's belt SHOWS, so only the tools-array needle answers it.
+                    const option_space: []const u8 = if (std.mem.indexOf(u8, turn_tools, "\"name\":\"cast\"") != null)
+                        "files: write_file/edit_file/read_file/list_dir; waiting or watching anything: poll; web: web_fetch/read_url/fetch_json; stored docs: read_doc/recall_hive; a side-thread: open_subchat; a team: cast"
+                    else
+                        "files: write_file/edit_file/read_file/list_dir; web: web_search/web_fetch/read_url/fetch_json; run code: run_python/run_tests; stored docs: read_doc; memory: recall";
+                    const nudged = std.fmt.allocPrint(gpa, "{s}\n(engine: {s} has produced a FAILED outcome {d} times in a row. STOP and weigh your options before the next call. Is there a dedicated tool for this job — {s}? Pick the SIMPLEST tool that does it, or fix the exact error shown above — never re-run the same approach unchanged.)", .{ result, c.name, fail_streak, option_space }) catch result;
                     if (nudged.ptr != result.ptr) {
                         gpa.free(result);
                         result = nudged;
