@@ -244,6 +244,66 @@ pub fn sandboxAllowed(name: []const u8) bool {
     return false;
 }
 
+/// The tool belt a SMALL-tier model is shown (modelcfg.Tier.small — ≤24B params, or a ≤15k window). Not a
+/// permission list: `execute` still dispatches every name in SCHEMA, so a small model that names a dropped
+/// tool from memory still runs it. This is purely about how much surface it must REASON over.
+///
+/// WHY: a chat turn advertised all 49 tools to every model — 35 KB of schema against 11 KB of actual
+/// conversation, ~75% of the request, re-sent on every inference. A frontier model shrugs that off; a 12B
+/// model drowns in it. Observed live on a 12B: asked for the weather it invented `WebSearch` (the real name is
+/// `web_search`) and a `Gemma4__1m_check` tool, and when told to use the browser it reached for
+/// `mcp_call{server:"google-search"}` and `mcp_discover` — twice — while `browser_navigate` sat in the same
+/// list. Every drop below is one fewer decoy between the model and the verb it wanted.
+///
+/// The keep-set is the solo-chat core: research, files, code, memory, the four load-bearing browser verbs.
+/// The drops fall in four groups — (1) multi-agent orchestration a solo small model cannot drive (cast,
+/// steer_swarm, answer_swarm, swarm_*, open_subchat, sync_dir, stage_file, absorb, poll); (2) advanced twins
+/// of a verb already in the belt (browser_type_text, browser_click_at, browser_key, browser_scroll,
+/// browser_console, browser_network, browser_eval, browser_close, pixel_capture, pixel_ingest, recall_hive);
+/// (3) the MCP pair, empirically the top hallucination magnet above; (4) scheduling + credential fetch, which
+/// need precision a small model does not have. Mid and large tiers are untouched and keep the full belt.
+const COMPACT_TOOLS = [_][]const u8{
+    // research
+    "web_search",     "web_fetch",  "read_url",   "fetch_json",
+    // files
+     "read_file",      "write_file", "edit_file",
+    "list_dir",       "delete_file",
+    // code
+      "run_python", "run_tests",  "stop_process",
+    // memory + documents (one recall verb, not two)
+    "recall",         "observe",    "read_doc",   "pixel_search",
+    // the browser, reduced to the four verbs that actually drive a page
+     "browser_navigate", "browser_read", "browser_click", "browser_type",
+};
+
+/// Is `name` in the small-tier belt? Twin of sandboxAllowed, same reason: one list, shared predicate.
+pub fn compactAllowed(name: []const u8) bool {
+    for (COMPACT_TOOLS) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
+/// The small-tier projection of a schema block — DERIVED from compactAllowed exactly as sandboxSchema is
+/// derived from sandboxAllowed (see the drift argument there; it applies verbatim). comptime-only, so the
+/// variant is a static string and picking between belts costs a turn nothing.
+pub fn compactSchema(comptime block: []const u8) []const u8 {
+    @setEvalBranchQuota(1_000_000);
+    comptime var out: []const u8 = "";
+    comptime {
+        var it = std.mem.splitScalar(u8, block, '\n');
+        while (it.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r,");
+            if (line.len == 0) continue;
+            const key = "\"name\":\"";
+            const at = std.mem.indexOf(u8, line, key) orelse continue;
+            const rest = line[at + key.len ..];
+            const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+            if (!compactAllowed(rest[0..end])) continue;
+            out = if (out.len == 0) line else out ++ ",\n" ++ line;
+        }
+    }
+    return out;
+}
+
 /// The `.sandboxed` projection of a tools-array schema block: the same comma-joined function defs with every
 /// entry the sandbox gate above would refuse dropped. DERIVED from sandboxAllowed rather than a second list of
 /// names — a hand-copied list rots silently the first time SANDBOX_TOOLS changes, and the cost of the drift is

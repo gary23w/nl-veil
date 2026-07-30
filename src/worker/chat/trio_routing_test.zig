@@ -57,6 +57,9 @@ const Role = engine.Role;
 /// what a single-model setup still runs on and must keep running on.
 const EXPECTED = [_]struct { label: []const u8, role: Role, review_gated: bool = false }{
     .{ .label = "chat", .role = .coding }, // the main agentic answer stream
+    // The empty-answer rescue: one tool-free re-ask for plain text. CODING because it finishes the answer
+    // stream's own job — same conversation, same voice — not a cheap rewrite or a fresh judgement.
+    .{ .label = "rescue", .role = .coding },
     .{ .label = "loop", .role = .prompting }, // the auto-loop self-prompt-back drive
     .{ .label = "plan", .role = .thinking },
     .{ .label = "reflect", .role = .thinking },

@@ -221,6 +221,28 @@ pub const ToolCall = struct {
     args: []u8,
 };
 
+/// A non-empty id for a tool call whose provider sent none. Ollama's NATIVE /api/chat carries no id field at
+/// all, so every local model's tool call used to flow through the engine as id="" — and the client tool bridge
+/// runs on ids: the desk answers a tool_request by POSTing /tool_result {id,…}, and that handler refuses an
+/// empty id ("tool call id required"), acks included. Observed live (conv c6a6b28c7): the desk serviced the
+/// sync_request beside the tool calls (real id) in seconds, while all 15 id="" tool calls timed out
+/// unacknowledged → "(no desk/CLI client picked up …)" — which the model believed, telling the user its tools
+/// were broken. Hosted OpenAI-style calls carry "call_…" ids, which is why only LOCAL models hit this wall.
+///
+/// Uniqueness, not secrecy: an atomic sequence (unique within the process — the splitmix64 finalizer is a
+/// bijection, so distinct seq ⇒ distinct id) salted with this global's own ASLR address (differs across
+/// processes, so a desk that remembers serviced ids can't collide with a pre-restart frame). std.crypto.random
+/// is absent in this Zig — same construction browser/cdp.zig uses for its ws mask keys.
+var call_id_seq: std.atomic.Value(u64) = .init(0);
+pub fn mintCallId(gpa: std.mem.Allocator) ![]u8 {
+    const seq = call_id_seq.fetchAdd(1, .monotonic);
+    var z: u64 = @as(u64, @intFromPtr(&call_id_seq)) ^ (seq +% 0x9E3779B97F4A7C15);
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    z ^= z >> 31;
+    return std.fmt.allocPrint(gpa, "tc{x:0>16}", .{z});
+}
+
 pub const Step = struct {
     content: []u8,
     reasoning: []u8,
@@ -504,11 +526,76 @@ fn effectiveCtx() u32 {
 // keep_alive "2m": once the worker exits, the local model is released a couple minutes later instead of
 // Ollama's 5-min default. During the run, every request resets the timer, so it stays loaded.
 const OLLAMA_KEEP_ALIVE = "2m";
+
+/// Index of the closing quote of the JSON string whose opening quote is at `open`, or null when it never
+/// closes. Escapes are honored, so a `\"` inside the value does not end it.
+fn jsonStrEnd(s: []const u8, open: usize) ?usize {
+    var i = open + 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1; // skip the escaped byte, whatever it is
+            continue;
+        }
+        if (s[i] == '"') return i;
+    }
+    return null;
+}
+
+/// Decode one `arguments` JSON-string token (quotes included) into the object text it encodes. `{}` whenever it
+/// is not a well-formed JSON OBJECT — including the truncated `{"path": "src/main.zi` a weak model emits when
+/// its call is cut off, which Ollama otherwise rejects a second way (`invalid tool call arguments`). `{}` still
+/// names the tool that ran, and the tool RESULT carries the correction the model needs. Owned.
+fn argsObjectOwned(gpa: std.mem.Allocator, token: []const u8) ![]u8 {
+    const dec = std.json.parseFromSlice([]const u8, gpa, token, .{ .allocate = .alloc_always }) catch
+        return gpa.dupe(u8, "{}");
+    defer dec.deinit();
+    const t = std.mem.trim(u8, dec.value, " \t\r\n");
+    if (t.len < 2 or t[0] != '{') return gpa.dupe(u8, "{}");
+    // parse rather than brace-count: trailing junk, a bare array, or an unbalanced tail must all read as unusable
+    const v = std.json.parseFromSlice(std.json.Value, gpa, t, .{}) catch return gpa.dupe(u8, "{}");
+    defer v.deinit();
+    if (v.value != .object) return gpa.dupe(u8, "{}");
+    return gpa.dupe(u8, t);
+}
+
+/// Ollama's NATIVE /api/chat requires `tool_calls[].function.arguments` to be a JSON **object**. Every conv
+/// buffer in this codebase is built in the OpenAI wire format, where that same field is a JSON **string** — so
+/// replaying a tool call to a LOCAL model shipped `"arguments":"{\"query\":\"…\"}"` and Ollama rejected the
+/// WHOLE request: `Value looks like object, but can't find closing '}' symbol`, in ~20ms with zero tokens
+/// evaluated. Every local-model turn therefore died on the first round that echoed a tool call back — which
+/// reads as "small models can't handle tools" when in fact the model never ran. Hosted providers take the
+/// OpenAI path, where the string form is correct, and are left untouched.
+///
+/// Returns an OWNED copy always, so callers free unconditionally.
+fn nativeToolArgs(gpa: std.mem.Allocator, messages_json: []const u8) ![]u8 {
+    const needle = "\"arguments\":\"";
+    if (std.mem.indexOf(u8, messages_json, needle) == null) return gpa.dupe(u8, messages_json);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, messages_json[i..], needle)) |rel| {
+        const at = i + rel;
+        const q = at + needle.len - 1; // the value's opening quote
+        const end = jsonStrEnd(messages_json, q) orelse break; // unterminated: ship the tail verbatim
+        try out.appendSlice(gpa, messages_json[i..at]);
+        try out.appendSlice(gpa, "\"arguments\":");
+        const obj = try argsObjectOwned(gpa, messages_json[q .. end + 1]);
+        defer gpa.free(obj);
+        try out.appendSlice(gpa, obj);
+        i = end + 1;
+    }
+    try out.appendSlice(gpa, messages_json[i..]);
+    return out.toOwnedSlice(gpa);
+}
+
 fn ollamaNativeBody(gpa: std.mem.Allocator, model: []const u8, messages_json: []const u8, tools_json: []const u8, np: u32, ctx: u32, temp_frag: []const u8) ![]u8 {
+    const msgs = try nativeToolArgs(gpa, messages_json); // OpenAI arguments-as-string → native arguments-as-object
+    defer gpa.free(msgs);
     return if (tools_json.len > 0)
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag })
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, msgs, tools_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag })
     else
-        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag });
+        std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":false,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, msgs, OLLAMA_KEEP_ALIVE, np, ctx, temp_frag });
 }
 
 /// What the caller knows about a call that the RESPONSE does not carry: which role asked for it, which model
@@ -563,7 +650,8 @@ fn parseOllamaNative(gpa: std.mem.Allocator, base_url: []const u8, raw: []const 
         for (tcs) |tc| {
             const args = std.json.Stringify.valueAlloc(gpa, tc.function.arguments, .{}) catch continue;
             calls.append(gpa, .{
-                .id = gpa.dupe(u8, "") catch {
+                // native /api/chat has no id field — mint one so the client tool bridge can match this call
+                .id = mintCallId(gpa) catch {
                     gpa.free(args);
                     continue;
                 },
@@ -1179,7 +1267,9 @@ fn completeBodyH(gpa: std.mem.Allocator, io: std.Io, run_dir: []const u8, tag: [
     if (msg.tool_calls) |tcs| {
         for (tcs) |tc| {
             calls.append(gpa, .{
-                .id = gpa.dupe(u8, tc.id) catch continue,
+                // spec-compliant providers always send an id; mint for the odd one that omits it, so the
+                // client tool bridge (which matches results BY id) never sees an unanswerable call
+                .id = (if (tc.id.len > 0) gpa.dupe(u8, tc.id) else mintCallId(gpa)) catch continue,
                 .name = gpa.dupe(u8, tc.function.name) catch continue,
                 .args = gpa.dupe(u8, tc.function.arguments) catch continue,
             }) catch {};
@@ -1600,7 +1690,8 @@ fn parseNativeToolCalls(gpa: std.mem.Allocator, raw: []const u8) []ToolCall {
     for (tcs) |tc| {
         const args = std.json.Stringify.valueAlloc(gpa, tc.function.arguments, .{}) catch continue;
         calls.append(gpa, .{
-            .id = gpa.dupe(u8, "") catch {
+            // native NDJSON carries no id either — mint, same contract as parseOllamaNative
+            .id = mintCallId(gpa) catch {
                 gpa.free(args);
                 continue;
             },
@@ -1644,7 +1735,8 @@ fn reconstructSseToolCalls(gpa: std.mem.Allocator, st: *const StreamState) []Too
             gpa.free(args);
             continue;
         };
-        const id = gpa.dupe(u8, a.id.items) catch {
+        // mint when the stream never carried an id — same bridge contract as the non-streamed paths
+        const id = (if (a.id.items.len > 0) gpa.dupe(u8, a.id.items) else mintCallId(gpa)) catch {
             gpa.free(args);
             gpa.free(name);
             continue;
@@ -1766,14 +1858,21 @@ fn streamAttempt(
     else
         effTokens(base_url, model, max_tokens);
 
+    // Ollama's native endpoint wants tool-call arguments as an OBJECT, not the OpenAI JSON string the conv
+    // buffer carries (see nativeToolArgs — sending the string form gets the request rejected outright). This is
+    // the STREAMED twin of the same rewrite; hosted requests keep the string form verbatim.
+    const native_msgs: ?[]u8 = if (native) (nativeToolArgs(gpa, messages_json) catch return null) else null;
+    defer if (native_msgs) |m| gpa.free(m);
+    const msgs = native_msgs orelse messages_json;
+
     const body = blk: {
         if (native) {
             const np: u32 = budget_tokens;
             const ctxw = effectiveCtx();
             break :blk (if (tools_json.len > 0)
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, tools_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"tools\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, msgs, tools_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })
             else
-                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, messages_json, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })) catch return null;
+                std.fmt.allocPrint(gpa, "{{\"model\":\"{s}\",\"messages\":[{s}],\"stream\":true,\"keep_alive\":\"{s}\",\"options\":{{\"num_predict\":{d},\"num_ctx\":{d}{s}}}}}", .{ model, msgs, OLLAMA_KEEP_ALIVE, np, ctxw, temp_frag })) catch return null;
         }
         const mt = budget_tokens;
         break :blk (if (tools_json.len > 0)
@@ -2163,6 +2262,22 @@ test "parseOllamaNative re-serializes an arguments OBJECT into a JSON-string Too
     try std.testing.expectEqualStrings("x.py", ap.value.object.get("path").?.string);
     try std.testing.expectEqualStrings("print(1)", ap.value.object.get("content").?.string);
     try std.testing.expectEqualStrings("I should write the file now.", step.reasoning);
+    // native calls carry NO id on the wire — one must be MINTED, never empty. The whole client tool bridge
+    // keys on it: /tool_result refuses an empty id (acks included), so an id-less call can only ever time out
+    // as "(no desk/CLI client picked up …)" — the wall that made local models' tools look broken.
+    try std.testing.expect(step.calls[0].id.len > 2);
+    try std.testing.expect(std.mem.startsWith(u8, step.calls[0].id, "tc"));
+}
+
+test "mintCallId: non-empty, tc-prefixed, and unique across calls" {
+    const gpa = std.testing.allocator;
+    const a = try mintCallId(gpa);
+    defer gpa.free(a);
+    const b = try mintCallId(gpa);
+    defer gpa.free(b);
+    try std.testing.expectEqual(@as(usize, 18), a.len); // "tc" + 16 hex chars
+    try std.testing.expect(std.mem.startsWith(u8, a, "tc"));
+    try std.testing.expect(!std.mem.eql(u8, a, b)); // two mints must never collide (random 64-bit body)
 }
 
 test "parseOllamaNative content-only (no tool call) returns text and no calls" {
@@ -2249,6 +2364,87 @@ test "ollamaNativeBody pins num_ctx in the options (titan1 truncation fix)" {
     try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"num_ctx\":32768") != null);
     try std.testing.expect(std.mem.indexOf(u8, no_tools, "\"tools\":") == null);
     try std.testing.expectEqual(@as(u32, 32768), NATIVE_CTX);
+}
+
+test "nativeToolArgs: OpenAI arguments-as-STRING becomes native arguments-as-OBJECT" {
+    const gpa = std.testing.allocator;
+
+    // the exact shape that broke every local tool turn: Ollama answered "Value looks like object, but can't
+    // find closing '}' symbol" in ~20ms with zero tokens evaluated, so the model never ran
+    const one = try nativeToolArgs(gpa,
+        \\{"role":"assistant","content":"","tool_calls":[{"id":"","type":"function","function":{"name":"web_search","arguments":"{\"query\":\"weather in Newmarket\"}"}}]}
+    );
+    defer gpa.free(one);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"arguments\":{\"query\":\"weather in Newmarket\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\\\"query\\\"") == null); // no escaped remnant survives
+    // everything around the rewrite is preserved byte-for-byte
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"name\":\"web_search\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, one, "\"id\":\"\"") != null);
+
+    // TWO calls in one assistant turn: both rewritten, the separator intact
+    const two = try nativeToolArgs(gpa,
+        \\[{"function":{"name":"a","arguments":"{\"p\":1}"}},{"function":{"name":"b","arguments":"{\"q\":[2,3]}"}}]
+    );
+    defer gpa.free(two);
+    try std.testing.expect(std.mem.indexOf(u8, two, "\"arguments\":{\"p\":1}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, two, "\"arguments\":{\"q\":[2,3]}") != null);
+
+    // a QUOTE and BRACES inside an argument value decode correctly (the string is not brace-counted)
+    const quoted = try nativeToolArgs(gpa,
+        \\{"function":{"name":"run","arguments":"{\"cmd\":\"echo \\\"hi {x}\\\"\"}"}}
+    );
+    defer gpa.free(quoted);
+    try std.testing.expect(std.mem.indexOf(u8, quoted, "\"arguments\":{\"cmd\":\"echo \\\"hi {x}\\\"\"}") != null);
+
+    // nothing to do: no tool call in the buffer ⇒ an exact copy
+    const plain = try nativeToolArgs(gpa, "{\"role\":\"user\",\"content\":\"hi\"}");
+    defer gpa.free(plain);
+    try std.testing.expectEqualStrings("{\"role\":\"user\",\"content\":\"hi\"}", plain);
+
+    // a user message QUOTING the wire format must not be rewritten — inside a JSON string the quotes are
+    // escaped, so the key needle cannot match it
+    const quoting = try nativeToolArgs(gpa, "{\"role\":\"user\",\"content\":\"why is \\\"arguments\\\":\\\"{}\\\" wrong?\"}");
+    defer gpa.free(quoting);
+    try std.testing.expectEqualStrings("{\"role\":\"user\",\"content\":\"why is \\\"arguments\\\":\\\"{}\\\" wrong?\"}", quoting);
+}
+
+test "nativeToolArgs: unusable arguments degrade to {} instead of sinking the request" {
+    const gpa = std.testing.allocator;
+
+    // a weak model's call cut off mid-JSON — Ollama rejects this shape too ("invalid tool call arguments")
+    const cut = try nativeToolArgs(gpa,
+        \\{"function":{"name":"read_file","arguments":"{\"path\": \"src/main.zi"}}
+    );
+    defer gpa.free(cut);
+    try std.testing.expect(std.mem.indexOf(u8, cut, "\"arguments\":{}") != null);
+
+    for ([_][]const u8{
+        \\{"function":{"arguments":""}}
+    ,
+        \\{"function":{"arguments":"path=src"}}
+    ,
+        \\{"function":{"arguments":"[1,2]"}}
+    ,
+        \\{"function":{"arguments":"{\"a\":1} trailing junk"}}
+    }) |src| {
+        const got = try nativeToolArgs(gpa, src);
+        defer gpa.free(got);
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"arguments\":{}") != null);
+    }
+
+    // an empty object is already valid and passes through unchanged
+    const empty_obj = try nativeToolArgs(gpa,
+        \\{"function":{"arguments":"{}"}}
+    );
+    defer gpa.free(empty_obj);
+    try std.testing.expectEqualStrings("{\"function\":{\"arguments\":{}}}", empty_obj);
+}
+
+test "jsonStrEnd: escapes do not terminate the string" {
+    try std.testing.expectEqual(@as(?usize, 2), jsonStrEnd("\"a\"", 0));
+    try std.testing.expectEqual(@as(?usize, 5), jsonStrEnd("\"a\\\"b\"x", 0)); // "a\"b" — the escaped quote is skipped
+    try std.testing.expectEqual(@as(?usize, null), jsonStrEnd("\"unterminated", 0));
+    try std.testing.expectEqual(@as(?usize, null), jsonStrEnd("\"ends with an escape\\", 0));
 }
 
 test "effectiveCtx: the probed model maximum bounds num_ctx; unprobed keeps the engine budget" {
