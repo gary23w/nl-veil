@@ -5441,7 +5441,13 @@ fn webSearch(ctx: *ToolCtx, args_json: []const u8) []u8 {
         if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (checked first; live web backends are unavailable right now):\n{s}", .{clip(local.items, 3600)}) catch dupe(gpa, "local");
         return dupe(gpa, "(no results: all search backends unavailable — try again later)");
     }
-    if (local.items.len > 0) return std.fmt.allocPrint(gpa, "LOCAL RAG (nl-rag + hive) — checked first, prefer these when they answer:\n{s}\n\n--- WEB RESULTS ---\n{s}", .{ clip(local.items, 1600), clip(web, 3200) }) catch dupe(gpa, clip(web, 4000));
+    // Prepend local hits ONLY when they actually cover this query — the same bar the short-circuit uses.
+    // assoc() is spreading activation: it returns SOMETHING for nearly any query, and unfiltered that
+    // something was observed live as FICTION from an ingested novel (matched on the word "papers"), glued
+    // ahead of the real web results with "prefer these when they answer". A frontier model shrugs; a small
+    // model takes the instruction at face value and reasons from a novel. Off-topic hits are dropped, not
+    // demoted — the RAG-first policy is the CHECK (which still always runs), not the exhibit.
+    if (local.items.len > 0 and localCoversQuery(local.items, query)) return std.fmt.allocPrint(gpa, "LOCAL RAG (nl-rag + hive) — checked first, prefer these when they answer:\n{s}\n\n--- WEB RESULTS ---\n{s}", .{ clip(local.items, 1600), clip(web, 3200) }) catch dupe(gpa, clip(web, 4000));
     return dupe(gpa, clip(web, 4000));
 }
 
@@ -7167,4 +7173,15 @@ test "poll file: an already-present pattern matches on the first sample, tail in
     const sw = pollTool(&ctx, "{\"kind\":\"swarm\",\"timeout_s\":1,\"interval_s\":1}");
     try std.testing.expect(std.mem.indexOf(u8, sw, "-> timeout") != null);
     try std.testing.expect(std.mem.indexOf(u8, sw, "call poll again") != null);
+}
+
+test "localCoversQuery gates the RAG prepend: on-topic passes, fiction matched on one word fails" {
+    // the live failure: a quantum-computing query pulled a NOVEL from the hive via the word "papers", and the
+    // old prepend branch glued it ahead of the web results with "prefer these when they answer"
+    const fiction = "but as the light from the window fell upon him as he picked up the papers, the face that smiled";
+    const query = "quantum machine learning inference review survey research arXiv papers";
+    try std.testing.expect(!localCoversQuery(fiction, query));
+    // genuinely on-topic hits still pass — the RAG-first policy keeps its exhibit when it has earned it
+    const on_topic = "quantum inference on variational circuits scales with qubit count; machine learning hybrids train the ansatz classically; see the arXiv survey papers";
+    try std.testing.expect(localCoversQuery(on_topic, query));
 }
