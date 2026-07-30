@@ -382,6 +382,38 @@ const TURN_TOOLS_SANDBOXED = blk: {
     break :blk out;
 };
 
+/// Comma-join the non-empty projections into one tools array. A projection CAN come back empty — the compact
+/// belt drops every orchestration verb, so tools.compactSchema(ORCH_TOOLS) is "" — and a blind `++ ",\n" ++`
+/// would then emit a leading or doubled comma and hand the provider a malformed tools array.
+fn joinDefs(comptime parts: []const []const u8) []const u8 {
+    comptime var out: []const u8 = "";
+    inline for (parts) |p| {
+        if (p.len == 0) continue;
+        out = if (out.len == 0) p else out ++ ",\n" ++ p;
+    }
+    return out;
+}
+
+/// The SMALL-tier projections (modelcfg.Tier.small — ≤24B, or a ≤15k window): the two CAPS variants with
+/// tools.compactSchema applied. See tools.COMPACT_TOOLS for exactly what drops and the live 12B evidence for
+/// why. Two more comptime strings cost a turn nothing, and the pick stays a pure function of (caps, tier) —
+/// both turn-stable — so the tools array is still byte-identical across the turn's inferences and the
+/// prompt-prefix cache keeps hitting, exactly as the note on TURN_TOOLS_FULL requires.
+///
+/// This does NOT remove capability: execute() dispatches the full SCHEMA regardless, so a small model that
+/// names a dropped tool from memory still runs it (knownToolName relies on that).
+const TURN_TOOLS_COMPACT = joinDefs(&.{
+    tools.compactSchema(tools.CHAT_SCHEMA),
+    tools.compactSchema(ORCH_TOOLS),
+    tools.compactSchema(EXTRA_TOOLS),
+});
+
+const TURN_TOOLS_SANDBOXED_COMPACT = joinDefs(&.{
+    tools.compactSchema(tools.sandboxSchema(tools.CHAT_SCHEMA)),
+    tools.compactSchema(tools.sandboxSchema(ORCH_TOOLS)),
+    tools.compactSchema(tools.sandboxSchema(EXTRA_TOOLS)),
+});
+
 /// Resolve THIS turn's granted recipe set (I3): for an admin (.full) the whole registry; for a sandboxed
 /// caller the registry ∩ the user's tool_grants. Called ONCE per turn (turn-stable), so the granted tools'
 /// advertised schemas do not vary with message content — same prefix-cache discipline the two static
@@ -415,8 +447,11 @@ fn resolveGrants(app: *App, uid: u64, is_admin: bool, gpa: std.mem.Allocator) []
 /// turn (grants don't vary with message content), so it never re-bills the prompt-prefix cache. Returns the
 /// static base verbatim (borrowed, do not free) when there are no grants; otherwise a gpa-owned buffer the
 /// caller frees. `owned` receives the allocation to free, or stays null for the borrowed-base path.
-fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, owned: *?[]u8) []const u8 {
-    const base: []const u8 = if (ctx.caps == .sandboxed) TURN_TOOLS_SANDBOXED else TURN_TOOLS_FULL;
+fn buildTurnTools(gpa: std.mem.Allocator, ctx: *const tools.ToolCtx, compact: bool, owned: *?[]u8) []const u8 {
+    const base: []const u8 = if (ctx.caps == .sandboxed)
+        (if (compact) TURN_TOOLS_SANDBOXED_COMPACT else TURN_TOOLS_SANDBOXED)
+    else
+        (if (compact) TURN_TOOLS_COMPACT else TURN_TOOLS_FULL);
     if (ctx.grants.len == 0) return base; // common case: no grants ⇒ the exact static string, zero allocation
     var b: std.ArrayListUnmanaged(u8) = .empty;
     b.appendSlice(gpa, base) catch {
@@ -587,6 +622,88 @@ test "turn tools: both caps variants are valid JSON arrays, and the sandboxed on
     try std.testing.expect(TURN_TOOLS_SANDBOXED.len < TURN_TOOLS_FULL.len);
 }
 
+test "compact belt: valid JSON, materially smaller, keeps the core verbs and drops the decoys" {
+    const gpa = std.testing.allocator;
+
+    // both compact variants must still be a well-formed tools array — joinDefs exists because an empty
+    // projection (compactSchema(ORCH_TOOLS) is empty: every orchestration verb drops) would otherwise splice a
+    // leading or doubled comma and hand the provider a malformed array
+    inline for (.{ TURN_TOOLS_COMPACT, TURN_TOOLS_SANDBOXED_COMPACT }) |variant| {
+        const arr = try std.fmt.allocPrint(gpa, "[{s}]", .{variant});
+        defer gpa.free(arr);
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, arr, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value == .array);
+        try std.testing.expect(parsed.value.array.items.len > 0);
+    }
+
+    // THE POINT: a 12B model was being handed 49 defs / ~35KB, three quarters of the whole request. Less than
+    // half the bytes is the floor worth asserting — if a future edit re-adds the world to the small belt, this
+    // fails rather than silently regressing every local turn.
+    try std.testing.expect(TURN_TOOLS_COMPACT.len * 2 < TURN_TOOLS_FULL.len);
+
+    // the core belt survives: research, files, code, memory, and the four browser verbs that drive a page
+    for ([_][]const u8{
+        "\"web_search\"", "\"web_fetch\"",       "\"read_file\"",   "\"write_file\"",    "\"edit_file\"",
+        "\"list_dir\"",   "\"run_python\"",      "\"run_tests\"",   "\"recall\"",        "\"observe\"",
+        "\"read_doc\"",   "\"browser_navigate\"", "\"browser_read\"", "\"browser_click\"", "\"browser_type\"",
+    }) |keep| {
+        if (std.mem.indexOf(u8, TURN_TOOLS_COMPACT, keep) == null) {
+            std.debug.print("\ncompact belt lost {s} — that is core solo-chat capability, not a decoy\n", .{keep});
+            return error.CompactDroppedCoreVerb;
+        }
+    }
+
+    // and the decoys are gone. mcp_call/mcp_discover lead this list on evidence: a 12B asked to "use the web
+    // browser" reached for them twice while browser_navigate sat in the same array.
+    for ([_][]const u8{
+        "\"mcp_call\"", "\"mcp_discover\"",  "\"cast\"",        "\"steer_swarm\"", "\"open_subchat\"",
+        "\"absorb\"",   "\"schedule_task\"", "\"browser_eval\"", "\"browser_key\"", "\"recall_hive\"",
+    }) |gone| {
+        if (std.mem.indexOf(u8, TURN_TOOLS_COMPACT, gone) != null) {
+            std.debug.print("\ncompact belt still advertises {s} — every extra def is surface a small model has to rule out\n", .{gone});
+            return error.CompactKeptDecoy;
+        }
+    }
+
+    // dropping from the BELT must not drop from the full variant — mid/large turns are untouched
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_FULL, "\"mcp_call\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TURN_TOOLS_FULL, "\"browser_eval\"") != null);
+
+    // the belt is a REASONING aid, not a permission boundary: a dropped-but-real tool must still be dispatchable,
+    // or hiding it would silently remove capability the model may still name from memory
+    try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "browser_eval"));
+    try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "cast"));
+}
+
+test "knownToolName + unknownToolResult: an invented name is refused with the real belt, never delegated" {
+    const gpa = std.testing.allocator;
+
+    // the three names a 12B actually invented in the "good morning gemma" conversation
+    for ([_][]const u8{ "WebSearch", "Gemma4__1m_check", "Gemma2_7B_Instruct", "" }) |bad|
+        try std.testing.expect(!knownToolName(TURN_TOOLS_COMPACT, bad));
+
+    // real names resolve, whether advertised this turn or only dispatchable
+    for ([_][]const u8{ "web_search", "read_file", "browser_navigate" }) |good|
+        try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, good));
+
+    // a name too long to even build a needle for is NOT refused — an unmeasurable case must never become a
+    // refusal, since the dispatcher below would have handled it
+    const huge = "x" ** 400;
+    try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, huge));
+
+    // the correction names the offender, says nothing ran, and lists real tools — the model must not be able to
+    // read it as a transport failure, which is the misreading that ended the observed turn
+    const msg = unknownToolResult(gpa, "WebSearch", TURN_TOOLS_COMPACT);
+    defer gpa.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "WebSearch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "nothing ran") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "web_search") != null); // the real name it meant
+    try std.testing.expect(std.mem.indexOf(u8, msg, "read_file") != null);
+    // it must NOT sound like the bridge died — that is the whole failure this replaces
+    try std.testing.expect(std.mem.indexOf(u8, msg, "disconnected") == null);
+}
+
 test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
     // WHY THIS TEST EXISTS: buildTurnTools' header promises the tools block is "turn-stable and
     // byte-identical across every inference of the turn, so it never re-bills the prompt-prefix
@@ -625,15 +742,26 @@ test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
     // `owned` stays null so the caller frees nothing. A cost claim, counted rather than timed.
     {
         var owned: ?[]u8 = null;
-        const got = buildTurnTools(gpa, &ctx, &owned);
+        const got = buildTurnTools(gpa, &ctx, false, &owned);
         try std.testing.expect(owned == null);
         try std.testing.expect(got.ptr == TURN_TOOLS_FULL.ptr);
+    }
+    // SMALL-tier belt: same zero-allocation static-pointer path, a DIFFERENT and smaller array. Asserted
+    // because buildTurnTools' contract is "a pure function of (caps, tier)" — if the compact path ever started
+    // allocating, or quietly fell through to FULL, both the prefix-cache promise and the point of the belt
+    // would go with it.
+    {
+        var owned: ?[]u8 = null;
+        const got = buildTurnTools(gpa, &ctx, true, &owned);
+        try std.testing.expect(owned == null);
+        try std.testing.expect(got.ptr == TURN_TOOLS_COMPACT.ptr);
+        try std.testing.expect(got.len < TURN_TOOLS_FULL.len);
     }
     // caps, and nothing else, picks the base.
     {
         ctx.caps = .sandboxed;
         var owned: ?[]u8 = null;
-        const got = buildTurnTools(gpa, &ctx, &owned);
+        const got = buildTurnTools(gpa, &ctx, false, &owned);
         try std.testing.expect(owned == null);
         try std.testing.expect(got.ptr == TURN_TOOLS_SANDBOXED.ptr);
         ctx.caps = .full;
@@ -647,7 +775,7 @@ test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
     ctx.grants = &grants;
 
     var owned1: ?[]u8 = null;
-    const a = buildTurnTools(gpa, &ctx, &owned1);
+    const a = buildTurnTools(gpa, &ctx, false, &owned1);
     defer if (owned1) |o| gpa.free(o);
     try std.testing.expect(owned1 != null); // now the caller DOES own it — the free contract flips
     try std.testing.expect(std.mem.startsWith(u8, a, TURN_TOOLS_FULL));
@@ -656,7 +784,7 @@ test "buildTurnTools: grants extend the cached prefix, they never rewrite it" {
     // Same grants twice ⇒ the same bytes. Any nondeterminism — map iteration order, a pointer or a
     // timestamp reaching the schema — would miss the cache on every inference after the first.
     var owned2: ?[]u8 = null;
-    const b = buildTurnTools(gpa, &ctx, &owned2);
+    const b = buildTurnTools(gpa, &ctx, false, &owned2);
     defer if (owned2) |o| gpa.free(o);
     try std.testing.expectEqualStrings(a, b);
 }
@@ -1175,7 +1303,14 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // runInnerAgentic so every drive pass sends the SAME bytes.
     var turn_tools_owned: ?[]u8 = null;
     defer if (turn_tools_owned) |t| gpa.free(t);
-    var turn_tools = buildTurnTools(gpa, &ctx, &turn_tools_owned);
+    // SMALL-tier models get the compact belt (tools.COMPACT_TOOLS): 49 tool defs — 35 KB, ~75% of the request —
+    // is surface a 12B model cannot pick through, and it demonstrably reached for invented and irrelevant tools
+    // instead of the one it needed. Keyed on this turn's CODING model (the role that actually emits tool calls)
+    // and on nothing that varies with message content, so the array stays turn-stable and prefix-cache safe.
+    const tier_local = std.mem.indexOf(u8, trio.coding.base_url, "127.0.0.1") != null or
+        std.mem.indexOf(u8, trio.coding.base_url, "localhost") != null;
+    const compact_belt = modelcfg.senseModel(trio.coding.model, tier_local).tier == .small;
+    var turn_tools = buildTurnTools(gpa, &ctx, compact_belt, &turn_tools_owned);
     // PLUGIN TOOLS: advertise every loaded plugin's tools (plug_<name>_<tool>) after the built-ins + grants.
     // reg.schemas is registry-stable and already ",\n"-prefixed, so it splices cleanly into the tools array
     // and stays byte-identical across the turn's inferences — the same prefix-cache discipline buildTurnTools
@@ -1436,6 +1571,19 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
             const fresh = planTask(app, llm_dir, think.base_url, think.key, think.model, user_text, ev.items, &brief);
             if (fresh.len > 0) {
+                // SMALL-tier turns keep every subtask INLINE. A hive route hands a small model the hardest
+                // orchestration surface there is — observed live on a 12B: the plan said "(hive)", the drive
+                // hint said "`cast` a swarm and steer it", and the model burned four rounds on cast /
+                // swarm_status / open_subchat (flubbing the args) instead of just writing the weather script
+                // it was asked for. One choke point, right where the plan is adopted: everything downstream
+                // (status lines, subtask hints, cast recording) then already sees inline.
+                if (compact_belt) for (fresh) |*t| {
+                    if (std.mem.eql(u8, t.route, cplan.ROUTE_HIVE)) {
+                        const nr = gpa.dupe(u8, cplan.ROUTE_INLINE) catch continue; // OOM: keep the old route
+                        gpa.free(t.route);
+                        t.route = nr;
+                    }
+                };
                 persistPlan(app, conv_dir, fresh);
                 persistBrief(app, conv_dir, brief);
                 emitPlanMessage(app, conv_dir, fresh);
@@ -1570,6 +1718,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // the budget, every further tool call is answered with "finalize NOW", which drives the model to settle.
     // The successful reference run used 14 calls; 60 is generous headroom for real research.
     var tools_spent: usize = 0;
+    var no_ack_streak: u32 = 0; // turn-scoped client-absence evidence — see delegateTool / CLIENT_GONE_AFTER
     const tool_budget: usize = if (schedTaskOf(conv) != null) 60 else std.math.maxInt(usize);
     // TOOL-ECHO GUARD + network repeat ledger, at TURN scope. Both used to live inside the inner agentic
     // pass, which is re-entered on EVERY drive step — so the guards forgot all repeats each step, and a
@@ -1682,7 +1831,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
 
         // Run one agentic tool pass to a SETTLED (no-tool-call) answer.
         const mut_before = file_ledger.mutations;
-        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
+        const inner = runInnerAgentic(app, uid, conv, conv_dir, llm_dir, trio, &conv_buf, &ctx, &steer_cursor, &tool_obs, &tool_perf, tool_client, &no_ack_streak, &tools_spent, tool_budget, &echo_guard, &call_ledger, &file_ledger, foreign_mem.items, &foreign_warned, search_intent, &search_log, turn_tools);
         // TRAJECTORY THREAD (fine weave): a pass that LANDED file changes mints one provenance-labeled
         // progress fact pairing the step's language with the engine-observed effect — the lexical thread
         // that lets a later step's recall hop from "what am I doing" to "what already happened here".
@@ -1768,8 +1917,45 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
             } else |_| {}
         }
 
-        // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing): don't
-        // commit an empty reply or drive further on nothing. Surface a brief honest note and end the turn.
+        // EMPTY settled answer (the model "died" — returned no text and no tools, or stripped to nothing).
+        // ONE plain-text rescue before surrendering: re-ask with NO tools advertised — the model cannot emit
+        // another malformed call, only prose. Small models earn this pass constantly: observed live, a 12B
+        // fetched the right answer through the tool bridge and then died emitting a hallucinated final call —
+        // the data was IN CONTEXT and the turn still ended "(no reply)". One bounded inference turns that
+        // gathered-but-unspoken context into the user's answer; a model that returns nothing twice still gets
+        // the honest note below.
+        if (std.mem.trim(u8, answer, " \r\n\t").len == 0) rescue: {
+            var rmsgs: std.ArrayListUnmanaged(u8) = .empty;
+            defer rmsgs.deinit(gpa);
+            rmsgs.appendSlice(gpa, conv_buf.items) catch break :rescue;
+            rmsgs.appendSlice(gpa, ",{\"role\":\"user\",\"content\":\"(your previous response was empty or malformed and was discarded. Answer me NOW in plain text, using what the conversation above already established — especially any tool results. Do not call tools; do not emit JSON, code fences, or tool markup. Just the answer.)\"}") catch break :rescue;
+            emitKV(app, conv_dir, "status", "text", "recovering: asking for a plain-text answer");
+            const rp = trio.coding; // the rescue finishes the answer stream's own job — coding role (see trio_routing_test)
+            const rcm = meterBegin(app.io);
+            var rs = llm.complete(gpa, app.io, llm_dir, "rescue", rp.base_url, rp.key, rp.model, rmsgs.items, "", 1024, 0.4);
+            defer rs.deinit(gpa);
+            meterEnd(app, rcm, "rescue", .coding, rp.model, rs.ok);
+            if (!rs.ok) break :rescue;
+            // the rescue output rides the same strips the settled path applies above
+            var r: []u8 = gpa.dupe(u8, rs.content) catch break :rescue;
+            if (cctx.stripSentinelTags(gpa, r)) |clean| {
+                gpa.free(r);
+                r = clean;
+            }
+            if (cctx.looksLikeToolMarkup(r)) {
+                const clean = cctx.contentBeforeMarkup(r);
+                if (gpa.dupe(u8, clean)) |d| {
+                    gpa.free(r);
+                    r = d;
+                } else |_| {}
+            }
+            if (std.mem.trim(u8, r, " \r\n\t").len == 0) {
+                gpa.free(r);
+                break :rescue;
+            }
+            gpa.free(answer);
+            answer = r; // rescued — fall through to the normal commit path
+        }
         if (std.mem.trim(u8, answer, " \r\n\t").len == 0) {
             gpa.free(answer);
             planStepInterrupted(app, conv_dir, plan, task_idx);
@@ -4082,7 +4268,10 @@ fn subtaskInstruction(gpa: std.mem.Allocator, task: cplan.Task, idx: usize, tota
     const hint = if (std.mem.eql(u8, task.route, cplan.ROUTE_HIVE))
         "This subtask suits a HIVE — `cast` a swarm for it and steer it; don't build it all yourself."
     else if (std.mem.eql(u8, task.route, cplan.ROUTE_RESEARCH))
-        "You may be missing knowledge here — research it first (web_search / read_url / recall_hive) before acting."
+        // `recall`, not `recall_hive`: this line must only name tools EVERY belt advertises — the compact
+        // (small-tier) belt carries recall alone, and a hint naming an unadvertised tool invites the exact
+        // off-belt flailing the belt exists to prevent.
+        "You may be missing knowledge here — research it first (web_search / read_url / recall) before acting."
     else
         "Do this directly with your own tools (write_file / edit_file / run_python).";
     const generic = "When it's done, briefly say what you did.";
@@ -4681,7 +4870,10 @@ fn statusTool(app: *App, uid: u64, conv_dir: []const u8, ctrl_cursor: usize, arg
     const p = std.json.parseFromSlice(A, gpa, args, .{ .ignore_unknown_fields = true }) catch return orchErr(gpa, "swarm_status: could not parse args JSON");
     defer p.deinit();
     if (p.value.id.len == 0) return orchErr(gpa, "swarm_status: an id is required");
-    var sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no such swarm");
+    // The friendlier miss matters most to a small model: a bare "no such swarm" after a successful cast reads
+    // as the swarm having DIED, and the observed response was to re-poll and then flail into other tools. Say
+    // what a valid id looks like and what to do instead — copied verbatim, not retyped, or stop polling.
+    var sw = app.sup.resolve(p.value.id) orelse return orchErr(gpa, "swarm_status: no swarm has that exact id — pass the `id` string cast returned, copied VERBATIM (do not retype or shorten it). If you have not cast a swarm in this conversation, do not poll; continue the work with your own tools.");
     if (sw.uid != uid) return orchErr(gpa, "swarm_status: that swarm isn't yours");
 
     // WAIT while running: probe every ~2s (stop-checked every 250ms), bounded per call. A finished/dead swarm
@@ -4833,12 +5025,71 @@ fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
     return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"answer_swarm\",\"note\":\"answer delivered to the mind's inbox; it reads it on its next round\"}") catch emptyRes();
 }
 
+/// Did this turn ADVERTISE `name` — or does any static table know it at all?
+///
+/// A small model routinely invents tool names. Observed live on a 12B: `WebSearch` (the real name is
+/// `web_search`), a `Gemma4__1m_check` that never existed anywhere, and `mcp_call{server:"google-search"}`. In
+/// client mode EVERY name was shipped straight to the client, which cannot answer for a tool it has never heard
+/// of, so the call burned the full 20s ack timeout and came back "(no desk/CLI client picked up …)". The model
+/// read that as its TOOLS BEING OFFLINE and abandoned the goal — verbatim, in that conversation: "My search and
+/// quick-look tools are currently offline on this session". Three of its six calls died exactly this way.
+///
+/// The advertised array is checked FIRST, then the full static tables: the compact belt deliberately hides
+/// tools that execute()/orchTool still dispatch, and a model naming one of those from memory must still run it.
+/// So only a name that exists NOWHERE is refused — recipes and plugin tools ride in `turn_tools` already.
+fn knownToolName(turn_tools: []const u8, name: []const u8) bool {
+    if (name.len == 0) return false;
+    var buf: [160]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"name\":\"{s}\"", .{name}) catch return true; // unmeasurably long ⇒ never block
+    return std.mem.indexOf(u8, turn_tools, needle) != null or
+        std.mem.indexOf(u8, TURN_TOOLS_FULL, needle) != null or
+        std.mem.indexOf(u8, tools.SCHEMA, needle) != null;
+}
+
+/// The corrective answer to a hallucinated tool name: say plainly that it does not exist, that nothing ran, and
+/// list the names that DO exist, so the next round has the real belt in front of it instead of a bridge error to
+/// misread. The names are read back out of the array this turn actually advertised — the belt varies with tier
+/// and caps, so any hardcoded list here would eventually lie to the model.
+fn unknownToolResult(gpa: std.mem.Allocator, name: []const u8, turn_tools: []const u8) []u8 {
+    var names: std.ArrayListUnmanaged(u8) = .empty;
+    defer names.deinit(gpa);
+    const key = "\"name\":\"";
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, turn_tools[i..], key)) |rel| {
+        const at = i + rel + key.len;
+        const end = std.mem.indexOfScalar(u8, turn_tools[at..], '"') orelse break;
+        if (names.items.len > 0) names.appendSlice(gpa, ", ") catch break;
+        names.appendSlice(gpa, turn_tools[at .. at + end]) catch break;
+        i = at + end;
+    }
+    return std.fmt.allocPrint(gpa, "(there is no tool named \"{s}\" — nothing ran, and this is NOT a tool being offline or a connection problem. Your tools this turn are exactly: {s}. Call one of those by its exact name, or answer without a tool.)", .{ name, names.items }) catch emptyRes();
+}
+
 /// CLIENT-MODE tool execution: emit a {kind:"tool_request"} frame and BLOCK the turn until the client posts
 /// the result back (POST .../tool_result → tool_results.jsonl). This is how a desk/CLI turn runs file/shell/
 /// code tools with ITS OWN harness on the user's machine while the brain stays server-side. Stop-checked and
 /// timed out so a disconnected client can't wedge the turn — a timeout returns an error the model then sees.
-fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u8, args: []const u8, ctrl_cursor: usize) []u8 {
+/// Consecutive never-acked delegation timeouts that prove the client ABSENT for the rest of the turn. One
+/// timeout is tolerated (an AV-scan stall, a reconnect window); two in a row — 40s of total silence against a
+/// ~1Hz event poller — is a desk that is not there. Without the latch a genuinely detached conversation paid
+/// the full ack timeout PER CALL (observed live: six delegated calls ≈ two minutes of dead air), and the
+/// model narrated the wait as its tools being permanently broken.
+const CLIENT_GONE_AFTER: u32 = 2;
+
+fn delegateTool(app: *App, conv_dir: []const u8, id_in: []const u8, name: []const u8, args: []const u8, ctrl_cursor: usize, no_ack_streak: *u32) []u8 {
     const gpa = app.gpa;
+    // LATCHED: the client proved absent earlier THIS turn — answer instantly instead of re-paying the ack
+    // timeout. Turn-scoped on purpose: the next turn starts at zero and probes the bridge fresh (a desk that
+    // reconnects between turns must not stay condemned).
+    if (no_ack_streak.* >= CLIENT_GONE_AFTER)
+        return gpa.dupe(u8, "(client tools are unavailable for the REST OF THIS TURN — earlier calls went unacknowledged, so this call was skipped instantly rather than waiting out another timeout. This is a session-connection state, NOT broken tools: stop calling client-side tools this turn, answer from what you already have, and tell the user plainly that the desk/CLI tool bridge is not responding — they can check the desk app and retry.)") catch emptyRes();
+    // An id-less call can NEVER round-trip the bridge: /tool_result refuses an empty id (acks included), so the
+    // request would sit unanswered for its full timeout and come back "(no desk/CLI client picked up …)" — the
+    // exact wall that made every LOCAL model's tools look broken (Ollama-native calls carry no id; llm.zig now
+    // mints upstream). Kept here as the backstop so no future call producer can regress the bridge silently.
+    const minted: ?[]u8 = if (id_in.len == 0) (llm.mintCallId(gpa) catch null) else null;
+    defer if (minted) |m| gpa.free(m);
+    const id: []const u8 = minted orelse id_in;
     var ev: std.ArrayListUnmanaged(u8) = .empty;
     defer ev.deinit(gpa);
     const built = blk: {
@@ -4863,13 +5114,18 @@ fn delegateTool(app: *App, conv_dir: []const u8, id: []const u8, name: []const u
     const CLIENT_TOOL_TIMEOUT_S: i64 = 180; // patience from t0 AND from each fresh ack/heartbeat
     var acked = false;
     var stopped = false;
-    return awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped) orelse
-        gpa.dupe(u8, if (stopped)
-            "(STOP requested by the user — this tool call was canceled, not failed. Do NOT retry it; acknowledge the stop and end the turn.)"
-        else if (acked)
-            "(the client started this tool but stopped answering before returning a result — it may have crashed mid-run; verify the state before retrying)"
-        else
-            "(no desk/CLI client picked up this tool call — the client that started this conversation looks disconnected)") catch emptyRes();
+    if (awaitClientResult(app, conv_dir, id, ctrl_cursor, start_offset, CLIENT_ACK_TIMEOUT_S, CLIENT_TOOL_TIMEOUT_S, &acked, &stopped)) |result| {
+        no_ack_streak.* = 0; // a real round-trip — the bridge is alive, forget any earlier silence
+        return result;
+    }
+    if (acked) no_ack_streak.* = 0 // the client picked it up and then died mid-run — present, just crashed
+    else if (!stopped) no_ack_streak.* += 1; // pure silence counts toward absence (a stop is the user, not the bridge)
+    return gpa.dupe(u8, if (stopped)
+        "(STOP requested by the user — this tool call was canceled, not failed. Do NOT retry it; acknowledge the stop and end the turn.)"
+    else if (acked)
+        "(the client started this tool but stopped answering before returning a result — it may have crashed mid-run; verify the state before retrying)"
+    else
+        "(no desk/CLI client picked up this tool call — the desk/CLI that started this conversation looks disconnected right now. This is a session-connection state, NOT broken tools: do not conclude your tools are gone; if it repeats, answer from what you already have and tell the user the tool bridge is not responding.)") catch emptyRes();
 }
 
 /// Absolute ceiling on any client round-trip, heartbeats or not — the backstop against a client that
@@ -5286,6 +5542,10 @@ fn runInnerAgentic(
     tool_obs: *std.ArrayListUnmanaged([]u8),
     tool_perf: *toolperf.Acc, // per-machine tool latency/reliability learner (records each executed tool)
     tool_client: bool,
+    // TURN-scoped consecutive never-acked delegation timeouts (owned by runTurn, like tools_spent): once it
+    // reaches CLIENT_GONE_AFTER, delegateTool answers the turn's remaining client calls instantly instead of
+    // re-paying the ack timeout per call. Turn-scoped so a reconnected desk gets a fresh probe next turn.
+    no_ack_streak: *u32,
     tools_spent: *usize, // turn-scoped executed-call counter (shared across drive steps)
     tool_budget: usize, // ceiling for scheduled runs; maxInt for interactive chats (a human holds Stop)
     // REPEAT-CALL GUARDS, both TURN-scoped (owned by the drive loop — pass-local state forgot every repeat
@@ -5622,8 +5882,12 @@ fn runInnerAgentic(
                 // its Discourse key and built around the failure). Everything else executes as a mind tool: in
                 // CLIENT mode (a desk/CLI turn) it is DELEGATED to the client's harness so file/shell/code
                 // tools act on the USER's machine; otherwise it runs here (a hive/server turn).
+                // A name that exists NOWHERE is answered here, instantly, with the real belt (see knownToolName).
+                // Delegated instead, a phantom name costs the full ack timeout and returns a bridge error the
+                // model misreads as its own tools being offline — which ends the turn on a false conclusion.
+                if (!knownToolName(turn_tools, c.name)) break :blk unknownToolResult(gpa, c.name, turn_tools);
                 break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, c.name, run_args, tool_client) orelse
-                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, run_args, steer_cursor.*) else tools.execute(ctx, c.name, run_args));
+                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, run_args, steer_cursor.*, no_ack_streak) else tools.execute(ctx, c.name, run_args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             // A reformulated search must SAY so in its own result. The transcript records the query the model
