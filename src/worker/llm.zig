@@ -948,9 +948,11 @@ fn hostedToolCallVerdict(raw: []const u8) bool {
         if (tcs.len > 0) return true; // structured — the native channel works
     }
     const c = m.content orelse return true;
-    // the failure signature: the CALL itself emitted as text/markup instead of a tool_calls entry
+    // the failure signature: the CALL itself emitted as text/markup instead of a tool_calls entry. "```" is
+    // the code-fence shape observed live on gemma-4-12B-coder: asked to CALL write_file it answered with a
+    // ```python `def write_file(...)` block — prose containing no '{' at all, which this check used to trust.
     if (std.mem.indexOf(u8, c, "write_file") != null and
-        (std.mem.indexOfScalar(u8, c, '{') != null or std.mem.indexOf(u8, c, "<invoke") != null or std.mem.indexOf(u8, c, "tool_calls>") != null)) return false;
+        (std.mem.indexOfScalar(u8, c, '{') != null or std.mem.indexOf(u8, c, "<invoke") != null or std.mem.indexOf(u8, c, "tool_calls>") != null or std.mem.indexOf(u8, c, "```") != null)) return false;
     return true;
 }
 
@@ -1015,8 +1017,11 @@ fn largeToolCallVerdict(raw: []const u8) bool {
         if (tcs.len > 0) return true; // the backend parsed the large call — trustworthy
     }
     const c = m.content orelse return true;
-    // the failure signature: the CALL itself came back as raw text instead of a structured tool_calls entry
-    if (std.mem.indexOf(u8, c, "write_file") != null and std.mem.indexOfScalar(u8, c, '{') != null) return false;
+    // the failure signature: the CALL itself came back as raw text instead of a structured tool_calls entry —
+    // brace-bearing JSON-ish text, or the fenced-code shape ("```python\ndef write_file(...)") gemma-4-12B-coder
+    // answered the probe with, which carries no '{' and used to read as trustworthy.
+    if (std.mem.indexOf(u8, c, "write_file") != null and
+        (std.mem.indexOfScalar(u8, c, '{') != null or std.mem.indexOf(u8, c, "```") != null)) return false;
     return true;
 }
 
@@ -2280,6 +2285,25 @@ test "mintCallId: non-empty, tc-prefixed, and unique across calls" {
     try std.testing.expect(!std.mem.eql(u8, a, b)); // two mints must never collide (random 64-bit body)
 }
 
+test "parseOllamaNative: done_reason=length with a PARSED call still reports truncated" {
+    // the silent-amputation shape, observed live at the transport (gemma v2, num_predict=256, a 300-line
+    // write ask): Ollama's constrained decoding closes the JSON when the budget dies, so the call parses
+    // cleanly with cut-off content. `truncated` is the ONLY signal left — the engine's truncated-mutation
+    // guard runs on it, so this flag surviving beside calls is load-bearing, not informational.
+    const gpa = std.testing.allocator;
+    const raw =
+        \\{"model":"m","message":{"role":"assistant","content":"",
+        \\"tool_calls":[{"function":{"name":"write_file","arguments":{"path":"big.txt","content":"line 001\nline 002"}}}]},
+        \\"done_reason":"length","eval_count":256,"prompt_eval_count":900}
+    ;
+    var step = parseOllamaNative(gpa, "http://localhost:11434/v1", raw, .{});
+    defer step.deinit(gpa);
+    try std.testing.expect(step.ok);
+    try std.testing.expect(step.truncated);
+    try std.testing.expectEqual(@as(usize, 1), step.calls.len);
+    try std.testing.expectEqualStrings("write_file", step.calls[0].name);
+}
+
 test "parseOllamaNative content-only (no tool call) returns text and no calls" {
     const gpa = std.testing.allocator;
     const raw =
@@ -2492,6 +2516,9 @@ test "largeToolCallVerdict: a structured call trusts; a text-emitted call or a t
     try std.testing.expect(!largeToolCallVerdict("{\"error\":\"Value looks like object, but can't find closing '}' symbol\"}"));
     // the other wall shape: the call comes back as raw TEXT in content
     try std.testing.expect(!largeToolCallVerdict("{\"message\":{\"content\":\"{\\\"name\\\": \\\"write_file\\\", \\\"parameters\\\": {\\\"path\\\": \\\"probe.txt\\\", \\\"content\\\": \\\"line 001\\\"}}\"}}"));
+    // the gemma-4-12B-coder wall shape: a fenced PYTHON FUNCTION instead of a call — no '{' anywhere, which
+    // the brace-only check trusted, so the fence probe handed that model large writes it provably drops
+    try std.testing.expect(!largeToolCallVerdict("{\"message\":{\"content\":\"```python\\ndef write_file(path, content):\\n    pass\\n```\"}}"));
     // inconclusive shapes stay trusted — the runtime adaptive flip is the safety net
     try std.testing.expect(largeToolCallVerdict("{\"message\":{\"content\":\"I wrote the file for you.\"}}"));
     try std.testing.expect(largeToolCallVerdict("{\"error\":\"model is out of memory\"}"));
@@ -2521,6 +2548,8 @@ test "hostedToolCallVerdict: structured call trusts; text-emitted markup fences;
     try std.testing.expect(hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"I cannot write files.\"}}]}"));
     try std.testing.expect(hostedToolCallVerdict("{\"error\":{\"message\":\"insufficient balance\"}}"));
     try std.testing.expect(!hostedToolCallVerdict("{\"error\":{\"message\":\"tool call arguments failed to parse\"}}"));
+    // the fenced-code shape: prose-with-``` mentioning write_file and no structured call is a fence failure
+    try std.testing.expect(!hostedToolCallVerdict("{\"choices\":[{\"message\":{\"content\":\"```python\\ndef write_file(path, content):\\n    pass\\n```\"}}]}"));
     try std.testing.expect(hostedToolCallVerdict("not json at all"));
 }
 

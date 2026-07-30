@@ -322,6 +322,43 @@ const SYSTEM_PROMPT =
     "actually needs one, fetch it with get_credential and use it directly in that call. Never repeat a fetched " ++
     "value into replies, observe/share notes, REMEMBER lines, or files beyond the immediate use.";
 
+/// The SMALL-tier twin of SYSTEM_PROMPT, paired with TURN_TOOLS_COMPACT the same way the full prompt pairs
+/// with the full belt. The full prompt is a 6KB orchestration curriculum — cast/steer_swarm/answer_swarm
+/// doctrine, "recall_hive first", open_subchat, poll — delivered to a model whose compact belt advertises NONE
+/// of those names. That is the recall_hive bug class at its source: the observed 12B never saw `cast` in its
+/// tools array, the PROMPT told it to cast ("do exactly that"), and knownToolName let the full-schema name
+/// through — so it spent four rounds failing to orchestrate a swarm instead of writing the file it was asked
+/// for. This twin names ONLY tools the compact belt advertises, keeps the behavioral spine (ground yourself /
+/// act don't promise / build discipline / REMEMBER lines), and drops every delegation concept — a small model
+/// works alone, one step at a time. Also ~4KB shorter, which a 12B feels on every single inference.
+///
+/// get_credential is deliberately NOT mentioned (the compact belt drops it): masked values stay masked, and a
+/// small model telling the user it cannot read a credential beats it fumbling a fetch-and-leak.
+const SYSTEM_PROMPT_COMPACT =
+    "You are veil, a helpful coding and research assistant. You have tools: web_search / web_fetch / read_url / " ++
+    "fetch_json for the live web; read_file / write_file / edit_file / list_dir / delete_file for files; " ++
+    "run_python / run_tests / stop_process to run code; recall / observe / read_doc / pixel_search for memory " ++
+    "and stored documents; browser_navigate / browser_read / browser_click / browser_type to drive a real " ++
+    "browser page. Those are ALL your tools — call them by exactly those names. Use a tool when it genuinely " ++
+    "helps, then reply in plain prose, grounded in what the tools actually returned.\n" ++
+    "HOW YOU WORK. Break a non-trivial request into a short list of steps and work them IN ORDER, yourself, one " ++
+    "tool call at a time. Do not try to delegate — you have no sub-agents; you are the one doing the work. If a " ++
+    "tool errors, read the error and CHANGE something (arguments, tool, approach) — never repeat the identical " ++
+    "call hoping for a different result.\n" ++
+    "GROUND YOURSELF — you have NO live knowledge of the current world. For anything time-sensitive (news, " ++
+    "prices, versions, 'latest'/'today'/'now'), recall first and, if that is thin, web_search — then answer FROM " ++
+    "what you find. NEVER fabricate current events, dates, statistics, or news.\n" ++
+    "STORED DOCUMENTS. recall answers TARGETED questions about an ingested document; for WHOLE-document work " ++
+    "(summarize, outline, review) page it in order with read_doc — recall fragments are NOT the document.\n" ++
+    "ACT, DON'T PROMISE — never end a reply promising future action ('I'll check...') without the tool call in " ++
+    "the SAME reply. After a change, VERIFY: run_tests or read the resource back before declaring success.\n" ++
+    "BUILD DISCIPLINE — write code to FILES with write_file/edit_file, do not paste whole files into chat. " ++
+    "read_file before you edit; once a file is right, move on — do not rewrite it next turn.\n" ++
+    "DURABLE MEMORY. A personal fact about THIS user worth keeping across conversations gets a line, alongside " ++
+    "your normal reply:\nREMEMBER: [category] the fact   (category: key, login, preference, or fact)\n" ++
+    "To drop a wrong fact: FORGET: <a few words identifying it>. These lines are stripped from what the user " ++
+    "sees — emit them bare, no prose header.";
+
 /// The chat turn's tool surface = the shared mind-tool SCHEMA + the veil's ORCHESTRATION verbs (cast / steer /
 /// stop / status). The orchestration verbs are handled in-process by orchTool (deploy_service + app.sup), NOT by
 /// tools.execute — the swarm minds themselves never get these (a mind can't spawn sibling swarms). Comptime
@@ -674,6 +711,70 @@ test "compact belt: valid JSON, materially smaller, keeps the core verbs and dro
     // or hiding it would silently remove capability the model may still name from memory
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "browser_eval"));
     try std.testing.expect(knownToolName(TURN_TOOLS_COMPACT, "cast"));
+}
+
+test "isMutatingTool: file mutations guard on truncation; reads never do" {
+    // the truncated-mutation guard (dispatch loop) refuses ONLY these on done_reason=length — a half-executed
+    // read just searches worse, but a half-executed write lands a corrupt file that reads as complete
+    for ([_][]const u8{ "write_file", "edit_file", "delete_file", "stage_file" }) |m|
+        try std.testing.expect(isMutatingTool(m));
+    for ([_][]const u8{ "read_file", "list_dir", "web_search", "run_python", "recall", "browser_read" }) |r|
+        try std.testing.expect(!isMutatingTool(r));
+}
+
+test "canonToolMatch: re-cased real names resolve uniquely; phantoms and ambiguity refuse" {
+    // the observed misses: CamelCase / stray punctuation over a REAL advertised name
+    try std.testing.expectEqualStrings("web_search", canonToolMatch(TURN_TOOLS_COMPACT, "WebSearch").?);
+    try std.testing.expectEqualStrings("list_dir", canonToolMatch(TURN_TOOLS_COMPACT, "ListDir").?);
+    try std.testing.expectEqualStrings("read_file", canonToolMatch(TURN_TOOLS_COMPACT, "Read_File").?);
+    try std.testing.expectEqualStrings("web_fetch", canonToolMatch(TURN_TOOLS_COMPACT, "web-fetch").?);
+    // pure inventions still refuse — there is nothing to correct TO
+    try std.testing.expect(canonToolMatch(TURN_TOOLS_COMPACT, "Gemma4__1m_check") == null);
+    try std.testing.expect(canonToolMatch(TURN_TOOLS_COMPACT, "I_want_to_know") == null);
+    try std.testing.expect(canonToolMatch(TURN_TOOLS_COMPACT, "") == null);
+    // the compact belt must NOT helpfully upgrade into hidden orchestration: "Cast" is a real full-schema
+    // name, but this turn never advertised it, so the match is scoped to the belt and misses
+    try std.testing.expect(canonToolMatch(TURN_TOOLS_COMPACT, "Cast") == null);
+    // ambiguity refuses to guess
+    const two = "{\"name\":\"web_search\"},{\"name\":\"websearch\"}";
+    try std.testing.expect(canonToolMatch(two, "WebSearch") == null);
+    // the loose comparator itself
+    try std.testing.expect(toolNameEqLoose("web_search", "WebSearch"));
+    try std.testing.expect(toolNameEqLoose("web_search", "web-search"));
+    try std.testing.expect(!toolNameEqLoose("web_search", "web_fetch"));
+    try std.testing.expect(!toolNameEqLoose("read_file", "read_files"));
+}
+
+test "looksLikeBotChallenge: challenge stubs flag; real content and big pages don't" {
+    try std.testing.expect(looksLikeBotChallenge("<html><head><title>Just a moment...</title></head></html>"));
+    try std.testing.expect(looksLikeBotChallenge("<html lang=\"en\"><head><title>reuters.com</title><style>#cmsg{animation: A 1.5s;}</style>"));
+    try std.testing.expect(looksLikeBotChallenge("<p>Please Enable JavaScript and cookies to continue</p>"));
+    // an article that merely TALKS about Cloudflare is not a challenge page
+    try std.testing.expect(!looksLikeBotChallenge("Cloudflare reported record revenue this quarter; the CDN market..."));
+    // a big body is a real page even if boilerplate appears somewhere in it
+    const gpa = std.testing.allocator;
+    const big = try gpa.alloc(u8, 20000);
+    defer gpa.free(big);
+    @memset(big, 'a');
+    @memcpy(big[0.."Just a moment...".len], "Just a moment...");
+    try std.testing.expect(!looksLikeBotChallenge(big));
+    try std.testing.expect(!looksLikeBotChallenge(""));
+}
+
+test "compact system prompt: paired with the compact belt — no unadvertised verbs, core verbs named" {
+    // the recall_hive class, asserted at its source: a compact turn must never be TAUGHT a verb its belt
+    // doesn't advertise. Each of these appears in the FULL prompt's doctrine and none is in COMPACT_TOOLS.
+    for ([_][]const u8{ "recall_hive", "open_subchat", "swarm", "absorb", "cast", "get_credential", "mcp", "poll" }) |verb| {
+        if (std.mem.indexOf(u8, SYSTEM_PROMPT_COMPACT, verb) != null) {
+            std.debug.print("\ncompact system prompt teaches '{s}' — its belt does not advertise that\n", .{verb});
+            return error.CompactPromptTeachesUnadvertisedVerb;
+        }
+    }
+    // and the belt's own core IS taught by exact name
+    for ([_][]const u8{ "web_search", "read_doc", "browser_navigate", "run_tests", "REMEMBER:" }) |need|
+        try std.testing.expect(std.mem.indexOf(u8, SYSTEM_PROMPT_COMPACT, need) != null);
+    // the whole point: materially smaller than the 6KB curriculum
+    try std.testing.expect(SYSTEM_PROMPT_COMPACT.len * 2 < SYSTEM_PROMPT.len);
 }
 
 test "knownToolName + unknownToolResult: an invented name is refused with the real belt, never delegated" {
@@ -1331,7 +1432,21 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     var conv_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer conv_buf.deinit(gpa);
     conv_buf.appendSlice(gpa, "{\"role\":\"system\",\"content\":") catch return;
-    http.jstr(gpa, &conv_buf, SYSTEM_PROMPT) catch return;
+    // Tier-paired with the belt: the compact belt gets the compact prompt. One decides WHAT is advertised, the
+    // other WHAT is taught — a small model must never be taught a verb its belt doesn't advertise (the
+    // recall_hive/cast class). Keyed on the same turn-stable compact_belt bool, so prefix caching still holds.
+    //
+    // DATE GROUNDING, every tier: no model knows what day it is, and a small one confidently invents dates —
+    // observed live, a 12B researching current events date-qualified its searches with THREE different wrong
+    // years in one turn ("last 24 hours January 30-31 2025" … in July 2026), which quietly poisons every
+    // time-sensitive query. Turn-stable (changes once a day, never per message), so prefix caching holds.
+    {
+        var dstamp: [16]u8 = undefined;
+        const sys_base: []const u8 = if (compact_belt) SYSTEM_PROMPT_COMPACT else SYSTEM_PROMPT;
+        const dated = std.fmt.allocPrint(gpa, "{s}\nTODAY (UTC): {s}. Any time-sensitive search query, date, or claim must be grounded in THIS date — never a guessed one.", .{ sys_base, tools.dateStamp(app.io, &dstamp) }) catch null;
+        defer if (dated) |d| gpa.free(d);
+        http.jstr(gpa, &conv_buf, dated orelse sys_base) catch return;
+    }
     conv_buf.append(gpa, '}') catch return;
 
     // HIPPOCAMPUS (recall): pull the facts most relevant to THIS user text from the conversation's own neuron-db
@@ -1400,7 +1515,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     // agent plans around them (waits out a cold browser, avoids a 404-ing endpoint) instead of relearning each
     // run. Fixed within this turn (computed once), so it lives in the stable prefix like durable memory. Absent
     // until enough samples accrue — a fresh machine sees nothing.
-    if (toolperf.digest(gpa, app.io, app.data)) |dg| {
+    if (toolperf.digest(gpa, app.io, app.data, turn_tools)) |dg| {
         defer gpa.free(dg);
         if (dg.len > 0) {
             conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
@@ -1416,7 +1531,7 @@ pub fn runTurn(app: *App, uid: u64, conv: []const u8, trio: ModelTrio, user_text
     {
         const tl = trustBeltLine(app, mem_scope);
         defer if (tl.len > 0) gpa.free(tl);
-        if (toolperf.belt(gpa, app.io, app.data, tl)) |bl| {
+        if (toolperf.belt(gpa, app.io, app.data, tl, turn_tools)) |bl| {
             defer gpa.free(bl);
             if (bl.len > 0) {
                 conv_buf.appendSlice(gpa, ",{\"role\":\"system\",\"content\":") catch return;
@@ -5025,6 +5140,15 @@ fn answerTool(app: *App, uid: u64, args: []const u8) []u8 {
     return gpa.dupe(u8, "{\"ok\":true,\"tool\":\"answer_swarm\",\"note\":\"answer delivered to the mind's inbox; it reads it on its next round\"}") catch emptyRes();
 }
 
+/// Tools whose half-executed arguments CORRUPT state (a truncated write lands a half file that reads as
+/// complete; a truncated delete could name a shorter-but-real path). Reads are deliberately absent: a cut-off
+/// search query just searches worse, and refusing it would cost a round for nothing.
+fn isMutatingTool(name: []const u8) bool {
+    for ([_][]const u8{ "write_file", "edit_file", "delete_file", "stage_file" }) |m|
+        if (std.mem.eql(u8, m, name)) return true;
+    return false;
+}
+
 /// Did this turn ADVERTISE `name` — or does any static table know it at all?
 ///
 /// A small model routinely invents tool names. Observed live on a 12B: `WebSearch` (the real name is
@@ -5044,6 +5168,66 @@ fn knownToolName(turn_tools: []const u8, name: []const u8) bool {
     return std.mem.indexOf(u8, turn_tools, needle) != null or
         std.mem.indexOf(u8, TURN_TOOLS_FULL, needle) != null or
         std.mem.indexOf(u8, tools.SCHEMA, needle) != null;
+}
+
+/// Case- and punctuation-insensitive tool-name equality: "WebSearch" ≡ "web_search" ≡ "web-search". Compares
+/// only alphanumerics, case-folded — the exact transformations small models apply to names they half-remember.
+fn toolNameEqLoose(a: []const u8, b: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+    while (true) {
+        while (i < a.len and !std.ascii.isAlphanumeric(a[i])) i += 1;
+        while (j < b.len and !std.ascii.isAlphanumeric(b[j])) j += 1;
+        if (i == a.len or j == b.len) return i == a.len and j == b.len;
+        if (std.ascii.toLower(a[i]) != std.ascii.toLower(b[j])) return false;
+        i += 1;
+        j += 1;
+    }
+}
+
+/// The ADVERTISED tool whose loose form matches `name` — exactly one, or null. Ambiguity refuses to guess
+/// (running the wrong tool is worse than a correction round), and matching is restricted to the belt this turn
+/// actually advertised: a compact turn's "Cast" must get the correction message, not a helpful upgrade into
+/// orchestration the belt deliberately hides.
+fn canonToolMatch(turn_tools: []const u8, name: []const u8) ?[]const u8 {
+    if (name.len == 0 or name.len > 80) return null;
+    var found: ?[]const u8 = null;
+    const key = "\"name\":\"";
+    var i: usize = 0;
+    while (std.mem.indexOf(u8, turn_tools[i..], key)) |rel| {
+        const at = i + rel + key.len;
+        const end = std.mem.indexOfScalar(u8, turn_tools[at..], '"') orelse break;
+        const cand = turn_tools[at .. at + end];
+        if (toolNameEqLoose(cand, name)) {
+            if (found != null) return null; // two candidates — do not guess
+            found = cand;
+        }
+        i = at + end;
+    }
+    return found;
+}
+
+/// Does a fetched body look like a bot-check interstitial rather than the page? Conservative on purpose: the
+/// markers are the stub pages' own words, checked only in the HEAD of a SMALL body — a real article that merely
+/// mentions Cloudflare is big and keeps its first bytes for itself. False negative = today's behavior; false
+/// positive would hide a real page, so every marker must be challenge-page boilerplate, not vocabulary.
+fn looksLikeBotChallenge(body: []const u8) bool {
+    if (body.len == 0 or body.len > 16384) return false; // challenge stubs are small; articles are not
+    const head = body[0..@min(body.len, 2048)];
+    const markers = [_][]const u8{
+        "Just a moment...",
+        "Enable JavaScript and cookies to continue",
+        "challenge-platform",
+        "Checking your browser before",
+        "Pardon Our Interruption",
+        "Attention Required! | Cloudflare",
+        "cf-chl-",
+        "Verifying you are human",
+        "#cmsg{animation", // the PerimeterX/Reuters stub observed live
+        "enable JS and disable any ad blocker",
+    };
+    for (markers) |mk| if (std.mem.indexOf(u8, head, mk) != null) return true;
+    return false;
 }
 
 /// The corrective answer to a hallucinated tool name: say plainly that it does not exist, that nothing ran, and
@@ -5665,7 +5849,10 @@ fn runInnerAgentic(
             if (cctx.recoverMarkupCalls(gpa, step.content)) |rec| {
                 var built: std.ArrayListUnmanaged(llm.ToolCall) = .empty;
                 for (rec.calls) |rc| {
-                    const idc = gpa.dupe(u8, "") catch {
+                    // MINT, never "": markup never carries an id, and an id-less call cannot round-trip the
+                    // client bridge (/tool_result refuses empty ids). Same contract as llm.zig's parse sites —
+                    // this recovery path is exactly the local-model shape that needs the bridge to work.
+                    const idc = llm.mintCallId(gpa) catch {
                         gpa.free(rc.name);
                         gpa.free(rc.args);
                         continue;
@@ -5831,6 +6018,7 @@ fn runInnerAgentic(
                 }
             }
             var executed = false; // did the tool genuinely run (vs a dedup/budget guard)? gates perf learning
+            var name_fixed: ?[]const u8 = null; // set when a miscapitalized name auto-corrected (WebSearch→web_search)
             const t_call = nowMillis(app.io);
             var result = if (echo_blocked)
                 // HONEST REFUSALS: these used to say "the result is above". Compaction may have folded that
@@ -5885,15 +6073,54 @@ fn runInnerAgentic(
                 // A name that exists NOWHERE is answered here, instantly, with the real belt (see knownToolName).
                 // Delegated instead, a phantom name costs the full ack timeout and returns a bridge error the
                 // model misreads as its own tools being offline — which ends the turn on a false conclusion.
-                if (!knownToolName(turn_tools, c.name)) break :blk unknownToolResult(gpa, c.name, turn_tools);
-                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, c.name, run_args, tool_client) orelse
-                    (if (tool_client and !std.mem.eql(u8, c.name, "get_credential")) delegateTool(app, conv_dir, c.id, c.name, run_args, steer_cursor.*, no_ack_streak) else tools.execute(ctx, c.name, run_args));
+                // FIRST, though: a small model's most common miss is a re-cased/re-punctuated REAL name
+                // (WebSearch, ListDir, Read_File — all observed live). When the loose form matches exactly ONE
+                // advertised tool, run that tool now and teach the exact name in the result note, instead of
+                // burning a whole agentic round on a correction the model must read, obey, and re-emit.
+                var run_name: []const u8 = c.name;
+                if (!knownToolName(turn_tools, c.name)) {
+                    if (canonToolMatch(turn_tools, c.name)) |real| {
+                        run_name = real;
+                        name_fixed = real;
+                    } else break :blk unknownToolResult(gpa, c.name, turn_tools);
+                }
+                // TRUNCATED MUTATION GUARD: `done_reason:"length"` with tool_calls present means the output
+                // budget ran out MID-CALL — and Ollama's constrained decoding closes the JSON anyway, so the
+                // last call arrives as VALID args whose string content was silently amputated. Executing that
+                // writes a half file the model then believes complete (a small local model asked for a 400-line
+                // write_file is the textbook case). Only the LAST call is suspect (earlier array entries
+                // finished before the budget died), and only mutations corrupt anything — reads just search a
+                // little worse. Refuse with the exact recovery move instead of executing the damage.
+                if (step.truncated and ci == step.calls.len - 1 and isMutatingTool(run_name))
+                    break :blk gpa.dupe(u8, "(NOT executed: this call was CUT OFF by the output-token limit — done_reason=length — so its arguments are almost certainly incomplete, and running it would have written a truncated file that looks finished. Re-issue the SAME call with less content: write the file in smaller pieces (edit_file appends/patches), or shorten what you are writing. Do not assume anything was written.)") catch emptyRes();
+                break :blk orchTool(app, uid, ctx, conv, conv_dir, steer_cursor.*, trio, run_name, run_args, tool_client) orelse
+                    (if (tool_client and !std.mem.eql(u8, run_name, "get_credential")) delegateTool(app, conv_dir, c.id, run_name, run_args, steer_cursor.*, no_ack_streak) else tools.execute(ctx, run_name, run_args));
             };
             scrubUtf8(result); // fetched bytes may be invalid UTF-8; must be valid before it rides in JSON
             // A reformulated search must SAY so in its own result. The transcript records the query the model
             // asked for, so without this it would read results for a search it never made and have no way to
             // tell. Appended, never prefixed: the observe gate below drops any result starting with '(' — a
             // leading note would silently cost the finding its place in memory.
+            // An auto-corrected name must SAY so, or the model keeps using the wrong one forever (the result
+            // arriving under its own alias reads as confirmation). Appended, same reason as the search note.
+            if (name_fixed) |real| {
+                if (std.fmt.allocPrint(gpa, "{s}\n(engine: no tool is named \"{s}\" — this ran {s}, the exact advertised name. Call it {s} from now on.)", .{ result, c.name, real, real })) |noted| {
+                    gpa.free(result);
+                    result = noted;
+                } else |_| {}
+            }
+            // BOT-CHALLENGE HONESTY: a blocked site answers a fetch with a small interstitial ("Just a
+            // moment…", a PerimeterX/Cloudflare stub) — REAL bytes that are not the page. A frontier model
+            // shrugs; a small model reads it as content, or retries the same URL forever (observed live: a
+            // Reuters challenge stub rode into a research answer as if it were the article). Replace the stub
+            // with an honest instruction + a short head as evidence; prepended '(' deliberately keeps the
+            // challenge HTML out of the memory weave (the observe gate drops '('-leading results).
+            if (looksLikeBotChallenge(result) and (std.mem.eql(u8, name_fixed orelse c.name, "web_fetch") or std.mem.eql(u8, name_fixed orelse c.name, "read_url"))) {
+                if (std.fmt.allocPrint(gpa, "(this is a BOT-CHECK page, not the article — the site blocked automated fetching. Do NOT treat it as content and do NOT retry this URL; use web_search or a different source. First bytes, as evidence:)\n{s}", .{clipBytes(result, 400)})) |noted| {
+                    gpa.free(result);
+                    result = noted;
+                } else |_| {}
+            }
             if (new_query.len > 0 and result.len > 0) {
                 if (std.fmt.allocPrint(gpa, "{s}\n(engine: this searched \"{s}\" — a focused rewrite of the query you gave, aimed at the same intent.)", .{ result, new_query })) |noted| {
                     gpa.free(result);
@@ -5933,7 +6160,7 @@ fn runInnerAgentic(
                     // call, its error, and this machine's tool belt, and returns ONE concrete next move. The
                     // generic nudge was ignored twice; a specific suggestion breaks the grind. Deliberation as
                     // escalation (fires once per streak), never a per-call tax. Never auto-executed — advice only.
-                    if (toolArbiter(app, run_root, trio.pick(.prompting), intent, c.name, run_args, result)) |adv| {
+                    if (toolArbiter(app, run_root, trio.pick(.prompting), intent, c.name, run_args, result, turn_tools)) |adv| {
                         defer gpa.free(adv);
                         const noted = std.fmt.allocPrint(gpa, "{s}\n(engine arbiter — {s} failed 3x; a focused look at your goal, this error, and your tool belt suggests: {s} Weigh it; you decide.)", .{ result, c.name, adv }) catch result;
                         if (noted.ptr != result.ptr) {
@@ -6151,9 +6378,10 @@ fn summarizeTurn(app: *App, run_root: []const u8, base_url: []const u8, key: []c
 /// learned tool belt, and returns ONE concrete next move (a different tool, or the specific fix). Advice only
 /// — never auto-executed; the caller appends it to the failing result as an engine note. Null on any failure
 /// (the generic streak-2 nudge already fired, so silence here just means no extra hint). gpa-owned.
-fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8, tool_name: []const u8, tool_args: []const u8, err_result: []const u8) ?[]u8 {
+fn toolArbiter(app: *App, run_root: []const u8, p: Provider, intent: []const u8, tool_name: []const u8, tool_args: []const u8, err_result: []const u8, tools_json: ?[]const u8) ?[]u8 {
     const gpa = app.gpa;
-    const belt = toolperf.belt(gpa, app.io, app.data, "") orelse gpa.dupe(u8, "") catch return null;
+    // filtered to the turn's advertised belt: advice naming a tool the model can't see is the recall_hive class
+    const belt = toolperf.belt(gpa, app.io, app.data, "", tools_json) orelse gpa.dupe(u8, "") catch return null;
     defer gpa.free(belt);
     var ask: std.ArrayListUnmanaged(u8) = .empty;
     defer ask.deinit(gpa);
@@ -6257,6 +6485,12 @@ fn formulateSearch(app: *App, run_root: []const u8, p: Provider, intent: []const
             ask.appendSlice(gpa, clipBytes(q, 160)) catch return null;
         }
     }
+    // The reformulator WRITES the queries, so it needs the date most of all — an undated model "helpfully"
+    // adds a guessed year to news queries, and a wrong year is worse than no year.
+    var db: [16]u8 = undefined;
+    ask.appendSlice(gpa, "\nToday (UTC) is ") catch return null;
+    ask.appendSlice(gpa, tools.dateStamp(app.io, &db)) catch return null;
+    ask.appendSlice(gpa, " — if the query needs a date, use THIS one, never a guessed one.") catch return null;
     ask.appendSlice(gpa, "\nOutput ONE web-search query:") catch return null;
     var msgs: std.ArrayListUnmanaged(u8) = .empty;
     defer msgs.deinit(gpa);
