@@ -3026,3 +3026,26 @@ edit, confirm it applied, then run.
   (web+CLI carry the downloader UX, engine errors point at both); GPU backends (CPU-only v1); aarch64
   arch flags are conservative (no dotprod/i8mm pin); streamed chat against REAL weights not yet
   exercised end-to-end (mock-engine streamed, live blocking smoke next).
+
+## 0111 — 2026-07-31 — desk-native BUILT-IN panel: download button, live loading bar, one-click select
+- owner: close 0110's named gap the same day — a Download/install button with a real progress bar
+  INSIDE the desk, and a one-click way to set chat onto the built-in model there too.
+- shape: pure desk-side plumbing over the surfaces 0110 shipped; the server is untouched. The poller
+  owns everything that talks (its whole design): a new status poll of the models/builtin route — 2s
+  while a transfer runs so the bar moves like one, 10s idle, reset to 0 by every verb so a click
+  reflects within a tick — and four new command-ring verbs (pull/cancel/import/remove) that turn the
+  reply into a toast (409 says which thing is busy, 401 says set the admin token). One terminal-
+  transition toast (landed/failed) fires off the poller's own state memory, for a user on another tab.
+- store: a bi_* snapshot block (state string, pct, MB done/total, arch, params, err, compiled,
+  has_weights) — bytes pre-reduced to MB because the UI never needs finer. New CmdKinds appended.
+- UI (Settings, its own section ABOVE Chat Model): status line → loading bar (panelBordered +
+  fillRect to the server pct, labeled "downloading 43% (3121 / 7204 MB)") → contextual verbs:
+  Download(~7 GB)+Import when absent/failed, Cancel while busy, "Use built-in for chat"+Remove when
+  installed. "Use built-in" writes chat_kind=1 + chat_byok=BUILTIN_IDX + the model id and saves —
+  BUILTIN_IDX is COMPTIME-derived from the catalog so a provider reorder fails the build here rather
+  than pointing the click at whichever provider inherited the slot. The download runs server-side,
+  so the copy says out loud that closing the window never interrupts it.
+- parsing: intForKey beside valueForKey — the ':' in its pattern makes a key immune to prefix
+  collisions; absent/non-numeric reads null, never 0-as-fact. Pinned by test with the real reply
+  shape.
+- verified: desk suite green incl. the new intForKey vectors; full oracle green; no server diff.

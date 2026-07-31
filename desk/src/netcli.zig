@@ -249,6 +249,39 @@ pub fn oauthCfLogout(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "POST", port, "/api/v1/oauth/cloudflare/logout", token, "{}", 8);
 }
 
+/// GET /api/v1/models/builtin — the built-in engine snapshot (compiled?, weights, transfer progress)
+/// the Settings tab renders. Cheap authed GET beside the other polls.
+pub fn builtinStatus(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinStatus port={d}", .{port});
+    return httpReq(io, gpa, "GET", port, "/api/v1/models/builtin", token, null, 6);
+}
+
+/// POST /api/v1/models/builtin/pull — start the server-side background download of the published
+/// weights. The reply is immediate ({ok,started} or a 409 while one runs); progress rides status.
+pub fn builtinPull(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinPull port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/models/builtin/pull", token, "{}", 10);
+}
+
+/// POST /api/v1/models/builtin/cancel — cooperative cancel; the .part stays for a later resume.
+pub fn builtinCancel(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinCancel port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/models/builtin/cancel", token, "{}", 8);
+}
+
+/// POST /api/v1/models/builtin/import — copy this machine's already-downloaded local-runtime blob
+/// into the server's store (background server-side; progress rides status like a pull).
+pub fn builtinImport(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinImport port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/models/builtin/import", token, "{}", 10);
+}
+
+/// DELETE /api/v1/models/builtin — remove the serving weights (refused mid-transfer with a 409).
+pub fn builtinRemove(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinRemove port={d}", .{port});
+    return httpReq(io, gpa, "DELETE", port, "/api/v1/models/builtin", token, null, 10);
+}
+
 /// DELETE /api/v1/chat/convs/<conv> — remove a conversation's whole tree server-side. Without this a
 /// server-born conv (a scheduled_* run, or one merged into the sidebar) reappears on the next list refresh.
 pub fn chatConvDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8) ?Resp {
