@@ -32,6 +32,10 @@ pub const PATH_PREFIX = "/builtin";
 pub const MODEL_ID = "the-veil-12b";
 /// Where the weights live when the user has not published/downloaded anything custom.
 pub const HF_REPO = "gary23w/the-veil-12b";
+/// The install manifest beside the weights: what the store serves, its sha256, and how it arrived.
+/// modelpull writes it on every promote; the election below trusts it FIRST (the authoritative
+/// "what was installed last"), and the update check compares against its sha.
+pub const INSTALL_MANIFEST = "builtin-install.json";
 
 // ---- the engine interface (implemented by llamaeng.zig; mocked in tests) -------------------------
 
@@ -188,6 +192,17 @@ fn scanLocked(io: std.Io) void {
     st.model_path_len = 0;
     const dir_path = st.dir[0..st.dir_len];
     if (dir_path.len == 0) return;
+    // The install manifest wins the election outright when its file exists: after an UPDATE that
+    // changed the artifact's name, the name heuristics below could prefer the old file — the
+    // manifest is the one record of which gguf was actually installed last.
+    if (manifestFileLocked(io)) |name| {
+        const full = std.fmt.bufPrint(st.model_path[0..], "{s}/{s}", .{ dir_path, name.slice() }) catch return;
+        if (std.Io.Dir.cwd().statFile(io, full, .{})) |_| {
+            st.model_path_len = @intCast(full.len);
+            return;
+        } else |_| {} // manifest points at a deleted file — fall through to the scan
+        st.model_path_len = 0;
+    }
     var d = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
     defer d.close(io);
     var best: [256]u8 = undefined;
@@ -211,6 +226,35 @@ fn scanLocked(io: std.Io) void {
     if (best_len == 0) return;
     const full = std.fmt.bufPrint(st.model_path[0..], "{s}/{s}", .{ dir_path, best[0..best_len] }) catch return;
     st.model_path_len = @intCast(full.len);
+}
+
+const ManifestName = struct {
+    buf: [256]u8,
+    len: usize,
+    fn slice(self: *const ManifestName) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// The `file` field of the install manifest, or null when absent/corrupt/oversized. Rejects names
+/// carrying path separators or quotes — the manifest is ours, but a corrupted one must not be able
+/// to point the election outside the store dir.
+fn manifestFileLocked(io: std.Io) ?ManifestName {
+    var pbuf: [600]u8 = undefined;
+    const p = std.fmt.bufPrint(&pbuf, "{s}/" ++ INSTALL_MANIFEST, .{st.dir[0..st.dir_len]}) catch return null;
+    var jbuf: [1024]u8 = undefined;
+    const f = std.Io.Dir.cwd().openFile(io, p, .{}) catch return null;
+    defer f.close(io);
+    const n = f.readPositionalAll(io, &jbuf, 0) catch return null;
+    const P = struct { file: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(P, std.heap.page_allocator, jbuf[0..n], .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    const name = parsed.value.file;
+    if (name.len == 0 or name.len > 256) return null;
+    if (std.mem.indexOfAny(u8, name, "/\\\"\r\n\t") != null) return null;
+    var out = ManifestName{ .buf = undefined, .len = name.len };
+    @memcpy(out.buf[0..name.len], name);
+    return out;
 }
 
 /// The endpoint reports in once it is listening (and reports out if its listener dies).
@@ -342,4 +386,41 @@ test "scan elects deterministically: a model-id-named gguf beats other ggufs, le
     rescan(io);
     const p2 = modelPath() orelse return error.TestExpectedModel;
     try std.testing.expect(std.mem.endsWith(u8, p2, "alpha.gguf"));
+}
+
+test "the install manifest steers the election: its file wins over name heuristics, a dangling one falls through" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-builtin-manifest-elect-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    const mdir = root ++ "/models";
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, mdir, .default_dir) catch {};
+    // the OLD install would win every heuristic (model-id-named, lexically first)…
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mdir ++ "/the-veil-12b-q4_k_m.gguf", .data = "old" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mdir ++ "/the-veil-12b-v2-q4_k_m.gguf", .data = "new" });
+    // …but the manifest says v2 is what was installed last, so v2 serves
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mdir ++ "/" ++ INSTALL_MANIFEST, .data = "{\"file\":\"the-veil-12b-v2-q4_k_m.gguf\",\"sha256\":\"x\",\"source\":\"pull\"}" });
+
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    init(io, &env, root);
+    const p = modelPath() orelse return error.TestExpectedModel;
+    try std.testing.expect(std.mem.endsWith(u8, p, "the-veil-12b-v2-q4_k_m.gguf"));
+
+    // a manifest pointing at a deleted file must not blank the store — the scan takes over
+    std.Io.Dir.cwd().deleteFile(io, mdir ++ "/the-veil-12b-v2-q4_k_m.gguf") catch {};
+    rescan(io);
+    const p2 = modelPath() orelse return error.TestExpectedModel;
+    try std.testing.expect(std.mem.endsWith(u8, p2, "the-veil-12b-q4_k_m.gguf"));
+
+    // and a CORRUPT manifest (separator smuggled into the name) is ignored, never followed
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mdir ++ "/" ++ INSTALL_MANIFEST, .data = "{\"file\":\"../../evil.gguf\"}" });
+    rescan(io);
+    const p3 = modelPath() orelse return error.TestExpectedModel;
+    try std.testing.expect(std.mem.endsWith(u8, p3, "the-veil-12b-q4_k_m.gguf"));
 }

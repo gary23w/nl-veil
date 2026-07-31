@@ -759,6 +759,47 @@ fn cmdModel(ctx: *Ctx, args: []const []const u8) u8 {
         out("cancel requested — the partial transfer stays for a later resume\n", .{});
         return 0;
     }
+    if (std.mem.eql(u8, sub, "check")) {
+        const resp = call(ctx, "POST", "/api/v1/models/builtin/check", "{}", 10, true) catch return unreachable_msg(ctx);
+        defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
+        if (resp.status != 200) {
+            std.debug.print("check not started (HTTP {d}): {s}\n", .{ resp.status, resp.body[0..@min(resp.body.len, 300)] });
+            return 1;
+        }
+        // the check is a network resolve (plus a one-time hash on an unmanaged store) — poll the
+        // verdict out of status rather than pretending it was instant
+        var waited: u32 = 0;
+        while (waited < 120) : (waited += 1) {
+            const sr = call(ctx, "GET", "/api/v1/models/builtin", null, 8, false) catch return unreachable_msg(ctx);
+            defer if (sr.body.len > 0) ctx.gpa.free(sr.body);
+            if (sr.status != 200) return 1;
+            const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, sr.body, .{}) catch return 1;
+            defer parsed.deinit();
+            const o = if (parsed.value == .object) parsed.value.object else return 1;
+            const us = if (o.get("update_state")) |v| (if (v == .string) v.string else "?") else "?";
+            if (!std.mem.eql(u8, us, "checking")) {
+                if (std.mem.eql(u8, us, "current")) {
+                    out("up to date — the store serves the repo's current release\n", .{});
+                    return 0;
+                }
+                if (std.mem.eql(u8, us, "update")) {
+                    const f = if (o.get("update_file")) |v| (if (v == .string) v.string else "") else "";
+                    const mb: i64 = if (o.get("update_mb")) |v| (if (v == .integer) v.integer else 0) else 0;
+                    out("update available: {s} ({d} MB) — run `veil model pull` to install it\n", .{ f, mb });
+                    return 0;
+                }
+                if (std.mem.eql(u8, us, "failed")) {
+                    out("check failed — no network, or the repo has no published weights yet\n", .{});
+                    return 1;
+                }
+                out("verdict: {s}\n", .{us});
+                return 0;
+            }
+            ctx.io.sleep(.{ .nanoseconds = std.time.ns_per_s }, .awake) catch {};
+        }
+        out("check is still running — `veil model status` will show the verdict\n", .{});
+        return 0;
+    }
     if (std.mem.eql(u8, sub, "rm")) {
         const resp = call(ctx, "DELETE", "/api/v1/models/builtin", null, 10, true) catch return unreachable_msg(ctx);
         defer if (resp.body.len > 0) ctx.gpa.free(resp.body);
@@ -769,7 +810,7 @@ fn cmdModel(ctx: *Ctx, args: []const []const u8) u8 {
         out("weights removed\n", .{});
         return 0;
     }
-    std.debug.print("unknown model subcommand '{s}' — status | pull | import [--path FILE] | cancel | rm\n", .{sub});
+    std.debug.print("unknown model subcommand '{s}' — status | pull | check | import [--path FILE] | cancel | rm\n", .{sub});
     return 1;
 }
 
@@ -872,6 +913,7 @@ fn cmdHelp() u8 {
         \\  model pull                   download the published weights (resumable, sha-verified)
         \\  model import [--path FILE]   copy an already-downloaded GGUF into the store instead
         \\                               (no --path: auto-import this machine's local-runtime copy)
+        \\  model check                  is a newer release published? (compares shas; pull installs it)
         \\  model cancel                 cancel the running pull/import (the partial resumes later)
         \\  model rm                     remove the serving weights
         \\

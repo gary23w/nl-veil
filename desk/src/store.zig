@@ -22,7 +22,7 @@ const SpinLock = struct {
 
 pub const Tab = enum { dashboard, chat, swarm, hub, scheduled, settings }; // deploy = the Swarm tab's inner form
 
-pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove };
+pub const CmdKind = enum { none, select, say, set_goal, stop, deploy, delete, open_folder, refresh_now, open_file, sched_create, sched_update, sched_toggle, sched_delete, sched_run, oauth_cf_login, oauth_cf_logout, builtin_pull, builtin_cancel, builtin_import, builtin_remove, builtin_check };
 
 /// A UI→poller command. Fixed-size, copied by value into the ring, so no cross-thread allocation.
 pub const Command = struct {
@@ -867,6 +867,12 @@ pub const Store = struct {
     bi_arch_len: u8 = 0,
     bi_err: [160]u8 = undefined,
     bi_err_len: u8 = 0,
+    // the update lane (never|checking|current|update|failed) + what a pull would install
+    bi_upd_state: [10]u8 = undefined,
+    bi_upd_state_len: u8 = 0,
+    bi_upd_file: [64]u8 = undefined,
+    bi_upd_file_len: u8 = 0,
+    bi_upd_mb: u32 = 0,
 
     // --- command ring (UI writes head, poller reads tail) ---
     cmds: [CMD_RING]Command = undefined,

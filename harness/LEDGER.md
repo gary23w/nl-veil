@@ -3049,3 +3049,41 @@ edit, confirm it applied, then run.
   collisions; absent/non-numeric reads null, never 0-as-fact. Pinned by test with the real reply
   shape.
 - verified: desk suite green incl. the new intForKey vectors; full oracle green; no server diff.
+
+## 0112 — 2026-07-31 — model updates: identity manifest, check verb, hot swap, election fix
+- owner asked "what about when the model updates?" — and the honest audit found three real holes in
+  0110, not just a missing button: (1) nothing ever DETECTED that the repo moved on; (2) replacing a
+  serving file fails on Windows while the engine maps it (the pull's delete+rename would just error),
+  and a same-path update that did land was invisible to repoint()'s same-path no-op; (3) an update
+  shipped under a NEW filename could LOSE the store election to the old file (model-id-named +
+  lexically-first favored the older name) — pull "succeeds", old weights keep serving.
+- identity: every promote now writes an install manifest beside the weights ({file, sha256, source:
+  pull|import|adopted}). It is three things at once: the ELECTION's first authority (builtin.zig
+  serves the manifest's file when it exists — a corrupt name with a path separator is ignored, and
+  a dangling one falls back to the scan, never a blanked store); the UPDATE CHECK's baseline; and
+  the supersede list — after a rename-y update, only the manifest's own PREVIOUS file is removed,
+  never an unmanaged gguf someone hand-dropped in the store.
+- check: POST models/builtin/check → its own tiny lane (CheckState never/checking/current/update/
+  failed), deliberately OUTSIDE the transfer state machine so a check can never repaint a serving
+  panel as "not downloaded". It resolves the repo (same election), compares shas, and — for
+  pre-manifest or hand-dropped stores — ADOPTS first: sha the serving file once, record it, then
+  compare identities instead of guessing. USER-INITIATED egress only; the server never phones the
+  repo on its own. Transfers and checks exclude each other under the one lock.
+- hot swap: modelpull.on_before_swap → llamaeng.unload(), which takes the engine mutex (so it WAITS
+  OUT an in-flight generation), drops the mapping, and clears the cached meta — the bytes under the
+  path are about to change, so what was probed is about to be a lie. repoint()'s same-path branch
+  now re-probes when unloaded+meta-cleared instead of no-opping, which is exactly the in-place
+  update shape. remove() takes the same hook (Windows refuses to delete a mapped file).
+- stale partials: a `.part.sha` sidecar names which release a partial belongs to; a resume against
+  a superseded release discards the partial UP FRONT instead of transferring 7GB to fail the hash.
+  Election also refuses artifact names carrying quotes/separators/controls — nothing that could
+  forge a path or the hand-formatted manifest is a candidate at all.
+- surfaces: status carries update_state/update_file/update_mb/checked_s + installed_sha12/source;
+  `veil model check` polls the verdict out; desk gets Check for updates / "update available:
+  <file> (<MB>)" / Update now (a pull) with a one-time verdict toast; web panel same. Pull itself
+  stamps the verdict current (what it installed IS the repo's present best); import resets it to
+  never (an import may be older or newer than published — unknown is the honest verdict).
+- verified: new tests — manifest write/read/restart-survival, manifest-steered election incl. the
+  corrupt-name and dangling cases, partIsForRelease's four verdicts, baseName, the evil-name
+  election filter; both suites + oracle green; live smoke re-run (adopt writes the manifest for the
+  pre-existing store; check lands "failed" honestly while the repo has no published gguf).

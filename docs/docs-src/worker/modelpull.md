@@ -14,8 +14,9 @@ The repo (`builtin.HF_REPO`) IS the manifest: the file list comes from its tree 
 
 - `configure` / `status` / `startPull` / `cancel` — the pull lifecycle (`NL_MODEL_HOST` overrides the repo host for mirrors/tests)
 - `startImport` / `importLocal` / `remove`
-- `electFromTree` / `modelDigestFromManifest` / `sha256HexOfFile` — the pinned pure parts
-- `on_store_change` — main wires it to re-point the engine after the store changes
+- `startCheck` / `checkStatus` — the UPDATE lane: every install records its identity (file + sha256 + source) in the install manifest beside the weights; a check resolves the repo again and compares shas (same = current, different = update available). Pull IS the updater — it always installs the repo's present best, hot-swap-safe: `on_before_swap` unloads the engine first (Windows file locks), a `.part.sha` sidecar discards partials of superseded releases, and the previous MANAGED file is removed after a rename-y update (never an unmanaged gguf)
+- `electFromTree` / `modelDigestFromManifest` / `sha256HexOfFile` / `partIsForRelease` / `baseName` — the pinned pure parts
+- `on_store_change` / `on_before_swap` — main wires them to re-point / unload the engine around store changes
 
 ## Dependencies
 

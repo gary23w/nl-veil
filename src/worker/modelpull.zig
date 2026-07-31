@@ -14,6 +14,17 @@
 //! `veil model import` is the no-download door: a machine that already pulled the model through a
 //! conventional local runtime has the same GGUF as a content-addressed blob; import copies it into
 //! the store and verifies it against the digest its own manifest declares.
+//!
+//! UPDATES. Every successful install records WHAT it installed (file + sha256 + source) in a small
+//! install manifest beside the weights — the store's identity. `startCheck` resolves the repo again
+//! and compares shas: same = current, different = update available (surfaced in status; the pull
+//! verb IS the updater, it always fetches the repo's present best). Replacing a serving file is
+//! made safe by `on_before_swap` (main wires it to unload the engine, which waits out any in-flight
+//! generation — Windows will not replace a file the engine still maps), a `.part.sha` sidecar
+//! naming which release a partial belongs to (a resumed partial of a SUPERSEDED release is
+//! discarded instead of failing verification 7GB later), and supersede cleanup: after a rename-y
+//! update lands, the PREVIOUS manifest-managed file is removed — never an unmanaged gguf a user
+//! dropped in the store themselves.
 
 const std = @import("std");
 const httpc = @import("httpc.zig");
@@ -22,6 +33,11 @@ const builtin_mod = @import("builtin.zig");
 const log = std.log.scoped(.modelpull);
 
 pub const State = enum { idle, resolving, downloading, verifying, importing, done, failed, cancelled };
+
+/// The update-check verdict — its OWN tiny lane, deliberately outside the transfer state machine so
+/// a check can never repaint a serving panel as "not downloaded".
+pub const CheckState = enum { never, checking, current, update, failed };
+
 
 const St = struct {
     mutex: std.Io.Mutex = .init,
@@ -45,6 +61,20 @@ const St = struct {
     /// startImport's explicit source path (empty = auto-discover the local runtime's blob).
     import_src: [512]u8 = @splat(0),
     import_src_len: u16 = 0,
+    // --- update check (see CheckState) ---
+    checking: bool = false, // a check thread is live; transfers and checks exclude each other
+    check_state: CheckState = .never,
+    upd_file: [128]u8 = @splat(0),
+    upd_file_len: u16 = 0,
+    upd_mb: u32 = 0,
+    checked_s: i64 = 0,
+    // --- the store's identity, cached from the install manifest (configure/promote refresh it) ---
+    inst_sha: [64]u8 = @splat(0),
+    inst_sha_len: u8 = 0,
+    inst_src: [8]u8 = @splat(0), // "pull" | "import" | "adopted"
+    inst_src_len: u8 = 0,
+    inst_file: [128]u8 = @splat(0),
+    inst_file_len: u16 = 0,
 };
 var st: St = .{};
 
@@ -58,6 +88,11 @@ fn unlock() void {
 /// Wired by main (build-gated): fires after the store changes (pull done, import done, delete) so
 /// the engine re-points without modelpull importing the FFI side.
 pub var on_store_change: ?*const fn () void = null;
+
+/// Wired by main (build-gated): fires right BEFORE the store replaces or removes the serving file.
+/// The engine must drop its mapping first (it waits out any in-flight generation) or Windows
+/// refuses the replace with the file lock held.
+pub var on_before_swap: ?*const fn () void = null;
 
 pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) void {
     st.io = io; // before the first lock — the mutex needs a valid io to park on
@@ -75,6 +110,60 @@ pub fn configure(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process
     };
     st.host_len = @intCast(host.len);
     @memcpy(st.host[0..host.len], host);
+    loadManifestCacheLocked(io);
+}
+
+/// Read the install manifest into the st.inst_* cache. Caller holds the lock. Absent/corrupt reads
+/// as "no identity" — the check lane then adopts whatever file is serving before comparing.
+fn loadManifestCacheLocked(io: std.Io) void {
+    st.inst_sha_len = 0;
+    st.inst_src_len = 0;
+    st.inst_file_len = 0;
+    var pbuf: [600]u8 = undefined;
+    const p = manifestPath(&pbuf) orelse return;
+    var jbuf: [1024]u8 = undefined;
+    const f = std.Io.Dir.cwd().openFile(io, p, .{}) catch return;
+    defer f.close(io);
+    const n = f.readPositionalAll(io, &jbuf, 0) catch return;
+    const P = struct {
+        file: []const u8 = "",
+        sha256: []const u8 = "",
+        source: []const u8 = "",
+    };
+    const parsed = std.json.parseFromSlice(P, std.heap.page_allocator, jbuf[0..n], .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    if (parsed.value.sha256.len == 64) {
+        @memcpy(st.inst_sha[0..64], parsed.value.sha256[0..64]);
+        st.inst_sha_len = 64;
+    }
+    const sn = @min(parsed.value.source.len, st.inst_src.len);
+    @memcpy(st.inst_src[0..sn], parsed.value.source[0..sn]);
+    st.inst_src_len = @intCast(sn);
+    const fnn = @min(parsed.value.file.len, st.inst_file.len);
+    @memcpy(st.inst_file[0..fnn], parsed.value.file[0..fnn]);
+    st.inst_file_len = @intCast(fnn);
+}
+
+fn manifestPath(buf: []u8) ?[]const u8 {
+    const dir = builtin_mod.modelsDir();
+    if (dir.len == 0) return null;
+    return std.fmt.bufPrint(buf, "{s}/" ++ builtin_mod.INSTALL_MANIFEST, .{dir}) catch null;
+}
+
+/// Record what the store now serves (file name + sha + how it got here) and refresh the cache.
+/// The manifest is the store's IDENTITY: the check lane compares against it, and supersede cleanup
+/// trusts it as the list of files THIS code manages (and may therefore remove).
+fn writeManifest(io: std.Io, file_name: []const u8, sha_hex: []const u8, source: []const u8) void {
+    var pbuf: [600]u8 = undefined;
+    const p = manifestPath(&pbuf) orelse return;
+    var jbuf: [512]u8 = undefined;
+    // names come from electFromTree (quote/control-free by its filter) or our own fixed ids, so a
+    // plain format IS well-formed JSON here
+    const j = std.fmt.bufPrint(&jbuf, "{{\"file\":\"{s}\",\"sha256\":\"{s}\",\"source\":\"{s}\"}}\n", .{ file_name, sha_hex, source }) catch return;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = j }) catch return;
+    lock();
+    defer unlock();
+    loadManifestCacheLocked(io);
 }
 
 pub const Status = struct {
@@ -136,7 +225,7 @@ fn fail(msg: []const u8) void {
 /// configure() (a route hit during a half-booted server).
 pub fn startPull() !void {
     lock();
-    if (st.running) {
+    if (st.running or st.checking) {
         unlock();
         return error.Busy;
     }
@@ -213,8 +302,19 @@ fn pullThread() void {
     defer gpa.free(dest);
     const part = std.fmt.allocPrint(gpa, "{s}.part", .{dest}) catch return fail("oom");
     defer gpa.free(part);
+    const part_sha = std.fmt.allocPrint(gpa, "{s}.sha", .{part}) catch return fail("oom");
+    defer gpa.free(part_sha);
     const url = std.fmt.allocPrint(gpa, "{s}/" ++ builtin_mod.HF_REPO ++ "/resolve/main/{s}", .{ host, pick.name }) catch return fail("oom");
     defer gpa.free(url);
+
+    // A leftover partial only resumes when its sidecar names THIS release. A partial of a
+    // superseded release would transfer to completion and then fail verification — 7GB of work to
+    // learn what the sidecar says up front.
+    if (!partIsForRelease(io, part, part_sha, pick.sha256[0..])) {
+        std.Io.Dir.cwd().deleteFile(io, part) catch {};
+        log.info("discarded a partial of a different release", .{});
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part_sha, .data = pick.sha256[0..] }) catch {};
 
     if (!fetchToPart(gpa, io, url, part)) {
         if (cancelled()) return setState(.cancelled);
@@ -228,14 +328,60 @@ fn pullThread() void {
     const got = sha256HexOfFile(io, part, &sha_buf) orelse return fail("could not read the transferred file back");
     if (!std.ascii.eqlIgnoreCase(got, pick.sha256[0..])) {
         std.Io.Dir.cwd().deleteFile(io, part) catch {};
+        std.Io.Dir.cwd().deleteFile(io, part_sha) catch {};
         return fail("sha256 mismatch — transfer corrupted, partial repo upload, or a tampered mirror; the partial was discarded");
     }
-    std.Io.Dir.cwd().deleteFile(io, dest) catch {}; // replacing a previous quant is fine
+    // remember which file the manifest managed BEFORE this install, for supersede cleanup below
+    var prev_buf: [128]u8 = undefined;
+    var prev_len: usize = 0;
+    {
+        lock();
+        defer unlock();
+        prev_len = st.inst_file_len;
+        @memcpy(prev_buf[0..prev_len], st.inst_file[0..prev_len]);
+    }
+    if (on_before_swap) |cb| cb(); // the engine drops its mapping (waits out a running generation)
+    std.Io.Dir.cwd().deleteFile(io, dest) catch {}; // same-name update: replace in place
     std.Io.Dir.cwd().rename(part, std.Io.Dir.cwd(), dest, io) catch return fail("could not move the verified file into place");
+    std.Io.Dir.cwd().deleteFile(io, part_sha) catch {};
+    writeManifest(io, pick.name, pick.sha256[0..], "pull");
+    // supersede: a rename-y update leaves the old MANAGED file behind — 7GB of dead weight that
+    // could even win the next election. Only the manifest's own previous file is ever removed;
+    // an unmanaged gguf someone placed here by hand is not ours to delete.
+    if (prev_len > 0 and !std.mem.eql(u8, prev_buf[0..prev_len], pick.name)) {
+        var ob: [600]u8 = undefined;
+        if (std.fmt.bufPrint(&ob, "{s}/{s}", .{ dir, prev_buf[0..prev_len] })) |old_path| {
+            std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
+            log.info("superseded {s}", .{prev_buf[0..prev_len]});
+        } else |_| {}
+    }
+    {
+        // this install IS the repo's present best — the check verdict is fresh by construction
+        lock();
+        defer unlock();
+        st.check_state = .current;
+        st.checked_s = nowS(io);
+    }
     setState(.done);
     builtin_mod.rescan(io);
     if (on_store_change) |cb| cb();
     log.info("pulled {s} ({d} bytes, verified)", .{ pick.name, pick.size });
+}
+
+fn nowS(io: std.Io) i64 {
+    return @intCast(std.Io.Timestamp.now(io, .real).toSeconds());
+}
+
+/// Does the .part on disk belong to the release we are about to fetch? True when there is no
+/// partial at all (nothing to mismatch) or when the sidecar names the same sha.
+pub fn partIsForRelease(io: std.Io, part: []const u8, part_sha: []const u8, want_sha: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, part, .{}) catch return true; // no partial → nothing stale
+    var buf: [80]u8 = undefined;
+    const f = std.Io.Dir.cwd().openFile(io, part_sha, .{}) catch return false; // partial without identity → stale
+    defer f.close(io);
+    const n = f.readPositionalAll(io, &buf, 0) catch return false;
+    const have = std.mem.trim(u8, buf[0..n], " \r\n\t");
+    return have.len == 64 and std.ascii.eqlIgnoreCase(have, want_sha);
 }
 
 const Artifact = struct {
@@ -272,6 +418,9 @@ pub fn electFromTree(gpa: std.mem.Allocator, tree_json: []const u8) ?Artifact {
     var best_q4 = false;
     for (parsed.value) |e| {
         if (!std.ascii.endsWithIgnoreCase(e.path, ".gguf")) continue;
+        // a name that could break out of a path or a hand-formatted JSON manifest is no candidate;
+        // real model artifacts are never named with quotes, separators-in-disguise, or controls
+        if (std.mem.indexOfAny(u8, e.path, "\"\\/\r\n\t") != null) continue;
         const lfs = e.lfs orelse continue; // a gguf small enough to dodge LFS is not a real model
         if (lfs.oid.len != 64) continue; // the record IS the verification root — no oid, no candidate
         const q4 = std.ascii.indexOfIgnoreCase(e.path, "q4_k_m") != null;
@@ -400,7 +549,7 @@ pub fn sha256HexOfFile(io: std.Io, path: []const u8, out: *[64]u8) ?[]const u8 {
 /// pull/import runs.
 pub fn startImport(explicit: ?[]const u8) !void {
     lock();
-    if (st.running) {
+    if (st.running or st.checking) {
         unlock();
         return error.Busy;
     }
@@ -478,12 +627,14 @@ pub fn importLocal(gpa: std.mem.Allocator, io: std.Io, explicit: ?[]const u8) ![
         setState(.failed);
         return error.CopyFailed;
     };
+    // sha the copy ALWAYS: the auto path verifies it against the runtime's declared digest, and
+    // either path records it in the install manifest — the identity the update check compares.
+    var got_buf: [64]u8 = undefined;
+    const got = sha256HexOfFile(io, part, &got_buf) orelse {
+        setState(.failed);
+        return error.CopyFailed;
+    };
     if (want_sha) |ws| {
-        var got_buf: [64]u8 = undefined;
-        const got = sha256HexOfFile(io, part, &got_buf) orelse {
-            setState(.failed);
-            return error.CopyFailed;
-        };
         if (!std.ascii.eqlIgnoreCase(got, ws[0..])) {
             std.Io.Dir.cwd().deleteFile(io, part) catch {};
             setState(.failed);
@@ -497,11 +648,33 @@ pub fn importLocal(gpa: std.mem.Allocator, io: std.Io, explicit: ?[]const u8) ![
             return error.NotAModel;
         }
     }
+    var prev_buf: [128]u8 = undefined;
+    var prev_len: usize = 0;
+    {
+        lock();
+        defer unlock();
+        prev_len = st.inst_file_len;
+        @memcpy(prev_buf[0..prev_len], st.inst_file[0..prev_len]);
+    }
+    if (on_before_swap) |cb| cb(); // the engine drops its mapping before the file is replaced
     std.Io.Dir.cwd().deleteFile(io, dest) catch {};
     std.Io.Dir.cwd().rename(part, std.Io.Dir.cwd(), dest, io) catch {
         setState(.failed);
         return error.CopyFailed;
     };
+    writeManifest(io, builtin_mod.MODEL_ID ++ ".gguf", got, "import");
+    if (prev_len > 0 and !std.mem.eql(u8, prev_buf[0..prev_len], builtin_mod.MODEL_ID ++ ".gguf")) {
+        var ob: [600]u8 = undefined;
+        if (std.fmt.bufPrint(&ob, "{s}/{s}", .{ dir, prev_buf[0..prev_len] })) |old_path| {
+            std.Io.Dir.cwd().deleteFile(io, old_path) catch {};
+        } else |_| {}
+    }
+    {
+        // an import may be older OR newer than the repo's best — the verdict is unknown again
+        lock();
+        defer unlock();
+        st.check_state = .never;
+    }
     setState(.done);
     builtin_mod.rescan(io);
     if (on_store_change) |cb| cb();
@@ -577,16 +750,144 @@ fn copyFile(io: std.Io, src: []const u8, dest: []const u8) !void {
 /// Remove the serving weights (route: DELETE /api/v1/models/builtin). Refused while a pull runs.
 pub fn remove(io: std.Io) !void {
     lock();
-    const busy = st.running;
+    const busy = st.running or st.checking;
     unlock();
     if (busy) return error.Busy;
     const p = builtin_mod.modelPath() orelse return;
     var pbuf: [600]u8 = undefined;
     const own = std.fmt.bufPrint(&pbuf, "{s}", .{p}) catch return error.Busy;
+    if (on_before_swap) |cb| cb(); // the engine may hold the mapping — Windows refuses the delete otherwise
     try std.Io.Dir.cwd().deleteFile(io, own);
+    var mbuf: [600]u8 = undefined;
+    if (manifestPath(&mbuf)) |mp| std.Io.Dir.cwd().deleteFile(io, mp) catch {};
+    {
+        lock();
+        defer unlock();
+        st.inst_sha_len = 0;
+        st.inst_src_len = 0;
+        st.inst_file_len = 0;
+        st.check_state = .never;
+    }
     builtin_mod.rescan(io);
     setState(.idle);
     if (on_store_change) |cb| cb();
+}
+
+// ---- the update check --------------------------------------------------------------------------
+
+pub const CheckStatus = struct {
+    state: CheckState,
+    /// The repo's current elected artifact (what a pull would install). Fixed storage.
+    file: []const u8,
+    mb: u32,
+    checked_s: i64,
+    /// The install's identity, for display/support: first 12 hex of the serving file's sha + how it
+    /// arrived ("pull"/"import"/"adopted"). Empty when the store has no manifest yet.
+    inst_sha12: []const u8,
+    inst_src: []const u8,
+};
+
+pub fn checkStatus() CheckStatus {
+    if (!st.configured) return .{ .state = .never, .file = "", .mb = 0, .checked_s = 0, .inst_sha12 = "", .inst_src = "" };
+    lock();
+    defer unlock();
+    return .{
+        .state = if (st.checking) .checking else st.check_state,
+        .file = st.upd_file[0..st.upd_file_len],
+        .mb = st.upd_mb,
+        .checked_s = st.checked_s,
+        .inst_sha12 = st.inst_sha[0..@min(st.inst_sha_len, 12)],
+        .inst_src = st.inst_src[0..st.inst_src_len],
+    };
+}
+
+/// Kick an update check: resolve the repo's current artifact and compare its sha against the
+/// install manifest. Runs on its own thread (the resolve is network, and an unmanaged store gets
+/// sha'd once to adopt an identity). Never starts under a transfer, and transfers never start
+/// under it — both flip `running`/`checking` under the one lock.
+pub fn startCheck() !void {
+    lock();
+    if (st.running or st.checking) {
+        unlock();
+        return error.Busy;
+    }
+    if (!st.configured) {
+        unlock();
+        return error.NotConfigured;
+    }
+    st.checking = true;
+    unlock();
+    errdefer {
+        lock();
+        st.checking = false;
+        unlock();
+    }
+    const t = try std.Thread.spawn(.{}, checkThread, .{});
+    t.detach();
+}
+
+fn checkThread() void {
+    defer {
+        lock();
+        st.checking = false;
+        unlock();
+    }
+    const gpa = st.gpa;
+    const io = st.io;
+
+    // adopt an unmanaged store first: a pre-manifest install (or a hand-dropped gguf) gets its sha
+    // computed ONCE and recorded, so this and every later check compares identities, not guesses
+    var have_identity = blk: {
+        lock();
+        defer unlock();
+        break :blk st.inst_sha_len == 64;
+    };
+    if (!have_identity) {
+        if (builtin_mod.modelPath()) |p| {
+            var pb: [600]u8 = undefined;
+            if (std.fmt.bufPrint(&pb, "{s}", .{p})) |own| {
+                var hex: [64]u8 = undefined;
+                if (sha256HexOfFile(io, own, &hex)) |h| {
+                    writeManifest(io, baseName(own), h, "adopted");
+                    have_identity = true;
+                }
+            } else |_| {}
+        }
+    }
+
+    var hbuf: [128]u8 = undefined;
+    lock();
+    const host = std.fmt.bufPrint(&hbuf, "{s}", .{st.host[0..st.host_len]}) catch {
+        unlock();
+        return;
+    };
+    unlock();
+    const pick = resolveArtifact(gpa, io, host) orelse {
+        lock();
+        defer unlock();
+        st.check_state = .failed;
+        st.checked_s = nowS(io);
+        return;
+    };
+    defer gpa.free(pick.name);
+
+    lock();
+    defer unlock();
+    st.checked_s = nowS(io);
+    st.upd_file_len = @intCast(@min(pick.name.len, st.upd_file.len));
+    @memcpy(st.upd_file[0..st.upd_file_len], pick.name[0..st.upd_file_len]);
+    st.upd_mb = @intCast(@min(pick.size >> 20, std.math.maxInt(u32)));
+    const same = st.inst_sha_len == 64 and std.ascii.eqlIgnoreCase(st.inst_sha[0..64], pick.sha256[0..]);
+    st.check_state = if (same) .current else .update;
+}
+
+/// The final path component — plain string math, no io.
+pub fn baseName(p: []const u8) []const u8 {
+    var i = p.len;
+    while (i > 0) : (i -= 1) {
+        if (p[i - 1] == '/' or p[i - 1] == '\\') return p[i..];
+    }
+    return p;
 }
 
 // ---- tests ---------------------------------------------------------------------------------------
@@ -617,6 +918,82 @@ test "election: q4_k_m wins over larger alternates; without one the largest gguf
     // a gguf with no LFS record cannot be verified, so it is not a candidate at all
     const bare = "[{\"path\":\"x.gguf\",\"size\":9}]";
     try std.testing.expect(electFromTree(gpa, bare) == null);
+
+    // a name that could forge a path or the hand-formatted install manifest is no candidate either
+    const evil =
+        \\[{"path":"a\"b.gguf","size":1,"lfs":{"oid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","size":5}},
+        \\ {"path":"sub/dir.gguf","size":1,"lfs":{"oid":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":9}}]
+    ;
+    try std.testing.expect(electFromTree(gpa, evil) == null);
+}
+
+test "install manifest: written on promote, read back as the store's identity, absent reads as none" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-modelpull-manifest-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    builtin_mod.init(io, &env, root);
+    configure(gpa, io, &env);
+
+    // absent → no identity
+    {
+        const cs = checkStatus();
+        try std.testing.expectEqual(@as(usize, 0), cs.inst_sha12.len);
+    }
+    const sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    writeManifest(io, "the-veil-12b-q4_k_m.gguf", sha, "pull");
+    {
+        const cs = checkStatus();
+        try std.testing.expectEqualStrings(sha[0..12], cs.inst_sha12);
+        try std.testing.expectEqualStrings("pull", cs.inst_src);
+    }
+    // and a fresh configure (a server restart) reads the same identity back off disk
+    configure(gpa, io, &env);
+    {
+        const cs = checkStatus();
+        try std.testing.expectEqualStrings(sha[0..12], cs.inst_sha12);
+    }
+}
+
+test "stale-partial rule: no partial passes, a matching sidecar passes, mismatch or no sidecar discards" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const root = "zig-modelpull-part-tmp";
+    std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, root, .default_dir) catch {};
+
+    const part = root ++ "/m.gguf.part";
+    const side = root ++ "/m.gguf.part.sha";
+    const sha_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const sha_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // nothing on disk → nothing stale to discard
+    try std.testing.expect(partIsForRelease(io, part, side, sha_a));
+    // a partial WITHOUT an identity sidecar is stale by definition (pre-sidecar leftovers)
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = part, .data = "half" });
+    try std.testing.expect(!partIsForRelease(io, part, side, sha_a));
+    // sidecar names the same release → resume it
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = side, .data = sha_a });
+    try std.testing.expect(partIsForRelease(io, part, side, sha_a));
+    // the repo moved on → the partial belongs to a superseded release
+    try std.testing.expect(!partIsForRelease(io, part, side, sha_b));
+}
+
+test "baseName: plain string math over both separators" {
+    try std.testing.expectEqualStrings("m.gguf", baseName("C:\\models\\m.gguf"));
+    try std.testing.expectEqualStrings("m.gguf", baseName("data/models/m.gguf"));
+    try std.testing.expectEqualStrings("m.gguf", baseName("m.gguf"));
 }
 
 test "runtime manifest: the .model layer's digest is extracted, other layers ignored" {

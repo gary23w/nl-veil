@@ -604,6 +604,7 @@ pub fn main(init: std.process.Init) !void {
     if (comptime HAS_BUILTIN) {
         llamaeng.configure(gpa, io, init.environ_map, builtin_state.modelPath());
         modelpull.on_store_change = builtinStoreChanged;
+        modelpull.on_before_swap = builtinBeforeSwap;
         if (builtin_endpoint.start(gpa, io, llamaeng.engine(), init.environ_map)) |bport| {
             const winf = llamaeng.info();
             log.info("built-in model engine: {s} on 127.0.0.1:{d}{s} (weights: {s})", .{ builtin_state.MODEL_ID, bport, builtin_state.PATH_PREFIX, @tagName(winf.state) });
@@ -714,6 +715,7 @@ pub fn main(init: std.process.Init) !void {
     router.post("/api/v1/models/builtin/pull", builtinPull, .{});
     router.post("/api/v1/models/builtin/cancel", builtinCancel, .{});
     router.post("/api/v1/models/builtin/import", builtinImport, .{});
+    router.post("/api/v1/models/builtin/check", builtinCheck, .{});
     router.delete("/api/v1/models/builtin", builtinDelete, .{});
     router.post("/api/v1/oauth/cloudflare/start", cf_oauth.start, .{});
     router.get("/api/v1/oauth/cloudflare/callback", cf_oauth.callback, .{});
@@ -1158,6 +1160,12 @@ fn builtinStoreChanged() void {
     if (comptime HAS_BUILTIN) llamaeng.repoint(builtin_state.modelPath());
 }
 
+/// modelpull's pre-swap hook: the engine drops its file mapping (waiting out any in-flight
+/// generation) so the store can replace/remove the weights under Windows' open-file locks.
+fn builtinBeforeSwap() void {
+    if (comptime HAS_BUILTIN) llamaeng.unload();
+}
+
 /// GET /api/v1/models/builtin → the one snapshot the desk row, the web settings and `veil model
 /// status` all render: compiled?, endpoint port, weights store, engine state, transfer progress.
 /// A transfer in flight is the headline (it is what the user is waiting on); otherwise the engine
@@ -1172,6 +1180,7 @@ fn builtinStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     };
     const headline: []const u8 = if (transferring or ps.state == .failed) @tagName(ps.state) else @tagName(inf.state);
     const pct: u64 = if (ps.bytes_total > 0) @min(ps.bytes_done * 100 / ps.bytes_total, 100) else 0;
+    const cs = modelpull.checkStatus();
     try res.json(.{
         .ok = true,
         .compiled = HAS_BUILTIN,
@@ -1189,7 +1198,27 @@ fn builtinStatus(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
         .ctx = inf.ctx_serving,
         .err = if (ps.state == .failed) ps.err else inf.errMsg(),
         .synced_dir_warning = builtin_state.syncedDirWarning(),
+        // the update lane: what the repo currently publishes vs what this store serves
+        .update_state = @tagName(cs.state),
+        .update_file = cs.file,
+        .update_mb = cs.mb,
+        .checked_s = cs.checked_s,
+        .installed_sha12 = cs.inst_sha12,
+        .installed_source = cs.inst_src,
     }, .{});
+}
+
+/// POST /api/v1/models/builtin/check → compare the repo's current artifact against the install
+/// manifest, on a background thread; the verdict lands in status as update_state. Deliberately
+/// USER-INITIATED egress only — this server never phones the repo on its own.
+fn builtinCheck(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    _ = http.requireUser(app, req, res) orelse return;
+    modelpull.startCheck() catch |e| {
+        res.status = if (e == error.Busy) 409 else 503;
+        try res.json(.{ .ok = false, .@"error" = if (e == error.Busy) "a transfer or check is already running" else "the downloader is not ready" }, .{});
+        return;
+    };
+    try res.json(.{ .ok = true, .started = true }, .{});
 }
 
 /// POST /api/v1/models/builtin/pull → start the background download from the published repo.

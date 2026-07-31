@@ -282,6 +282,13 @@ pub fn builtinRemove(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u
     return httpReq(io, gpa, "DELETE", port, "/api/v1/models/builtin", token, null, 10);
 }
 
+/// POST /api/v1/models/builtin/check — ask the server to compare the repo's current release
+/// against what the store serves; the verdict lands in status as update_state.
+pub fn builtinCheck(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8) ?Resp {
+    log.trace("netcli.builtinCheck port={d}", .{port});
+    return httpReq(io, gpa, "POST", port, "/api/v1/models/builtin/check", token, "{}", 10);
+}
+
 /// DELETE /api/v1/chat/convs/<conv> — remove a conversation's whole tree server-side. Without this a
 /// server-born conv (a scheduled_* run, or one merged into the sidebar) reappears on the next list refresh.
 pub fn chatConvDelete(io: Io, gpa: std.mem.Allocator, port: u16, token: []const u8, conv: []const u8) ?Resp {
